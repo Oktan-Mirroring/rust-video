@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "just",
+            "args": [
+              "--justfile",
+              "${CLAUDE_PROJECT_DIR}/justfile",
+              "--working-directory",
+              "${CLAUDE_PROJECT_DIR}",
+              "commit-lint-gate"
+            ],
+            "timeout": 30,
+            "statusMessage": "Commit-lint gate"
+          }
+        ]
+      }
+    ]
+  }
+}

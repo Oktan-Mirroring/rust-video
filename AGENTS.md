@@ -58,6 +58,7 @@ Non-negotiable. A change that violates one is a regression.
 | the workspace, crates, and lint floor | [`Cargo.toml`](Cargo.toml) |
 | any task's route | [`docs/AGENT-ROUTING.md`](docs/AGENT-ROUTING.md) |
 | the scope rule | [`.claude/skills/realtime-scope/SKILL.md`](.claude/skills/realtime-scope/SKILL.md) |
+| how to test | [`docs/testing/README.md`](docs/testing/README.md) |
 | every command | `just --list` |
 
 - Match surrounding code's idiom, naming, and comment density. The codebase

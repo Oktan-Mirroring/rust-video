@@ -1,0 +1,74 @@
+# Capability registry. Every mechanism gets a row: tier, command, source,
+# requires, artifact, status. Statuses: ready, skeleton, planned.
+
+[[capability]]
+id = "unit"
+tier = "unit"
+command = "just test"
+source = "crates/*/src"
+requires = "none"
+artifact = "none"
+status = "ready"
+
+[[capability]]
+id = "harness-lib"
+tier = "unit"
+command = "just test"
+source = "crates/rust-video-harness/src"
+requires = "none"
+artifact = "none"
+status = "ready"
+
+[[capability]]
+id = "vector-corpus"
+tier = "e2e"
+command = "just vectors"
+source = "scripts/fetch-vectors.sh"
+requires = "network"
+artifact = "corpus/"
+status = "ready"
+
+[[capability]]
+id = "e2e-layout"
+tier = "e2e"
+command = "just e2e"
+source = "crates/rust-video/tests/e2e.rs"
+requires = "corpus/"
+artifact = "none"
+status = "skeleton"
+
+[[capability]]
+id = "e2e-decode-goldens"
+tier = "e2e"
+command = "just e2e"
+source = "crates/rust-video-harness/goldens/"
+requires = "corpus/, first decoder backend"
+artifact = "golden hash files"
+status = "planned"
+
+[[capability]]
+id = "rc-matrix"
+tier = "e2e"
+command = "just e2e"
+source = "planned"
+requires = "corpus/, first encoder backend"
+artifact = "score report"
+status = "planned"
+
+[[capability]]
+id = "vmaf-oracle"
+tier = "e2e"
+command = "planned"
+source = "planned"
+requires = "external vmaf binary"
+artifact = "score report"
+status = "planned"
+
+[[capability]]
+id = "device-mediacodec"
+tier = "device"
+command = "planned"
+source = "planned"
+requires = "two SoC vendors"
+artifact = "quirk matrix"
+status = "planned"

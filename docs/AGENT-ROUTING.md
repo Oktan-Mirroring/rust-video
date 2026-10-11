@@ -10,3 +10,7 @@ that proves it.
 | fix a lint or warning | `AGENTS.md` directive 1 | `just check` |
 | add a dependency | `AGENTS.md` directive 5 | `just ci` |
 | write skill or routing docs | `.claude/skills/INDEX.md` | `just ci` |
+| add a unit test | `docs/testing/README.md` tier table | `just test` |
+| add an e2e or golden test | `docs/testing/README.md`, `docs/testing/vectors.md` | `just e2e` |
+| fetch the vector corpus | `docs/testing/vectors.md` | `just vectors` |
+| register a capability | `docs/testing/manifest.toml` | `just ci` |

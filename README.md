@@ -25,7 +25,10 @@ already exists; this crate stays on the live path.
 | `crates/rust-video-h264` … `-av2` | Codec backends, one crate each |
 | `crates/rust-video-vulkan` … `-mediacodec` | Platform tiers, one crate each |
 | `crates/rust-video-livepack` | Livepack frame packing |
+| `crates/rust-video-harness` | Vector suites and golden oracles |
 | `docs/` | Agent routing and design docs |
+| `scripts/` | Vector fetch and probes |
+| `corpus/` | Vector corpus, gitignored, via `just vectors` |
 
 ## Build
 

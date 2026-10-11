@@ -1,0 +1,32 @@
+# Behaviour oracle map. Each RV id names the test that proves it.
+# Statuses: proven, unmeasured.
+
+[[oracle]]
+id = "RV1"
+behaviour = "Auto tier order resolves Vulkan, platform hardware, then software"
+test = "planned"
+status = "unmeasured"
+
+[[oracle]]
+id = "RV2"
+behaviour = "H.265 decodes only behind available hardware or a realtime software backend"
+test = "planned"
+status = "unmeasured"
+
+[[oracle]]
+id = "RV3"
+behaviour = "Vulkan decode hands GPU textures with no readback"
+test = "planned"
+status = "unmeasured"
+
+[[oracle]]
+id = "RV4"
+behaviour = "Every software backend sustains realtime throughput on commodity hardware"
+test = "planned"
+status = "unmeasured"
+
+[[oracle]]
+id = "RV5"
+behaviour = "Every decoder output matches its golden frame hashes"
+test = "crates/rust-video-harness goldens, generation pending first backend"
+status = "unmeasured"
