@@ -1,5 +1,10 @@
 # rust-video
 
+[![Crates.io](https://img.shields.io/crates/v/rust-video)](https://crates.io/crates/rust-video)
+[![Docs.rs](https://docs.rs/rust-video/badge.svg)](https://docs.rs/rust-video)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
+
 Safe Rust interface over realtime video encode and decode. Each codec and
 tier carries the fastest implementation that holds the frame budget: platform
 hardware, tuned C behind an isolated sys crate, or pure Rust once it wins on
