@@ -1,0 +1,28 @@
+[package]
+name = "rust-video-sw"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "Software CPU codec backends behind the rust-video facade"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[features]
+default = []
+h264-openh264 = ["dep:openh264"]
+av1-dav1d = ["dep:dav1d-sys"]
+vpx = ["dep:env-libvpx-sys"]
+
+[dependencies]
+bytes = "1"
+rust-video = { path = "../rust-video" }
+rust-video-caps = { path = "../rust-video-caps" }
+openh264 = { version = "0.9", optional = true }
+dav1d-sys = { version = "0.8", optional = true }
+env-libvpx-sys = { version = "5.1", optional = true, features = ["generate"] }
