@@ -1,0 +1,7 @@
+# rust-video golden v1
+# vector: corpus/vp9/invalid-vp90-2-12-droppable_1.ivf.s73804_r01-05_b6-.ivf
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 350x32
+# frames: 2
+cee4e7cf3273543397cf0bfad3bcf8db1bb81366ed8d10b4af7c2286f4c9bd39
+47482a70772e02e6d43726d6c346a9cb3cf5f8b1badce4a4e80f3868a093d866

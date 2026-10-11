@@ -1,0 +1,6 @@
+# rust-video golden v1
+# vector: corpus/vp9/invalid-vp90-2-10-show-existing-frame.webm.ivf.s180315_r01-05_b6-.ivf
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p12le 703x576
+# frames: 1
+2760234d4d921097cec54d27c4244cb4efc88a05453d606c52e2010ff13d6ab2

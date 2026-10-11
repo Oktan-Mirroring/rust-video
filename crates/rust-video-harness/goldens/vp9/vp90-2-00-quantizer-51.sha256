@@ -1,0 +1,7 @@
+# rust-video golden v1
+# vector: corpus/vp9/vp90-2-00-quantizer-51.webm
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 352x288
+# frames: 2
+e06f17ec5d547b7efffecc48dbd8b51704b9a8cb0c581c0d1fe1c712e3fd5bfb
+4e58f715254dabeca4a38704aca810f783e38b0cbe13ec189a1d12ad72ab3cae

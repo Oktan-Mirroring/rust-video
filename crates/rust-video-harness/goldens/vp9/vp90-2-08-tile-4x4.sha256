@@ -1,0 +1,10 @@
+# rust-video golden v1
+# vector: corpus/vp9/vp90-2-08-tile-4x4.webm
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 1920x1080
+# frames: 5
+d90e7b24f55803d9da1523c771fc4e008a8102b1afb1f32e734672f6e13558af
+f9205cf5b00ce3a3be8a42d1e7ad00bb32ddedbe37c084b2aa0767efdadd4e68
+f0bcc29d34a3fc0dfa1fa2047dd0ca14ae219f4aa198fca28226aa760b032cad
+16f7081411c78388bddf229a294f39210814b41532f4fb8d10575018ed2d29a4
+268f370aca2afc4b202afd6bc2d9d5fe4160d2c6d73b4db8930db21eb86a80c2

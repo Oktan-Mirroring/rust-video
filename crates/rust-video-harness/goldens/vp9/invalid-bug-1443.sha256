@@ -1,0 +1,6 @@
+# rust-video golden v1
+# vector: corpus/vp9/invalid-bug-1443.ivf
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: 0 yuv420p 8x2
+# frames: 1
+bd3d3c7831549d624af26ef79ea60c501a5fb8dce085e6ad4f0b7ef25e3cbeff
