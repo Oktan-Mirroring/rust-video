@@ -1,0 +1,4 @@
+target/
+.preview/
+.tmp/
+*.log
