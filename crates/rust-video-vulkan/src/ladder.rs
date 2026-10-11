@@ -1,0 +1,537 @@
+//! Vulkan negotiation ladder over an injected backend.
+//!
+//! Rung order follows `docs/compat.md`: loader, instance version,
+//! device properties, extension strings, video capabilities per codec
+//! op, then logical device with only used queues.
+
+use std::ffi::{CStr, CString};
+
+use crate::error::{SkipReason, VulkanError};
+
+/// Video operation the ladder negotiates for.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CodecOp {
+    /// H.264 decode.
+    H264Decode,
+}
+
+impl CodecOp {
+    /// Device extensions the op needs, in enable order.
+    ///
+    /// Names are ash 0.38 constants, headers 1.3.281.
+    /// <https://docs.rs/ash/0.38.0/ash/vk/index.html>
+    #[must_use]
+    pub fn extensions(self) -> [&'static CStr; 3] {
+        match self {
+            Self::H264Decode => [
+                ash::vk::KHR_VIDEO_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_H264_NAME,
+            ],
+        }
+    }
+}
+
+/// Ladder failure: graceful skip or hard error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LadderError {
+    /// Tier declines the machine.
+    #[error("{0}")]
+    Skip(#[from] SkipReason),
+    /// Unexpected Vulkan failure.
+    #[error("{0}")]
+    Hard(#[from] VulkanError),
+}
+
+impl From<ash::vk::Result> for LadderError {
+    fn from(result: ash::vk::Result) -> Self {
+        Self::Hard(VulkanError::Vulkan(result))
+    }
+}
+
+impl From<std::ffi::FromBytesUntilNulError> for LadderError {
+    fn from(error: std::ffi::FromBytesUntilNulError) -> Self {
+        Self::Hard(VulkanError::StringConversion(error))
+    }
+}
+
+/// H.264 decode capabilities of one adapter.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct H264Facts {
+    /// Largest coded picture in luma samples.
+    pub coded_extent: (u32, u32),
+    /// Decoded-picture-buffer slot count.
+    pub dpb_slots: u32,
+    /// Active reference picture count.
+    pub active_refs: u32,
+}
+
+/// One adapter as the ladder sees it.
+#[derive(Clone, Debug)]
+pub(crate) struct AdapterFacts<A> {
+    /// Backend handle for device creation.
+    pub handle: A,
+    /// Packed device API version.
+    pub api_version: u32,
+    /// Device extension strings.
+    pub extensions: Vec<CString>,
+    /// Queue families with video-decode capability.
+    pub decode_queue_families: Vec<u32>,
+    /// H.264 caps, when a profile reports them.
+    pub h264: Option<H264Facts>,
+}
+
+impl<A> AdapterFacts<A> {
+    /// Device API against the 1.3 video floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when the adapter reports below 1.3.
+    pub fn check_floor(&self) -> Result<(), LadderError> {
+        let major = ash::vk::api_version_major(self.api_version);
+        let minor = ash::vk::api_version_minor(self.api_version);
+        if (major, minor) >= (1, 3) {
+            Ok(())
+        } else {
+            Err(SkipReason::BelowApiFloor {
+                found: self.api_version,
+            }
+            .into())
+        }
+    }
+
+    /// Required extension strings of `op` against the adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when one string is missing.
+    pub fn check_extensions(&self, op: CodecOp) -> Result<(), LadderError> {
+        for need in op.extensions() {
+            let present = self.extensions.iter().any(|have| have.as_c_str() == need);
+            if !present {
+                let name = need.to_string_lossy().into_owned();
+                return Err(SkipReason::MissingExtension { name }.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode queue family pick from the adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when no family decodes video.
+    pub fn check_queues(&self) -> Result<u32, LadderError> {
+        self.decode_queue_families
+            .first()
+            .copied()
+            .ok_or(LadderError::Skip(SkipReason::NoDecodeQueue))
+    }
+
+    /// Video capabilities of the adapter for `op`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when no profile reports caps.
+    pub fn check_video_caps(&self, op: CodecOp) -> Result<&H264Facts, LadderError> {
+        match op {
+            CodecOp::H264Decode => self
+                .h264
+                .as_ref()
+                .ok_or(LadderError::Skip(SkipReason::NoH264Caps)),
+        }
+    }
+}
+
+/// Vulkan queries behind the ladder.
+pub(crate) trait Backend {
+    /// Adapter handle the backend opens devices from.
+    type Adapter: Clone;
+    /// Opened logical device.
+    type Device;
+
+    /// Loader instance version, or `None` on a 1.0 loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the loader is absent or the query fails.
+    fn instance_version(&self) -> Result<Option<u32>, LadderError>;
+
+    /// Every adapter with its ladder facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when enumeration fails.
+    fn adapters(&self) -> Result<Vec<AdapterFacts<Self::Adapter>>, LadderError>;
+
+    /// Logical device over `queues` families and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when device creation fails.
+    fn open_device(
+        &self,
+        adapter: &Self::Adapter,
+        queues: &[u32],
+    ) -> Result<Self::Device, LadderError>;
+}
+
+/// Negotiated adapter with its opened device.
+pub(crate) struct Negotiated<B: Backend> {
+    /// Facts of the picked adapter.
+    pub facts: AdapterFacts<B::Adapter>,
+    /// Opened logical device.
+    pub device: B::Device,
+}
+
+/// Negotiation ladder over one backend.
+pub(crate) struct Ladder<B> {
+    /// Query backend.
+    backend: B,
+}
+
+impl<B: Backend> Ladder<B> {
+    /// Ladder over `backend`.
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    /// Loader instance version, `None` on a 1.0 loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the loader is absent.
+    pub fn instance_version(&self) -> Result<Option<u32>, LadderError> {
+        self.backend.instance_version()
+    }
+
+    /// Every adapter the loader enumerates.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when no adapter exists, or on query failure.
+    pub fn enumerate(&self) -> Result<Vec<AdapterFacts<B::Adapter>>, LadderError> {
+        let adapters = self.backend.adapters()?;
+        if adapters.is_empty() {
+            return Err(SkipReason::NoPhysicalDevice.into());
+        }
+        Ok(adapters)
+    }
+
+    /// First adapter passing every rung, with its device opened.
+    ///
+    /// Runs the loader rung first: an absent loader skips before any
+    /// adapter query. Reports the first adapter's failing rung when
+    /// none passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when the tier declines, or on query failure.
+    pub fn negotiate(&self, op: CodecOp) -> Result<Negotiated<B>, LadderError> {
+        let _loader = self.instance_version()?;
+        let adapters = self.enumerate()?;
+        let mut failure: Option<LadderError> = None;
+        for facts in &adapters {
+            match self.pick(facts, op) {
+                Ok(device) => {
+                    return Ok(Negotiated {
+                        facts: facts.clone(),
+                        device,
+                    });
+                }
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        Err(failure.unwrap_or(LadderError::Skip(SkipReason::NoPhysicalDevice)))
+    }
+
+    /// All rungs for one adapter plus device open.
+    fn pick(
+        &self,
+        facts: &AdapterFacts<B::Adapter>,
+        op: CodecOp,
+    ) -> Result<B::Device, LadderError> {
+        facts.check_floor()?;
+        facts.check_extensions(op)?;
+        facts.check_video_caps(op)?;
+        let queue = facts.check_queues()?;
+        self.backend.open_device(&facts.handle, &[queue])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::ffi::CString;
+
+    use super::{AdapterFacts, Backend, CodecOp, H264Facts, Ladder, LadderError};
+    use crate::error::{SkipReason, VulkanError};
+
+    /// Opened fake device: the queue families it was given.
+    #[derive(Debug, PartialEq)]
+    struct FakeDevice {
+        /// Queue families passed to open.
+        queues: Vec<u32>,
+    }
+
+    /// Scripted loader state.
+    #[derive(Clone, Copy)]
+    enum Loader {
+        /// No loader library.
+        Absent,
+        /// Loader reporting `Option<u32>`, `None` on 1.0 loaders.
+        Present(Option<u32>),
+    }
+
+    /// Scripted backend driving each rung red or green.
+    struct FakeBackend {
+        /// Loader state.
+        loader: Loader,
+        /// Scripted adapters.
+        adapters: Vec<AdapterFacts<usize>>,
+        /// Hard failure from `adapters`, when set.
+        adapters_error: Option<ash::vk::Result>,
+        /// Queues each `open_device` call received.
+        opened: RefCell<Vec<Vec<u32>>>,
+    }
+
+    impl FakeBackend {
+        /// Backend with `adapters` behind a 1.3 loader.
+        fn with(adapters: Vec<AdapterFacts<usize>>) -> Self {
+            Self::scripted(
+                Loader::Present(Some(ash::vk::make_api_version(0, 1, 3, 0))),
+                adapters,
+                None,
+            )
+        }
+
+        /// Backend with explicit loader, adapters, and failure.
+        fn scripted(
+            loader: Loader,
+            adapters: Vec<AdapterFacts<usize>>,
+            adapters_error: Option<ash::vk::Result>,
+        ) -> Self {
+            Self {
+                loader,
+                adapters,
+                adapters_error,
+                opened: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for FakeBackend {
+        type Adapter = usize;
+        type Device = FakeDevice;
+
+        fn instance_version(&self) -> Result<Option<u32>, LadderError> {
+            match self.loader {
+                Loader::Absent => Err(LadderError::Skip(SkipReason::LoaderAbsent)),
+                Loader::Present(version) => Ok(version),
+            }
+        }
+
+        fn adapters(&self) -> Result<Vec<AdapterFacts<usize>>, LadderError> {
+            if let Some(result) = self.adapters_error {
+                return Err(LadderError::Hard(VulkanError::Vulkan(result)));
+            }
+            Ok(self.adapters.clone())
+        }
+
+        fn open_device(&self, _adapter: &usize, queues: &[u32]) -> Result<FakeDevice, LadderError> {
+            self.opened.borrow_mut().push(queues.to_vec());
+            Ok(FakeDevice {
+                queues: queues.to_vec(),
+            })
+        }
+    }
+
+    /// H.264 caps the fake reports.
+    fn caps() -> H264Facts {
+        H264Facts {
+            coded_extent: (1920, 1080),
+            dpb_slots: 16,
+            active_refs: 8,
+        }
+    }
+
+    /// Extension strings the H.264 op needs.
+    fn extensions() -> Vec<CString> {
+        CodecOp::H264Decode
+            .extensions()
+            .iter()
+            .map(|name| CString::from(*name))
+            .collect()
+    }
+
+    /// Adapter passing every rung.
+    fn green() -> AdapterFacts<usize> {
+        AdapterFacts {
+            handle: 0,
+            api_version: ash::vk::make_api_version(0, 1, 3, 0),
+            extensions: extensions(),
+            decode_queue_families: vec![2],
+            h264: Some(caps()),
+        }
+    }
+
+    /// Skip reason of a failed ladder step.
+    fn skip<T>(result: Result<T, LadderError>) -> SkipReason {
+        match result {
+            Ok(_) => panic!("ok, want skip"),
+            Err(LadderError::Skip(reason)) => reason,
+            Err(LadderError::Hard(error)) => panic!("hard error, want skip: {error}"),
+        }
+    }
+
+    #[test]
+    fn loader_version_reports_fake() {
+        let ladder = Ladder::new(FakeBackend::with(vec![green()]));
+        let version = ladder.instance_version().expect("loader present");
+        assert_eq!(version.map(ash::vk::api_version_major), Some(1));
+    }
+
+    #[test]
+    fn loader_absent_skips() {
+        let backend = FakeBackend::scripted(Loader::Absent, vec![green()], None);
+        let ladder = Ladder::new(backend);
+        assert_eq!(skip(ladder.instance_version()), SkipReason::LoaderAbsent);
+    }
+
+    #[test]
+    fn empty_enumeration_skips() {
+        let ladder = Ladder::new(FakeBackend::with(Vec::new()));
+        assert_eq!(skip(ladder.enumerate()), SkipReason::NoPhysicalDevice);
+    }
+
+    #[test]
+    fn enumeration_failure_is_hard() {
+        let backend = FakeBackend::scripted(
+            Loader::Present(Some(ash::vk::make_api_version(0, 1, 3, 0))),
+            Vec::new(),
+            Some(ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+        );
+        let ladder = Ladder::new(backend);
+        assert!(matches!(
+            ladder.enumerate().unwrap_err(),
+            LadderError::Hard(_)
+        ));
+    }
+
+    #[test]
+    fn floor_passes_above_1_3() {
+        let mut facts = green();
+        facts.api_version = ash::vk::make_api_version(0, 1, 4, 0);
+        assert!(facts.check_floor().is_ok());
+        assert!(green().check_floor().is_ok());
+    }
+
+    #[test]
+    fn floor_skips_below_1_3() {
+        let mut facts = green();
+        facts.api_version = ash::vk::make_api_version(0, 1, 2, 0);
+        assert_eq!(
+            skip(facts.check_floor()),
+            SkipReason::BelowApiFloor {
+                found: facts.api_version,
+            }
+        );
+    }
+
+    #[test]
+    fn extensions_pass_when_all_present() {
+        assert!(green().check_extensions(CodecOp::H264Decode).is_ok());
+    }
+
+    #[test]
+    fn extensions_skip_on_first_missing() {
+        let mut facts = green();
+        facts.extensions.pop();
+        assert_eq!(
+            skip(facts.check_extensions(CodecOp::H264Decode)),
+            SkipReason::MissingExtension {
+                name: "VK_KHR_video_decode_h264".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn queues_pick_first_decode_family() {
+        let mut facts = green();
+        facts.decode_queue_families = vec![3, 5];
+        assert_eq!(facts.check_queues().expect("decode family"), 3);
+    }
+
+    #[test]
+    fn queues_skip_without_decode_family() {
+        let mut facts = green();
+        facts.decode_queue_families.clear();
+        assert_eq!(skip(facts.check_queues()), SkipReason::NoDecodeQueue);
+    }
+
+    #[test]
+    fn video_caps_pass_with_profile() {
+        assert_eq!(
+            green().check_video_caps(CodecOp::H264Decode).expect("caps"),
+            &caps()
+        );
+    }
+
+    #[test]
+    fn video_caps_skip_without_profile() {
+        let mut facts = green();
+        facts.h264 = None;
+        assert_eq!(
+            skip(facts.check_video_caps(CodecOp::H264Decode)),
+            SkipReason::NoH264Caps
+        );
+    }
+
+    #[test]
+    fn negotiate_opens_first_green_adapter() {
+        let mut red = green();
+        red.h264 = None;
+        let mut second = green();
+        second.handle = 1;
+        let backend = FakeBackend::with(vec![red, second]);
+        let ladder = Ladder::new(backend);
+        let won = ladder.negotiate(CodecOp::H264Decode).expect("green wins");
+        assert_eq!(won.facts.handle, 1);
+        assert_eq!(won.device.queues, vec![2]);
+    }
+
+    #[test]
+    fn negotiate_skips_before_adapters_without_loader() {
+        let backend = FakeBackend::scripted(Loader::Absent, vec![green()], None);
+        let ladder = Ladder::new(backend);
+        assert_eq!(
+            skip(ladder.negotiate(CodecOp::H264Decode)),
+            SkipReason::LoaderAbsent
+        );
+        assert!(ladder.backend.opened.borrow().is_empty());
+    }
+
+    #[test]
+    fn negotiate_reports_first_failure() {
+        let mut red = green();
+        red.h264 = None;
+        let backend = FakeBackend::with(vec![red]);
+        let ladder = Ladder::new(backend);
+        assert_eq!(
+            skip(ladder.negotiate(CodecOp::H264Decode)),
+            SkipReason::NoH264Caps
+        );
+    }
+
+    #[test]
+    fn negotiate_opens_only_the_decode_queue() {
+        let backend = FakeBackend::with(vec![green()]);
+        let ladder = Ladder::new(backend);
+        ladder.negotiate(CodecOp::H264Decode).expect("green");
+        assert_eq!(ladder.backend.opened.borrow().as_slice(), &[vec![2]]);
+    }
+}

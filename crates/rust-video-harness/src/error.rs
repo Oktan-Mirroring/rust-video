@@ -9,6 +9,8 @@ pub enum Error {
     MissingCorpus(PathBuf),
     /// Golden file malformed.
     Golden(String),
+    /// Decoder under test failed.
+    Decode(String),
 }
 
 impl fmt::Display for Error {
@@ -17,6 +19,7 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(f, "io: {error}"),
             Self::MissingCorpus(path) => write!(f, "corpus missing: {}", path.display()),
             Self::Golden(why) => write!(f, "golden: {why}"),
+            Self::Decode(why) => write!(f, "decode: {why}"),
         }
     }
 }
@@ -25,7 +28,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::MissingCorpus(_) | Self::Golden(_) => None,
+            Self::MissingCorpus(_) | Self::Golden(_) | Self::Decode(_) => None,
         }
     }
 }
