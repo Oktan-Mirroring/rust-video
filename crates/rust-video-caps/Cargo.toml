@@ -1,0 +1,10 @@
+[package]
+name = "rust-video-caps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Codec profiles, levels, and caps enforced in the type system"
+
+[lints]
+workspace = true

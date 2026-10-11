@@ -14,3 +14,5 @@ that proves it.
 | add an e2e or golden test | `docs/testing/README.md`, `docs/testing/vectors.md` | `just e2e` |
 | fetch the vector corpus | `docs/testing/vectors.md` | `just vectors` |
 | register a capability | `docs/testing/manifest.toml` | `just ci` |
+| touch a codec cap or level | `docs/specs/<codec>.md`, `docs/sourcing.md` | `just spec-check` |
+| add a sourced value | `docs/sourcing.md` tier table | `just ci` |

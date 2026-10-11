@@ -59,6 +59,7 @@ Non-negotiable. A change that violates one is a regression.
 | any task's route | [`docs/AGENT-ROUTING.md`](docs/AGENT-ROUTING.md) |
 | the scope rule | [`.claude/skills/realtime-scope/SKILL.md`](.claude/skills/realtime-scope/SKILL.md) |
 | how to test | [`docs/testing/README.md`](docs/testing/README.md) |
+| codec specs and sourcing | [`docs/specs/`](docs/specs/h264.md), [`docs/sourcing.md`](docs/sourcing.md) |
 | every command | `just --list` |
 
 - Match surrounding code's idiom, naming, and comment density. The codebase

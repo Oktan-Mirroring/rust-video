@@ -78,6 +78,10 @@ name = "rust-video-av2"
 version = "0.1.0"
 
 [[package]]
+name = "rust-video-caps"
+version = "0.1.0"
+
+[[package]]
 name = "rust-video-d3d11"
 version = "0.1.0"
 

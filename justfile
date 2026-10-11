@@ -22,8 +22,12 @@ doc:
 fmt-check:
     cargo fmt --all --check
 
-# Full gate: format, lints, tests, docs.
-ci: fmt-check check test doc
+# Full gate: format, lints, tests, docs, spec tables.
+ci: fmt-check check test doc spec-check
+
+# Diff spec doc tables against caps const tables.
+spec-check:
+    python3 scripts/spec-check.py
 
 # Fetch the vector corpus into ./corpus (network).
 vectors:
