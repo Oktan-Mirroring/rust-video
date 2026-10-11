@@ -4,14 +4,14 @@
 [[oracle]]
 id = "RV1"
 behaviour = "Auto tier order resolves Vulkan, platform hardware, then software"
-test = "planned"
-status = "unmeasured"
+test = "crates/rust-video/src/tier.rs auto_order and resolve auto-selection tests"
+status = "proven"
 
 [[oracle]]
 id = "RV2"
 behaviour = "H.265 decodes only behind available hardware or a realtime software backend"
-test = "planned"
-status = "unmeasured"
+test = "crates/rust-video/src/tier.rs h265 software-gate tests, auto and forced"
+status = "proven"
 
 [[oracle]]
 id = "RV3"

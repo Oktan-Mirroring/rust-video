@@ -1,49 +1,18 @@
-//! Realtime video encode/decode toolkit.
+//! Safe Rust interface over realtime video encode and decode.
 //!
-//! Safe Rust interface over realtime video handling: codec backends and
-//! platform tiers behind one facade.
+//! Codec backends and platform tiers behind one facade.
 
-/// Decode tier.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum DecodeTier {
-    /// Vulkan video decode.
-    Vulkan,
-    /// VA-API decode.
-    VaApi,
-    /// Direct3D 11 decode.
-    D3d11,
-    /// Android `MediaCodec` decode.
-    MediaCodec,
-    /// Software decode.
-    Software,
-}
+pub mod error;
+pub mod frame;
+pub mod packet;
+pub mod tier;
+pub mod traits;
 
-/// Encode tier.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EncodeTier {
-    /// Vulkan video encode.
-    Vulkan,
-    /// VA-API encode.
-    VaApi,
-    /// Direct3D 11 encode.
-    D3d11,
-    /// Android `MediaCodec` encode.
-    MediaCodec,
-    /// Software encode.
-    Software,
-}
-
-/// Video codec.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum VideoCodec {
-    /// H.264 codec.
-    H264,
-    /// H.265 codec.
-    H265,
-    /// AV1 codec.
-    Av1,
-    /// VP9 codec.
-    Vp9,
-    /// AV2 codec.
-    Av2,
-}
+pub use error::Error;
+pub use frame::{CpuFrame, PixelFormat, Plane};
+pub use packet::Packet;
+pub use tier::{
+    auto_order, host_platform, resolve, Capabilities, Platform, SoftwareH265, Tier, TierError,
+    TierPreference, VideoCodec,
+};
+pub use traits::{Decoder, Encoder};
