@@ -15,6 +15,7 @@ pedantic = "warn"
 
 [features]
 default = []
+h264-ffmpeg = []
 h264-openh264 = ["dep:openh264"]
 av1-dav1d = ["dep:dav1d-sys"]
 vpx = ["dep:env-libvpx-sys"]

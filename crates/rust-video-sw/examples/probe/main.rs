@@ -1,10 +1,18 @@
 //! Candidate benchmark probe: decode against goldens, encode for throughput.
 
-#[cfg(any(feature = "h264-openh264", feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(any(
+    feature = "h264-openh264",
+    feature = "h264-ffmpeg",
+    feature = "av1-dav1d",
+    feature = "vpx"
+))]
 mod common;
 
 #[cfg(feature = "h264-openh264")]
 mod h264;
+
+#[cfg(feature = "h264-ffmpeg")]
+mod ffmpeg;
 
 #[cfg(feature = "av1-dav1d")]
 mod av1;
@@ -12,7 +20,12 @@ mod av1;
 #[cfg(feature = "vpx")]
 mod vpx;
 
-#[cfg(any(feature = "h264-openh264", feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(any(
+    feature = "h264-openh264",
+    feature = "h264-ffmpeg",
+    feature = "av1-dav1d",
+    feature = "vpx"
+))]
 use std::path::Path;
 
 /// Probe entry point.
@@ -29,6 +42,13 @@ fn main() {
             let max = args.get(3).map_or(usize::MAX, |s| s.parse().expect("max"));
             let dump = args.get(4).map(Path::new);
             h264::run_decode(Path::new(&args[2]), max, dump);
+        }
+        #[cfg(feature = "h264-ffmpeg")]
+        "h264ff" => {
+            let max = args.get(3).map_or(usize::MAX, |s| s.parse().expect("max"));
+            let threads = args.get(4).map_or(4, |s| s.parse().expect("threads"));
+            let dump = args.get(5).map(Path::new);
+            ffmpeg::run_decode(Path::new(&args[2]), max, threads, dump);
         }
         #[cfg(feature = "h264-openh264")]
         "h264enc" => {
@@ -63,6 +83,6 @@ fn main() {
             let frames = args[5].parse().expect("frames");
             vpx::run_encode(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }
-        _ => panic!("usage: probe h264dec|h264enc|av1dec|vpxdec|vpxenc ..."),
+        _ => panic!("usage: probe h264dec|h264enc|h264ff|av1dec|vpxdec|vpxenc ..."),
     }
 }
