@@ -1,6 +1,6 @@
 //! Software CPU codec backends behind the facade.
 //!
-//! Decode rides one ffmpeg sys layer; each encoder wraps its own library.
+//! Decode rides one ffmpeg sys layer; VP9 encode rides its libvpx wrapper.
 
 pub mod error;
 
@@ -10,7 +10,7 @@ pub mod ffmpeg;
 mod ffmpeg_sys;
 #[cfg(feature = "h264-openh264")]
 pub mod h264;
-#[cfg(feature = "vpx")]
+#[cfg(feature = "ffmpeg")]
 pub mod vpx;
 
 pub use error::SwError;
@@ -20,5 +20,5 @@ pub use ffmpeg::{
 };
 #[cfg(feature = "h264-openh264")]
 pub use h264::H264Encoder;
-#[cfg(feature = "vpx")]
+#[cfg(feature = "ffmpeg")]
 pub use vpx::Vp9Encoder;

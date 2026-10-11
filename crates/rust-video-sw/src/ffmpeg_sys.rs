@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-//! Minimal libavcodec/libavutil bindings for software decode.
+//! Minimal libavcodec/libavutil bindings for software codecs.
 //!
 //! Hand-written surface over the system libraries; no bindgen.
 
@@ -27,6 +27,8 @@ pub const AGAIN: c_int = -11;
 pub const EOF: c_int = -541_478_725;
 /// Missing timestamp for parser input.
 pub const NOPTS: i64 = i64::MIN;
+/// Search flag reaching the encoder wrapper's private options.
+pub const OPT_SEARCH_CHILDREN: c_int = 1;
 
 /// Opaque codec descriptor.
 #[repr(C)]
@@ -46,7 +48,7 @@ pub struct AVCodecParserContext {
     _opaque: [u8; 0],
 }
 
-/// Coded packet; only the payload span is exposed.
+/// Coded packet; payload span, stream index, and flags are exposed.
 #[repr(C)]
 pub struct AVPacket {
     _head: [u8; 24],
@@ -54,10 +56,17 @@ pub struct AVPacket {
     pub data: *mut u8,
     /// Payload length.
     pub size: c_int,
-    _tail: [u8; 68],
+    /// Stream index.
+    pub stream_index: c_int,
+    /// Flag bits (`FLAG_KEY` marks a keyframe).
+    pub flags: c_int,
+    _tail: [u8; 60],
 }
 
-/// Decoded frame; only geometry, format, and planes are exposed.
+/// Keyframe bit in `AVPacket::flags`.
+pub const FLAG_KEY: c_int = 1;
+
+/// Decoded frame; only geometry, format, planes, and pts are exposed.
 #[repr(C)]
 pub struct AVFrame {
     /// Plane base pointers.
@@ -74,18 +83,24 @@ pub struct AVFrame {
     pub nb_samples: c_int,
     /// Pixel format id.
     pub format: c_int,
-    _tail: [u8; 320],
+    _mid: [u8; 16],
+    /// Presentation timestamp in time-base units.
+    pub pts: i64,
+    _tail: [u8; 296],
 }
 
 const _: () = assert!(size_of::<AVPacket>() == 104);
 const _: () = assert!(size_of::<AVFrame>() == 440);
 const _: () = assert!(std::mem::offset_of!(AVPacket, data) == 24);
 const _: () = assert!(std::mem::offset_of!(AVPacket, size) == 32);
+const _: () = assert!(std::mem::offset_of!(AVPacket, stream_index) == 36);
+const _: () = assert!(std::mem::offset_of!(AVPacket, flags) == 40);
 const _: () = assert!(std::mem::offset_of!(AVFrame, data) == 0);
 const _: () = assert!(std::mem::offset_of!(AVFrame, linesize) == 64);
 const _: () = assert!(std::mem::offset_of!(AVFrame, width) == 104);
 const _: () = assert!(std::mem::offset_of!(AVFrame, height) == 108);
 const _: () = assert!(std::mem::offset_of!(AVFrame, format) == 116);
+const _: () = assert!(std::mem::offset_of!(AVFrame, pts) == 136);
 
 #[link(name = "avcodec")]
 unsafe extern "C" {
@@ -93,6 +108,8 @@ unsafe extern "C" {
     pub fn avcodec_version() -> u32;
     /// Decoder descriptor for `id`, or null.
     pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
+    /// Encoder descriptor named `name`, or null.
+    pub fn avcodec_find_encoder_by_name(name: *const c_char) -> *const AVCodec;
     /// Decoder descriptor named `name`, or null.
     pub fn avcodec_find_decoder_by_name(name: *const c_char) -> *const AVCodec;
     /// Context for `codec`, or null.
@@ -139,6 +156,10 @@ unsafe extern "C" {
     pub fn av_new_packet(packet: *mut AVPacket, size: c_int) -> c_int;
     /// Packet queued; zero on success.
     pub fn avcodec_send_packet(ctx: *mut AVCodecContext, packet: *const AVPacket) -> c_int;
+    /// Frame queued for encode; zero on success.
+    pub fn avcodec_send_frame(ctx: *mut AVCodecContext, frame: *const AVFrame) -> c_int;
+    /// Next packet into `packet`; zero on success.
+    pub fn avcodec_receive_packet(ctx: *mut AVCodecContext, packet: *mut AVPacket) -> c_int;
     /// Next frame into `frame`; zero on success.
     pub fn avcodec_receive_frame(ctx: *mut AVCodecContext, frame: *mut AVFrame) -> c_int;
     /// Context reset for a new stream.
@@ -157,6 +178,8 @@ unsafe extern "C" {
     pub fn avutil_version() -> u32;
     /// Blank frame, or null.
     pub fn av_frame_alloc() -> *mut AVFrame;
+    /// Buffer for `frame` with `align`; zero on success.
+    pub fn av_frame_get_buffer(frame: *mut AVFrame, align: c_int) -> c_int;
     /// Frame contents released.
     pub fn av_frame_unref(frame: *mut AVFrame);
     /// Frame released.

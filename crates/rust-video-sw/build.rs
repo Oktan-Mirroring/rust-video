@@ -2,8 +2,7 @@
 //!
 //! Unix links the system libavcodec/libavutil straight from the `#[link]`
 //! attrs. Windows has no system copy, so `FFMPEG_LIB_DIR` points at the
-//! directory holding `avcodec.lib` and `avutil.lib`, mirroring how
-//! `env-libvpx-sys` takes `VPX_LIB_DIR`.
+//! directory holding `avcodec.lib` and `avutil.lib`.
 
 /// Build script entry point.
 ///

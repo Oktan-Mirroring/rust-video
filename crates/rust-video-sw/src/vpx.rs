@@ -1,14 +1,12 @@
 #![allow(unsafe_code)]
-//! VP9 encode over libvpx.
+//! VP9 encode over ffmpeg's libvpx-vp9 wrapper.
 //!
-//! Encode only: decode rides the ffmpeg sys layer, which beat the direct
-//! bind on every codec (see `docs/sw-codecs.md`), and ffmpeg ships no
-//! native LGPL VP9 encoder, so libvpx stays for the encode direction.
+//! Encode only: decode rides the same sys layer, and the wrapper drives the
+//! same libvpx underneath, so the coded output keeps its performance.
 
-use std::mem::MaybeUninit;
+use std::ptr;
 
 use bytes::Bytes;
-use vpx_sys as vpx;
 
 use rust_video::frame::{CpuFrame, PixelFormat};
 use rust_video::packet::Packet;
@@ -17,114 +15,269 @@ use rust_video::traits::Encoder;
 use rust_video_caps::common::PictureSize;
 
 use crate::error::SwError;
+use crate::ffmpeg_sys as sys;
 
 /// Realtime VP9 encoder.
 pub struct Vp9Encoder {
-    ctx: vpx::vpx_codec_ctx_t,
+    ctx: *mut sys::AVCodecContext,
+    frame: *mut sys::AVFrame,
+    packet: *mut sys::AVPacket,
     width: u32,
     height: u32,
     next_pts: i64,
 }
 
 impl Vp9Encoder {
+    /// Speed preset matching the fastest libvpx realtime tune.
+    const CPU_USED: i64 = 8;
     /// Realtime deadline, `VPX_DL_REALTIME`.
-    const DEADLINE: std::os::raw::c_ulong = 1;
-    /// Linked libvpx major the bindings were generated against.
-    const ABI_MAJOR: u32 = 1;
+    const DEADLINE: i64 = 1;
+    /// Keyframe interval in frames.
+    const GOP: i64 = 60;
 
     /// CBR encoder for `width`x`height` at `bitrate_kbps` on `threads`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when libvpx drifts from the bound ABI or rejects
-    /// the configuration.
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
     pub fn open(width: u32, height: u32, bitrate_kbps: u32, threads: u32) -> Result<Self, SwError> {
-        // SAFETY: version query takes no arguments and touches no state.
-        let version = unsafe { vpx::vpx_codec_version() };
-        let Ok(version) = u32::try_from(version) else {
-            return Err(SwError::Init);
-        };
-        if (version >> 16) & 0xff != Self::ABI_MAJOR {
+        // SAFETY: version queries take no arguments and touch no state.
+        if unsafe { sys::avcodec_version() } >> 16 != sys::ABI_MAJOR
+            || unsafe { sys::avutil_version() } >> 16 != sys::UTIL_MAJOR
+        {
             return Err(SwError::Init);
         }
         if PictureSize::new(width, height).is_none() {
             return Err(SwError::Init);
         }
-        // SAFETY: the VP9 encoder table is a static libvpx interface.
-        let iface = unsafe { vpx::vpx_codec_vp9_cx() };
-        let mut cfg = MaybeUninit::<vpx::vpx_codec_enc_cfg_t>::zeroed();
-        // SAFETY: defaults fill the whole struct.
-        let err = unsafe { vpx::vpx_codec_enc_config_default(iface, cfg.as_mut_ptr(), 0) };
-        if err != vpx::VPX_CODEC_OK {
+        let bitrate = i64::from(bitrate_kbps) * 1000;
+        if bitrate <= 0 {
             return Err(SwError::Init);
         }
-        // SAFETY: config holds defaults from the call above.
-        let mut cfg = unsafe { cfg.assume_init() };
-        cfg.g_w = width;
-        cfg.g_h = height;
-        cfg.g_threads = threads;
-        cfg.g_timebase.num = 1;
-        cfg.g_timebase.den = 60;
-        cfg.rc_target_bitrate = bitrate_kbps;
-        cfg.rc_end_usage = vpx::vpx_rc_mode::VPX_CBR;
-        cfg.g_pass = vpx::vpx_enc_pass::VPX_RC_ONE_PASS;
-        cfg.kf_max_dist = 60;
-        let mut ctx = MaybeUninit::<vpx::vpx_codec_ctx_t>::zeroed();
-        // SAFETY: iface and cfg are valid; init fills the context.
-        let err = unsafe {
-            vpx::vpx_codec_enc_init_ver(
-                ctx.as_mut_ptr(),
-                iface,
-                &raw const cfg,
-                0,
-                vpx::VPX_ENCODER_ABI_VERSION.cast_signed(),
-            )
+        // SAFETY: name is a valid C string; null is checked.
+        let codec = unsafe { sys::avcodec_find_encoder_by_name(c"libvpx-vp9".as_ptr()) };
+        if codec.is_null() {
+            return Err(SwError::Init);
+        }
+        // SAFETY: codec is live; null is checked.
+        let ctx = unsafe { sys::avcodec_alloc_context3(codec) };
+        if ctx.is_null() {
+            return Err(SwError::Init);
+        }
+        let configured = Self::configure(ctx, width, height, bitrate, threads);
+        // SAFETY: context and codec are live; null options select defaults.
+        let opened = configured && unsafe { sys::avcodec_open2(ctx, codec, ptr::null_mut()) } == 0;
+        // SAFETY: blank frame or null; null is checked.
+        let frame = if opened {
+            unsafe { sys::av_frame_alloc() }
+        } else {
+            ptr::null_mut()
         };
-        if err != vpx::VPX_CODEC_OK {
+        // SAFETY: blank packet or null; null is checked.
+        let packet = if frame.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { sys::av_packet_alloc() }
+        };
+        if !opened || frame.is_null() || packet.is_null() {
+            // SAFETY: non-null slots are live; null slots are skipped.
+            unsafe { Self::release(ctx, frame, packet) };
             return Err(SwError::Init);
-        }
-        // SAFETY: init succeeded; destroy in Drop balances it.
-        let mut ctx = unsafe { ctx.assume_init() };
-        // SAFETY: control id and value match the realtime preset contract.
-        unsafe {
-            vpx::vpx_codec_control_(
-                &raw mut ctx,
-                vpx::vp8e_enc_control_id::VP8E_SET_CPUUSED as _,
-                8,
-            );
         }
         Ok(Self {
             ctx,
+            frame,
+            packet,
             width,
             height,
             next_pts: 0,
         })
     }
 
-    /// Coded packets ready now.
-    fn drain(&mut self) -> Vec<Packet> {
-        let mut out = Vec::new();
-        let mut iter: vpx::vpx_codec_iter_t = std::ptr::null();
+    /// Context options matching the realtime preset; false on first refusal.
+    fn configure(
+        ctx: *mut sys::AVCodecContext,
+        width: u32,
+        height: u32,
+        bitrate: i64,
+        threads: u32,
+    ) -> bool {
+        let Ok(size) = std::ffi::CString::new(format!("{width}x{height}")) else {
+            return false;
+        };
+        // SAFETY: context is live; option names are valid C strings.
+        unsafe {
+            sys::av_opt_set(
+                ctx.cast::<std::ffi::c_void>(),
+                c"video_size".as_ptr(),
+                size.as_ptr(),
+                0,
+            ) == 0
+                && sys::av_opt_set(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"pixel_format".as_ptr(),
+                    c"yuv420p".as_ptr(),
+                    0,
+                ) == 0
+                && sys::av_opt_set(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"time_base".as_ptr(),
+                    c"1/60".as_ptr(),
+                    0,
+                ) == 0
+                && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"b".as_ptr(), bitrate, 0)
+                    == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"maxrate".as_ptr(),
+                    bitrate,
+                    0,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"minrate".as_ptr(),
+                    bitrate,
+                    0,
+                ) == 0
+                && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"g".as_ptr(), Self::GOP, 0)
+                    == 0
+                && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"bf".as_ptr(), 0, 0) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"threads".as_ptr(),
+                    i64::from(threads),
+                    0,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"cpu-used".as_ptr(),
+                    Self::CPU_USED,
+                    sys::OPT_SEARCH_CHILDREN,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"deadline".as_ptr(),
+                    Self::DEADLINE,
+                    sys::OPT_SEARCH_CHILDREN,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"lag-in-frames".as_ptr(),
+                    0,
+                    sys::OPT_SEARCH_CHILDREN,
+                ) == 0
+        }
+    }
+
+    /// Partially built state released; null slots are skipped.
+    ///
+    /// # Safety
+    ///
+    /// Each non-null pointer must come from its allocator and be freed once.
+    unsafe fn release(
+        ctx: *mut sys::AVCodecContext,
+        frame: *mut sys::AVFrame,
+        packet: *mut sys::AVPacket,
+    ) {
+        if !packet.is_null() {
+            let mut packet = packet;
+            // SAFETY: packet is live by the contract above.
+            unsafe { sys::av_packet_free(&raw mut packet) };
+        }
+        if !frame.is_null() {
+            let mut frame = frame;
+            // SAFETY: frame is live by the contract above.
+            unsafe { sys::av_frame_free(&raw mut frame) };
+        }
+        if !ctx.is_null() {
+            let mut ctx = ctx;
+            // SAFETY: context is live by the contract above.
+            unsafe { sys::avcodec_free_context(&raw mut ctx) };
+        }
+    }
+
+    /// Input frame queued from `frame`, packets drained into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the frame is rejected or a ready packet is unusable.
+    fn send(&mut self, frame: &CpuFrame, out: &mut Vec<Packet>) -> Result<(), SwError> {
+        // SAFETY: frame is live; unref resets it for reuse.
+        unsafe { sys::av_frame_unref(self.frame) };
+        // SAFETY: geometry matches the open call; get_buffer fills the planes.
+        unsafe {
+            (*self.frame).width = self.width.cast_signed();
+            (*self.frame).height = self.height.cast_signed();
+            (*self.frame).format = sys::PIX_FMT_YUV420P;
+        }
+        // SAFETY: dimensions and format are set; zero aligns by CPU.
+        if unsafe { sys::av_frame_get_buffer(self.frame, 0) } != 0 {
+            return Err(SwError::Rejected);
+        }
+        // SAFETY: buffer is live and writable; rows are copied within strides.
+        unsafe {
+            for (slot, plane) in frame.planes().iter().enumerate() {
+                let stride =
+                    usize::try_from((*self.frame).linesize[slot]).map_err(|_| SwError::Rejected)?;
+                let cols = plane.stride() as usize;
+                let rows = plane.data().len() / cols;
+                if stride < cols {
+                    return Err(SwError::Rejected);
+                }
+                for row in 0..rows {
+                    let dst = (*self.frame).data[slot].add(row * stride);
+                    let src = &plane.data()[row * cols..row * cols + cols];
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, cols);
+                }
+            }
+            (*self.frame).pts = self.next_pts;
+        }
+        self.next_pts += 1;
         loop {
-            // SAFETY: iterator protocol per `vpx_codec_get_cx_data` docs.
-            let pkt = unsafe { vpx::vpx_codec_get_cx_data(&raw mut self.ctx, &raw mut iter) };
-            if pkt.is_null() {
-                return out;
+            // SAFETY: frame holds one complete picture; EAGAIN keeps it queued.
+            let err = unsafe { sys::avcodec_send_frame(self.ctx, self.frame) };
+            if err == 0 {
+                return Ok(());
             }
-            // SAFETY: packet is valid until the next encoder call.
-            let pkt = unsafe { &*pkt };
-            if pkt.kind != vpx::vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT {
-                continue;
+            if err != sys::AGAIN {
+                return Err(SwError::Rejected);
             }
-            // SAFETY: kind tag selects the frame union arm.
-            let frame = unsafe { pkt.data.frame };
-            // SAFETY: coded bytes span live encoder memory, copied now.
-            let bytes = unsafe { std::slice::from_raw_parts(frame.buf as *const u8, frame.sz) };
+            let drained = out.len();
+            self.receive(out)?;
+            if out.len() == drained {
+                return Err(SwError::Rejected);
+            }
+        }
+    }
+
+    /// Packets ready now, copied out of the reusable slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a ready packet breaks mid-encode.
+    fn receive(&mut self, out: &mut Vec<Packet>) -> Result<(), SwError> {
+        loop {
+            // SAFETY: packet is a valid output slot; success lends its bytes.
+            let err = unsafe { sys::avcodec_receive_packet(self.ctx, self.packet) };
+            if err == sys::AGAIN || err == sys::EOF {
+                return Ok(());
+            }
+            if err != 0 {
+                return Err(SwError::Rejected);
+            }
+            // SAFETY: success initialized the packet; unref below balances it.
+            let len =
+                usize::try_from(unsafe { (*self.packet).size }).map_err(|_| SwError::Rejected)?;
+            // SAFETY: payload spans live packet memory, copied now.
+            let bytes = unsafe { std::slice::from_raw_parts((*self.packet).data, len) };
             let mut packet = Packet::new(Bytes::copy_from_slice(bytes));
-            if frame.flags & vpx::VPX_FRAME_IS_KEY != 0 {
+            if unsafe { (*self.packet).flags } & sys::FLAG_KEY != 0 {
                 packet = packet.mark_keyframe();
             }
             out.push(packet);
+            // SAFETY: packet is live and uniquely borrowed here.
+            unsafe { sys::av_packet_unref(self.packet) };
         }
     }
 }
@@ -139,62 +292,35 @@ impl Encoder for Vp9Encoder {
         {
             return Err(SwError::Rejected);
         }
-        let image = MaybeUninit::<vpx::vpx_image_t>::zeroed();
-        // SAFETY: only the planes, strides, and geometry below are read.
-        let mut image = unsafe { image.assume_init() };
-        image.fmt = vpx::vpx_img_fmt::VPX_IMG_FMT_I420;
-        image.w = self.width;
-        image.h = self.height;
-        image.d_w = self.width;
-        image.d_h = self.height;
-        image.x_chroma_shift = 1;
-        image.y_chroma_shift = 1;
-        for (slot, plane) in frame.planes().iter().enumerate() {
-            image.planes[slot] = plane.data().as_ptr().cast_mut();
-            image.stride[slot] = plane.stride().cast_signed();
-        }
-        let pts = self.next_pts;
-        self.next_pts += 1;
-        // SAFETY: image points at the live frame; flags and deadline are valid.
-        let err = unsafe {
-            vpx::vpx_codec_encode(
-                &raw mut self.ctx,
-                &raw const image,
-                pts,
-                1,
-                0,
-                Self::DEADLINE,
-            )
-        };
-        if err != vpx::VPX_CODEC_OK {
-            return Err(SwError::Rejected);
-        }
-        Ok(self.drain())
+        let mut out = Vec::new();
+        self.send(frame, &mut out)?;
+        self.receive(&mut out)?;
+        Ok(out)
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
-        // SAFETY: null frame flushes delayed packets.
-        let err = unsafe {
-            vpx::vpx_codec_encode(
-                &raw mut self.ctx,
-                std::ptr::null(),
-                self.next_pts,
-                1,
-                0,
-                Self::DEADLINE,
-            )
-        };
-        if err != vpx::VPX_CODEC_OK {
+        let mut out = Vec::new();
+        // SAFETY: null frame signals end of stream.
+        let err = unsafe { sys::avcodec_send_frame(self.ctx, ptr::null()) };
+        if err == sys::AGAIN {
+            self.receive(&mut out)?;
+            // SAFETY: queue drained above, so the signal fits now.
+            let err = unsafe { sys::avcodec_send_frame(self.ctx, ptr::null()) };
+            if err != 0 {
+                return Err(SwError::Rejected);
+            }
+        } else if err != 0 {
             return Err(SwError::Rejected);
         }
-        Ok(self.drain())
+        self.receive(&mut out)?;
+        Ok(out)
     }
 }
 
 impl Drop for Vp9Encoder {
     fn drop(&mut self) {
-        // SAFETY: context initialized at open and destroyed once.
-        unsafe { vpx::vpx_codec_destroy(&raw mut self.ctx) };
+        // SAFETY: every slot came from its allocator and is dropped once.
+        unsafe { Self::release(self.ctx, self.frame, self.packet) };
     }
 }
 
@@ -231,7 +357,6 @@ mod tests {
         assert!(packets[0].is_keyframe());
     }
 
-    #[cfg(feature = "ffmpeg")]
     #[test]
     fn roundtrip_through_ffmpeg_decoder() {
         use rust_video::traits::Decoder as _;
@@ -277,5 +402,10 @@ mod tests {
     fn encode_rejects_zero_geometry() {
         assert!(Vp9Encoder::open(0, 64, 500, 1).is_err());
         assert!(Vp9Encoder::open(64, 0, 500, 1).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_zero_bitrate() {
+        assert!(Vp9Encoder::open(64, 64, 0, 1).is_err());
     }
 }

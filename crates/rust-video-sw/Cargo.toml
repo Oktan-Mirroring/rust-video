@@ -17,14 +17,9 @@ pedantic = "warn"
 default = []
 ffmpeg = []
 h264-openh264 = ["dep:openh264"]
-vpx = ["dep:env-libvpx-sys"]
 
 [dependencies]
 bytes = "1"
 rust-video = { path = "../rust-video" }
 rust-video-caps = { path = "../rust-video-caps" }
 openh264 = { version = "0.9", optional = true }
-# Unwired since the ffmpeg convergence (AV1 rides the libdav1d wrapper);
-# the entry stays so Cargo.lock is untouched, prune with the coordinator.
-dav1d-sys = { version = "0.8", optional = true }
-env-libvpx-sys = { version = "5.1", optional = true, features = ["generate"] }

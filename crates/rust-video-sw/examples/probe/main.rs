@@ -1,6 +1,6 @@
 //! Candidate benchmark probe: decode against goldens, encode for throughput.
 
-#[cfg(any(feature = "h264-openh264", feature = "ffmpeg", feature = "vpx"))]
+#[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]
 mod common;
 
 #[cfg(feature = "h264-openh264")]
@@ -9,10 +9,10 @@ mod h264;
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
-#[cfg(feature = "vpx")]
+#[cfg(feature = "ffmpeg")]
 mod vpx;
 
-#[cfg(any(feature = "h264-openh264", feature = "ffmpeg", feature = "vpx"))]
+#[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]
 use std::path::Path;
 
 /// Probe entry point.
@@ -53,7 +53,7 @@ fn main() {
             let dump = args.get(6).map(Path::new);
             ffmpeg::run_codec(codec, Path::new(&args[3]), max, threads, dump, "ffdec");
         }
-        #[cfg(feature = "vpx")]
+        #[cfg(feature = "ffmpeg")]
         "vpxenc" => {
             let w = args[3].parse().expect("width");
             let h = args[4].parse().expect("height");
