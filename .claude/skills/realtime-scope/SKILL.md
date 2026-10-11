@@ -18,6 +18,10 @@ rust-video covers live frames and nothing else: codec encode/decode, platform ti
 - Archival demuxing, subtitles, filters, audio.
 - General media framework surface.
 
+## Maturity
+
+Backend lands only when it holds realtime throughput on its tier, measured on the clock. Pure-Rust loses to tuned C until it wins there. No toy backend behind this facade.
+
 ## Rule
 
 New behaviour names its codec or tier crate in the change. No owner crate fits, behaviour stays out. Scope question unanswered in this file, ask owner before writing code.

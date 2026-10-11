@@ -1,9 +1,9 @@
 # rust-video
 
-Realtime video encode and decode in Rust. The codecs ship as pure-Rust-first
-implementations; platform hardware (Vulkan, VA-API, D3D11, MediaCodec) arrives as
-optional tiers behind the same facade. One dependency for live frames, no ffmpeg
-build in the loop.
+Safe Rust interface over realtime video encode and decode. Each codec and
+tier carries the fastest implementation that holds the frame budget: platform
+hardware, tuned C behind an isolated sys crate, or pure Rust once it wins on
+the clock. One dependency for live frames.
 
 Status: scaffold. The workspace compiles and the gates run, but no backend
 encodes or decodes anything yet.

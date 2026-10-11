@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Safe Rust interface over realtime video encode and decode"
+repository = "https://github.com/Oktan-Mirroring/rust-video"
+documentation = "https://docs.rs/rust-video"
+keywords = ["video", "codec", "h264", "h265", "av1"]
+categories = ["multimedia"]
 
 [lints]
 workspace = true

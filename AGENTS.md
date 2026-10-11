@@ -1,7 +1,8 @@
 # rust-video: agent doctrine
 
-> rust-video is a pure-Rust-first realtime video encode/decode toolkit: codec
-> backends plus platform tiers behind one facade. This file is the quality bar.
+> rust-video is a production-grade safe Rust interface over realtime video
+> handling: codec backends plus platform tiers behind one facade. This file is
+> the quality bar.
 > Detail lives in the README and in `.claude/skills/`. When something here grows
 > into a how-to, move it there and link it below.
 
@@ -41,6 +42,13 @@ Non-negotiable. A change that violates one is a regression.
    ratio does. Reason to the answer with the assumptions written down, then
    spend one cheap measurement confirming it. A number without its stated
    assumptions is unverified.
+8. **Realtime or rejected.** The product is a safe interface over realtime
+   video, not a pure-Rust showcase. A backend lands only when it sustains
+   realtime throughput (1080p60 class) on its tier: threaded and SIMD where
+   the format allows, measured, never claimed. A pure-Rust codec that cannot
+   hold the frame budget stays out until it can; the facade carries the fast
+   implementation (platform hardware, tuned C behind an isolated sys crate)
+   instead. No toy backends behind a production API.
 
 ## Orientation
 

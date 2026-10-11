@@ -1,6 +1,7 @@
 //! Realtime video encode/decode toolkit.
 //!
-//! Pure-Rust-first codecs and platform tiers behind one facade.
+//! Safe Rust interface over realtime video handling: codec backends and
+//! platform tiers behind one facade.
 
 /// Decode tier.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -13,7 +14,7 @@ pub enum DecodeTier {
     D3d11,
     /// Android `MediaCodec` decode.
     MediaCodec,
-    /// Pure-Rust software decode.
+    /// Software decode.
     Software,
 }
 
@@ -28,7 +29,7 @@ pub enum EncodeTier {
     D3d11,
     /// Android `MediaCodec` encode.
     MediaCodec,
-    /// Pure-Rust software encode.
+    /// Software encode.
     Software,
 }
 
