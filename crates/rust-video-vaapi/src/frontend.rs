@@ -8,11 +8,9 @@ use std::io::Cursor;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
-use crate::vendor::h264::dpb::{Dpb, ReferencePicLists};
-use crate::vendor::h264::parser::{
-    MaxLongTermFrameIdx, Nalu, NaluType, Parser, Pps, SliceHeader, Sps,
-};
-use crate::vendor::h264::picture::{Field, IsIdr, PictureData, Reference};
+use crate::h264::dpb::{Dpb, ReferencePicLists};
+use crate::h264::parser::{MaxLongTermFrameIdx, Nalu, NaluType, Parser, Pps, SliceHeader, Sps};
+use crate::h264::picture::{Field, IsIdr, PictureData, Reference};
 
 /// DPB surface slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -329,7 +327,7 @@ impl Frontend {
 
     /// Slots still held by the DPB, in output order.
     pub fn drain(&mut self) -> Vec<SurfaceSlot> {
-        self.dpb.drain().into_iter().flatten().collect()
+        self.dpb.drain()
     }
 
     /// Adopt `nalu` as the active sequence set.
@@ -439,14 +437,11 @@ impl Frontend {
         };
         pic.ref_pic_marking = first.header.dec_ref_pic_marking.clone();
         pic.timestamp = self.stamp();
-        pic.set_reference(
-            if pending.nal_ref_idc == 0 {
-                Reference::None
-            } else {
-                Reference::ShortTerm
-            },
-            true,
-        );
+        pic.set_reference(if pending.nal_ref_idc == 0 {
+            Reference::None
+        } else {
+            Reference::ShortTerm
+        });
         match pending.sps.pic_order_cnt_type {
             0 => {
                 pic.pic_order_cnt_lsb = i32::from(first.header.pic_order_cnt_lsb);
@@ -495,13 +490,13 @@ impl Frontend {
     ) -> Result<Vec<usize>, VaApiError> {
         let (flag, active, mods) = if second {
             (
-                header.ref_pic_list_modification_flag_l1,
+                header.list_modification.l1,
                 header.num_ref_idx_l1_active_minus1,
                 &header.ref_pic_list_modification_l1,
             )
         } else {
             (
-                header.ref_pic_list_modification_flag_l0,
+                header.list_modification.l0,
                 header.num_ref_idx_l0_active_minus1,
                 &header.ref_pic_list_modification_l0,
             )
@@ -616,11 +611,11 @@ impl Frontend {
             }
             self.dpb.mark_all_as_unused_for_ref();
             if pic.ref_pic_marking.long_term_reference_flag {
-                pic.set_reference(Reference::LongTerm, true);
+                pic.set_reference(Reference::LongTerm);
                 pic.long_term_frame_idx = 0;
                 self.max_long_term_frame_idx = MaxLongTermFrameIdx::Idx(0);
             } else {
-                pic.set_reference(Reference::ShortTerm, true);
+                pic.set_reference(Reference::ShortTerm);
                 self.max_long_term_frame_idx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
             }
         } else if pic.nal_ref_idc != 0 {
@@ -635,7 +630,7 @@ impl Frontend {
                             .map_err(|error| Self::broken(&error))?,
                         2 => self
                             .dpb
-                            .mmco_op_2(&pic, marking)
+                            .mmco_op_2(marking)
                             .map_err(|error| Self::broken(&error))?,
                         3 => self
                             .dpb
@@ -656,10 +651,10 @@ impl Frontend {
                     }
                 }
             } else {
-                self.dpb.sliding_window_marking(&mut pic, &picture.sps);
+                self.dpb.sliding_window_marking(&picture.sps);
             }
             if !matches!(pic.reference(), Reference::LongTerm) {
-                pic.set_reference(Reference::ShortTerm, true);
+                pic.set_reference(Reference::ShortTerm);
             }
         }
         if pic.is_ref() {
@@ -669,7 +664,7 @@ impl Frontend {
         if pic.has_mmco_5 {
             outputs.extend(self.drain());
         }
-        outputs.extend(self.dpb.bump_as_needed(&pic).into_iter().flatten());
+        outputs.extend(self.dpb.bump_as_needed(&pic));
         let is_ref = pic.is_ref();
         let frame_num = pic.frame_num;
         if is_ref || self.dpb.has_empty_frame_buffer() {
@@ -712,8 +707,8 @@ impl Frontend {
                 self.poc.derive(&mut gap, sps)?;
             }
             self.dpb.update_pic_nums(unused, max_frame_num, &gap);
-            self.dpb.sliding_window_marking(&mut gap, sps);
-            bumped.extend(self.dpb.bump_as_needed(&gap).into_iter().flatten());
+            self.dpb.sliding_window_marking(sps);
+            bumped.extend(self.dpb.bump_as_needed(&gap));
             self.dpb
                 .store_picture(gap.into_rc(), None)
                 .map_err(|_| VaApiError::DpbFull)?;
@@ -746,22 +741,22 @@ impl Frontend {
 
     /// Reject streams outside progressive 8-bit 4:2:0 without FMO.
     fn check_progressive(sps: &Sps, pps: &Pps, header: &SliceHeader) -> Result<(), VaApiError> {
-        if header.field_pic_flag {
+        if header.field != Field::Frame {
             return Err(VaApiError::Unsupported("interlaced".to_owned()));
         }
         if pps.num_slice_groups_minus1 > 0 {
             return Err(VaApiError::Unsupported("fmo".to_owned()));
         }
-        if sps.separate_colour_plane_flag {
+        if sps.chroma.separate_plane {
             return Err(VaApiError::Unsupported("separate colour planes".to_owned()));
         }
-        if sps.chroma_format_idc != 1 {
+        if sps.chroma.idc != 1 {
             return Err(VaApiError::Unsupported(format!(
                 "chroma {}",
-                sps.chroma_format_idc
+                sps.chroma.idc
             )));
         }
-        if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+        if sps.bit_depth.luma_minus8 != 0 || sps.bit_depth.chroma_minus8 != 0 {
             return Err(VaApiError::Unsupported("high bit depth".to_owned()));
         }
         Ok(())
@@ -797,7 +792,7 @@ impl Frontend {
     }
 
     /// Marking failure as a broken reference list.
-    fn broken(error: &crate::vendor::h264::dpb::MmcoError) -> VaApiError {
+    fn broken(error: &crate::h264::dpb::MmcoError) -> VaApiError {
         VaApiError::BrokenReference(error.to_string())
     }
 
@@ -848,7 +843,7 @@ impl SliceKey {
         Self {
             frame_num: header.frame_num,
             pps_id: header.pic_parameter_set_id,
-            field: header.field(),
+            field: header.field,
             nal_ref_zero: nal_ref_idc == 0,
             pic_order_cnt_lsb: header.pic_order_cnt_lsb,
             delta_pic_order_cnt_bottom: header.delta_pic_order_cnt_bottom,
@@ -1098,21 +1093,28 @@ mod tests {
 
     use super::{Frontend, Picture, PocTracker, SliceKey, SurfaceSlot};
     use crate::error::VaApiError;
-    use crate::vendor::h264::dpb::ReferencePicLists;
-    use crate::vendor::h264::parser::{
-        Level, PpsBuilder, RefPicListModification, RefPicMarking, SliceHeader, Sps,
+    use crate::h264::dpb::ReferencePicLists;
+    use crate::h264::parser::{
+        ChromaFormat, FrameFieldCoding, Level, ListModificationFlags, PpsBuilder,
+        RefPicListModification, RefPicMarking, SliceHeader, Sps,
     };
-    use crate::vendor::h264::picture::{IsIdr, PictureData, Reference};
+    use crate::h264::picture::{IsIdr, PictureData, Reference};
 
     /// Sequence set for 1080p, order-count type `poc_type`.
     fn sps(poc_type: u8) -> Sps {
         Sps {
             profile_idc: 100,
             level_idc: Level::L4,
-            chroma_format_idc: 1,
+            chroma: ChromaFormat {
+                idc: 1,
+                ..Default::default()
+            },
             pic_width_in_mbs_minus1: 119,
             pic_height_in_map_units_minus1: 67,
-            frame_mbs_only_flag: true,
+            frame_field: FrameFieldCoding {
+                frame_mbs_only: true,
+                ..Default::default()
+            },
             log2_max_frame_num_minus4: 0,
             pic_order_cnt_type: poc_type,
             log2_max_pic_order_cnt_lsb_minus4: 0,
@@ -1129,14 +1131,11 @@ mod tests {
         pic.pic_num = i32::try_from(frame_num).expect("small frame number");
         pic.frame_num_wrap = i32::try_from(frame_num).expect("small frame number");
         pic.nal_ref_idc = nal_ref_idc;
-        pic.set_reference(
-            if nal_ref_idc == 0 {
-                Reference::None
-            } else {
-                Reference::ShortTerm
-            },
-            true,
-        );
+        pic.set_reference(if nal_ref_idc == 0 {
+            Reference::None
+        } else {
+            Reference::ShortTerm
+        });
         pic
     }
 
@@ -1333,7 +1332,10 @@ mod tests {
         let (frontend, _) = frontend_with_refs();
         let initial = vec![0usize, 1];
         let header = SliceHeader {
-            ref_pic_list_modification_flag_l0: true,
+            list_modification: ListModificationFlags {
+                l0: true,
+                ..Default::default()
+            },
             num_ref_idx_l0_active_minus1: 1,
             ref_pic_list_modification_l0: vec![
                 RefPicListModification {
@@ -1358,7 +1360,10 @@ mod tests {
     fn modify_reports_absent_reference() {
         let (frontend, _) = frontend_with_refs();
         let header = SliceHeader {
-            ref_pic_list_modification_flag_l0: true,
+            list_modification: ListModificationFlags {
+                l0: true,
+                ..Default::default()
+            },
             ref_pic_list_modification_l0: vec![RefPicListModification {
                 modification_of_pic_nums_idc: 0,
                 abs_diff_pic_num_minus1: 0,

@@ -39,9 +39,8 @@ where
         let pos = usize::try_from(cursor.position()).map_err(|err| err.to_string())?;
 
         // Find the start code for this NALU
-        let current_nalu_offset = match Nalu::<'a, U>::find_start_code(cursor, pos) {
-            Some(offset) => offset,
-            None => return Err("No NAL found".into()),
+        let Some(current_nalu_offset) = Nalu::<'a, U>::find_start_code(cursor, pos) else {
+            return Err("No NAL found".into());
         };
 
         let mut start_code_offset = pos + current_nalu_offset;
@@ -61,9 +60,10 @@ where
         let hdr = U::parse(cursor)?;
 
         // Find the start of the subsequent NALU.
-        let mut next_nalu_offset = match Nalu::<'a, U>::find_start_code(cursor, nalu_offset) {
-            Some(offset) => offset,
-            None => {
+        let mut next_nalu_offset =
+            if let Some(offset) = Nalu::<'a, U>::find_start_code(cursor, nalu_offset) {
+                offset
+            } else {
                 let cur_pos = cursor.position();
                 let end_pos = cursor
                     .seek(SeekFrom::End(0))
@@ -71,9 +71,8 @@ where
                 let _ = cursor
                     .seek(SeekFrom::Start(cur_pos))
                     .map_err(|err| err.to_string())?;
-                (end_pos - cur_pos) as usize
-            } // Whatever data is left must be part of the current NALU
-        };
+                usize::try_from(end_pos - cur_pos).map_err(|_| "nal size range")?
+            };
 
         while next_nalu_offset > 0 && cursor.get_ref()[nalu_offset + next_nalu_offset - 1] == 00 {
             // Discard trailing_zero_8bits
@@ -106,18 +105,9 @@ where
             .windows(3)
             .position(|window| window == [0x00, 0x00, 0x01])
     }
-
-    pub fn into_owned(self) -> Nalu<'static, U> {
-        Nalu {
-            header: self.header,
-            size: self.size,
-            offset: self.offset,
-            data: Cow::Owned(self.data.into_owned()),
-        }
-    }
 }
 
-impl<'a, U> AsRef<[u8]> for Nalu<'a, U> {
+impl<U> AsRef<[u8]> for Nalu<'_, U> {
     fn as_ref(&self) -> &[u8] {
         &self.data[self.offset..self.offset + self.size]
     }

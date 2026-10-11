@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-//! Vendored H.264 parser and DPB; see `super` for provenance.
+//! H.264 syntax: NAL units, parameter sets, slices, and the DPB.
+//!
+//! Assimilated from `cros-codecs` 0.0.6; see `docs/vaapi.md` and
+//! `LICENSE.cros-codecs` for provenance.
 
 pub(crate) mod dpb;
 pub(crate) mod nalu;

@@ -12,10 +12,10 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::rc::Rc;
 
-use crate::vendor::bitstream_utils::BitReader;
-use crate::vendor::h264::nalu;
-use crate::vendor::h264::nalu::Header;
-use crate::vendor::h264::picture::Field;
+use crate::bitstream::BitReader;
+use crate::h264::nalu;
+use crate::h264::nalu::Header;
+use crate::h264::picture::Field;
 
 pub type Nalu<'a> = nalu::Nalu<'a, NaluHeader>;
 
@@ -43,7 +43,7 @@ const MAX_PPS_COUNT: u16 = 256;
 const MAX_SPS_COUNT: u8 = 32;
 
 /// The maximum number of pictures in the DPB, as per A.3.1, clause h)
-const DPB_MAX_SIZE: usize = 16;
+const DPB_MAX_SIZE: u32 = 16;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Point<T> {
@@ -106,7 +106,7 @@ impl TryFrom<u8> for NaluType {
             19 => Ok(NaluType::SliceAux),
             20 => Ok(NaluType::SliceExt),
             21 => Ok(NaluType::SliceDepth),
-            _ => Err(format!("Invalid NaluType {}", value)),
+            _ => Err(format!("Invalid NaluType {value}")),
         }
     }
 }
@@ -202,16 +202,16 @@ pub struct RefPicMarkingInner {
     /// specified in Table 7-9
     pub memory_management_control_operation: u8,
 
-    /// Used (with memory_management_control_operation equal to 3 or 1) to
+    /// Used (with `memory_management_control_operation` equal to 3 or 1) to
     /// assign a long-term frame index to a short-term reference picture or to
     /// mark a short-term reference picture as "unused for reference".
     pub difference_of_pic_nums_minus1: u32,
 
-    /// Used (with memory_management_control_operation equal to 2) to mark a
+    /// Used (with `memory_management_control_operation` equal to 2) to mark a
     /// long-term reference picture as "unused for reference".
     pub long_term_pic_num: u32,
 
-    /// Used (with memory_management_control_operation equal to 3 or 6) to
+    /// Used (with `memory_management_control_operation` equal to 3 or 6) to
     /// assign a long-term frame index to a picture.
     pub long_term_frame_idx: u32,
 
@@ -227,12 +227,12 @@ pub struct RefPicMarking {
     /// buffer are treated after decoding of an IDR picture. See Annex C.
     pub no_output_of_prior_pics_flag: bool,
 
-    /// If unset, specifies that the MaxLongTermFrameIdx variable is set equal
+    /// If unset, specifies that the `MaxLongTermFrameIdx` variable is set equal
     /// to "no long-term frame indices" and that the IDR picture is marked as
     /// "used for short-term reference". If set, specifies that the
-    /// MaxLongTermFrameIdx variable is set equal to 0 and that the current IDR
+    /// `MaxLongTermFrameIdx` variable is set equal to 0 and that the current IDR
     /// picture is marked "used for long-term reference" and is assigned
-    /// LongTermFrameIdx equal to 0.
+    /// `LongTermFrameIdx` equal to 0.
     pub long_term_reference_flag: bool,
 
     /// Selects the reference picture marking mode of the currently decoded
@@ -241,6 +241,15 @@ pub struct RefPicMarking {
 
     /// An Vec with additional data used in the marking process.
     pub inner: Vec<RefPicMarkingInner>,
+}
+
+/// Presence of reference-list modification data for each list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListModificationFlags {
+    /// Modification data present for list 0.
+    pub l0: bool,
+    /// Modification data present for list 1.
+    pub l1: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -262,13 +271,8 @@ pub struct SliceHeader {
     /// `log2_max_frame_num_minus4 + 4` bits in the bitstream.
     pub frame_num: u16,
 
-    /// If set, specifies that the slice is a slice of a coded field. If not
-    /// set, specifies that the slice is a slice of a coded frame.
-    pub field_pic_flag: bool,
-
-    /// If set, specifies that the slice is part of a coded bottom field. If not
-    /// set, specifies that the picture is a coded top field.
-    pub bottom_field_flag: bool,
+    /// Picture structure coded by the slice.
+    pub field: Field,
 
     /// Identifies an IDR picture. The values of `idr_pic_id` in all the slices
     /// of an IDR picture shall remain unchanged. When two consecutive access
@@ -323,19 +327,12 @@ pub struct SliceHeader {
     /// shall be used to decode the slice.
     pub num_ref_idx_l1_active_minus1: u8,
 
-    /// If set, specifies that the syntax element `modification_of_pic_nums_idc`
-    /// is present for specifying reference picture list 0. If not set,
-    /// specifies that this syntax element is not present.
-    pub ref_pic_list_modification_flag_l0: bool,
+    /// Reference picture list 0 modification presence.
+    pub list_modification: ListModificationFlags,
 
     /// Reference picture list 0 modification as parsed with the
     /// `ref_pic_list_modification()` process.
     pub ref_pic_list_modification_l0: Vec<RefPicListModification>,
-
-    /// If set, specifies that the syntax element `modification_of_pic_nums_idc`
-    /// is present for specifying reference picture list 1. If not set,
-    /// specifies that this syntax element is not present.
-    pub ref_pic_list_modification_flag_l1: bool,
 
     /// Reference picture list 1 modification as parsed with the
     /// `ref_pic_list_modification()` process.
@@ -389,26 +386,11 @@ pub struct SliceHeader {
     /// Same as `MaxPicNum` in the specification.
     pub max_pic_num: u32,
 
-    /// Size of the slice_header() in bits
+    /// Size of the `slice_header()` in bits
     pub header_bit_size: usize,
 
-    /// Number of emulation prevention bytes (EPB) in this slice_header()
+    /// Number of emulation prevention bytes (EPB) in this `slice_header()`
     pub n_emulation_prevention_bytes: usize,
-}
-
-impl SliceHeader {
-    /// Returns the field that is coded by this header.
-    pub fn field(&self) -> Field {
-        if self.field_pic_flag {
-            if self.bottom_field_flag {
-                Field::Bottom
-            } else {
-                Field::Top
-            }
-        } else {
-            Field::Frame
-        }
-    }
 }
 
 pub struct SliceHeaderBuilder(SliceHeader);
@@ -482,7 +464,9 @@ pub struct Slice<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// See table 7-6 in the specification.
+#[derive(Default)]
 pub enum SliceType {
+    #[default]
     P = 0,
     B = 1,
     I = 2,
@@ -500,41 +484,35 @@ impl TryFrom<u8> for SliceType {
             2 => Ok(SliceType::I),
             3 => Ok(SliceType::Sp),
             4 => Ok(SliceType::Si),
-            _ => Err(format!("Invalid SliceType {}", value)),
+            _ => Err(format!("Invalid SliceType {value}")),
         }
     }
 }
 
 impl SliceType {
     /// Whether this is a P slice. See table 7-6 in the specification.
-    pub fn is_p(&self) -> bool {
+    pub fn is_p(self) -> bool {
         matches!(self, SliceType::P)
     }
 
     /// Whether this is a B slice. See table 7-6 in the specification.
-    pub fn is_b(&self) -> bool {
+    pub fn is_b(self) -> bool {
         matches!(self, SliceType::B)
     }
 
     /// Whether this is an I slice. See table 7-6 in the specification.
-    pub fn is_i(&self) -> bool {
+    pub fn is_i(self) -> bool {
         matches!(self, SliceType::I)
     }
 
     /// Whether this is a SP slice. See table 7-6 in the specification.
-    pub fn is_sp(&self) -> bool {
+    pub fn is_sp(self) -> bool {
         matches!(self, SliceType::Sp)
     }
 
     /// Whether this is a SI slice. See table 7-6 in the specification.
-    pub fn is_si(&self) -> bool {
+    pub fn is_si(self) -> bool {
         matches!(self, SliceType::Si)
-    }
-}
-
-impl Default for SliceType {
-    fn default() -> Self {
-        Self::P
     }
 }
 
@@ -560,7 +538,7 @@ impl TryFrom<u8> for Profile {
             100 => Ok(Profile::High),
             110 => Ok(Profile::High10),
             122 => Ok(Profile::High422P),
-            _ => Err(format!("Invalid Profile {}", value)),
+            _ => Err(format!("Invalid Profile {value}")),
         }
     }
 }
@@ -615,15 +593,98 @@ impl TryFrom<u8> for Level {
             60 => Ok(Level::L6),
             61 => Ok(Level::L6_1),
             62 => Ok(Level::L6_2),
-            _ => Err(format!("Invalid Level {}", value)),
+            _ => Err(format!("Invalid Level {value}")),
         }
     }
 }
 
+/// Chroma sampling of the sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChromaFormat {
+    /// `chroma_format_idc` value.
+    pub idc: u8,
+    /// Colour planes coded separately.
+    pub separate_plane: bool,
+}
+
+impl ChromaFormat {
+    /// `ChromaArrayType`: 0 for separate planes, else the format value.
+    pub const fn array_type(self) -> u8 {
+        if self.separate_plane {
+            0
+        } else {
+            self.idc
+        }
+    }
+
+    /// `(SubWidthC, SubHeightC)` per Table 6-1.
+    const fn sub_width_height_c(self) -> (u32, u32) {
+        match (self.idc, self.separate_plane) {
+            (1, false) => (2, 2),
+            (2, false) => (2, 1),
+            _ => (1, 1),
+        }
+    }
+}
+
+/// Luma/chroma bit depth of the sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitDepth {
+    /// `bit_depth_luma_minus8` value.
+    pub luma_minus8: u8,
+    /// `bit_depth_chroma_minus8` value.
+    pub chroma_minus8: u8,
+    /// Transform bypass for zero luma QP.
+    pub transform_bypass: bool,
+}
+
+/// Sequence scaling lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceScaling {
+    /// Scaling-matrix syntax present.
+    pub present: bool,
+    /// 4x4 lists.
+    pub lists_4x4: [[u8; 16]; 6],
+    /// 8x8 lists.
+    pub lists_8x8: [[u8; 64]; 6],
+}
+
+impl Default for SequenceScaling {
+    fn default() -> Self {
+        Self {
+            present: false,
+            lists_4x4: [[0; 16]; 6],
+            lists_8x8: [[0; 64]; 6],
+        }
+    }
+}
+
+/// Frame/field macroblock coding of the sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameFieldCoding {
+    /// Every picture is a frame of frame macroblocks.
+    pub frame_mbs_only: bool,
+    /// Frame/field macroblock switching within frames.
+    pub mb_adaptive: bool,
+}
+
+/// Frame-crop rectangle in crop units.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCrop {
+    /// Left offset.
+    pub left: u32,
+    /// Right offset.
+    pub right: u32,
+    /// Top offset.
+    pub top: u32,
+    /// Bottom offset.
+    pub bottom: u32,
+}
+
 /// A H264 Sequence Parameter Set. A syntax structure containing syntax elements
 /// that apply to zero or more entire coded video sequences as determined by the
-/// content of a seq_parameter_set_id syntax element found in the picture
-/// parameter set referred to by the pic_parameter_set_id syntax element found
+/// content of a `seq_parameter_set_id` syntax element found in the picture
+/// parameter set referred to by the `pic_parameter_set_id` syntax element found
 /// in each slice header.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sps {
@@ -634,74 +695,36 @@ pub struct Sps {
     /// Profile to which the coded video sequence conforms
     pub profile_idc: u8,
 
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set0_flag: bool,
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set1_flag: bool,
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set2_flag: bool,
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set3_flag: bool,
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set4_flag: bool,
-    /// Retains the same meaning as in the specification. See 7.4.2.1.1
-    pub constraint_set5_flag: bool,
+    /// `constraint_set0_flag` through `constraint_set5_flag`, indexed by set
+    /// number. See 7.4.2.1.1.
+    pub constraints: [bool; 6],
 
     /// Level to which the coded video sequence conforms
     pub level_idc: Level,
 
-    /// Specifies the chroma sampling relative to the luma sampling as specified
-    /// in clause 6.2.
-    pub chroma_format_idc: u8,
+    /// Chroma sampling relative to luma sampling, clause 6.2.
+    pub chroma: ChromaFormat,
 
-    /// Specifies whether the three colour components of the 4:4:4 chroma format
-    /// are coded separately.
-    pub separate_colour_plane_flag: bool,
+    /// Bit depth of luma/chroma samples and the luma QP range offset.
+    /// See 7-3 through 7-6.
+    pub bit_depth: BitDepth,
 
-    /// Specifies the bit depth of the samples of the luma array and the value
-    /// of the luma quantization parameter range offset QpBdOffsetY. See 7-3 and
-    /// 7-4.
-    pub bit_depth_luma_minus8: u8,
+    /// Sequence scaling lists, 7.3.2.1.1.1.
+    pub scaling: SequenceScaling,
 
-    /// Specifies the bit depth of the samples of the chroma arrays and the
-    /// value of the chroma quantization parameter range offset QpBdOffsetC. See
-    /// 7-5 and 7-6.
-    pub bit_depth_chroma_minus8: u8,
-
-    /// qpprime_y_zero_transform_bypass_flag equal to 1 specifies that, when
-    /// QP′Y is equal to 0, a transform bypass operation for the transform
-    /// coefficient decoding process and picture construction process prior to
-    /// deblocking filter process as specified in clause 8.5 shall be applied.
-    /// qpprime_y_zero_transform_bypass_flag equal to 0 specifies that the
-    /// transform coefficient decoding process and picture construction process
-    /// prior to deblocking filter process shall not use the transform bypass
-    /// operation
-    /// QP′Y is defined in 7-38 as QP′Y = QPY + QpBdOffsetY
-    pub qpprime_y_zero_transform_bypass_flag: bool,
-
-    /// Whether `seq_scaling_list_present_flag[i]` for i = 0..7 or i = 0..11 is
-    /// present or whether the sequence level scaling list shall be specified by
-    /// Flat_4x4_16 for i = 0..5 and flat_8x8_16 for i = 6..11
-    pub seq_scaling_matrix_present_flag: bool,
-
-    /// 4x4 Scaling list as read with 7.3.2.1.1.1
-    pub scaling_lists_4x4: [[u8; 16]; 6],
-    /// 8x8 Scaling list as read with 7.3.2.1.1.1
-    pub scaling_lists_8x8: [[u8; 64]; 6],
-
-    /// Specifies the value of the variable MaxFrameNum that is used in
-    /// frame_num related derivations as follows: MaxFrameNum = 2 ^
-    /// (log2_max_frame_num_minus4 + 4 )
+    /// Specifies the value of the variable `MaxFrameNum` that is used in
+    /// `frame_num` related derivations as follows: `MaxFrameNum` = 2 ^
+    /// (`log2_max_frame_num_minus4` + 4 )
     pub log2_max_frame_num_minus4: u8,
 
     /// Specifies the method to decode picture order count (as specified in
     /// clause 8.2.1)
     pub pic_order_cnt_type: u8,
 
-    /// Specifies the value of the variable MaxPicOrderCntLsb that is used in
+    /// Specifies the value of the variable `MaxPicOrderCntLsb` that is used in
     /// the decoding process for picture order count as specified in clause
-    /// 8.2.1 as follows: MaxPicOrderCntLsb = 2 ^ (
-    /// log2_max_pic_order_cnt_lsb_minus4 + 4 ).
+    /// 8.2.1 as follows: `MaxPicOrderCntLsb` = 2 ^ (
+    /// `log2_max_pic_order_cnt_lsb_minus4` + 4 ).
     pub log2_max_pic_order_cnt_lsb_minus4: u8,
 
     /// If true, specifies that `delta_pic_order_cnt[0]` and
@@ -724,7 +747,7 @@ pub struct Sps {
     /// clause 8.2.1
     pub num_ref_frames_in_pic_order_cnt_cycle: u8,
 
-    /// An element of a list of num_ref_frames_in_pic_order_cnt_cycle values
+    /// An element of a list of `num_ref_frames_in_pic_order_cnt_cycle` values
     /// used in the decoding process for picture order count as specified in
     /// clause 8.2.
     pub offset_for_ref_frame: [i32; 255],
@@ -737,9 +760,9 @@ pub struct Sps {
     /// clause 8.2.5.3.
     pub max_num_ref_frames: u8,
 
-    /// Specifies the allowed values of frame_num as specified in clause 7.4.3
+    /// Specifies the allowed values of `frame_num` as specified in clause 7.4.3
     /// and the decoding process in case of an inferred gap between values of
-    /// frame_num as specified in clause 8.2.5.2
+    /// `frame_num` as specified in clause 8.2.5.2
     pub gaps_in_frame_num_value_allowed_flag: bool,
 
     /// Plus 1 specifies the width of each decoded picture in units of
@@ -753,49 +776,30 @@ pub struct Sps {
     /// is a coded frame containing only frame macroblocks, else specifies that
     /// coded pictures of the coded video sequence may either be coded fields or
     /// coded frames.
-    pub frame_mbs_only_flag: bool,
-
-    /// If true, specifies the possible use of switching between frame and field
-    /// macroblocks within frames, else, specifies no switching between frame
-    /// and field macroblocks within a picture.
-    pub mb_adaptive_frame_field_flag: bool,
+    pub frame_field: FrameFieldCoding,
 
     /// Specifies the method used in the derivation process for luma motion
-    /// vectors for B_Skip, B_Direct_16x16 and B_Direct_8x8 as specified in
+    /// vectors for `B_Skip`, `B_Direct_16x16` and `B_Direct_8x8` as specified in
     /// clause 8.4.1.2.
     pub direct_8x8_inference_flag: bool,
 
-    /// If true, specifies that the frame cropping offset parameters follow next
-    /// in the sequence parameter, else specifies that the frame cropping offset
-    /// parameters are not present
-    pub frame_cropping_flag: bool,
-
-    /// Specify the samples of the pictures in the coded video sequence that are
-    /// output from the decoding process, in terms of a rectangular region
-    /// specified in frame coordinates for output.
-    pub frame_crop_left_offset: u32,
-    /// Specify the samples of the pictures in the coded video sequence that are
-    /// output from the decoding process, in terms of a rectangular region
-    /// specified in frame coordinates for output.
-    pub frame_crop_right_offset: u32,
-    /// Specify the samples of the pictures in the coded video sequence that are
-    /// output from the decoding process, in terms of a rectangular region
-    /// specified in frame coordinates for output.
-    pub frame_crop_top_offset: u32,
-    /// Specify the samples of the pictures in the coded video sequence that are
-    /// output from the decoding process, in terms of a rectangular region
-    /// specified in frame coordinates for output.
-    pub frame_crop_bottom_offset: u32,
+    /// Frame-crop rectangle in crop units, absent when the sequence is uncropped.
+    pub crop: Option<FrameCrop>,
 
     // Calculated
-    /// Same as ExpectedDeltaPerPicOrderCntCycle, see 7-12 in the specification.
+    /// Same as `ExpectedDeltaPerPicOrderCntCycle`, see 7-12 in the specification.
     pub expected_delta_per_pic_order_cnt_cycle: i32,
 
-    pub vui_parameters_present_flag: bool,
-    pub vui_parameters: VuiParams,
+    /// VUI parameters, absent when `vui_parameters_present_flag` is unset.
+    pub vui: Option<VuiParams>,
 }
 
 impl Sps {
+    /// `constraint_set3_flag`: gates level-1b inference, Table A.1.
+    fn constraint_set3(&self) -> bool {
+        self.constraints[3]
+    }
+
     /// Returns the coded width of the stream.
     ///
     /// See 7-13 through 7-17 in the specification.
@@ -809,53 +813,43 @@ impl Sps {
     pub const fn height(&self) -> u32 {
         (self.pic_height_in_map_units_minus1 as u32 + 1)
             * 16
-            * (2 - self.frame_mbs_only_flag as u32)
+            * (2 - self.frame_field.frame_mbs_only as u32)
     }
 
     /// Returns `ChromaArrayType`, as computed in the specification.
     pub const fn chroma_array_type(&self) -> u8 {
-        match self.separate_colour_plane_flag {
-            false => self.chroma_format_idc,
-            true => 0,
-        }
+        self.chroma.array_type()
     }
 
     /// Returns `SubWidthC` and `SubHeightC`.
     ///
     /// See table 6-1 in the specification.
     fn sub_width_height_c(&self) -> (u32, u32) {
-        match (self.chroma_format_idc, self.separate_colour_plane_flag) {
-            (1, false) => (2, 2),
-            (2, false) => (2, 1),
-            (3, false) => (1, 1),
-            // undefined.
-            _ => (1, 1),
-        }
+        self.chroma.sub_width_height_c()
     }
 
     /// Returns `CropUnitX` and `CropUnitY`.
     ///
     /// See 7-19 through 7-22 in the specification.
     fn crop_unit_x_y(&self) -> (u32, u32) {
-        match self.chroma_array_type() {
-            0 => (1, 2 - u32::from(self.frame_mbs_only_flag)),
-            _ => {
-                let (sub_width_c, sub_height_c) = self.sub_width_height_c();
-                (
-                    sub_width_c,
-                    sub_height_c * (2 - u32::from(self.frame_mbs_only_flag)),
-                )
-            }
+        if self.chroma_array_type() == 0 {
+            (1, 2 - u32::from(self.frame_field.frame_mbs_only))
+        } else {
+            let (sub_width_c, sub_height_c) = self.sub_width_height_c();
+            (
+                sub_width_c,
+                sub_height_c * (2 - u32::from(self.frame_field.frame_mbs_only)),
+            )
         }
     }
 
-    /// Same as MaxFrameNum. See 7-10 in the specification.
+    /// Same as `MaxFrameNum`. See 7-10 in the specification.
     pub fn max_frame_num(&self) -> u32 {
         1 << (self.log2_max_frame_num_minus4 + 4)
     }
 
     pub fn visible_rectangle(&self) -> Rect<u32> {
-        if !self.frame_cropping_flag {
+        let Some(crop) = &self.crop else {
             return Rect {
                 min: Point { x: 0, y: 0 },
                 max: Point {
@@ -863,14 +857,14 @@ impl Sps {
                     y: self.height(),
                 },
             };
-        }
+        };
 
         let (crop_unit_x, crop_unit_y) = self.crop_unit_x_y();
 
-        let crop_left = crop_unit_x * self.frame_crop_left_offset;
-        let crop_right = crop_unit_x * self.frame_crop_right_offset;
-        let crop_top = crop_unit_y * self.frame_crop_top_offset;
-        let crop_bottom = crop_unit_y * self.frame_crop_bottom_offset;
+        let crop_left = crop_unit_x * crop.left;
+        let crop_right = crop_unit_x * crop.right;
+        let crop_top = crop_unit_y * crop.top;
+        let crop_bottom = crop_unit_y * crop.bottom;
 
         Rect {
             min: Point {
@@ -892,70 +886,61 @@ impl Sps {
         // profile if level_idc == 11 and constraint_set3_flag == 1
         if matches!(level, Level::L1_1)
             && (profile == Profile::Baseline as u8 || profile == Profile::Main as u8)
-            && self.constraint_set3_flag
+            && self.constraint_set3()
         {
             level = Level::L1B;
-        };
+        }
 
         // Table A.1
         let max_dpb_mbs = match level {
-            Level::L1 => 396,
-            Level::L1B => 396,
+            Level::L1 | Level::L1B => 396,
             Level::L1_1 => 900,
-            Level::L1_2 => 2376,
-            Level::L1_3 => 2376,
-            Level::L2_0 => 2376,
+            Level::L1_2 | Level::L1_3 | Level::L2_0 => 2376,
             Level::L2_1 => 4752,
-            Level::L2_2 => 8100,
-            Level::L3 => 8100,
+            Level::L2_2 | Level::L3 => 8100,
             Level::L3_1 => 18000,
             Level::L3_2 => 20480,
-            Level::L4 => 32768,
-            Level::L4_1 => 32768,
+            Level::L4 | Level::L4_1 => 32768,
             Level::L4_2 => 34816,
-            Level::L5 => 110400,
-            Level::L5_1 => 184320,
-            Level::L5_2 => 184320,
-            Level::L6 => 696320,
-            Level::L6_1 => 696320,
-            Level::L6_2 => 696320,
+            Level::L5 => 110_400,
+            Level::L5_1 | Level::L5_2 => 184_320,
+            Level::L6 | Level::L6_1 | Level::L6_2 => 696_320,
         };
 
         let width_mb = self.width() / 16;
         let height_mb = self.height() / 16;
 
         let max_dpb_frames =
-            std::cmp::min(max_dpb_mbs / (width_mb * height_mb), DPB_MAX_SIZE as u32) as usize;
+            std::cmp::min(max_dpb_mbs / (width_mb * height_mb), DPB_MAX_SIZE) as usize;
 
         let mut max_dpb_frames = std::cmp::max(max_dpb_frames, self.max_num_ref_frames as usize);
 
-        if self.vui_parameters_present_flag && self.vui_parameters.bitstream_restriction_flag {
-            max_dpb_frames = std::cmp::max(1, self.vui_parameters.max_dec_frame_buffering as usize);
+        if let Some(vui) = &self.vui {
+            if let Some(restriction) = &vui.restriction {
+                max_dpb_frames = std::cmp::max(1, restriction.max_dec_frame_buffering as usize);
+            }
         }
 
         max_dpb_frames
     }
 
     pub fn max_num_order_frames(&self) -> u32 {
-        let vui = &self.vui_parameters;
-        let present = self.vui_parameters_present_flag && vui.bitstream_restriction_flag;
+        if let Some(restriction) = self.vui.as_ref().and_then(|vui| vui.restriction.as_ref()) {
+            return restriction.max_num_reorder_frames;
+        }
 
-        if present {
-            vui.max_num_reorder_frames
+        let profile = self.profile_idc;
+        if (profile == 44
+            || profile == 86
+            || profile == 100
+            || profile == 110
+            || profile == 122
+            || profile == 244)
+            && self.constraint_set3()
+        {
+            0
         } else {
-            let profile = self.profile_idc;
-            if (profile == 44
-                || profile == 86
-                || profile == 100
-                || profile == 110
-                || profile == 122
-                || profile == 244)
-                && self.constraint_set3_flag
-            {
-                0
-            } else {
-                self.max_dpb_frames() as u32
-            }
+            u32::try_from(self.max_dpb_frames()).unwrap_or(u32::MAX)
         }
     }
 }
@@ -964,24 +949,14 @@ impl Sps {
 impl Default for Sps {
     fn default() -> Self {
         Self {
-            scaling_lists_4x4: [[0; 16]; 6],
-            scaling_lists_8x8: [[0; 64]; 6],
+            scaling: SequenceScaling::default(),
             offset_for_ref_frame: [0; 255],
             seq_parameter_set_id: Default::default(),
             profile_idc: Default::default(),
-            constraint_set0_flag: Default::default(),
-            constraint_set1_flag: Default::default(),
-            constraint_set2_flag: Default::default(),
-            constraint_set3_flag: Default::default(),
-            constraint_set4_flag: Default::default(),
-            constraint_set5_flag: Default::default(),
-            level_idc: Default::default(),
-            chroma_format_idc: Default::default(),
-            separate_colour_plane_flag: Default::default(),
-            bit_depth_luma_minus8: Default::default(),
-            bit_depth_chroma_minus8: Default::default(),
-            qpprime_y_zero_transform_bypass_flag: Default::default(),
-            seq_scaling_matrix_present_flag: Default::default(),
+            constraints: Default::default(),
+            level_idc: Level::default(),
+            chroma: ChromaFormat::default(),
+            bit_depth: BitDepth::default(),
             log2_max_frame_num_minus4: Default::default(),
             pic_order_cnt_type: Default::default(),
             log2_max_pic_order_cnt_lsb_minus4: Default::default(),
@@ -993,17 +968,11 @@ impl Default for Sps {
             gaps_in_frame_num_value_allowed_flag: Default::default(),
             pic_width_in_mbs_minus1: Default::default(),
             pic_height_in_map_units_minus1: Default::default(),
-            frame_mbs_only_flag: Default::default(),
-            mb_adaptive_frame_field_flag: Default::default(),
+            frame_field: FrameFieldCoding::default(),
             direct_8x8_inference_flag: Default::default(),
-            frame_cropping_flag: Default::default(),
-            frame_crop_left_offset: Default::default(),
-            frame_crop_right_offset: Default::default(),
-            frame_crop_top_offset: Default::default(),
-            frame_crop_bottom_offset: Default::default(),
+            crop: None,
             expected_delta_per_pic_order_cnt_cycle: Default::default(),
-            vui_parameters_present_flag: Default::default(),
-            vui_parameters: Default::default(),
+            vui: None,
         }
     }
 }
@@ -1013,7 +982,7 @@ pub struct SpsBuilder(Sps);
 
 impl SpsBuilder {
     pub fn new() -> Self {
-        Default::default()
+        SpsBuilder::default()
     }
 
     pub fn seq_parameter_set_id(mut self, value: u8) -> Self {
@@ -1032,20 +1001,26 @@ impl SpsBuilder {
     }
 
     pub fn frame_crop_offsets(mut self, top: u32, bottom: u32, left: u32, right: u32) -> Self {
-        self.0.frame_cropping_flag = true;
-        self.0.frame_crop_top_offset = top;
-        self.0.frame_crop_bottom_offset = bottom;
-        self.0.frame_crop_left_offset = left;
-        self.0.frame_crop_right_offset = right;
+        self.0.crop = Some(FrameCrop {
+            left,
+            right,
+            top,
+            bottom,
+        });
         self
     }
 
     pub fn frame_crop(self, top: u32, bottom: u32, left: u32, right: u32) -> Self {
-        let sub_width_c = if self.0.chroma_format_idc > 2 { 1 } else { 2 };
-        let sub_height_c = if self.0.chroma_format_idc > 1 { 1 } else { 2 };
+        let sub_width_c = if self.0.chroma.idc > 2 { 1 } else { 2 };
+        let sub_height_c = if self.0.chroma.idc > 1 { 1 } else { 2 };
 
         let crop_unit_x = sub_width_c;
-        let crop_unit_y = sub_height_c * (if self.0.frame_mbs_only_flag { 1 } else { 2 });
+        let crop_unit_y = sub_height_c
+            * (if self.0.frame_field.frame_mbs_only {
+                1
+            } else {
+                2
+            });
 
         self.frame_crop_offsets(
             top / crop_unit_y,
@@ -1058,11 +1033,11 @@ impl SpsBuilder {
     pub fn resolution(mut self, width: u32, height: u32) -> Self {
         const MB_SIZE: u32 = 16;
 
-        let mb_width = (width + MB_SIZE - 1) / MB_SIZE;
-        let mb_height = (height + MB_SIZE - 1) / MB_SIZE;
+        let mb_width = width.div_ceil(MB_SIZE);
+        let mb_height = height.div_ceil(MB_SIZE);
 
-        self.0.pic_width_in_mbs_minus1 = (mb_width - 1) as u16;
-        self.0.pic_height_in_map_units_minus1 = (mb_height - 1) as u16;
+        self.0.pic_width_in_mbs_minus1 = u16::try_from(mb_width - 1).unwrap_or(u16::MAX);
+        self.0.pic_height_in_map_units_minus1 = u16::try_from(mb_height - 1).unwrap_or(u16::MAX);
 
         let compressed_width = mb_width * MB_SIZE;
         let compressed_height = mb_height * MB_SIZE;
@@ -1075,7 +1050,7 @@ impl SpsBuilder {
     }
 
     pub fn chroma_format_idc(mut self, value: u8) -> Self {
-        self.0.chroma_format_idc = value;
+        self.0.chroma.idc = value;
         self
     }
 
@@ -1085,17 +1060,17 @@ impl SpsBuilder {
     }
 
     pub fn frame_mbs_only_flag(mut self, value: bool) -> Self {
-        self.0.frame_mbs_only_flag = value;
+        self.0.frame_field.frame_mbs_only = value;
         self
     }
 
     pub fn mb_adaptive_frame_field_flag(mut self, value: bool) -> Self {
-        self.0.mb_adaptive_frame_field_flag = value;
+        self.0.frame_field.mb_adaptive = value;
         self
     }
 
     pub fn seq_scaling_matrix_present_flag(mut self, value: bool) -> Self {
-        self.0.seq_scaling_matrix_present_flag = value;
+        self.0.scaling.present = value;
         self
     }
 
@@ -1105,36 +1080,32 @@ impl SpsBuilder {
     }
 
     pub fn vui_parameters_present(mut self) -> Self {
-        if self.0.vui_parameters_present_flag {
-            return self;
-        }
-
-        self.0.vui_parameters_present_flag = true;
-        // Disable all options at default
-        self.0.vui_parameters.aspect_ratio_info_present_flag = false;
-        self.0.vui_parameters.overscan_info_present_flag = false;
-        self.0.vui_parameters.video_signal_type_present_flag = false;
-        self.0.vui_parameters.colour_description_present_flag = false;
-        self.0.vui_parameters.chroma_loc_info_present_flag = false;
-        self.0.vui_parameters.timing_info_present_flag = false;
-        self.0.vui_parameters.nal_hrd_parameters_present_flag = false;
-        self.0.vui_parameters.vcl_hrd_parameters_present_flag = false;
-        self.0.vui_parameters.pic_struct_present_flag = false;
-        self.0.vui_parameters.bitstream_restriction_flag = false;
+        self.0.vui.get_or_insert_with(VuiParams::default);
         self
     }
 
     pub fn aspect_ratio_idc(mut self, value: u8) -> Self {
         self = self.vui_parameters_present();
-        self.0.vui_parameters.aspect_ratio_info_present_flag = true;
-        self.0.vui_parameters.aspect_ratio_idc = value;
+        let vui = self.0.vui.as_mut().expect("vui present");
+        vui.aspect_ratio = Some(AspectRatio {
+            idc: value,
+            ..vui.aspect_ratio.take().unwrap_or_default()
+        });
         self
     }
 
     pub fn sar_resolution(mut self, width: u16, height: u16) -> Self {
         self = self.aspect_ratio_idc(255);
-        self.0.vui_parameters.sar_width = width;
-        self.0.vui_parameters.sar_height = height;
+        let aspect_ratio = self
+            .0
+            .vui
+            .as_mut()
+            .expect("vui present")
+            .aspect_ratio
+            .as_mut()
+            .expect("aspect ratio present");
+        aspect_ratio.sar_width = width;
+        aspect_ratio.sar_height = height;
         self
     }
 
@@ -1169,10 +1140,11 @@ impl SpsBuilder {
         fixed_frame_rate_flag: bool,
     ) -> Self {
         self = self.vui_parameters_present();
-        self.0.vui_parameters.timing_info_present_flag = true;
-        self.0.vui_parameters.num_units_in_tick = num_units_in_tick;
-        self.0.vui_parameters.time_scale = time_scale;
-        self.0.vui_parameters.fixed_frame_rate_flag = fixed_frame_rate_flag;
+        self.0.vui.as_mut().expect("vui present").timing = Some(TimingInfo {
+            num_units_in_tick,
+            time_scale,
+            fixed_frame_rate: fixed_frame_rate_flag,
+        });
         self
     }
 
@@ -1182,7 +1154,7 @@ impl SpsBuilder {
     }
 
     pub fn max_frame_num(self, value: u32) -> Self {
-        self.log2_max_frame_num_minus4(value.ilog2() as u8 - 4u8)
+        self.log2_max_frame_num_minus4(u8::try_from(value.ilog2()).unwrap_or(u8::MAX) - 4u8)
     }
 
     pub fn pic_order_cnt_type(mut self, value: u8) -> Self {
@@ -1196,7 +1168,7 @@ impl SpsBuilder {
     }
 
     pub fn max_pic_order_cnt_lsb(self, value: u32) -> Self {
-        self.log2_max_pic_order_cnt_lsb_minus4(value.ilog2() as u8 - 4u8)
+        self.log2_max_pic_order_cnt_lsb_minus4(u8::try_from(value.ilog2()).unwrap_or(u8::MAX) - 4u8)
     }
 
     pub fn delta_pic_order_always_zero_flag(mut self, value: bool) -> Self {
@@ -1205,7 +1177,7 @@ impl SpsBuilder {
     }
 
     pub fn bit_depth_chroma_minus8(mut self, value: u8) -> Self {
-        self.0.bit_depth_chroma_minus8 = value;
+        self.0.bit_depth.chroma_minus8 = value;
         self
     }
 
@@ -1214,7 +1186,7 @@ impl SpsBuilder {
     }
 
     pub fn bit_depth_luma_minus8(mut self, value: u8) -> Self {
-        self.0.bit_depth_luma_minus8 = value;
+        self.0.bit_depth.luma_minus8 = value;
         self
     }
 
@@ -1240,10 +1212,10 @@ pub struct HrdParams {
     /// size of the SchedSelIdx-th CPB.
     pub cpb_size_scale: u8,
 
-    /// `[ SchedSelIdx ]` (together with bit_rate_scale) specifies the maximum
+    /// `[ SchedSelIdx ]` (together with `bit_rate_scale`) specifies the maximum
     /// input bit rate for the SchedSelIdx-th CPB.
     pub bit_rate_value_minus1: [u32; 32],
-    /// `[ SchedSelIdx ]` is used together with cpb_size_scale to specify the
+    /// `[ SchedSelIdx ]` is used together with `cpb_size_scale` to specify the
     /// SchedSelIdx-th CPB size.
     pub cpb_size_value_minus1: [u32; 32],
     /// `[ SchedSelIdx ]` equal to 0 specifies that to decode this bitstream by
@@ -1267,215 +1239,129 @@ pub struct HrdParams {
     pub time_offset_length: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VuiParams {
-    /// Specifies whether `aspect_ratio_idc` is present.
-    pub aspect_ratio_info_present_flag: bool,
-    /// Specifies the value of the sample aspect ratio of the luma samples.
-    /// Table E-1 shows the meaning of the code. When aspect_ratio_idc indicates
-    /// Extended_SAR, the sample aspect ratio is represented by sar_width :
-    /// sar_height. When the aspect_ratio_idc syntax element is not present,
-    /// aspect_ratio_idc value shall be inferred to be equal to 0
-    pub aspect_ratio_idc: u8,
-
-    /* if aspect_ratio_idc == 255 */
-    /// Indicates the horizontal size of the sample aspect ratio (in arbitrary
-    /// units)
+/// Sample aspect ratio from the VUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AspectRatio {
+    /// `aspect_ratio_idc` value.
+    pub idc: u8,
+    /// Extended SAR width, valid when `idc` is 255.
     pub sar_width: u16,
-    /// Indicates the vertical size of the sample aspect ratio (in the same
-    /// arbitrary units as sar_width).
+    /// Extended SAR height, valid when `idc` is 255.
     pub sar_height: u16,
+}
 
-    /// If true specifies that the overscan_appropriate_flag is present. Else,
-    /// the preferred display method for the video signal is unspecified
-    pub overscan_info_present_flag: bool,
-    /* if overscan_info_present_flag */
-    /// If true, indicates that the cropped decoded pictures output are suitable
-    /// for display using overscan. Else, indicates that the cropped decoded
-    /// pictures output contain visually important information in the entire
-    /// region out to the edges of the cropping rectangle of the picture, such
-    /// that the cropped decoded pictures output should not be displayed using
-    /// overscan.
-    pub overscan_appropriate_flag: bool,
+/// Colour description from the VUI video signal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColourDescription {
+    /// `colour_primaries` value.
+    pub primaries: u8,
+    /// `transfer_characteristics` value.
+    pub transfer: u8,
+    /// `matrix_coefficients` value.
+    pub matrix: u8,
+}
 
-    /// Specifies that video_format, video_full_range_flag and
-    /// colour_description_present_flag are present
-    pub video_signal_type_present_flag: bool,
-    /// Indicates the representation of the pictures as specified in Table E-2,
-    /// before being coded in accordance with this Recommendation |
-    /// International Standard. When the video_format syntax element is not
-    /// present, video_format value shall be inferred to be equal to 5.
-    pub video_format: u8,
-    /// Indicates the black level and range of the luma and chroma signals as
-    /// derived from E′Y, E′PB, and E′PR or E′ R, E′G, and E′B real-valued
-    /// component signals.
-    pub video_full_range_flag: bool,
-    /// Specifies that colour_primaries, transfer_characteristics and
-    /// matrix_coefficients are present.
-    pub colour_description_present_flag: bool,
-    /// Indicates the chromaticity coordinates of the source primaries as
-    /// specified in Table E-3 in terms of the CIE 1931 definition of x and y as
-    /// specified by ISO 11664-1.
-    pub colour_primaries: u8,
-    /// Retains same meaning as in the specification.
-    pub transfer_characteristics: u8,
-    /// Describes the matrix coefficients used in deriving luma and chroma
-    /// signals from the green, blue, and red, or Y, Z, and X primaries, as
-    /// specified in Table E-5.
-    pub matrix_coefficients: u8,
+/// Video signal type from the VUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoSignalType {
+    /// `video_format` value.
+    pub format: u8,
+    /// Full-range luma/chroma levels.
+    pub full_range: bool,
+    /// Colour description, absent when not signalled.
+    pub colour: Option<ColourDescription>,
+}
 
-    /// Specifies that chroma_sample_loc_type_top_field and
-    /// chroma_sample_loc_type_bottom_field are present
-    pub chroma_loc_info_present_flag: bool,
-    /// Specify the location of chroma samples. See the spec for more details.
-    pub chroma_sample_loc_type_top_field: u8,
-    /// Specify the location of chroma samples. See the spec for more details.
-    pub chroma_sample_loc_type_bottom_field: u8,
+/// Chroma sample location from the VUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChromaLoc {
+    /// Top-field location type.
+    pub top: u8,
+    /// Bottom-field location type.
+    pub bottom: u8,
+}
 
-    /// Specifies that num_units_in_tick, time_scale and fixed_frame_rate_flag
-    /// are present in the bitstream
-    pub timing_info_present_flag: bool,
-    /* if timing_info_present_flag */
-    /// The number of time units of a clock operating at the frequency
-    /// time_scale Hz that corresponds to one increment (called a clock tick) of
-    /// a clock tick counter
+/// Timing info from the VUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimingInfo {
+    /// Clock ticks per counter increment.
     pub num_units_in_tick: u32,
-    /// The number of time units that pass in one second. For example, a time
-    /// coordinate system that measures time using a 27 MHz clock has a
-    /// time_scale of 27 000 000. time_scale shall be greater than 0.
+    /// Clock ticks per second.
     pub time_scale: u32,
-    /// Retains the same meaning as the specification.
-    pub fixed_frame_rate_flag: bool,
+    /// Fixed frame rate.
+    pub fixed_frame_rate: bool,
+}
 
-    /// Specifies that NAL HRD parameters (pertaining to Type II bitstream
-    /// conformance) are present.
-    pub nal_hrd_parameters_present_flag: bool,
-    /* if nal_hrd_parameters_present_flag */
-    /// The NAL HDR parameters
-    pub nal_hrd_parameters: HrdParams,
-    /// Specifies that VCL HRD parameters (pertaining to all bitstream
-    /// conformance) are present.
-    pub vcl_hrd_parameters_present_flag: bool,
-    /* if vcl_hrd_parameters_present_flag */
-    /// The VCL HRD parameters
-    pub vcl_hrd_parameters: HrdParams,
-
-    /// Specifies the HRD operational mode as specified in Annex C.
-    pub low_delay_hrd_flag: bool,
-
-    /// Specifies that picture timing SEI messages (clause D.2.3) are present
-    /// that include the pic_struct syntax element.
-    pub pic_struct_present_flag: bool,
-
-    /// Specifies that the following coded video sequence bitstream restriction
-    /// parameters are present
-    pub bitstream_restriction_flag: bool,
-    /*  if bitstream_restriction_flag */
-    /// If false, indicates that no sample outside the picture boundaries and no
-    /// sample at a fractional sample position for which the sample value is
-    /// derived using one or more samples outside the picture boundaries is used
-    /// for inter prediction of any sample. If true, indicates that one or more
-    /// samples outside picture boundaries may be used in inter prediction. When
-    /// the motion_vectors_over_pic_boundaries_flag syntax element is not
-    /// present, motion_vectors_over_pic_boundaries_flag value shall be inferred
-    /// to be true.
-    pub motion_vectors_over_pic_boundaries_flag: bool,
-    /// Indicates a number of bytes not exceeded by the sum of the sizes of the
-    /// VCL NAL units associated with any coded picture in the coded video
-    /// sequence.
+/// Bitstream restriction from the VUI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BitstreamRestriction {
+    /// Motion vectors may cross picture boundaries.
+    pub motion_vectors_over_pic_boundaries: bool,
+    /// `max_bytes_per_pic_denom` value.
     pub max_bytes_per_pic_denom: u32,
-    /// Indicates an upper bound for the number of coded bits of
-    /// macroblock_layer( ) data for any macroblock in any picture of the coded
-    /// video sequence
+    /// `max_bits_per_mb_denom` value.
     pub max_bits_per_mb_denom: u32,
-    /// Retains the same meaning as the specification.
+    /// `log2_max_mv_length_horizontal` value.
     pub log2_max_mv_length_horizontal: u32,
-    /// Retains the same meaning as the specification.
+    /// `log2_max_mv_length_vertical` value.
     pub log2_max_mv_length_vertical: u32,
-    /// Indicates an upper bound for the number of frames buffers, in the
-    /// decoded picture buffer (DPB), that are required for storing frames,
-    /// complementary field pairs, and non-paired fields before output. It is a
-    /// requirement of bitstream conformance that the maximum number of frames,
-    /// complementary field pairs, or non-paired fields that precede any frame,
-    /// complementary field pair, or non-paired field in the coded video
-    /// sequence in decoding order and follow it in output order shall be less
-    /// than or equal to max_num_reorder_frames. The value of
-    /// max_num_reorder_frames shall be in the range of 0 to
-    /// max_dec_frame_buffering, inclusive.
-    ///
-    /// When the max_num_reorder_frames syntax element is not present, the value
-    /// of max_num_reorder_frames value shall be inferred as follows:
-    /// If profile_idc is equal to 44, 86, 100, 110, 122, or 244 and
-    /// constraint_set3_flag is equal to 1, the value of max_num_reorder_frames
-    /// shall be inferred to be equal to 0.
-    ///
-    /// Otherwise (profile_idc is not equal to 44, 86, 100, 110, 122, or 244 or
-    /// constraint_set3_flag is equal to 0), the value of max_num_reorder_frames
-    /// shall be inferred to be equal to MaxDpbFrames.
+    /// `max_num_reorder_frames` value.
     pub max_num_reorder_frames: u32,
-    /// Specifies the required size of the HRD decoded picture buffer (DPB) in
-    /// units of frame buffers. It is a requirement of bitstream conformance
-    /// that the coded video sequence shall not require a decoded picture buffer
-    /// with size of more than Max( 1, max_dec_frame_buffering ) frame buffers
-    /// to enable the output of decoded pictures at the output times specified
-    /// by dpb_output_delay of the picture timing SEI messages. The value of
-    /// max_dec_frame_buffering shall be greater than or equal to
-    /// max_num_ref_frames. An upper bound for the value of
-    /// max_dec_frame_buffering is specified by the level limits in clauses
-    /// A.3.1, A.3.2, G.10.2.1, and H.10.2.
-    ///
-    /// When the max_dec_frame_buffering syntax element is not present, the
-    /// value of max_dec_frame_buffering shall be inferred as follows:
-    ///
-    /// If profile_idc is equal to 44, 86, 100, 110, 122, or 244 and
-    /// constraint_set3_flag is equal to 1, the value of max_dec_frame_buffering
-    /// shall be inferred to be equal to 0.
-    ///
-    /// Otherwise (profile_idc is not equal to 44, 86, 100, 110, 122, or 244 or
-    /// constraint_set3_flag is equal to 0), the value of
-    /// max_dec_frame_buffering shall be inferred to be equal to MaxDpbFrames.
+    /// `max_dec_frame_buffering` value.
     pub max_dec_frame_buffering: u32,
 }
 
-impl Default for VuiParams {
-    fn default() -> Self {
-        Self {
-            aspect_ratio_info_present_flag: Default::default(),
-            aspect_ratio_idc: Default::default(),
-            sar_width: Default::default(),
-            sar_height: Default::default(),
-            overscan_info_present_flag: Default::default(),
-            overscan_appropriate_flag: Default::default(),
-            video_signal_type_present_flag: Default::default(),
-            video_format: 5,
-            video_full_range_flag: Default::default(),
-            colour_description_present_flag: Default::default(),
-            colour_primaries: 2,
-            transfer_characteristics: 2,
-            matrix_coefficients: 2,
-            chroma_loc_info_present_flag: Default::default(),
-            chroma_sample_loc_type_top_field: Default::default(),
-            chroma_sample_loc_type_bottom_field: Default::default(),
-            timing_info_present_flag: Default::default(),
-            num_units_in_tick: Default::default(),
-            time_scale: Default::default(),
-            fixed_frame_rate_flag: Default::default(),
-            nal_hrd_parameters_present_flag: Default::default(),
-            nal_hrd_parameters: Default::default(),
-            vcl_hrd_parameters_present_flag: Default::default(),
-            vcl_hrd_parameters: Default::default(),
-            low_delay_hrd_flag: Default::default(),
-            pic_struct_present_flag: Default::default(),
-            bitstream_restriction_flag: Default::default(),
-            motion_vectors_over_pic_boundaries_flag: Default::default(),
-            max_bytes_per_pic_denom: Default::default(),
-            max_bits_per_mb_denom: Default::default(),
-            log2_max_mv_length_horizontal: Default::default(),
-            log2_max_mv_length_vertical: Default::default(),
-            max_num_reorder_frames: Default::default(),
-            max_dec_frame_buffering: Default::default(),
-        }
-    }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiParams {
+    /// Sample aspect ratio, absent when not signalled.
+    pub aspect_ratio: Option<AspectRatio>,
+    /// Overscan display suitability, absent when not signalled.
+    pub overscan_appropriate: Option<bool>,
+    /// Video signal type, absent when not signalled.
+    pub video_signal: Option<VideoSignalType>,
+    /// Chroma sample location, absent when not signalled.
+    pub chroma_loc: Option<ChromaLoc>,
+    /// Timing info, absent when not signalled.
+    pub timing: Option<TimingInfo>,
+    /// NAL HRD parameters, absent when not signalled.
+    pub nal_hrd: Option<HrdParams>,
+    /// VCL HRD parameters, absent when not signalled.
+    pub vcl_hrd: Option<HrdParams>,
+    /// HRD low-delay mode.
+    pub low_delay_hrd_flag: bool,
+    /// Picture-timing SEI carries `pic_struct`.
+    pub pic_struct_present_flag: bool,
+    /// Bitstream restriction, absent when not signalled.
+    pub restriction: Option<BitstreamRestriction>,
+}
+
+/// Entropy-coding tools of the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PpsCodingFlags {
+    /// CABAC in use for the picture.
+    pub entropy_coding_mode_flag: bool,
+    /// 8x8 transform decoding may be in use.
+    pub transform_8x8_mode_flag: bool,
+}
+
+/// Prediction constraints of the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PpsPredictionFlags {
+    /// Explicit weighted prediction for P/SP slices.
+    pub weighted_pred_flag: bool,
+    /// Constrained intra prediction.
+    pub constrained_intra_pred_flag: bool,
+}
+
+/// Slice-header presence flags of the picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PpsPresenceFlags {
+    /// Bottom-field order counts may be present.
+    pub bottom_field_pic_order_in_frame_present_flag: bool,
+    /// Redundant picture counts may be present.
+    pub redundant_pic_cnt_present_flag: bool,
+    /// Deblocking-filter parameters may be present.
+    pub deblocking_filter_control_present_flag: bool,
 }
 
 /// A H264 Picture Parameter Set. A syntax structure containing syntax elements
@@ -1489,23 +1375,14 @@ pub struct Pps {
     /// Refers to the active sequence parameter set.
     pub seq_parameter_set_id: u8,
 
-    /// Selects the entropy decoding method to be applied for the syntax
-    /// elements for which two descriptors appear in the syntax tables as
-    /// follows: If `entropy_coding_mode_flag` is false, the method specified by
-    /// the left descriptor in the syntax table is applied (Exp-Golomb coded,
-    /// see clause 9.1 or CAVLC, see clause 9.2). Otherwise
-    /// (`entropy_coding_mode_flag` is true), the method specified by the right
-    /// descriptor in the syntax table is applied (CABAC, see clause 9.3).
-    pub entropy_coding_mode_flag: bool,
+    /// Entropy-coding tools of the picture.
+    pub coding: PpsCodingFlags,
 
-    /// If true, specifies that the syntax elements delta_pic_order_cnt_bottom
-    /// (when `pic_order_cnt_type` is equal to 0) or `delta_pic_order_cnt[1]`
-    /// (when `pic_order_cnt_type` is equal to 1), which are related to picture
-    /// order counts for the bottom field of a coded frame, are present in the
-    /// slice headers for coded frames as specified in clause 7.3.3. Otherwise,
-    /// specifies that the syntax elements `delta_pic_order_cnt_bottom` and
-    /// `delta_pic_order_cnt[1]` are not present in the slice headers.
-    pub bottom_field_pic_order_in_frame_present_flag: bool,
+    /// Prediction constraints of the picture.
+    pub prediction: PpsPredictionFlags,
+
+    /// Slice-header presence flags of the picture.
+    pub presence: PpsPresenceFlags,
 
     /// Plus 1 specifies the number of slice groups for a picture. When
     /// `num_slice_groups_minus1` is equal to 0, all slices of the picture
@@ -1521,11 +1398,6 @@ pub struct Pps {
     /// with `num_ref_idx_active_override_flag` not set.
     pub num_ref_idx_l1_default_active_minus1: u8,
 
-    /// If not set, specifies that the default weighted prediction shall be
-    /// applied to P and SP slices. If set, specifies that explicit weighted
-    /// prediction shall be applied to P and SP slices.
-    pub weighted_pred_flag: bool,
-
     /// `weighted_bipred_idc` equal to 0 specifies that the default weighted
     /// prediction shall be applied to B slices. `weighted_bipred_idc` equal to
     /// 1 specifies that explicit weighted prediction shall be applied to B
@@ -1533,13 +1405,13 @@ pub struct Pps {
     /// weighted prediction shall be applied to B slices
     pub weighted_bipred_idc: u8,
 
-    /// Specifies the initial value minus 26 of SliceQPY for each slice. The
+    /// Specifies the initial value minus 26 of `SliceQPY` for each slice. The
     /// initial value is modified at the slice layer when a non-zero value of
     /// `slice_qp_delta` is decoded, and is modified further when a non-zero
     /// value of `mb_qp_delta` is decoded at the macroblock layer.
     pub pic_init_qp_minus26: i8,
 
-    /// Specifies the initial value minus 26 of SliceQSY for all macroblocks in
+    /// Specifies the initial value minus 26 of `SliceQSY` for all macroblocks in
     /// SP or SI slices. The initial value is modified at the slice layer when a
     /// non-zero value of `slice_qs_delta` is decoded.
     pub pic_init_qs_minus26: i8,
@@ -1547,39 +1419,6 @@ pub struct Pps {
     /// Specifies the offset that shall be added to QP Y and QSY for addressing
     /// the table of QPC values for the Cb chroma component.
     pub chroma_qp_index_offset: i8,
-
-    /// If set, specifies that a set of syntax elements controlling the
-    /// characteristics of the deblocking filter is present in the slice header.
-    /// If not set, specifies that the set of syntax elements controlling the
-    /// characteristics of the deblocking filter is not present in the slice
-    /// headers and their inferred values are in effect.
-    pub deblocking_filter_control_present_flag: bool,
-
-    /// If not set, specifies that intra prediction allows usage of residual
-    /// data and decoded samples of neighbouring macroblocks coded using Inter
-    /// macroblock prediction modes for the prediction of macroblocks coded
-    /// using Intra macroblock prediction modes. If set, specifies constrained
-    /// intra prediction, in which case prediction of macroblocks coded using
-    /// Intra macroblock prediction modes only uses residual data and decoded
-    /// samples from I or SI macroblock types.
-    pub constrained_intra_pred_flag: bool,
-
-    /// If not set, specifies that the `redundant_pic_cnt` syntax element is not
-    /// present in slice headers, coded slice data partition B NAL units, and
-    /// coded slice data partition C NAL units that refer (either directly or by
-    /// association with a corresponding coded slice data partition A NAL unit)
-    /// to the picture parameter set. If set, specifies that the
-    /// `redundant_pic_cnt` syntax element is present in all slice headers,
-    /// coded slice data partition B NAL units, and coded slice data partition C
-    /// NAL units that refer (either directly or by association with a
-    /// corresponding coded slice data partition A NAL unit) to the picture
-    /// parameter set.
-    pub redundant_pic_cnt_present_flag: bool,
-
-    /// If set, specifies that the 8x8 transform decoding process may be in use
-    /// (see clause 8.5). If not set, specifies that the 8x8 transform decoding
-    /// process is not in use.
-    pub transform_8x8_mode_flag: bool,
 
     ///  If set, specifies that parameters are present to modify the scaling
     ///  lists specified in the sequence parameter set. If not set, specifies
@@ -1609,20 +1448,16 @@ impl PpsBuilder {
         PpsBuilder(Pps {
             pic_parameter_set_id: 0,
             seq_parameter_set_id: sps.seq_parameter_set_id,
-            entropy_coding_mode_flag: false,
-            bottom_field_pic_order_in_frame_present_flag: false,
+            coding: PpsCodingFlags::default(),
+            prediction: PpsPredictionFlags::default(),
+            presence: PpsPresenceFlags::default(),
             num_slice_groups_minus1: 0,
             num_ref_idx_l0_default_active_minus1: 0,
             num_ref_idx_l1_default_active_minus1: 0,
-            weighted_pred_flag: false,
             weighted_bipred_idc: 0,
             pic_init_qp_minus26: 0,
             pic_init_qs_minus26: 0,
             chroma_qp_index_offset: 0,
-            deblocking_filter_control_present_flag: false,
-            constrained_intra_pred_flag: false,
-            redundant_pic_cnt_present_flag: false,
-            transform_8x8_mode_flag: false,
             pic_scaling_matrix_present_flag: false,
             scaling_lists_4x4: [[0; 16]; 6],
             scaling_lists_8x8: [[0; 64]; 6],
@@ -1642,11 +1477,11 @@ impl PpsBuilder {
     }
 
     pub fn pic_init_qp(self, value: u8) -> Self {
-        self.pic_init_qp_minus26(value as i8 - 26)
+        self.pic_init_qp_minus26(value.cast_signed() - 26)
     }
 
     pub fn deblocking_filter_control_present_flag(mut self, value: bool) -> Self {
-        self.0.deblocking_filter_control_present_flag = value;
+        self.0.presence.deblocking_filter_control_present_flag = value;
         self
     }
 
@@ -1692,7 +1527,7 @@ impl Parser {
 
     fn fill_default_scaling_list_8x8(scaling_list8x8: &mut [u8; 64], i: usize) {
         assert!(i < 6);
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             *scaling_list8x8 = DEFAULT_8X8_INTRA;
         } else {
             *scaling_list8x8 = DEFAULT_8X8_INTER;
@@ -1713,7 +1548,7 @@ impl Parser {
             3 => *default_scaling_list_inter,
             4 => scaling_list4x4[3],
             5 => scaling_list4x4[4],
-            _ => panic!("Unexpected value {}", i),
+            _ => panic!("Unexpected value {i}"),
         }
     }
 
@@ -1731,7 +1566,7 @@ impl Parser {
             3 => scaling_list8x8[1],
             4 => scaling_list8x8[2],
             5 => scaling_list8x8[3],
-            _ => panic!("Unexpected value {}", i),
+            _ => panic!("Unexpected value {i}"),
         }
     }
 
@@ -1766,7 +1601,10 @@ impl Parser {
         for j in 0..scaling_list.as_mut().len() {
             if next_scale != 0 {
                 let delta_scale = r.read_se::<i32>()?;
-                next_scale = ((last_scale as i32 + delta_scale + 256) % 256) as u8;
+                // Fold to 0..256: `%` alone keeps a negative sign.
+                next_scale =
+                    u8::try_from((((i32::from(last_scale) + delta_scale + 256) % 256) + 256) % 256)
+                        .map_err(|_| "scale range")?;
                 *use_default = j == 0 && next_scale == 0;
                 if *use_default {
                     return Ok(());
@@ -1786,8 +1624,8 @@ impl Parser {
     }
 
     fn parse_sps_scaling_lists(r: &mut BitReader, sps: &mut Sps) -> Result<(), String> {
-        let scaling_lists4x4 = &mut sps.scaling_lists_4x4;
-        let scaling_lisst8x8 = &mut sps.scaling_lists_8x8;
+        let scaling_lists4x4 = &mut sps.scaling.lists_4x4;
+        let scaling_lisst8x8 = &mut sps.scaling.lists_8x8;
 
         // Parse scaling_list4x4
         for i in 0..6 {
@@ -1811,7 +1649,7 @@ impl Parser {
         }
 
         // Parse scaling_list8x8
-        let num_8x8 = if sps.chroma_format_idc != 3 { 2 } else { 6 };
+        let num_8x8 = if sps.chroma.idc == 3 { 6 } else { 2 };
         for i in 0..num_8x8 {
             let seq_scaling_list_present_flag = r.read_bit()?;
             if seq_scaling_list_present_flag {
@@ -1847,7 +1685,7 @@ impl Parser {
                 if use_default {
                     Parser::fill_default_scaling_list_4x4(&mut scaling_lists4x4[i], i);
                 }
-            } else if !sps.seq_scaling_matrix_present_flag {
+            } else if !sps.scaling.present {
                 // Table 7-2: Fallback rule A
                 Parser::fill_fallback_scaling_list_4x4(
                     scaling_lists4x4,
@@ -1860,14 +1698,14 @@ impl Parser {
                 Parser::fill_fallback_scaling_list_4x4(
                     scaling_lists4x4,
                     i,
-                    &sps.scaling_lists_4x4[0],
-                    &sps.scaling_lists_4x4[3],
+                    &sps.scaling.lists_4x4[0],
+                    &sps.scaling.lists_4x4[3],
                 );
             }
         }
 
-        if pps.transform_8x8_mode_flag {
-            let num8x8 = if sps.chroma_format_idc != 3 { 2 } else { 6 };
+        if pps.coding.transform_8x8_mode_flag {
+            let num8x8 = if sps.chroma.idc == 3 { 6 } else { 2 };
 
             for i in 0..num8x8 {
                 let pic_scaling_list_present_flag = r.read_bit()?;
@@ -1879,7 +1717,7 @@ impl Parser {
                     if use_default {
                         Parser::fill_default_scaling_list_8x8(&mut scaling_lists8x8[i], i);
                     }
-                } else if !sps.seq_scaling_matrix_present_flag {
+                } else if !sps.scaling.present {
                     // Table 7-2: Fallback rule A
                     Parser::fill_fallback_scaling_list_8x8(
                         scaling_lists8x8,
@@ -1892,8 +1730,8 @@ impl Parser {
                     Parser::fill_fallback_scaling_list_8x8(
                         scaling_lists8x8,
                         i,
-                        &sps.scaling_lists_8x8[0],
-                        &sps.scaling_lists_8x8[1],
+                        &sps.scaling.lists_8x8[0],
+                        &sps.scaling.lists_8x8[1],
                     );
                 }
             }
@@ -1921,82 +1759,148 @@ impl Parser {
     }
 
     fn parse_vui(r: &mut BitReader, sps: &mut Sps) -> Result<(), String> {
-        let vui = &mut sps.vui_parameters;
+        let vui = sps.vui.as_mut().expect("vui allocated by caller");
 
-        vui.aspect_ratio_info_present_flag = r.read_bit()?;
-        if vui.aspect_ratio_info_present_flag {
-            vui.aspect_ratio_idc = r.read_bits(8)?;
-            if vui.aspect_ratio_idc == 255 {
-                vui.sar_width = r.read_bits(16)?;
-                vui.sar_height = r.read_bits(16)?;
-            }
+        if r.read_bit()? {
+            let idc = r.read_bits(8)?;
+            let (sar_width, sar_height) = if idc == 255 {
+                (r.read_bits(16)?, r.read_bits(16)?)
+            } else {
+                (0, 0)
+            };
+            vui.aspect_ratio = Some(AspectRatio {
+                idc,
+                sar_width,
+                sar_height,
+            });
         }
 
-        vui.overscan_info_present_flag = r.read_bit()?;
-        if vui.overscan_info_present_flag {
-            vui.overscan_appropriate_flag = r.read_bit()?;
+        if r.read_bit()? {
+            vui.overscan_appropriate = Some(r.read_bit()?);
         }
 
-        vui.video_signal_type_present_flag = r.read_bit()?;
-        if vui.video_signal_type_present_flag {
-            vui.video_format = r.read_bits(3)?;
-            vui.video_full_range_flag = r.read_bit()?;
-            vui.colour_description_present_flag = r.read_bit()?;
-            if vui.colour_description_present_flag {
-                vui.colour_primaries = r.read_bits(8)?;
-                vui.transfer_characteristics = r.read_bits(8)?;
-                vui.matrix_coefficients = r.read_bits(8)?;
-            }
+        if r.read_bit()? {
+            let format = r.read_bits(3)?;
+            let full_range = r.read_bit()?;
+            let colour = if r.read_bit()? {
+                Some(ColourDescription {
+                    primaries: r.read_bits(8)?,
+                    transfer: r.read_bits(8)?,
+                    matrix: r.read_bits(8)?,
+                })
+            } else {
+                None
+            };
+            vui.video_signal = Some(VideoSignalType {
+                format,
+                full_range,
+                colour,
+            });
         }
 
-        vui.chroma_loc_info_present_flag = r.read_bit()?;
-        if vui.chroma_loc_info_present_flag {
-            vui.chroma_sample_loc_type_top_field = r.read_ue_max(5)?;
-            vui.chroma_sample_loc_type_bottom_field = r.read_ue_max(5)?;
+        if r.read_bit()? {
+            vui.chroma_loc = Some(ChromaLoc {
+                top: r.read_ue_max(5)?,
+                bottom: r.read_ue_max(5)?,
+            });
         }
 
-        vui.timing_info_present_flag = r.read_bit()?;
-        if vui.timing_info_present_flag {
-            vui.num_units_in_tick = r.read_bits::<u32>(31)? << 1;
-            vui.num_units_in_tick |= r.read_bit()? as u32;
-            if vui.num_units_in_tick == 0 {
+        if r.read_bit()? {
+            let mut num_units_in_tick = r.read_bits::<u32>(31)? << 1;
+            num_units_in_tick |= u32::from(r.read_bit()?);
+            if num_units_in_tick == 0 {
                 return Err("num_units_in_tick == 0, which is not allowed by E.2.1".into());
             }
 
-            vui.time_scale = r.read_bits::<u32>(31)? << 1;
-            vui.time_scale |= r.read_bit()? as u32;
-            if vui.time_scale == 0 {
+            let mut time_scale = r.read_bits::<u32>(31)? << 1;
+            time_scale |= u32::from(r.read_bit()?);
+            if time_scale == 0 {
                 return Err("time_scale == 0, which is not allowed by E.2.1".into());
             }
 
-            vui.fixed_frame_rate_flag = r.read_bit()?;
+            vui.timing = Some(TimingInfo {
+                num_units_in_tick,
+                time_scale,
+                fixed_frame_rate: r.read_bit()?,
+            });
         }
 
-        vui.nal_hrd_parameters_present_flag = r.read_bit()?;
-        if vui.nal_hrd_parameters_present_flag {
-            Parser::parse_hrd(r, &mut vui.nal_hrd_parameters)?;
+        let nal_present = r.read_bit()?;
+        if nal_present {
+            let mut parameters = HrdParams::default();
+            Parser::parse_hrd(r, &mut parameters)?;
+            vui.nal_hrd = Some(parameters);
         }
 
-        vui.vcl_hrd_parameters_present_flag = r.read_bit()?;
-        if vui.vcl_hrd_parameters_present_flag {
-            Parser::parse_hrd(r, &mut vui.vcl_hrd_parameters)?;
+        let vcl_present = r.read_bit()?;
+        if vcl_present {
+            let mut parameters = HrdParams::default();
+            Parser::parse_hrd(r, &mut parameters)?;
+            vui.vcl_hrd = Some(parameters);
         }
 
-        if vui.nal_hrd_parameters_present_flag || vui.vcl_hrd_parameters_present_flag {
+        if nal_present || vcl_present {
             vui.low_delay_hrd_flag = r.read_bit()?;
         }
 
         vui.pic_struct_present_flag = r.read_bit()?;
-        vui.bitstream_restriction_flag = r.read_bit()?;
 
-        if vui.bitstream_restriction_flag {
-            vui.motion_vectors_over_pic_boundaries_flag = r.read_bit()?;
-            vui.max_bytes_per_pic_denom = r.read_ue()?;
-            vui.max_bits_per_mb_denom = r.read_ue_max(16)?;
-            vui.log2_max_mv_length_horizontal = r.read_ue_max(16)?;
-            vui.log2_max_mv_length_vertical = r.read_ue_max(16)?;
-            vui.max_num_reorder_frames = r.read_ue()?;
-            vui.max_dec_frame_buffering = r.read_ue()?;
+        if r.read_bit()? {
+            vui.restriction = Some(BitstreamRestriction {
+                motion_vectors_over_pic_boundaries: r.read_bit()?,
+                max_bytes_per_pic_denom: r.read_ue()?,
+                max_bits_per_mb_denom: r.read_ue_max(16)?,
+                log2_max_mv_length_horizontal: r.read_ue_max(16)?,
+                log2_max_mv_length_vertical: r.read_ue_max(16)?,
+                max_num_reorder_frames: r.read_ue()?,
+                max_dec_frame_buffering: r.read_ue()?,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn parse_sps_high_profile(r: &mut BitReader, sps: &mut Sps) -> Result<(), String> {
+        sps.chroma.idc = r.read_ue_max(3)?;
+        if sps.chroma.idc == 3 {
+            sps.chroma.separate_plane = r.read_bit()?;
+        }
+
+        sps.bit_depth.luma_minus8 = r.read_ue_max(6)?;
+        sps.bit_depth.chroma_minus8 = r.read_ue_max(6)?;
+        sps.bit_depth.transform_bypass = r.read_bit()?;
+        sps.scaling.present = r.read_bit()?;
+
+        if sps.scaling.present {
+            Parser::parse_sps_scaling_lists(r, sps)?;
+        } else {
+            Parser::fill_scaling_list_flat(&mut sps.scaling.lists_4x4, &mut sps.scaling.lists_8x8);
+        }
+
+        Ok(())
+    }
+
+    fn parse_sps_poc(r: &mut BitReader, sps: &mut Sps) -> Result<(), String> {
+        sps.pic_order_cnt_type = r.read_ue_max(2)?;
+
+        if sps.pic_order_cnt_type == 0 {
+            sps.log2_max_pic_order_cnt_lsb_minus4 = r.read_ue_max(12)?;
+            sps.expected_delta_per_pic_order_cnt_cycle = 0;
+        } else if sps.pic_order_cnt_type == 1 {
+            sps.delta_pic_order_always_zero_flag = r.read_bit()?;
+            sps.offset_for_non_ref_pic = r.read_se()?;
+            sps.offset_for_top_to_bottom_field = r.read_se()?;
+            sps.num_ref_frames_in_pic_order_cnt_cycle = r.read_ue_max(254)?;
+
+            let mut offset_acc = 0;
+            for i in 0..usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle) {
+                sps.offset_for_ref_frame[i] = r.read_se()?;
+
+                // (7-12) in the spec.
+                offset_acc += sps.offset_for_ref_frame[i];
+            }
+
+            sps.expected_delta_per_pic_order_cnt_cycle = offset_acc;
         }
 
         Ok(())
@@ -2019,12 +1923,14 @@ impl Parser {
         let mut r = BitReader::new(&data[nalu.header.len()..], true);
         let mut sps = Sps {
             profile_idc: r.read_bits(8)?,
-            constraint_set0_flag: r.read_bit()?,
-            constraint_set1_flag: r.read_bit()?,
-            constraint_set2_flag: r.read_bit()?,
-            constraint_set3_flag: r.read_bit()?,
-            constraint_set4_flag: r.read_bit()?,
-            constraint_set5_flag: r.read_bit()?,
+            constraints: [
+                r.read_bit()?,
+                r.read_bit()?,
+                r.read_bit()?,
+                r.read_bit()?,
+                r.read_bit()?,
+                r.read_bit()?,
+            ],
             ..Default::default()
         };
 
@@ -2049,92 +1955,58 @@ impl Parser {
             || sps.profile_idc == 134
             || sps.profile_idc == 135
         {
-            sps.chroma_format_idc = r.read_ue_max(3)?;
-            if sps.chroma_format_idc == 3 {
-                sps.separate_colour_plane_flag = r.read_bit()?;
-            }
-
-            sps.bit_depth_luma_minus8 = r.read_ue_max(6)?;
-            sps.bit_depth_chroma_minus8 = r.read_ue_max(6)?;
-            sps.qpprime_y_zero_transform_bypass_flag = r.read_bit()?;
-            sps.seq_scaling_matrix_present_flag = r.read_bit()?;
-
-            if sps.seq_scaling_matrix_present_flag {
-                Parser::parse_sps_scaling_lists(&mut r, &mut sps)?;
-            } else {
-                Parser::fill_scaling_list_flat(
-                    &mut sps.scaling_lists_4x4,
-                    &mut sps.scaling_lists_8x8,
-                );
-            }
+            Parser::parse_sps_high_profile(&mut r, &mut sps)?;
         } else {
-            sps.chroma_format_idc = 1;
-            Parser::fill_scaling_list_flat(&mut sps.scaling_lists_4x4, &mut sps.scaling_lists_8x8);
+            sps.chroma.idc = 1;
+            Parser::fill_scaling_list_flat(&mut sps.scaling.lists_4x4, &mut sps.scaling.lists_8x8);
         }
 
         sps.log2_max_frame_num_minus4 = r.read_ue_max(12)?;
 
-        sps.pic_order_cnt_type = r.read_ue_max(2)?;
+        Parser::parse_sps_poc(&mut r, &mut sps)?;
 
-        if sps.pic_order_cnt_type == 0 {
-            sps.log2_max_pic_order_cnt_lsb_minus4 = r.read_ue_max(12)?;
-            sps.expected_delta_per_pic_order_cnt_cycle = 0;
-        } else if sps.pic_order_cnt_type == 1 {
-            sps.delta_pic_order_always_zero_flag = r.read_bit()?;
-            sps.offset_for_non_ref_pic = r.read_se()?;
-            sps.offset_for_top_to_bottom_field = r.read_se()?;
-            sps.num_ref_frames_in_pic_order_cnt_cycle = r.read_ue_max(254)?;
-
-            let mut offset_acc = 0;
-            for i in 0..usize::from(sps.num_ref_frames_in_pic_order_cnt_cycle) {
-                sps.offset_for_ref_frame[i] = r.read_se()?;
-
-                // (7-12) in the spec.
-                offset_acc += sps.offset_for_ref_frame[i];
-            }
-
-            sps.expected_delta_per_pic_order_cnt_cycle = offset_acc;
-        }
-
-        sps.max_num_ref_frames = r.read_ue_max(DPB_MAX_SIZE as u32)?;
+        sps.max_num_ref_frames = r.read_ue_max(DPB_MAX_SIZE)?;
         sps.gaps_in_frame_num_value_allowed_flag = r.read_bit()?;
         sps.pic_width_in_mbs_minus1 = r.read_ue()?;
         sps.pic_height_in_map_units_minus1 = r.read_ue()?;
-        sps.frame_mbs_only_flag = r.read_bit()?;
+        sps.frame_field.frame_mbs_only = r.read_bit()?;
 
-        if !sps.frame_mbs_only_flag {
-            sps.mb_adaptive_frame_field_flag = r.read_bit()?;
+        if !sps.frame_field.frame_mbs_only {
+            sps.frame_field.mb_adaptive = r.read_bit()?;
         }
 
         sps.direct_8x8_inference_flag = r.read_bit()?;
-        sps.frame_cropping_flag = r.read_bit()?;
 
-        if sps.frame_cropping_flag {
-            sps.frame_crop_left_offset = r.read_ue()?;
-            sps.frame_crop_right_offset = r.read_ue()?;
-            sps.frame_crop_top_offset = r.read_ue()?;
-            sps.frame_crop_bottom_offset = r.read_ue()?;
+        if r.read_bit()? {
+            let crop = FrameCrop {
+                left: r.read_ue()?,
+                right: r.read_ue()?,
+                top: r.read_ue()?,
+                bottom: r.read_ue()?,
+            };
+            sps.crop = Some(crop);
 
             // Validate that cropping info is valid.
             let (crop_unit_x, crop_unit_y) = sps.crop_unit_x_y();
+            let crop = sps.crop.expect("crop just parsed");
 
-            let _ = sps
-                .frame_crop_left_offset
-                .checked_add(sps.frame_crop_right_offset)
+            let _ = crop
+                .left
+                .checked_add(crop.right)
                 .and_then(|r| r.checked_mul(crop_unit_x))
                 .and_then(|r| sps.width().checked_sub(r))
                 .ok_or::<String>("Invalid frame crop width".into())?;
 
-            let _ = sps
-                .frame_crop_top_offset
-                .checked_add(sps.frame_crop_bottom_offset)
+            let _ = crop
+                .top
+                .checked_add(crop.bottom)
                 .and_then(|r| r.checked_mul(crop_unit_y))
                 .and_then(|r| sps.height().checked_sub(r))
                 .ok_or::<String>("invalid frame crop height".into())?;
         }
 
-        sps.vui_parameters_present_flag = r.read_bit()?;
-        if sps.vui_parameters_present_flag {
+        if r.read_bit()? {
+            sps.vui = Some(VuiParams::default());
             Parser::parse_vui(&mut r, &mut sps)?;
         }
 
@@ -2161,11 +2033,10 @@ impl Parser {
         let data = nalu.as_ref();
         // Skip the header
         let mut r = BitReader::new(&data[nalu.header.len()..], true);
-        let pic_parameter_set_id = r.read_ue_max(MAX_PPS_COUNT as u32 - 1)?;
-        let seq_parameter_set_id = r.read_ue_max(MAX_SPS_COUNT as u32 - 1)?;
+        let pic_parameter_set_id = r.read_ue_max(u32::from(MAX_PPS_COUNT) - 1)?;
+        let seq_parameter_set_id = r.read_ue_max(u32::from(MAX_SPS_COUNT) - 1)?;
         let sps = self.get_sps(seq_parameter_set_id).ok_or::<String>(format!(
-            "Could not get SPS for seq_parameter_set_id {}",
-            seq_parameter_set_id
+            "Could not get SPS for seq_parameter_set_id {seq_parameter_set_id}"
         ))?;
         let mut pps = Pps {
             pic_parameter_set_id,
@@ -2173,26 +2044,22 @@ impl Parser {
             sps: Rc::clone(sps),
             scaling_lists_4x4: [[0; 16]; 6],
             scaling_lists_8x8: [[0; 64]; 6],
-            entropy_coding_mode_flag: Default::default(),
-            bottom_field_pic_order_in_frame_present_flag: Default::default(),
+            coding: PpsCodingFlags::default(),
+            prediction: PpsPredictionFlags::default(),
+            presence: PpsPresenceFlags::default(),
             num_slice_groups_minus1: Default::default(),
             num_ref_idx_l0_default_active_minus1: Default::default(),
             num_ref_idx_l1_default_active_minus1: Default::default(),
-            weighted_pred_flag: Default::default(),
             weighted_bipred_idc: Default::default(),
             pic_init_qp_minus26: Default::default(),
             pic_init_qs_minus26: Default::default(),
             chroma_qp_index_offset: Default::default(),
-            deblocking_filter_control_present_flag: Default::default(),
-            constrained_intra_pred_flag: Default::default(),
-            redundant_pic_cnt_present_flag: Default::default(),
-            transform_8x8_mode_flag: Default::default(),
             second_chroma_qp_index_offset: Default::default(),
             pic_scaling_matrix_present_flag: Default::default(),
         };
 
-        pps.entropy_coding_mode_flag = r.read_bit()?;
-        pps.bottom_field_pic_order_in_frame_present_flag = r.read_bit()?;
+        pps.coding.entropy_coding_mode_flag = r.read_bit()?;
+        pps.presence.bottom_field_pic_order_in_frame_present_flag = r.read_bit()?;
         pps.num_slice_groups_minus1 = r.read_ue_max(7)?;
 
         if pps.num_slice_groups_minus1 > 0 {
@@ -2202,10 +2069,10 @@ impl Parser {
         pps.num_ref_idx_l0_default_active_minus1 = r.read_ue_max(31)?;
         pps.num_ref_idx_l1_default_active_minus1 = r.read_ue_max(31)?;
 
-        pps.weighted_pred_flag = r.read_bit()?;
+        pps.prediction.weighted_pred_flag = r.read_bit()?;
         pps.weighted_bipred_idc = r.read_bits(2)?;
 
-        let qp_bd_offset_y = i32::from(6 * (sps.bit_depth_luma_minus8));
+        let qp_bd_offset_y = i32::from(6 * (sps.bit_depth.luma_minus8));
         pps.pic_init_qp_minus26 = r.read_se_bounded(-(26 + qp_bd_offset_y), 25)?;
         pps.pic_init_qs_minus26 = r.read_se_bounded(-26, 25)?;
 
@@ -2215,12 +2082,12 @@ impl Parser {
         // inferred to be equal to chroma_qp_index_offset.
         pps.second_chroma_qp_index_offset = pps.chroma_qp_index_offset;
 
-        pps.deblocking_filter_control_present_flag = r.read_bit()?;
-        pps.constrained_intra_pred_flag = r.read_bit()?;
-        pps.redundant_pic_cnt_present_flag = r.read_bit()?;
+        pps.presence.deblocking_filter_control_present_flag = r.read_bit()?;
+        pps.prediction.constrained_intra_pred_flag = r.read_bit()?;
+        pps.presence.redundant_pic_cnt_present_flag = r.read_bit()?;
 
         if r.has_more_rsbp_data() {
-            pps.transform_8x8_mode_flag = r.read_bit()?;
+            pps.coding.transform_8x8_mode_flag = r.read_bit()?;
             pps.pic_scaling_matrix_present_flag = r.read_bit()?;
 
             if pps.pic_scaling_matrix_present_flag {
@@ -2235,8 +2102,8 @@ impl Parser {
             // shall be inferred to be equal to those specified by the sequence
             // parameter set. When pic_scaling_matrix_present_flag is not
             // present, it shall be inferred to be not set.
-            pps.scaling_lists_4x4 = sps.scaling_lists_4x4;
-            pps.scaling_lists_8x8 = sps.scaling_lists_8x8;
+            pps.scaling_lists_4x4 = sps.scaling.lists_4x4;
+            pps.scaling_lists_8x8 = sps.scaling.lists_8x8;
         }
 
         let key = pps.pic_parameter_set_id;
@@ -2293,8 +2160,8 @@ impl Parser {
         header: &mut SliceHeader,
     ) -> Result<(), String> {
         if !header.slice_type.is_i() && !header.slice_type.is_si() {
-            header.ref_pic_list_modification_flag_l0 = r.read_bit()?;
-            if header.ref_pic_list_modification_flag_l0 {
+            header.list_modification.l0 = r.read_bit()?;
+            if header.list_modification.l0 {
                 Parser::parse_ref_pic_list_modification(
                     r,
                     header.num_ref_idx_l0_active_minus1,
@@ -2304,8 +2171,8 @@ impl Parser {
         }
 
         if header.slice_type.is_b() {
-            header.ref_pic_list_modification_flag_l1 = r.read_bit()?;
-            if header.ref_pic_list_modification_flag_l1 {
+            header.list_modification.l1 = r.read_bit()?;
+            if header.list_modification.l1 {
                 Parser::parse_ref_pic_list_modification(
                     r,
                     header.num_ref_idx_l1_active_minus1,
@@ -2459,6 +2326,110 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_slice_poc(
+        r: &mut BitReader,
+        sps: &Sps,
+        pps: &Pps,
+        header: &mut SliceHeader,
+    ) -> Result<(), String> {
+        let num_bits_left = r.num_bits_left();
+        let is_frame = header.field == Field::Frame;
+        if sps.pic_order_cnt_type == 0 {
+            header.pic_order_cnt_lsb =
+                r.read_bits(usize::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4)?;
+
+            if pps.presence.bottom_field_pic_order_in_frame_present_flag && is_frame {
+                header.delta_pic_order_cnt_bottom = r.read_se()?;
+            }
+        }
+
+        if sps.pic_order_cnt_type == 1 && !sps.delta_pic_order_always_zero_flag {
+            header.delta_pic_order_cnt[0] = r.read_se()?;
+            if pps.presence.bottom_field_pic_order_in_frame_present_flag && is_frame {
+                header.delta_pic_order_cnt[1] = r.read_se()?;
+            }
+        }
+        header.pic_order_cnt_bit_size = num_bits_left - r.num_bits_left();
+
+        Ok(())
+    }
+
+    fn parse_slice_ref_idx(
+        r: &mut BitReader,
+        pps: &Pps,
+        header: &mut SliceHeader,
+    ) -> Result<(), String> {
+        if !(header.slice_type.is_p() || header.slice_type.is_sp() || header.slice_type.is_b()) {
+            return Ok(());
+        }
+
+        header.num_ref_idx_active_override_flag = r.read_bit()?;
+        if header.num_ref_idx_active_override_flag {
+            header.num_ref_idx_l0_active_minus1 = r.read_ue()?;
+            if header.slice_type.is_b() {
+                header.num_ref_idx_l1_active_minus1 = r.read_ue()?;
+            }
+        } else {
+            header.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+            if header.slice_type.is_b() {
+                header.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_slice_tail(
+        r: &mut BitReader,
+        sps: &Sps,
+        pps: &Pps,
+        nalu: &Nalu,
+        header: &mut SliceHeader,
+    ) -> Result<(), String> {
+        Parser::parse_ref_pic_list_modifications(r, header)?;
+
+        if (pps.prediction.weighted_pred_flag
+            && (header.slice_type.is_p() || header.slice_type.is_sp()))
+            || (pps.weighted_bipred_idc == 1 && header.slice_type.is_b())
+        {
+            Parser::parse_pred_weight_table(r, sps, header)?;
+        }
+
+        // H.264 (01/2012) 7.3.3 order: list modification, weight table,
+        // marking, cabac init, qp delta.
+        if nalu.header.ref_idc != 0 {
+            Parser::parse_dec_ref_pic_marking(r, nalu, header)?;
+        }
+
+        if pps.coding.entropy_coding_mode_flag
+            && !header.slice_type.is_i()
+            && !header.slice_type.is_si()
+        {
+            header.cabac_init_idc = r.read_ue_max(2)?;
+        }
+
+        header.slice_qp_delta = r.read_se_bounded(-87, 77)?;
+
+        if header.slice_type.is_sp() || header.slice_type.is_si() {
+            if header.slice_type.is_sp() {
+                header.sp_for_switch_flag = r.read_bit()?;
+            }
+
+            header.slice_qs_delta = r.read_se_bounded(-51, 51)?;
+        }
+
+        if pps.presence.deblocking_filter_control_present_flag {
+            header.disable_deblocking_filter_idc = r.read_ue_max(2)?;
+
+            if header.disable_deblocking_filter_idc != 1 {
+                header.slice_alpha_c0_offset_div2 = r.read_se_bounded(-6, 6)?;
+                header.slice_beta_offset_div2 = r.read_se_bounded(-6, 6)?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn parse_slice_header<'a>(&self, nalu: Nalu<'a>) -> Result<Slice<'a>, String> {
         if !matches!(
             nalu.header.type_,
@@ -2498,48 +2469,36 @@ impl Parser {
 
         let sps = &pps.sps;
 
-        if sps.separate_colour_plane_flag {
+        if sps.chroma.separate_plane {
             header.colour_plane_id = r.read_bits(2)?;
         }
 
         header.frame_num = r.read_bits(usize::from(sps.log2_max_frame_num_minus4) + 4)?;
 
-        if !sps.frame_mbs_only_flag {
-            header.field_pic_flag = r.read_bit()?;
-            if header.field_pic_flag {
-                header.bottom_field_flag = r.read_bit()?;
-            }
+        if !sps.frame_field.frame_mbs_only {
+            let field_pic = r.read_bit()?;
+            header.field = if field_pic && r.read_bit()? {
+                Field::Bottom
+            } else if field_pic {
+                Field::Top
+            } else {
+                Field::Frame
+            };
         }
 
-        if header.field_pic_flag {
-            header.max_pic_num = 2 * sps.max_frame_num();
+        header.max_pic_num = if header.field == Field::Frame {
+            sps.max_frame_num()
         } else {
-            header.max_pic_num = sps.max_frame_num();
-        }
+            2 * sps.max_frame_num()
+        };
 
         if nalu.header.idr_pic_flag {
             header.idr_pic_id = r.read_ue_max(0xffff)?;
         }
 
-        let num_bits_left = r.num_bits_left();
-        if sps.pic_order_cnt_type == 0 {
-            header.pic_order_cnt_lsb =
-                r.read_bits(usize::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4)?;
+        Parser::parse_slice_poc(&mut r, sps, pps, &mut header)?;
 
-            if pps.bottom_field_pic_order_in_frame_present_flag && !header.field_pic_flag {
-                header.delta_pic_order_cnt_bottom = r.read_se()?;
-            }
-        }
-
-        if sps.pic_order_cnt_type == 1 && !sps.delta_pic_order_always_zero_flag {
-            header.delta_pic_order_cnt[0] = r.read_se()?;
-            if pps.bottom_field_pic_order_in_frame_present_flag && !header.field_pic_flag {
-                header.delta_pic_order_cnt[1] = r.read_se()?;
-            }
-        }
-        header.pic_order_cnt_bit_size = num_bits_left - r.num_bits_left();
-
-        if pps.redundant_pic_cnt_present_flag {
+        if pps.presence.redundant_pic_cnt_present_flag {
             header.redundant_pic_cnt = r.read_ue_max(127)?;
         }
 
@@ -2547,22 +2506,9 @@ impl Parser {
             header.direct_spatial_mv_pred_flag = r.read_bit()?;
         }
 
-        if header.slice_type.is_p() || header.slice_type.is_sp() || header.slice_type.is_b() {
-            header.num_ref_idx_active_override_flag = r.read_bit()?;
-            if header.num_ref_idx_active_override_flag {
-                header.num_ref_idx_l0_active_minus1 = r.read_ue()?;
-                if header.slice_type.is_b() {
-                    header.num_ref_idx_l1_active_minus1 = r.read_ue()?;
-                }
-            } else {
-                header.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
-                if header.slice_type.is_b() {
-                    header.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
-                }
-            }
-        }
+        Parser::parse_slice_ref_idx(&mut r, pps, &mut header)?;
 
-        if header.field_pic_flag {
+        if header.field != Field::Frame {
             if header.num_ref_idx_l0_active_minus1 > 31 || header.num_ref_idx_l1_active_minus1 > 31
             {
                 return Err("Broken Data".into());
@@ -2577,40 +2523,7 @@ impl Parser {
             return Err("Stream contain unsupported/unimplemented NALs".into());
         }
 
-        Parser::parse_ref_pic_list_modifications(&mut r, &mut header)?;
-
-        if (pps.weighted_pred_flag && (header.slice_type.is_p() || header.slice_type.is_sp()))
-            || (pps.weighted_bipred_idc == 1 && header.slice_type.is_b())
-        {
-            Parser::parse_pred_weight_table(&mut r, sps, &mut header)?;
-        }
-
-        if nalu.header.ref_idc != 0 {
-            Parser::parse_dec_ref_pic_marking(&mut r, &nalu, &mut header)?;
-        }
-
-        if pps.entropy_coding_mode_flag && !header.slice_type.is_i() && !header.slice_type.is_si() {
-            header.cabac_init_idc = r.read_ue_max(2)?;
-        }
-
-        header.slice_qp_delta = r.read_se_bounded(-87, 77)?;
-
-        if header.slice_type.is_sp() || header.slice_type.is_si() {
-            if header.slice_type.is_sp() {
-                header.sp_for_switch_flag = r.read_bit()?;
-            }
-
-            header.slice_qs_delta = r.read_se_bounded(-51, 51)?;
-        }
-
-        if pps.deblocking_filter_control_present_flag {
-            header.disable_deblocking_filter_idc = r.read_ue_max(2)?;
-
-            if header.disable_deblocking_filter_idc != 1 {
-                header.slice_alpha_c0_offset_div2 = r.read_se_bounded(-6, 6)?;
-                header.slice_beta_offset_div2 = r.read_se_bounded(-6, 6)?;
-            }
-        }
+        Parser::parse_slice_tail(&mut r, sps, pps, &nalu, &mut header)?;
 
         if pps.num_slice_groups_minus1 > 0 {
             return Err("Stream contain unsupported/unimplemented NALs".into());
@@ -2647,7 +2560,9 @@ impl Header for NaluHeader {
             .read_exact(&mut byte_buf)
             .map_err(|_| String::from("Broken Data"))?;
         let byte = byte_buf[0];
-        let _ = cursor.seek(SeekFrom::Current(-1 * byte_buf.len() as i64));
+        let _ = cursor.seek(SeekFrom::Current(
+            -(i64::try_from(byte_buf.len()).map_err(|_| "rewind range")?),
+        ));
 
         let type_ = NaluType::try_from(byte & 0x1f)?;
 

@@ -11,9 +11,9 @@ use crate::ffi::{
     VaSurfaceId,
 };
 use crate::frontend::SurfaceSlot;
-use crate::vendor::h264::dpb::Dpb;
-use crate::vendor::h264::parser::{Level, Pps, SliceHeader, Sps};
-use crate::vendor::h264::picture::{PictureData, Reference};
+use crate::h264::dpb::Dpb;
+use crate::h264::parser::{Level, Pps, SliceHeader, Sps};
+use crate::h264::picture::{Field, PictureData, Reference};
 
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
@@ -70,7 +70,7 @@ impl<'a> Params<'a> {
         pic: &PictureData,
         surface: VaSurfaceId,
     ) -> Result<VaPictureParameterBufferH264, VaApiError> {
-        let interlaced = u32::from(!sps.frame_mbs_only_flag);
+        let interlaced = u32::from(!sps.frame_field.frame_mbs_only);
         let height_in_mbs = (u32::from(sps.pic_height_in_map_units_minus1) + 1) << interlaced;
         let height_in_mbs = u16::try_from(height_in_mbs.saturating_sub(1))
             .map_err(|_| VaApiError::Parse("coded height range".to_owned()))?;
@@ -79,8 +79,8 @@ impl<'a> Params<'a> {
             reference_frames: self.reference_frames()?,
             picture_width_in_mbs_minus1: sps.pic_width_in_mbs_minus1,
             picture_height_in_mbs_minus1: height_in_mbs,
-            bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
-            bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
+            bit_depth_luma_minus8: sps.bit_depth.luma_minus8,
+            bit_depth_chroma_minus8: sps.bit_depth.chroma_minus8,
             num_ref_frames: sps.max_num_ref_frames,
             seq_fields: Self::seq_fields(sps),
             num_slice_groups_minus1: 0,
@@ -181,7 +181,7 @@ impl<'a> Params<'a> {
                 break;
             }
             let picture = entry.pic.borrow();
-            if picture.nonexisting || picture.is_second_field() {
+            if picture.nonexisting {
                 continue;
             }
             let Some(slot) = entry.reference.or(entry.decoded_frame) else {
@@ -272,11 +272,11 @@ impl<'a> Params<'a> {
             SEQ_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4, SEQ_MBAFF, SEQ_MIN_LUMA_BI_PRED_SIZE_8X8,
             SEQ_PIC_ORDER_CNT_TYPE, SEQ_SEPARATE_COLOUR_PLANE,
         };
-        (u32::from(sps.chroma_format_idc) << SEQ_CHROMA_FORMAT_IDC)
-            | (u32::from(sps.separate_colour_plane_flag) << SEQ_SEPARATE_COLOUR_PLANE)
+        (u32::from(sps.chroma.idc) << SEQ_CHROMA_FORMAT_IDC)
+            | (u32::from(sps.chroma.separate_plane) << SEQ_SEPARATE_COLOUR_PLANE)
             | (u32::from(sps.gaps_in_frame_num_value_allowed_flag) << SEQ_GAPS_IN_FRAME_NUM)
-            | (u32::from(sps.frame_mbs_only_flag) << SEQ_FRAME_MBS_ONLY)
-            | (u32::from(sps.mb_adaptive_frame_field_flag) << SEQ_MBAFF)
+            | (u32::from(sps.frame_field.frame_mbs_only) << SEQ_FRAME_MBS_ONLY)
+            | (u32::from(sps.frame_field.mb_adaptive) << SEQ_MBAFF)
             | (u32::from(sps.direct_8x8_inference_flag) << SEQ_DIRECT_8X8_INFERENCE)
             | (u32::from(sps.level_idc >= Level::L3_1) << SEQ_MIN_LUMA_BI_PRED_SIZE_8X8)
             | (u32::from(sps.log2_max_frame_num_minus4) << SEQ_LOG2_MAX_FRAME_NUM_MINUS4)
@@ -294,16 +294,18 @@ impl<'a> Params<'a> {
             PIC_REDUNDANT_PIC_CNT_PRESENT, PIC_REFERENCE_PIC, PIC_TRANSFORM_8X8_MODE,
             PIC_WEIGHTED_BIPRED_IDC, PIC_WEIGHTED_PRED,
         };
-        (u32::from(pps.entropy_coding_mode_flag) << PIC_ENTROPY_CODING_MODE)
-            | (u32::from(pps.weighted_pred_flag) << PIC_WEIGHTED_PRED)
+        (u32::from(pps.coding.entropy_coding_mode_flag) << PIC_ENTROPY_CODING_MODE)
+            | (u32::from(pps.prediction.weighted_pred_flag) << PIC_WEIGHTED_PRED)
             | (u32::from(pps.weighted_bipred_idc) << PIC_WEIGHTED_BIPRED_IDC)
-            | (u32::from(pps.transform_8x8_mode_flag) << PIC_TRANSFORM_8X8_MODE)
-            | (u32::from(header.field_pic_flag) << PIC_FIELD_PIC)
-            | (u32::from(pps.constrained_intra_pred_flag) << PIC_CONSTRAINED_INTRA_PRED)
-            | (u32::from(pps.bottom_field_pic_order_in_frame_present_flag) << PIC_ORDER_PRESENT)
-            | (u32::from(pps.deblocking_filter_control_present_flag)
+            | (u32::from(pps.coding.transform_8x8_mode_flag) << PIC_TRANSFORM_8X8_MODE)
+            | (u32::from(header.field != Field::Frame) << PIC_FIELD_PIC)
+            | (u32::from(pps.prediction.constrained_intra_pred_flag) << PIC_CONSTRAINED_INTRA_PRED)
+            | (u32::from(pps.presence.bottom_field_pic_order_in_frame_present_flag)
+                << PIC_ORDER_PRESENT)
+            | (u32::from(pps.presence.deblocking_filter_control_present_flag)
                 << PIC_DEBLOCKING_FILTER_CONTROL_PRESENT)
-            | (u32::from(pps.redundant_pic_cnt_present_flag) << PIC_REDUNDANT_PIC_CNT_PRESENT)
+            | (u32::from(pps.presence.redundant_pic_cnt_present_flag)
+                << PIC_REDUNDANT_PIC_CNT_PRESENT)
             | (u32::from(pic.nal_ref_idc != 0) << PIC_REFERENCE_PIC)
     }
 }
@@ -343,7 +345,7 @@ struct Weights {
 impl Weights {
     /// Weights for `header` under `sps` and `pps`.
     fn new(header: &SliceHeader, sps: &Sps, pps: &Pps) -> Self {
-        use crate::vendor::h264::parser::SliceType;
+        use crate::h264::parser::SliceType;
 
         let mut weights = Self {
             luma_log2_denom: header.pred_weight_table.luma_log2_weight_denom,
@@ -362,8 +364,8 @@ impl Weights {
             chroma_offset_l1: [[0; 2]; 32],
         };
         let table = &header.pred_weight_table;
-        let l0 =
-            pps.weighted_pred_flag && matches!(header.slice_type, SliceType::P | SliceType::Sp);
+        let l0 = pps.prediction.weighted_pred_flag
+            && matches!(header.slice_type, SliceType::P | SliceType::Sp);
         let l1 = pps.weighted_bipred_idc == 1 && matches!(header.slice_type, SliceType::B);
         if l0 || l1 {
             weights.luma_l0_flag = 1;
@@ -422,19 +424,27 @@ mod tests {
     use super::Params;
     use crate::error::VaApiError;
     use crate::frontend::SurfaceSlot;
-    use crate::vendor::h264::dpb::Dpb;
-    use crate::vendor::h264::parser::{Level, PpsBuilder, SliceHeader, Sps};
-    use crate::vendor::h264::picture::{PictureData, Reference};
+    use crate::h264::dpb::Dpb;
+    use crate::h264::parser::{
+        ChromaFormat, FrameFieldCoding, Level, PpsBuilder, SliceHeader, Sps,
+    };
+    use crate::h264::picture::{PictureData, Reference};
 
     /// Sequence set matching the word test below.
     fn sps() -> std::rc::Rc<Sps> {
         std::rc::Rc::new(Sps {
             profile_idc: 100,
             level_idc: Level::L4,
-            chroma_format_idc: 1,
+            chroma: ChromaFormat {
+                idc: 1,
+                ..Default::default()
+            },
             pic_width_in_mbs_minus1: 119,
             pic_height_in_map_units_minus1: 67,
-            frame_mbs_only_flag: true,
+            frame_field: FrameFieldCoding {
+                frame_mbs_only: true,
+                ..Default::default()
+            },
             direct_8x8_inference_flag: true,
             ..Sps::default()
         })
@@ -500,7 +510,7 @@ mod tests {
         let params = Params::new(&dpb, &[7]);
         let mut pic = PictureData::default();
         pic.nal_ref_idc = 1;
-        pic.set_reference(Reference::ShortTerm, true);
+        pic.set_reference(Reference::ShortTerm);
         let header = SliceHeader::default();
         let raw = params
             .picture(&sps, &pps, &header, &pic, 7)
@@ -522,7 +532,7 @@ mod tests {
         let mut dpb: Dpb<SurfaceSlot> = Dpb::default();
         dpb.set_limits(16, 16);
         let mut pic = PictureData::default();
-        pic.set_reference(Reference::ShortTerm, true);
+        pic.set_reference(Reference::ShortTerm);
         dpb.store_picture(pic.into_rc(), Some(SurfaceSlot::new(3)))
             .expect("dpb room");
         let params = Params::new(&dpb, &[7]);
@@ -543,7 +553,7 @@ mod tests {
         pic.frame_num = 5;
         pic.top_field_order_cnt = 10;
         pic.bottom_field_order_cnt = 10;
-        pic.set_reference(Reference::ShortTerm, true);
+        pic.set_reference(Reference::ShortTerm);
         dpb.store_picture(pic.into_rc(), Some(SurfaceSlot::new(0)))
             .expect("dpb room");
         let params = Params::new(&dpb, &[41]);

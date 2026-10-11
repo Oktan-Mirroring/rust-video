@@ -5,8 +5,8 @@ use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::VaSliceParameterBufferH264;
 use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
+use crate::h264::parser::{SliceHeader, SliceType};
 use crate::params::Params;
-use crate::vendor::h264::parser::{SliceHeader, SliceType};
 
 use bytes::Bytes;
 use rust_video::{
@@ -146,7 +146,7 @@ impl<'a> H264Decoder<'a> {
             SliceType::P | SliceType::Sp => {
                 let list0 = self.frontend.modify(
                     header,
-                    &initial.ref_pic_list_p0,
+                    &initial.p_list,
                     false,
                     curr_pic_num,
                     max_pic_num,
@@ -156,14 +156,14 @@ impl<'a> H264Decoder<'a> {
             SliceType::B => {
                 let list0 = self.frontend.modify(
                     header,
-                    &initial.ref_pic_list_b0,
+                    &initial.b_list0,
                     false,
                     curr_pic_num,
                     max_pic_num,
                 )?;
                 let list1 = self.frontend.modify(
                     header,
-                    &initial.ref_pic_list_b1,
+                    &initial.b_list1,
                     true,
                     curr_pic_num,
                     max_pic_num,
