@@ -1,13 +1,70 @@
 # VA-API decode tier
 
 H.264 decode over DRM render nodes behind the facade `Decoder` shape:
-`crates/rust-video-vaapi`. The frontend (Annex B parse, picture-order
-counts, DPB, reference lists) vendors the H.264 parser and DPB from
-`cros-codecs` 0.0.6 into `src/vendor/` (BSD-3-Clause, attribution kept,
-no `cros-codecs` dependency); the libva binding is a minimal hand
-rebind; the two meet in a portable parameter layer. The crate builds on
-every platform and decodes on Linux where a render node offers H.264
-VLD into NV12.
+`crates/rust-video-vaapi`. H.265, VP8, VP9, and AV1 carry staged
+frontends: parser sources on disk with typed decline until each is
+wired. The libva binding is a minimal hand rebind; syntax and
+parameters meet in a portable layer. The crate builds on every
+platform and decodes on Linux where a render node offers the matching
+VLD profile into NV12.
+
+## Module map
+
+| Path | Owns |
+|---|---|
+| `lib.rs` | crate root, public decoders and errors |
+| `device.rs` | `VaApiDevice`, first capable render node |
+| `backend.rs` | config, context, surface pool, submit, NV12 readback with crop |
+| `decoder.rs` | `H264Decoder`: ingest → begin → submit → commit → readback; `VaApiFrame` |
+| `frontend.rs` | Annex B into ordered `Picture`s over DPB slots, POC, reference lists |
+| `params.rs` | syntax onto VA-API picture/slice buffers |
+| `ffi.rs` | hand rebind of the used libva subset, layouts pinned against `/usr/include/va/va.h` (libva 1.22.0) with size tests |
+| `error.rs` | `VaApiError`/`SkipReason` |
+| `bitstream.rs` | `BitReader`: bits, Exp-Golomb, emulation prevention, `more_rbsp_data` |
+| `h264.rs` + `h264/` | wired H.264 syntax: `nalu`, `parser`, `dpb`, `picture` |
+| `h265.rs` + `h265/` | staged H.265 syntax: `parser`, `dpb`, `picture` (dormant) |
+| `vp8.rs` + `vp8/` | staged VP8 syntax: `parser`, `bool_decoder`, `probs` (dormant) |
+| `vp9.rs` + `vp9/` | staged VP9 syntax: `parser`, `lookups` (dormant) |
+| `av1.rs` + `av1/` | staged AV1 syntax: `parser`, `reader`, `helpers` (dormant) |
+
+Dormant means the subdirectory files are not declared with `mod` and
+do not join the build; the sibling shim (`h265.rs`, `vp8.rs`,
+`vp9.rs`, `av1.rs`) exports the decoder handle whose `decode`
+declines every packet with typed `Unsupported`, covered by unit
+tests. Off Linux the crate compiles and every entry point declines
+with typed `Skipped`.
+
+## Per-codec now / later
+
+| Codec | Now | Later |
+|---|---|---|
+| H.264 | fully wired: Annex B parse, POC (8.2.1), first-VCL (7.4.1.2.4), list modification (8.2.4.3), marking (8.2.5.1), DPB, VA-API submit, NV12 readback | interlaced, FMO, separate planes, non-4:2:0, high bit depth stay typed `Unsupported` (no H.264 VLD profile covers them) |
+| H.265 | parser + DPB + picture sources staged with attribution; shell declines typed | wire parser `mod`, frontend, params, e2e against ffmpeg oracle |
+| VP8 | parser + boolean decoder + probability tables staged with attribution; shell declines typed | restore `position` on `BitReader`, wire parser `mod`, frontend, params, e2e |
+| VP9 | parser + lookup tables staged with attribution; shell declines typed | restore `position` and `read_bits_signed` on `BitReader`, wire parser `mod`, frontend, params, e2e |
+| AV1 | OBU parser + reader + helpers staged with attribution; shell declines typed | restore `position` and `read_bits_aligned` on `BitReader`, wire reader/parser `mod`, frontend, params, e2e |
+
+The missing `BitReader` surface (`position`, `read_bits_aligned`,
+`read_bits_signed`, `read_le`) was cut with the old `vendor/`
+enclave, which only H.264 callers needed. Each staged codec's later
+column names exactly which pieces its parser calls, so the restore
+happens once per wiring, not up front.
+
+## Provenance
+
+Syntax sources: `cros-codecs` 0.0.6, BSD-3-Clause, Copyright
+2022–2024 The ChromiumOS Authors. License text kept at
+`crates/rust-video-vaapi/LICENSE.cros-codecs`; every staged file
+keeps its upstream copyright header. No `cros-codecs` dependency.
+The H.264 tree is restructured from upstream (grouped parameter
+structs, safe index math where the workspace denies `unsafe_code`);
+the staged trees are byte-close to upstream pending their wiring.
+
+Slice tail order follows ITU-T H.264 (01/2012) 7.3.3: list
+modification, weight table, marking, cabac init, qp delta. A
+restructure once read marking before the tail and shifted every
+later field on P/B slices; the call site in `parse_slice_tail`
+pins the order.
 
 ## Binding decision
 
@@ -16,7 +73,7 @@ Three candidates, measured on this box (AMD Granite Ridge + NVIDIA RTX
 
 | Candidate | Check time | Normal tree | Verdict |
 |---|---|---|---|
-| `cros-codecs` 0.0.6, default features | 2.35 s | 1 crate (`log`) | **taken, then vendored**, H.264 frontend only |
+| `cros-codecs` 0.0.6, default features | 2.35 s | 1 crate (`log`) | **taken, then staged**, H.264 wired |
 | `cros-codecs` 0.0.6, `vaapi` feature | 7.4 s | 127 nodes (`drm`, `gbm`, `nix`, `zerocopy`, …) | rejected |
 | `cros-libva` 0.0.12 standalone | 12.95 s | `bindgen` + `libclang` at build time | rejected |
 
@@ -27,52 +84,7 @@ Android, declining at runtime), and its C2-wrapper API is `Rc`-based and
 not shaped for the facade. `cros-libva` alone was rejected because its
 `bindgen` build step needs `libclang` plus libva headers on every build
 machine, while the tier touches about twenty entry points whose total
-rebind is smaller than the build dependency. Both rejects were measured,
-not assumed: the numbers above are `cargo check` wall time on a warm
-registry.
-
-What shipped instead: the H.264 frontend vendored from `cros-codecs`
-0.0.6 (pure-Rust parser plus DPB, portable, one `log` dependency kept
-for its `debug!` calls), and a hand rebind of the used libva subset
-(`ffi.rs`, layouts pinned against `/usr/include/va/va.h` from libva
-1.22.0 with size tests). The vendored sources were the dependency:
-`cros-codecs-0.0.6/src/codec/h264` is byte-identical to the depth-1
-clone of `chromeos/cros-codecs` at `71387be` (`diff -rq` clean), so
-the audit below covers both.
-
-Annex B assembly, picture-order counts (8.2.1), first-VCL detection
-(7.4.1.2.4), list modification (8.2.4.3), and the marking sequence
-(8.2.5.1) are implemented in this crate against the spec; the vendored
-pieces are the NAL/SPS/PPS/slice-header parser and the DPB primitives
-(picture numbers, initial lists, MMCO 1–6, sliding window, store/bump).
-
-## Vendoring
-
-Source: `cros-codecs` 0.0.6, BSD-3-Clause, Copyright 2022–2024 The
-ChromiumOS Authors. License text kept at
-`crates/rust-video-vaapi/LICENSE.cros-codecs`; every vendored file
-keeps its upstream copyright header. Only the H.264 frontend plus its
-direct closure came over:
-
-| Upstream | Vendored as |
-|---|---|
-| `src/codec/h264/parser.rs` | `src/vendor/h264/parser.rs` |
-| `src/codec/h264/dpb.rs` | `src/vendor/h264/dpb.rs` |
-| `src/codec/h264/picture.rs` | `src/vendor/h264/picture.rs` |
-| `src/codec/h264/nalu.rs` | `src/vendor/h264/nalu.rs` |
-| `src/bitstream_utils.rs` | `src/vendor/bitstream_utils.rs` |
-| `Resolution` block in `src/lib.rs` | `src/vendor/types.rs` |
-
-Trimmed: everything H.265/VP8/VP9/AV1 (the `NalIterator` H.265 impl in
-`bitstream_utils.rs` fell with it), `nalu_writer.rs`, `synthesizer.rs`,
-the backends/decoders/encoders, and the upstream `#[cfg(test)]`
-modules with their `test_data/` blobs (this crate's own 44 tests cover
-the vendored paths). Adaptations: `crate::` imports repointed at
-`crate::vendor::`, and the one `unsafe` (`dpb.rs` pointer-offset index
-math) rewritten as a safe `position()` search, since the workspace
-denies `unsafe_code`. The module carries `#[allow(dead_code, ...)]`:
-vendored code keeps its upstream API surface, most of which no local
-caller touches.
+rebind is smaller than the build dependency.
 
 ## RPS audit
 
@@ -80,13 +92,12 @@ Audited against ITU-T H.264 (01/2012), Tier 1, fetched from the ITU for
 this task. Cross-checks: FFmpeg `libavcodec` in-tree and the
 backend-gated half of `cros-codecs` 0.0.6 (Tier 2, read-only reference).
 
-Vendored code, verified clause by clause: frame/field picture numbers
+Staged code, verified clause by clause: frame/field picture numbers
 (8.2.4.1) match; P-frame (8.2.4.2.1) and B-frame (8.2.4.2.3) initial
 lists match, including the B1 identity swap, the poc-type-0
 non-existing exclusion, and POC — not FrameNumWrap — ordering for every
-poc type (an early FrameNumWrap suspicion died on the spec text);
-sliding window (8.2.5.3) and MMCO 1–6 (8.2.5.4) match, including the
-MMCO 5 order-count reset arithmetic.
+poc type; sliding window (8.2.5.3) and MMCO 1–6 (8.2.5.4) match,
+including the MMCO 5 order-count reset arithmetic.
 
 Holes found and how each ships:
 
@@ -135,18 +146,6 @@ that is harness-area work, not a tier gap. High 4:2:2 and High 4:4:4
 vectors decline with typed `Unsupported`: VA-API defines no H.264 VLD
 profile outside 8-bit 4:2:0, so there is nothing to fall back to.
 
-## Layout
-
-`device.rs` opens the first H.264-capable render node (`VaApiDevice`,
-facade `Device`). `frontend.rs` turns Annex B into ordered `Picture`s
-over DPB slots. `params.rs` maps syntax onto VA-API buffers.
-`backend.rs` owns the config, context, surface pool, submit, and NV12
-readback with crop. `decoder.rs` (`H264Decoder`, facade `Decoder`)
-drives ingest → begin → submit → commit → readback; `VaApiFrame`
-carries NV12 bytes, identity, and a lease. `ffi.rs` is the rebind;
-`error.rs` holds `VaApiError`/`SkipReason`. Off Linux the crate
-compiles and every entry point declines with typed `Skipped`.
-
 Budgets: output frames are readback copies, so they lease their byte
 count against an unbounded readback budget that documents exactly that;
 the fixed surface pool cannot overrun, and pool-sized accounting would
@@ -156,7 +155,7 @@ spuriously trip on streams longer than the pool.
 
 - ITU-T H.264 (01/2012), clauses 7.4.1.2.4, 8.2.1, 8.2.4, 8.2.5:
   `https://www.itu.int/rec/T-REC-H.264-201201-S`
-- `cros-codecs` 0.0.6 (vendored sources, see above):
+- `cros-codecs` 0.0.6 (staged sources, see above):
   `https://docs.rs/cros-codecs/0.0.6/`,
   `https://github.com/chromeos/cros-codecs`
 - libva 1.22.0 `va.h` (FFI ground truth, profiles, H.264 layouts):

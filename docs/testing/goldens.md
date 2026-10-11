@@ -13,7 +13,9 @@ profile, each pixel format, each bit depth the matrix names. On top of
 that, hot combinations exercise the paths production actually hits
 (1080p High, 4K Main 10, AV1 film grain). No combinatorial explosion:
 one per option plus the hot list. A new option without a vector is an
-incomplete change; the gate says so.
+incomplete change; the gate says so. A codec landing is not done
+until every golden runs green against it; stale goldens get
+regenerated in the same change.
 
 Tests stay broad and data-driven. One runner walks the corpus and the
 required matrix; no per-case test function exists to update. The matrix
