@@ -3,7 +3,7 @@
 > rust-video is a production-grade safe Rust interface over realtime video
 > handling: codec backends plus platform tiers behind one facade. This file is
 > the quality bar.
-> Detail lives in the README and in `.claude/skills/`. When something here grows
+> Detail lives in the README and in `.agents/skills/`. When something here grows
 > into a how-to, move it there and link it below.
 
 ## Prime directives
@@ -57,7 +57,7 @@ Non-negotiable. A change that violates one is a regression.
 | the repo's shape and how to build it | [`README.md`](README.md) |
 | the workspace, crates, and lint floor | [`Cargo.toml`](Cargo.toml) |
 | any task's route | [`docs/AGENT-ROUTING.md`](docs/AGENT-ROUTING.md) |
-| the scope rule | [`.claude/skills/realtime-scope/SKILL.md`](.claude/skills/realtime-scope/SKILL.md) |
+| the scope rule | [`.agents/skills/realtime-scope/SKILL.md`](.agents/skills/realtime-scope/SKILL.md) |
 | how to test | [`docs/testing/README.md`](docs/testing/README.md) |
 | codec specs and sourcing | [`docs/specs/`](docs/specs/h264.md), [`docs/sourcing.md`](docs/sourcing.md) |
 | compatibility and pins | [`docs/compat.md`](docs/compat.md) |
