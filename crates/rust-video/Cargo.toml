@@ -17,4 +17,5 @@ rust-video-harness = { path = "../rust-video-harness" }
 workspace = true
 
 [dependencies]
+bytes = "1"
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }

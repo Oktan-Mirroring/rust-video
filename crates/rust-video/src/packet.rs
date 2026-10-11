@@ -2,10 +2,12 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
+
 /// Coded bytes with timing and keyframe flag.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Packet {
-    data: Vec<u8>,
+    data: Bytes,
     pts: Option<Duration>,
     dts: Option<Duration>,
     keyframe: bool,
@@ -14,7 +16,7 @@ pub struct Packet {
 impl Packet {
     /// Packet carrying `data` with no timestamps and no keyframe flag.
     #[must_use]
-    pub fn new(data: Vec<u8>) -> Self {
+    pub fn new(data: Bytes) -> Self {
         Self {
             data,
             pts: None,
@@ -73,11 +75,13 @@ impl Packet {
 mod tests {
     use std::time::Duration;
 
+    use bytes::Bytes;
+
     use super::Packet;
 
     #[test]
     fn new_packet_has_no_stamps_or_flag() {
-        let packet = Packet::new(vec![0x65, 0x88]);
+        let packet = Packet::new(Bytes::from_static(&[0x65, 0x88]));
         assert_eq!(packet.data(), &[0x65, 0x88]);
         assert_eq!(packet.pts(), None);
         assert_eq!(packet.dts(), None);
@@ -88,7 +92,7 @@ mod tests {
     fn builders_stamp_time_and_flag() {
         let pts = Duration::from_millis(40);
         let dts = Duration::from_millis(20);
-        let packet = Packet::new(vec![1])
+        let packet = Packet::new(Bytes::from_static(&[1]))
             .with_pts(pts)
             .with_dts(dts)
             .mark_keyframe();

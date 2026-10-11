@@ -21,7 +21,8 @@ already exists; this crate stays on the live path.
 
 | Path | Holds |
 |---|---|
-| `crates/rust-video` | Facade: codec and tier enums |
+| `crates/rust-video` | Facade: codec and tier enums, packet and frame types |
+| `docs/runtime.md` | Runtime data-plane ownership and flow rules |
 | `crates/rust-video-h264` … `-av2` | Codec backends, one crate each |
 | `crates/rust-video-vulkan` … `-mediacodec` | Platform tiers, one crate each |
 | `crates/rust-video-livepack` | Livepack frame packing |
@@ -50,6 +51,7 @@ Windows compiles in CI only; see `.github/workflows/ci.yml`.
 - AOMedia AV2 specification v1.0.0: <https://av2.aomedia.org/v1.0.0/>
 - VP9 v0.7 specification and levels: <https://www.webmproject.org/vp9/levels/>
 - RFC 6386: VP8 data format.
+- bytes 1.12.1: <https://docs.rs/bytes/1.12.1/> (refcounted packet and plane backing).
 
 ## License
 

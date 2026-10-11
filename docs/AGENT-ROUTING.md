@@ -17,3 +17,4 @@ that proves it.
 | touch a codec cap or level | `docs/specs/<codec>.md`, `docs/sourcing.md` | `just spec-check` |
 | add a sourced value | `docs/sourcing.md` tier table | `just ci` |
 | touch versions, tiers, or CI matrix | `docs/compat.md` | `just ci` |
+| touch frames, pools, queues, or exports | `docs/runtime.md` | `just ci` |
