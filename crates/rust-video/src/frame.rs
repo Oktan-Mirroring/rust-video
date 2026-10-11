@@ -62,6 +62,10 @@ pub enum PixelFormat {
     Nv12,
     /// Planar 8-bit 4:2:0.
     Yuv420P,
+    /// Planar 8-bit 4:2:2.
+    Yuv422P,
+    /// Planar 8-bit 4:4:4.
+    Yuv444P,
     /// Packed 8-bit RGBA.
     Rgba8,
     /// Packed 8-bit BGRA.
@@ -74,7 +78,7 @@ impl PixelFormat {
     pub fn plane_count(self) -> usize {
         match self {
             Self::Nv12 => 2,
-            Self::Yuv420P => 3,
+            Self::Yuv420P | Self::Yuv422P | Self::Yuv444P => 3,
             Self::Rgba8 | Self::Bgra8 => 1,
         }
     }
@@ -84,6 +88,8 @@ impl PixelFormat {
     fn doubled_bytes_per_sample(self) -> u64 {
         match self {
             Self::Nv12 | Self::Yuv420P => 3,
+            Self::Yuv422P => 4,
+            Self::Yuv444P => 6,
             Self::Rgba8 | Self::Bgra8 => 8,
         }
     }
@@ -319,6 +325,8 @@ mod tests {
     fn pixel_format_plane_counts() {
         assert_eq!(PixelFormat::Nv12.plane_count(), 2);
         assert_eq!(PixelFormat::Yuv420P.plane_count(), 3);
+        assert_eq!(PixelFormat::Yuv422P.plane_count(), 3);
+        assert_eq!(PixelFormat::Yuv444P.plane_count(), 3);
         assert_eq!(PixelFormat::Rgba8.plane_count(), 1);
         assert_eq!(PixelFormat::Bgra8.plane_count(), 1);
     }
@@ -345,6 +353,14 @@ mod tests {
         let buffer = pool.acquire();
         assert!(buffer.capacity() >= 16 * 16 * 3 / 2);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn pool_sizes_422_and_444_buffers() {
+        let mut planar422 = FramePool::new(size(), PixelFormat::Yuv422P);
+        assert!(planar422.acquire().capacity() >= 16 * 16 * 2);
+        let mut planar444 = FramePool::new(size(), PixelFormat::Yuv444P);
+        assert!(planar444.acquire().capacity() >= 16 * 16 * 3);
     }
 
     #[test]

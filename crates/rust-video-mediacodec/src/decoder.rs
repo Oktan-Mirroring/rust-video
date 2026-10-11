@@ -656,7 +656,10 @@ impl OutputLayout {
         let layout = match format {
             PixelFormat::Nv12 => Layout::Nv12,
             PixelFormat::Yuv420P => Layout::Planar,
-            PixelFormat::Rgba8 | PixelFormat::Bgra8 => {
+            PixelFormat::Rgba8
+            | PixelFormat::Bgra8
+            | PixelFormat::Yuv422P
+            | PixelFormat::Yuv444P => {
                 return Err(MediaCodecError::UnsupportedColorFormat { value: color });
             }
         };
