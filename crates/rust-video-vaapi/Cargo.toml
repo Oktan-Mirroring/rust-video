@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 bytes = "1"
-cros-codecs = { version = "0.0.6", default-features = false }
+log = "0"
 rust-video = { version = "0.1.0", path = "../rust-video" }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 thiserror = "1"

@@ -6,9 +6,9 @@ use crate::error::VaApiError;
 use crate::ffi::VaSliceParameterBufferH264;
 use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
 use crate::params::Params;
+use crate::vendor::h264::parser::{SliceHeader, SliceType};
 
 use bytes::Bytes;
-use cros_codecs::codec::h264::parser::{SliceHeader, SliceType};
 use rust_video::{
     CpuFrame, Decoder, GpuExport, GpuFrame, Lease, Packet, PixelFormat, Plane, SharedDevice,
 };

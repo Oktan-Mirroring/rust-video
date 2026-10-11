@@ -8,12 +8,11 @@ use std::io::Cursor;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
-
-use cros_codecs::codec::h264::dpb::{Dpb, ReferencePicLists};
-use cros_codecs::codec::h264::parser::{
+use crate::vendor::h264::dpb::{Dpb, ReferencePicLists};
+use crate::vendor::h264::parser::{
     MaxLongTermFrameIdx, Nalu, NaluType, Parser, Pps, SliceHeader, Sps,
 };
-use cros_codecs::codec::h264::picture::{Field, IsIdr, PictureData, Reference};
+use crate::vendor::h264::picture::{Field, IsIdr, PictureData, Reference};
 
 /// DPB surface slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -798,7 +797,7 @@ impl Frontend {
     }
 
     /// Marking failure as a broken reference list.
-    fn broken(error: &cros_codecs::codec::h264::dpb::MmcoError) -> VaApiError {
+    fn broken(error: &crate::vendor::h264::dpb::MmcoError) -> VaApiError {
         VaApiError::BrokenReference(error.to_string())
     }
 
@@ -1099,12 +1098,11 @@ mod tests {
 
     use super::{Frontend, Picture, PocTracker, SliceKey, SurfaceSlot};
     use crate::error::VaApiError;
-
-    use cros_codecs::codec::h264::dpb::ReferencePicLists;
-    use cros_codecs::codec::h264::parser::{
+    use crate::vendor::h264::dpb::ReferencePicLists;
+    use crate::vendor::h264::parser::{
         Level, PpsBuilder, RefPicListModification, RefPicMarking, SliceHeader, Sps,
     };
-    use cros_codecs::codec::h264::picture::{IsIdr, PictureData, Reference};
+    use crate::vendor::h264::picture::{IsIdr, PictureData, Reference};
 
     /// Sequence set for 1080p, order-count type `poc_type`.
     fn sps(poc_type: u8) -> Sps {

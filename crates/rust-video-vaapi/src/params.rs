@@ -11,10 +11,9 @@ use crate::ffi::{
     VaSurfaceId,
 };
 use crate::frontend::SurfaceSlot;
-
-use cros_codecs::codec::h264::dpb::Dpb;
-use cros_codecs::codec::h264::parser::{Level, Pps, SliceHeader, Sps};
-use cros_codecs::codec::h264::picture::{PictureData, Reference};
+use crate::vendor::h264::dpb::Dpb;
+use crate::vendor::h264::parser::{Level, Pps, SliceHeader, Sps};
+use crate::vendor::h264::picture::{PictureData, Reference};
 
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
@@ -344,7 +343,7 @@ struct Weights {
 impl Weights {
     /// Weights for `header` under `sps` and `pps`.
     fn new(header: &SliceHeader, sps: &Sps, pps: &Pps) -> Self {
-        use cros_codecs::codec::h264::parser::SliceType;
+        use crate::vendor::h264::parser::SliceType;
 
         let mut weights = Self {
             luma_log2_denom: header.pred_weight_table.luma_log2_weight_denom,
@@ -423,10 +422,9 @@ mod tests {
     use super::Params;
     use crate::error::VaApiError;
     use crate::frontend::SurfaceSlot;
-
-    use cros_codecs::codec::h264::dpb::Dpb;
-    use cros_codecs::codec::h264::parser::{Level, PpsBuilder, SliceHeader, Sps};
-    use cros_codecs::codec::h264::picture::{PictureData, Reference};
+    use crate::vendor::h264::dpb::Dpb;
+    use crate::vendor::h264::parser::{Level, PpsBuilder, SliceHeader, Sps};
+    use crate::vendor::h264::picture::{PictureData, Reference};
 
     /// Sequence set matching the word test below.
     fn sps() -> std::rc::Rc<Sps> {
