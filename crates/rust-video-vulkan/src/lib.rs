@@ -5,9 +5,11 @@ mod device;
 mod error;
 mod inflight;
 mod ladder;
+mod parse;
 mod raw;
+mod session;
 
-pub use decoder::{H264Decoder, VulkanFrame};
+pub use decoder::{H264Decoder, H265Decoder, VulkanFrame};
 pub use device::VulkanDevice;
 pub use error::{SkipReason, VulkanError};
 pub use inflight::{Fence, Inflight, Signaled};

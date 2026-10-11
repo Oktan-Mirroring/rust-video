@@ -13,6 +13,10 @@ use crate::error::{SkipReason, VulkanError};
 pub enum CodecOp {
     /// H.264 decode.
     H264Decode,
+    /// H.265 decode.
+    H265Decode,
+    /// H.264 encode.
+    H264Encode,
 }
 
 impl CodecOp {
@@ -28,7 +32,23 @@ impl CodecOp {
                 ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME,
                 ash::vk::KHR_VIDEO_DECODE_H264_NAME,
             ],
+            Self::H265Decode => [
+                ash::vk::KHR_VIDEO_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_H265_NAME,
+            ],
+            Self::H264Encode => [
+                ash::vk::KHR_VIDEO_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_ENCODE_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_ENCODE_H264_NAME,
+            ],
         }
+    }
+
+    /// True for encode ops, false for decode ops.
+    #[must_use]
+    pub fn is_encode(self) -> bool {
+        matches!(self, Self::H264Encode)
     }
 }
 
@@ -55,15 +75,41 @@ impl From<std::ffi::FromBytesUntilNulError> for LadderError {
     }
 }
 
-/// H.264 decode capabilities of one adapter.
+/// Decode capabilities of one adapter for one codec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct H264Facts {
+pub(crate) struct DecodeFacts {
     /// Largest coded picture in luma samples.
     pub coded_extent: (u32, u32),
     /// Decoded-picture-buffer slot count.
     pub dpb_slots: u32,
     /// Active reference picture count.
     pub active_refs: u32,
+    /// Highest wire level idc the session runs.
+    pub max_level: u8,
+    /// Video Std header spec version the session pins.
+    pub std_version: u32,
+}
+
+/// Encode capabilities of one adapter for one codec.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct EncodeFacts {
+    /// Largest coded picture in luma samples.
+    pub coded_extent: (u32, u32),
+    /// Encoder quality level count.
+    pub quality_levels: u32,
+    /// Peak bitrate in bits per second.
+    pub max_bitrate: u64,
+    /// Video Std header spec version the session pins.
+    pub std_version: u32,
+}
+
+/// Video capabilities of one adapter for `op`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum OpCaps {
+    /// Decode caps for a decode op.
+    Decode(DecodeFacts),
+    /// Encode caps for an encode op.
+    Encode(EncodeFacts),
 }
 
 /// One adapter as the ladder sees it.
@@ -77,8 +123,14 @@ pub(crate) struct AdapterFacts<A> {
     pub extensions: Vec<CString>,
     /// Queue families with video-decode capability.
     pub decode_queue_families: Vec<u32>,
+    /// Queue families with video-encode capability.
+    pub encode_queue_families: Vec<u32>,
     /// H.264 caps, when a profile reports them.
-    pub h264: Option<H264Facts>,
+    pub h264: Option<DecodeFacts>,
+    /// H.265 caps, when a profile reports them.
+    pub h265: Option<DecodeFacts>,
+    /// H.264 encode caps, when a profile reports them.
+    pub h264_encode: Option<EncodeFacts>,
 }
 
 impl<A> AdapterFacts<A> {
@@ -128,17 +180,50 @@ impl<A> AdapterFacts<A> {
             .ok_or(LadderError::Skip(SkipReason::NoDecodeQueue))
     }
 
+    /// Encode queue family pick from the adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when no family encodes video.
+    pub fn check_encode_queues(&self) -> Result<u32, LadderError> {
+        self.encode_queue_families
+            .first()
+            .copied()
+            .ok_or(LadderError::Skip(SkipReason::NoEncodeQueue))
+    }
+
+    /// Queue family pick from the adapter for `op`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on skip when no family runs `op`.
+    pub fn check_queues_for(&self, op: CodecOp) -> Result<u32, LadderError> {
+        if op.is_encode() {
+            self.check_encode_queues()
+        } else {
+            self.check_queues()
+        }
+    }
+
     /// Video capabilities of the adapter for `op`.
     ///
     /// # Errors
     ///
     /// Returns `Err` on skip when no profile reports caps.
-    pub fn check_video_caps(&self, op: CodecOp) -> Result<&H264Facts, LadderError> {
+    pub fn check_video_caps(&self, op: CodecOp) -> Result<OpCaps, LadderError> {
         match op {
             CodecOp::H264Decode => self
                 .h264
-                .as_ref()
+                .map(OpCaps::Decode)
                 .ok_or(LadderError::Skip(SkipReason::NoH264Caps)),
+            CodecOp::H265Decode => self
+                .h265
+                .map(OpCaps::Decode)
+                .ok_or(LadderError::Skip(SkipReason::NoH265Caps)),
+            CodecOp::H264Encode => self
+                .h264_encode
+                .map(OpCaps::Encode)
+                .ok_or(LadderError::Skip(SkipReason::NoH264EncodeCaps)),
         }
     }
 }
@@ -164,7 +249,7 @@ pub(crate) trait Backend {
     /// Returns `Err` when enumeration fails.
     fn adapters(&self) -> Result<Vec<AdapterFacts<Self::Adapter>>, LadderError>;
 
-    /// Logical device over `queues` families and nothing else.
+    /// Logical device over `queues` families with `op` extensions.
     ///
     /// # Errors
     ///
@@ -172,6 +257,7 @@ pub(crate) trait Backend {
     fn open_device(
         &self,
         adapter: &Self::Adapter,
+        op: CodecOp,
         queues: &[u32],
     ) -> Result<Self::Device, LadderError>;
 }
@@ -182,6 +268,10 @@ pub(crate) struct Negotiated<B: Backend> {
     pub facts: AdapterFacts<B::Adapter>,
     /// Opened logical device.
     pub device: B::Device,
+    /// Queue family the device opened.
+    pub queue_family: u32,
+    /// Capabilities the winning rung reported.
+    pub caps: OpCaps,
 }
 
 /// Negotiation ladder over one backend.
@@ -233,10 +323,12 @@ impl<B: Backend> Ladder<B> {
         let mut failure: Option<LadderError> = None;
         for facts in &adapters {
             match self.pick(facts, op) {
-                Ok(device) => {
+                Ok((device, queue_family, caps)) => {
                     return Ok(Negotiated {
                         facts: facts.clone(),
                         device,
+                        queue_family,
+                        caps,
                     });
                 }
                 Err(error) => {
@@ -254,12 +346,13 @@ impl<B: Backend> Ladder<B> {
         &self,
         facts: &AdapterFacts<B::Adapter>,
         op: CodecOp,
-    ) -> Result<B::Device, LadderError> {
+    ) -> Result<(B::Device, u32, OpCaps), LadderError> {
         facts.check_floor()?;
         facts.check_extensions(op)?;
-        facts.check_video_caps(op)?;
-        let queue = facts.check_queues()?;
-        self.backend.open_device(&facts.handle, &[queue])
+        let caps = facts.check_video_caps(op)?;
+        let queue = facts.check_queues_for(op)?;
+        let device = self.backend.open_device(&facts.handle, op, &[queue])?;
+        Ok((device, queue, caps))
     }
 }
 
@@ -268,12 +361,16 @@ mod tests {
     use std::cell::RefCell;
     use std::ffi::CString;
 
-    use super::{AdapterFacts, Backend, CodecOp, H264Facts, Ladder, LadderError};
+    use super::{
+        AdapterFacts, Backend, CodecOp, DecodeFacts, EncodeFacts, Ladder, LadderError, OpCaps,
+    };
     use crate::error::{SkipReason, VulkanError};
 
-    /// Opened fake device: the queue families it was given.
+    /// Opened fake device: the op and queue families it was given.
     #[derive(Debug, PartialEq)]
     struct FakeDevice {
+        /// Op passed to open.
+        op: CodecOp,
         /// Queue families passed to open.
         queues: Vec<u32>,
     }
@@ -295,8 +392,8 @@ mod tests {
         adapters: Vec<AdapterFacts<usize>>,
         /// Hard failure from `adapters`, when set.
         adapters_error: Option<ash::vk::Result>,
-        /// Queues each `open_device` call received.
-        opened: RefCell<Vec<Vec<u32>>>,
+        /// Op and queues each `open_device` call received.
+        opened: RefCell<Vec<(CodecOp, Vec<u32>)>>,
     }
 
     impl FakeBackend {
@@ -342,41 +439,66 @@ mod tests {
             Ok(self.adapters.clone())
         }
 
-        fn open_device(&self, _adapter: &usize, queues: &[u32]) -> Result<FakeDevice, LadderError> {
-            self.opened.borrow_mut().push(queues.to_vec());
+        fn open_device(
+            &self,
+            _adapter: &usize,
+            op: CodecOp,
+            queues: &[u32],
+        ) -> Result<FakeDevice, LadderError> {
+            self.opened.borrow_mut().push((op, queues.to_vec()));
             Ok(FakeDevice {
+                op,
                 queues: queues.to_vec(),
             })
         }
     }
 
-    /// H.264 caps the fake reports.
-    fn caps() -> H264Facts {
-        H264Facts {
+    /// Decode caps the fake reports.
+    fn caps() -> DecodeFacts {
+        DecodeFacts {
             coded_extent: (1920, 1080),
             dpb_slots: 16,
             active_refs: 8,
+            max_level: 52,
+            std_version: 1,
         }
     }
 
-    /// Extension strings the H.264 op needs.
-    fn extensions() -> Vec<CString> {
-        CodecOp::H264Decode
-            .extensions()
+    /// Encode caps the fake reports.
+    fn encode_caps() -> EncodeFacts {
+        EncodeFacts {
+            coded_extent: (1920, 1080),
+            quality_levels: 4,
+            max_bitrate: 100_000_000,
+            std_version: 1,
+        }
+    }
+
+    /// Extension strings `op` needs.
+    fn extensions_for(op: CodecOp) -> Vec<CString> {
+        op.extensions()
             .iter()
             .map(|name| CString::from(*name))
             .collect()
     }
 
-    /// Adapter passing every rung.
-    fn green() -> AdapterFacts<usize> {
+    /// Adapter passing every rung for `op`.
+    fn green_for(op: CodecOp) -> AdapterFacts<usize> {
         AdapterFacts {
             handle: 0,
             api_version: ash::vk::make_api_version(0, 1, 3, 0),
-            extensions: extensions(),
+            extensions: extensions_for(op),
             decode_queue_families: vec![2],
+            encode_queue_families: vec![4],
             h264: Some(caps()),
+            h265: Some(caps()),
+            h264_encode: Some(encode_caps()),
         }
+    }
+
+    /// Adapter passing every H.264 decode rung.
+    fn green() -> AdapterFacts<usize> {
+        green_for(CodecOp::H264Decode)
     }
 
     /// Skip reason of a failed ladder step.
@@ -477,7 +599,7 @@ mod tests {
     fn video_caps_pass_with_profile() {
         assert_eq!(
             green().check_video_caps(CodecOp::H264Decode).expect("caps"),
-            &caps()
+            OpCaps::Decode(caps())
         );
     }
 
@@ -488,6 +610,114 @@ mod tests {
         assert_eq!(
             skip(facts.check_video_caps(CodecOp::H264Decode)),
             SkipReason::NoH264Caps
+        );
+    }
+
+    #[test]
+    fn ops_split_encode_from_decode() {
+        assert!(!CodecOp::H264Decode.is_encode());
+        assert!(!CodecOp::H265Decode.is_encode());
+        assert!(CodecOp::H264Encode.is_encode());
+    }
+
+    #[test]
+    fn extensions_name_each_codec_op() {
+        let h265: Vec<String> = CodecOp::H265Decode
+            .extensions()
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            h265.as_slice(),
+            [
+                "VK_KHR_video_queue",
+                "VK_KHR_video_decode_queue",
+                "VK_KHR_video_decode_h265",
+            ]
+        );
+        let encode: Vec<String> = CodecOp::H264Encode
+            .extensions()
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            encode.as_slice(),
+            [
+                "VK_KHR_video_queue",
+                "VK_KHR_video_encode_queue",
+                "VK_KHR_video_encode_h264",
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_queues_pick_first_encode_family() {
+        let mut facts = green_for(CodecOp::H264Encode);
+        facts.encode_queue_families = vec![5, 7];
+        assert_eq!(facts.check_encode_queues().expect("encode family"), 5);
+    }
+
+    #[test]
+    fn encode_queues_skip_without_encode_family() {
+        let mut facts = green_for(CodecOp::H264Encode);
+        facts.encode_queue_families.clear();
+        assert_eq!(skip(facts.check_encode_queues()), SkipReason::NoEncodeQueue);
+    }
+
+    #[test]
+    fn queues_for_routes_by_op() {
+        let facts = green_for(CodecOp::H264Encode);
+        assert_eq!(
+            facts.check_queues_for(CodecOp::H264Decode).expect("decode"),
+            2
+        );
+        assert_eq!(
+            facts.check_queues_for(CodecOp::H265Decode).expect("decode"),
+            2
+        );
+        assert_eq!(
+            facts.check_queues_for(CodecOp::H264Encode).expect("encode"),
+            4
+        );
+    }
+
+    #[test]
+    fn h265_caps_pass_with_profile() {
+        assert_eq!(
+            green_for(CodecOp::H265Decode)
+                .check_video_caps(CodecOp::H265Decode)
+                .expect("caps"),
+            OpCaps::Decode(caps())
+        );
+    }
+
+    #[test]
+    fn h265_caps_skip_without_profile() {
+        let mut facts = green_for(CodecOp::H265Decode);
+        facts.h265 = None;
+        assert_eq!(
+            skip(facts.check_video_caps(CodecOp::H265Decode)),
+            SkipReason::NoH265Caps
+        );
+    }
+
+    #[test]
+    fn encode_caps_pass_with_profile() {
+        assert_eq!(
+            green_for(CodecOp::H264Encode)
+                .check_video_caps(CodecOp::H264Encode)
+                .expect("caps"),
+            OpCaps::Encode(encode_caps())
+        );
+    }
+
+    #[test]
+    fn encode_caps_skip_without_profile() {
+        let mut facts = green_for(CodecOp::H264Encode);
+        facts.h264_encode = None;
+        assert_eq!(
+            skip(facts.check_video_caps(CodecOp::H264Encode)),
+            SkipReason::NoH264EncodeCaps
         );
     }
 
@@ -532,6 +762,34 @@ mod tests {
         let backend = FakeBackend::with(vec![green()]);
         let ladder = Ladder::new(backend);
         ladder.negotiate(CodecOp::H264Decode).expect("green");
-        assert_eq!(ladder.backend.opened.borrow().as_slice(), &[vec![2]]);
+        assert_eq!(
+            ladder.backend.opened.borrow().as_slice(),
+            &[(CodecOp::H264Decode, vec![2])]
+        );
+    }
+
+    #[test]
+    fn negotiate_encode_opens_only_the_encode_queue() {
+        let backend = FakeBackend::with(vec![green_for(CodecOp::H264Encode)]);
+        let ladder = Ladder::new(backend);
+        let won = ladder.negotiate(CodecOp::H264Encode).expect("green");
+        assert_eq!(won.device.op, CodecOp::H264Encode);
+        assert_eq!(won.device.queues, vec![4]);
+        assert_eq!(
+            ladder.backend.opened.borrow().as_slice(),
+            &[(CodecOp::H264Encode, vec![4])]
+        );
+    }
+
+    #[test]
+    fn negotiate_h265_reports_first_failure() {
+        let mut red = green_for(CodecOp::H265Decode);
+        red.h265 = None;
+        let backend = FakeBackend::with(vec![red]);
+        let ladder = Ladder::new(backend);
+        assert_eq!(
+            skip(ladder.negotiate(CodecOp::H265Decode)),
+            SkipReason::NoH265Caps
+        );
     }
 }

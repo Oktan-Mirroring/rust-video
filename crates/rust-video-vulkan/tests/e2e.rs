@@ -7,26 +7,24 @@ use bytes::Bytes;
 
 use rust_video::{Decoder, Packet, VideoCodec};
 use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
-use rust_video_vulkan::{CodecOp, H264Decoder, VulkanDevice};
+use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice};
 
-/// Harness oracle over the Vulkan H.264 decoder.
-struct VulkanOracle {
+/// Harness oracle over a Vulkan decoder.
+struct VulkanOracle<D> {
     /// Decoder under test, behind interior mutability for `Oracle`.
-    decoder: RefCell<H264Decoder>,
+    decoder: RefCell<D>,
 }
 
-impl VulkanOracle {
-    /// Oracle over a negotiated device.
-    fn open(device: &VulkanDevice) -> Result<Self, Error> {
-        let decoder =
-            H264Decoder::open(device).map_err(|error| Error::Decode(error.to_string()))?;
-        Ok(Self {
+impl<D> VulkanOracle<D> {
+    /// Oracle over `decoder`.
+    fn new(decoder: D) -> Self {
+        Self {
             decoder: RefCell::new(decoder),
-        })
+        }
     }
 }
 
-impl Oracle for VulkanOracle {
+impl Oracle for VulkanOracle<H264Decoder<'_>> {
     fn decode(&self, case: &Case) -> Result<Vec<FrameHash>, Error> {
         let bytes = std::fs::read(case.path())?;
         let mut decoder = self.decoder.borrow_mut();
@@ -35,13 +33,34 @@ impl Oracle for VulkanOracle {
             .decode(&Packet::new(Bytes::from(bytes)))
             .map_err(|error| Error::Decode(error.to_string()))?
         {
-            hashes.push(FrameHash::of(frame.nv12()));
+            hashes.push(FrameHash::of(&frame.yuv420p()));
         }
         for frame in decoder
             .flush()
             .map_err(|error| Error::Decode(error.to_string()))?
         {
-            hashes.push(FrameHash::of(frame.nv12()));
+            hashes.push(FrameHash::of(&frame.yuv420p()));
+        }
+        Ok(hashes)
+    }
+}
+
+impl Oracle for VulkanOracle<H265Decoder<'_>> {
+    fn decode(&self, case: &Case) -> Result<Vec<FrameHash>, Error> {
+        let bytes = std::fs::read(case.path())?;
+        let mut decoder = self.decoder.borrow_mut();
+        let mut hashes = Vec::new();
+        for frame in decoder
+            .decode(&Packet::new(Bytes::from(bytes)))
+            .map_err(|error| Error::Decode(error.to_string()))?
+        {
+            hashes.push(FrameHash::of(&frame.yuv420p()));
+        }
+        for frame in decoder
+            .flush()
+            .map_err(|error| Error::Decode(error.to_string()))?
+        {
+            hashes.push(FrameHash::of(&frame.yuv420p()));
         }
         Ok(hashes)
     }
@@ -55,14 +74,22 @@ fn corpus() -> PathBuf {
     )
 }
 
-#[test]
-fn h264_matches_goldens() {
-    let Some(device) = VulkanDevice::open(CodecOp::H264Decode).expect("negotiation runs") else {
-        panic!("vulkan tier skipped on an e2e runner");
-    };
-    let oracle = VulkanOracle::open(&device).expect("engine starts");
+/// Device for `op`, declining loudly when the tier skips.
+fn device_or_decline(op: CodecOp) -> Option<VulkanDevice> {
+    match VulkanDevice::open_or_skip(op) {
+        Ok(device) => Some(device),
+        Err(rust_video_vulkan::VulkanError::BackendAbsent(reason)) => {
+            println!("declined: {op:?} on this box: {reason}");
+            None
+        }
+        Err(error) => panic!("negotiation failed: {error}"),
+    }
+}
+
+/// Golden comparison of every `codec` case through `oracle`.
+fn check_goldens(codec: VideoCodec, oracle: &dyn Oracle) {
     let suite = Suite::open_at(&corpus()).expect("corpus present by build gate");
-    for case in suite.cases_for(VideoCodec::H264) {
+    for case in suite.cases_for(codec) {
         let actual = oracle.decode(case).expect("decode runs");
         let golden_path = case.path().with_extension("golden");
         if golden_path.is_file() {
@@ -74,4 +101,24 @@ fn h264_matches_goldens() {
             assert!(!actual.is_empty(), "no frames from {}", case.name());
         }
     }
+}
+
+#[test]
+fn h264_matches_goldens() {
+    let Some(device) = device_or_decline(CodecOp::H264Decode) else {
+        return;
+    };
+    let decoder = H264Decoder::open(&device).expect("engine starts");
+    let oracle = VulkanOracle::new(decoder);
+    check_goldens(VideoCodec::H264, &oracle);
+}
+
+#[test]
+fn h265_matches_goldens() {
+    let Some(device) = device_or_decline(CodecOp::H265Decode) else {
+        return;
+    };
+    let decoder = H265Decoder::open(&device).expect("engine starts");
+    let oracle = VulkanOracle::new(decoder);
+    check_goldens(VideoCodec::H265, &oracle);
 }

@@ -11,7 +11,6 @@ workspace = true
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 bytes = "1"
-gpu-video = { version = "0.4.0", default-features = false }
 rust-video = { version = "0.1.0", path = "../rust-video" }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 thiserror = "1"
