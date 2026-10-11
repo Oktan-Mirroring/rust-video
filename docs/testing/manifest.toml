@@ -38,6 +38,15 @@ artifact = "none"
 status = "skeleton"
 
 [[capability]]
+id = "golden-gen"
+tier = "e2e"
+command = "just goldens"
+source = "crates/rust-video-harness/src/bin/golden_gen.rs"
+requires = "corpus/, ffmpeg"
+artifact = "golden hash files"
+status = "ready"
+
+[[capability]]
 id = "e2e-decode-goldens"
 tier = "e2e"
 command = "just e2e"

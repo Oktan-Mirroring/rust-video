@@ -38,6 +38,10 @@ e2e:
     test -d corpus || (echo "corpus missing: run 'just vectors' first" && exit 1)
     RUST_VIDEO_CORPUS={{justfile_directory()}}/corpus cargo test --workspace -j24 --test e2e
 
+# Generate goldens with the ffmpeg oracle; fails on uncovered options.
+goldens *args:
+    cargo run -j24 -p rust-video-harness --bin golden_gen -- {{args}}
+
 # Commit gate hook entry point.
 commit-lint-gate:
     bash .claude/hooks/commit-lint-gate.sh

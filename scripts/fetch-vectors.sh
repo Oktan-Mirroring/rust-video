@@ -8,6 +8,8 @@ corpus="$root/corpus"
 mkdir -p "$corpus/h264" "$corpus/h265" "$corpus/av1" "$corpus/vp9" "$corpus/vp8" "$corpus/av2"
 
 fail=0
+fetched=0
+max="${VECTORS_MAX:-0}"
 
 echo "== libvpx VP9/VP8 vectors"
 manifest="$(curl -sL --max-time 60 'https://raw.githubusercontent.com/webmproject/libvpx/main/test/test-data.sha1')"
@@ -20,8 +22,17 @@ else
       *.ivf|*.webm) ;;
       *) continue ;;
     esac
-    dest="$corpus/vp9/$file"
-    [ -f "$dest" ] && continue
+    if [ "$max" -gt 0 ] && [ "$fetched" -ge "$max" ]; then
+      break
+    fi
+    case "$file" in
+      vp80-*) dest="$corpus/vp8/$file" ;;
+      *) dest="$corpus/vp9/$file" ;;
+    esac
+    if [ -f "$dest" ]; then
+      fetched=$((fetched+1))
+      continue
+    fi
     if ! curl -sL --max-time 120 -o "$dest" "http://downloads.webmproject.org/test_data/libvpx/$file"; then
       echo "FAIL: $file unreachable" >&2
       rm -f "$dest"
@@ -34,6 +45,7 @@ else
       rm -f "$dest"
       fail=1
     fi
+    fetched=$((fetched+1))
   done <<< "$(printf '%s' "$manifest" | tr -d '*')"
 fi
 
