@@ -1,0 +1,45 @@
+# SoC quirks for the MediaCodec tier.
+#
+# Strict subset of TOML: `[[quirk]]` sections, `key = value` pairs, string and
+# string-list values, `#` comments. The crate parser rejects anything else.
+# `soc` holds lowercase substrings matched against the device SoC name; `"*"`
+# matches every device. `codec` takes `*`, `h264`, `h265`, `av1`, `vp9`.
+# `status` is `suspected` until the 2-SoC device-proof rule in
+# docs/mediacodec.md graduates it to `confirmed`. Every entry names its
+# `fallback`: the behavior the code takes when the quirk does not match.
+
+[[quirk]]
+id = "async-null-callback-segfault"
+soc = ["*"]
+codec = ["*"]
+status = "confirmed"
+source = "ndk 0.9.0 AsyncNotifyCallback docs; frameworks/av/media/ndk/NdkMediaCodec.cpp (Android 12 and earlier)"
+effect = "leaving one async callback slot unset while any other is set faults on Android 12 and earlier"
+fallback = "register all four slots; unset slots no-op"
+
+[[quirk]]
+id = "qcom-stride-padding"
+soc = ["qcom", "qualcomm", "snapdragon", "sm", "sdm", "msm", "apq"]
+codec = ["*"]
+status = "confirmed"
+source = "android.media.MediaFormat stride/slice-height keys; AOSP Grafika continuous-capture path"
+effect = "output row stride and slice height exceed width and height"
+fallback = "read stride and slice-height from the output format; use width and height when absent"
+
+[[quirk]]
+id = "mtk-csd-out-of-band"
+soc = ["mt67", "mt68", "mt69", "mt87", "mediatek", "dimensity", "helio"]
+codec = ["h264", "h265"]
+status = "suspected"
+source = "field reports; unconfirmed, needs 2-SoC proof"
+effect = "decoder may fail to start when parameter sets arrive only in-band"
+fallback = "always supply csd-0 and csd-1 out-of-band through the format"
+
+[[quirk]]
+id = "exynos-drain-before-flush"
+soc = ["exynos"]
+codec = ["*"]
+status = "suspected"
+source = "field reports; unconfirmed, needs 2-SoC proof"
+effect = "queued output may drop when flush runs with buffers pending"
+fallback = "drain all available output before flushing, on every SoC"
