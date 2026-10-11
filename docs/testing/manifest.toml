@@ -56,6 +56,15 @@ artifact = "score report"
 status = "planned"
 
 [[capability]]
+id = "cpu-microbench"
+tier = "unit"
+command = "planned (criterion + codspeed runner, non-blocking)"
+source = "planned"
+requires = "CPU hot paths worth benching"
+artifact = "PR perf deltas"
+status = "planned"
+
+[[capability]]
 id = "vmaf-oracle"
 tier = "e2e"
 command = "planned"
