@@ -1,5 +1,5 @@
 #![allow(unsafe_code)]
-//! Minimal libavcodec/libavutil bindings for H.264 decode.
+//! Minimal libavcodec/libavutil bindings for software decode.
 //!
 //! Hand-written surface over the system libraries; no bindgen.
 
@@ -7,10 +7,20 @@ use std::ffi::{c_char, c_int, c_void};
 
 /// Native H.264 codec id.
 pub const CODEC_ID_H264: c_int = 27;
+/// Native VP8 codec id.
+pub const CODEC_ID_VP8: c_int = 139;
+/// Native VP9 codec id.
+pub const CODEC_ID_VP9: c_int = 167;
+/// Native HEVC codec id.
+pub const CODEC_ID_HEVC: c_int = 173;
+/// Native AV1 codec id.
+pub const CODEC_ID_AV1: c_int = 225;
 /// Planar 8-bit 4:2:0 pixel format.
 pub const PIX_FMT_YUV420P: c_int = 0;
 /// Linked libavcodec major these layouts were read from.
 pub const ABI_MAJOR: u32 = 61;
+/// Linked libavutil major the frame layout was read from.
+pub const UTIL_MAJOR: u32 = 59;
 /// Receiver needs more input before the next frame.
 pub const AGAIN: c_int = -11;
 /// End of stream reached after a null send.
@@ -83,6 +93,8 @@ unsafe extern "C" {
     pub fn avcodec_version() -> u32;
     /// Decoder descriptor for `id`, or null.
     pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
+    /// Decoder descriptor named `name`, or null.
+    pub fn avcodec_find_decoder_by_name(name: *const c_char) -> *const AVCodec;
     /// Context for `codec`, or null.
     pub fn avcodec_alloc_context3(codec: *const AVCodec) -> *mut AVCodecContext;
     /// Option value on `obj`; zero on success.
@@ -141,6 +153,8 @@ unsafe extern "C" {
 
 #[link(name = "avutil")]
 unsafe extern "C" {
+    /// Linked utility library version.
+    pub fn avutil_version() -> u32;
     /// Blank frame, or null.
     pub fn av_frame_alloc() -> *mut AVFrame;
     /// Frame contents released.

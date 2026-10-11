@@ -1,224 +1,22 @@
 #![allow(unsafe_code)]
-//! VP8/VP9 decode and VP9 encode over libvpx.
+//! VP9 encode over libvpx.
 //!
-//! Each type owns its codec context; FFI stays in `SAFETY`-justified blocks.
+//! Encode only: decode rides the ffmpeg sys layer, which beat the direct
+//! bind on every codec (see `docs/sw-codecs.md`), and ffmpeg ships no
+//! native LGPL VP9 encoder, so libvpx stays for the encode direction.
 
 use std::mem::MaybeUninit;
 
 use bytes::Bytes;
 use vpx_sys as vpx;
 
-use rust_video::frame::{CpuFrame, PixelFormat, Plane};
+use rust_video::frame::{CpuFrame, PixelFormat};
 use rust_video::packet::Packet;
-use rust_video::traits::{Decoder, Encoder};
+use rust_video::traits::Encoder;
 
 use rust_video_caps::common::PictureSize;
 
 use crate::error::SwError;
-
-/// Shared decode context over one libvpx decoder interface.
-struct VpxDecoder {
-    ctx: vpx::vpx_codec_ctx_t,
-}
-
-impl VpxDecoder {
-    /// Realtime deadline, `VPX_DL_REALTIME`.
-    const DEADLINE: std::os::raw::c_long = 1;
-
-    /// Context for `iface` with `threads` decoder threads.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when libvpx rejects the configuration.
-    ///
-    /// # Safety
-    ///
-    /// `iface` must be a live libvpx decoder interface table.
-    unsafe fn open(iface: *const vpx::vpx_codec_iface, threads: u32) -> Result<Self, SwError> {
-        let cfg = vpx::vpx_codec_dec_cfg_t {
-            threads,
-            w: 0,
-            h: 0,
-        };
-        let mut ctx = MaybeUninit::<vpx::vpx_codec_ctx_t>::zeroed();
-        // SAFETY: zeroed context is the documented init input; iface is live.
-        let err = unsafe {
-            vpx::vpx_codec_dec_init_ver(
-                ctx.as_mut_ptr(),
-                iface,
-                &raw const cfg,
-                0,
-                vpx::VPX_DECODER_ABI_VERSION.cast_signed(),
-            )
-        };
-        if err != vpx::VPX_CODEC_OK {
-            return Err(SwError::Init);
-        }
-        // SAFETY: init succeeded, so the context is fully written.
-        Ok(Self {
-            ctx: unsafe { ctx.assume_init() },
-        })
-    }
-
-    /// Frames decoded from `packet`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when libvpx rejects the packet or yields an unusable frame.
-    fn decode_packet(&mut self, packet: &Packet) -> Result<Vec<CpuFrame>, SwError> {
-        let size = u32::try_from(packet.data().len()).map_err(|_| SwError::Rejected)?;
-        // SAFETY: packet bytes stay alive for the call.
-        let err = unsafe {
-            vpx::vpx_codec_decode(
-                &raw mut self.ctx,
-                packet.data().as_ptr(),
-                size,
-                std::ptr::null_mut(),
-                Self::DEADLINE,
-            )
-        };
-        if err != vpx::VPX_CODEC_OK {
-            return Err(SwError::Rejected);
-        }
-        self.drain()
-    }
-
-    /// Frames libvpx holds ready now.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when a ready frame is not 8-bit 4:2:0.
-    fn drain(&mut self) -> Result<Vec<CpuFrame>, SwError> {
-        let mut out = Vec::new();
-        let mut iter: vpx::vpx_codec_iter_t = std::ptr::null();
-        loop {
-            // SAFETY: iterator protocol per `vpx_codec_get_frame` docs.
-            let img = unsafe { vpx::vpx_codec_get_frame(&raw mut self.ctx, &raw mut iter) };
-            if img.is_null() {
-                return Ok(out);
-            }
-            // SAFETY: image is valid until the next decode call; copied now.
-            out.push(convert(unsafe { &*img })?);
-        }
-    }
-}
-
-impl Drop for VpxDecoder {
-    fn drop(&mut self) {
-        // SAFETY: context initialized at open and destroyed once.
-        unsafe { vpx::vpx_codec_destroy(&raw mut self.ctx) };
-    }
-}
-
-/// VP8 decoder.
-pub struct Vp8Decoder {
-    inner: VpxDecoder,
-}
-
-impl Vp8Decoder {
-    /// Decoder with `threads` decoder threads.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when libvpx rejects the configuration.
-    pub fn open(threads: u32) -> Result<Self, SwError> {
-        // SAFETY: the VP8 decoder table is a static libvpx interface.
-        let iface = unsafe { vpx::vpx_codec_vp8_dx() };
-        // SAFETY: iface is the live table from the call above.
-        unsafe { VpxDecoder::open(iface, threads).map(|inner| Self { inner }) }
-    }
-}
-
-impl Decoder for Vp8Decoder {
-    type Frame = CpuFrame;
-    type Error = SwError;
-
-    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.inner.decode_packet(packet)
-    }
-
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.inner.drain()
-    }
-}
-
-/// VP9 decoder.
-pub struct Vp9Decoder {
-    inner: VpxDecoder,
-}
-
-impl Vp9Decoder {
-    /// Decoder with `threads` decoder threads.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when libvpx rejects the configuration.
-    pub fn open(threads: u32) -> Result<Self, SwError> {
-        // SAFETY: the VP9 decoder table is a static libvpx interface.
-        let iface = unsafe { vpx::vpx_codec_vp9_dx() };
-        // SAFETY: iface is the live table from the call above.
-        unsafe { VpxDecoder::open(iface, threads).map(|inner| Self { inner }) }
-    }
-}
-
-impl Decoder for Vp9Decoder {
-    type Frame = CpuFrame;
-    type Error = SwError;
-
-    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.inner.decode_packet(packet)
-    }
-
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.inner.drain()
-    }
-}
-
-/// CPU frame copied from a decoded image.
-///
-/// # Errors
-///
-/// Returns `Err` when the image is not 8-bit 4:2:0 or its geometry is unusable.
-fn convert(img: &vpx::vpx_image_t) -> Result<CpuFrame, SwError> {
-    if img.fmt != vpx::vpx_img_fmt::VPX_IMG_FMT_I420 {
-        return Err(SwError::BadFrame);
-    }
-    let (width, height) = (img.d_w, img.d_h);
-    let Some(size) = PictureSize::new(width, height) else {
-        return Err(SwError::BadFrame);
-    };
-    let strides = [
-        u32::try_from(img.stride[0]).map_err(|_| SwError::BadFrame)?,
-        u32::try_from(img.stride[1]).map_err(|_| SwError::BadFrame)?,
-        u32::try_from(img.stride[2]).map_err(|_| SwError::BadFrame)?,
-    ];
-    if strides[0] < width || strides[1] < width / 2 || strides[2] < width / 2 {
-        return Err(SwError::BadFrame);
-    }
-    let rows = |plane: usize, count: u32, cols: u32| {
-        let mut out = Vec::with_capacity(count as usize * cols as usize);
-        for row in 0..count {
-            // SAFETY: rows are stride bytes apart inside the live image.
-            let src = unsafe { img.planes[plane].add(row as usize * strides[plane] as usize) };
-            // SAFETY: each row spans live decoder memory, copied now.
-            let bytes = unsafe { std::slice::from_raw_parts(src, cols as usize) };
-            out.extend_from_slice(bytes);
-        }
-        (out, cols)
-    };
-    let (luma, luma_stride) = rows(0, height, width);
-    let (chroma_u, chroma_stride) = rows(1, height / 2, width / 2);
-    let (chroma_v, _) = rows(2, height / 2, width / 2);
-    let [Some(luma), Some(chroma_u), Some(chroma_v)] = [
-        Plane::new(Bytes::from(luma), luma_stride),
-        Plane::new(Bytes::from(chroma_u), chroma_stride),
-        Plane::new(Bytes::from(chroma_v), chroma_stride),
-    ] else {
-        return Err(SwError::BadFrame);
-    };
-    CpuFrame::new(size, PixelFormat::Yuv420P, vec![luma, chroma_u, chroma_v])
-        .ok_or(SwError::BadFrame)
-}
 
 /// Realtime VP9 encoder.
 pub struct Vp9Encoder {
@@ -231,13 +29,24 @@ pub struct Vp9Encoder {
 impl Vp9Encoder {
     /// Realtime deadline, `VPX_DL_REALTIME`.
     const DEADLINE: std::os::raw::c_ulong = 1;
+    /// Linked libvpx major the bindings were generated against.
+    const ABI_MAJOR: u32 = 1;
 
     /// CBR encoder for `width`x`height` at `bitrate_kbps` on `threads`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when libvpx rejects the configuration.
+    /// Returns `Err` when libvpx drifts from the bound ABI or rejects
+    /// the configuration.
     pub fn open(width: u32, height: u32, bitrate_kbps: u32, threads: u32) -> Result<Self, SwError> {
+        // SAFETY: version query takes no arguments and touches no state.
+        let version = unsafe { vpx::vpx_codec_version() };
+        let Ok(version) = u32::try_from(version) else {
+            return Err(SwError::Init);
+        };
+        if (version >> 16) & 0xff != Self::ABI_MAJOR {
+            return Err(SwError::Init);
+        }
         if PictureSize::new(width, height).is_none() {
             return Err(SwError::Init);
         }
@@ -394,12 +203,11 @@ mod tests {
     use bytes::Bytes;
 
     use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-    use rust_video::packet::Packet;
-    use rust_video::traits::{Decoder, Encoder};
+    use rust_video::traits::Encoder;
 
     use rust_video_caps::common::PictureSize;
 
-    use super::{Vp8Decoder, Vp9Decoder, Vp9Encoder};
+    use super::Vp9Encoder;
 
     fn frame_64() -> CpuFrame {
         let y = Bytes::from(vec![0x80; 64 * 64]);
@@ -414,7 +222,22 @@ mod tests {
     }
 
     #[test]
-    fn vp9_roundtrip_keeps_geometry() {
+    fn encode_marks_first_packet_keyframe() {
+        let mut encoder = Vp9Encoder::open(64, 64, 500, 1).expect("encoder");
+        let mut packets = encoder.encode(&frame_64()).expect("encode");
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.flush().expect("flush"));
+        assert!(!packets.is_empty());
+        assert!(packets[0].is_keyframe());
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn roundtrip_through_ffmpeg_decoder() {
+        use rust_video::traits::Decoder as _;
+
+        use crate::ffmpeg::Vp9Decoder;
+
         let mut encoder = Vp9Encoder::open(64, 64, 500, 2).expect("encoder");
         let mut decoder = Vp9Decoder::open(2).expect("decoder");
         let mut packets = encoder.encode(&frame_64()).expect("encode");
@@ -436,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn vp9_rejects_size_mismatch() {
+    fn encode_rejects_size_mismatch() {
         let mut encoder = Vp9Encoder::open(64, 64, 500, 1).expect("encoder");
         let tiny = Bytes::from(vec![0x80; 16 * 16]);
         let chroma = Bytes::from(vec![0x80; 8 * 8]);
@@ -451,22 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn vp9_rejects_zero_geometry() {
+    fn encode_rejects_zero_geometry() {
         assert!(Vp9Encoder::open(0, 64, 500, 1).is_err());
         assert!(Vp9Encoder::open(64, 0, 500, 1).is_err());
-    }
-
-    #[test]
-    fn vp8_garbage_fails_without_panic() {
-        let mut decoder = Vp8Decoder::open(1).expect("decoder");
-        let packet = Packet::new(Bytes::from(vec![0x9d, 0x12, 0x34]));
-        let _ = decoder.decode(&packet);
-        let _ = decoder.flush();
-    }
-
-    #[test]
-    fn vp9_flush_without_input_is_empty() {
-        let mut decoder = Vp9Decoder::open(1).expect("decoder");
-        assert!(decoder.flush().expect("flush").is_empty());
     }
 }

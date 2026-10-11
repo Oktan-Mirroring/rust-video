@@ -1,4 +1,4 @@
-//! Production vpx decoder and encoder probes.
+//! Production vpx encoder probe.
 
 use std::fs;
 use std::path::Path;
@@ -7,79 +7,9 @@ use std::time::Instant;
 use bytes::Bytes;
 use rust_video::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video::packet::Packet;
-use rust_video::traits::{Decoder, Encoder};
+use rust_video::traits::Encoder;
 use rust_video_caps::common::PictureSize;
-use rust_video_sw::{Vp8Decoder, Vp9Decoder, Vp9Encoder};
-
-use crate::common::read_ivf;
-
-/// Codec selector.
-#[derive(Clone, Copy)]
-pub enum Codec {
-    /// VP8 decode.
-    Vp8,
-    /// VP9 decode or encode.
-    Vp9,
-}
-
-/// Decode IVF `stream` on `threads`, at most `max` frames, packed raw to `dump`.
-pub fn run_decode(codec: Codec, stream: &Path, max: usize, threads: u32, dump: Option<&Path>) {
-    let ivf = read_ivf(stream);
-    println!("vpxdec: {} frames in stream", ivf.frames.len());
-    let mut packed_all = Vec::new();
-    let mut frames = 0usize;
-    let start = Instant::now();
-    match codec {
-        Codec::Vp8 => {
-            let mut decoder = Vp8Decoder::open(threads).expect("decoder");
-            run_loop(&mut decoder, &ivf.frames, max, &mut packed_all, &mut frames);
-        }
-        Codec::Vp9 => {
-            let mut decoder = Vp9Decoder::open(threads).expect("decoder");
-            run_loop(&mut decoder, &ivf.frames, max, &mut packed_all, &mut frames);
-        }
-    }
-    let secs = start.elapsed().as_secs_f64();
-    println!(
-        "vpxdec: {frames} frames in {secs:.2}s = {:.1} fps",
-        crate::common::fps(frames, secs)
-    );
-    if let Some(path) = dump {
-        fs::write(path, &packed_all).expect("dump written");
-        println!("vpxdec: {} bytes dumped", packed_all.len());
-    }
-}
-
-/// Packets through `decoder`, packed planes appended to `dump`.
-fn run_loop(
-    decoder: &mut impl Decoder<Frame = CpuFrame, Error = rust_video_sw::SwError>,
-    frames_in: &[Vec<u8>],
-    max: usize,
-    dump: &mut Vec<u8>,
-    count: &mut usize,
-) {
-    for bytes_in in frames_in {
-        if *count >= max {
-            break;
-        }
-        let packet = Packet::new(Bytes::from(bytes_in.clone()));
-        for out in decoder.decode(&packet).expect("decode") {
-            for plane in out.planes() {
-                dump.extend_from_slice(plane.data());
-            }
-            *count += 1;
-        }
-    }
-    for out in decoder.flush().expect("flush") {
-        if *count >= max {
-            break;
-        }
-        for plane in out.planes() {
-            dump.extend_from_slice(plane.data());
-        }
-        *count += 1;
-    }
-}
+use rust_video_sw::Vp9Encoder;
 
 /// Encode `frames` I420 frames from `raw` at `w`x`h` into IVF `out` as VP9.
 pub fn run_encode(raw: &Path, w: u32, h: u32, frames: usize, out: &Path) {

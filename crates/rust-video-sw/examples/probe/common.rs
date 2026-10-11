@@ -1,12 +1,12 @@
 //! Shared probe helpers: IVF/Annex B splitters, hashing, goldens.
 
-#[cfg(any(feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(feature = "ffmpeg")]
 use std::fs;
-#[cfg(any(feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(feature = "ffmpeg")]
 use std::path::Path;
 
 /// IVF frames plus header geometry.
-#[cfg(any(feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(feature = "ffmpeg")]
 pub struct Ivf {
     /// Coded frame payloads in file order.
     pub frames: Vec<Vec<u8>>,
@@ -17,7 +17,7 @@ pub struct Ivf {
 /// # Panics
 ///
 /// Panics when `path` is unreadable or fails the IVF shape.
-#[cfg(any(feature = "av1-dav1d", feature = "vpx"))]
+#[cfg(feature = "ffmpeg")]
 #[must_use]
 pub fn read_ivf(path: &Path) -> Ivf {
     let bytes = fs::read(path).expect("ivf readable");

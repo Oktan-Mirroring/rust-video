@@ -1,8 +1,9 @@
 #![allow(unsafe_code)]
-//! H.264 decode over ffmpeg's native decoder.
+//! Software decode over ffmpeg's native decoders.
 //!
 //! One safe owner around the raw context; each FFI call justifies itself.
 
+use std::ffi::c_int;
 use std::ptr;
 
 use bytes::Bytes;
@@ -16,33 +17,86 @@ use rust_video_caps::common::PictureSize;
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
 
-/// Threaded H.264 decoder.
-pub struct H264Decoder {
+/// Codec decoded through libavcodec.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Codec {
+    /// Native H.264 decoder.
+    H264,
+    /// Native HEVC decoder.
+    H265,
+    /// Native VP8 decoder.
+    Vp8,
+    /// Native VP9 decoder.
+    Vp9,
+    /// AV1 through the libdav1d wrapper.
+    Av1,
+}
+
+impl Codec {
+    /// libavcodec id selected by `find_decoder`, unless named below.
+    fn id(self) -> c_int {
+        match self {
+            Self::H264 => sys::CODEC_ID_H264,
+            Self::H265 => sys::CODEC_ID_HEVC,
+            Self::Vp8 => sys::CODEC_ID_VP8,
+            Self::Vp9 => sys::CODEC_ID_VP9,
+            Self::Av1 => sys::CODEC_ID_AV1,
+        }
+    }
+
+    /// Decoder name for `find_decoder_by_name`, when id lookup is wrong.
+    fn decoder_name(self) -> Option<&'static std::ffi::CStr> {
+        match self {
+            // By name, not by id: id lookup returns whichever AV1 decoder
+            // registered first, and the true native `av1` is hardware-only.
+            Self::Av1 => Some(c"libdav1d"),
+            Self::H264 | Self::H265 | Self::Vp8 | Self::Vp9 => None,
+        }
+    }
+
+    /// Packets already hold whole frames, so no parser runs.
+    fn framed(self) -> bool {
+        match self {
+            Self::H264 | Self::H265 => false,
+            Self::Vp8 | Self::Vp9 | Self::Av1 => true,
+        }
+    }
+}
+
+/// Threaded decoder over one libavcodec decoder.
+pub struct FfmpegDecoder {
     ctx: *mut sys::AVCodecContext,
     parser: *mut sys::AVCodecParserContext,
     frame: *mut sys::AVFrame,
     packet: *mut sys::AVPacket,
+    framed: bool,
 }
 
-impl H264Decoder {
-    /// Decoder with `threads` worker threads; zero selects the library default.
+impl FfmpegDecoder {
+    /// Decoder for `codec` with `threads` worker threads; zero selects the library default.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the system library drifts from the bound ABI or
     /// rejects the configuration.
-    pub fn open(threads: u32) -> Result<Self, SwError> {
-        // SAFETY: version query takes no arguments and touches no state.
-        if unsafe { sys::avcodec_version() } >> 16 != sys::ABI_MAJOR {
+    pub fn open(codec: Codec, threads: u32) -> Result<Self, SwError> {
+        // SAFETY: version queries take no arguments and touch no state.
+        if unsafe { sys::avcodec_version() } >> 16 != sys::ABI_MAJOR
+            || unsafe { sys::avutil_version() } >> 16 != sys::UTIL_MAJOR
+        {
             return Err(SwError::Init);
         }
-        // SAFETY: id names a registered decoder; null is checked.
-        let codec = unsafe { sys::avcodec_find_decoder(sys::CODEC_ID_H264) };
-        if codec.is_null() {
+        let codec_ptr = match codec.decoder_name() {
+            // SAFETY: name is a valid C string; null is checked.
+            Some(name) => unsafe { sys::avcodec_find_decoder_by_name(name.as_ptr()) },
+            // SAFETY: id names a registered decoder; null is checked.
+            None => unsafe { sys::avcodec_find_decoder(codec.id()) },
+        };
+        if codec_ptr.is_null() {
             return Err(SwError::Init);
         }
         // SAFETY: codec is live; null is checked.
-        let mut ctx = unsafe { sys::avcodec_alloc_context3(codec) };
+        let mut ctx = unsafe { sys::avcodec_alloc_context3(codec_ptr) };
         if ctx.is_null() {
             return Err(SwError::Init);
         }
@@ -70,19 +124,24 @@ impl H264Decoder {
             return Err(SwError::Init);
         }
         // SAFETY: context and codec are live; null options select defaults.
-        let err = unsafe { sys::avcodec_open2(ctx, codec, ptr::null_mut()) };
+        let err = unsafe { sys::avcodec_open2(ctx, codec_ptr, ptr::null_mut()) };
         if err != 0 {
             // SAFETY: context came from a successful alloc and is freed once.
             unsafe { sys::avcodec_free_context(&raw mut ctx) };
             return Err(SwError::Init);
         }
+        // Framed codecs take whole frames per packet; byte streams need the splitter.
         // SAFETY: id names a registered parser; null is checked.
-        let parser = unsafe { sys::av_parser_init(sys::CODEC_ID_H264) };
+        let parser = if codec.framed() {
+            ptr::null_mut()
+        } else {
+            unsafe { sys::av_parser_init(codec.id()) }
+        };
         // SAFETY: blank frame or null; null is checked.
         let frame = unsafe { sys::av_frame_alloc() };
         // SAFETY: blank packet or null; null is checked.
         let packet = unsafe { sys::av_packet_alloc() };
-        if parser.is_null() || frame.is_null() || packet.is_null() {
+        if (!codec.framed() && parser.is_null()) || frame.is_null() || packet.is_null() {
             // SAFETY: non-null slots are live; null slots are skipped.
             unsafe { Self::release(ctx, parser, frame, packet) };
             return Err(SwError::Init);
@@ -92,6 +151,7 @@ impl H264Decoder {
             parser,
             frame,
             packet,
+            framed: codec.framed(),
         })
     }
 
@@ -231,46 +291,55 @@ impl H264Decoder {
     }
 }
 
-impl Decoder for H264Decoder {
+impl Decoder for FfmpegDecoder {
     type Frame = CpuFrame;
     type Error = SwError;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         let mut out = Vec::new();
-        self.parse(packet.data(), &mut out)?;
+        if self.framed {
+            if packet.data().is_empty() {
+                return Ok(out);
+            }
+            self.send(packet.data(), &mut out)?;
+        } else {
+            self.parse(packet.data(), &mut out)?;
+        }
         self.receive(&mut out)?;
         Ok(out)
     }
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         let mut out = Vec::new();
-        loop {
-            let mut pout = ptr::null_mut();
-            let mut pout_size = 0;
-            // SAFETY: null input flushes the parser; output pair receives the tail.
-            let err = unsafe {
-                sys::av_parser_parse2(
-                    self.parser,
-                    self.ctx,
-                    &raw mut pout,
-                    &raw mut pout_size,
-                    ptr::null(),
-                    0,
-                    sys::NOPTS,
-                    sys::NOPTS,
-                    -1,
-                )
-            };
-            if err < 0 {
-                return Err(SwError::Rejected);
+        if !self.framed {
+            loop {
+                let mut pout = ptr::null_mut();
+                let mut pout_size = 0;
+                // SAFETY: null input flushes the parser; output pair receives the tail.
+                let err = unsafe {
+                    sys::av_parser_parse2(
+                        self.parser,
+                        self.ctx,
+                        &raw mut pout,
+                        &raw mut pout_size,
+                        ptr::null(),
+                        0,
+                        sys::NOPTS,
+                        sys::NOPTS,
+                        -1,
+                    )
+                };
+                if err < 0 {
+                    return Err(SwError::Rejected);
+                }
+                if pout_size == 0 {
+                    break;
+                }
+                let len = usize::try_from(pout_size).map_err(|_| SwError::Rejected)?;
+                // SAFETY: parser lends the tail frame, copied into the send below.
+                let frame = unsafe { std::slice::from_raw_parts(pout, len) };
+                self.send(frame, &mut out)?;
             }
-            if pout_size == 0 {
-                break;
-            }
-            let len = usize::try_from(pout_size).map_err(|_| SwError::Rejected)?;
-            // SAFETY: parser lends the tail frame, copied into the send below.
-            let frame = unsafe { std::slice::from_raw_parts(pout, len) };
-            self.send(frame, &mut out)?;
         }
         // SAFETY: null packet signals end of stream.
         let err = unsafe { sys::avcodec_send_packet(self.ctx, ptr::null()) };
@@ -291,10 +360,160 @@ impl Decoder for H264Decoder {
     }
 }
 
-impl Drop for H264Decoder {
+impl Drop for FfmpegDecoder {
     fn drop(&mut self) {
         // SAFETY: every slot came from its allocator and is dropped once.
         unsafe { Self::release(self.ctx, self.parser, self.frame, self.packet) };
+    }
+}
+
+/// Threaded H.264 decoder.
+pub struct H264Decoder {
+    inner: FfmpegDecoder,
+}
+
+impl H264Decoder {
+    /// Decoder with `threads` worker threads; zero selects the library default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
+    pub fn open(threads: u32) -> Result<Self, SwError> {
+        FfmpegDecoder::open(Codec::H264, threads).map(|inner| Self { inner })
+    }
+}
+
+impl Decoder for H264Decoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.decode(packet)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.flush()
+    }
+}
+
+/// Threaded HEVC decoder.
+pub struct H265Decoder {
+    inner: FfmpegDecoder,
+}
+
+impl H265Decoder {
+    /// Decoder with `threads` worker threads; zero selects the library default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
+    pub fn open(threads: u32) -> Result<Self, SwError> {
+        FfmpegDecoder::open(Codec::H265, threads).map(|inner| Self { inner })
+    }
+}
+
+impl Decoder for H265Decoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.decode(packet)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.flush()
+    }
+}
+
+/// Threaded VP8 decoder.
+pub struct Vp8Decoder {
+    inner: FfmpegDecoder,
+}
+
+impl Vp8Decoder {
+    /// Decoder with `threads` decoder threads; zero selects the library default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
+    pub fn open(threads: u32) -> Result<Self, SwError> {
+        FfmpegDecoder::open(Codec::Vp8, threads).map(|inner| Self { inner })
+    }
+}
+
+impl Decoder for Vp8Decoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.decode(packet)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.flush()
+    }
+}
+
+/// Threaded VP9 decoder.
+pub struct Vp9Decoder {
+    inner: FfmpegDecoder,
+}
+
+impl Vp9Decoder {
+    /// Decoder with `threads` decoder threads; zero selects the library default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
+    pub fn open(threads: u32) -> Result<Self, SwError> {
+        FfmpegDecoder::open(Codec::Vp9, threads).map(|inner| Self { inner })
+    }
+}
+
+impl Decoder for Vp9Decoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.decode(packet)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.flush()
+    }
+}
+
+/// Threaded AV1 decoder.
+pub struct Av1Decoder {
+    inner: FfmpegDecoder,
+}
+
+impl Av1Decoder {
+    /// Decoder with `threads` worker threads; zero selects the library default.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the system library drifts from the bound ABI or
+    /// rejects the configuration.
+    pub fn open(threads: u32) -> Result<Self, SwError> {
+        FfmpegDecoder::open(Codec::Av1, threads).map(|inner| Self { inner })
+    }
+}
+
+impl Decoder for Av1Decoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.decode(packet)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.inner.flush()
     }
 }
 
@@ -353,12 +572,19 @@ mod tests {
     use rust_video::packet::Packet;
     use rust_video::traits::Decoder;
 
-    use super::H264Decoder;
+    use super::{Codec, FfmpegDecoder, H264Decoder};
 
     #[test]
     fn open_accepts_thread_counts() {
         assert!(H264Decoder::open(0).is_ok());
         assert!(H264Decoder::open(4).is_ok());
+    }
+
+    #[test]
+    fn open_accepts_every_codec() {
+        for codec in [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1] {
+            assert!(FfmpegDecoder::open(codec, 1).is_ok(), "{codec:?}");
+        }
     }
 
     #[test]
@@ -378,6 +604,21 @@ mod tests {
     #[test]
     fn empty_input_fails_without_panic() {
         let mut decoder = H264Decoder::open(1).expect("decoder");
+        let packet = Packet::new(Bytes::new());
+        assert!(decoder.decode(&packet).expect("decode").is_empty());
+    }
+
+    #[test]
+    fn framed_garbage_fails_without_panic() {
+        let mut decoder = FfmpegDecoder::open(Codec::Vp9, 1).expect("decoder");
+        let packet = Packet::new(Bytes::from(vec![0xff; 64]));
+        let _ = decoder.decode(&packet);
+        let _ = decoder.flush();
+    }
+
+    #[test]
+    fn framed_empty_input_is_empty() {
+        let mut decoder = FfmpegDecoder::open(Codec::Vp9, 1).expect("decoder");
         let packet = Packet::new(Bytes::new());
         assert!(decoder.decode(&packet).expect("decode").is_empty());
     }
