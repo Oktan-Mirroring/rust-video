@@ -105,6 +105,7 @@ impl Suite {
             "h264" => Some(VideoCodec::H264),
             "h265" => Some(VideoCodec::H265),
             "av1" => Some(VideoCodec::Av1),
+            "vp8" => Some(VideoCodec::Vp8),
             "vp9" => Some(VideoCodec::Vp9),
             "av2" => Some(VideoCodec::Av2),
             _ => None,
@@ -130,6 +131,10 @@ mod tests {
         assert_eq!(
             Suite::codec_of_dir(OsStr::new("av1")),
             Some(VideoCodec::Av1)
+        );
+        assert_eq!(
+            Suite::codec_of_dir(OsStr::new("vp8")),
+            Some(VideoCodec::Vp8)
         );
         assert_eq!(Suite::codec_of_dir(OsStr::new("yuv")), None);
     }
