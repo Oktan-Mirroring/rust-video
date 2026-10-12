@@ -537,7 +537,12 @@ fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
     let y_stride = usize::try_from(frame.linesize[0]).map_err(|_| SwError::BadFrame)?;
     let u_stride = usize::try_from(frame.linesize[1]).map_err(|_| SwError::BadFrame)?;
     let v_stride = usize::try_from(frame.linesize[2]).map_err(|_| SwError::BadFrame)?;
-    if y_stride < width as usize || u_stride < width as usize / 2 || v_stride < width as usize / 2 {
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    if y_stride < width as usize
+        || u_stride < chroma_width as usize
+        || v_stride < chroma_width as usize
+    {
         return Err(SwError::BadFrame);
     }
     let rows = |plane: usize, stride: usize, count: usize, cols: usize| {
@@ -552,12 +557,12 @@ fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
         out
     };
     let y = rows(0, y_stride, height as usize, width as usize);
-    let u = rows(1, u_stride, height as usize / 2, width as usize / 2);
-    let v = rows(2, v_stride, height as usize / 2, width as usize / 2);
+    let u = rows(1, u_stride, chroma_height as usize, chroma_width as usize);
+    let v = rows(2, v_stride, chroma_height as usize, chroma_width as usize);
     let planes = [
         Plane::new(Bytes::from(y), width),
-        Plane::new(Bytes::from(u), width / 2),
-        Plane::new(Bytes::from(v), width / 2),
+        Plane::new(Bytes::from(u), chroma_width),
+        Plane::new(Bytes::from(v), chroma_width),
     ];
     let [Some(y), Some(u), Some(v)] = planes else {
         return Err(SwError::BadFrame);
