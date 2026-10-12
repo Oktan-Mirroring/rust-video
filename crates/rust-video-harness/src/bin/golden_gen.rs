@@ -463,7 +463,19 @@ fn decode_frames(path: &Path, pix_fmt: &str, slot: usize) -> Result<Vec<Vec<u8>>
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-i"]);
     cmd.arg(path);
-    cmd.args(["-map", "0:v:0", "-pix_fmt", pix_fmt, "-f", "image2"]);
+    cmd.args([
+        "-map",
+        "0:v:0",
+        "-noautoscale",
+        "-pix_fmt",
+        pix_fmt,
+        "-c:v",
+        "rawvideo",
+        "-vsync",
+        "0",
+        "-f",
+        "image2",
+    ]);
     cmd.arg(&pattern);
     let (ok, err, _) = spawn(&mut cmd)?;
     if !ok {
