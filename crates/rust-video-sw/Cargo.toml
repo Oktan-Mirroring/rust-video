@@ -16,6 +16,9 @@ pedantic = "warn"
 [features]
 default = []
 ffmpeg = []
+# Enabling `gpl` links the GPL path (libx265 is GPL-2+, which flips the ffmpeg
+# build GPL): the closed product ships the default LGPL-clean set, opt in only.
+gpl = ["ffmpeg"]
 h264-openh264 = ["dep:openh264"]
 
 [dependencies]
