@@ -23,3 +23,6 @@ bytes = "1"
 rust-video = { path = "../rust-video" }
 rust-video-caps = { path = "../rust-video-caps" }
 openh264 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+rust-video-harness = { path = "../rust-video-harness" }

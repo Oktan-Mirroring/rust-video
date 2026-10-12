@@ -373,6 +373,7 @@ dependencies = [
  "openh264",
  "rust-video",
  "rust-video-caps",
+ "rust-video-harness",
 ]
 
 [[package]]
