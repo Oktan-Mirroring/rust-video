@@ -5,22 +5,46 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
 
-Safe Rust interface over realtime video encode and decode. Each codec and
-tier carries the fastest implementation that holds the frame budget: platform
-hardware, tuned C behind an isolated sys crate, or pure Rust once it wins on
-the clock. One dependency for live frames.
-
-Status: scaffold. The workspace compiles and the gates run, but no backend
-encodes or decodes anything yet.
+Fourteen crates ship one hand-written ffmpeg sys layer that every software decoder rides. Direct dav1d and libvpx binds measured 1.4 to 1.9x slower at 4 threads and were deleted.
 
 ## Scope
 
-In: realtime frame encode/decode for H.264, H.265, AV1, VP9, and AV2, the
-platform tiers that accelerate them, and the livepack frame packing between the
-two.
+In: realtime frame encode and decode for H.264, H.265, AV1, VP9, VP8, the platform tiers that carry them, and livepack packing between the two.
 
-Out: archival demuxing, subtitles, filters, and audio. A general media framework
-already exists; this crate stays on the live path.
+Out: archival demuxing, subtitles, filters, audio.
+
+`docs/` holds the canonical detail. This file summarizes and links.
+
+## Codec support
+
+| Codec | SW decode | SW encode | HW tiers | Packing | Notes |
+|---|---|---|---|---|---|
+| H.264 | native ffmpeg, 588 fps 4t | openh264, 272 fps 4t | VA-API full, 60/60 vs ffmpeg; MediaCodec avc, min API 21; D3D11 stub | TS + fMP4 | 8-bit 4:2:0 only; openh264 decode rejected on B-frame content, 27/60 |
+| H.265 | native ffmpeg, 563 fps 4t, 361 fps 1t | libx265 wrapper, `gpl` feature, ~290 fps 8t real footage | VA-API stub, declines Unsupported; MediaCodec hevc, min API 21; D3D11 stub | TS + fMP4 | 8-bit 4:2:0 only |
+| AV1 | libdav1d wrapper, 604 fps 4t, ~347 fps 1t | libaom-av1 realtime wrapper, ~136 fps 8t real footage | VA-API stub, declines Unsupported; MediaCodec av01, min API 29; D3D11 stub | fMP4 only | TS refused, no registered stream_type; native av1 decoder is hardware-only |
+| VP9 | native ffmpeg, 625 fps 4t, 325 fps 1t | libvpx-vp9 wrapper, 368 fps 4t | VA-API stub, declines Unsupported; MediaCodec vp9, min API 21; D3D11 stub | unpacked | same system libvpx under the wrapper |
+| VP8 | native ffmpeg, 1336 fps 4t, 444 fps 1t | never | VA-API stub, declines Unsupported; no MediaCodec; D3D11 stub | unpacked | decode only, by design |
+| AV2 | none | none | none | unpacked | gated behind measurement |
+
+All fps figures are 1080p on the rig named in `docs/sw-codecs.md`. Hardware detail lives in `docs/vaapi.md` and `docs/mediacodec.md`. Packing detail lives in `docs/livepack-ts-fmp4.md`. Backend policy lives in `docs/matrix.md`.
+
+## Test status
+
+Unit tests run per crate. Current counts: vulkan 120, livepack 74, vaapi 54, caps 47, facade 43, mediacodec 37, sw 30, harness 13.
+
+Goldens: 423 total. VP9 353, VP8 58, AV1 6, H.264 3, H.265 3. Runner and generation rules are in `docs/testing/goldens.md`.
+
+`fmt`, `clippy`, and tests are green on master.
+
+## Limits
+
+Software paths emit 8-bit 4:2:0 only. Anything else returns `SwError`.
+
+MediaCodec: no EOS API, no PTS out, no surface path yet, one copy per plane.
+
+Windows link is unverified here and fails closed without `FFMPEG_LIB_DIR`. See `docs/sw-codecs.md`.
+
+Unmeasured: encode quality (PSNR/bitrate) oracles for AV1 and H.265, RV3/RV4/RV5 oracles.
 
 ## Layout
 
