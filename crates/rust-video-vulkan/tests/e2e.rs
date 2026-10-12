@@ -2,12 +2,16 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 
 use rust_video::{Decoder, Packet, VideoCodec};
 use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
 use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice};
+
+// Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Harness oracle over a Vulkan decoder.
 struct VulkanOracle<D> {
@@ -105,6 +109,7 @@ fn check_goldens(codec: VideoCodec, oracle: &dyn Oracle) {
 
 #[test]
 fn h264_matches_goldens() {
+    let _guard = SERIAL.lock().unwrap();
     let Some(device) = device_or_decline(CodecOp::H264Decode) else {
         return;
     };
@@ -115,6 +120,7 @@ fn h264_matches_goldens() {
 
 #[test]
 fn h265_matches_goldens() {
+    let _guard = SERIAL.lock().unwrap();
     let Some(device) = device_or_decline(CodecOp::H265Decode) else {
         return;
     };
