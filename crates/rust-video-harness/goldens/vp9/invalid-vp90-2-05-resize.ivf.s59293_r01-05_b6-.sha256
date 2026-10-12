@@ -1,0 +1,11 @@
+# rust-video golden v1
+# vector: corpus/vp9/invalid-vp90-2-05-resize.ivf.s59293_r01-05_b6-.ivf
+# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 352x32
+# frames: 6
+da27d38dc4507d4115b752906d0b599ea3219c63929cd421c11d7dadc3ae21d7
+3b3957a38eb7c58ba7a9968c12e684bb73096a8e488ce7b6ceec0129cf75d58c
+642942eb766da4ab8f5bec23d86f0b00e7f63a590ebf22376f1c7feb972b31e8
+b0ac51686a7ab604e5268cd244df5f2601e08deccfaa3e9f9718a58d892591f6
+13179debe1d297bb9959887a8e8300c0b0d9592186b5e47d7266beee8a2cb54b
+196f95454a08328429dee45ddc59ab468b146e1f23c573f5270cfc9171d1ca4c
