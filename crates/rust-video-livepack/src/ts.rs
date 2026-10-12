@@ -1,5 +1,9 @@
 //! MPEG-TS mux and demux for H.264/H.265.
 //!
+//! AV1/VP9/VP8/AV2 have no registered `stream_type` and decline with
+//! [`TsMuxError::CodecNotMappable`]; the demuxer skips their PMT
+//! entries as unknown.
+//!
 //! [ITU-T H.222.0](https://www.itu.int/rec/T-REC-H.222.0) section 2.4.
 
 use std::fmt;
@@ -52,7 +56,7 @@ impl Default for TsMuxConfig {
 pub enum TsMuxError {
     /// PID outside `0x0020..=0x1FFA`, or PMT equals video PID.
     InvalidPid(u16),
-    /// Codec has no MPEG-TS `stream_type` (AV1).
+    /// Codec has no MPEG-TS `stream_type` (AV1, VP9, VP8, AV2).
     CodecNotMappable(Codec),
     /// Payload exceeds `max_pes_bytes`.
     PayloadTooLarge(usize),
@@ -177,8 +181,8 @@ impl TsMux {
     ///
     /// # Errors
     ///
-    /// Returns `Err` on AV1 payloads, empty payloads, and payloads past
-    /// `max_pes_bytes`.
+    /// Returns `Err` on AV1/VP9/VP8/AV2 payloads, empty payloads, and
+    /// payloads past `max_pes_bytes`.
     pub fn push(
         &mut self,
         unit: &AccessUnit,
@@ -880,6 +884,34 @@ mod tests {
             TsMuxError::EmptyPayload
         );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn mux_declines_unmappable_codecs() {
+        use crate::codec::{AccessUnit, Codec};
+        let mut mux = TsMux::new(TsMuxConfig::default()).expect("valid config");
+        let mut out = Vec::new();
+        for codec in [Codec::Vp9, Codec::Vp8, Codec::Av2] {
+            let unit = AccessUnit::new(codec, vec![1, 2, 3], 0, 0, true);
+            assert_eq!(
+                mux.push(&unit, None, &mut out).unwrap_err(),
+                TsMuxError::CodecNotMappable(codec)
+            );
+        }
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pmt_skips_unmappable_entries() {
+        use crate::codec::Codec;
+        let mut section = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0, 0x00];
+        section.extend_from_slice(&[0xEA, 0xE1, 0x00, 0xF0, 0x00, 0, 0, 0, 0]);
+        assert_eq!(TsDemux::parse_pmt(&section), None);
+        let mut mixed = section[..12].to_vec();
+        mixed.extend_from_slice(&[0xEA, 0xE1, 0x00, 0xF0, 0x00]);
+        mixed.extend_from_slice(&[0x1B, 0xE1, 0x01, 0xF0, 0x00]);
+        mixed.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(TsDemux::parse_pmt(&mixed), Some((0x0101, Codec::H264)));
     }
 
     #[test]

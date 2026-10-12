@@ -1,7 +1,9 @@
-//! Fragmented MP4 / CMAF mux for H.264/H.265/AV1.
+//! Fragmented MP4 / CMAF mux for H.264/H.265/AV1/VP9/VP8.
 //!
 //! Boxes: ISO/IEC 14496-12; `avcC`/`hvcC`: 14496-15; `av1C`:
 //! [AV1-ISOBMFF §2.3](https://aomediacodec.github.io/av1-isobmff/#av1codecconfigurationbox-section).
+//! `vpcC`: [VP9 MP4](https://www.webmproject.org/vp9/mp4/);
+//! [FFmpeg master `vpcc.c`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/vpcc.c).
 //! `cmfc`/`iso6` brands follow
 //! [FFmpeg n7.1 `movenc.c`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/movenc.c).
 
@@ -27,6 +29,8 @@ pub enum ConfigError {
     BadHvcc(&'static str),
     /// Malformed `av1C` record; carries the cause.
     BadAv1c(&'static str),
+    /// Malformed `vpcC` record; carries the cause.
+    BadVpcc(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -38,6 +42,7 @@ impl fmt::Display for ConfigError {
             Self::ParameterSetTooLarge => write!(f, "parameter set past 65535 bytes"),
             Self::BadHvcc(cause) => write!(f, "malformed hvcc: {cause}"),
             Self::BadAv1c(cause) => write!(f, "malformed av1C: {cause}"),
+            Self::BadVpcc(cause) => write!(f, "malformed vpcC: {cause}"),
         }
     }
 }
@@ -143,6 +148,123 @@ struct Av1Chroma {
     subsampling_y: bool,
 }
 
+/// VP9 decoder configuration: `vpcC` fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vp9Config {
+    /// Shared `vpcC` fields.
+    inner: Vpcc,
+}
+
+/// VP8 decoder configuration: `vpcC` fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Vp8Config {
+    /// Shared `vpcC` fields.
+    inner: Vpcc,
+}
+
+/// Parsed `vpcC` full box shared by VP8 and VP9.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Vpcc {
+    /// `profile`.
+    profile: u8,
+    /// `level`.
+    level: u8,
+    /// `bitDepth`.
+    bitdepth: u8,
+    /// `chromaSubsampling`.
+    chroma: u8,
+    /// `fullRange`.
+    fullrange: bool,
+    /// `colourPrimaries`.
+    color_primaries: u8,
+    /// `transferCharacteristics`.
+    transfer: u8,
+    /// `matrixCoefficients`.
+    matrix: u8,
+}
+
+impl Vpcc {
+    /// Fields parsed from a full `vpcC` box.
+    fn parse(record: &[u8]) -> Result<Self, ConfigError> {
+        if record.len() != 12 {
+            return Err(ConfigError::BadVpcc("size"));
+        }
+        if record[0] != 1 {
+            return Err(ConfigError::BadVpcc("version"));
+        }
+        if record[1..4] != [0, 0, 0] {
+            return Err(ConfigError::BadVpcc("flags"));
+        }
+        if record[10..12] != [0, 0] {
+            return Err(ConfigError::BadVpcc("init data"));
+        }
+        Ok(Self {
+            profile: record[4],
+            level: record[5],
+            bitdepth: record[6] >> 4,
+            chroma: (record[6] >> 1) & 0x07,
+            fullrange: record[6] & 0x01 != 0,
+            color_primaries: record[7],
+            transfer: record[8],
+            matrix: record[9],
+        })
+    }
+
+    /// Full `vpcC` box bytes.
+    fn emit(self) -> Vec<u8> {
+        vec![
+            1,
+            0,
+            0,
+            0,
+            self.profile,
+            self.level,
+            (self.bitdepth << 4) | ((self.chroma & 0x07) << 1) | u8::from(self.fullrange),
+            self.color_primaries,
+            self.transfer,
+            self.matrix,
+            0,
+            0,
+        ]
+    }
+}
+
+impl Vp9Config {
+    /// Configuration parsed from a full `vpcC` box.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on wrong size, version other than 1, nonzero
+    /// flags, or present codec init data.
+    pub fn from_vpcc_record(record: &[u8]) -> Result<Self, ConfigError> {
+        Vpcc::parse(record).map(|inner| Self { inner })
+    }
+
+    /// Full `vpcC` box bytes.
+    #[must_use]
+    pub fn record_bytes(&self) -> Vec<u8> {
+        self.inner.emit()
+    }
+}
+
+impl Vp8Config {
+    /// Configuration parsed from a full `vpcC` box.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on wrong size, version other than 1, nonzero
+    /// flags, or present codec init data.
+    pub fn from_vpcc_record(record: &[u8]) -> Result<Self, ConfigError> {
+        Vpcc::parse(record).map(|inner| Self { inner })
+    }
+
+    /// Full `vpcC` box bytes.
+    #[must_use]
+    pub fn record_bytes(&self) -> Vec<u8> {
+        self.inner.emit()
+    }
+}
+
 /// Track decoder configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrackConfig {
@@ -152,6 +274,10 @@ pub enum TrackConfig {
     Hevc(HevcConfig),
     /// AV1.
     Av1(Av1Config),
+    /// VP9.
+    Vp9(Vp9Config),
+    /// VP8.
+    Vp8(Vp8Config),
 }
 
 impl AvcConfig {
@@ -304,6 +430,8 @@ impl TrackConfig {
             Self::Avc(_) => Codec::H264,
             Self::Hevc(_) => Codec::H265,
             Self::Av1(_) => Codec::Av1,
+            Self::Vp9(_) => Codec::Vp9,
+            Self::Vp8(_) => Codec::Vp8,
         }
     }
 
@@ -314,6 +442,8 @@ impl TrackConfig {
             Self::Avc(config) => config.record_bytes(),
             Self::Hevc(config) => config.record_bytes().to_vec(),
             Self::Av1(config) => config.record_bytes(),
+            Self::Vp9(config) => config.record_bytes(),
+            Self::Vp8(config) => config.record_bytes(),
         }
     }
 
@@ -323,6 +453,8 @@ impl TrackConfig {
             Self::Avc(_) => *b"avc1",
             Self::Hevc(_) => *b"hvc1",
             Self::Av1(_) => *b"av01",
+            Self::Vp9(_) => *b"vp09",
+            Self::Vp8(_) => *b"vp08",
         };
         [*b"isom", *b"iso2", codec, *b"cmfc", *b"iso6", *b"mp41"]
     }
@@ -403,8 +535,8 @@ impl FragmentMux {
 
     /// One access unit as a CMAF chunk: `moof` plus `mdat`.
     ///
-    /// H.264/H.265 payloads convert annex-B to 4-byte lengths; AV1
-    /// payloads pass through untouched.
+    /// H.264/H.265 payloads convert annex-B to 4-byte lengths;
+    /// AV1/VP9/VP8 payloads pass through untouched.
     ///
     /// # Arguments
     ///
@@ -469,7 +601,10 @@ impl FragmentMux {
 
     /// Sample bytes for the track codec.
     fn sample_bytes(unit: &AccessUnit) -> Result<Vec<u8>, Fmp4Error> {
-        if unit.codec() == Codec::Av1 {
+        if matches!(
+            unit.codec(),
+            Codec::Av1 | Codec::Vp9 | Codec::Vp8 | Codec::Av2
+        ) {
             return Ok(unit.payload().to_vec());
         }
         let mut sample = Vec::with_capacity(unit.payload().len());
@@ -715,6 +850,9 @@ impl ByteSink {
             Codec::H264 => *b"avcC",
             Codec::H265 => *b"hvcC",
             Codec::Av1 => *b"av1C",
+            Codec::Vp9 | Codec::Vp8 => *b"vpcC",
+            // BLOCKED: no TrackConfig carries Av2; unreachable.
+            Codec::Av2 => *b"av02",
         };
         let config = self.open(config_tag);
         self.bytes(&track.record_bytes());
@@ -782,6 +920,7 @@ impl ByteSink {
 mod tests {
     use super::{
         Av1Config, AvcConfig, ConfigError, Fmp4Error, FragmentMux, HevcConfig, TrackConfig,
+        Vp8Config, Vp9Config,
     };
     use crate::codec::{AccessUnit, Codec, KeyframeGate, PacketAction};
 
@@ -865,6 +1004,116 @@ mod tests {
             Av1Config::from_av1c_record(&[0x00, 0x08, 0x0C, 0x00]).unwrap_err(),
             ConfigError::BadAv1c("marker/version")
         );
+    }
+
+    #[test]
+    fn vpcc_round_trips() {
+        let record = [1, 0, 0, 0, 0, 0x1F, 0xC1, 1, 1, 1, 0, 0];
+        assert_eq!(
+            Vp9Config::from_vpcc_record(&record)
+                .expect("valid")
+                .record_bytes(),
+            record
+        );
+        assert_eq!(
+            Vp8Config::from_vpcc_record(&record)
+                .expect("valid")
+                .record_bytes(),
+            record
+        );
+        assert_eq!(
+            Vp9Config::from_vpcc_record(&record[..8]).unwrap_err(),
+            ConfigError::BadVpcc("size")
+        );
+        let mut bad = record;
+        bad[0] = 2;
+        assert_eq!(
+            Vp9Config::from_vpcc_record(&bad).unwrap_err(),
+            ConfigError::BadVpcc("version")
+        );
+        let mut bad = record;
+        bad[3] = 1;
+        assert_eq!(
+            Vp8Config::from_vpcc_record(&bad).unwrap_err(),
+            ConfigError::BadVpcc("flags")
+        );
+        let mut bad = record;
+        bad[11] = 4;
+        assert_eq!(
+            Vp9Config::from_vpcc_record(&bad).unwrap_err(),
+            ConfigError::BadVpcc("init data")
+        );
+    }
+
+    #[test]
+    fn vp_tracks_init_with_entry_and_vpcc() {
+        for (codec, entry) in [(Codec::Vp9, *b"vp09"), (Codec::Vp8, *b"vp08")] {
+            let record = [1, 0, 0, 0, 0, 0x1F, 0xC1, 1, 1, 1, 0, 0];
+            let track = match codec {
+                Codec::Vp9 => TrackConfig::Vp9(Vp9Config::from_vpcc_record(&record).expect("vpcc")),
+                _ => TrackConfig::Vp8(Vp8Config::from_vpcc_record(&record).expect("vpcc")),
+            };
+            assert_eq!(track.codec(), codec);
+            let mux = FragmentMux::new(track, 320, 240).expect("valid dims");
+            let init = mux.init_segment();
+            let fourcc = |tag: &[u8; 4]| init.windows(4).any(|w| w == tag);
+            assert!(fourcc(&entry));
+            assert!(fourcc(b"vpcC"));
+        }
+    }
+
+    #[test]
+    fn vp_chunks_carry_samples_with_keyframe_flags() {
+        let record = [1, 0, 0, 0, 0, 0x1F, 0xC1, 1, 1, 1, 0, 0];
+        let cases = [
+            (
+                TrackConfig::Vp9(Vp9Config::from_vpcc_record(&record).expect("vpcc")),
+                Codec::Vp9,
+                vec![0x80, 0x00, 0xAA],
+            ),
+            (
+                TrackConfig::Vp8(Vp8Config::from_vpcc_record(&record).expect("vpcc")),
+                Codec::Vp8,
+                vec![0x10, 0x9D, 0x01, 0x2A],
+            ),
+        ];
+        for (track, codec, payload) in cases {
+            let mut mux = FragmentMux::new(track, 320, 240).expect("valid dims");
+            let unit = AccessUnit::classified(codec, payload.clone(), 3000, 0);
+            assert!(unit.is_keyframe());
+            let mut out = Vec::new();
+            let action = mux
+                .push_sample(&unit, 3000, None, &mut out)
+                .expect("fragment");
+            assert!(matches!(action, PacketAction::Emitted(n) if n == out.len()));
+            assert_eq!(&out[4..8], b"moof");
+            let moof_len = usize::try_from(u32::from_be_bytes(out[..4].try_into().expect("len")))
+                .expect("len");
+            assert_eq!(&out[moof_len + 4..moof_len + 8], b"mdat");
+            assert_eq!(&out[moof_len + 8..], payload.as_slice());
+            assert!(out.windows(4).any(|w| w == [0x02, 0x00, 0x00, 0x00]));
+        }
+    }
+
+    #[test]
+    fn av2_push_declines_on_every_track() {
+        let record = [1, 0, 0, 0, 0, 0x1F, 0xC1, 1, 1, 1, 0, 0];
+        let (sps, pps) = baseline_sets();
+        let tracks = [
+            TrackConfig::Avc(AvcConfig::from_parameter_sets(sps, pps).expect("valid")),
+            TrackConfig::Vp9(Vp9Config::from_vpcc_record(&record).expect("vpcc")),
+            TrackConfig::Vp8(Vp8Config::from_vpcc_record(&record).expect("vpcc")),
+        ];
+        for track in tracks {
+            let mut mux = FragmentMux::new(track, 320, 240).expect("valid dims");
+            let mut out = Vec::new();
+            let unit = AccessUnit::new(Codec::Av2, vec![0xAA], 0, 0, true);
+            assert_eq!(
+                mux.push_sample(&unit, 3000, None, &mut out).unwrap_err(),
+                Fmp4Error::CodecMismatch
+            );
+            assert!(out.is_empty());
+        }
     }
 
     #[test]

@@ -10,7 +10,8 @@ mod ts;
 
 pub use codec::{AccessUnit, AnnexB, Codec, KeyframeGate, KeyframeState, PacketAction};
 pub use fmp4::{
-    Av1Config, AvcConfig, ConfigError, Fmp4Error, FragmentMux, HevcConfig, TrackConfig,
+    Av1Config, AvcConfig, ConfigError, Fmp4Error, FragmentMux, HevcConfig, TrackConfig, Vp8Config,
+    Vp9Config,
 };
 pub use queue::{BoundedQueue, FrameSlot, Policy, PushError};
 pub use time::{ClockTracker, Pcr, Ts90k, PCR_EXT_MAX, PCR_TICKS_PER_SEC, STC_WRAP, TICKS_PER_SEC};

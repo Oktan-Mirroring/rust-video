@@ -4,6 +4,9 @@
 //! and [`hevc.h`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavcodec/hevc/hevc.h).
 //! OBU types: [FFmpeg n7.1 `av1.h`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavcodec/av1.h);
 //! frame-header bit order: [dav1d 1.5.1 `obu.c`](https://github.com/videolan/dav1d/blob/1.5.1/src/obu.c).
+//! VP8 tag: [RFC 6386 §9.1](https://datatracker.ietf.org/doc/html/rfc6386#section-9.1).
+//! VP9 header: [VP9 spec §6.2/§7.2](https://www.webmproject.org/vp9/); sync
+//! `0x498342`, bit order: [FFmpeg master `vpcc.c`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/vpcc.c).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -16,6 +19,12 @@ pub enum Codec {
     H265,
     /// AV1.
     Av1,
+    /// VP9.
+    Vp9,
+    /// VP8.
+    Vp8,
+    /// AV2 packing stub; every mux path declines it typed.
+    Av2,
 }
 
 /// One decodable frame: NALUs or OBUs sharing a timestamp.
@@ -99,25 +108,31 @@ struct BitReader<'a> {
 impl Codec {
     /// MPEG-TS `stream_type`; `None` has no registered value.
     ///
-    /// `0x1B`/`0x24`: H.222.0 section 2.4.4.9 table 2-34. AV1 has none:
-    /// [FFmpeg master `mpegts.h`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mpegts.h)
-    /// carries no AV1 video type (`0xCF` there is HLS AAC audio).
+    /// `0x1B`/`0x24`: H.222.0 section 2.4.4.9 table 2-34. AV1/VP9/VP8/AV2
+    /// have none: [FFmpeg master `mpegts.h`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mpegts.h)
+    /// carries no video type for them (`0xCF` there is HLS AAC audio).
     #[must_use]
     pub fn ts_stream_type(self) -> Option<u8> {
         match self {
             Self::H264 => Some(0x1B),
             Self::H265 => Some(0x24),
-            Self::Av1 => None,
+            Self::Av1 | Self::Vp9 | Self::Vp8 | Self::Av2 => None,
         }
     }
 
     /// ISO BMFF sample entry fourcc.
+    ///
+    /// `Av2` never reaches a mux: no `TrackConfig` carries it, so this
+    /// arm is BLOCKED and pinned by decline tests, not by bytes.
     #[must_use]
     pub fn sample_entry(self) -> [u8; 4] {
         match self {
             Self::H264 => *b"avc1",
             Self::H265 => *b"hvc1",
             Self::Av1 => *b"av01",
+            Self::Vp9 => *b"vp09",
+            Self::Vp8 => *b"vp08",
+            Self::Av2 => *b"av02",
         }
     }
 
@@ -134,6 +149,9 @@ impl Codec {
                 .find(|t| *t <= 23)
                 .is_some_and(|t| (16..=23).contains(&t)),
             Self::Av1 => Self::av1_frame_is_key(payload),
+            Self::Vp9 => Self::vp9_frame_is_key(payload),
+            Self::Vp8 => Self::vp8_frame_is_key(payload),
+            Self::Av2 => false,
         }
     }
 
@@ -202,6 +220,38 @@ impl Codec {
     /// True when a frame header body opens with `0,00`.
     fn av1_header_is_key(body: &[u8]) -> bool {
         BitReader::new(body).read_bits(3).is_some_and(|v| v == 0)
+    }
+
+    /// True when a VP8 frame tag opens a key frame.
+    ///
+    /// Bit 0 of byte 0 is `frame_type`: 0 key, 1 inter; empty payload
+    /// carries no tag.
+    fn vp8_frame_is_key(payload: &[u8]) -> bool {
+        payload.first().is_some_and(|b| b & 0x01 == 0)
+    }
+
+    /// True when a VP9 uncompressed header opens a key frame.
+    ///
+    /// Key iff `frame_marker` is `0b10`, `show_existing_frame` is 0,
+    /// and `frame_type` is 0. Truncation or marker mismatch reads
+    /// `false`.
+    fn vp9_frame_is_key(payload: &[u8]) -> bool {
+        let mut reader = BitReader::new(payload);
+        if reader.read_bits(2) != Some(0b10) {
+            return false;
+        }
+        let low = reader.read_bits(1);
+        let high = reader.read_bits(1);
+        let (Some(low), Some(high)) = (low, high) else {
+            return false;
+        };
+        if (high << 1) | low == 3 && reader.read_bits(1).is_none() {
+            return false;
+        }
+        if reader.read_bits(1) != Some(0) {
+            return false;
+        }
+        reader.read_bits(1) == Some(0)
     }
 }
 
@@ -508,6 +558,40 @@ mod tests {
         assert_eq!(Codec::H264.ts_stream_type(), Some(0x1B));
         assert_eq!(Codec::H265.ts_stream_type(), Some(0x24));
         assert_eq!(Codec::Av1.ts_stream_type(), None);
+        assert_eq!(Codec::Vp9.ts_stream_type(), None);
+        assert_eq!(Codec::Vp8.ts_stream_type(), None);
+        assert_eq!(Codec::Av2.ts_stream_type(), None);
+    }
+
+    #[test]
+    fn sample_entries_match_fourcc() {
+        assert_eq!(Codec::H264.sample_entry(), *b"avc1");
+        assert_eq!(Codec::H265.sample_entry(), *b"hvc1");
+        assert_eq!(Codec::Av1.sample_entry(), *b"av01");
+        assert_eq!(Codec::Vp9.sample_entry(), *b"vp09");
+        assert_eq!(Codec::Vp8.sample_entry(), *b"vp08");
+    }
+
+    #[test]
+    fn vp8_tag_bit_selects_key() {
+        assert!(Codec::Vp8.is_keyframe(&[0x10, 0x9D, 0x01, 0x2A]));
+        assert!(!Codec::Vp8.is_keyframe(&[0x01]));
+        assert!(!Codec::Vp8.is_keyframe(&[]));
+    }
+
+    #[test]
+    fn vp9_header_bits_select_key() {
+        assert!(Codec::Vp9.is_keyframe(&[0x80, 0x00]));
+        assert!(!Codec::Vp9.is_keyframe(&[0x84, 0x00]));
+        assert!(!Codec::Vp9.is_keyframe(&[0x88, 0x00]));
+        assert!(!Codec::Vp9.is_keyframe(&[0x00, 0x00]));
+        assert!(!Codec::Vp9.is_keyframe(&[]));
+    }
+
+    #[test]
+    fn av2_never_classifies_key() {
+        assert!(!Codec::Av2.is_keyframe(&[0x00]));
+        assert!(!Codec::Av2.is_keyframe(&[]));
     }
 
     #[test]
