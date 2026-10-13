@@ -641,33 +641,29 @@ mod tests {
         assert_eq!(reference.PicOrderCnt, [0, 0]);
     }
 
-    /// Parsed sets of the high vector: Annex B form of repo
-    /// corpus/synth/h264/h264-high.mp4 (ffprobe: High, 1920x1080,
-    /// level 4.0, yuv420p, 2 B-frames).
+    /// High 1920x1080 sequence set.
+    const HIGH_SPS: &str = "67640028acd940780227e5c044000003000400000300f03c60c658";
+    /// High vector picture set.
+    const HIGH_PPS: &str = "68ef8fcb";
+
+    /// Parsed High 1920x1080 level 4.0 sets.
     fn high_vector_sets() -> (
         std::rc::Rc<crate::parse::h264::Sps>,
         std::rc::Rc<crate::parse::h264::Pps>,
     ) {
-        use crate::parse::nal::NaluSplitter;
-        let bytes = std::fs::read("/tmp/h264-high.h264").expect("vector");
-        let mut splitter = NaluSplitter::new();
-        let mut units = splitter.push(&bytes);
-        units.extend(splitter.flush());
+        let units = split(&[hex(HIGH_SPS), hex(HIGH_PPS)]);
         let mut parser = H264Parser::new();
-        let mut sps_found = None;
-        let mut pps_found = None;
-        for raw in units.iter().take(4) {
-            match parser.parse(raw).expect("parse") {
-                ParsedNalu::Sps(sps) => sps_found = Some(sps),
-                ParsedNalu::Pps(pps) => pps_found = Some(pps),
-                _ => {}
-            }
-        }
-        (sps_found.expect("sps"), pps_found.expect("pps"))
+        let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
+            panic!("want sps");
+        };
+        let ParsedNalu::Pps(pps) = parser.parse(&units[1]).expect("pps") else {
+            panic!("want pps");
+        };
+        (sps, pps)
     }
 
     #[test]
-    fn tmp_high_vector_std_sps() {
+    fn high_vector_std_sps() {
         use ash::vk::native::{
             StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
             StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_4_0,
@@ -731,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_high_vector_std_pps() {
+    fn high_vector_std_pps() {
         use ash::vk::native::StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_IMPLICIT;
         let (_, pps) = high_vector_sets();
         let mut tables = super::H264Tables::new();
