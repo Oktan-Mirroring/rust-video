@@ -13,3 +13,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: extractions/setup-just@v2
       - run: just ci
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: extractions/setup-just@v2
+      - run: just msrv
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r30
+      - run: cargo check -p rust-video-mediacodec --target aarch64-linux-android -j24

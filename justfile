@@ -45,3 +45,8 @@ goldens *args:
 # Commit gate hook entry point.
 commit-lint-gate:
     bash .claude/hooks/commit-lint-gate.sh
+
+# MSRV gate: check and test on the pinned 1.87.0 toolchain.
+msrv:
+    cargo +1.87.0 clippy --workspace --all-targets -j24 -- -D warnings
+    cargo +1.87.0 test --workspace -j24
