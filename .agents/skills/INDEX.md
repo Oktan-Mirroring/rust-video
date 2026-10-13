@@ -4,5 +4,5 @@
 |---|---|
 | [realtime-scope](realtime-scope/SKILL.md) | Adding or scoping any behaviour |
 
-New skills land as `.claude/skills/<name>/SKILL.md` with a row here.
-`.agents/skills` symlinks to this directory so both paths resolve.
+New skills land as `.agents/skills/<name>/SKILL.md` with a row here.
+`.claude/skills` symlinks to this directory so both paths resolve.

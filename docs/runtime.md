@@ -39,12 +39,12 @@ types in `crates/rust-video/src/`, slots and queues in
 ## Export matrix
 
 `GpuFrame::export` returns the platform handle for zero-copy handoff.
-All variants compile on all targets; behavior arrives with the tiers.
+Variants are `cfg`-gated per target; behavior arrives with the tiers.
 
 | Platform | Variant | Handle |
 |---|---|---|
-| Unix | `DmaBuf` | fd, stride, offset, modifier |
-| Windows | `NtHandle` | NT handle |
+| `cfg(unix)` | `DmaBuf` | fd, stride, offset, modifier |
+| `cfg(windows)` | `NtHandle` | NT handle |
 | Any | `Opaque` | backend name |
 
 Until a backend attaches, `export` and `try_to_cpu` return

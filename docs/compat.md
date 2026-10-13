@@ -13,14 +13,14 @@ secondary, **[?]** unresolved, never filled. All fetches 2026-10-11.
 |---|---|---|
 | `ash` | `0.38.0+1.3.281` (headers 1.3.281) [T1] | crates.io ash API |
 | `libloading` (via ash `loaded`) | `^0.8` [T1] | ash deps API |
-| `wgpu` | `30.0.1`, rust 1.87.0 [T1] | crates.io wgpu API |
+| `wgpu` | not in tree; `30.0.1` applies only if a consumer lands (planned [?]) | crates.io wgpu API |
 | `ndk` / `ndk-sys` | `0.9.0` / `0.6.0+11769913` [T1] | crates.io API, docs.rs ndk 0.9.0 |
-| `windows` | `0.62.2`, rust 1.82 [T1] | crates.io API |
+| `windows` | not in tree; `0.62.2` named for the D3D11 tier (planned [?]) | crates.io API |
 | NDK (CI) | r30 (2026-09-08) [T1] | android/ndk releases |
-| `cargo-ndk` (CI) | `4.1.2` [T1] | crates.io API |
-| `cargo-msrv` (CI) | `0.19.3` [T1] | crates.io API |
+| `cargo-ndk` (CI) | unused; CI runs plain `cargo check --target` under `nttld/setup-ndk` [T1] | `.github/workflows/ci.yml` |
+| `cargo-msrv` (CI) | unused; the `msrv` job runs `just msrv` on the pinned toolchain [T1] | `.github/workflows/ci.yml` |
 | libva latest / floor | 2.24.1 / 2.14.0 [T1] | libva releases, Ubuntu packages |
-| MSRV | 1.87, binding constraint wgpu 30.0.1 [T1] | workspace Cargo.toml |
+| MSRV | 1.87 [T1] | workspace Cargo.toml |
 
 ## Vulkan
 
@@ -55,44 +55,44 @@ for android-24) [T1]. Certified handhelds from API 34 must decode
 H.264/H.265/VP8/VP9/AV1 and encode H.264/VP8/AV1 (CDD 14) [T1];
 below that, attempt creation and handle absence.
 
-Rules: `ndk 0.9.0` with `media` plus the `api-level-NN` chain, NDK
-r30, `cargo-ndk`. Every call above 21 sits behind an `SDK_INT` gate
-read once at tier init (exact accessor [?], probe docs.rs at
-implementation); missing API skips that op, never crashes, never
-silently degrades. NDK has no codec-list API, so codec choice and
-quirks go over JNI `MediaCodecList` [T2, levels to verify]. Quirk
-table `quirks.toml` keys `(manufacturer, soc, mime)` to flags; all
-values are Tier 3 until measured, so it ships empty-but-functional
-with the loader tested. Emulator CI covers negotiation and software
-paths at 21/24/28/33/34; hardware decode needs a physical-device lab
-[?].
+Rules: `ndk 0.9.0` with `media` plus fixed `api-level-28`, NDK
+r30, plain `cargo check --target` (no `cargo-ndk`). Every call above
+21 sits behind an `ApiLevel` gate over
+`ndk_sys::android_get_device_api_level`; missing API skips that op,
+never crashes, never silently degrades. NDK has no codec-list API,
+so codec choice over JNI `MediaCodecList` is planned [?]. Quirk
+table `quirks.toml` keys `(soc, codec)` to entries and ships 4
+(2 confirmed, 2 suspected), loader tested. Emulator CI over
+negotiation and software paths at 21/24/28/33/34 is planned [?];
+hardware decode needs a physical-device lab [?].
 
 ## VA-API, D3D11, wgpu
 
 VA-API: dlopen `libva.so.2`, `vaInitialize` reports the runtime
 version, caps come purely from profile/entrypoint queries [T1, va.h].
-No libva floor in code. CI builds against 2.14.0 (jammy), 2.20.0
-(noble), and 2.24.1 [T1]. Headless-driver CI story is [?].
+No libva floor in code. Floor-container CI against 2.14.0 (jammy),
+2.20.0 (noble), and 2.24.1 is planned [?]. Headless-driver CI story
+is [?].
 
 D3D11: floor is Windows 8 desktop, the `ID3D11VideoDevice` minimum
-[T1, MS Learn]. `windows 0.62.2` with the D3D11 features [T1].
-Decoder GUIDs come from the windows-crate constants only (H.264,
-HEVC, VP9, AV1, APV profiles all present [T1]); never hand-copy hex,
-which closes the hw-tiers GUID gap. Runtime enumerates device
-(hardware, WARP, reference), profiles, and formats per adapter; the
-basic display adapter reports no decoders and the tier skips [T2].
+[T1, MS Learn]. The tier is a stub: `rust-video-d3d11` holds no code
+and no `windows` dependency (planned [?], pin 0.62.2 named above).
+Decoder GUIDs will come from the windows-crate constants only
+(H.264, HEVC, VP9, AV1, APV profiles all present [T1]); never
+hand-copy hex. Runtime enumeration per adapter (hardware, WARP,
+reference; profiles; formats) is planned [?].
 
-wgpu 30.0.1 is not a decode tier: its `Backends` list has no D3D11
-and no video API [T1, docs.rs]. Allowed roles are upload/render
-interop behind a facade feature only, backend chosen at runtime. If
-no consumer exists, the dependency stays out. Its rust_version
-1.87.0 exactly equals the MSRV floor, so it stays exactly pinned.
+wgpu is not a decode tier: its `Backends` list has no D3D11 and no
+video API [T1, docs.rs]. Allowed roles are upload/render interop
+behind a facade feature only, backend chosen at runtime. No consumer
+exists, so the dependency stays out and nothing is pinned; the
+30.0.1 pin above applies only if it lands.
 
 ## MSRV
 
 Floor 1.87, declared as workspace `rust-version`. Every pin
-satisfies it [T1]. CI enforces with `cargo-msrv verify` plus a `just
-msrv` recipe running check and test on the pinned 1.87.0 toolchain.
+satisfies it [T1]. CI enforces with the `msrv` job running the `just
+msrv` recipe (clippy plus test) on the pinned 1.87.0 toolchain.
 Any dependency whose `rust_version` exceeds the floor is rejected at
 review. A bump is a minor-version decision with a changelog note,
 never silent.
@@ -101,14 +101,14 @@ never silent.
 
 | Axis | Mechanism | Why |
 |---|---|---|
-| OS tier inclusion | facade `tier-*` features, `cfg(target_os)` deps | a target cannot carry another OS's tier |
-| NDK API ladder | `api-level-NN` features plus `SDK_INT` gates | features expose symbols, gates pick paths |
+| OS tier inclusion | facade `tier-d3d11` feature; `rust-video-vulkan`, `rust-video-vaapi`, `rust-video-mediacodec` as direct dependencies, facade flags planned [?] | a target cannot carry another OS's tier |
+| NDK API ladder | fixed `api-level-28` plus `ApiLevel` gates (21 floor, 28 async notify) | features expose symbols, gates pick paths |
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
-| D3D11 adapter/GUID/format | runtime only | per-adapter enumeration |
-| wgpu backend | runtime `Backends` flags | one binary, many GPUs |
-| software codecs | facade `codec-*` features | compile cost and binary size |
-| quirk table | runtime data file | per-device Tier 3 values |
+| D3D11 adapter/GUID/format | runtime only, planned [?] | per-adapter enumeration |
+| wgpu backend | planned [?]; runtime `Backends` flags when it lands | one binary, many GPUs |
+| software codecs | `rust-video-sw` features (`ffmpeg`, `gpl`, `h264-openh264`); facade `codec-*` map to stub crates | compile cost and binary size |
+| quirk table | runtime data file | per-device values, suspected until measured |
 
 Anti-rule: no `cfg` on driver versions, no `cfg` on OS API levels,
 no build script baking host GPU state into the binary. The corpus
@@ -116,24 +116,28 @@ script gates tests only, never behavior.
 
 ## CI matrix
 
-`just ci` on Ubuntu plus Windows stays GPU-free. Around it: MSRV job
-on pinned 1.87.0; Android NDK builds for all targets at minSdk 21
-with every `api-level` feature; emulator jobs at 21/24/28/33/34 for
-negotiation and software paths; Lavapipe Vulkan ladder [?]; VA-API
-floor containers; Windows no-GPU enumeration expecting skip-or-list;
-self-hosted GPU runners plus an Android device lab for hardware
-e2e [?].
+`just ci` on Ubuntu plus Windows stays GPU-free. Around it: the
+`msrv` job on pinned 1.87.0; one Android NDK check
+(`rust-video-mediacodec` for `aarch64-linux-android` under NDK r30).
+Planned [?]: emulator jobs at 21/24/28/33/34, Lavapipe Vulkan
+ladder, VA-API floor containers, Windows no-GPU enumeration,
+self-hosted GPU runners, an Android device lab for hardware e2e.
 
 ## Packaging
 
 One dependency: the `rust-video` facade. Tiers arrive as facade
-features (`tier-vulkan`, `tier-vaapi`, `tier-d3d11`,
-`tier-mediacodec`, `codec-*`, `wgpu-interop`), each an optional
-dependency on its tier crate; defaults are all tiers compilable on
-the building target, individually disableable. Tier crates never
-depend on each other. The facade re-exports runtime capability
-discovery so users write one code path. Adding a tier is minor;
-removing is major.
+features: `codec-av1`, `codec-av2`, `codec-h264`, `codec-h265`,
+`codec-vp9`, and `tier-d3d11`, each wired to its crate. Default is
+empty: every feature is opt-in. No `codec-vp8`, no `sw` wiring, no
+`wgpu-interop` (planned [?]). `rust-video-vulkan`,
+`rust-video-vaapi`, and `rust-video-mediacodec` are direct
+dependencies for now: each depends on the facade, so a facade
+feature pointing at one would close a dependency cycle that cargo
+rejects. Facade flags for the three are planned [?] and reopen
+when the tier crates drop the facade dependency. Tier crates never
+depend on each other. The facade resolves tiers over caller-supplied
+`Capabilities` so users write one code path. Adding a tier is
+minor; removing is major.
 
 ## Open questions
 
@@ -142,7 +146,6 @@ removing is major.
 3. Lavapipe version and video-extension exposure: probe `vulkaninfo`.
 4. VA-API headless CI story: probe DRM plus driver-name matrix.
 5. Android hardware lab: owner infra decision.
-6. `ndk::api_level()` accessor shape: probe docs.rs at implementation.
-7. JNI `MediaCodecList` levels: probe Android reference at implementation.
-8. All quirk-table values: per-device measurement.
-9. Sub-Win8 floors: no requirement; Win8 stands.
+6. JNI `MediaCodecList` levels: probe Android reference at implementation.
+7. Suspected quirk-table values: per-device measurement.
+8. Sub-Win8 floors: no requirement; Win8 stands.

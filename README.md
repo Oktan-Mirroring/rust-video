@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
 
-Fourteen crates ship one hand-written ffmpeg sys layer that every software decoder rides. Direct dav1d and libvpx binds measured 1.4 to 1.9x slower at 4 threads and were deleted.
+rust-video is a Rust library for realtime video encoding and decoding. It presents software and platform hardware codecs behind one API, for applications that send or receive live video.
 
 ## Scope
 
@@ -13,38 +13,47 @@ In: realtime frame encode and decode for H.264, H.265, AV1, VP9, VP8, the platfo
 
 Out: archival demuxing, subtitles, filters, audio.
 
-`docs/` holds the canonical detail. This file summarizes and links.
-
 ## Codec support
 
-| Codec | SW decode | SW encode | HW tiers | Packing | Notes |
-|---|---|---|---|---|---|
-| H.264 | native ffmpeg, 588 fps 4t | openh264, 272 fps 4t | VA-API full, 60/60 vs ffmpeg; MediaCodec avc, min API 21; D3D11 stub | TS + fMP4 | 8-bit 4:2:0 only; openh264 decode rejected on B-frame content, 27/60 |
-| H.265 | native ffmpeg, 563 fps 4t, 361 fps 1t | libx265 wrapper, `gpl` feature, ~290 fps 8t real footage | VA-API stub, declines Unsupported; MediaCodec hevc, min API 21; D3D11 stub | TS + fMP4 | 8-bit 4:2:0 only |
-| AV1 | libdav1d wrapper, 604 fps 4t, ~347 fps 1t | libaom-av1 realtime wrapper, ~136 fps 8t real footage | VA-API stub, declines Unsupported; MediaCodec av01, min API 29; D3D11 stub | fMP4 only | TS refused, no registered stream_type; native av1 decoder is hardware-only |
-| VP9 | native ffmpeg, 625 fps 4t, 325 fps 1t | libvpx-vp9 wrapper, 368 fps 4t | VA-API stub, declines Unsupported; MediaCodec vp9, min API 21; D3D11 stub | unpacked | same system libvpx under the wrapper |
-| VP8 | native ffmpeg, 1336 fps 4t, 444 fps 1t | never | VA-API stub, declines Unsupported; no MediaCodec; D3D11 stub | unpacked | decode only, by design |
-| AV2 | none | none | none | unpacked | gated behind measurement |
+| Codec | Decode | Encode | Hardware | Packing |
+|---|---|---|---|---|
+| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11 stub | TS and fMP4 |
+| H.265 | native ffmpeg | libx265 (`gpl` feature) | Vulkan, VA-API stub, MediaCodec, D3D11 stub | TS and fMP4 |
+| AV1 | libdav1d wrapper | libaom-av1 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
+| VP9 | native ffmpeg | libvpx-vp9 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
+| VP8 | native ffmpeg | none | VA-API stub; MediaCodec, D3D11 absent | fMP4 only |
 
-All fps figures are 1080p on the rig named in `docs/sw-codecs.md`. Hardware detail lives in `docs/vaapi.md` and `docs/mediacodec.md`. Packing detail lives in `docs/livepack-ts-fmp4.md`. Backend policy lives in `docs/matrix.md`.
+Backend policy lives in `docs/matrix.md`. Hardware detail lives in `docs/vaapi.md` and `docs/mediacodec.md`. Packing detail lives in `docs/livepack-ts-fmp4.md`. AV2 has no backend yet; the gating bar is in `docs/matrix.md`.
 
-## Test status
+## Requirements
 
-Unit tests run per crate. Current counts: vulkan 120, livepack 74, vaapi 54, caps 47, facade 43, mediacodec 37, sw 30, harness 13.
+Rust 1.87 or later. `rust-video-sw` features select the software backends: `ffmpeg` decodes all five codecs and encodes VP9 and AV1 through the system libavcodec and libavutil (install the matching development headers); `h264-openh264` encodes H.264 through a vendored openh264; `gpl` encodes H.265 through libx265 and implies `ffmpeg`. On Windows, `FFMPEG_LIB_DIR` must point at `avcodec.lib` and `avutil.lib`.
 
-Goldens: 423 total. VP9 353, VP8 58, AV1 6, H.264 3, H.265 3. Runner and generation rules are in `docs/testing/goldens.md`.
+## Quick start
 
-`fmt`, `clippy`, and tests are green on master.
+```bash
+just build
+just test
+```
 
-## Limits
+The decode snippet needs `rust-video-sw` with the `ffmpeg` feature; default features expose no backend.
 
-Software paths emit 8-bit 4:2:0 only. Anything else returns `SwError`.
+```rust
+use rust_video::Decoder;
+use rust_video::Packet;
+use rust_video_sw::H264Decoder;
+fn run(packet: &Packet) -> usize {
+    let mut decoder = H264Decoder::open(0).unwrap();
+    let mut total = 0;
+    total += decoder.decode(packet).unwrap().len();
+    total += decoder.flush().unwrap().len();
+    total
+}
+```
 
-MediaCodec: no EOS API, no PTS out, no surface path yet, one copy per plane.
+## Testing
 
-Windows link is unverified here and fails closed without `FFMPEG_LIB_DIR`. See `docs/sw-codecs.md`.
-
-Unmeasured: encode quality (PSNR/bitrate) oracles for AV1 and H.265, RV3/RV4/RV5 oracles.
+Each crate carries unit tests beside the modules they cover, run with `just test`. Pixel correctness is pinned by 423 golden vectors compared against ffmpeg output; the runner, generation rules, and coverage gate are documented in `docs/testing/goldens.md`.
 
 ## Layout
 
@@ -61,27 +70,10 @@ Unmeasured: encode quality (PSNR/bitrate) oracles for AV1 and H.265, RV3/RV4/RV5
 | `scripts/` | Vector fetch and probes |
 | `corpus/` | Vector corpus, gitignored, via `just vectors` |
 
-## Build
-
-```bash
-just build    # cargo build --workspace
-just check    # clippy, warnings denied
-just test     # cargo test --workspace
-just doc      # API docs, no dependency docs
-just ci       # format check plus all of the above
-```
-
-Windows compiles in CI only; see `.github/workflows/ci.yml`.
-
-## References
-
-- ITU-T H.264 (01/2012) and H.265 V10 (07/2024): profiles, tiers, levels.
-- AOMedia AV1 specification: profiles, levels, OBU, decoder model.
-- AOMedia AV2 specification v1.0.0: <https://av2.aomedia.org/v1.0.0/>
-- VP9 v0.7 specification and levels: <https://www.webmproject.org/vp9/levels/>
-- RFC 6386: VP8 data format.
-- bytes 1.12.1: <https://docs.rs/bytes/1.12.1/> (refcounted packet and plane backing).
-
 ## License
 
-MIT or Apache 2.0, at your choice. See `LICENSE-MIT` and `LICENSE-APACHE`.
+MIT or Apache 2.0, at your choice. See `LICENSE-MIT` and `LICENSE-APACHE`. Third-party attributions live beside the code that needs them.
+
+## Further reading
+
+`docs/` holds the canonical detail. Start with `docs/matrix.md` for backend policy, `docs/sw-codecs.md` for software codec notes, `docs/compat.md` for platform compatibility, and `docs/testing/goldens.md` for the test story.

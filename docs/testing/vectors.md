@@ -8,8 +8,8 @@ committed. Each source below carries its verification state.
 | Codec | Source | State |
 |---|---|---|
 | VP9, VP8 | libvpx `test/test-data.sha1` manifest plus `downloads.webmproject.org/test_data/libvpx/` files, SHA-1 verified | fetched, hashes verified |
-| H.264, H.265 | ITU `wftp3` JCT-VC bitstream exchange directory, reachable | manual drop-in, file URLs unverified |
-| raw YUV | Xiph `media.xiph.org/video/derf/`, reachable | manual drop-in, file names unverified |
+| H.264, H.265 | ITU `wftp3` JCT-VC bitstream exchange directory | manual drop-in, reachability and file URLs unverified |
+| raw YUV | Xiph `media.xiph.org/video/derf/` | manual drop-in, reachability and file names unverified |
 | AV1 | AOM test clips | manual drop-in, source unverified |
 | AV2 | AVM corpus | manual drop-in, source unverified |
 
