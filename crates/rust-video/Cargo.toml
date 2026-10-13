@@ -10,6 +10,15 @@ documentation = "https://docs.rs/rust-video"
 keywords = ["video", "codec", "h264", "h265", "av1"]
 categories = ["multimedia"]
 
+[features]
+default = []
+codec-av1 = ["dep:rust-video-av1"]
+codec-av2 = ["dep:rust-video-av2"]
+codec-h264 = ["dep:rust-video-h264"]
+codec-h265 = ["dep:rust-video-h265"]
+codec-vp9 = ["dep:rust-video-vp9"]
+tier-d3d11 = ["dep:rust-video-d3d11"]
+
 [dev-dependencies]
 rust-video-harness = { path = "../rust-video-harness" }
 
@@ -18,4 +27,10 @@ workspace = true
 
 [dependencies]
 bytes = "1"
+rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1", optional = true }
+rust-video-av2 = { version = "0.1.0", path = "../rust-video-av2", optional = true }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
+rust-video-d3d11 = { version = "0.1.0", path = "../rust-video-d3d11", optional = true }
+rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264", optional = true }
+rust-video-h265 = { version = "0.1.0", path = "../rust-video-h265", optional = true }
+rust-video-vp9 = { version = "0.1.0", path = "../rust-video-vp9", optional = true }

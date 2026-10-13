@@ -56,6 +56,7 @@ pub enum GpuExport {
 }
 
 /// Pixel layout of a CPU frame.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PixelFormat {
     /// Semi-planar 8-bit 4:2:0.

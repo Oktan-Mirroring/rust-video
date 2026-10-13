@@ -659,7 +659,8 @@ impl OutputLayout {
             PixelFormat::Rgba8
             | PixelFormat::Bgra8
             | PixelFormat::Yuv422P
-            | PixelFormat::Yuv444P => {
+            | PixelFormat::Yuv444P
+            | _ => {
                 return Err(MediaCodecError::UnsupportedColorFormat { value: color });
             }
         };

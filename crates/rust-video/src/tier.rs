@@ -3,6 +3,7 @@
 use std::fmt;
 
 /// Host operating system family.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Platform {
     /// Windows.
@@ -38,6 +39,7 @@ pub enum SoftwareH265 {
 }
 
 /// Encode/decode backend tier.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Tier {
     /// Vulkan video.
@@ -53,6 +55,7 @@ pub enum Tier {
 }
 
 /// Tier selection policy.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TierPreference {
     /// First available tier in platform order.
@@ -62,6 +65,7 @@ pub enum TierPreference {
 }
 
 /// Video codec.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VideoCodec {
     /// H.264 codec.
@@ -154,6 +158,18 @@ impl TierError {
     #[must_use]
     pub(crate) fn new(codec: VideoCodec, preference: TierPreference) -> Self {
         Self { codec, preference }
+    }
+
+    /// Codec the failed resolution targeted.
+    #[must_use]
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
+    /// Preference the failed resolution used.
+    #[must_use]
+    pub fn preference(&self) -> TierPreference {
+        self.preference
     }
 }
 
@@ -468,6 +484,16 @@ mod tests {
             ),
             Ok(Tier::Software)
         );
+    }
+
+    #[test]
+    fn tier_error_accessors_report_fields() {
+        let err = TierError::new(VideoCodec::H264, TierPreference::Force(Tier::VaApi));
+        assert_eq!(err.codec(), VideoCodec::H264);
+        assert_eq!(err.preference(), TierPreference::Force(Tier::VaApi));
+        let err = TierError::new(VideoCodec::H265, TierPreference::Auto);
+        assert_eq!(err.codec(), VideoCodec::H265);
+        assert_eq!(err.preference(), TierPreference::Auto);
     }
 
     #[test]
