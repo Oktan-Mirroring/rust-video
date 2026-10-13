@@ -1,5 +1,6 @@
 [package]
 name = "rust-video-av1"
+description = "AV1 codec backend behind the rust-video facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

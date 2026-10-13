@@ -1,5 +1,6 @@
 [package]
 name = "rust-video-vulkan"
+description = "Vulkan video tier with negotiation ladder and H.264 decode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

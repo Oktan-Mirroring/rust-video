@@ -1,5 +1,6 @@
 [package]
 name = "rust-video-livepack"
+description = "Live TS and fMP4 packaging for coded video"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "rust-video-h264"
+description = "H.264 codec backend behind the rust-video facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

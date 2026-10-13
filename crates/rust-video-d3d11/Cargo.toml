@@ -1,5 +1,6 @@
 [package]
 name = "rust-video-d3d11"
+description = "Direct3D 11 video tier behind the rust-video facade"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

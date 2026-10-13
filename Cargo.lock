@@ -313,8 +313,14 @@ name = "rust-video"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rust-video-av1",
+ "rust-video-av2",
  "rust-video-caps",
+ "rust-video-d3d11",
+ "rust-video-h264",
+ "rust-video-h265",
  "rust-video-harness",
+ "rust-video-vp9",
 ]
 
 [[package]]

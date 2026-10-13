@@ -1,17 +1,13 @@
 [package]
 name = "rust-video-sw"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.87"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Software CPU codec backends behind the rust-video facade"
 
-[lints.rust]
-unsafe_code = "deny"
-
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
+[lints]
+workspace = true
 
 [features]
 default = []
