@@ -154,7 +154,25 @@ fn decode_stream(
     Ok(frames)
 }
 
-/// Device, or `None` with a loud note when the tier declines the machine.
+/// True when `RUST_VIDEO_ALLOW_SKIP=1` permits skipping.
+fn allow_skip() -> bool {
+    std::env::var("RUST_VIDEO_ALLOW_SKIP").is_ok_and(|value| value == "1")
+}
+
+/// Skip over missing `what`.
+///
+/// # Panics
+///
+/// Panics unless `RUST_VIDEO_ALLOW_SKIP=1` is set.
+fn skip(what: &str) {
+    if allow_skip() {
+        eprintln!("skipped: missing {what}");
+    } else {
+        panic!("missing {what}; rerun with RUST_VIDEO_ALLOW_SKIP=1 to skip");
+    }
+}
+
+/// Device, or `None` when the tier declines the machine and skips are allowed.
 fn device() -> Option<VaApiDevice> {
     match VaApiDevice::open() {
         Ok(device) => {
@@ -162,7 +180,7 @@ fn device() -> Option<VaApiDevice> {
             Some(device)
         }
         Err(VaApiError::Skipped(reason)) => {
-            eprintln!("va-api e2e skipped: machine declined ({reason})");
+            skip(&format!("va-api tier ({reason})"));
             None
         }
         Err(error) => panic!("unexpected va-api failure: {error}"),
@@ -172,7 +190,7 @@ fn device() -> Option<VaApiDevice> {
 #[test]
 fn demux_matches_ffmpeg_remux() {
     if !cfg!(have_corpus) {
-        eprintln!("demux e2e skipped: corpus absent; run `just vectors`");
+        skip("corpus (run `just vectors`)");
         return;
     }
     let path = corpus().join("synth/h264/h264-high.mp4");
@@ -181,7 +199,7 @@ fn demux_matches_ffmpeg_remux() {
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x67)));
     let Some(remux) = ffmpeg_remux(&path, &scratch()) else {
-        eprintln!("demux oracle skipped: ffmpeg absent; structural asserts only");
+        skip("ffmpeg remux oracle (install ffmpeg)");
         return;
     };
     let blob = annex_b(&stream);
@@ -196,7 +214,7 @@ fn demux_matches_ffmpeg_remux() {
 #[test]
 fn vaapi_decodes_synth_high() {
     if !cfg!(have_corpus) {
-        eprintln!("va-api e2e skipped: corpus absent; run `just vectors`");
+        skip("corpus (run `just vectors`)");
         return;
     }
     let Some(device) = device() else {
@@ -217,7 +235,7 @@ fn vaapi_decodes_synth_high() {
         hashes.push(FrameHash::of(&to_planar(nv12, 1920, 1080)).hex());
     }
     let Some(expected) = ffmpeg_hashes(&path, &scratch(), 1920, 1080) else {
-        eprintln!("decode oracle skipped: ffmpeg absent; structural asserts only");
+        skip("ffmpeg decode oracle (install ffmpeg)");
         return;
     };
     assert_eq!(hashes.len(), expected.len(), "frame count");
@@ -229,7 +247,7 @@ fn vaapi_decodes_synth_high() {
 #[test]
 fn vaapi_declines_high_chroma() {
     if !cfg!(have_corpus) {
-        eprintln!("va-api e2e skipped: corpus absent; run `just vectors`");
+        skip("corpus (run `just vectors`)");
         return;
     }
     let Some(device) = device() else {

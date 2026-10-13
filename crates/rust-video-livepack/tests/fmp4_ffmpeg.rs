@@ -1,6 +1,7 @@
 //! `FFmpeg` oracle: real streams through both muxes.
 //!
-//! Skips when `ffmpeg`/`ffprobe` or the needed encoder is missing.
+//! Fails without `ffmpeg`/`ffprobe` plus the needed encoder; set
+//! `RUST_VIDEO_ALLOW_SKIP=1` to skip instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,6 +10,24 @@ use rust_video_livepack::{
     AccessUnit, AnnexB, Av1Config, AvcConfig, Codec, FragmentMux, HevcConfig, TrackConfig, TsDemux,
     TsMux, TsMuxConfig,
 };
+
+/// True when `RUST_VIDEO_ALLOW_SKIP=1` permits skipping.
+fn allow_skip() -> bool {
+    std::env::var("RUST_VIDEO_ALLOW_SKIP").is_ok_and(|value| value == "1")
+}
+
+/// Skip over missing `what`.
+///
+/// # Panics
+///
+/// Panics unless `RUST_VIDEO_ALLOW_SKIP=1` is set.
+fn skip(what: &str) {
+    if allow_skip() {
+        eprintln!("skipped: missing {what}");
+    } else {
+        panic!("missing {what}; rerun with RUST_VIDEO_ALLOW_SKIP=1 to skip");
+    }
+}
 
 /// Working directory for oracle artifacts.
 fn workdir() -> PathBuf {
@@ -247,7 +266,7 @@ fn ivf_frames(path: &Path) -> Vec<Vec<u8>> {
 #[test]
 fn h264_ts_to_fmp4_round_trip() {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") || !have_encoder("libx264") {
-        eprintln!("skip: ffmpeg/ffprobe/libx264 missing");
+        skip("ffmpeg/ffprobe/libx264 (install an ffmpeg build with libx264)");
         return;
     }
     let dir = workdir();
@@ -340,7 +359,7 @@ fn h264_ts_to_fmp4_round_trip() {
 #[test]
 fn h265_ts_to_fmp4_round_trip() {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") || !have_encoder("libx265") {
-        eprintln!("skip: ffmpeg/ffprobe/libx265 missing");
+        skip("ffmpeg/ffprobe/libx265 (install an ffmpeg build with libx265)");
         return;
     }
     let dir = workdir();
@@ -435,7 +454,7 @@ fn h265_ts_to_fmp4_round_trip() {
 #[test]
 fn av1_mp4_to_fmp4_round_trip() {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") || !have_encoder("libsvtav1") {
-        eprintln!("skip: ffmpeg/ffprobe/libsvtav1 missing");
+        skip("ffmpeg/ffprobe/libsvtav1 (install an ffmpeg build with libsvtav1)");
         return;
     }
     let dir = workdir();
@@ -515,7 +534,7 @@ fn av1_mp4_to_fmp4_round_trip() {
 #[test]
 fn ts_mux_accepted_by_ffmpeg() {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") {
-        eprintln!("skip: ffmpeg/ffprobe missing");
+        skip("ffmpeg/ffprobe (install ffmpeg)");
         return;
     }
     let dir = workdir();

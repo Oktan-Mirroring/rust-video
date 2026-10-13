@@ -2588,3 +2588,73 @@ impl Header for NaluHeader {
         1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{Nalu, Parser};
+
+    /// Annex B buffer: start code, `header`, `payload`.
+    fn annex_b(header: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 1, header];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// First NAL unit of `bytes`.
+    fn first(bytes: &[u8]) -> Nalu<'_> {
+        let mut cursor = Cursor::new(bytes);
+        Nalu::next(&mut cursor).expect("annex b unit")
+    }
+
+    #[test]
+    fn start_code_missing_rejected() {
+        let bytes: &[u8] = &[0xFF; 8];
+        let mut cursor = Cursor::new(bytes);
+        assert!(Nalu::next(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn empty_sps_payload_rejected() {
+        let bytes = annex_b(0x67, &[]);
+        let nalu = first(&bytes);
+        let mut parser = Parser::default();
+        assert_eq!(
+            parser.parse_sps(&nalu).map(|_| ()),
+            Err("reader ran out of bits".to_owned())
+        );
+    }
+
+    #[test]
+    fn truncated_sps_payload_rejected() {
+        let bytes = annex_b(0x67, &[0x42]);
+        let nalu = first(&bytes);
+        let mut parser = Parser::default();
+        assert!(parser.parse_sps(&nalu).is_err());
+    }
+
+    #[test]
+    fn garbage_sps_payload_rejected() {
+        let bytes = annex_b(0x67, &[0xFF; 6]);
+        let nalu = first(&bytes);
+        let mut parser = Parser::default();
+        assert!(parser.parse_sps(&nalu).is_err());
+    }
+
+    #[test]
+    fn empty_pps_payload_rejected() {
+        let bytes = annex_b(0x68, &[]);
+        let nalu = first(&bytes);
+        let mut parser = Parser::default();
+        assert!(parser.parse_pps(&nalu).is_err());
+    }
+
+    #[test]
+    fn garbage_slice_payload_rejected() {
+        let bytes = annex_b(0x65, &[0xFF; 4]);
+        let nalu = first(&bytes);
+        let parser = Parser::default();
+        assert!(parser.parse_slice_header(nalu).is_err());
+    }
+}
