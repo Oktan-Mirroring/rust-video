@@ -7,7 +7,7 @@ use std::ptr;
 
 use bytes::Bytes;
 
-use rust_video::frame::{CpuFrame, PixelFormat};
+use rust_video::frame::CpuFrame;
 use rust_video::packet::Packet;
 use rust_video::traits::Encoder;
 
@@ -219,7 +219,12 @@ impl Av1Encoder {
                 let stride =
                     usize::try_from((*self.frame).linesize[slot]).map_err(|_| SwError::Rejected)?;
                 let cols = plane.stride() as usize;
-                let rows = plane.data().len() / cols;
+                let cap = if slot == 0 {
+                    self.height as usize
+                } else {
+                    self.height as usize / 2
+                };
+                let rows = (plane.data().len() / cols).min(cap);
                 if stride < cols {
                     return Err(SwError::Rejected);
                 }
@@ -284,12 +289,7 @@ impl Encoder for Av1Encoder {
     type Error = SwError;
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
-        if frame.format() != PixelFormat::Yuv420P
-            || frame.size().width() != self.width
-            || frame.size().height() != self.height
-        {
-            return Err(SwError::Rejected);
-        }
+        SwError::check_yuv420p(frame, self.width, self.height)?;
         let mut out = Vec::new();
         self.send(frame, &mut out)?;
         self.receive(&mut out)?;
@@ -343,6 +343,30 @@ mod tests {
         ];
         let size = PictureSize::new(64, 64).expect("size");
         CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
+    }
+
+    fn frame_with_y(y_len: usize) -> CpuFrame {
+        let y = Bytes::from(vec![0x80; y_len]);
+        let c = Bytes::from(vec![0x80; 32 * 32]);
+        let planes = [
+            Plane::new(y, 64).expect("plane"),
+            Plane::new(c.clone(), 32).expect("plane"),
+            Plane::new(c, 32).expect("plane"),
+        ];
+        let size = PictureSize::new(64, 64).expect("size");
+        CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
+    }
+
+    #[test]
+    fn encode_rejects_short_plane() {
+        let mut encoder = Av1Encoder::open(64, 64, 500, 1).expect("encoder");
+        assert!(encoder.encode(&frame_with_y(64 * 63)).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_plane() {
+        let mut encoder = Av1Encoder::open(64, 64, 500, 1).expect("encoder");
+        assert!(encoder.encode(&frame_with_y(64 * 65)).is_err());
     }
 
     #[test]

@@ -61,7 +61,6 @@ fn vp8_decode_matches_golden() {
     assert!(!cases.is_empty(), "no vp8 cases in {}", corpus.display());
     let mut decoder = Vp8Decoder::open(4).expect("vp8 decoder opens");
     let mut checked = 0;
-    let mut skipped = 0;
     for case in cases {
         let stem = Path::new(case.name())
             .file_stem()
@@ -69,11 +68,12 @@ fn vp8_decode_matches_golden() {
             .to_string_lossy()
             .into_owned();
         let golden_path = goldens.join("vp8").join(format!("{stem}.sha256"));
-        if !golden_path.is_file() {
-            println!("skip {}: no golden {}", case.name(), golden_path.display());
-            skipped += 1;
-            continue;
-        }
+        assert!(
+            golden_path.is_file(),
+            "missing golden for {}: {}",
+            case.name(),
+            golden_path.display()
+        );
         let golden = Golden::load(&golden_path).expect("golden loads");
         let mut actual = Vec::new();
         for payload in ivf_frames(case.path()) {
@@ -103,6 +103,6 @@ fn vp8_decode_matches_golden() {
         );
         checked += 1;
     }
-    println!("vp8: {checked} matched, {skipped} skipped");
+    println!("vp8: {checked} matched");
     assert!(checked > 0, "no vp8 case checked");
 }

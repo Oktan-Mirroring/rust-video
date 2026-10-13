@@ -7,7 +7,7 @@ use bytes::Bytes;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType, RateControlMode};
 use openh264::formats::YUVBuffer;
 
-use rust_video::frame::{CpuFrame, PixelFormat};
+use rust_video::frame::CpuFrame;
 use rust_video::packet::Packet;
 use rust_video::traits::Encoder as FacadeEncoder;
 
@@ -48,13 +48,8 @@ impl FacadeEncoder for H264Encoder {
     type Error = SwError;
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
-        if frame.format() != PixelFormat::Yuv420P
-            || frame.size().width() != self.width
-            || frame.size().height() != self.height
-        {
-            return Err(SwError::Rejected);
-        }
-        let packed = pack(frame);
+        SwError::check_yuv420p(frame, self.width, self.height)?;
+        let packed = pack(frame)?;
         let source = YUVBuffer::from_vec(packed, self.width as usize, self.height as usize);
         let stream = self.inner.encode(&source).map_err(|_| SwError::Rejected)?;
         let mut coded = Packet::new(Bytes::from(stream.to_vec()));
@@ -70,7 +65,15 @@ impl FacadeEncoder for H264Encoder {
 }
 
 /// Tightly packed I420 bytes from a CPU frame.
-fn pack(frame: &CpuFrame) -> Vec<u8> {
+///
+/// # Arguments
+///
+/// * `frame` - source frame.
+///
+/// # Errors
+///
+/// Returns `Err` when a plane holds fewer bytes than its rows need.
+fn pack(frame: &CpuFrame) -> Result<Vec<u8>, SwError> {
     let width = frame.size().width() as usize;
     let height = frame.size().height() as usize;
     let mut out = Vec::with_capacity(width * height * 3 / 2);
@@ -81,10 +84,13 @@ fn pack(frame: &CpuFrame) -> Vec<u8> {
     ] {
         let stride = plane.stride() as usize;
         for row in 0..rows {
-            out.extend_from_slice(&plane.data()[row * stride..row * stride + cols]);
+            let start = row.checked_mul(stride).ok_or(SwError::Rejected)?;
+            let end = start.checked_add(cols).ok_or(SwError::Rejected)?;
+            let cell = plane.data().get(start..end).ok_or(SwError::Rejected)?;
+            out.extend_from_slice(cell);
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -111,6 +117,30 @@ mod tests {
         ];
         let size = PictureSize::new(64, 64).expect("size");
         CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
+    }
+
+    fn frame_with_y(y_len: usize) -> CpuFrame {
+        let y = Bytes::from(vec![0x80; y_len]);
+        let c = Bytes::from(vec![0x80; 32 * 32]);
+        let planes = [
+            Plane::new(y, 64).expect("plane"),
+            Plane::new(c.clone(), 32).expect("plane"),
+            Plane::new(c, 32).expect("plane"),
+        ];
+        let size = PictureSize::new(64, 64).expect("size");
+        CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
+    }
+
+    #[test]
+    fn encode_rejects_short_plane() {
+        let mut encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
+        assert!(encoder.encode(&frame_with_y(64 * 63)).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_plane() {
+        let mut encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
+        assert!(encoder.encode(&frame_with_y(64 * 65)).is_err());
     }
 
     #[test]
