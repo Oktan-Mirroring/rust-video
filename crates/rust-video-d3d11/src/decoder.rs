@@ -1,0 +1,535 @@
+//! H.264 decode plus probed shells behind the caps `Decoder` trait.
+
+use crate::device::D3d11Device;
+use crate::dpb::{Dpb, Output};
+use crate::error::{D3d11Error, SkipReason};
+use crate::guid::Codec;
+use crate::h264::{Crop, Ingest, Picture};
+use crate::session::Session;
+#[cfg(target_os = "windows")]
+use crate::session::SharedExport;
+
+use bytes::Bytes;
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+
+/// Decoded frame: NV12 bytes with identity and a budget lease.
+pub struct D3d11Frame {
+    /// Frame identity: size, format, generation.
+    identity: GpuFrame,
+    /// NV12 frame bytes in row-major order.
+    data: Bytes,
+    /// VRAM budget held for the bytes.
+    lease: Lease,
+    /// Shared-texture export, absent without NT-handle sharing.
+    #[cfg(target_os = "windows")]
+    shared: Option<SharedExport>,
+}
+
+impl D3d11Frame {
+    /// Frame identity.
+    #[must_use]
+    pub fn identity(&self) -> GpuFrame {
+        self.identity
+    }
+
+    /// NV12 frame bytes in row-major order.
+    #[must_use]
+    pub fn nv12(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Budget bytes the frame holds.
+    #[must_use]
+    pub fn lease_bytes(&self) -> u64 {
+        self.lease.bytes()
+    }
+
+    /// Platform export handle for the frame.
+    ///
+    /// NT handle over the shared decode texture, or an opaque backend
+    /// descriptor when the driver declines sharing.
+    #[must_use]
+    pub fn export(&self) -> GpuExport {
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.shared {
+            return GpuExport::NtHandle {
+                handle: shared.handle(),
+            };
+        }
+        GpuExport::Opaque { name: "d3d11" }
+    }
+
+    /// CPU copy split into NV12 planes.
+    #[must_use]
+    pub fn to_cpu(&self) -> Option<CpuFrame> {
+        let size = self.identity.size();
+        let luma = u64::from(size.width()) * u64::from(size.height());
+        let y_len = usize::try_from(luma).ok()?;
+        let uv_len = y_len / 2;
+        if self.data.len() < y_len + uv_len {
+            return None;
+        }
+        let y = self.data.slice(..y_len);
+        let uv = self.data.slice(y_len..y_len + uv_len);
+        let stride = size.width();
+        CpuFrame::new(
+            size,
+            PixelFormat::Nv12,
+            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
+        )
+    }
+}
+
+/// Active sequence behind the live session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Active {
+    /// Sequence set id.
+    sps_id: u8,
+    /// Coded width in luma samples.
+    width: u32,
+    /// Coded height in luma samples.
+    height: u32,
+    /// Visible rectangle, absent when uncropped.
+    crop: Option<Crop>,
+    /// Visible size in luma samples.
+    visible: PictureSize,
+}
+
+/// H.264 decoder over a D3D11 device.
+pub struct H264Decoder<'a> {
+    /// Device owning the decode session.
+    device: &'a D3d11Device,
+    /// Annex B ingest: sets plus picture assembly.
+    ingest: Ingest,
+    /// Live picture buffer, created from the first sequence set.
+    dpb: Option<Dpb>,
+    /// Live decode session, created from the first sequence set.
+    session: Option<Session>,
+    /// VRAM budget sized to the adapter memory.
+    shared: Option<SharedDevice>,
+    /// Sequence behind the live session.
+    active: Option<Active>,
+    /// Next frame generation number.
+    generation: u64,
+}
+
+impl<'a> H264Decoder<'a> {
+    /// Decoder over `device`; the session starts on the first picture.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self {
+            device,
+            ingest: Ingest::new(),
+            dpb: None,
+            session: None,
+            shared: None,
+            active: None,
+            generation: 0,
+        }
+    }
+
+    /// Decode `picture` into `frames`.
+    fn decode_picture(
+        &mut self,
+        picture: &Picture,
+        frames: &mut Vec<D3d11Frame>,
+    ) -> Result<(), D3d11Error> {
+        let pps = self
+            .ingest
+            .pps(picture.pps_id())
+            .ok_or(D3d11Error::NoSession)?
+            .clone();
+        let sps = self
+            .ingest
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d11Error::NoSession)?
+            .clone();
+        let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
+            .ok_or_else(|| D3d11Error::Parse("crop empties picture".to_owned()))?;
+        let active = Active {
+            sps_id: sps.seq_parameter_set_id,
+            width: sps.width(),
+            height: sps.height(),
+            crop: sps.crop,
+            visible,
+        };
+        if self.active != Some(active) {
+            self.reconfigure(active, frames)?;
+        }
+        let active = self.active.ok_or(D3d11Error::NoSession)?;
+        let decoded = match self
+            .dpb
+            .as_mut()
+            .ok_or(D3d11Error::NoSession)?
+            .decode(picture, &sps, &pps)
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        let mut failed = None;
+        {
+            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+            let shared = self.shared.as_ref().ok_or(D3d11Error::NoSession)?;
+            // Submit before any readback: outputs may name the submission slot.
+            if let Err(error) = session.submit(&decoded.submission) {
+                failed = Some(error);
+            } else {
+                for output in &decoded.outputs {
+                    match emit_frame(session, shared, output, &active, self.generation) {
+                        Ok(frame) => {
+                            self.generation = self.generation.wrapping_add(1);
+                            frames.push(frame);
+                        }
+                        Err(error) => {
+                            failed = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Drop the live session, buffer, and sequence after a mid-picture failure.
+    fn reset_stream(&mut self) {
+        self.dpb = None;
+        self.session = None;
+        self.shared = None;
+        self.active = None;
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    fn reconfigure(
+        &mut self,
+        active: Active,
+        frames: &mut Vec<D3d11Frame>,
+    ) -> Result<(), D3d11Error> {
+        if let Some(previous) = self.active {
+            self.drain_live(&previous, frames)?;
+        }
+        let session = Session::open(self.device, active.width, active.height)?;
+        self.shared = Some(self.device.shared().clone());
+        self.session = Some(session);
+        self.dpb = Some(Dpb::new(&self.sequence_set(active.sps_id)?));
+        self.active = Some(active);
+        Ok(())
+    }
+
+    /// Sequence set `id` behind the ingest store.
+    fn sequence_set(&self, id: u8) -> Result<crate::h264::Sps, D3d11Error> {
+        self.ingest.sps(id).cloned().ok_or(D3d11Error::NoSession)
+    }
+
+    /// Live DPB outputs into `frames`.
+    fn drain_live(
+        &mut self,
+        active: &Active,
+        frames: &mut Vec<D3d11Frame>,
+    ) -> Result<(), D3d11Error> {
+        let (Some(dpb), Some(session), Some(shared)) = (
+            self.dpb.as_mut(),
+            self.session.as_ref(),
+            self.shared.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        for output in dpb.drain() {
+            let frame = emit_frame(session, shared, &output, active, self.generation)?;
+            self.generation = self.generation.wrapping_add(1);
+            frames.push(frame);
+        }
+        Ok(())
+    }
+}
+
+impl Decoder for H264Decoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut frames = Vec::new();
+        for picture in &pictures {
+            self.decode_picture(picture, &mut frames)?;
+        }
+        Ok(frames)
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        let mut frames = Vec::new();
+        if let Some(picture) = self.ingest.finish()? {
+            self.decode_picture(&picture, &mut frames)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live(&active, &mut frames)?;
+        }
+        Ok(frames)
+    }
+}
+
+/// Frame for `output`.
+fn emit_frame(
+    session: &Session,
+    shared: &SharedDevice,
+    output: &Output,
+    active: &Active,
+    generation: u64,
+) -> Result<D3d11Frame, D3d11Error> {
+    let data = session.readback(output.slot(), active.crop)?;
+    let lease = shared.try_acquire(data.len() as u64)?;
+    Ok(D3d11Frame {
+        identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
+        data,
+        lease,
+        #[cfg(target_os = "windows")]
+        shared: session.export(),
+    })
+}
+
+/// HEVC decoder; the picture builder is pending.
+pub struct HevcDecoder<'a> {
+    /// Device behind the profile probe.
+    device: &'a D3d11Device,
+}
+
+impl<'a> HevcDecoder<'a> {
+    /// Decoder over `device`; decode reports the pending builder.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self { device }
+    }
+}
+
+impl Decoder for HevcDecoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.device.supports(Codec::Hevc) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::Hevc }.into());
+        }
+        Err(D3d11Error::Unsupported(
+            "hevc picture builder pending".to_owned(),
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// VP9 decoder; the picture builder is pending.
+pub struct Vp9Decoder<'a> {
+    /// Device behind the profile probe.
+    device: &'a D3d11Device,
+}
+
+impl<'a> Vp9Decoder<'a> {
+    /// Decoder over `device`; decode reports the pending builder.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self { device }
+    }
+}
+
+impl Decoder for Vp9Decoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.device.supports(Codec::Vp9) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::Vp9 }.into());
+        }
+        Err(D3d11Error::Unsupported(
+            "vp9 picture builder pending".to_owned(),
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// AV1 decoder; the picture builder is pending.
+pub struct Av1Decoder<'a> {
+    /// Device behind the profile probe.
+    device: &'a D3d11Device,
+}
+
+impl<'a> Av1Decoder<'a> {
+    /// Decoder over `device`; decode reports the pending builder.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self { device }
+    }
+}
+
+impl Decoder for Av1Decoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.device.supports(Codec::Av1) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::Av1 }.into());
+        }
+        Err(D3d11Error::Unsupported(
+            "av1 picture builder pending".to_owned(),
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// MPEG-2 decoder; the picture builder is pending.
+pub struct Mpeg2Decoder<'a> {
+    /// Device behind the profile probe.
+    device: &'a D3d11Device,
+}
+
+impl<'a> Mpeg2Decoder<'a> {
+    /// Decoder over `device`; decode reports the pending builder.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self { device }
+    }
+}
+
+impl Decoder for Mpeg2Decoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.device.supports(Codec::Mpeg2) {
+            return Err(SkipReason::ProfileUnsupported {
+                codec: Codec::Mpeg2,
+            }
+            .into());
+        }
+        Err(D3d11Error::Unsupported(
+            "mpeg2 picture builder pending".to_owned(),
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// VC-1 decoder; the picture builder is pending.
+pub struct Vc1Decoder<'a> {
+    /// Device behind the profile probe.
+    device: &'a D3d11Device,
+}
+
+impl<'a> Vc1Decoder<'a> {
+    /// Decoder over `device`; decode reports the pending builder.
+    #[must_use]
+    pub fn open(device: &'a D3d11Device) -> Self {
+        Self { device }
+    }
+}
+
+impl Decoder for Vc1Decoder<'_> {
+    type Frame = D3d11Frame;
+    type Error = D3d11Error;
+
+    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.device.supports(Codec::Vc1) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::Vc1 }.into());
+        }
+        Err(D3d11Error::Unsupported(
+            "vc1 picture builder pending".to_owned(),
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::D3d11Frame;
+
+    use bytes::Bytes;
+    use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
+    use rust_video_caps::traits::SharedDevice;
+
+    /// Frame over `data` leased against `shared`.
+    fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> D3d11Frame {
+        let size = PictureSize::new(width, height).expect("nonzero extent");
+        let identity = GpuFrame::new(size, PixelFormat::Nv12, 3);
+        let bytes = Bytes::from(data);
+        let lease = shared
+            .try_acquire(bytes.len() as u64)
+            .expect("within budget");
+        D3d11Frame {
+            identity,
+            data: bytes,
+            lease,
+            #[cfg(target_os = "windows")]
+            shared: None,
+        }
+    }
+
+    #[test]
+    fn frame_holds_lease_against_budget() {
+        let shared = SharedDevice::new("d3d11", 100);
+        let held = frame(&shared, 4, 2, vec![7; 12]);
+        assert_eq!(held.lease_bytes(), 12);
+        assert_eq!(shared.used(), 12);
+        assert_eq!(held.nv12(), &[7; 12]);
+        assert_eq!(held.identity().generation(), 3);
+    }
+
+    #[test]
+    fn dropped_frame_releases_budget() {
+        let shared = SharedDevice::new("d3d11", 100);
+        {
+            let _held = frame(&shared, 4, 2, vec![0; 12]);
+            assert_eq!(shared.used(), 12);
+        }
+        assert_eq!(shared.used(), 0);
+    }
+
+    #[test]
+    fn export_without_sharing_names_backend() {
+        let shared = SharedDevice::new("d3d11", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        assert!(matches!(held.export(), GpuExport::Opaque { name: "d3d11" }));
+    }
+
+    #[test]
+    fn to_cpu_splits_nv12_planes() {
+        let shared = SharedDevice::new("d3d11", 100);
+        let mut data = vec![1; 8];
+        data.extend_from_slice(&[2; 4]);
+        let held = frame(&shared, 4, 2, data);
+        let cpu = held.to_cpu().expect("full nv12");
+        assert_eq!(cpu.format(), PixelFormat::Nv12);
+        assert_eq!(cpu.planes().len(), 2);
+        assert_eq!(cpu.planes()[0].data(), &[1; 8]);
+        assert_eq!(cpu.planes()[1].data(), &[2; 4]);
+    }
+
+    #[test]
+    fn to_cpu_rejects_truncated_bytes() {
+        let shared = SharedDevice::new("d3d11", 100);
+        let held = frame(&shared, 4, 2, vec![0; 11]);
+        assert!(held.to_cpu().is_none());
+    }
+}

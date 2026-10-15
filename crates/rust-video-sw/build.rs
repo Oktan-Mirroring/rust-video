@@ -8,9 +8,13 @@
 ///
 /// # Panics
 ///
-/// Panics when targeting Windows without `FFMPEG_LIB_DIR` set.
+/// Panics when the `ffmpeg` feature is on, targeting Windows without
+/// `FFMPEG_LIB_DIR` set.
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_LIB_DIR");
+    if std::env::var_os("CARGO_FEATURE_FFMPEG").is_none() {
+        return;
+    }
     let windows = std::env::var("TARGET").is_ok_and(|target| target.contains("windows"));
     if !windows {
         return;

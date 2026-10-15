@@ -25,9 +25,11 @@ fmt-check:
 # Full gate: format, lints, tests, docs, spec tables.
 ci: fmt-check check test doc spec-check
 
+python := if os() == "windows" { "python" } else { "python3" }
+
 # Diff spec doc tables against caps const tables.
 spec-check:
-    python3 scripts/spec-check.py
+    {{python}} scripts/spec-check.py
 
 # Fetch the vector corpus into ./corpus (network).
 vectors:

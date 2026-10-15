@@ -16,7 +16,7 @@ ash, ndk-crate, libva, NDK, and CDD pins re-verified 2026-10-15.
 | `libloading` (via ash `loaded`) | `^0.8` [T1] | ash deps API |
 | `wgpu` | not in tree; `30.0.1` applies only if a consumer lands (planned [?]) | crates.io wgpu API |
 | `ndk` / `ndk-sys` | `0.9.0` / `0.6.0+11769913` [T1] | crates.io API, docs.rs ndk 0.9.0 |
-| `windows` | not in tree; `0.62.2` named for the D3D11 tier (planned [?]) | crates.io API |
+| `windows` | `0.62.2` for the D3D11 tier on Windows targets [T1] | crates.io API |
 | NDK (CI) | r30 (2026-09-08) [T1] | android/ndk releases |
 | `cargo-ndk` (CI) | unused; CI runs plain `cargo check --target` under `nttld/setup-ndk` [T1] | `.github/workflows/ci.yml` |
 | `cargo-msrv` (CI) | unused; the `msrv` job runs `just msrv` on the pinned toolchain [T1] | `.github/workflows/ci.yml` |
@@ -77,12 +77,16 @@ No libva floor in code. Floor-container CI against 2.14.0 (jammy),
 is [?].
 
 D3D11: floor is Windows 8 desktop, the `ID3D11VideoDevice` minimum
-[T1, MS Learn]. The tier is a stub: `rust-video-d3d11` holds no code
-and no `windows` dependency (planned [?], pin 0.62.2 named above).
-Decoder GUIDs will come from the windows-crate constants only
-(H.264, HEVC, VP9, AV1, APV profiles all present [T1]); never
-hand-copy hex. Runtime enumeration per adapter (hardware, WARP,
-reference; profiles; formats) is planned [?].
+[T1, MS Learn]. The tier decodes H.264 over `ID3D11VideoDevice` /
+`ID3D11VideoContext` with the `windows` binding at pin 0.62.2 [T1].
+Decoder GUIDs come from the windows-crate constants only
+(H.264, HEVC, VP9, AV1 profiles matched [T1]); never
+hand-copy hex. Runtime enumeration per adapter covers hardware
+with WARP and the basic adapter declining; HEVC, VP9, AV1, MPEG-2,
+and VC-1 profiles probe while their picture builders stay pending.
+Encode runs over MediaFoundation encoder MFTs probed at runtime:
+H.264 and HEVC in-box, AV1 vendor-only, VP9/MPEG-2/VC-1 declining
+without an MFT [T1, MS Learn].
 
 wgpu is not a decode tier: its `Backends` list has no D3D11 and no
 video API [T1, docs.rs]. Allowed roles are upload/render interop
@@ -107,7 +111,7 @@ never silent.
 | NDK API ladder | fixed `api-level-28` plus `ApiLevel` gates (21 floor, 28 async notify) | features expose symbols, gates pick paths |
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
-| D3D11 adapter/GUID/format | runtime only, planned [?] | per-adapter enumeration |
+| D3D11 adapter/GUID/format | runtime only [T1] | per-adapter enumeration |
 | wgpu backend | planned [?]; runtime `Backends` flags when it lands | one binary, many GPUs |
 | software codecs | `rust-video-sw` features (`ffmpeg`, `gpl`, `h264-openh264`); facade `codec-*` map to stub crates | compile cost and binary size |
 | quirk table | runtime data file | per-device values, suspected until measured |

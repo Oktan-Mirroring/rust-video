@@ -1,3 +1,5 @@
+#![cfg(have_corpus)]
+
 //! VA-API end-to-end: synth vectors in, hashed frames out.
 
 #[path = "support/mp4.rs"]
@@ -191,10 +193,6 @@ fn device() -> Option<VaApiDevice> {
 
 #[test]
 fn demux_matches_ffmpeg_remux() {
-    if !cfg!(have_corpus) {
-        skip("corpus (run `just vectors`)");
-        return;
-    }
     let path = corpus().join("synth/h264/h264-high.mp4");
     let stream = mp4::demux(&path).expect("demux synth high");
     assert_eq!(stream.samples.len(), 60);
@@ -215,10 +213,6 @@ fn demux_matches_ffmpeg_remux() {
 
 #[test]
 fn vaapi_decodes_synth_high() {
-    if !cfg!(have_corpus) {
-        skip("corpus (run `just vectors`)");
-        return;
-    }
     let Some(device) = device() else {
         return;
     };
@@ -248,10 +242,6 @@ fn vaapi_decodes_synth_high() {
 
 #[test]
 fn vaapi_declines_high_chroma() {
-    if !cfg!(have_corpus) {
-        skip("corpus (run `just vectors`)");
-        return;
-    }
     let Some(device) = device() else {
         return;
     };

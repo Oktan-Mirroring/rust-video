@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use ash::vk::native::{
-    __BindgenBitfieldUnit, StdVideoDecodeH264PictureInfo, StdVideoDecodeH264PictureInfoFlags,
+    StdVideoDecodeH264PictureInfo, StdVideoDecodeH264PictureInfoFlags,
     StdVideoDecodeH264ReferenceInfo, StdVideoDecodeH264ReferenceInfoFlags,
     StdVideoH264AspectRatioIdc_STD_VIDEO_H264_ASPECT_RATIO_IDC_INVALID,
     StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
@@ -23,6 +23,7 @@ use ash::vk::native::{
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_EXPLICIT,
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_IMPLICIT,
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_INVALID,
+    __BindgenBitfieldUnit,
 };
 
 use crate::error::ParseError;

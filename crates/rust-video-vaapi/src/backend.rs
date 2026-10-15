@@ -152,6 +152,7 @@ impl Backend {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = self;
             &[]
         }
     }
@@ -188,7 +189,7 @@ impl Backend {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (target, picture, matrix, slices);
+            let _ = (self, target, picture, matrix, slices);
             Err(SkipReason::PlatformUnsupported.into())
         }
     }
@@ -226,7 +227,7 @@ impl Backend {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (surface, crop);
+            let _ = (self, surface, crop);
             Err(SkipReason::PlatformUnsupported.into())
         }
     }

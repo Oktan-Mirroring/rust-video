@@ -30,7 +30,8 @@ supported.
 
 H.264 A-F (motion compensation, IDCT, VLD with and without film grain),
 HEVC VLD Main/Main 10, MPEG-2, VC-1, WMV families. VP9 VLD Profile 0
-per the DXVA VPx specification. No published maximum resolution:
+per the DXVA VPx specification, AV1 VLD profiles 0-2.
+No published maximum resolution:
 per-adapter enumeration, and the basic display adapter reports no
 decoders. Decoder GUIDs come from the windows-crate constants, never
 hand-copied hex; the unmapped-hex gap is closed by rule.

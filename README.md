@@ -17,7 +17,7 @@ Out: archival demuxing, subtitles, filters, audio.
 
 | Codec | Decode | Encode | Hardware | Packing |
 |---|---|---|---|---|
-| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11 stub | TS and fMP4 |
+| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11 | TS and fMP4 |
 | H.265 | native ffmpeg | libx265 (`gpl` feature) | Vulkan, VA-API stub, MediaCodec, D3D11 stub | TS and fMP4 |
 | AV1 | libdav1d wrapper | libaom-av1 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
 | VP9 | native ffmpeg | libvpx-vp9 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
@@ -53,7 +53,7 @@ fn run(packet: &Packet) -> usize {
 
 ## Testing
 
-Each crate carries unit tests beside the modules they cover, run with `just test`. Pixel correctness is pinned by 423 golden vectors compared against ffmpeg output; the runner, generation rules, and coverage gate are documented in `docs/testing/goldens.md`.
+Each crate carries unit tests beside the modules they cover, run with `just test`. Pixel correctness is pinned by 427 golden vectors compared against ffmpeg output; the runner, generation rules, and coverage gate are documented in `docs/testing/goldens.md`.
 
 ## Layout
 
