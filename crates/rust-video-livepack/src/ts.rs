@@ -205,11 +205,11 @@ impl TsMux {
         }
         let start = out.len();
         if !self.started || keyframe {
-            let pat = self.pat_section();
-            self.packetize_section(0x0000, &pat, out);
-            let pmt = self.pmt_section(stream_type);
+            let association = self.pat_section();
+            self.packetize_section(0x0000, &association, out);
+            let map = self.pmt_section(stream_type);
             let pmt_pid = self.config.pmt_pid;
-            self.packetize_section(pmt_pid, &pmt, out);
+            self.packetize_section(pmt_pid, &map, out);
             self.started = true;
         }
         self.packetize_pes(unit, keyframe, out);
@@ -282,14 +282,14 @@ impl TsMux {
             packet[1] = (u8::from(first) << 6) | (pid_bytes[0] & 0x1F);
             packet[2] = pid_bytes[1];
             packet[3] = 0x10 | (*counter & 0x0F);
-            let mut pos = 4;
+            let mut cursor = 4;
             if first {
-                packet[pos] = 0;
-                pos += 1;
+                packet[cursor] = 0;
+                cursor += 1;
             }
-            let room = PACKET_SIZE - pos;
+            let room = PACKET_SIZE - cursor;
             let take = rest.len().min(room);
-            packet[pos..pos + take].copy_from_slice(&rest[..take]);
+            packet[cursor..cursor + take].copy_from_slice(&rest[..take]);
             rest = &rest[take..];
             out.extend_from_slice(&packet);
             *counter = (*counter + 1) & 0x0F;
@@ -318,7 +318,7 @@ impl TsMux {
             } else {
                 0
             };
-            let mut pos = 4;
+            let mut cursor = 4;
             if adapt > 0 {
                 packet[3] = 0x30 | (self.video_cc & 0x0F);
                 packet[4] = u8::try_from(adapt).unwrap_or(u8::MAX);
@@ -327,13 +327,13 @@ impl TsMux {
                     let pcr = Pcr::from_base_ext(Ts90k::new(unit.dts()), 0);
                     packet[6..12].copy_from_slice(&pcr.bytes());
                 }
-                pos = 5 + adapt;
+                cursor = 5 + adapt;
             } else {
                 packet[3] = 0x10 | (self.video_cc & 0x0F);
             }
-            let room = PACKET_SIZE - pos;
+            let room = PACKET_SIZE - cursor;
             let take = rest.len().min(room);
-            packet[pos..pos + take].copy_from_slice(&rest[..take]);
+            packet[cursor..cursor + take].copy_from_slice(&rest[..take]);
             rest = &rest[take..];
             self.video_cc = (self.video_cc + 1) & 0x0F;
             out.extend_from_slice(&packet);

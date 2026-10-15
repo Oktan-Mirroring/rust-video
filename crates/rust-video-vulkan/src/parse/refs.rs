@@ -1531,7 +1531,7 @@ mod tests {
         let mut context = H264Context::new();
         let first = context.compile(units.remove(0));
         assert_eq!(first.len(), 3);
-        let Some(super::H264Instruction::Picture(idr)) = first.into_iter().last() else {
+        let Some(super::H264Instruction::Picture(idr)) = first.into_iter().next_back() else {
             panic!("want picture");
         };
         assert_eq!(idr.poc(), 0);
@@ -1569,7 +1569,8 @@ mod tests {
             .all(|instruction| !matches!(instruction, super::H264Instruction::Picture(_))));
         let mut idr = units264(&[hex(SPS264), hex(PPS264), hex(IDR264)]);
         let recovered = context.compile(idr.remove(0));
-        let Some(super::H264Instruction::Picture(picture)) = recovered.into_iter().last() else {
+        let Some(super::H264Instruction::Picture(picture)) = recovered.into_iter().next_back()
+        else {
             panic!("want picture");
         };
         assert!(picture.resets_dpb());
@@ -1703,7 +1704,7 @@ mod tests {
         assert_eq!(replay.len(), 2);
         let first = context.compile(replay.remove(0));
         assert_eq!(first.len(), 4);
-        let Some(super::H265Instruction::Picture(idr)) = first.into_iter().last() else {
+        let Some(super::H265Instruction::Picture(idr)) = first.into_iter().next_back() else {
             panic!("want picture");
         };
         assert_eq!(idr.picture().poc(), 0);
@@ -1743,7 +1744,8 @@ mod tests {
             .all(|instruction| !matches!(instruction, super::H265Instruction::Picture(_))));
         let mut idr = units265(&[hex(VPS265), hex(SPS265), hex(PPS265), hex(IDR265)]);
         let recovered = context.compile(idr.remove(0));
-        let Some(super::H265Instruction::Picture(picture)) = recovered.into_iter().last() else {
+        let Some(super::H265Instruction::Picture(picture)) = recovered.into_iter().next_back()
+        else {
             panic!("want picture");
         };
         assert!(picture.picture().resets_dpb());

@@ -1090,7 +1090,7 @@ mod tests {
         let mut units = units265(&[hex(VPS), hex(SPS), hex(PPS), hex(IDR)]);
         let mut context = H265Context::new();
         let first = context.compile(units.remove(0));
-        let Some(H265Instruction::Picture(idr)) = first.into_iter().last() else {
+        let Some(H265Instruction::Picture(idr)) = first.into_iter().next_back() else {
             panic!("want picture");
         };
         let book = SlotBook::with_slots(4);

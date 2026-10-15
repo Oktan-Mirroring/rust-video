@@ -3,6 +3,7 @@
 //! Syntax per ITU-T H.265 section 7.3; the hardware parses slice bodies,
 //! so the slice header stops after reference lists.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -669,10 +670,10 @@ impl RefPicSet {
                 continue;
             }
             let derived = poc.saturating_add(delta);
-            if derived < 0 {
-                set.s0.push((derived, used));
-            } else if derived > 0 {
-                set.s1.push((derived, used));
+            match derived.cmp(&0) {
+                Ordering::Less => set.s0.push((derived, used)),
+                Ordering::Greater => set.s1.push((derived, used)),
+                Ordering::Equal => {}
             }
         }
         set.ref_pics = ref_pics;

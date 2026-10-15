@@ -603,7 +603,7 @@ mod tests {
         let mut units = units264(&[hex(SPS), hex(PPS), hex(IDR)]);
         let mut context = H264Context::new();
         let first = context.compile(units.remove(0));
-        let Some(H264Instruction::Picture(idr)) = first.into_iter().last() else {
+        let Some(H264Instruction::Picture(idr)) = first.into_iter().next_back() else {
             panic!("want picture");
         };
         let std = super::fill_picture(&idr);

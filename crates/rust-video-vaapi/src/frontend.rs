@@ -1315,10 +1315,10 @@ mod tests {
         frontend.dpb.set_limits(16, 16);
         for (frame_num, slot) in [(5, 0), (3, 1)] {
             let mut pic = picture(frame_num, 1);
-            let poc = i32::try_from(frame_num).expect("small frame number") * 2;
-            pic.top_field_order_cnt = poc;
-            pic.bottom_field_order_cnt = poc;
-            pic.pic_order_cnt = poc;
+            let order_cnt = i32::try_from(frame_num).expect("small frame number") * 2;
+            pic.top_field_order_cnt = order_cnt;
+            pic.bottom_field_order_cnt = order_cnt;
+            pic.pic_order_cnt = order_cnt;
             frontend
                 .dpb
                 .store_picture(pic.into_rc(), Some(SurfaceSlot::new(slot)))
