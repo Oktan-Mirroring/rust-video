@@ -2,6 +2,8 @@
 //!
 //! Frame-only progressive pictures; the DPB owns ordering and output.
 
+use std::borrow::Cow;
+
 use crate::bits::BitReader;
 use crate::error::D3d11Error;
 
@@ -63,7 +65,10 @@ pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// NAL with emulation prevention bytes removed.
-pub(crate) fn rbsp(nal: &[u8]) -> Vec<u8> {
+pub(crate) fn rbsp(nal: &[u8]) -> Cow<'_, [u8]> {
+    if !has_prevention(nal) {
+        return Cow::Borrowed(nal);
+    }
     let mut out = Vec::with_capacity(nal.len());
     let mut zeros = 0;
     for &byte in nal {
@@ -74,7 +79,19 @@ pub(crate) fn rbsp(nal: &[u8]) -> Vec<u8> {
         out.push(byte);
         zeros = if byte == 0 { zeros + 1 } else { 0 };
     }
-    out
+    Cow::Owned(out)
+}
+
+/// True when `nal` holds an emulation prevention byte.
+fn has_prevention(nal: &[u8]) -> bool {
+    let mut zeros = 0;
+    for &byte in nal {
+        if zeros == 2 && byte == 3 {
+            return true;
+        }
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    false
 }
 
 /// Scaling lists in zig-zag scan order.
@@ -1418,9 +1435,8 @@ impl Ingest {
             .map_err(|_| D3d11Error::Parse("seq_parameter_set_id range".to_owned()))?;
         let sps = self
             .sps(sps_id)
-            .ok_or_else(|| D3d11Error::Parse("pps cites unknown sps".to_owned()))?
-            .clone();
-        let pps = parse_pps(body, &sps)?;
+            .ok_or_else(|| D3d11Error::Parse("pps cites unknown sps".to_owned()))?;
+        let pps = parse_pps(body, sps)?;
         let id = pps.pic_parameter_set_id;
         self.pps[usize::from(id)] = Some(pps);
         Ok(())
@@ -1664,9 +1680,15 @@ mod tests {
     #[test]
     fn rbsp_removes_prevention_bytes() {
         assert_eq!(
-            rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 5]),
+            rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 5]).into_owned(),
             vec![0, 0, 1, 0, 0, 0, 5]
         );
+    }
+
+    #[test]
+    fn rbsp_borrows_without_prevention_bytes() {
+        let nal = [0x65, 0x88, 0x00, 0x02];
+        assert!(matches!(rbsp(&nal), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

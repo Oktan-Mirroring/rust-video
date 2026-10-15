@@ -17,10 +17,10 @@ Out: archival demuxing, subtitles, filters, audio.
 
 | Codec | Decode | Encode | Hardware | Packing |
 |---|---|---|---|---|
-| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11 | TS and fMP4 |
-| H.265 | native ffmpeg | libx265 (`gpl` feature) | Vulkan, VA-API stub, MediaCodec, D3D11 stub | TS and fMP4 |
-| AV1 | libdav1d wrapper | libaom-av1 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
-| VP9 | native ffmpeg | libvpx-vp9 wrapper | VA-API stub, MediaCodec, D3D11 stub | fMP4 only |
+| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11, D3D12 | TS and fMP4 |
+| H.265 | native ffmpeg | libx265 (`gpl` feature) | Vulkan, VA-API stub, MediaCodec, D3D11 stub, D3D12 | TS and fMP4 |
+| AV1 | libdav1d wrapper | libaom-av1 wrapper | VA-API stub, MediaCodec, D3D11 stub, D3D12 stub | fMP4 only |
+| VP9 | native ffmpeg | libvpx-vp9 wrapper | VA-API stub, MediaCodec, D3D11 stub, D3D12 stub | fMP4 only |
 | VP8 | native ffmpeg | none | VA-API stub; MediaCodec, D3D11 absent | fMP4 only |
 
 Backend policy lives in `docs/matrix.md`. Hardware detail lives in `docs/vaapi.md` and `docs/mediacodec.md`. Packing detail lives in `docs/livepack-ts-fmp4.md`. AV2 has no backend yet; the gating bar is in `docs/matrix.md`.

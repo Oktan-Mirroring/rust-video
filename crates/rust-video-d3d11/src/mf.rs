@@ -161,10 +161,10 @@ impl Session {
         let mut standby = VecDeque::new();
         let mut subtype = MFVideoFormat_H264;
         for candidate in subtypes(codec) {
-            let matches = enumerate(&candidate);
+            let matches = enumerate(candidate);
             if !matches.is_empty() {
                 standby = matches.into_iter().collect();
-                subtype = candidate;
+                subtype = *candidate;
                 break;
             }
         }
@@ -667,13 +667,13 @@ fn missing_encoder(codec: Codec) -> D3d11Error {
 
 /// Output subtypes for `codec`, preferred first.
 #[cfg(target_os = "windows")]
-fn subtypes(codec: Codec) -> Vec<GUID> {
+fn subtypes(codec: Codec) -> &'static [GUID] {
     match codec {
-        Codec::H264 => vec![MFVideoFormat_H264],
-        Codec::Hevc => vec![MFVideoFormat_HEVC, MFVideoFormat_H265],
-        Codec::Vp9 => vec![MFVideoFormat_VP90],
-        Codec::Av1 => vec![MFVideoFormat_AV1],
-        Codec::Mpeg2 | Codec::Vc1 => Vec::new(),
+        Codec::H264 => &[MFVideoFormat_H264],
+        Codec::Hevc => &[MFVideoFormat_HEVC, MFVideoFormat_H265],
+        Codec::Vp9 => &[MFVideoFormat_VP90],
+        Codec::Av1 => &[MFVideoFormat_AV1],
+        Codec::Mpeg2 | Codec::Vc1 => &[],
     }
 }
 

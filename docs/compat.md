@@ -16,7 +16,7 @@ ash, ndk-crate, libva, NDK, and CDD pins re-verified 2026-10-15.
 | `libloading` (via ash `loaded`) | `^0.8` [T1] | ash deps API |
 | `wgpu` | not in tree; `30.0.1` applies only if a consumer lands (planned [?]) | crates.io wgpu API |
 | `ndk` / `ndk-sys` | `0.9.0` / `0.6.0+11769913` [T1] | crates.io API, docs.rs ndk 0.9.0 |
-| `windows` | `0.62.2` for the D3D11 tier on Windows targets [T1] | crates.io API |
+| `windows` | `0.62.2` for the D3D11 and D3D12 tiers on Windows targets [T1] | crates.io API |
 | NDK (CI) | r30 (2026-09-08) [T1] | android/ndk releases |
 | `cargo-ndk` (CI) | unused; CI runs plain `cargo check --target` under `nttld/setup-ndk` [T1] | `.github/workflows/ci.yml` |
 | `cargo-msrv` (CI) | unused; the `msrv` job runs `just msrv` on the pinned toolchain [T1] | `.github/workflows/ci.yml` |
@@ -68,7 +68,7 @@ table `quirks.toml` keys `(soc, codec)` to entries and ships 4
 negotiation and software paths at 21/24/28/33/34 is planned [?];
 hardware decode needs a physical-device lab [?].
 
-## VA-API, D3D11, wgpu
+## VA-API, D3D11, D3D12, wgpu
 
 VA-API: dlopen `libva.so.2`, `vaInitialize` reports the runtime
 version, caps come purely from profile/entrypoint queries [T1, va.h].
@@ -87,6 +87,16 @@ and VC-1 profiles probe while their picture builders stay pending.
 Encode runs over MediaFoundation encoder MFTs probed at runtime:
 H.264 and HEVC in-box, AV1 vendor-only, VP9/MPEG-2/VC-1 declining
 without an MFT [T1, MS Learn].
+
+D3D12: floor is Windows 10, the `ID3D12VideoDevice` minimum [T1, MS Learn].
+The tier probes decode profiles and encode support per adapter over
+`CheckFeatureSupport` with the `windows` binding at pin 0.62.2 [T1];
+decoder GUIDs come from the windows-crate constants only, never hand-copy
+hex. Video encode probes H.264, HEVC, and AV1 per adapter; sessions open H.264 only while the other args builders stay pending, and other codecs decline loudly.
+D3D12 H.264 encode on NVIDIA 596.36 emits corrupt IDR slices on
+noise-like input (2026-10-15 inquest, RTX 3060 Laptop): byte-identical
+corruption through this tier and ffmpeg `h264_d3d12va`, parameter sets
+exonerated; retest on 617.42 or later.
 
 wgpu is not a decode tier: its `Backends` list has no D3D11 and no
 video API [T1, docs.rs]. Allowed roles are upload/render interop
@@ -112,6 +122,7 @@ never silent.
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
 | D3D11 adapter/GUID/format | runtime only [T1] | per-adapter enumeration |
+| D3D12 adapter/GUID/format | runtime only [T1] | per-adapter enumeration |
 | wgpu backend | planned [?]; runtime `Backends` flags when it lands | one binary, many GPUs |
 | software codecs | `rust-video-sw` features (`ffmpeg`, `gpl`, `h264-openh264`); facade `codec-*` map to stub crates | compile cost and binary size |
 | quirk table | runtime data file | per-device values, suspected until measured |
@@ -133,8 +144,8 @@ self-hosted GPU runners, an Android device lab for hardware e2e.
 
 One dependency: the `rust-video` facade. Tiers arrive as facade
 features: `codec-av1`, `codec-av2`, `codec-h264`, `codec-h265`,
-`codec-vp9`, `tier-d3d11`, `tier-mediacodec`, `tier-vaapi`, and
-`tier-vulkan`, each wired to its crate. Default carries the three
+`codec-vp9`, `tier-d3d11`, `tier-d3d12`, `tier-mediacodec`, `tier-vaapi`,
+and `tier-vulkan`, each wired to its crate. Default carries the three
 portable tiers (`tier-vulkan`, `tier-vaapi`, `tier-mediacodec`);
 every tier crate compiles on every target and declines at runtime
 where its platform is absent. Codecs and `tier-d3d11` stay opt-in.

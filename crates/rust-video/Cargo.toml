@@ -18,6 +18,7 @@ codec-h264 = ["dep:rust-video-h264"]
 codec-h265 = ["dep:rust-video-h265"]
 codec-vp9 = ["dep:rust-video-vp9"]
 tier-d3d11 = ["dep:rust-video-d3d11"]
+tier-d3d12 = ["dep:rust-video-d3d12"]
 tier-mediacodec = ["dep:rust-video-mediacodec"]
 tier-vaapi = ["dep:rust-video-vaapi"]
 tier-vulkan = ["dep:rust-video-vulkan"]
@@ -34,6 +35,7 @@ rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1", optional = tru
 rust-video-av2 = { version = "0.1.0", path = "../rust-video-av2", optional = true }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 rust-video-d3d11 = { version = "0.1.0", path = "../rust-video-d3d11", optional = true }
+rust-video-d3d12 = { version = "0.1.0", path = "../rust-video-d3d12", optional = true }
 rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264", optional = true }
 rust-video-h265 = { version = "0.1.0", path = "../rust-video-h265", optional = true }
 rust-video-mediacodec = { version = "0.1.0", path = "../rust-video-mediacodec", optional = true }

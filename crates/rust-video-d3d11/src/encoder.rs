@@ -87,7 +87,8 @@ fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d11Error> {
             "nv12 frame without two planes".to_owned(),
         ));
     };
-    let mut nv12 = Vec::new();
+    let capacity = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2).unwrap_or(0);
+    let mut nv12 = Vec::with_capacity(capacity);
     copy_plane(y.data(), y.stride(), width, height, &mut nv12)?;
     copy_plane(uv.data(), uv.stride(), width, height / 2, &mut nv12)?;
     Ok((width, height, nv12))

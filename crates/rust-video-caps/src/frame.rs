@@ -61,6 +61,8 @@ pub enum GpuExport {
 pub enum PixelFormat {
     /// Semi-planar 8-bit 4:2:0.
     Nv12,
+    /// Semi-planar 10-bit 4:2:0.
+    P010,
     /// Planar 8-bit 4:2:0.
     Yuv420P,
     /// Planar 8-bit 4:2:2.
@@ -78,7 +80,7 @@ impl PixelFormat {
     #[must_use]
     pub fn plane_count(self) -> usize {
         match self {
-            Self::Nv12 => 2,
+            Self::Nv12 | Self::P010 => 2,
             Self::Yuv420P | Self::Yuv422P | Self::Yuv444P => 3,
             Self::Rgba8 | Self::Bgra8 => 1,
         }
@@ -90,7 +92,7 @@ impl PixelFormat {
         match self {
             Self::Nv12 | Self::Yuv420P => 3,
             Self::Yuv422P => 4,
-            Self::Yuv444P => 6,
+            Self::Yuv444P | Self::P010 => 6,
             Self::Rgba8 | Self::Bgra8 => 8,
         }
     }
@@ -324,6 +326,7 @@ mod tests {
     #[test]
     fn pixel_format_plane_counts() {
         assert_eq!(PixelFormat::Nv12.plane_count(), 2);
+        assert_eq!(PixelFormat::P010.plane_count(), 2);
         assert_eq!(PixelFormat::Yuv420P.plane_count(), 3);
         assert_eq!(PixelFormat::Yuv422P.plane_count(), 3);
         assert_eq!(PixelFormat::Yuv444P.plane_count(), 3);
@@ -353,6 +356,12 @@ mod tests {
         let buffer = pool.acquire();
         assert!(buffer.capacity() >= 16 * 16 * 3 / 2);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn pool_sizes_p010_buffer() {
+        let mut pool = FramePool::new(size(), PixelFormat::P010);
+        assert!(pool.acquire().capacity() >= 16 * 16 * 3);
     }
 
     #[test]

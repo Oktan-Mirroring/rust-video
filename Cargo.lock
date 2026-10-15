@@ -317,6 +317,7 @@ dependencies = [
  "rust-video-av2",
  "rust-video-caps",
  "rust-video-d3d11",
+ "rust-video-d3d12",
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",
@@ -343,6 +344,16 @@ dependencies = [
 
 [[package]]
 name = "rust-video-d3d11"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rust-video-caps",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "rust-video-d3d12"
 version = "0.1.0"
 dependencies = [
  "bytes",

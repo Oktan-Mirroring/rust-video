@@ -2,6 +2,8 @@
 //!
 //! Field order matches dxva.h in the Windows SDK.
 
+use std::mem::{offset_of, size_of};
+
 /// H.264 picture entry: surface index plus one flag bit.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -241,40 +243,35 @@ pub(crate) struct SliceLongH264 {
     pub(crate) slice_id: u16,
 }
 
+/// Sizes and offsets against dxva.h; the driver reads these bytes verbatim.
+const _: () = {
+    assert!(size_of::<PicEntryH264>() == 1);
+    assert!(size_of::<PicParamsH264>() == 1040);
+    assert!(size_of::<QmatrixH264>() == 224);
+    assert!(size_of::<SliceLongH264>() == 864);
+    assert!(offset_of!(PicParamsH264, curr_pic) == 4);
+    assert!(offset_of!(PicParamsH264, ref_frame_list) == 16);
+    assert!(offset_of!(PicParamsH264, field_order_cnt_list) == 40);
+    assert!(offset_of!(PicParamsH264, frame_num_list) == 176);
+    assert!(offset_of!(PicParamsH264, used_for_reference_flags) == 208);
+    assert!(offset_of!(PicParamsH264, frame_num) == 214);
+    assert!(offset_of!(PicParamsH264, slice_group_map) == 230);
+    assert!(offset_of!(SliceLongH264, first_mb) == 10);
+    assert!(offset_of!(SliceLongH264, ref_lists) == 24);
+    assert!(offset_of!(SliceLongH264, weights) == 88);
+    assert!(offset_of!(SliceLongH264, qs_delta) == 856);
+    assert!(offset_of!(SliceLongH264, slice_id) == 862);
+};
+
 #[cfg(test)]
 mod tests {
-    use super::{PicEntryH264, PicParamsH264, QmatrixH264, SliceLongH264};
-    use std::mem::{offset_of, size_of};
+    use super::{PicEntryH264, PicParamsH264};
 
     #[test]
     fn entry_packs_index_and_flag() {
         assert_eq!(PicEntryH264::frame(3).entry, 3);
         assert_eq!(PicEntryH264::new(3, true).entry, 0x83);
         assert_eq!(PicEntryH264::INVALID.entry, 0xFF);
-    }
-
-    #[test]
-    fn params_match_dxva_sizes() {
-        assert_eq!(size_of::<PicEntryH264>(), 1);
-        assert_eq!(size_of::<PicParamsH264>(), 1040);
-        assert_eq!(size_of::<QmatrixH264>(), 224);
-        assert_eq!(size_of::<SliceLongH264>(), 864);
-    }
-
-    #[test]
-    fn params_match_dxva_offsets() {
-        assert_eq!(offset_of!(PicParamsH264, curr_pic), 4);
-        assert_eq!(offset_of!(PicParamsH264, ref_frame_list), 16);
-        assert_eq!(offset_of!(PicParamsH264, field_order_cnt_list), 40);
-        assert_eq!(offset_of!(PicParamsH264, frame_num_list), 176);
-        assert_eq!(offset_of!(PicParamsH264, used_for_reference_flags), 208);
-        assert_eq!(offset_of!(PicParamsH264, frame_num), 214);
-        assert_eq!(offset_of!(PicParamsH264, slice_group_map), 230);
-        assert_eq!(offset_of!(SliceLongH264, first_mb), 10);
-        assert_eq!(offset_of!(SliceLongH264, ref_lists), 24);
-        assert_eq!(offset_of!(SliceLongH264, weights), 88);
-        assert_eq!(offset_of!(SliceLongH264, qs_delta), 856);
-        assert_eq!(offset_of!(SliceLongH264, slice_id), 862);
     }
 
     #[test]

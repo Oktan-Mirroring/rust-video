@@ -17,6 +17,17 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// True when `tier` is native hardware on the platform.
+    #[must_use]
+    fn supports_hardware(self, tier: Tier) -> bool {
+        matches!(
+            (self, tier),
+            (Self::Windows, Tier::D3d11 | Tier::D3d12)
+                | (Self::Linux, Tier::VaApi)
+                | (Self::Android, Tier::MediaCodec)
+        )
+    }
+
     /// Hardware tier native to the platform, if any.
     #[must_use]
     fn hardware_tier(self) -> Option<Tier> {
@@ -48,6 +59,8 @@ pub enum Tier {
     VaApi,
     /// Direct3D 11.
     D3d11,
+    /// Direct3D 12.
+    D3d12,
     /// Android `MediaCodec`.
     MediaCodec,
     /// Software.
@@ -137,7 +150,7 @@ impl Capabilities {
         let present = match tier {
             Tier::Vulkan => self.vulkan,
             Tier::Software => self.software,
-            hardware => platform.hardware_tier() == Some(hardware) && self.platform_hw,
+            hardware => self.platform_hw && platform.supports_hardware(hardware),
         };
         present
             && (tier != Tier::Software
@@ -416,6 +429,51 @@ mod tests {
                 VideoCodec::H264,
                 TierPreference::Force(Tier::VaApi)
             ))
+        );
+    }
+
+    #[test]
+    fn force_d3d12_on_windows_succeeds() {
+        let caps = Capabilities::none().with_platform_hw();
+        assert_eq!(
+            resolve(
+                VideoCodec::H264,
+                TierPreference::Force(Tier::D3d12),
+                &caps,
+                Platform::Windows
+            ),
+            Ok(Tier::D3d12)
+        );
+    }
+
+    #[test]
+    fn force_d3d12_off_windows_fails() {
+        let caps = Capabilities::none().with_platform_hw();
+        assert_eq!(
+            resolve(
+                VideoCodec::H264,
+                TierPreference::Force(Tier::D3d12),
+                &caps,
+                Platform::Linux
+            ),
+            Err(TierError::new(
+                VideoCodec::H264,
+                TierPreference::Force(Tier::D3d12)
+            ))
+        );
+    }
+
+    #[test]
+    fn auto_keeps_d3d11_middle_slot() {
+        let caps = Capabilities::none().with_platform_hw().with_software();
+        assert_eq!(
+            resolve(
+                VideoCodec::H264,
+                TierPreference::Auto,
+                &caps,
+                Platform::Windows
+            ),
+            Ok(Tier::D3d11)
         );
     }
 

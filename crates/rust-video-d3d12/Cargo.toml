@@ -1,0 +1,18 @@
+[package]
+name = "rust-video-d3d12"
+description = "Direct3D 12 video tier behind the rust-video facade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation"] }
+
+[dependencies]
+bytes = "1"
+rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
+thiserror = "1"

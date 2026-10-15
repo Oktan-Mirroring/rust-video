@@ -50,5 +50,5 @@ where marked.
 
 ## Hardware tiers
 
-Vulkan, VA-API, D3D11, and MediaCodec carry their platform's own
+Vulkan, VA-API, D3D11, D3D12, and MediaCodec carry their platform's own
 implementation. No software politics apply: the driver is the fast path.

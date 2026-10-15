@@ -146,7 +146,7 @@ impl Dpb {
             return Err(D3d11Error::Parse("frame_num range".to_owned()));
         }
         self.check_gap(picture, sps)?;
-        let mut emits: Vec<(i32, usize)> = Vec::new();
+        let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
         let refs = self.ref_snapshot();
         if picture.idr {
             self.reset_idr(picture, &mut emits);
@@ -182,7 +182,7 @@ impl Dpb {
 
     /// Undisplayed pictures in display order.
     pub(crate) fn drain(&mut self) -> Vec<Output> {
-        let mut emits: Vec<(i32, usize)> = Vec::new();
+        let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if let Some(occupant) = slot {
                 if !occupant.displayed {
@@ -278,13 +278,13 @@ impl Dpb {
             .slices
             .iter()
             .find_map(|slice| match &slice.header.marking {
-                Marking::Adaptive(operations) => Some(operations.clone()),
+                Marking::Adaptive(operations) => Some(operations),
                 _ => None,
             });
         match adaptive {
             Some(operations) => {
                 for op in operations {
-                    self.apply_mmco(op, picture, emits)?;
+                    self.apply_mmco(*op, picture, emits)?;
                 }
                 Ok(())
             }
@@ -678,21 +678,22 @@ impl Dpb {
     /// Submission payload for the stored picture.
     /// Reference pictures behind list construction, before marking.
     fn ref_snapshot(&self) -> Vec<RefState> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, occupant)| {
-                let occupant = occupant.as_ref()?;
-                occupant.reference.then_some(RefState {
-                    slot,
-                    frame_num: occupant.frame_num,
-                    wrap: occupant.wrap,
-                    poc: occupant.poc,
-                    long_term: occupant.long_term,
-                    long_term_idx: occupant.long_term_idx,
-                })
-            })
-            .collect()
+        let mut refs = Vec::with_capacity(SLOTS);
+        for (slot, occupant) in self.slots.iter().enumerate() {
+            if let Some(occupant) = occupant {
+                if occupant.reference {
+                    refs.push(RefState {
+                        slot,
+                        frame_num: occupant.frame_num,
+                        wrap: occupant.wrap,
+                        poc: occupant.poc,
+                        long_term: occupant.long_term,
+                        long_term_idx: occupant.long_term_idx,
+                    });
+                }
+            }
+        }
+        refs
     }
 
     fn submit(
@@ -704,11 +705,8 @@ impl Dpb {
         slot: usize,
         poc: i32,
     ) -> Result<SubmittedPicture, D3d11Error> {
-        let mut pp_refs: Vec<RefState> = refs
-            .iter()
-            .copied()
-            .filter(|state| !state.long_term)
-            .collect();
+        let mut pp_refs: Vec<RefState> = Vec::with_capacity(refs.len());
+        pp_refs.extend(refs.iter().copied().filter(|state| !state.long_term));
         pp_refs.extend(refs.iter().copied().filter(|state| state.long_term));
         let params = Self::fill_params(picture, sps, pps, slot, poc, &pp_refs)?;
         let qmatrix = QmatrixH264 {
@@ -724,7 +722,14 @@ impl Dpb {
         };
         let mb_total =
             (u32::from(sps.width_in_mbs_minus1) + 1) * (u32::from(sps.height_in_mbs_minus1) + 1);
-        let mut bitstream = Vec::new();
+        let mut bitstream = Vec::with_capacity(
+            picture
+                .slices
+                .iter()
+                .map(|slice| slice.nal.len() + 3)
+                .sum::<usize>()
+                + 128,
+        );
         let mut slices = Vec::with_capacity(picture.slices.len());
         let total = picture.slices.len();
         for (index, slice) in picture.slices.iter().enumerate() {
@@ -860,18 +865,16 @@ impl Dpb {
         active: u8,
     ) -> Result<[PicEntryH264; 32], D3d11Error> {
         let current_poc = context.poc;
-        let mut shorts: Vec<RefState> = context
-            .refs
-            .iter()
-            .copied()
-            .filter(|state| !state.long_term)
-            .collect();
-        let mut longs: Vec<RefState> = context
-            .refs
-            .iter()
-            .copied()
-            .filter(|state| state.long_term)
-            .collect();
+        let mut shorts: Vec<RefState> = Vec::with_capacity(context.refs.len());
+        shorts.extend(
+            context
+                .refs
+                .iter()
+                .copied()
+                .filter(|state| !state.long_term),
+        );
+        let mut longs: Vec<RefState> = Vec::with_capacity(context.refs.len());
+        longs.extend(context.refs.iter().copied().filter(|state| state.long_term));
         match kind {
             RefList::Forward => {
                 shorts.sort_by(|a, b| b.wrap.cmp(&a.wrap).then_with(|| a.slot.cmp(&b.slot)));

@@ -4,7 +4,7 @@ use crate::device::D3d11Device;
 use crate::dpb::{Dpb, Output};
 use crate::error::{D3d11Error, SkipReason};
 use crate::guid::Codec;
-use crate::h264::{Crop, Ingest, Picture};
+use crate::h264::{Crop, Ingest, Picture, Sps};
 use crate::session::Session;
 #[cfg(target_os = "windows")]
 use crate::session::SharedExport;
@@ -98,6 +98,21 @@ struct Active {
     visible: PictureSize,
 }
 
+impl Active {
+    /// Active sequence behind `sps`.
+    fn new(sps: &Sps) -> Result<Self, D3d11Error> {
+        let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
+            .ok_or_else(|| D3d11Error::Parse("crop empties picture".to_owned()))?;
+        Ok(Self {
+            sps_id: sps.seq_parameter_set_id,
+            width: sps.width(),
+            height: sps.height(),
+            crop: sps.crop,
+            visible,
+        })
+    }
+}
+
 /// H.264 decoder over a D3D11 device.
 pub struct H264Decoder<'a> {
     /// Device owning the decode session.
@@ -137,35 +152,36 @@ impl<'a> H264Decoder<'a> {
         picture: &Picture,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
-        let pps = self
-            .ingest
-            .pps(picture.pps_id())
-            .ok_or(D3d11Error::NoSession)?
-            .clone();
-        let sps = self
-            .ingest
-            .sps(pps.seq_parameter_set_id)
-            .ok_or(D3d11Error::NoSession)?
-            .clone();
-        let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
-            .ok_or_else(|| D3d11Error::Parse("crop empties picture".to_owned()))?;
-        let active = Active {
-            sps_id: sps.seq_parameter_set_id,
-            width: sps.width(),
-            height: sps.height(),
-            crop: sps.crop,
-            visible,
+        let active = {
+            let pps = self
+                .ingest
+                .pps(picture.pps_id())
+                .ok_or(D3d11Error::NoSession)?;
+            let sps = self
+                .ingest
+                .sps(pps.seq_parameter_set_id)
+                .ok_or(D3d11Error::NoSession)?;
+            Active::new(sps)?
         };
         if self.active != Some(active) {
             self.reconfigure(active, frames)?;
         }
         let active = self.active.ok_or(D3d11Error::NoSession)?;
-        let decoded = match self
-            .dpb
-            .as_mut()
-            .ok_or(D3d11Error::NoSession)?
-            .decode(picture, &sps, &pps)
-        {
+        let decoded = {
+            let pps = self
+                .ingest
+                .pps(picture.pps_id())
+                .ok_or(D3d11Error::NoSession)?;
+            let sps = self
+                .ingest
+                .sps(pps.seq_parameter_set_id)
+                .ok_or(D3d11Error::NoSession)?;
+            self.dpb
+                .as_mut()
+                .ok_or(D3d11Error::NoSession)?
+                .decode(picture, sps, pps)
+        };
+        let decoded = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
@@ -221,14 +237,13 @@ impl<'a> H264Decoder<'a> {
         let session = Session::open(self.device, active.width, active.height)?;
         self.shared = Some(self.device.shared().clone());
         self.session = Some(session);
-        self.dpb = Some(Dpb::new(&self.sequence_set(active.sps_id)?));
+        let sps = self
+            .ingest
+            .sps(active.sps_id)
+            .ok_or(D3d11Error::NoSession)?;
+        self.dpb = Some(Dpb::new(sps));
         self.active = Some(active);
         Ok(())
-    }
-
-    /// Sequence set `id` behind the ingest store.
-    fn sequence_set(&self, id: u8) -> Result<crate::h264::Sps, D3d11Error> {
-        self.ingest.sps(id).cloned().ok_or(D3d11Error::NoSession)
     }
 
     /// Live DPB outputs into `frames`.

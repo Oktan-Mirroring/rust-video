@@ -281,23 +281,21 @@ impl Session {
     /// Picture, matrix, bitstream, and slice buffers in one submit.
     #[cfg(target_os = "windows")]
     fn submit_buffers(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
-        let params = struct_bytes(&submission.params);
-        let matrix = struct_bytes(&submission.qmatrix);
+        let params = struct_slice(&submission.params);
+        let matrix = struct_slice(&submission.qmatrix);
+        let short;
         let slices = if self.slice_short {
-            short_bytes(&submission.slices)
+            short = short_bytes(&submission.slices);
+            short.as_slice()
         } else {
-            slice_bytes(&submission.slices)
+            slice_slice(&submission.slices)
         };
         let macroblocks = (self.width / 16) * (self.height / 16);
         let buffers = [
-            (
-                D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
-                params.as_slice(),
-                0,
-            ),
+            (D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, params, 0),
             (
                 D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
-                matrix.as_slice(),
+                matrix,
                 0,
             ),
             (
@@ -307,7 +305,7 @@ impl Session {
             ),
             (
                 D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
-                slices.as_slice(),
+                slices,
                 macroblocks,
             ),
         ];
@@ -586,7 +584,7 @@ fn flag_word(bits: i32) -> u32 {
 
 /// Plain-data struct as bytes.
 #[cfg(target_os = "windows")]
-fn struct_bytes<T>(value: &T) -> Vec<u8> {
+fn struct_slice<T>(value: &T) -> &[u8] {
     // Sound: the value is a live `repr(C)` plain-data struct.
     unsafe {
         std::slice::from_raw_parts(
@@ -594,17 +592,15 @@ fn struct_bytes<T>(value: &T) -> Vec<u8> {
             std::mem::size_of_val(value),
         )
     }
-    .to_vec()
 }
 
 /// Slice control entries as bytes.
 #[cfg(target_os = "windows")]
-fn slice_bytes<T>(values: &[T]) -> Vec<u8> {
+fn slice_slice<T>(values: &[T]) -> &[u8] {
     // Sound: the slice is live with a plain-data element type.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
-    .to_vec()
 }
 
 /// Short slice controls with cleared trailing pad.
@@ -635,14 +631,17 @@ fn copy_nv12(
         });
     }
     let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
-    let capacity = u64::from(width) * u64::from(height) * 3 / 2;
     let pitch = usize::try_from(mapped.RowPitch).unwrap_or(0);
     let left = usize::try_from(left).unwrap_or(0);
     let top = usize::try_from(top).unwrap_or(0);
     let visible_width = usize::try_from(visible_width).unwrap_or(0);
     let visible_height = usize::try_from(visible_height).unwrap_or(0);
     let height = usize::try_from(height).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
+    let capacity = visible_width
+        .saturating_mul(visible_height)
+        .saturating_mul(3)
+        / 2;
+    let mut bytes = Vec::with_capacity(capacity);
     // Sound: the pitch and extents bound every row inside the mapped staging texture.
     unsafe {
         let base = mapped.pData.cast::<u8>();

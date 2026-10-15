@@ -28,6 +28,9 @@ pub use rust_video_av2 as av2;
 #[cfg(feature = "tier-d3d11")]
 /// Direct3D 11 platform tier.
 pub use rust_video_d3d11 as d3d11;
+#[cfg(feature = "tier-d3d12")]
+/// Direct3D 12 platform tier.
+pub use rust_video_d3d12 as d3d12;
 #[cfg(feature = "codec-h264")]
 /// H.264 codec backend.
 pub use rust_video_h264 as h264;
@@ -71,6 +74,12 @@ mod tests {
     #[test]
     fn tier_d3d11_reexport_resolves() {
         assert!(core::any::type_name::<crate::d3d11::D3d11>().contains("D3d11"));
+    }
+
+    #[cfg(feature = "tier-d3d12")]
+    #[test]
+    fn tier_d3d12_reexport_resolves() {
+        assert!(core::any::type_name::<crate::d3d12::D3d12>().contains("D3d12"));
     }
 
     #[cfg(feature = "codec-h264")]

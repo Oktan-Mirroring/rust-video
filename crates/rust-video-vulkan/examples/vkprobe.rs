@@ -8,7 +8,10 @@ fn main() {
     let vector =
         std::env::var("VKPROBE_VECTOR").unwrap_or_else(|_| "/tmp/h264-high.h264".to_owned());
     let out_path = std::env::var("VKPROBE_OUT").unwrap_or_else(|_| "/tmp/vk_all.yuv".to_owned());
-    let bytes = std::fs::read(&vector).expect("vector");
+    let Ok(bytes) = std::fs::read(&vector) else {
+        println!("vkprobe: no vector at {vector}; skipped");
+        return;
+    };
     let bytes = match std::env::var("VKPROBE_TRUNC_NALS")
         .ok()
         .and_then(|text| text.parse().ok())
@@ -16,7 +19,17 @@ fn main() {
         Some(k) => truncate_nals(&bytes, k),
         None => bytes,
     };
-    let device = VulkanDevice::open_or_skip(CodecOp::H264Decode).expect("device");
+    let device = match VulkanDevice::open(CodecOp::H264Decode) {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            println!("vkprobe: no vulkan device; skipped");
+            return;
+        }
+        Err(error) => {
+            eprintln!("vkprobe: negotiation failed ({error})");
+            std::process::exit(1);
+        }
+    };
     let mut decoder = H264Decoder::open(&device).expect("decoder");
     let mut out = Vec::new();
     let mut count = 0;
