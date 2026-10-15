@@ -17,3 +17,7 @@ Manual drop-in: place vector files under `corpus/<codec>/` (`h264`, `h265`,
 `av1`, `vp9`, `vp8`, `av2`); unknown directory names are ignored by the suite
 scan. A fetched source graduates from manual only after its exact file URLs
 return 200 and its hashes verify.
+
+Fetch normalization: `vp80-03-segmentation-01..04.ivf` ship FourCC `I420`
+over VP8 payloads; `scripts/fetch-vectors.sh` rewrites bytes 8-11 to `VP80`
+after SHA-1 verification.

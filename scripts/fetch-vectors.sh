@@ -11,6 +11,27 @@ fail=0
 fetched=0
 max="${VECTORS_MAX:-0}"
 
+# Upstream libvpx vp80-03-segmentation-01..04.ivf ship FourCC I420 over VP8
+# payloads; the ffmpeg oracle trusts the FourCC. Called for vp80-* only:
+# vp9 invalid-* vectors keep non-VP90 FourCC by design.
+normalize_ivf() {
+  dest="$1"
+  case "$dest" in *.ivf) ;; *) return 0 ;; esac
+  [ -f "$dest" ] || return 0
+  magic="$(dd if="$dest" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+  [ "$magic" = "444b4946" ] || return 0
+  fourcc="$(dd if="$dest" bs=1 skip=8 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+  [ "$fourcc" = "56503830" ] && return 0
+  tmp="$dest.normalize"
+  cp "$dest" "$tmp" || return 1
+  if ! printf 'VP80' | dd of="$tmp" bs=1 seek=8 count=4 conv=notrunc 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+  echo "NORMALIZED IVF FourCC $fourcc -> 56503830 (VP80): $dest"
+  mv "$tmp" "$dest"
+}
+
 echo "== libvpx VP9/VP8 vectors"
 manifest="$(curl -sL --max-time 60 'https://raw.githubusercontent.com/webmproject/libvpx/main/test/test-data.sha1')"
 if [ -z "$manifest" ]; then
@@ -30,6 +51,7 @@ else
       *) dest="$corpus/vp9/$file" ;;
     esac
     if [ -f "$dest" ]; then
+      case "$file" in vp80-*) normalize_ivf "$dest" ;; esac
       fetched=$((fetched+1))
       continue
     fi
@@ -44,6 +66,8 @@ else
       echo "FAIL: $file hash mismatch" >&2
       rm -f "$dest"
       fail=1
+    else
+      case "$file" in vp80-*) normalize_ivf "$dest" ;; esac
     fi
     fetched=$((fetched+1))
   done <<< "$(printf '%s' "$manifest" | tr -d '*')"
