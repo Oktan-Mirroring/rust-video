@@ -87,7 +87,7 @@ pub enum VulkanError {
     Parse(#[from] ParseError),
     /// Frame over the VRAM budget.
     #[error("frame over budget: {0}")]
-    OverBudget(#[from] rust_video::OverBudget),
+    OverBudget(#[from] rust_video_caps::traits::OverBudget),
     /// Session returned a zero extent.
     #[error("session returned zero extent {width}x{height}")]
     BadExtent {
@@ -126,7 +126,7 @@ pub enum VulkanError {
     #[error("encoder wants NV12 input, got {format:?}")]
     UnsupportedInput {
         /// Pixel layout the caller supplied.
-        format: rust_video::PixelFormat,
+        format: rust_video_caps::frame::PixelFormat,
     },
 }
 
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn unsupported_input_names_format() {
         let error = VulkanError::UnsupportedInput {
-            format: rust_video::PixelFormat::Rgba8,
+            format: rust_video_caps::frame::PixelFormat::Rgba8,
         };
         assert_eq!(error.to_string(), "encoder wants NV12 input, got Rgba8");
     }

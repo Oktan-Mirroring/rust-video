@@ -25,8 +25,8 @@ pub fn run_codec(
     tag: &str,
 ) {
     use bytes::Bytes;
-    use rust_video::packet::Packet;
-    use rust_video::traits::Decoder as _;
+    use rust_video_caps::packet::Packet;
+    use rust_video_caps::traits::Decoder as _;
 
     let inputs = match selected {
         ProbeCodec::AnnexB(_) => vec![fs::read(stream).expect("stream readable")],

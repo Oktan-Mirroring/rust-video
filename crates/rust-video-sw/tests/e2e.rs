@@ -5,8 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use rust_video::traits::Decoder as _;
-use rust_video::{CpuFrame, Packet, VideoCodec};
+use rust_video::VideoCodec;
+use rust_video_caps::frame::CpuFrame;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder as _;
 use rust_video_harness::{FrameHash, Golden, Suite};
 use rust_video_sw::Vp8Decoder;
 

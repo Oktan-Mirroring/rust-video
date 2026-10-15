@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 
-use rust_video::{Decoder, Packet, VideoCodec};
+use rust_video::VideoCodec;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
 use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice};
 

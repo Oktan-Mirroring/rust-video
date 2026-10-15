@@ -1,4 +1,4 @@
-//! Byte-buffer decode behind the facade `Decoder` trait.
+//! Byte-buffer decode behind the caps `Decoder` trait.
 
 #[cfg(target_os = "android")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -19,8 +19,10 @@ use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, InputBuffer, MediaCodec,
     MediaCodecDirection,
 };
-use rust_video::{CpuFrame, Decoder, Packet, PixelFormat, Plane};
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 
 /// Decoder lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +121,7 @@ enum Layout {
 }
 
 impl Layout {
-    /// Facade pixel layout.
+    /// Shared pixel layout.
     fn pixel_format(self) -> PixelFormat {
         match self {
             Self::Nv12 => PixelFormat::Nv12,
@@ -788,7 +790,8 @@ mod tests {
 
     use bytes::Bytes;
 
-    use rust_video::{Packet, PixelFormat};
+    use rust_video_caps::frame::PixelFormat;
+    use rust_video_caps::packet::Packet;
 
     use super::{ranged_bytes, DecodeState, MediaCodecDecoder, MediaCodecError, OutputLayout};
 

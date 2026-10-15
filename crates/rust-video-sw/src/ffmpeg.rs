@@ -8,11 +8,10 @@ use std::ptr;
 
 use bytes::Bytes;
 
-use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-use rust_video::packet::Packet;
-use rust_video::traits::Decoder;
-
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
@@ -574,8 +573,8 @@ fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
 mod tests {
     use bytes::Bytes;
 
-    use rust_video::packet::Packet;
-    use rust_video::traits::Decoder;
+    use rust_video_caps::packet::Packet;
+    use rust_video_caps::traits::Decoder;
 
     use super::{Codec, FfmpegDecoder, H264Decoder};
 
@@ -631,10 +630,9 @@ mod tests {
     #[cfg(feature = "h264-openh264")]
     #[test]
     fn own_encoder_output_decodes_back() {
-        use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-        use rust_video::traits::Encoder as _;
-
         use rust_video_caps::common::PictureSize;
+        use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+        use rust_video_caps::traits::Encoder as _;
 
         use crate::h264::H264Encoder;
 

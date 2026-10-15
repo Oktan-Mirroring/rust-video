@@ -5,10 +5,10 @@ use std::path::Path;
 use std::time::Instant;
 
 use bytes::Bytes;
-use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-use rust_video::packet::Packet;
-use rust_video::traits::Encoder;
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Encoder;
 use rust_video_sw::Vp9Encoder;
 
 /// Encode `frames` I420 frames from `raw` at `w`x`h` into IVF `out` as VP9.

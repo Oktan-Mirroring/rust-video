@@ -1,10 +1,10 @@
-//! Negotiated Vulkan device behind the facade `Device` trait.
+//! Negotiated Vulkan device behind the caps `Device` trait.
 
 use crate::error::VulkanError;
 use crate::ladder::{CodecOp, Ladder, LadderError, OpCaps};
 use crate::raw::{AshBackend, RawDevice};
 
-use rust_video::{Device, SharedDevice};
+use rust_video_caps::traits::{Device, SharedDevice};
 
 /// Vulkan device with a VRAM budget.
 pub struct VulkanDevice {

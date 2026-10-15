@@ -7,9 +7,9 @@ use bytes::Bytes;
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameType, RateControlMode};
 use openh264::formats::YUVBuffer;
 
-use rust_video::frame::CpuFrame;
-use rust_video::packet::Packet;
-use rust_video::traits::Encoder as FacadeEncoder;
+use rust_video_caps::frame::CpuFrame;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Encoder as CapsEncoder;
 
 use crate::error::SwError;
 
@@ -44,7 +44,7 @@ impl H264Encoder {
     }
 }
 
-impl FacadeEncoder for H264Encoder {
+impl CapsEncoder for H264Encoder {
     type Error = SwError;
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
@@ -100,10 +100,9 @@ mod tests {
     use openh264::decoder::{DecodeOptions, Decoder, DecoderConfig, Flush};
     use openh264::formats::YUVSource;
 
-    use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-    use rust_video::traits::Encoder as _;
-
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+    use rust_video_caps::traits::Encoder as _;
 
     use super::H264Encoder;
 

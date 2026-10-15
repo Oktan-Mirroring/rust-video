@@ -405,7 +405,7 @@ impl Backend for AshBackend {
                     .queue_priorities(&priorities),
             );
         }
-        let names: Vec<*const i8> = op.extensions().iter().map(|name| name.as_ptr()).collect();
+        let names: Vec<*const c_char> = op.extensions().iter().map(|name| name.as_ptr()).collect();
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&infos)
             .enabled_extension_names(&names);

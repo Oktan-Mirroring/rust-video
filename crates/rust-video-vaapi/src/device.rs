@@ -1,4 +1,4 @@
-//! VA-API display behind the facade `Device` trait.
+//! VA-API display behind the caps `Device` trait.
 
 #![allow(unsafe_code)]
 
@@ -13,9 +13,10 @@ use crate::error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]
 use crate::ffi;
 
-use rust_video::Device;
+use rust_video_caps::traits::Device;
 
 /// VA-API display over one DRM render node.
+#[derive(Debug)]
 pub struct VaApiDevice {
     /// Initialized VA-API display; terminated before the node below closes.
     #[cfg(target_os = "linux")]
@@ -29,6 +30,7 @@ pub struct VaApiDevice {
 
 impl VaApiDevice {
     /// DRM render-node directory.
+    #[cfg(target_os = "linux")]
     const DRI_DIR: &'static str = "/dev/dri";
 
     /// Display over the first H.264-capable render node.
@@ -284,7 +286,9 @@ mod tests {
     #[test]
     fn open_selects_an_h264_node() {
         match VaApiDevice::open() {
-            Ok(device) => assert!(!rust_video::Device::name(&device).is_empty()),
+            Ok(device) => {
+                assert!(!rust_video_caps::traits::Device::name(&device).is_empty());
+            }
             Err(crate::error::VaApiError::Skipped(reason)) => {
                 eprintln!("skipped: no va-api hardware ({reason})");
             }

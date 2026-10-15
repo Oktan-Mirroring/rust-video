@@ -43,7 +43,7 @@ pub enum VaApiError {
     DpbFull,
     /// Frame over the VRAM budget.
     #[error("frame over budget: {0}")]
-    OverBudget(#[from] rust_video::OverBudget),
+    OverBudget(#[from] rust_video_caps::traits::OverBudget),
     /// Driver returned a zero extent.
     #[error("driver returned zero extent {width}x{height}")]
     BadExtent {

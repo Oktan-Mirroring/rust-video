@@ -12,7 +12,8 @@
 use crate::decoder::VaApiFrame;
 use crate::error::VaApiError;
 
-use rust_video::{Decoder, Packet};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 
 /// VP9 decoder handle: frontend staged, every packet declines typed.
 pub struct Vp9Decoder;
@@ -36,7 +37,8 @@ mod tests {
     use crate::error::VaApiError;
 
     use bytes::Bytes;
-    use rust_video::{Decoder, Packet};
+    use rust_video_caps::packet::Packet;
+    use rust_video_caps::traits::Decoder;
 
     #[test]
     fn decode_declines_typed() {

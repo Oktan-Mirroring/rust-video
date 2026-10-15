@@ -1,4 +1,4 @@
-//! H.264 decode behind the facade `Decoder` trait.
+//! H.264 decode behind the caps `Decoder` trait.
 
 use crate::backend::Backend;
 use crate::device::VaApiDevice;
@@ -9,10 +9,10 @@ use crate::h264::parser::{SliceHeader, SliceType};
 use crate::params::Params;
 
 use bytes::Bytes;
-use rust_video::{
-    CpuFrame, Decoder, GpuExport, GpuFrame, Lease, Packet, PixelFormat, Plane, SharedDevice,
-};
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 
 /// H.264 decoder over a VA-API display.
 pub struct H264Decoder<'a> {
@@ -274,7 +274,7 @@ impl Decoder for H264Decoder<'_> {
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct VaApiFrame {
-    /// Facade identity: size, format, generation.
+    /// Frame identity: size, format, generation.
     identity: GpuFrame,
     /// NV12 frame bytes in row-major order.
     data: Bytes,
@@ -283,7 +283,7 @@ pub struct VaApiFrame {
 }
 
 impl VaApiFrame {
-    /// Facade identity of the frame.
+    /// Frame identity.
     #[must_use]
     pub fn identity(&self) -> GpuFrame {
         self.identity
@@ -337,8 +337,9 @@ mod tests {
     use super::VaApiFrame;
 
     use bytes::Bytes;
-    use rust_video::{GpuExport, GpuFrame, PixelFormat, SharedDevice};
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
+    use rust_video_caps::traits::SharedDevice;
 
     /// Frame over `data` leased against `shared`.
     fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> VaApiFrame {

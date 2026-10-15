@@ -3,7 +3,7 @@
 use std::fmt;
 
 #[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
-use rust_video::frame::{CpuFrame, PixelFormat};
+use rust_video_caps::frame::{CpuFrame, PixelFormat};
 
 /// Software backend failure.
 #[non_exhaustive]

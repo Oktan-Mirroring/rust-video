@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use bytes::Bytes;
-use rust_video::{Decoder, Device, Packet, PixelFormat};
+use rust_video_caps::frame::PixelFormat;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::{Decoder, Device};
 use rust_video_harness::FrameHash;
 use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaApiFrame};
 

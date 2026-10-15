@@ -7,11 +7,10 @@ use std::ptr;
 
 use bytes::Bytes;
 
-use rust_video::frame::CpuFrame;
-use rust_video::packet::Packet;
-use rust_video::traits::Encoder;
-
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::CpuFrame;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Encoder;
 
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
@@ -389,10 +388,9 @@ impl Drop for H265Encoder {
 mod tests {
     use bytes::Bytes;
 
-    use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-    use rust_video::traits::Encoder;
-
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+    use rust_video_caps::traits::Encoder;
 
     use super::{H265Encoder, H265Preset};
 
@@ -460,7 +458,7 @@ mod tests {
 
     #[test]
     fn roundtrip_through_ffmpeg_decoder() {
-        use rust_video::traits::Decoder as _;
+        use rust_video_caps::traits::Decoder as _;
 
         use crate::ffmpeg::H265Decoder;
 

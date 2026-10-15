@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Codec profiles, levels, and caps enforced in the type system"
+description = "Shared video vocabulary: frames, packets, backend traits, codec caps"
 
 [lints]
 workspace = true
+
+[dependencies]
+bytes = "1"

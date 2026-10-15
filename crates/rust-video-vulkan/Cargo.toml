@@ -12,9 +12,9 @@ workspace = true
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
 bytes = "1"
-rust-video = { version = "0.1.0", path = "../rust-video" }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 thiserror = "1"
 
 [dev-dependencies]
+rust-video = { path = "../rust-video" }
 rust-video-harness = { path = "../rust-video-harness" }

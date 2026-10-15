@@ -59,9 +59,9 @@ fn push_packed(yuv: &openh264::decoder::DecodedYUV<'_>, out: &mut Vec<u8>) {
 /// Encode `frames` I420 frames from `raw` at `width`x`height` into `out`.
 pub fn run_encode(raw: &Path, width: u32, height: u32, frames: usize, out: &Path) {
     use bytes::Bytes;
-    use rust_video::frame::{CpuFrame, PixelFormat, Plane};
-    use rust_video::traits::Encoder as _;
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+    use rust_video_caps::traits::Encoder as _;
     use rust_video_sw::H264Encoder;
 
     let pitch = width as usize * height as usize;

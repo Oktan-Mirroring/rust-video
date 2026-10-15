@@ -1,6 +1,6 @@
 //! Codec input formats and output layout mapping.
 
-use rust_video::PixelFormat;
+use rust_video_caps::frame::PixelFormat;
 
 #[cfg(target_os = "android")]
 use ndk::media::media_format::MediaFormat;
@@ -238,7 +238,7 @@ pub fn pixel_format_for(color_format: i32) -> Option<PixelFormat> {
 mod tests {
     use super::{pixel_format_for, FormatSpec};
 
-    use rust_video::PixelFormat;
+    use rust_video_caps::frame::PixelFormat;
 
     #[test]
     fn builders_carry_mime_and_dims() {

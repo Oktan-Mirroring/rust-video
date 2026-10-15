@@ -1,11 +1,13 @@
-//! Decode behind the facade `Decoder` trait.
+//! Decode behind the caps `Decoder` trait.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use ash::vk;
 use bytes::Bytes;
-use rust_video::{CpuFrame, Decoder, GpuExport, GpuFrame, Lease, Packet, PixelFormat, Plane};
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 
 use crate::device::VulkanDevice;
 use crate::error::{ParseError, VulkanError};
@@ -26,7 +28,7 @@ use crate::session::std_h264::{fill_picture, fill_reference, H264Tables};
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct VulkanFrame {
-    /// Facade identity: size, format, generation.
+    /// Frame identity: size, format, generation.
     identity: GpuFrame,
     /// NV12 frame bytes in row-major order.
     data: Bytes,
@@ -35,7 +37,7 @@ pub struct VulkanFrame {
 }
 
 impl VulkanFrame {
-    /// Facade identity of the frame.
+    /// Frame identity.
     #[must_use]
     pub fn identity(&self) -> GpuFrame {
         self.identity
@@ -114,14 +116,14 @@ pub(crate) struct FrameSink {
     /// Display reordering.
     reorder: ReorderBuffer<VulkanFrame>,
     /// VRAM budget shared with frames.
-    shared: rust_video::SharedDevice,
+    shared: SharedDevice,
     /// Frame generation counter.
     generation: u64,
 }
 
 impl FrameSink {
     /// Empty sink over `shared`.
-    pub(crate) fn new(shared: rust_video::SharedDevice) -> Self {
+    pub(crate) fn new(shared: SharedDevice) -> Self {
         Self {
             reorder: ReorderBuffer::with_capacity(0),
             shared,
@@ -1207,8 +1209,9 @@ fn ref_poc(session: &Session, slot: usize) -> i32 {
 mod tests {
     use bytes::Bytes;
 
-    use rust_video::{GpuExport, GpuFrame, PixelFormat, SharedDevice};
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
+    use rust_video_caps::traits::SharedDevice;
 
     use super::VulkanFrame;
 

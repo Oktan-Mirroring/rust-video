@@ -320,7 +320,10 @@ dependencies = [
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",
+ "rust-video-mediacodec",
+ "rust-video-vaapi",
  "rust-video-vp9",
+ "rust-video-vulkan",
 ]
 
 [[package]]
@@ -334,6 +337,9 @@ version = "0.1.0"
 [[package]]
 name = "rust-video-caps"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "rust-video-d3d11"
@@ -366,7 +372,6 @@ dependencies = [
  "bytes",
  "ndk",
  "ndk-sys",
- "rust-video",
  "rust-video-caps",
  "thiserror",
 ]
@@ -388,7 +393,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "log",
- "rust-video",
  "rust-video-caps",
  "rust-video-harness",
  "thiserror",

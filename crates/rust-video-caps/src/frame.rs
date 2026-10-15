@@ -4,9 +4,9 @@ use std::fmt;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 
-use bytes::{Bytes, BytesMut};
+use crate::common::PictureSize;
 
-use rust_video_caps::common::PictureSize;
+use bytes::{Bytes, BytesMut};
 
 /// CPU readback failure.
 #[non_exhaustive]
@@ -289,11 +289,10 @@ impl Plane {
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Bytes, BytesMut};
-
     use super::{CpuFrame, CpuReadback, FramePool, GpuFrame, PixelFormat, Plane};
+    use crate::common::PictureSize;
 
-    use rust_video_caps::common::PictureSize;
+    use bytes::{Bytes, BytesMut};
 
     fn plane() -> Plane {
         Plane::new(Bytes::from_static(&[0; 8]), 4).expect("valid plane")

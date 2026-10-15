@@ -11,13 +11,16 @@ keywords = ["video", "codec", "h264", "h265", "av1"]
 categories = ["multimedia"]
 
 [features]
-default = []
+default = ["tier-mediacodec", "tier-vaapi", "tier-vulkan"]
 codec-av1 = ["dep:rust-video-av1"]
 codec-av2 = ["dep:rust-video-av2"]
 codec-h264 = ["dep:rust-video-h264"]
 codec-h265 = ["dep:rust-video-h265"]
 codec-vp9 = ["dep:rust-video-vp9"]
 tier-d3d11 = ["dep:rust-video-d3d11"]
+tier-mediacodec = ["dep:rust-video-mediacodec"]
+tier-vaapi = ["dep:rust-video-vaapi"]
+tier-vulkan = ["dep:rust-video-vulkan"]
 
 [dev-dependencies]
 rust-video-harness = { path = "../rust-video-harness" }
@@ -33,4 +36,7 @@ rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 rust-video-d3d11 = { version = "0.1.0", path = "../rust-video-d3d11", optional = true }
 rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264", optional = true }
 rust-video-h265 = { version = "0.1.0", path = "../rust-video-h265", optional = true }
+rust-video-mediacodec = { version = "0.1.0", path = "../rust-video-mediacodec", optional = true }
+rust-video-vaapi = { version = "0.1.0", path = "../rust-video-vaapi", optional = true }
 rust-video-vp9 = { version = "0.1.0", path = "../rust-video-vp9", optional = true }
+rust-video-vulkan = { version = "0.1.0", path = "../rust-video-vulkan", optional = true }

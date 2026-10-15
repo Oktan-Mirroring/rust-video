@@ -5,7 +5,8 @@
 One binary spans every driver, OS release, and device it can run on.
 Build time varies what compiles; runtime varies what runs. Never both
 for one axis. Tier tags: **[T1]** fetched primary, **[T2]** consistent
-secondary, **[?]** unresolved, never filled. All fetches 2026-10-11.
+secondary, **[?]** unresolved, never filled. All fetches 2026-10-11;
+ash, ndk-crate, libva, NDK, and CDD pins re-verified 2026-10-15.
 
 ## Pins
 
@@ -51,9 +52,10 @@ create/configure/buffers/queue; 26 input surfaces and parameters;
 28 async callbacks; 31 low-latency and HDR keys; 33 frame-rendered
 callbacks; nothing above 33 exists, so ndk 0.9.0 covers the whole
 surface [T1]. Vulkan tier needs API 24+ (CDD 7.0 lists `libvulkan.so`
-for android-24) [T1]. Certified handhelds from API 34 must decode
-H.264/H.265/VP8/VP9/AV1 and encode H.264/VP8/AV1 (CDD 14) [T1];
-below that, attempt creation and handle absence.
+for android-24; CDD 14 section 3.3.1 retains it) [T1]. Certified
+handhelds from API 34 must decode H.264/H.265/VP8/VP9/AV1 and
+encode H.264/VP8/AV1 (CDD 14 section 2.2.2) [T1]; below that,
+attempt creation and handle absence.
 
 Rules: `ndk 0.9.0` with `media` plus fixed `api-level-28`, NDK
 r30, plain `cargo check --target` (no `cargo-ndk`). Every call above
@@ -101,7 +103,7 @@ never silent.
 
 | Axis | Mechanism | Why |
 |---|---|---|
-| OS tier inclusion | facade `tier-d3d11` feature; `rust-video-vulkan`, `rust-video-vaapi`, `rust-video-mediacodec` as direct dependencies, facade flags planned [?] | a target cannot carry another OS's tier |
+| OS tier inclusion | facade `tier-*` features; default enables `tier-vulkan`, `tier-vaapi`, `tier-mediacodec`, each compiling on every target | a target builds only the tiers it enables |
 | NDK API ladder | fixed `api-level-28` plus `ApiLevel` gates (21 floor, 28 async notify) | features expose symbols, gates pick paths |
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
@@ -127,17 +129,17 @@ self-hosted GPU runners, an Android device lab for hardware e2e.
 
 One dependency: the `rust-video` facade. Tiers arrive as facade
 features: `codec-av1`, `codec-av2`, `codec-h264`, `codec-h265`,
-`codec-vp9`, and `tier-d3d11`, each wired to its crate. Default is
-empty: every feature is opt-in. No `codec-vp8`, no `sw` wiring, no
-`wgpu-interop` (planned [?]). `rust-video-vulkan`,
-`rust-video-vaapi`, and `rust-video-mediacodec` are direct
-dependencies for now: each depends on the facade, so a facade
-feature pointing at one would close a dependency cycle that cargo
-rejects. Facade flags for the three are planned [?] and reopen
-when the tier crates drop the facade dependency. Tier crates never
-depend on each other. The facade resolves tiers over caller-supplied
-`Capabilities` so users write one code path. Adding a tier is
-minor; removing is major.
+`codec-vp9`, `tier-d3d11`, `tier-mediacodec`, `tier-vaapi`, and
+`tier-vulkan`, each wired to its crate. Default carries the three
+portable tiers (`tier-vulkan`, `tier-vaapi`, `tier-mediacodec`);
+every tier crate compiles on every target and declines at runtime
+where its platform is absent. Codecs and `tier-d3d11` stay opt-in.
+No `codec-vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
+Shared vocabulary (frames, packets, backend traits) lives in the
+leaf `rust-video-caps`; tier crates build on it, never on the
+facade outside dev-dependencies, and never on each other. The
+facade resolves tiers over caller-supplied `Capabilities` so users
+write one code path. Adding a tier is minor; removing is major.
 
 ## Open questions
 

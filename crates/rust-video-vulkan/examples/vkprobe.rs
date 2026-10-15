@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
-use rust_video::{Decoder, Packet};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 use rust_video_vulkan::{CodecOp, H264Decoder, VulkanDevice};
 
 fn main() {

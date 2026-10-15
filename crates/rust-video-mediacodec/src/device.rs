@@ -1,8 +1,8 @@
-//! Tier device behind the facade `Device` trait.
+//! Tier device behind the caps `Device` trait.
 
 use crate::sdk::ApiLevel;
 
-use rust_video::Device;
+use rust_video_caps::traits::Device;
 
 /// Probed `MediaCodec` tier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +50,7 @@ impl Device for MediaCodecDevice {
 mod tests {
     use super::MediaCodecDevice;
 
-    use rust_video::Device;
+    use rust_video_caps::traits::Device;
 
     #[test]
     fn probe_names_tier() {
