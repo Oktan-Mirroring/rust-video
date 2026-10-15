@@ -36,7 +36,7 @@ vectors:
 # End-to-end suites; needs ./corpus, fails loud without it.
 e2e:
     test -d corpus || (echo "corpus missing: run 'just vectors' first" && exit 1)
-    RUST_VIDEO_CORPUS={{justfile_directory()}}/corpus cargo test --workspace -j24 --test e2e
+    RUST_VIDEO_CORPUS={{justfile_directory()}}/corpus cargo test --workspace -j24 --features rust-video-sw/ffmpeg --test e2e
 
 # Generate goldens with the ffmpeg oracle; fails on uncovered options.
 goldens *args:
