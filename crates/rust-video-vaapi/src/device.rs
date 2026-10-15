@@ -81,16 +81,6 @@ impl VaApiDevice {
         Err(SkipReason::NoNv12Target.into())
     }
 
-    /// Display over the first H.264-capable render node.
-    ///
-    /// # Errors
-    ///
-    /// Always returns `Err`: VA-API exists on Linux only.
-    #[cfg(not(target_os = "linux"))]
-    pub fn open() -> Result<Self, VaApiError> {
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Initialized VA-API display.
     #[must_use]
     #[cfg(target_os = "linux")]
@@ -270,17 +260,6 @@ impl Drop for Display {
 #[cfg(test)]
 mod tests {
     use super::VaApiDevice;
-    #[cfg(not(target_os = "linux"))]
-    use crate::error::SkipReason;
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn open_declines_off_linux() {
-        assert_eq!(
-            VaApiDevice::open().unwrap_err().to_string(),
-            crate::error::VaApiError::from(SkipReason::PlatformUnsupported).to_string()
-        );
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

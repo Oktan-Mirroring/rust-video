@@ -10,8 +10,6 @@ use std::os::raw::c_int;
 use std::os::raw::c_void;
 
 use crate::device::VaApiDevice;
-#[cfg(not(target_os = "linux"))]
-use crate::error::SkipReason;
 use crate::error::VaApiError;
 use crate::ffi::{self, VaSurfaceId};
 #[cfg(target_os = "linux")]
@@ -136,24 +134,12 @@ impl Backend {
                 count,
             })
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (device, profile, width, height, count);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
     }
 
     /// Pool surfaces.
     #[must_use]
     pub fn surfaces(&self) -> &[VaSurfaceId] {
-        #[cfg(target_os = "linux")]
-        {
-            &self.surfaces
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            &[]
-        }
+        &self.surfaces
     }
 
     /// Pool size.
@@ -185,11 +171,6 @@ impl Backend {
                 }
             }
             outcome
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (target, picture, matrix, slices);
-            Err(SkipReason::PlatformUnsupported.into())
         }
     }
 
@@ -223,11 +204,6 @@ impl Backend {
                 ffi::vaDestroyImage(self.display, image.image_id);
             }
             outcome
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (surface, crop);
-            Err(SkipReason::PlatformUnsupported.into())
         }
     }
 
