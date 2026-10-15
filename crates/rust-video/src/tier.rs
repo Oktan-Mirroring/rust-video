@@ -262,7 +262,12 @@ pub fn resolve(
             }
         }
         TierPreference::Auto => {
+            let mut previous: Option<Tier> = None;
             for tier in auto_order(platform) {
+                if previous == Some(tier) {
+                    continue;
+                }
+                previous = Some(tier);
                 if caps.supports(codec, tier, platform) {
                     return Ok(tier);
                 }

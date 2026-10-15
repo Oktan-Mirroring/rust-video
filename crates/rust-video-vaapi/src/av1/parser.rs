@@ -1781,7 +1781,9 @@ impl Parser {
         };
 
         let obu_reserved_1bit = r.0.read_bit()?;
-        assert!(!obu_reserved_1bit); // Must be set to zero as per spec.
+        if obu_reserved_1bit {
+            return Err("obu_reserved_1bit set".into());
+        }
 
         if header.extension_flag {
             header.temporal_id = r.0.read_bits::<u32>(3)?;
@@ -1834,8 +1836,8 @@ impl Parser {
         // Both "low-overhead" and Annex B are now at the same point, i.e.: a
         // open_bitstream_unit() follows.
         let header = Self::parse_obu_header(&mut reader)?;
-        if matches!(self.stream_format, StreamFormat::LowOverhead) {
-            assert!(header.has_size_field);
+        if matches!(self.stream_format, StreamFormat::LowOverhead) && !header.has_size_field {
+            return Err("low-overhead OBU without size field".into());
         }
 
         let obu_size: usize = if header.has_size_field {
@@ -1882,10 +1884,17 @@ impl Parser {
             }
         }
 
+        let end = start_offset
+            .checked_add(obu_size)
+            .ok_or("obu_size overflows")?;
+        if end > data.len() {
+            return Err("obu_size exceeds data".into());
+        }
+
         Ok(ObuAction::Process(Obu {
             header,
-            data: Cow::from(&data[start_offset..start_offset + obu_size]),
-            bytes_used: start_offset + obu_size,
+            data: Cow::from(&data[start_offset..end]),
+            bytes_used: end,
         }))
     }
 
@@ -2367,7 +2376,7 @@ impl Parser {
             self.tile_rows = u32::try_from(i).map_err(|_| "tile index range")?;
 
             if self.tile_rows > u32::try_from(MAX_TILE_ROWS).map_err(|_| "tile rows range")? {
-                return Err(format!("Invalid tile_rows {}", self.tile_cols));
+                return Err(format!("Invalid tile_rows {}", self.tile_rows));
             }
 
             /* compute this anyways */
@@ -2939,7 +2948,7 @@ impl Parser {
         let alpha0 = helpers::clip3(-32768, 32767, warp_params[2] - (1 << WARPEDMODEL_PREC_BITS));
         let beta0 = helpers::clip3(-32768, 32767, warp_params[3]);
 
-        let (div_shift, div_factor) = helpers::resolve_divisor(warp_params[2]);
+        let (div_shift, div_factor) = helpers::resolve_divisor(warp_params[2])?;
 
         let v = i64::from(warp_params[4] << WARPEDMODEL_PREC_BITS);
         let v = i32::try_from(v * i64::from(div_factor)).map_err(|_| "shear range")?;
@@ -3627,13 +3636,8 @@ impl Parser {
                 if fh.frame_refs_short_signaling {
                     fh.last_frame_idx = r.0.read_bits::<u8>(3)?;
                     fh.gold_frame_idx = r.0.read_bits::<u8>(3)?;
-                    let ref_order_hints = self
-                        .ref_info
-                        .iter()
-                        .map(|i| i.ref_order_hint)
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap();
+                    let ref_order_hints: [u32; NUM_REF_FRAMES] =
+                        std::array::from_fn(|i| self.ref_info[i].ref_order_hint);
                     self.set_frame_refs(&mut fh, &ref_order_hints)?;
                 }
             } else {
@@ -3874,6 +3878,12 @@ impl Parser {
             let tile_bits = (self.tile_cols_log2 + self.tile_rows_log2) as usize;
             tg.tg_start = r.0.read_bits::<u32>(tile_bits)?;
             tg.tg_end = r.0.read_bits::<u32>(tile_bits)?;
+            if tg.tg_start > tg.tg_end || tg.tg_end >= num_tiles {
+                return Err(format!(
+                    "Invalid tile group range {}..={} for {num_tiles} tiles",
+                    tg.tg_start, tg.tg_end
+                ));
+            }
         }
 
         r.byte_alignment()?;
@@ -3904,8 +3914,8 @@ impl Parser {
                 col,
                 mi_row_start: self.mi_row_starts[row as usize],
                 mi_row_end: self.mi_row_starts[row as usize + 1],
-                mi_col_start: self.mi_row_starts[col as usize],
-                mi_col_end: self.mi_row_starts[col as usize + 1],
+                mi_col_start: self.mi_col_starts[col as usize],
+                mi_col_end: self.mi_col_starts[col as usize + 1],
             };
 
             tg.tiles.push(tile);
@@ -4049,9 +4059,7 @@ impl Parser {
             /* No scalability information, all OBUs must be decoded */
             None
         } else {
-            Some(helpers::floor_log2(u32::from(
-                self.operating_point_idc >> 8,
-            )))
+            helpers::floor_log2(u32::from(self.operating_point_idc >> 8)).ok()
         }
     }
 

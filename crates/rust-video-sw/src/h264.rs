@@ -35,7 +35,9 @@ impl H264Encoder {
             .rate_control_mode(RateControlMode::Bitrate)
             .num_threads(threads);
         let api = openh264::OpenH264API::from_source();
-        let inner = Encoder::with_api_config(api, config).map_err(|_| SwError::Init)?;
+        let inner = Encoder::with_api_config(api, config).map_err(|error| SwError::Native {
+            code: error.native_code(),
+        })?;
         Ok(Self {
             inner,
             width,
@@ -51,7 +53,12 @@ impl CapsEncoder for H264Encoder {
         SwError::check_yuv420p(frame, self.width, self.height)?;
         let packed = pack(frame)?;
         let source = YUVBuffer::from_vec(packed, self.width as usize, self.height as usize);
-        let stream = self.inner.encode(&source).map_err(|_| SwError::Rejected)?;
+        let stream = self
+            .inner
+            .encode(&source)
+            .map_err(|error| SwError::Native {
+                code: error.native_code(),
+            })?;
         let mut coded = Packet::new(Bytes::from(stream.to_vec()));
         if matches!(stream.frame_type(), FrameType::IDR | FrameType::I) {
             coded = coded.mark_keyframe();
@@ -95,40 +102,13 @@ fn pack(frame: &CpuFrame) -> Result<Vec<u8>, SwError> {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
-
     use openh264::decoder::{DecodeOptions, Decoder, DecoderConfig, Flush};
     use openh264::formats::YUVSource;
 
-    use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::traits::Encoder as _;
 
     use super::H264Encoder;
-
-    fn frame_64() -> CpuFrame {
-        let y = Bytes::from(vec![0x80; 64 * 64]);
-        let c = Bytes::from(vec![0x80; 32 * 32]);
-        let planes = [
-            Plane::new(y, 64).expect("plane"),
-            Plane::new(c.clone(), 32).expect("plane"),
-            Plane::new(c, 32).expect("plane"),
-        ];
-        let size = PictureSize::new(64, 64).expect("size");
-        CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
-    }
-
-    fn frame_with_y(y_len: usize) -> CpuFrame {
-        let y = Bytes::from(vec![0x80; y_len]);
-        let c = Bytes::from(vec![0x80; 32 * 32]);
-        let planes = [
-            Plane::new(y, 64).expect("plane"),
-            Plane::new(c.clone(), 32).expect("plane"),
-            Plane::new(c, 32).expect("plane"),
-        ];
-        let size = PictureSize::new(64, 64).expect("size");
-        CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame")
-    }
+    use crate::fixtures::{frame_16, frame_64, frame_with_y};
 
     #[test]
     fn encode_rejects_short_plane() {
@@ -157,16 +137,7 @@ mod tests {
     #[test]
     fn encode_rejects_size_mismatch() {
         let mut encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
-        let tiny = Bytes::from(vec![0x80; 16 * 16]);
-        let chroma = Bytes::from(vec![0x80; 8 * 8]);
-        let planes = [
-            Plane::new(tiny, 16).expect("plane"),
-            Plane::new(chroma.clone(), 8).expect("plane"),
-            Plane::new(chroma, 8).expect("plane"),
-        ];
-        let size = PictureSize::new(16, 16).expect("size");
-        let frame = CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame");
-        assert!(encoder.encode(&frame).is_err());
+        assert!(encoder.encode(&frame_16()).is_err());
     }
 
     #[test]

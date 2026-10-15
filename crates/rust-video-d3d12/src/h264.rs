@@ -2,7 +2,7 @@
 //!
 //! Frame-only progressive pictures for single-picture submissions.
 
-use crate::bits::BitReader;
+use crate::bits::{rbsp, BitReader};
 use crate::error::D3d12Error;
 
 /// Sequence set count, H.264 7.4.2.1.
@@ -60,21 +60,6 @@ pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
         nals.push(&data[start..]);
     }
     nals
-}
-
-/// NAL with emulation prevention bytes removed.
-pub(crate) fn rbsp(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &byte in nal {
-        if zeros == 2 && byte == 3 {
-            zeros = 0;
-            continue;
-        }
-        out.push(byte);
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-    }
-    out
 }
 
 /// Scaling lists in zig-zag scan order.
@@ -1446,8 +1431,8 @@ impl Ingest {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_pps, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, split_nals, Ingest,
-        Marking, PocType, SlicePoc, SliceType, Sps, DEFAULT_4X4_INTRA,
+        parse_pps, parse_slice_prefix, parse_slice_rest, parse_sps, split_nals, Ingest, Marking,
+        PocType, SlicePoc, SliceType, Sps, DEFAULT_4X4_INTRA,
     };
 
     /// Test bit writer with emulation prevention.
@@ -1643,14 +1628,6 @@ mod tests {
     fn split_nals_strips_start_codes() {
         let nals = split_nals(b"\0\0\0\x01\x67abc\0\0\x01\x68de");
         assert_eq!(nals, vec![b"\x67abc".as_slice(), b"\x68de".as_slice()]);
-    }
-
-    #[test]
-    fn rbsp_removes_prevention_bytes() {
-        assert_eq!(
-            rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 5]),
-            vec![0, 0, 1, 0, 0, 0, 5]
-        );
     }
 
     #[test]

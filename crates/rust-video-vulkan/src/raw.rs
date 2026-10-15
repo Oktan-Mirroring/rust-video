@@ -671,31 +671,6 @@ impl GpuMemory {
         Ok(())
     }
 
-    /// Copy `bytes` into the allocation at `offset`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the write overruns the allocation or mapping fails.
-    pub fn fill_offset(&self, offset: usize, bytes: &[u8]) -> Result<(), VulkanError> {
-        let end = offset as vk::DeviceSize + bytes.len() as vk::DeviceSize;
-        if end > self.size {
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-        }
-        // SAFETY: the memory is host-visible and owned; the copy stays in range.
-        unsafe {
-            let ptr =
-                self.device
-                    .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                ptr.cast::<u8>().add(offset),
-                bytes.len(),
-            );
-            self.device.unmap_memory(self.memory);
-        }
-        Ok(())
-    }
-
     /// Copy the allocation prefix into `out`.
     ///
     /// # Errors

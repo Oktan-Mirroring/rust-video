@@ -176,7 +176,8 @@ mod tests {
     }
 
     #[test]
-    fn output_event_carries_range_and_timing() {
+    fn output_event_survives_queue_round_trip() {
+        let queue = EventQueue::new();
         let event = CodecEvent::OutputAvailable {
             index: 1,
             offset: 0,
@@ -184,15 +185,16 @@ mod tests {
             pts_us: 33_366,
             flags: 0,
         };
+        queue.sender().send(event).expect("open receiver");
         assert_eq!(
-            event,
-            CodecEvent::OutputAvailable {
+            queue.drain_blocking(Duration::from_secs(5)),
+            vec![CodecEvent::OutputAvailable {
                 index: 1,
                 offset: 0,
                 size: 64,
                 pts_us: 33_366,
                 flags: 0,
-            }
+            }]
         );
     }
 }

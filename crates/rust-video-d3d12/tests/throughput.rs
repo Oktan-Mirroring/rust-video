@@ -24,19 +24,26 @@ const HOPS: u32 = 30;
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
+/// Packets over `raws`, built once outside the timed loop.
+fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
+    raws.iter()
+        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+        .collect()
+}
+
 /// Measured fps of `HOPS` 1080p hops through `transcoder`.
 fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64 {
-    for raw in warmup {
-        let packet = Packet::new(Bytes::from(raw.clone()));
-        let outcome = transcoder.transcode(&packet).expect("warmup transcode");
+    let warmup = packets(warmup);
+    let raws = packets(raws);
+    for packet in &warmup {
+        let outcome = transcoder.transcode(packet).expect("warmup transcode");
         assert!(matches!(outcome.plan().route(), Route::Gpu));
     }
     let mut bytes = 0;
     let start = std::time::Instant::now();
     for _ in 0..HOPS {
-        for raw in raws {
-            let packet = Packet::new(Bytes::from(raw.clone()));
-            let outcome = transcoder.transcode(&packet).expect("timed transcode");
+        for packet in &raws {
+            let outcome = transcoder.transcode(packet).expect("timed transcode");
             assert!(matches!(outcome.plan().route(), Route::Gpu));
             bytes += outcome
                 .packets()

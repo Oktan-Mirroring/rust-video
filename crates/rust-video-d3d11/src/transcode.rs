@@ -56,7 +56,7 @@ impl<'a> Transcoder<'a> {
             device.supports(decode),
             encoder.gpu_ready(),
         );
-        let plan = Plan::for_hops(caps.platform(), caps.decode_export(), caps.encode_import());
+        let plan = Plan::for_caps(&caps);
         let decoder = Box::new(H264Decoder::open(device));
         Ok(Self {
             decoder,

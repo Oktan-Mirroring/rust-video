@@ -35,8 +35,8 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
     ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
     D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
-    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
 };
@@ -343,6 +343,71 @@ struct RefTables {
     textures: [Option<ID3D12Resource>; POOL],
     /// Subresource per pool texture.
     subs: [u32; POOL],
+}
+
+/// Picture arguments behind one `DecodeFrame` call.
+#[cfg(target_os = "windows")]
+trait Submission {
+    /// Picture parameters type.
+    type Params;
+    /// Inverse quantization matrix type.
+    type Matrix;
+    /// Slice control entry type.
+    type Slice;
+    /// Picture parameters.
+    fn params(&self) -> &Self::Params;
+    /// Inverse quantization matrices.
+    fn matrix(&self) -> &Self::Matrix;
+    /// Slice control entries.
+    fn slices(&self) -> &[Self::Slice];
+    /// Bitstream length in bytes.
+    fn bitstream_len(&self) -> usize;
+}
+
+#[cfg(target_os = "windows")]
+impl Submission for H264Submission {
+    type Params = PicParamsH264;
+    type Matrix = QmatrixH264;
+    type Slice = SliceShortH264;
+
+    fn params(&self) -> &Self::Params {
+        &self.params
+    }
+
+    fn matrix(&self) -> &Self::Matrix {
+        &self.qmatrix
+    }
+
+    fn slices(&self) -> &[Self::Slice] {
+        &self.slices
+    }
+
+    fn bitstream_len(&self) -> usize {
+        self.bitstream.len()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Submission for HevcSubmission {
+    type Params = PicParamsHevc;
+    type Matrix = QmatrixHevc;
+    type Slice = SliceShortHevc;
+
+    fn params(&self) -> &Self::Params {
+        &self.params
+    }
+
+    fn matrix(&self) -> &Self::Matrix {
+        &self.qmatrix
+    }
+
+    fn slices(&self) -> &[Self::Slice] {
+        &self.slices
+    }
+
+    fn bitstream_len(&self) -> usize {
+        self.bitstream.len()
+    }
 }
 
 /// Visible extent plus per-plane source boxes under a crop.
@@ -671,7 +736,7 @@ impl DecodeSession {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let mut refs = self.ref_tables();
-        let input = self.input_args(submission, &mut refs)?;
+        let input = self.input_args(submission, Some(&mut refs))?;
         self.submit_video(&input, submission.slot)
     }
 
@@ -697,7 +762,7 @@ impl DecodeSession {
     fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
-        let input = self.input_args_hevc(submission)?;
+        let input = self.input_args(submission, None)?;
         self.submit_video(&input, 0)
     }
 
@@ -733,9 +798,10 @@ impl DecodeSession {
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
-        let staged = DeviceResources::read_readback(&self.staging, total)?;
-        self.layout
-            .tighten(&staged, self.width, self.height, self.crop)
+        DeviceResources::with_readback(&self.staging, total, |mapped| {
+            self.layout
+                .tighten(mapped, self.width, self.height, self.crop)
+        })
     }
 
     /// `DecodeFrame` for `input` through the video queue into pool `slot`.
@@ -765,32 +831,23 @@ impl DecodeSession {
             OutputSubresource: 0,
             ConversionArguments: D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS::default(),
         };
-        let enter: Vec<_> = self
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(index, texture)| {
-                let after = if u8::try_from(index).is_ok_and(|at| at == slot) {
-                    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
-                } else {
-                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
-                };
-                DeviceResources::barrier(texture, D3D12_RESOURCE_STATE_COMMON, after)
-            })
-            .collect();
-        let leave: Vec<_> = self
-            .outputs
-            .iter()
-            .enumerate()
-            .map(|(index, texture)| {
-                let before = if u8::try_from(index).is_ok_and(|at| at == slot) {
-                    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
-                } else {
-                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
-                };
-                DeviceResources::barrier(texture, before, D3D12_RESOURCE_STATE_COMMON)
-            })
-            .collect();
+        debug_assert_eq!(self.outputs.len(), POOL);
+        let enter: [D3D12_RESOURCE_BARRIER; POOL] = core::array::from_fn(|index| {
+            let after = if u8::try_from(index).is_ok_and(|at| at == slot) {
+                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
+            } else {
+                D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
+            };
+            DeviceResources::barrier(&self.outputs[index], D3D12_RESOURCE_STATE_COMMON, after)
+        });
+        let leave: [D3D12_RESOURCE_BARRIER; POOL] = core::array::from_fn(|index| {
+            let before = if u8::try_from(index).is_ok_and(|at| at == slot) {
+                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
+            } else {
+                D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
+            };
+            DeviceResources::barrier(&self.outputs[index], before, D3D12_RESOURCE_STATE_COMMON)
+        });
         // Sound: the barriers name live textures; the list is open.
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
@@ -817,102 +874,56 @@ impl DecodeSession {
         Ok(())
     }
 
-    /// Decode input arguments borrowing `submission` and `refs`.
+    /// Decode input arguments borrowing `submission`, plus `refs` when present.
     #[cfg(target_os = "windows")]
-    fn input_args(
+    fn input_args<S: Submission>(
         &self,
-        submission: &H264Submission,
-        refs: &mut RefTables,
+        submission: &S,
+        refs: Option<&mut RefTables>,
     ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
-        let params_len = u32::try_from(std::mem::size_of::<PicParamsH264>())
+        let params_len = u32::try_from(std::mem::size_of::<S::Params>())
             .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
-        let matrix_len = u32::try_from(std::mem::size_of::<QmatrixH264>())
+        let matrix_len = u32::try_from(std::mem::size_of::<S::Matrix>())
             .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
         let slices_len = u32::try_from(
-            std::mem::size_of::<SliceShortH264>().saturating_mul(submission.slices.len()),
+            std::mem::size_of::<S::Slice>().saturating_mul(submission.slices().len()),
         )
         .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
-        let bitstream_len = u64::try_from(submission.bitstream.len())
+        let bitstream_len = u64::try_from(submission.bitstream_len())
             .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
         let mut args = [D3D12_VIDEO_DECODE_FRAME_ARGUMENT::default(); 10];
         args[0] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
             Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS,
             Size: params_len,
-            pData: std::ptr::from_ref(&submission.params)
+            pData: std::ptr::from_ref(submission.params())
                 .cast_mut()
                 .cast::<c_void>(),
         };
         args[1] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
             Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX,
             Size: matrix_len,
-            pData: std::ptr::from_ref(&submission.qmatrix)
+            pData: std::ptr::from_ref(submission.matrix())
                 .cast_mut()
                 .cast::<c_void>(),
         };
         args[2] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
             Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL,
             Size: slices_len,
-            pData: submission.slices.as_ptr().cast_mut().cast::<c_void>(),
+            pData: submission.slices().as_ptr().cast_mut().cast::<c_void>(),
         };
-        let count = u32::try_from(POOL).unwrap_or(u32::MAX);
-        Ok(D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS {
-            NumFrameArguments: 3,
-            FrameArguments: args,
-            ReferenceFrames: D3D12_VIDEO_DECODE_REFERENCE_FRAMES {
-                NumTexture2Ds: count,
+        let references = match refs {
+            Some(refs) => D3D12_VIDEO_DECODE_REFERENCE_FRAMES {
+                NumTexture2Ds: u32::try_from(POOL).unwrap_or(u32::MAX),
                 ppTexture2Ds: refs.textures.as_mut_ptr(),
                 pSubresources: refs.subs.as_mut_ptr(),
                 ppHeaps: std::ptr::null_mut(),
             },
-            CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
-                pBuffer: ManuallyDrop::new(Some(self.bitstream.clone())),
-                Offset: 0,
-                Size: bitstream_len,
-            },
-            pHeap: ManuallyDrop::new(Some(self.heap.clone())),
-        })
-    }
-
-    /// Decode input arguments borrowing `submission`.
-    #[cfg(target_os = "windows")]
-    fn input_args_hevc(
-        &self,
-        submission: &HevcSubmission,
-    ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
-        let params_len = u32::try_from(std::mem::size_of::<PicParamsHevc>())
-            .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
-        let matrix_len = u32::try_from(std::mem::size_of::<QmatrixHevc>())
-            .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
-        let slices_len = u32::try_from(
-            std::mem::size_of::<SliceShortHevc>().saturating_mul(submission.slices.len()),
-        )
-        .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
-        let bitstream_len = u64::try_from(submission.bitstream.len())
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
-        let mut args = [D3D12_VIDEO_DECODE_FRAME_ARGUMENT::default(); 10];
-        args[0] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
-            Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS,
-            Size: params_len,
-            pData: std::ptr::from_ref(&submission.params)
-                .cast_mut()
-                .cast::<c_void>(),
-        };
-        args[1] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
-            Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX,
-            Size: matrix_len,
-            pData: std::ptr::from_ref(&submission.qmatrix)
-                .cast_mut()
-                .cast::<c_void>(),
-        };
-        args[2] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
-            Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL,
-            Size: slices_len,
-            pData: submission.slices.as_ptr().cast_mut().cast::<c_void>(),
+            None => D3D12_VIDEO_DECODE_REFERENCE_FRAMES::default(),
         };
         Ok(D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS {
             NumFrameArguments: 3,
             FrameArguments: args,
-            ReferenceFrames: D3D12_VIDEO_DECODE_REFERENCE_FRAMES::default(),
+            ReferenceFrames: references,
             CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
                 pBuffer: ManuallyDrop::new(Some(self.bitstream.clone())),
                 Offset: 0,
@@ -1318,8 +1329,8 @@ mod tests {
         ]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
         let mut dpb = crate::dpb::Dpb::new(&sps);
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         assert!(decoded.outputs.is_empty());
@@ -1345,8 +1356,8 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::bits::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::bits::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert_eq!(pps.pic_init_qp, -3);
         let picture = &pictures[0];
@@ -1390,8 +1401,8 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::bits::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::bits::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert!(pps.transform_8x8());
         assert!(!pps.entropy());
@@ -1433,8 +1444,8 @@ mod tests {
         let mut live = Ingest::new();
         let idr = live.ingest_packet(&idr).expect("idr");
         assert_eq!(idr.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
         let mut dpb = crate::dpb::Dpb::new(&sps);
         dpb.decode(&idr[0], &sps, &pps).expect("idr");
         let pictures = live.ingest_packet(&next).expect("p");
@@ -1464,9 +1475,9 @@ mod tests {
         let mut ingest = HevcIngest::new();
         let pictures = ingest.ingest_packet(&data).expect("ingest");
         assert_eq!(pictures.len(), 1);
-        let sps = parse_hevc_sps(&crate::hevc::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
+        let sps = parse_hevc_sps(&crate::bits::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
         let pps =
-            parse_hevc_pps(&crate::hevc::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
+            parse_hevc_pps(&crate::bits::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
         let submission = HevcSubmission::build(&sps, &pps, &pictures[0], 7).expect("submission");
         assert_eq!(submission.params.pic_width_in_min_cbs_y, 8);
         assert_eq!(submission.params.pic_height_in_min_cbs_y, 6);
@@ -1495,9 +1506,9 @@ mod tests {
             Picture as HevcPicture, SliceHeader, SliceType,
         };
 
-        let sps = parse_hevc_sps(&crate::hevc::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
+        let sps = parse_hevc_sps(&crate::bits::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
         let pps =
-            parse_hevc_pps(&crate::hevc::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
+            parse_hevc_pps(&crate::bits::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
         let inter = HevcPicture {
             slices: vec![PendingSlice {
                 header: SliceHeader {

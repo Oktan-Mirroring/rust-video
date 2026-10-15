@@ -106,9 +106,24 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// NAL with emulation prevention bytes removed.
+pub(crate) fn rbsp(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &byte in nal {
+        if zeros == 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        out.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BitReader;
+    use super::{rbsp, BitReader};
 
     #[test]
     fn reads_bits_across_bytes() {
@@ -134,6 +149,14 @@ mod tests {
         assert!(payload.more_data());
         let empty = BitReader::new(&[]);
         assert!(!empty.more_data());
+    }
+
+    #[test]
+    fn rbsp_removes_prevention_bytes() {
+        assert_eq!(
+            rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 5]),
+            vec![0, 0, 1, 0, 0, 0, 5]
+        );
     }
 
     #[test]

@@ -36,9 +36,10 @@ One builder per codec, all pure and host-tested:
 | `FormatSpec::h265` | `video/hevc` | 21 |
 | `FormatSpec::av1` | `video/av01` | 29 |
 | `FormatSpec::vp9` | `video/x-vnd.on2.vp9` | 21 |
+| `FormatSpec::vp8` | `video/x-vnd.on2.vp8` | 21 |
 
 Keys (`mime`, `width`, `height`, `frame-rate`, `csd-0`, `csd-1`,
-`color-format`, `stride`, `slice-height`), the four mimes above, the
+`color-format`, `stride`, `slice-height`), the five mimes above, the
 color values 19 (planar) / 21 (semi-planar), and the buffer flags 2
 (codec-config) / 4 (end-of-stream) / 32 (decode-only) were read from
 the installed platform, not copied from memory [T1]:
@@ -89,8 +90,8 @@ as host unit tests (37 tests). Device-only code is covered by
   so trailing frames that need one stay inside the codec.
 - No timestamps out: `CpuFrame` has no timing field, so output PTS
   is dropped after queueing.
-- Byte-buffer copies: one copy per plane from codec buffers. A
-  zero-copy surface path is future work, not this tier.
+- Byte-buffer copies: one copy per frame from codec buffers.
+  A zero-copy surface path is future work, not this tier.
 
 ## References
 

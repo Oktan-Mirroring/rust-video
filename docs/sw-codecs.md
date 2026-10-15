@@ -174,8 +174,8 @@ bound major; there is no silent fallback to a drifted ABI:
 
 | Linked lib | Guard | Bound | Binds it protects |
 |---|---|---|---|
-| libavcodec | `avcodec_version() >> 16` | 61 | all five decoders, VP9 encode |
-| libavutil | `avutil_version() >> 16` | 59 | frame layout, VP9 encode |
+| libavcodec | `avcodec_version() >> 16` | 61 | all five decoders, all three ffmpeg encodes |
+| libavutil | `avutil_version() >> 16` | 59 | frame layout, all three ffmpeg encodes |
 | libvpx | none direct; `libvpx-vp9` by-name lookup + avcodec guard | n/a | VP9 encode via wrapper |
 | libdav1d | none direct; by-name lookup + avcodec guard | n/a | AV1 decode via wrapper |
 | openh264 | none needed; vendored static, pinned in `Cargo.lock` | 0.9.8 | H.264 encode |

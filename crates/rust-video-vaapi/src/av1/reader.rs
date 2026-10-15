@@ -76,7 +76,7 @@ impl<'a> Reader<'a> {
     /// n (i.e. output in range 0..n-1). See 4.10.7
     pub fn read_ns(&mut self, num_bits: usize) -> Result<u32, String> {
         let num_bits = u32::try_from(num_bits).map_err(|_| "ns range")?;
-        let w = helpers::floor_log2(num_bits) + 1;
+        let w = helpers::floor_log2(num_bits)? + 1;
         let m = (1 << w) - num_bits;
         let v = self.0.read_bits::<u32>(
             usize::try_from(w).map_err(|_| String::from("Invalid num_bits"))? - 1,

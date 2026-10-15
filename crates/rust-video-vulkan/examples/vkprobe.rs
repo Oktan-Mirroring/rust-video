@@ -5,9 +5,18 @@ use rust_video_caps::traits::Decoder;
 use rust_video_vulkan::{CodecOp, H264Decoder, VulkanDevice};
 
 fn main() {
-    let vector =
-        std::env::var("VKPROBE_VECTOR").unwrap_or_else(|_| "/tmp/h264-high.h264".to_owned());
-    let out_path = std::env::var("VKPROBE_OUT").unwrap_or_else(|_| "/tmp/vk_all.yuv".to_owned());
+    let vector = std::env::var("VKPROBE_VECTOR").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("h264-high.h264")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let out_path = std::env::var("VKPROBE_OUT").unwrap_or_else(|_| {
+        std::env::temp_dir()
+            .join("vk_all.yuv")
+            .to_string_lossy()
+            .into_owned()
+    });
     let Ok(bytes) = std::fs::read(&vector) else {
         println!("vkprobe: no vector at {vector}; skipped");
         return;
@@ -32,16 +41,19 @@ fn main() {
     };
     let mut decoder = H264Decoder::open(&device).expect("decoder");
     let mut out = Vec::new();
+    let mut scratch = Vec::new();
     let mut count = 0;
     for frame in decoder
         .decode(&Packet::new(Bytes::from(bytes)))
         .expect("decode")
     {
-        out.extend_from_slice(&frame.yuv420p());
+        frame.yuv420p_into(&mut scratch);
+        out.extend_from_slice(&scratch);
         count += 1;
     }
     for frame in decoder.flush().expect("flush") {
-        out.extend_from_slice(&frame.yuv420p());
+        frame.yuv420p_into(&mut scratch);
+        out.extend_from_slice(&scratch);
         count += 1;
     }
     std::fs::write(&out_path, &out).expect("write");
@@ -65,7 +77,8 @@ fn truncate_nals(bytes: &[u8], k: usize) -> Vec<u8> {
         }
     }
     starts.push(bytes.len());
-    let end = starts.get(k).copied().unwrap_or(bytes.len());
+    let units = starts.len() - 1;
+    let k = k.min(units);
     let mut out = Vec::new();
     let mut j = 0;
     let mut taken = 0;
@@ -83,6 +96,5 @@ fn truncate_nals(bytes: &[u8], k: usize) -> Vec<u8> {
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(body);
     }
-    let _ = end;
     out
 }

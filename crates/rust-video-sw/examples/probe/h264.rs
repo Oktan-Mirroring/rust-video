@@ -39,14 +39,7 @@ pub fn run_decode(stream: &Path, max: usize, dump: Option<&Path>) {
         frames += 1;
     }
     let secs = start.elapsed().as_secs_f64();
-    println!(
-        "h264dec: {frames} frames in {secs:.2}s = {:.1} fps",
-        crate::common::fps(frames, secs)
-    );
-    if let Some(path) = dump {
-        fs::write(path, &packed_all).expect("dump written");
-        println!("h264dec: {} bytes dumped", packed_all.len());
-    }
+    crate::common::report("h264dec", frames, secs, &packed_all, dump);
 }
 
 /// Packed frame bytes appended to `out`.

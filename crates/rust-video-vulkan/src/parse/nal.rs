@@ -49,13 +49,7 @@ impl NaluSplitter {
         self.buffer.extend_from_slice(chunk);
         self.trim_junk();
         let mut out = Vec::new();
-        while let Some(cut) = find_start(&self.buffer, self.floor) {
-            let unit: Vec<u8> = self.buffer.drain(..cut).collect();
-            if unit_contains_payload(&unit) {
-                out.push(Nalu { bytes: unit });
-            }
-            self.floor = 0;
-        }
+        self.drain_complete(&mut out);
         self.floor = self.buffer.len().saturating_sub(4);
         out
     }
@@ -64,13 +58,7 @@ impl NaluSplitter {
     pub fn flush(&mut self) -> Vec<Nalu> {
         self.trim_junk();
         let mut out = Vec::new();
-        while let Some(cut) = find_start(&self.buffer, self.floor) {
-            let unit: Vec<u8> = self.buffer.drain(..cut).collect();
-            if unit_contains_payload(&unit) {
-                out.push(Nalu { bytes: unit });
-            }
-            self.floor = 0;
-        }
+        self.drain_complete(&mut out);
         if unit_contains_payload(&self.buffer) {
             out.push(Nalu {
                 bytes: std::mem::take(&mut self.buffer),
@@ -90,6 +78,17 @@ impl Default for NaluSplitter {
 }
 
 impl NaluSplitter {
+    /// Complete units out of the buffer into `out`.
+    fn drain_complete(&mut self, out: &mut Vec<Nalu>) {
+        while let Some(cut) = find_start(&self.buffer, self.floor) {
+            let unit: Vec<u8> = self.buffer.drain(..cut).collect();
+            if unit_contains_payload(&unit) {
+                out.push(Nalu { bytes: unit });
+            }
+            self.floor = 0;
+        }
+    }
+
     /// Drop bytes before the first start code.
     fn trim_junk(&mut self) {
         if starts_with_code(&self.buffer) {

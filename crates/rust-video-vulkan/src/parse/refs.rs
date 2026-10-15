@@ -464,7 +464,7 @@ impl H264Context {
         let id = is_reference.then(|| self.track_reference(&sps, header, poc, offset, is_idr));
         self.waiting_idr = false;
         self.first = false;
-        let (bytes, slice_offsets) = join_slices(slices);
+        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 0, 1], h264::Slice::payload);
         Some(Picture {
             l0,
             l1,
@@ -937,14 +937,14 @@ fn poc_type2(offset: i32, frame_num: u16, is_reference: bool) -> Option<i32> {
     }
 }
 
-/// Concatenated slice bytes with per-slice offsets.
-fn join_slices(slices: &[h264::Slice]) -> (Vec<u8>, Vec<u32>) {
+/// Concatenated slice bytes with per-slice offsets behind `code`.
+fn join_coded<S>(slices: &[S], code: &[u8], payload: impl Fn(&S) -> &[u8]) -> (Vec<u8>, Vec<u32>) {
     let mut bytes = Vec::new();
     let mut offsets = Vec::with_capacity(slices.len());
     for slice in slices {
         offsets.push(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
-        bytes.extend_from_slice(&[0, 0, 0, 1]);
-        bytes.extend_from_slice(slice.payload());
+        bytes.extend_from_slice(code);
+        bytes.extend_from_slice(payload(slice));
     }
     (bytes, offsets)
 }
@@ -1201,7 +1201,7 @@ impl H265Context {
             is_idr: is_idr(unit),
             vps_id: first.vps().id(),
         };
-        let (bytes, slice_offsets) = join_h265_slices(slices);
+        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 1], h265::Slice::payload);
         let picture = Picture {
             l0,
             l1: None,
@@ -1415,18 +1415,6 @@ fn poc_from_lsb(sps: &h265::Sps, anchor: i32, lsb: u32, bla: bool) -> Option<i32
         msb = 0;
     }
     i32::try_from(msb + lsb).ok()
-}
-
-/// Concatenated slice bytes with per-slice offsets.
-fn join_h265_slices(slices: &[h265::Slice]) -> (Vec<u8>, Vec<u32>) {
-    let mut bytes = Vec::new();
-    let mut offsets = Vec::with_capacity(slices.len());
-    for slice in slices {
-        offsets.push(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
-        bytes.extend_from_slice(&[0, 0, 1]);
-        bytes.extend_from_slice(slice.payload());
-    }
-    (bytes, offsets)
 }
 
 #[cfg(test)]

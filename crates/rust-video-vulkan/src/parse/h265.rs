@@ -631,7 +631,11 @@ impl RefPicSet {
         let reference = sets.get(ref_idx).ok_or(ParseError::OutOfRange {
             syntax: "rps delta idx",
         })?;
-        let ref_pics = u8::try_from(reference.s0.len() + reference.s1.len()).unwrap_or(u8::MAX);
+        let ref_pics = u8::try_from(reference.s0.len() + reference.s1.len()).map_err(|_| {
+            ParseError::OutOfRange {
+                syntax: "rps ref pics",
+            }
+        })?;
         let delta_rps_sign = reader.bit("rps delta sign")?;
         let abs = reader.ue("rps abs delta")?;
         let abs_delta_rps_minus1 = u16::try_from(abs).map_err(|_| ParseError::OutOfRange {

@@ -1,7 +1,7 @@
 //! Software CPU codec backends behind the facade.
 //!
-//! Decode rides one ffmpeg sys layer; VP9 encode rides its libvpx wrapper.
-//! H.265 encode hides behind the `gpl` gate.
+//! Decode rides one ffmpeg sys layer; VP9 and AV1 encode ride their ffmpeg
+//! wrappers. H.265 encode hides behind the `gpl` gate.
 
 #[cfg(feature = "ffmpeg")]
 pub mod av1;
@@ -9,7 +9,11 @@ pub mod error;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
 #[cfg(feature = "ffmpeg")]
+mod ffmpeg_enc;
+#[cfg(feature = "ffmpeg")]
 mod ffmpeg_sys;
+#[cfg(all(test, any(feature = "ffmpeg", feature = "h264-openh264")))]
+mod fixtures;
 #[cfg(feature = "h264-openh264")]
 pub mod h264;
 #[cfg(feature = "gpl")]

@@ -214,14 +214,6 @@ impl Session {
             });
         }
         self.bitstream.memory().fill(bytes)?;
-        if std::env::var("VKPROBE_ZEROPAD").is_ok() {
-            let pad = vec![0u8; 65536];
-            let _ = self.bitstream.memory().fill_offset(bytes.len(), &pad);
-        }
-        if std::env::var("VKPROBE_FFPAD").is_ok() {
-            let pad = vec![0xFFu8; 65536];
-            let _ = self.bitstream.memory().fill_offset(bytes.len(), &pad);
-        }
         Ok(())
     }
 
@@ -529,13 +521,31 @@ pub(crate) struct Submission<'a> {
 ///
 /// Panics when `bytes` is shorter than the coded frame.
 pub(crate) fn crop_nv12(coded: vk::Extent2D, display: vk::Extent2D, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    crop_nv12_into(coded, display, bytes, &mut out);
+    out
+}
+
+/// Crop tight coded NV12 `bytes` down to `display`, into `out`.
+///
+/// # Panics
+///
+/// Panics when `bytes` is shorter than the coded frame.
+pub(crate) fn crop_nv12_into(
+    coded: vk::Extent2D,
+    display: vk::Extent2D,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) {
+    out.clear();
     if coded == display {
-        return bytes.to_vec();
+        out.extend_from_slice(bytes);
+        return;
     }
     let coded_w = coded.width as usize;
     let display_w = display.width as usize;
     let display_h = display.height as usize;
-    let mut out = Vec::with_capacity(display_w * display_h * 3 / 2);
+    out.reserve(display_w * display_h * 3 / 2);
     for row in 0..display_h {
         let start = row * coded_w;
         out.extend_from_slice(&bytes[start..start + display_w]);
@@ -545,7 +555,6 @@ pub(crate) fn crop_nv12(coded: vk::Extent2D, display: vk::Extent2D, bytes: &[u8]
         let start = chroma_base + row * coded_w;
         out.extend_from_slice(&bytes[start..start + display_w]);
     }
-    out
 }
 
 #[cfg(test)]
@@ -645,6 +654,11 @@ mod tests {
         let bytes: Vec<u8> = (0..24).collect();
         let cropped = super::crop_nv12(coded, display, &bytes);
         assert_eq!(cropped, vec![0, 1, 4, 5, 16, 17]);
+        let mut reused = Vec::with_capacity(1);
+        super::crop_nv12_into(coded, display, &bytes, &mut reused);
+        assert_eq!(reused, cropped);
+        super::crop_nv12_into(display, display, &cropped, &mut reused);
+        assert_eq!(reused, cropped);
     }
 
     #[test]

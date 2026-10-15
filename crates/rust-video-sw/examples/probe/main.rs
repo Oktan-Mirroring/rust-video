@@ -10,6 +10,9 @@ mod h264;
 mod ffmpeg;
 
 #[cfg(feature = "ffmpeg")]
+mod ivf;
+
+#[cfg(feature = "ffmpeg")]
 mod vpx;
 
 #[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]

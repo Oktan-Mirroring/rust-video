@@ -1,38 +1,18 @@
-//! Shared probe helpers: IVF/Annex B splitters, hashing, goldens.
+//! Shared probe helpers: Annex B splitter, timing reports, packing.
 
-#[cfg(feature = "ffmpeg")]
 use std::fs;
-#[cfg(feature = "ffmpeg")]
 use std::path::Path;
 
-/// IVF frames plus header geometry.
-#[cfg(feature = "ffmpeg")]
-pub struct Ivf {
-    /// Coded frame payloads in file order.
-    pub frames: Vec<Vec<u8>>,
-}
-
-/// IVF payloads and geometry from `path`.
-///
-/// # Panics
-///
-/// Panics when `path` is unreadable or fails the IVF shape.
-#[cfg(feature = "ffmpeg")]
-#[must_use]
-pub fn read_ivf(path: &Path) -> Ivf {
-    let bytes = fs::read(path).expect("ivf readable");
-    assert!(bytes.len() >= 32, "ivf header");
-    assert_eq!(&bytes[0..4], b"DKIF", "ivf magic");
-    let mut frames = Vec::new();
-    let mut at = 32usize;
-    while at + 12 <= bytes.len() {
-        let size = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("ivf size")) as usize;
-        at += 12;
-        assert!(at + size <= bytes.len(), "ivf frame bounds");
-        frames.push(bytes[at..at + size].to_vec());
-        at += size;
+/// Timed-loop report plus optional raw `dump` write.
+pub fn report(tag: &str, frames: usize, secs: f64, packed: &[u8], dump: Option<&Path>) {
+    println!(
+        "{tag}: {frames} frames in {secs:.2}s = {:.1} fps",
+        fps(frames, secs)
+    );
+    if let Some(path) = dump {
+        fs::write(path, packed).expect("dump written");
+        println!("{tag}: {} bytes dumped", packed.len());
     }
-    Ivf { frames }
 }
 
 /// NAL units from Annex B `bytes`, start codes kept.

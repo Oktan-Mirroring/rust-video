@@ -120,14 +120,19 @@ impl FfmpegDecoder {
         if err != 0 || typed != 0 {
             // SAFETY: context came from a successful alloc and is freed once.
             unsafe { sys::avcodec_free_context(&raw mut ctx) };
-            return Err(SwError::Init);
+            let code = if err != 0 { err } else { typed };
+            return Err(SwError::Native {
+                code: i64::from(code),
+            });
         }
         // SAFETY: context and codec are live; null options select defaults.
         let err = unsafe { sys::avcodec_open2(ctx, codec_ptr, ptr::null_mut()) };
         if err != 0 {
             // SAFETY: context came from a successful alloc and is freed once.
             unsafe { sys::avcodec_free_context(&raw mut ctx) };
-            return Err(SwError::Init);
+            return Err(SwError::Native {
+                code: i64::from(err),
+            });
         }
         // Framed codecs take whole frames per packet; byte streams need the splitter.
         // SAFETY: id names a registered parser; null is checked.
@@ -198,7 +203,9 @@ impl FfmpegDecoder {
         // SAFETY: packet is live and blank; size is the input length.
         let err = unsafe { sys::av_new_packet(self.packet, size) };
         if err != 0 {
-            return Err(SwError::Rejected);
+            return Err(SwError::Native {
+                code: i64::from(err),
+            });
         }
         // SAFETY: payload spans the fresh packet buffer, written now.
         let dst = unsafe { std::slice::from_raw_parts_mut((*self.packet).data, bytes.len()) };
@@ -210,7 +217,9 @@ impl FfmpegDecoder {
                 return Ok(());
             }
             if err != sys::AGAIN {
-                return Err(SwError::Rejected);
+                return Err(SwError::Native {
+                    code: i64::from(err),
+                });
             }
             let drained = out.len();
             self.receive(out)?;
@@ -233,7 +242,9 @@ impl FfmpegDecoder {
                 return Ok(());
             }
             if err != 0 {
-                return Err(SwError::Rejected);
+                return Err(SwError::Native {
+                    code: i64::from(err),
+                });
             }
             // SAFETY: success initialized the frame; unref below balances it.
             let frame = convert(unsafe { &*self.frame });
@@ -269,7 +280,9 @@ impl FfmpegDecoder {
                 )
             };
             if consumed < 0 {
-                return Err(SwError::Rejected);
+                return Err(SwError::Native {
+                    code: i64::from(consumed),
+                });
             }
             if pout_size > 0 {
                 let len = usize::try_from(pout_size).map_err(|_| SwError::Rejected)?;
@@ -329,7 +342,9 @@ impl Decoder for FfmpegDecoder {
                     )
                 };
                 if err < 0 {
-                    return Err(SwError::Rejected);
+                    return Err(SwError::Native {
+                        code: i64::from(err),
+                    });
                 }
                 if pout_size == 0 {
                     break;
@@ -347,10 +362,14 @@ impl Decoder for FfmpegDecoder {
             // SAFETY: queue drained above, so the signal fits now.
             let err = unsafe { sys::avcodec_send_packet(self.ctx, ptr::null()) };
             if err != 0 {
-                return Err(SwError::Rejected);
+                return Err(SwError::Native {
+                    code: i64::from(err),
+                });
             }
         } else if err != 0 {
-            return Err(SwError::Rejected);
+            return Err(SwError::Native {
+                code: i64::from(err),
+            });
         }
         self.receive(&mut out)?;
         // SAFETY: context is live; reset readies it for the next stream.
@@ -630,21 +649,13 @@ mod tests {
     #[cfg(feature = "h264-openh264")]
     #[test]
     fn own_encoder_output_decodes_back() {
-        use rust_video_caps::common::PictureSize;
-        use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+        use rust_video_caps::frame::PixelFormat;
         use rust_video_caps::traits::Encoder as _;
 
+        use crate::fixtures::frame_64;
         use crate::h264::H264Encoder;
 
-        let y = Bytes::from(vec![0x80; 64 * 64]);
-        let c = Bytes::from(vec![0x80; 32 * 32]);
-        let planes = [
-            Plane::new(y, 64).expect("plane"),
-            Plane::new(c.clone(), 32).expect("plane"),
-            Plane::new(c, 32).expect("plane"),
-        ];
-        let size = PictureSize::new(64, 64).expect("size");
-        let frame = CpuFrame::new(size, PixelFormat::Yuv420P, planes.into()).expect("frame");
+        let frame = frame_64();
         let mut encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
         let first = encoder.encode(&frame).expect("encode");
         let second = encoder.encode(&frame).expect("encode");

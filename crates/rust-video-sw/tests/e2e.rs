@@ -3,8 +3,10 @@
 #[path = "../../rust-video-vaapi/tests/support/mp4.rs"]
 mod mp4;
 
+#[path = "../examples/probe/ivf.rs"]
+mod ivf;
+
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -14,34 +16,6 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{Case, FrameHash, Golden, Suite};
 use rust_video_sw::{Av1Decoder, H264Decoder, Vp8Decoder, Vp9Decoder};
-
-fn ivf_frames(path: &Path) -> Vec<Vec<u8>> {
-    let bytes = fs::read(path).unwrap_or_else(|_| panic!("unreadable ivf: {}", path.display()));
-    assert!(bytes.len() >= 32, "short header: {}", path.display());
-    assert!(&bytes[0..4] == b"DKIF", "bad magic: {}", path.display());
-    let mut frames = Vec::new();
-    let mut pos = 32;
-    while pos < bytes.len() {
-        assert!(
-            pos + 12 <= bytes.len(),
-            "short frame header: {}",
-            path.display()
-        );
-        let size = usize::try_from(u32::from_le_bytes(
-            bytes[pos..pos + 4].try_into().expect("frame size"),
-        ))
-        .expect("frame size fits");
-        pos += 12;
-        assert!(
-            pos + size <= bytes.len(),
-            "short frame payload: {}",
-            path.display()
-        );
-        frames.push(bytes[pos..pos + size].to_vec());
-        pos += size;
-    }
-    frames
-}
 
 fn hash_frame(frame: &CpuFrame) -> FrameHash {
     let mut bytes = Vec::new();
@@ -70,7 +44,7 @@ fn ivf_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     let ivf = Path::new(case.name())
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ivf"));
-    ivf.then(|| ivf_frames(case.path()))
+    ivf.then(|| ivf::read_ivf(case.path()).frames)
 }
 
 /// Payloads of one MP4 case, `None` for containers outside the MP4 path.

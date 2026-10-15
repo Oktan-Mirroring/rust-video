@@ -19,5 +19,5 @@ scan. A fetched source graduates from manual only after its exact file URLs
 return 200 and its hashes verify.
 
 Fetch normalization: `vp80-03-segmentation-01..04.ivf` ship FourCC `I420`
-over VP8 payloads; `scripts/fetch-vectors.sh` rewrites bytes 8-11 to `VP80`
+over VP8 payloads; `scripts/fetch-vectors.py` rewrites bytes 8-11 to `VP80`
 after SHA-1 verification.

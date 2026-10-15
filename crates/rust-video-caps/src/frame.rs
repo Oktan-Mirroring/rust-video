@@ -136,6 +136,9 @@ impl CpuFrame {
     }
 }
 
+/// Fresh-buffer reservation ceiling; the buffer grows past it on write.
+const MAX_RESERVE: usize = 256 << 20;
+
 /// Recycled plane backing owned by one decoder.
 #[derive(Debug)]
 pub struct FramePool {
@@ -182,11 +185,20 @@ impl FramePool {
     /// Buffer capacity in bytes for the pooled size and format.
     #[must_use]
     fn buffer_len(&self) -> usize {
-        let bytes = self.size.samples() * self.format.doubled_bytes_per_sample() / 2;
-        usize::try_from(bytes).unwrap_or(usize::MAX)
+        let bytes = self
+            .size
+            .samples()
+            .saturating_mul(self.format.doubled_bytes_per_sample())
+            / 2;
+        usize::try_from(bytes)
+            .unwrap_or(usize::MAX)
+            .min(MAX_RESERVE)
     }
 
     /// Recycled buffer, or a fresh one sized for the pooled frame.
+    ///
+    /// Fresh reservations stop at `MAX_RESERVE`; the buffer grows past it
+    /// on write.
     #[must_use]
     pub fn acquire(&mut self) -> BytesMut {
         self.free.pop().map_or_else(
@@ -370,6 +382,13 @@ mod tests {
         assert!(planar422.acquire().capacity() >= 16 * 16 * 2);
         let mut planar444 = FramePool::new(size(), PixelFormat::Yuv444P);
         assert!(planar444.acquire().capacity() >= 16 * 16 * 3);
+    }
+
+    #[test]
+    fn pool_bounds_absurd_extent() {
+        let huge = PictureSize::new(u32::MAX, u32::MAX).expect("valid size");
+        let mut pool = FramePool::new(huge, PixelFormat::Rgba8);
+        assert!(pool.acquire().capacity() <= 256 << 20);
     }
 
     #[test]

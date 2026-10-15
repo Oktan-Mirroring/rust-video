@@ -23,16 +23,19 @@ enum CodecScope {
     Av1,
     /// VP9.
     Vp9,
+    /// VP8.
+    Vp8,
 }
 
 impl CodecScope {
-    /// Scope for a mime type, if one of the four tier codecs.
+    /// Scope for a mime type, if one of the five tier codecs.
     fn of_mime(mime: &str) -> Option<Self> {
         match mime {
             crate::format::FormatSpec::MIME_H264 => Some(Self::H264),
             crate::format::FormatSpec::MIME_H265 => Some(Self::H265),
             crate::format::FormatSpec::MIME_AV1 => Some(Self::Av1),
             crate::format::FormatSpec::MIME_VP9 => Some(Self::Vp9),
+            crate::format::FormatSpec::MIME_VP8 => Some(Self::Vp8),
             _ => None,
         }
     }
@@ -45,6 +48,7 @@ impl CodecScope {
             "h265" => Some(Self::H265),
             "av1" => Some(Self::Av1),
             "vp9" => Some(Self::Vp9),
+            "vp8" => Some(Self::Vp8),
             _ => None,
         }
     }

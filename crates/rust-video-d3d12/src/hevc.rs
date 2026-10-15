@@ -2,7 +2,7 @@
 //!
 //! Frame-only progressive pictures for single-picture submissions.
 
-use crate::bits::BitReader;
+use crate::bits::{rbsp, BitReader};
 use crate::error::D3d12Error;
 use crate::h264::Crop;
 
@@ -40,21 +40,6 @@ pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
         nals.push(&data[start..]);
     }
     nals
-}
-
-/// NAL with emulation prevention bytes removed.
-pub(crate) fn rbsp(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &byte in nal {
-        if zeros == 2 && byte == 3 {
-            zeros = 0;
-            continue;
-        }
-        out.push(byte);
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-    }
-    out
 }
 
 /// Parsed sequence parameter set.

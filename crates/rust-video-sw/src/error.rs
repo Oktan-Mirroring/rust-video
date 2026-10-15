@@ -15,6 +15,11 @@ pub enum SwError {
     Rejected,
     /// Backend returned a frame the facade cannot hold.
     BadFrame,
+    /// Backend call failed with its native status code.
+    Native {
+        /// Native backend status code.
+        code: i64,
+    },
 }
 
 impl SwError {
@@ -61,6 +66,7 @@ impl fmt::Display for SwError {
             Self::Init => write!(f, "backend init failed"),
             Self::Rejected => write!(f, "backend rejected input"),
             Self::BadFrame => write!(f, "backend returned unusable frame"),
+            Self::Native { code } => write!(f, "backend call failed: {code}"),
         }
     }
 }

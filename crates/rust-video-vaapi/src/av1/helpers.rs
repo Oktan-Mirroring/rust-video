@@ -34,8 +34,10 @@ const DIV_LUT_PREC_BITS: u32 = 14;
 ///
 /// The input x will always be an integer, and will always be greater than or equal to 1.
 /// This function extracts the location of the most significant bit in x.
-pub fn floor_log2(mut x: u32) -> u32 {
-    assert!(x > 0);
+pub fn floor_log2(mut x: u32) -> Result<u32, String> {
+    if x == 0 {
+        return Err("floor_log2 of zero".into());
+    }
     let mut s = 0;
 
     while x != 0 {
@@ -43,7 +45,7 @@ pub fn floor_log2(mut x: u32) -> u32 {
         s += 1;
     }
 
-    s - 1
+    Ok(s - 1)
 }
 
 /// Implements 5.9.3. Get relative distance function
@@ -166,9 +168,9 @@ pub fn round2signed(x: i32, n: u32) -> Result<i32, String> {
 }
 
 /// Implements 7.11.3.7. Resolve divisor process
-pub fn resolve_divisor(d: i32) -> (u32, i32) {
-    let abs_d = u32::try_from(d.abs()).unwrap(); // abs cannot return a negative
-    let n = floor_log2(abs_d);
+pub fn resolve_divisor(d: i32) -> Result<(u32, i32), String> {
+    let abs_d = d.unsigned_abs();
+    let n = floor_log2(abs_d)?;
     let e = abs_d - (1 << n);
 
     let f = if n > DIV_LUT_BITS {
@@ -184,5 +186,5 @@ pub fn resolve_divisor(d: i32) -> (u32, i32) {
         DIV_LUT[f as usize]
     };
 
-    (div_shift, div_factor)
+    Ok((div_shift, div_factor))
 }

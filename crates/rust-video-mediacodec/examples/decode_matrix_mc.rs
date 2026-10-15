@@ -1,4 +1,4 @@
-//! `MediaCodec` decode matrix over the four shipped codecs.
+//! `MediaCodec` decode matrix over the five shipped codecs.
 
 use bytes::Bytes;
 
@@ -28,6 +28,7 @@ fn main() {
         ("h265", FormatSpec::h265(64, 64)),
         ("av1", FormatSpec::av1(64, 64)),
         ("vp9", FormatSpec::vp9(64, 64)),
+        ("vp8", FormatSpec::vp8(64, 64)),
     ] {
         let Some(spec) = spec else {
             println!("{name}: spec rejected");

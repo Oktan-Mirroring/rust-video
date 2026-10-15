@@ -170,6 +170,12 @@ impl Plan {
         }
     }
 
+    /// GPU plan when every hop of `caps` holds, else the CPU plan naming the first miss.
+    #[must_use]
+    pub const fn for_caps(caps: &GpuCaps) -> Self {
+        Self::for_hops(caps.platform(), caps.decode_export(), caps.encode_import())
+    }
+
     /// GPU plan when every hop holds, else the CPU plan naming the first miss.
     #[must_use]
     pub const fn for_hops(platform: bool, decode_export: bool, encode_import: bool) -> Self {
@@ -251,6 +257,17 @@ mod tests {
         assert!(!GpuCaps::new(false, true, true).ready());
         assert!(!GpuCaps::new(true, false, true).ready());
         assert!(!GpuCaps::new(true, true, false).ready());
+    }
+
+    #[test]
+    fn for_caps_matches_for_hops() {
+        let caps = GpuCaps::new(true, true, true);
+        assert_eq!(Plan::for_caps(&caps), Plan::gpu());
+        let caps = GpuCaps::new(true, false, true);
+        assert_eq!(
+            Plan::for_caps(&caps).cause(),
+            Some(FallbackCause::NoSharedExport)
+        );
     }
 
     #[test]

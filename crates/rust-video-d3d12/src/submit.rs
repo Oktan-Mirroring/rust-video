@@ -10,6 +10,8 @@ use std::mem::ManuallyDrop;
 
 use crate::error::D3d12Error;
 #[cfg(target_os = "windows")]
+use windows::Win32::Foundation::WAIT_TIMEOUT;
+#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
     ID3D12Resource, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC,
@@ -438,9 +440,18 @@ impl DeviceResources {
         readback: &ID3D12Resource,
         len: usize,
     ) -> Result<Vec<u8>, D3d12Error> {
+        Self::with_readback(readback, len, |mapped| Ok(mapped.to_vec()))
+    }
+
+    /// `f` over the `len`-byte readback mapping.
+    pub(crate) fn with_readback<T>(
+        readback: &ID3D12Resource,
+        len: usize,
+        f: impl FnOnce(&[u8]) -> Result<T, D3d12Error>,
+    ) -> Result<T, D3d12Error> {
         let range = D3D12_RANGE { Begin: 0, End: len };
         let mut read: *mut c_void = std::ptr::null_mut();
-        // Sound: the readback mapping outlives the copy below.
+        // Sound: the readback mapping outlives `f` below.
         unsafe {
             readback.Map(
                 0,
@@ -457,13 +468,14 @@ impl DeviceResources {
                 "readback map returned null".to_owned(),
             ));
         }
-        let mut out = vec![0u8; len];
-        // Sound: `read` spans `len` readback bytes; `out` outlives the copy.
+        // Sound: `read` spans `len` readback bytes; the mapping outlives `f`.
+        let mapped = unsafe { std::slice::from_raw_parts(read.cast::<u8>(), len) };
+        let out = f(mapped);
+        // Sound: the mapping is live; `out` owns its bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(read.cast::<u8>(), out.as_mut_ptr(), len);
             readback.Unmap(0, None);
         }
-        Ok(out)
+        out
     }
 }
 
@@ -521,7 +533,10 @@ impl Fence {
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
-        Err(D3d12Error::Unsupported("fence wait timed out".to_owned()))
+        Err(D3d12Error::Call {
+            call: "FenceWait",
+            hresult: WAIT_TIMEOUT.0.cast_signed(),
+        })
     }
 }
 

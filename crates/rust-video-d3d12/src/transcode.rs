@@ -104,7 +104,7 @@ impl<'a> Transcoder<'a> {
             device.supports(decode),
             device.supports_encode(encode),
         );
-        let plan = Plan::for_hops(caps.platform(), caps.decode_export(), caps.encode_import());
+        let plan = Plan::for_caps(&caps);
         Ok(Self {
             source,
             encoder,

@@ -16,6 +16,8 @@ enum Codec {
     Av1,
     /// VP9.
     Vp9,
+    /// VP8.
+    Vp8,
 }
 
 /// Decoder input format.
@@ -63,6 +65,8 @@ impl FormatSpec {
     pub const MIME_AV1: &'static str = "video/av01";
     /// `MIMETYPE_VIDEO_VP9`.
     pub const MIME_VP9: &'static str = "video/x-vnd.on2.vp9";
+    /// `MIMETYPE_VIDEO_VP8`.
+    pub const MIME_VP8: &'static str = "video/x-vnd.on2.vp8";
 
     /// `COLOR_FormatYUV420Planar`.
     pub const COLOR_PLANAR: i32 = 19;
@@ -97,6 +101,12 @@ impl FormatSpec {
     #[must_use]
     pub fn vp9(width: u32, height: u32) -> Option<Self> {
         Self::coded(Codec::Vp9, width, height)
+    }
+
+    /// VP8 format over `width` by `height`; zero or oversize dims rejected.
+    #[must_use]
+    pub fn vp8(width: u32, height: u32) -> Option<Self> {
+        Self::coded(Codec::Vp8, width, height)
     }
 
     /// Format for `codec` over `width` by `height`.
@@ -144,6 +154,7 @@ impl FormatSpec {
             Codec::H265 => Self::MIME_H265,
             Codec::Av1 => Self::MIME_AV1,
             Codec::Vp9 => Self::MIME_VP9,
+            Codec::Vp8 => Self::MIME_VP8,
         }
     }
 
@@ -152,7 +163,7 @@ impl FormatSpec {
     pub fn min_sdk(&self) -> u32 {
         match self.codec {
             Codec::Av1 => Self::AV1_MIN_SDK,
-            Codec::H264 | Codec::H265 | Codec::Vp9 => crate::sdk::MIN_SDK,
+            Codec::H264 | Codec::H265 | Codec::Vp9 | Codec::Vp8 => crate::sdk::MIN_SDK,
         }
     }
 
@@ -251,6 +262,8 @@ mod tests {
         assert_eq!(spec.mime(), "video/av01");
         let spec = FormatSpec::vp9(640, 480).expect("valid dims");
         assert_eq!(spec.mime(), "video/x-vnd.on2.vp9");
+        let spec = FormatSpec::vp8(320, 240).expect("valid dims");
+        assert_eq!(spec.mime(), "video/x-vnd.on2.vp8");
     }
 
     #[test]
@@ -279,10 +292,12 @@ mod tests {
         let h265 = FormatSpec::h265(16, 16).expect("valid dims");
         let vp9 = FormatSpec::vp9(16, 16).expect("valid dims");
         let av1 = FormatSpec::av1(16, 16).expect("valid dims");
+        let vp8 = FormatSpec::vp8(16, 16).expect("valid dims");
         assert_eq!(h264.min_sdk(), 21);
         assert_eq!(h265.min_sdk(), 21);
         assert_eq!(vp9.min_sdk(), 21);
         assert_eq!(av1.min_sdk(), 29);
+        assert_eq!(vp8.min_sdk(), 21);
     }
 
     #[test]

@@ -54,12 +54,21 @@ impl VulkanFrame {
     /// The golden oracle hashes planar bytes, so tests compare through this.
     #[must_use]
     pub fn yuv420p(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.yuv420p_into(&mut out);
+        out
+    }
+
+    /// Planar bytes into `out`, reusing its allocation.
+    pub fn yuv420p_into(&self, out: &mut Vec<u8>) {
         let size = self.identity.size();
         let luma = u64::from(size.width()) * u64::from(size.height());
         let Ok(y_len) = usize::try_from(luma) else {
-            return Vec::new();
+            out.clear();
+            return;
         };
-        let mut out = vec![0; y_len + y_len / 2];
+        out.clear();
+        out.resize(y_len + y_len / 2, 0);
         let y_take = y_len.min(self.data.len());
         out[..y_take].copy_from_slice(&self.data[..y_take]);
         let uv = &self.data[y_take.min(self.data.len())..];
@@ -71,7 +80,6 @@ impl VulkanFrame {
             u[index] = pair[0];
             v[index] = pair[1];
         }
-        out
     }
 
     /// Budget bytes the frame holds.
@@ -376,16 +384,6 @@ impl<'a> H264Decoder<'a> {
         let setup_std = fill_reference(picture.frame_num(), picture.poc(), false);
         let (setup_resource, setup_index) = setup_target(session, extent, setup_slot)?;
         let std_picture = fill_picture(picture);
-        if std::env::var("VKPROBE_DUMP").is_ok() {
-            dump_h264_probe(
-                &self.sps,
-                &self.pps,
-                picture,
-                &refs,
-                setup_slot,
-                begin_slots.len(),
-            );
-        }
         finish_h264_submit(
             session,
             &mut self.sink,
@@ -512,11 +510,6 @@ fn collect_h264_refs<'a>(
     let mut refs = Vec::new();
     let mut seen = HashSet::new();
     let lists = [picture.l0(), picture.l1()];
-    let lists = if std::env::var("VKPROBE_SWAP").is_ok() {
-        [lists[1], lists[0]]
-    } else {
-        lists
-    };
     for list in lists.into_iter().flatten() {
         for reference in list {
             let Some(id) = reference.id() else { continue };
@@ -551,14 +544,8 @@ fn fill_h264_refs(
         let Some(view) = session.dpb_view(*slot) else {
             continue;
         };
-        let mut poc = reference.poc();
-        let mut frame_num = reference.frame_num();
-        if std::env::var("VKPROBE_POISON").is_ok() && *slot == 1 {
-            poc = 999;
-        }
-        if std::env::var("VKPROBE_POISON_FN").is_ok() && *slot == 1 {
-            frame_num = 9;
-        }
+        let poc = reference.poc();
+        let frame_num = reference.frame_num();
         let std = fill_reference(frame_num, poc, reference.long_term().is_some());
         session.set_meta(*slot, Some(DpbMeta::H264(std)));
         entries.push((*slot, std, view));
@@ -585,84 +572,6 @@ fn begin_h264_entries(
         entries.push((slot, std, view));
     }
     entries
-}
-
-/// Probe dump of one H.264 picture and its parameter sets.
-fn dump_h264_probe(
-    sps: &HashMap<u8, Rc<crate::parse::h264::Sps>>,
-    pps: &HashMap<u8, Rc<crate::parse::h264::Pps>>,
-    picture: &Picture,
-    refs: &[(usize, &RefPicture)],
-    setup_slot: usize,
-    begin_len: usize,
-) {
-    for (id, sps) in sps {
-        eprintln!(
-            "sps id={id} prof={} level={} poct={} lsbminus4={} fnminus4={} ref-frames={} mbs={}x{} crop={:?} gaps={} direct8={} topbottom={} nonref={}",
-            sps.profile_idc(),
-            sps.level_idc(),
-            sps.pic_order_cnt_type(),
-            sps.log2_max_pic_order_cnt_lsb_minus4(),
-            sps.log2_max_frame_num_minus4(),
-            sps.max_num_ref_frames(),
-            sps.pic_width_in_mbs_minus1(),
-            sps.pic_height_in_map_units_minus1(),
-            sps.crop(),
-            sps.gaps_in_frame_num_allowed(),
-            sps.direct_8x8_inference(),
-            sps.offset_for_top_to_bottom_field(),
-            sps.offset_for_non_ref_pic(),
-        );
-    }
-    for (id, pps) in pps {
-        eprintln!(
-            "pps id={id} wpred={} wbipred={} l0def={} l1def={}",
-            pps.weighted_pred(),
-            pps.weighted_bipred_idc(),
-            pps.num_ref_idx_l0_default_minus1(),
-            pps.num_ref_idx_l1_default_minus1(),
-        );
-    }
-    let l0: Vec<(u16, i32)> = picture
-        .l0()
-        .map(|list| {
-            list.iter()
-                .map(|entry| (entry.frame_num(), entry.poc()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let l1: Vec<(u16, i32)> = picture
-        .l1()
-        .map(|list| {
-            list.iter()
-                .map(|entry| (entry.frame_num(), entry.poc()))
-                .collect()
-        })
-        .unwrap_or_default();
-    eprintln!(
-        "pic fn={} poc={} idrpic={} ref={} intra={} idr={} l0={l0:?} l1={l1:?} slices={} bytes={}",
-        picture.frame_num(),
-        picture.poc(),
-        picture.idr_pic_id(),
-        picture.is_reference(),
-        picture.is_intra(),
-        picture.is_idr(),
-        picture.slice_offsets().len(),
-        picture.bytes().len(),
-    );
-    if std::env::var("VKPROBE_DUMP_BYTES").is_ok() {
-        let path = format!("/tmp/vkbytes_{}.bin", picture.poc());
-        let _ = std::fs::write(path, picture.bytes());
-    }
-    for (slot, reference) in refs {
-        eprintln!(
-            "  ref slot={slot} fn={} poc={} lt={}",
-            reference.frame_num(),
-            reference.poc(),
-            reference.long_term().is_some(),
-        );
-    }
-    eprintln!("  setup slot={setup_slot} begin={begin_len}");
 }
 
 /// Decode target resource and slot index of the claimed setup slot.
@@ -729,30 +638,11 @@ fn finish_h264_submit(
     };
     let mut setup = reference_slot(plan.setup_index, &plan.dst);
     setup.p_next = std::ptr::from_ref(&setup_dpb).cast();
-    let mut begin_setup_slot = reference_slot(-1, &plan.dst);
-    begin_setup_slot.p_next = std::ptr::from_ref(&setup_dpb).cast();
-    let begin_all;
-    let begin = if std::env::var("VKPROBE_BEGIN_SETUP").is_ok()
-        && !plan
-            .begin
-            .iter()
-            .any(|slot| slot.slot_index == plan.setup_index)
-    {
-        begin_all = plan
-            .begin
-            .iter()
-            .chain(std::iter::once(&begin_setup_slot))
-            .copied()
-            .collect::<Vec<_>>();
-        &begin_all
-    } else {
-        plan.begin
-    };
     let sub = Submission {
         bytes: picture.bytes(),
         setup_slot: plan.setup_slot,
         reset: picture.resets_dpb(),
-        begin,
+        begin: plan.begin,
         refs: plan.refs,
         setup: &setup,
         dst: plan.dst,

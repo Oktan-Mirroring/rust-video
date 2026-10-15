@@ -30,7 +30,7 @@ pub fn run_codec(
 
     let inputs = match selected {
         ProbeCodec::AnnexB(_) => vec![fs::read(stream).expect("stream readable")],
-        ProbeCodec::Ivf(_) => crate::common::read_ivf(stream).frames,
+        ProbeCodec::Ivf(_) => crate::ivf::read_ivf(stream).frames,
     };
     let inner = match selected {
         ProbeCodec::AnnexB(codec) | ProbeCodec::Ivf(codec) => codec,
@@ -65,12 +65,5 @@ pub fn run_codec(
         frames += 1;
     }
     let secs = start.elapsed().as_secs_f64();
-    println!(
-        "{tag}: {frames} frames in {secs:.2}s = {:.1} fps",
-        crate::common::fps(frames, secs)
-    );
-    if let Some(path) = dump {
-        fs::write(path, &packed_all).expect("dump written");
-        println!("{tag}: {} bytes dumped", packed_all.len());
-    }
+    crate::common::report(tag, frames, secs, &packed_all, dump);
 }

@@ -10,7 +10,9 @@ use rust_video::VideoCodec;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
-use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice};
+use rust_video_vulkan::{
+    CodecOp, H264Decoder, H265Decoder, VulkanDevice, VulkanError, VulkanFrame,
+};
 
 // Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -30,43 +32,28 @@ impl<D> VulkanOracle<D> {
     }
 }
 
-impl Oracle for VulkanOracle<H264Decoder<'_>> {
+impl<D> Oracle for VulkanOracle<D>
+where
+    D: Decoder<Frame = VulkanFrame, Error = VulkanError>,
+{
     fn decode(&self, case: &Case) -> Result<Vec<FrameHash>, Error> {
         let bytes = std::fs::read(case.path())?;
         let mut decoder = self.decoder.borrow_mut();
         let mut hashes = Vec::new();
+        let mut scratch = Vec::new();
         for frame in decoder
             .decode(&Packet::new(Bytes::from(bytes)))
             .map_err(|error| Error::Decode(error.to_string()))?
         {
-            hashes.push(FrameHash::of(&frame.yuv420p()));
+            frame.yuv420p_into(&mut scratch);
+            hashes.push(FrameHash::of(&scratch));
         }
         for frame in decoder
             .flush()
             .map_err(|error| Error::Decode(error.to_string()))?
         {
-            hashes.push(FrameHash::of(&frame.yuv420p()));
-        }
-        Ok(hashes)
-    }
-}
-
-impl Oracle for VulkanOracle<H265Decoder<'_>> {
-    fn decode(&self, case: &Case) -> Result<Vec<FrameHash>, Error> {
-        let bytes = std::fs::read(case.path())?;
-        let mut decoder = self.decoder.borrow_mut();
-        let mut hashes = Vec::new();
-        for frame in decoder
-            .decode(&Packet::new(Bytes::from(bytes)))
-            .map_err(|error| Error::Decode(error.to_string()))?
-        {
-            hashes.push(FrameHash::of(&frame.yuv420p()));
-        }
-        for frame in decoder
-            .flush()
-            .map_err(|error| Error::Decode(error.to_string()))?
-        {
-            hashes.push(FrameHash::of(&frame.yuv420p()));
+            frame.yuv420p_into(&mut scratch);
+            hashes.push(FrameHash::of(&scratch));
         }
         Ok(hashes)
     }
