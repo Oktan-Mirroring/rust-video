@@ -14,7 +14,8 @@ use rust_video_caps::traits::Encoder;
 
 /// D3D12 hardware encoder over the video encode session.
 ///
-/// Encoders take NV12 input.
+/// Encoders take NV12 input and code intra-only: every frame is an
+/// IDR; reference pictures stay pending.
 ///
 /// # Usage Notes
 ///
@@ -60,6 +61,38 @@ impl<'a> D3d12Encoder<'a> {
     pub const fn codec(&self) -> Codec {
         self.codec
     }
+
+    /// Live session at `width` x `height`, reopened on change.
+    fn ensure_session(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<&mut EncodeSession, D3d12Error> {
+        if self.active != Some((width, height)) {
+            let session = EncodeSession::open(self.device, self.codec, width, height)?;
+            self.session = Some(session);
+            self.active = Some((width, height));
+        }
+        self.session.as_mut().ok_or(D3d12Error::NoSession)
+    }
+
+    /// Packets coded from `texture`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the texture misses the session extent or the
+    /// backend cannot encode it.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn encode_texture(
+        &mut self,
+        texture: &crate::texture::GpuTexture,
+    ) -> Result<Vec<Packet>, D3d12Error> {
+        let size = texture.size();
+        let (width, height) = (size.width(), size.height());
+        let session = self.ensure_session(width, height)?;
+        let bitstream = session.encode_texture(texture.resource(), width, height)?;
+        Ok(vec![Packet::new(Bytes::from(bitstream))])
+    }
 }
 
 impl Encoder for D3d12Encoder<'_> {
@@ -67,12 +100,7 @@ impl Encoder for D3d12Encoder<'_> {
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, D3d12Error> {
         let (width, height, nv12) = pack_nv12(frame)?;
-        if self.active != Some((width, height)) {
-            let session = EncodeSession::open(self.device, self.codec, width, height)?;
-            self.session = Some(session);
-            self.active = Some((width, height));
-        }
-        let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+        let session = self.ensure_session(width, height)?;
         let bitstream = session.encode(&nv12)?;
         Ok(vec![Packet::new(Bytes::from(bitstream))])
     }

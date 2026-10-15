@@ -2,10 +2,15 @@
 //!
 //! Encode stays a named miss until the args builder lands.
 
-#[path = "common/synthetic.rs"]
-mod synthetic;
+#[path = "common/bits.rs"]
+mod bits;
+#[path = "common/grey.rs"]
+mod grey;
+#[path = "common/hevc.rs"]
+mod hevc;
 
-use synthetic::{annex_b_packets, grey_nv12};
+use grey::grey_nv12;
+use hevc::annex_b_packets;
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
@@ -52,6 +57,10 @@ fn main() {
             println!("ERROR: flush: {error}");
             std::process::exit(1);
         }
+    }
+    if total == 0 {
+        println!("ERROR: hevc decode produced no frames");
+        std::process::exit(1);
     }
     println!("total: {total} frame(s)");
     println!("parity: size-proven only; pixel content unverified vs oracle");

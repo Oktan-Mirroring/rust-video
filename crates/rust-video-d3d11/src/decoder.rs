@@ -1,7 +1,7 @@
 //! H.264 decode plus probed shells behind the caps `Decoder` trait.
 
 use crate::device::D3d11Device;
-use crate::dpb::{Dpb, Output};
+use crate::dpb::{Decoded, Dpb, Output};
 use crate::error::{D3d11Error, SkipReason};
 use crate::guid::Codec;
 use crate::h264::{Crop, Ingest, Picture, Sps};
@@ -14,6 +14,8 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+#[cfg(target_os = "windows")]
+use rust_video_caps::transcode::FallbackCause;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d11Frame {
@@ -80,6 +82,54 @@ impl D3d11Frame {
             PixelFormat::Nv12,
             vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
         )
+    }
+}
+
+/// Device-resident decode surface without CPU access.
+#[cfg(target_os = "windows")]
+pub(crate) struct GpuSurface {
+    /// Frame identity: size, format, generation.
+    identity: GpuFrame,
+    /// Shared decode texture plus its NT handle.
+    export: SharedExport,
+    /// Array slice behind the picture.
+    slot: u8,
+    /// Visible left offset in luma samples.
+    left: u32,
+    /// Visible top offset in luma samples.
+    top: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl GpuSurface {
+    /// Picture dimensions in luma samples.
+    #[must_use]
+    pub(crate) fn size(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Shared decode texture plus its NT handle.
+    #[must_use]
+    pub(crate) fn export(&self) -> &SharedExport {
+        &self.export
+    }
+
+    /// Array slice behind the picture.
+    #[must_use]
+    pub(crate) fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    /// Visible left offset in luma samples.
+    #[must_use]
+    pub(crate) fn left(&self) -> u32 {
+        self.left
+    }
+
+    /// Visible top offset in luma samples.
+    #[must_use]
+    pub(crate) fn top(&self) -> u32 {
+        self.top
     }
 }
 
@@ -152,35 +202,12 @@ impl<'a> H264Decoder<'a> {
         picture: &Picture,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
-        let active = {
-            let pps = self
-                .ingest
-                .pps(picture.pps_id())
-                .ok_or(D3d11Error::NoSession)?;
-            let sps = self
-                .ingest
-                .sps(pps.seq_parameter_set_id)
-                .ok_or(D3d11Error::NoSession)?;
-            Active::new(sps)?
-        };
+        let active = self.sequence(picture)?;
         if self.active != Some(active) {
             self.reconfigure(active, frames)?;
         }
         let active = self.active.ok_or(D3d11Error::NoSession)?;
-        let decoded = {
-            let pps = self
-                .ingest
-                .pps(picture.pps_id())
-                .ok_or(D3d11Error::NoSession)?;
-            let sps = self
-                .ingest
-                .sps(pps.seq_parameter_set_id)
-                .ok_or(D3d11Error::NoSession)?;
-            self.dpb
-                .as_mut()
-                .ok_or(D3d11Error::NoSession)?
-                .decode(picture, sps, pps)
-        };
+        let decoded = self.decode_dpb(picture);
         let decoded = match decoded {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -234,6 +261,11 @@ impl<'a> H264Decoder<'a> {
         if let Some(previous) = self.active {
             self.drain_live(&previous, frames)?;
         }
+        self.open_session(active)
+    }
+
+    /// Session plus picture buffer for `active`.
+    fn open_session(&mut self, active: Active) -> Result<(), D3d11Error> {
         let session = Session::open(self.device, active.width, active.height)?;
         self.shared = Some(self.device.shared().clone());
         self.session = Some(session);
@@ -244,6 +276,35 @@ impl<'a> H264Decoder<'a> {
         self.dpb = Some(Dpb::new(sps));
         self.active = Some(active);
         Ok(())
+    }
+
+    /// Active sequence behind `picture`'s parameter sets.
+    fn sequence(&self, picture: &Picture) -> Result<Active, D3d11Error> {
+        let pps = self
+            .ingest
+            .pps(picture.pps_id())
+            .ok_or(D3d11Error::NoSession)?;
+        let sps = self
+            .ingest
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d11Error::NoSession)?;
+        Active::new(sps)
+    }
+
+    /// Submission plus display-order outputs for `picture`.
+    fn decode_dpb(&mut self, picture: &Picture) -> Result<Decoded, D3d11Error> {
+        let pps = self
+            .ingest
+            .pps(picture.pps_id())
+            .ok_or(D3d11Error::NoSession)?;
+        let sps = self
+            .ingest
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d11Error::NoSession)?;
+        self.dpb
+            .as_mut()
+            .ok_or(D3d11Error::NoSession)?
+            .decode(picture, sps, pps)
     }
 
     /// Live DPB outputs into `frames`.
@@ -265,6 +326,129 @@ impl<'a> H264Decoder<'a> {
             frames.push(frame);
         }
         Ok(())
+    }
+
+    /// Decode `picture` into GPU `surfaces`.
+    #[cfg(target_os = "windows")]
+    fn surface_picture(
+        &mut self,
+        picture: &Picture,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let outcome = self.surface_inner(picture, surfaces);
+        if outcome.is_err() {
+            self.reset_stream();
+        }
+        outcome
+    }
+
+    /// Decode `picture` into GPU `surfaces` without resetting on failure.
+    #[cfg(target_os = "windows")]
+    fn surface_inner(
+        &mut self,
+        picture: &Picture,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let active = self.sequence(picture)?;
+        if self.active != Some(active) {
+            self.reconfigure_surface(active, surfaces)?;
+        }
+        let active = self.active.ok_or(D3d11Error::NoSession)?;
+        let decoded = self.decode_dpb(picture);
+        let decoded = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        let mut failed = None;
+        {
+            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+            // Submit before any surface handoff: outputs may name the submission slot.
+            if let Err(error) = session.submit(&decoded.submission) {
+                failed = Some(error);
+            } else {
+                for output in &decoded.outputs {
+                    let Some(surface) = emit_surface(session, output, &active, self.generation)
+                    else {
+                        failed = Some(D3d11Error::Unsupported(
+                            FallbackCause::NoSharedExport.to_string(),
+                        ));
+                        break;
+                    };
+                    self.generation = self.generation.wrapping_add(1);
+                    surfaces.push(surface);
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    #[cfg(target_os = "windows")]
+    fn reconfigure_surface(
+        &mut self,
+        active: Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        if let Some(previous) = self.active {
+            self.drain_live_surface(&previous, surfaces)?;
+        }
+        self.open_session(active)
+    }
+
+    /// Live DPB outputs into GPU `surfaces`.
+    #[cfg(target_os = "windows")]
+    fn drain_live_surface(
+        &mut self,
+        active: &Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_ref()) else {
+            return Ok(());
+        };
+        for output in dpb.drain() {
+            let Some(surface) = emit_surface(session, &output, active, self.generation) else {
+                return Err(D3d11Error::Unsupported(
+                    FallbackCause::NoSharedExport.to_string(),
+                ));
+            };
+            self.generation = self.generation.wrapping_add(1);
+            surfaces.push(surface);
+        }
+        Ok(())
+    }
+
+    /// GPU surfaces decoded from `packet`, possibly none.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn decode_surface(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut surfaces = Vec::new();
+        for picture in &pictures {
+            self.surface_picture(picture, &mut surfaces)?;
+        }
+        Ok(surfaces)
+    }
+
+    /// GPU surfaces held back for reordering or buffering.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let mut surfaces = Vec::new();
+        if let Some(picture) = self.ingest.finish()? {
+            self.surface_picture(&picture, &mut surfaces)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live_surface(&active, &mut surfaces)?;
+        }
+        Ok(surfaces)
     }
 }
 
@@ -309,6 +493,25 @@ fn emit_frame(
         lease,
         #[cfg(target_os = "windows")]
         shared: session.export(),
+    })
+}
+
+/// Surface for `output`, absent without NT-handle sharing.
+#[cfg(target_os = "windows")]
+fn emit_surface(
+    session: &Session,
+    output: &Output,
+    active: &Active,
+    generation: u64,
+) -> Option<GpuSurface> {
+    let (export, slot) = session.surface(output.slot())?;
+    let (left, top) = active.crop.map_or((0, 0), |crop| (crop.left, crop.top));
+    Some(GpuSurface {
+        identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
+        export,
+        slot,
+        left,
+        top,
     })
 }
 

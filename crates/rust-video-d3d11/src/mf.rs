@@ -30,23 +30,32 @@ use windows::core::GUID;
 #[cfg(target_os = "windows")]
 use windows::core::PWSTR;
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+#[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
-    MFCreateAlignedMemoryBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx, MFT_FRIENDLY_NAME_Attribute,
-    MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_H265, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MFVideoFormat_VP90, MFVideoInterlace_Progressive,
-    MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_INPUT_STREAM_INFO, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_TYPE,
+    IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    MFCreateAlignedMemoryBuffer, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
+    MFCreateMediaType, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint, MFStartup,
+    MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_AV1, MFVideoFormat_H264,
+    MFVideoFormat_H265, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoFormat_VP90,
+    MFVideoInterlace_Progressive, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_MESSAGE_TYPE,
     MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
     MF_EVENT_TYPE, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
@@ -110,6 +119,9 @@ pub struct Session {
     /// Transform D3D11 awareness.
     #[cfg(target_os = "windows")]
     d3d11_aware: bool,
+    /// D3D11 bind behind GPU samples, absent without a bound transform.
+    #[cfg(target_os = "windows")]
+    gpu: Option<GpuBind>,
     /// Serving encoder MFT name.
     #[cfg(target_os = "windows")]
     name: String,
@@ -157,7 +169,6 @@ impl Session {
     fn open_windows(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
         let _com = ComGuard::enter();
         startup()?;
-        let _ = device;
         let mut standby = VecDeque::new();
         let mut subtype = MFVideoFormat_H264;
         for candidate in subtypes(codec) {
@@ -171,6 +182,7 @@ impl Session {
         let Some(opened) = elect(&mut standby, codec) else {
             return Err(missing_encoder(codec));
         };
+        let gpu = GpuBind::open(device, opened.d3d11_aware);
         Ok(Self {
             transform: opened.transform,
             input: opened.input,
@@ -181,6 +193,7 @@ impl Session {
             in_align: SAMPLE_ALIGN,
             events: opened.events,
             d3d11_aware: opened.d3d11_aware,
+            gpu,
             name: opened.name,
             standby,
             subtype,
@@ -214,6 +227,20 @@ impl Session {
         #[cfg(target_os = "windows")]
         {
             self.d3d11_aware
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = self;
+            false
+        }
+    }
+
+    /// True when the session encodes from GPU textures.
+    #[must_use]
+    pub(crate) fn gpu_bound(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.gpu.is_some()
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -274,6 +301,15 @@ impl Session {
                 "packed NV12 length outside its extent".to_owned(),
             ));
         }
+        let mut packets = self.ensure_size(width, height)?;
+        let sample = input_sample(nv12, self.in_align, self.pts)?;
+        self.submit_sample(&sample, &mut packets)?;
+        Ok(packets)
+    }
+
+    /// Drained packets across the size switch to `width` x `height`.
+    #[cfg(target_os = "windows")]
+    fn ensure_size(&mut self, width: u32, height: u32) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         if self.size != Some((width, height)) {
             if self.size.is_some() {
@@ -282,13 +318,58 @@ impl Session {
             }
             self.configure(width, height)?;
         }
-        let sample = input_sample(nv12, self.in_align, self.pts)?;
+        Ok(packets)
+    }
+
+    /// `sample` through the sync or async submit path into `packets`.
+    #[cfg(target_os = "windows")]
+    fn submit_sample(
+        &mut self,
+        sample: &IMFSample,
+        packets: &mut Vec<Packet>,
+    ) -> Result<(), D3d11Error> {
         self.pts = self.pts.wrapping_add(FRAME_HNS);
         if self.events.is_some() {
-            self.submit_async(&sample, &mut packets)?;
+            self.submit_async(sample, packets)
         } else {
-            self.submit_sync(&sample, &mut packets)?;
+            self.submit_sync(sample, packets)
         }
+    }
+
+    /// Packets coded from the `slice` decode-texture region at (`left`, `top`) sized `width` by `height`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without a D3D11 bind, for an odd extent, or when the
+    /// transform refuses the frame.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn encode_texture(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        slice: u32,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Packet>, D3d11Error> {
+        let _com = ComGuard::enter();
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(D3d11Error::Unsupported("odd NV12 extent".to_owned()));
+        }
+        let mut packets = self.ensure_size(width, height)?;
+        let region = Region {
+            slice,
+            left,
+            top,
+            width,
+            height,
+        };
+        let gpu = self
+            .gpu
+            .as_mut()
+            .ok_or_else(|| D3d11Error::Unsupported("encoder without gpu import".to_owned()))?;
+        let sample = gpu.sample(&self.transform, self.input, texture, &region, self.pts)?;
+        self.submit_sample(&sample, &mut packets)?;
         Ok(packets)
     }
 
@@ -328,33 +409,15 @@ impl Session {
     /// Media types for `width` x `height` plus streaming start.
     #[cfg(target_os = "windows")]
     fn configure_try(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
-        let target = bitrate(width, height);
-        let output_type = find_available(
-            &self.transform,
-            self.output,
-            &self.subtype,
-            IMFTransform::GetOutputAvailableType,
-        )
-        .map_or_else(|| media_type(self.subtype, width, height, Some(target)), Ok)?;
-        stamp(&output_type, width, height, Some(target))?;
-        // Sound: the transform and type are live; output precedes input.
-        call(
-            unsafe { self.transform.SetOutputType(self.output, &output_type, 0) },
-            "SetOutputType",
-        )?;
-        let input_type = find_available(
-            &self.transform,
-            self.input,
-            &MFVideoFormat_NV12,
-            IMFTransform::GetInputAvailableType,
-        )
-        .map_or_else(|| media_type(MFVideoFormat_NV12, width, height, None), Ok)?;
-        stamp(&input_type, width, height, None)?;
-        // Sound: the transform and type are live past the output set.
-        call(
-            unsafe { self.transform.SetInputType(self.input, &input_type, 0) },
-            "SetInputType",
-        )?;
+        self.set_output_type(width, height)?;
+        self.set_input_type(width, height)?;
+        let bound = self
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.attach(&self.transform).is_ok());
+        if !bound {
+            self.gpu = None;
+        }
         self.message(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
         self.message(MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
         let mut info: MFT_INPUT_STREAM_INFO = unsafe { std::mem::zeroed() };
@@ -370,6 +433,43 @@ impl Session {
         self.refresh_output_info(width, height)?;
         self.size = Some((width, height));
         Ok(())
+    }
+
+    /// Output media type for `width` x `height` behind the target bitrate.
+    #[cfg(target_os = "windows")]
+    fn set_output_type(&self, width: u32, height: u32) -> Result<(), D3d11Error> {
+        let target = bitrate(width, height);
+        let output_type = find_available(
+            &self.transform,
+            self.output,
+            &self.subtype,
+            IMFTransform::GetOutputAvailableType,
+        )
+        .map_or_else(|| media_type(self.subtype, width, height, Some(target)), Ok)?;
+        stamp(&output_type, width, height, Some(target))?;
+        // Sound: the transform and type are live.
+        call(
+            unsafe { self.transform.SetOutputType(self.output, &output_type, 0) },
+            "SetOutputType",
+        )
+    }
+
+    /// Input NV12 media type for `width` x `height`.
+    #[cfg(target_os = "windows")]
+    fn set_input_type(&self, width: u32, height: u32) -> Result<(), D3d11Error> {
+        let input_type = find_available(
+            &self.transform,
+            self.input,
+            &MFVideoFormat_NV12,
+            IMFTransform::GetInputAvailableType,
+        )
+        .map_or_else(|| media_type(MFVideoFormat_NV12, width, height, None), Ok)?;
+        stamp(&input_type, width, height, None)?;
+        // Sound: the transform and type are live.
+        call(
+            unsafe { self.transform.SetInputType(self.input, &input_type, 0) },
+            "SetInputType",
+        )
     }
 
     /// Output buffer shape behind the current output type.
@@ -639,6 +739,196 @@ struct Opened {
     input: u32,
     /// Output stream id.
     output: u32,
+}
+
+/// D3D11 bind behind GPU encoder samples.
+#[cfg(target_os = "windows")]
+struct GpuBind {
+    /// DXGI device manager behind the bound transform.
+    manager: IMFDXGIDeviceManager,
+    /// Logical device behind input textures.
+    device: ID3D11Device,
+    /// Immediate context behind GPU copies.
+    context: ID3D11DeviceContext,
+    /// Input texture plus its extent, recreated per size.
+    input: Option<(ID3D11Texture2D, u32, u32)>,
+}
+
+#[cfg(target_os = "windows")]
+impl GpuBind {
+    /// Manager over `device`, absent without D3D11 awareness.
+    fn open(device: &D3d11Device, aware: bool) -> Option<Self> {
+        if !aware {
+            return None;
+        }
+        let mut token = 0u32;
+        let mut manager = None;
+        // Sound: the out-parameters stay live for the call.
+        unsafe {
+            MFCreateDXGIDeviceManager(
+                std::ptr::addr_of_mut!(token),
+                std::ptr::addr_of_mut!(manager),
+            )
+        }
+        .ok()?;
+        let manager: IMFDXGIDeviceManager = manager?;
+        // Sound: the device is live; the token came from the create call.
+        unsafe { manager.ResetDevice(device.device(), token) }.ok()?;
+        Some(Self {
+            manager,
+            device: device.device().clone(),
+            context: device.context().clone(),
+            input: None,
+        })
+    }
+
+    /// Manager through `transform` as its D3D11 device manager.
+    fn attach(&self, transform: &IMFTransform) -> Result<(), D3d11Error> {
+        send_manager(transform, &self.manager)
+    }
+
+    /// Input sample over `region` of `texture`.
+    fn sample(
+        &mut self,
+        transform: &IMFTransform,
+        input: u32,
+        texture: &ID3D11Texture2D,
+        region: &Region,
+        pts: i64,
+    ) -> Result<IMFSample, D3d11Error> {
+        let target = self.texture(transform, input, region.width, region.height)?;
+        // 4:2:0 crop origins stay even; odd origins break planar copies.
+        let src_box = D3D11_BOX {
+            left: region.left,
+            top: region.top,
+            front: 0,
+            right: region.left.saturating_add(region.width),
+            bottom: region.top.saturating_add(region.height),
+            back: 1,
+        };
+        // Sound: both textures are live; the slice and box name the decode extent.
+        unsafe {
+            self.context.CopySubresourceRegion(
+                &target,
+                0,
+                0,
+                0,
+                0,
+                texture,
+                region.slice,
+                Some(std::ptr::from_ref(&src_box)),
+            );
+        }
+        // Sound: the texture is live past the copy.
+        let buffer = call(
+            unsafe {
+                MFCreateDXGISurfaceBuffer(
+                    std::ptr::from_ref(&ID3D11Texture2D::IID),
+                    &target,
+                    0,
+                    false,
+                )
+            },
+            "MFCreateDXGISurfaceBuffer",
+        )?;
+        // Sound: the sample and buffer are live for every set below.
+        let sample = call(unsafe { MFCreateSample() }, "MFCreateSample")?;
+        call(unsafe { sample.AddBuffer(&buffer) }, "AddBuffer")?;
+        call(unsafe { sample.SetSampleTime(pts) }, "SetSampleTime")?;
+        call(
+            unsafe { sample.SetSampleDuration(FRAME_HNS) },
+            "SetSampleDuration",
+        )?;
+        Ok(sample)
+    }
+
+    /// Input texture at `width` by `height`, honoring the MFT bind flags.
+    fn texture(
+        &mut self,
+        transform: &IMFTransform,
+        input: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<ID3D11Texture2D, D3d11Error> {
+        if let Some((texture, cached_width, cached_height)) = &self.input {
+            if (*cached_width, *cached_height) == (width, height) {
+                return Ok(texture.clone());
+            }
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind_flags(transform, input),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        // Sound: the descriptor stays live for the call.
+        unsafe {
+            self.device.CreateTexture2D(
+                std::ptr::addr_of!(desc),
+                None,
+                Some(std::ptr::addr_of_mut!(texture)),
+            )
+        }
+        .map_err(|error| D3d11Error::Call {
+            call: "CreateTexture2D",
+            hresult: error.code().0,
+        })?;
+        let texture: ID3D11Texture2D = texture.ok_or(D3d11Error::Call {
+            call: "CreateTexture2D",
+            hresult: windows::Win32::Foundation::E_FAIL.0,
+        })?;
+        self.input = Some((texture.clone(), width, height));
+        Ok(texture)
+    }
+}
+
+/// Visible NV12 region inside a decode texture.
+#[cfg(target_os = "windows")]
+struct Region {
+    /// Array slice behind the picture.
+    slice: u32,
+    /// Visible left offset in luma samples.
+    left: u32,
+    /// Visible top offset in luma samples.
+    top: u32,
+    /// Visible width in luma samples.
+    width: u32,
+    /// Visible height in luma samples.
+    height: u32,
+}
+
+/// `manager` through `transform` as its D3D11 device manager.
+#[cfg(target_os = "windows")]
+fn send_manager(
+    transform: &IMFTransform,
+    manager: &IMFDXGIDeviceManager,
+) -> Result<(), D3d11Error> {
+    // Sound: the manager outlives the call; the transform AddRefs its copy.
+    call(
+        unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize) },
+        "ProcessMessage",
+    )
+}
+
+/// MFT input bind flags behind `stream`, shader-resource without the hint.
+#[cfg(target_os = "windows")]
+fn bind_flags(transform: &IMFTransform, stream: u32) -> u32 {
+    // Sound: the transform is live; absent keys read as unset.
+    let hint = unsafe { transform.GetInputStreamAttributes(stream) }
+        .ok()
+        .and_then(|attrs| unsafe { attrs.GetUINT32(&MF_SA_D3D11_BINDFLAGS) }.ok())
+        .unwrap_or(0);
+    hint | u32_flag(D3D11_BIND_SHADER_RESOURCE.0)
 }
 
 /// `MediaFoundation` platform, started once per process.

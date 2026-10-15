@@ -207,6 +207,16 @@ impl Session {
         self.export.clone()
     }
 
+    /// Shared decode texture plus `slot`, absent without NT-handle sharing.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn surface(&self, slot: u8) -> Option<(SharedExport, u8)> {
+        if usize::from(slot) >= self.views.len() {
+            return None;
+        }
+        self.export.clone().map(|export| (export, slot))
+    }
+
     /// Decode `submission` onto its surface slot.
     ///
     /// # Errors

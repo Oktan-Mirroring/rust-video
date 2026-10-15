@@ -2,10 +2,15 @@
 //!
 //! Skips without hardware.
 
-#[path = "../examples/common/synthetic.rs"]
-mod synthetic;
+#[path = "../examples/common/bits.rs"]
+mod bits;
+#[path = "../examples/common/grey.rs"]
+mod grey;
+#[path = "../examples/common/hevc.rs"]
+mod hevc;
 
-use synthetic::{annex_b_packets, grey_nv12};
+use grey::grey_nv12;
+use hevc::annex_b_packets;
 
 #[cfg(not(target_os = "windows"))]
 use rust_video_d3d12::SkipReason;

@@ -436,17 +436,36 @@ pub(crate) trait PictureSubmission {
     /// Returns `Err` off Windows, past the bitstream buffer, or when the
     /// driver refuses the picture.
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error>;
+
+    /// Output texture behind the arguments decode, without readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` past the bitstream buffer or when the driver refuses
+    /// the picture.
+    #[cfg(target_os = "windows")]
+    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error>;
 }
 
 impl PictureSubmission for H264Submission {
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error> {
         session.decode(self)
     }
+
+    #[cfg(target_os = "windows")]
+    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
+        session.decode_texture(self)
+    }
 }
 
 impl PictureSubmission for HevcSubmission {
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error> {
         session.decode_hevc(self)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
+        session.decode_texture_hevc(self)
     }
 }
 
@@ -658,21 +677,53 @@ impl DecodeSession {
     /// NV12 bytes decoded from `submission` on the GPU.
     #[cfg(target_os = "windows")]
     fn decode_windows(&mut self, submission: &H264Submission) -> Result<Vec<u8>, D3d12Error> {
+        self.submit_h264(submission)?;
+        self.download()
+    }
+
+    /// Output texture behind `submission` decode, without readback.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn decode_texture(
+        &mut self,
+        submission: &H264Submission,
+    ) -> Result<ID3D12Resource, D3d12Error> {
+        self.submit_h264(submission)?;
+        Ok(self.output.clone())
+    }
+
+    /// `submission` through the video queue into the output texture.
+    #[cfg(target_os = "windows")]
+    fn submit_h264(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let input = self.input_args(submission)?;
-        self.submit_video(&input)?;
-        self.download()
+        self.submit_video(&input)
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
     #[cfg(target_os = "windows")]
     fn decode_hevc_windows(&mut self, submission: &HevcSubmission) -> Result<Vec<u8>, D3d12Error> {
+        self.submit_hevc(submission)?;
+        self.download()
+    }
+
+    /// Output texture behind `submission` decode, without readback.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn decode_texture_hevc(
+        &mut self,
+        submission: &HevcSubmission,
+    ) -> Result<ID3D12Resource, D3d12Error> {
+        self.submit_hevc(submission)?;
+        Ok(self.output.clone())
+    }
+
+    /// `submission` through the video queue into the output texture.
+    #[cfg(target_os = "windows")]
+    fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let input = self.input_args_hevc(submission)?;
-        self.submit_video(&input)?;
-        self.download()
+        self.submit_video(&input)
     }
 
     /// Bitstream length against the upload capacity.

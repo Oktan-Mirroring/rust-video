@@ -5,6 +5,8 @@ use crate::device::D3d12Device;
 use crate::error::{D3d12Error, SkipReason};
 use crate::guid::Codec;
 use crate::h264::Crop;
+#[cfg(target_os = "windows")]
+use crate::texture::GpuTexture;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
@@ -140,6 +142,34 @@ macro_rules! real_decoder {
                 picture: &$picture,
                 frames: &mut Vec<D3d12Frame>,
             ) -> Result<(), D3d12Error> {
+                let (active, submission) = self.prepare_picture(picture)?;
+                let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+                let nv12 = submission.submit(session)?;
+                let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
+                let y_len = usize::try_from(luma)
+                    .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+                if nv12.len() != y_len + y_len / 2 {
+                    return Err(D3d12Error::Unsupported(
+                        "readback short of extent".to_owned(),
+                    ));
+                }
+                let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, self.generation);
+                self.generation = self.generation.wrapping_add(1);
+                let bytes = Bytes::from(nv12);
+                let lease = self.shared.try_acquire(bytes.len() as u64)?;
+                frames.push(D3d12Frame {
+                    identity,
+                    data: bytes,
+                    lease,
+                });
+                Ok(())
+            }
+
+            /// Session plus arguments for `picture`.
+            fn prepare_picture(
+                &mut self,
+                picture: &$picture,
+            ) -> Result<(Active, $submission), D3d12Error> {
                 let active = {
                     let pps = self
                         .ingest
@@ -183,32 +213,98 @@ macro_rules! real_decoder {
                     <$submission>::build(sps, pps, picture, self.feedback)?
                 };
                 self.feedback = self.feedback.wrapping_add(1);
-                let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-                let nv12 = submission.submit(session)?;
-                let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
-                let y_len = usize::try_from(luma)
-                    .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
-                if nv12.len() != y_len + y_len / 2 {
-                    return Err(D3d12Error::Unsupported(
-                        "readback short of extent".to_owned(),
-                    ));
+                Ok((active, submission))
+            }
+
+            /// `picture` into GPU `textures` without resetting on failure.
+            #[cfg(target_os = "windows")]
+            fn texture_inner(
+                &mut self,
+                picture: &$picture,
+                textures: &mut Vec<GpuTexture>,
+            ) -> Result<(), D3d12Error> {
+                let (active, submission) = self.prepare_picture(picture)?;
+                if active.visible.width() != active.width
+                    || active.visible.height() != active.height
+                {
+                    return Err(D3d12Error::Unsupported(format!(
+                        "crop {}x{} in {}x{} needs crop copy",
+                        active.visible.width(),
+                        active.visible.height(),
+                        active.width,
+                        active.height
+                    )));
                 }
-                let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, self.generation);
+                let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+                let resource = submission.submit_texture(session)?;
+                let texture = GpuTexture::new(resource, active.visible, self.generation);
                 self.generation = self.generation.wrapping_add(1);
-                let bytes = Bytes::from(nv12);
-                let lease = self.shared.try_acquire(bytes.len() as u64)?;
-                frames.push(D3d12Frame {
-                    identity,
-                    data: bytes,
-                    lease,
-                });
+                textures.push(texture);
                 Ok(())
+            }
+
+            /// `picture` into GPU `textures`.
+            #[cfg(target_os = "windows")]
+            fn texture_picture(
+                &mut self,
+                picture: &$picture,
+                textures: &mut Vec<GpuTexture>,
+            ) -> Result<(), D3d12Error> {
+                let outcome = self.texture_inner(picture, textures);
+                if outcome.is_err() {
+                    self.reset_stream();
+                }
+                outcome
             }
 
             /// Drop the live session and sequence after a mid-picture failure.
             fn reset_stream(&mut self) {
                 self.session = None;
                 self.active = None;
+            }
+
+            /// GPU textures decoded from `packet`, possibly none.
+            ///
+            /// # Errors
+            ///
+            /// Returns `Err` without a `codec` profile or when the backend
+            /// cannot decode `packet`.
+            #[cfg(target_os = "windows")]
+            pub(crate) fn decode_texture(
+                &mut self,
+                packet: &Packet,
+            ) -> Result<Vec<GpuTexture>, D3d12Error> {
+                if !self.device.supports(Codec::$codec) {
+                    return Err(SkipReason::ProfileUnsupported {
+                        codec: Codec::$codec,
+                    }
+                    .into());
+                }
+                let pictures = self.ingest.ingest_packet(packet.data())?;
+                if pictures.len() > 1 {
+                    return Err(D3d12Error::Unsupported(
+                        "multi-picture packet needs per-picture encode".to_owned(),
+                    ));
+                }
+                let mut textures = Vec::new();
+                for picture in &pictures {
+                    self.texture_picture(picture, &mut textures)?;
+                }
+                Ok(textures)
+            }
+
+            /// GPU textures held back for reordering or buffering.
+            ///
+            /// # Errors
+            ///
+            /// Returns `Err` when the backend cannot release its held frames.
+            #[cfg(target_os = "windows")]
+            pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
+                let mut textures = Vec::new();
+                if let Some(picture) = self.ingest.finish()? {
+                    self.texture_picture(&picture, &mut textures)?;
+                }
+                Ok(textures)
             }
         }
 

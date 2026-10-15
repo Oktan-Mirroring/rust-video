@@ -3,6 +3,8 @@
 //! The live path targets Windows; other platforms decline at `open`
 //! with a typed skip.
 
+#[cfg(target_os = "windows")]
+use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
 use crate::error::D3d11Error;
 use crate::guid::Codec;
@@ -52,6 +54,34 @@ impl D3d11Encoder {
     #[must_use]
     pub fn mft_name(&self) -> &str {
         self.session.mft_name()
+    }
+
+    /// True when the session encodes from GPU textures.
+    #[must_use]
+    pub(crate) fn gpu_ready(&self) -> bool {
+        self.session.gpu_bound()
+    }
+
+    /// Packets coded from `surface`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without a D3D11 bind or when the backend cannot
+    /// encode `surface`.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn encode_surface(
+        &mut self,
+        surface: &GpuSurface,
+    ) -> Result<Vec<Packet>, D3d11Error> {
+        let size = surface.size();
+        self.session.encode_texture(
+            surface.export(),
+            u32::from(surface.slot()),
+            surface.left(),
+            surface.top(),
+            size.width(),
+            size.height(),
+        )
     }
 }
 

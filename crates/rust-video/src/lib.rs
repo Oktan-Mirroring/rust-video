@@ -5,7 +5,7 @@
 pub mod error;
 pub mod tier;
 
-pub use rust_video_caps::{frame, packet, traits};
+pub use rust_video_caps::{frame, packet, traits, transcode};
 
 pub use error::Error;
 pub use frame::{CpuFrame, CpuReadback, FramePool, GpuExport, GpuFrame, PixelFormat, Plane};
@@ -15,6 +15,7 @@ pub use tier::{
     TierPreference, VideoCodec,
 };
 pub use traits::{Decoder, Device, Encoder, Lease, OverBudget, SharedDevice};
+pub use transcode::{FallbackCause, Outcome, Plan, Route, Scale};
 
 /// Shared byte buffer.
 pub use bytes::Bytes;

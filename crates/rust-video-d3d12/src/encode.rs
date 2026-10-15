@@ -815,6 +815,29 @@ impl EncodeSession {
         let staged = self.layout.stride(nv12, self.width, self.height)?;
         DeviceResources::write_upload(&self.upload, &staged)?;
         self.submit_copy()?;
+        self.finish_picture()
+    }
+
+    /// Bitstream bytes encoded from the `src` texture on the GPU.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn encode_texture(
+        &mut self,
+        src: &ID3D12Resource,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, D3d12Error> {
+        if (width, height) != (self.width, self.height) {
+            return Err(D3d12Error::Unsupported(
+                "texture extent outside session".to_owned(),
+            ));
+        }
+        self.submit_copy_from(src)?;
+        self.finish_picture()
+    }
+
+    /// Picture through the video queue plus metadata into Annex B bytes.
+    #[cfg(target_os = "windows")]
+    fn finish_picture(&mut self) -> Result<Vec<u8>, D3d12Error> {
         self.submit_video()?;
         self.submit_download()?;
         let meta = self.read_metadata()?;
@@ -839,21 +862,42 @@ impl EncodeSession {
         Ok(out)
     }
 
-    /// NV12 upload through the direct queue into the input texture.
+    /// Copy allocator plus list reset for one submission.
     #[cfg(target_os = "windows")]
-    fn submit_copy(&mut self) -> Result<(), D3d12Error> {
+    fn reset_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
             call: "ResetAllocator",
             hresult: error.code().0,
         })?;
         // Sound: the allocator outlives the reset; no initial pipeline.
-        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| {
-            D3d12Error::Call {
-                call: "ResetList",
-                hresult: error.code().0,
-            }
+        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    /// Closed copy list through the direct queue.
+    #[cfg(target_os = "windows")]
+    fn close_copy(&mut self) -> Result<(), D3d12Error> {
+        // Sound: the list holds the caller's barriers and copies.
+        unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
+            call: "Close",
+            hresult: error.code().0,
         })?;
+        // Sound: the list is closed; the cast holds the live list.
+        let command: ID3D12CommandList =
+            self.copy_list.cast().map_err(|error| D3d12Error::Call {
+                call: "CastCommandList",
+                hresult: error.code().0,
+            })?;
+        self.fence.submit(&self.copy_queue, &command)
+    }
+
+    /// NV12 upload through the direct queue into the input texture.
+    #[cfg(target_os = "windows")]
+    fn submit_copy(&mut self) -> Result<(), D3d12Error> {
+        self.reset_copy()?;
         // Sound: the barriers name a live texture; the list is open.
         unsafe {
             self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
@@ -882,18 +926,56 @@ impl EncodeSession {
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
-        // Sound: the list holds only the barriers and copies above.
-        unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.copy_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.copy_queue, &command)
+        self.close_copy()
+    }
+
+    /// `src` texture planes through the direct queue into the input texture.
+    #[cfg(target_os = "windows")]
+    fn submit_copy_from(&mut self, src: &ID3D12Resource) -> Result<(), D3d12Error> {
+        self.reset_copy()?;
+        // Sound: the barriers name live textures; the list is open.
+        unsafe {
+            self.copy_list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &self.input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+                DeviceResources::barrier(
+                    src,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+            ]);
+        }
+        // Sound: the copy locations name live resources; the list is open.
+        unsafe {
+            for index in [0u32, 1u32] {
+                let dst = DeviceResources::subresource_location(&self.input, index);
+                let src_loc = DeviceResources::subresource_location(src, index);
+                self.copy_list.CopyTextureRegion(
+                    std::ptr::from_ref(&dst),
+                    0,
+                    0,
+                    0,
+                    std::ptr::from_ref(&src_loc),
+                    None,
+                );
+            }
+            self.copy_list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &self.input,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+                DeviceResources::barrier(
+                    src,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+            ]);
+        }
+        self.close_copy()
     }
 
     /// Picture control over `pic_data`.
