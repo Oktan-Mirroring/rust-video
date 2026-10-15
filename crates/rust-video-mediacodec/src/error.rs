@@ -6,9 +6,6 @@ use crate::quirks::QuirkSyntax;
 /// `MediaCodec` tier failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MediaCodecError {
-    /// Backend missing off Android.
-    #[error("MediaCodec backend absent on this platform")]
-    BackendAbsent,
     /// Device below the 21 floor.
     #[error("API level {found} below minimum {}", crate::sdk::MIN_SDK)]
     BelowMinSdk {
@@ -99,10 +96,6 @@ mod tests {
 
     #[test]
     fn displays_name_cause() {
-        assert_eq!(
-            MediaCodecError::BackendAbsent.to_string(),
-            "MediaCodec backend absent on this platform"
-        );
         assert_eq!(
             MediaCodecError::NoDecoder { mime: "video/avc" }.to_string(),
             "no MediaCodec decoder for video/avc"

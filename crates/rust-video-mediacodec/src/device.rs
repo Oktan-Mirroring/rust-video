@@ -16,13 +16,11 @@ impl MediaCodecDevice {
     const NAME: &'static str = "mediacodec";
 
     /// Device probed on this machine.
+    #[cfg(target_os = "android")]
     #[must_use]
     pub fn probe() -> Self {
         Self {
-            #[cfg(target_os = "android")]
             level: Some(ApiLevel::current()),
-            #[cfg(not(target_os = "android"))]
-            level: None,
         }
     }
 
@@ -48,20 +46,15 @@ impl Device for MediaCodecDevice {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "android")]
     use super::MediaCodecDevice;
 
+    #[cfg(target_os = "android")]
     use rust_video_caps::traits::Device;
 
+    #[cfg(target_os = "android")]
     #[test]
     fn probe_names_tier() {
         assert_eq!(MediaCodecDevice::probe().name(), "mediacodec");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "android"))]
-    fn probe_absent_off_android() {
-        let device = MediaCodecDevice::probe();
-        assert!(!device.available());
-        assert!(device.api_level().is_none());
     }
 }
