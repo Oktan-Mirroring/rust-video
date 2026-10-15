@@ -6,10 +6,12 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsStr,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 use rust_video_harness::FrameHash;
@@ -453,13 +455,132 @@ fn probe(path: &Path) -> Result<Probe, String> {
     })
 }
 
-fn decode_frames(path: &Path, pix_fmt: &str, slot: usize) -> Result<Vec<Vec<u8>>, String> {
-    let dir = std::env::temp_dir().join(format!("rust-video-golden-{}-{slot}", std::process::id()));
+fn frame_root_from(tmpdir: Option<&OsStr>) -> PathBuf {
+    tmpdir
+        .filter(|set| !set.is_empty())
+        .map_or_else(|| PathBuf::from(".tmp"), PathBuf::from)
+}
+
+fn frame_root() -> Result<PathBuf, String> {
+    let root = frame_root_from(env::var_os("TMPDIR").as_deref());
+    fs::create_dir_all(&root).map_err(|e| format!("frame root failed: {e}"))?;
+    Ok(root)
+}
+
+fn raw_frame_size(path: &Path, pix_fmt: &str, slot: usize, root: &Path) -> Result<usize, String> {
+    let probe = root.join(format!(
+        "rust-video-golden-{}-{slot}.probe",
+        std::process::id()
+    ));
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-i"]);
+    cmd.arg(path);
+    cmd.args([
+        "-map",
+        "0:v:0",
+        "-noautoscale",
+        "-pix_fmt",
+        pix_fmt,
+        "-c:v",
+        "rawvideo",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+    ]);
+    cmd.arg(&probe);
+    cmd.stdin(Stdio::null());
+    let out = cmd.output().map_err(|e| format!("spawn failed: {e}"))?;
+    let size = fs::metadata(&probe).map_or(0, |found| found.len());
+    let _ = fs::remove_file(&probe);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("decode {} failed: {err}", path.display()));
+    }
+    if size == 0 {
+        return Err(format!("decode {} yielded no frames", path.display()));
+    }
+    usize::try_from(size).map_err(|_| format!("decode {} frame too large", path.display()))
+}
+
+enum Shapes {
+    Unknown,
+    Uniform,
+    Varied,
+}
+
+fn parse_shapes(text: &str) -> Shapes {
+    let mut first: Option<&str> = None;
+    let mut count = 0;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+            return Shapes::Unknown;
+        }
+        count += 1;
+        match first {
+            None => first = Some(line),
+            Some(want) if want == line => {}
+            Some(_) => return Shapes::Varied,
+        }
+    }
+    if count == 0 {
+        Shapes::Unknown
+    } else {
+        Shapes::Uniform
+    }
+}
+
+fn frame_shapes(path: &Path) -> Shapes {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "frame=width,height,pix_fmt",
+        "-of",
+        "csv=p=0",
+    ]);
+    cmd.arg(path);
+    let Ok(out) = cmd.output() else {
+        return Shapes::Unknown;
+    };
+    if !out.status.success() {
+        return Shapes::Unknown;
+    }
+    parse_shapes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Spill ceiling for the file fallback; a vector past it skips loudly.
+const SPILL_CAP: u64 = 256 * 1024 * 1024;
+
+fn dir_size(dir: &Path) -> Result<u64, String> {
+    let mut total = 0;
+    let entries = fs::read_dir(dir).map_err(|e| format!("{} unreadable: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("frame entry failed: {e}"))?;
+        total += entry.metadata().map_or(0, |found| found.len());
+    }
+    Ok(total)
+}
+
+fn file_hashes(
+    path: &Path,
+    pix_fmt: &str,
+    slot: usize,
+    root: &Path,
+) -> Result<Vec<FrameHash>, String> {
+    let tag = format!("rust-video-golden-{}-{slot}", std::process::id());
+    let dir = root.join(&tag);
     if dir.is_dir() {
         fs::remove_dir_all(&dir).map_err(|e| format!("stale frame dir failed: {e}"))?;
     }
     fs::create_dir_all(&dir).map_err(|e| format!("frame dir failed: {e}"))?;
     let pattern = dir.join("f%05d.bin");
+    let err_path = root.join(format!("{tag}.stderr"));
+    let err_file = fs::File::create(&err_path).map_err(|e| format!("stderr file failed: {e}"))?;
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-i"]);
     cmd.arg(path);
@@ -477,24 +598,171 @@ fn decode_frames(path: &Path, pix_fmt: &str, slot: usize) -> Result<Vec<Vec<u8>>
         "image2",
     ]);
     cmd.arg(&pattern);
-    let (ok, err, _) = spawn(&mut cmd)?;
-    if !ok {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(format!("decode {} failed: {err}", path.display()));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(err_file);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            let _ = fs::remove_file(&err_path);
+            return Err(format!("spawn failed: {e}"));
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(None) => {
+                let size = match dir_size(&dir) {
+                    Ok(size) => size,
+                    Err(why) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = fs::remove_dir_all(&dir);
+                        let _ = fs::remove_file(&err_path);
+                        return Err(why);
+                    }
+                };
+                if size > SPILL_CAP {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = fs::remove_dir_all(&dir);
+                    let _ = fs::remove_file(&err_path);
+                    return Err(format!("decode {} spill cap exceeded", path.display()));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let err = fs::read_to_string(&err_path).unwrap_or_default();
+                    let _ = fs::remove_dir_all(&dir);
+                    let _ = fs::remove_file(&err_path);
+                    return Err(format!("decode {} failed: {err}", path.display()));
+                }
+                break;
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = fs::remove_dir_all(&dir);
+                let _ = fs::remove_file(&err_path);
+                return Err(format!("wait failed: {e}"));
+            }
+        }
     }
-    let names: Vec<PathBuf> = children(&dir)?
+    let mut names: Vec<PathBuf> = children(&dir)?
         .into_iter()
         .filter(|p| p.is_file())
         .collect();
-    let mut frames = Vec::with_capacity(names.len());
+    names.sort();
+    let mut hashes = Vec::with_capacity(names.len());
     for name in &names {
-        frames.push(fs::read(name).map_err(|e| format!("frame read failed: {e}"))?);
+        let bytes = fs::read(name).map_err(|e| format!("frame read failed: {e}"))?;
+        hashes.push(FrameHash::of(&bytes));
+        fs::remove_file(name).map_err(|e| format!("frame cleanup failed: {e}"))?;
     }
     fs::remove_dir_all(&dir).map_err(|e| format!("frame cleanup failed: {e}"))?;
-    if frames.is_empty() {
+    let _ = fs::remove_file(&err_path);
+    if hashes.is_empty() {
         return Err(format!("decode {} yielded no frames", path.display()));
     }
-    Ok(frames)
+    Ok(hashes)
+}
+
+fn pipe_hashes(
+    path: &Path,
+    pix_fmt: &str,
+    slot: usize,
+    root: &Path,
+    size: usize,
+) -> Result<Vec<FrameHash>, String> {
+    use std::io::Read as _;
+    let tag = format!("rust-video-golden-{}-{slot}", std::process::id());
+    let err_path = root.join(format!("{tag}.stderr"));
+    let err_file = fs::File::create(&err_path).map_err(|e| format!("stderr file failed: {e}"))?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-i"]);
+    cmd.arg(path);
+    cmd.args([
+        "-map",
+        "0:v:0",
+        "-noautoscale",
+        "-pix_fmt",
+        pix_fmt,
+        "-c:v",
+        "rawvideo",
+        "-vsync",
+        "0",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(err_file);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = fs::remove_file(&err_path);
+            return Err(format!("spawn failed: {e}"));
+        }
+    };
+    let mut hashes = Vec::new();
+    let mut frame = vec![0u8; size];
+    let mut first = [0u8; 1];
+    let failed = match child.stdout.take() {
+        Some(stdout) => {
+            let mut pipe = std::io::BufReader::new(stdout);
+            loop {
+                match pipe.read(&mut first) {
+                    Ok(0) => break None,
+                    Ok(_) => {
+                        frame[0] = first[0];
+                        match pipe.read_exact(&mut frame[1..]) {
+                            Ok(()) => hashes.push(FrameHash::of(&frame)),
+                            Err(_) => {
+                                break Some(format!(
+                                    "decode {} truncated mid-frame",
+                                    path.display()
+                                ));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        break Some(format!("decode {} pipe read failed", path.display()));
+                    }
+                }
+            }
+        }
+        None => Some(format!("decode {} pipe missing", path.display())),
+    };
+    let status = child.wait().map_err(|e| format!("wait failed: {e}"))?;
+    if let Some(why) = failed {
+        let _ = fs::remove_file(&err_path);
+        return Err(why);
+    }
+    if !status.success() {
+        let err = fs::read_to_string(&err_path).unwrap_or_default();
+        let _ = fs::remove_file(&err_path);
+        return Err(format!("decode {} failed: {err}", path.display()));
+    }
+    let _ = fs::remove_file(&err_path);
+    if hashes.is_empty() {
+        return Err(format!("decode {} yielded no frames", path.display()));
+    }
+    Ok(hashes)
+}
+
+fn decode_hashes(path: &Path, pix_fmt: &str, slot: usize) -> Result<Vec<FrameHash>, String> {
+    let root = frame_root()?;
+    if matches!(frame_shapes(path), Shapes::Uniform) {
+        match raw_frame_size(path, pix_fmt, slot, &root) {
+            Ok(size) => match pipe_hashes(path, pix_fmt, slot, &root, size) {
+                Ok(hashes) => return Ok(hashes),
+                Err(why) => println!("pipe retry as files {}: {why}", path.display()),
+            },
+            Err(why) => println!("pipe retry as files {}: {why}", path.display()),
+        }
+    }
+    file_hashes(path, pix_fmt, slot, &root)
 }
 
 fn scan_dir(dir: &Path, codec: &str, synth: bool) -> Result<Vec<Vector>, String> {
@@ -594,9 +862,9 @@ fn generate(goldens: &Path, vectors: &[Vector], ffmpeg: &str) -> Result<usize, S
     let mut skipped = 0;
     let mut seen: Vec<PathBuf> = Vec::new();
     for (slot, vector) in vectors.iter().enumerate() {
-        let Some(frames) = keep(
+        let Some(hashes) = keep(
             &vector.path,
-            decode_frames(&vector.path, &vector.probe.pix_fmt, slot),
+            decode_hashes(&vector.path, &vector.probe.pix_fmt, slot),
         ) else {
             skipped += 1;
             continue;
@@ -617,13 +885,13 @@ fn generate(goldens: &Path, vectors: &[Vector], ffmpeg: &str) -> Result<usize, S
             vector.probe.pix_fmt,
             vector.probe.width,
             vector.probe.height,
-            frames.len(),
+            hashes.len(),
         );
         if let Some(recipe) = &vector.synth {
             writeln!(text, "# synth: {recipe}").expect("String write");
         }
-        for frame in &frames {
-            text.push_str(&FrameHash::of(frame).hex());
+        for hash in &hashes {
+            text.push_str(&hash.hex());
             text.push('\n');
         }
         let tmp = target.with_extension("tmp");
@@ -779,4 +1047,38 @@ fn run() -> Result<(), String> {
         writeln!(msg, "- {}/{}: {fix}", req.codec, req.name).expect("String write");
     }
     Err(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{frame_root_from, parse_shapes, Shapes};
+    use std::path::PathBuf;
+
+    #[test]
+    fn root_prefers_tmpdir() {
+        assert_eq!(
+            frame_root_from(Some("/scratch/tmp".as_ref())),
+            PathBuf::from("/scratch/tmp")
+        );
+    }
+
+    #[test]
+    fn root_falls_back_to_repo_tmp() {
+        assert_eq!(frame_root_from(None), PathBuf::from(".tmp"));
+        assert_eq!(frame_root_from(Some("".as_ref())), PathBuf::from(".tmp"));
+    }
+
+    #[test]
+    fn shapes_classifies_uniformity() {
+        assert!(matches!(
+            parse_shapes("352,288,yuv420p\n352,288,yuv420p\n"),
+            Shapes::Uniform
+        ));
+        assert!(matches!(
+            parse_shapes("352,288,yuv420p\n176,144,yuv420p\n"),
+            Shapes::Varied
+        ));
+        assert!(matches!(parse_shapes(""), Shapes::Unknown));
+        assert!(matches!(parse_shapes("352,288\n"), Shapes::Unknown));
+    }
 }
