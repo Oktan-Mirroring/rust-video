@@ -9,10 +9,14 @@ use crate::error::D3d11Error;
 #[cfg(not(target_os = "windows"))]
 use crate::error::SkipReason;
 use crate::guid::Codec;
+#[cfg(target_os = "windows")]
+use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
+#[cfg(target_os = "windows")]
+use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
 
 /// GPU transcode from decode surface to encoder texture.
@@ -25,6 +29,12 @@ pub struct Transcoder<'a> {
     caps: GpuCaps,
     /// Optional scale hop.
     scale: Scale,
+    /// Device behind the scale hop.
+    #[cfg(target_os = "windows")]
+    device: &'a D3d11Device,
+    /// Scale hop, opened on first use.
+    #[cfg(target_os = "windows")]
+    scaler: Option<Scaler>,
     /// Executed plan for passthrough frames.
     plan: Plan,
 }
@@ -53,14 +63,19 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
+            #[cfg(target_os = "windows")]
+            device,
+            #[cfg(target_os = "windows")]
+            scaler: None,
             plan,
         })
     }
 
     /// Transcoder retargeted to `target`.
     ///
-    /// A size change without GPU scale fails loud at `transcode` and
-    /// `flush` with `Unsupported`, never silently.
+    /// A size change scales on the GPU where the box supports it, else
+    /// fails loud at `transcode` and `flush` with `Unsupported`, never
+    /// silently.
     #[must_use]
     pub fn with_target(mut self, target: PictureSize) -> Self {
         self.scale = Scale::to(target);
@@ -142,11 +157,40 @@ impl<'a> Transcoder<'a> {
         let mut packets = Vec::new();
         for surface in surfaces {
             if let Some(cause) = self.scale.miss(surface.size()) {
-                return Err(D3d11Error::Unsupported(cause.to_string()));
+                let scaled = self.scaled_or_miss(surface, cause)?;
+                packets.append(&mut self.encoder.encode_scaled(&scaled)?);
+            } else {
+                packets.append(&mut self.encoder.encode_surface(surface)?);
             }
-            packets.append(&mut self.encoder.encode_surface(surface)?);
         }
         Ok(packets)
+    }
+
+    /// Scaled `surface` for a `cause` miss, or the loud miss itself.
+    #[cfg(target_os = "windows")]
+    fn scaled_or_miss(
+        &mut self,
+        surface: &GpuSurface,
+        cause: FallbackCause,
+    ) -> Result<ScaledSurface, D3d11Error> {
+        let FallbackCause::ScaleNeeded { from, to } = cause else {
+            return Err(D3d11Error::Unsupported(cause.to_string()));
+        };
+        if self
+            .scaler
+            .as_ref()
+            .is_none_or(|scaler| scaler.from() != from || scaler.to() != to)
+        {
+            match Scaler::open(self.device, from, to) {
+                Ok(scaler) => self.scaler = Some(scaler),
+                Err(D3d11Error::Unsupported(_)) => {
+                    return Err(D3d11Error::Unsupported(cause.to_string()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let scaler = self.scaler.as_ref().ok_or(D3d11Error::NoSession)?;
+        scaler.scale(surface)
     }
 
     /// `frames` through the proven CPU path.

@@ -16,12 +16,18 @@ impl PicEntryH264 {
     /// Entry naming no surface.
     pub(crate) const INVALID: Self = Self { entry: 0xFF };
 
+    /// Entry for surface `index` with `flag` set.
+    #[must_use]
+    pub(crate) const fn new(index: u8, flag: bool) -> Self {
+        Self {
+            entry: (index & 0x7F) | ((flag as u8) << 7),
+        }
+    }
+
     /// Entry for surface `index` without the flag.
     #[must_use]
     pub(crate) const fn frame(index: u8) -> Self {
-        Self {
-            entry: index & 0x7F,
-        }
+        Self::new(index, false)
     }
 }
 

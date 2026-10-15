@@ -86,7 +86,7 @@ fn report(frame: &D3d12Frame) {
     }
 }
 
-/// HEVC encode attempt; the args builder is pending, so this names the miss.
+/// HEVC encode attempt; names the miss when the box declines it.
 fn probe_encode_miss(device: &D3d12Device) {
     let mut encoder = match D3d12Encoder::open(device, Codec::Hevc) {
         Ok(encoder) => encoder,
@@ -101,6 +101,6 @@ fn probe_encode_miss(device: &D3d12Device) {
             let bytes: usize = packets.iter().map(|packet| packet.data().len()).sum();
             println!("hevc encode: 320x240 bitstream {bytes}B");
         }
-        Err(error) => println!("MISS: hevc encode args pending ({error})"),
+        Err(error) => println!("MISS: hevc encode miss ({error})"),
     }
 }

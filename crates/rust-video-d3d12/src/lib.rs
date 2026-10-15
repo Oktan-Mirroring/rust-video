@@ -6,6 +6,7 @@ mod bits;
 mod decode;
 mod decoder;
 mod device;
+mod dpb;
 mod dxva;
 mod encode;
 mod encoder;
@@ -13,6 +14,8 @@ mod error;
 mod guid;
 mod h264;
 mod hevc;
+#[cfg(target_os = "windows")]
+mod scale;
 mod submit;
 #[cfg(target_os = "windows")]
 mod texture;

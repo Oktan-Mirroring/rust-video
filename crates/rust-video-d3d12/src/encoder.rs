@@ -24,7 +24,10 @@ use rust_video_caps::traits::Encoder;
 /// reports intra4x4 mode -1 at MB 0,0); parameter sets are exonerated.
 /// Corruption spans high/main profiles, CQP/default rate control, and
 /// GOP lengths; only main profile with CQP and intra-only stays clean.
-/// Retest on 617.42 or later; flat input is unaffected.
+/// Retest on 617.42 or later; flat input is unaffected. HEVC encode
+/// needs driver configuration support: boxes reporting the codec but
+/// refusing its configuration fail the first frame loud with
+/// `OverCaps`; retest on 617.42 or later.
 pub struct D3d12Encoder<'a> {
     /// Device owning the encode session.
     device: &'a D3d12Device,

@@ -1,6 +1,6 @@
 //! D3D12 video encode: headers plus GPU submission.
 //!
-//! Intra-only H.264; reference pictures stay pending.
+//! Intra-only H.264 and HEVC; reference pictures stay pending.
 
 #![allow(unsafe_code)]
 
@@ -18,10 +18,10 @@ use windows::core::Interface;
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
-    ID3D12Resource, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE,
-    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
+    D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
+    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
 };
@@ -29,41 +29,58 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL};
 #[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
-    ID3D12VideoDevice, ID3D12VideoDevice3, ID3D12VideoEncodeCommandList2, ID3D12VideoEncoder,
-    ID3D12VideoEncoderHeap, D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_32x32,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_8x8,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_32x32,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_4x4, ID3D12VideoDevice, ID3D12VideoDevice3,
+    ID3D12VideoEncodeCommandList2, ID3D12VideoEncoder, ID3D12VideoEncoderHeap,
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS,
     D3D12_FEATURE_VIDEO_ENCODER_RESOURCE_REQUIREMENTS,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_DIRECT_MODES_DISABLED,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_SLICES_DEBLOCKING_MODE_0_ALL_LUMA_CHROMA_SLICE_BLOCK_EDGES_ALWAYS_FILTERED,
-    D3D12_VIDEO_ENCODER_CODEC_H264, D3D12_VIDEO_ENCODER_COMPRESSED_BITSTREAM,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE, D3D12_VIDEO_ENCODER_CODEC_H264,
+    D3D12_VIDEO_ENCODER_CODEC_HEVC, D3D12_VIDEO_ENCODER_COMPRESSED_BITSTREAM,
     D3D12_VIDEO_ENCODER_DESC, D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS,
     D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS,
     D3D12_VIDEO_ENCODER_ENCODE_OPERATION_METADATA_BUFFER, D3D12_VIDEO_ENCODER_FLAGS,
     D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME,
-    D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME, D3D12_VIDEO_ENCODER_HEAP_DESC,
-    D3D12_VIDEO_ENCODER_HEAP_FLAGS, D3D12_VIDEO_ENCODER_INTRA_REFRESH,
-    D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE, D3D12_VIDEO_ENCODER_LEVELS_H264,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_1, D3D12_VIDEO_ENCODER_LEVELS_H264_11,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_12, D3D12_VIDEO_ENCODER_LEVELS_H264_13,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_2, D3D12_VIDEO_ENCODER_LEVELS_H264_21,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_22, D3D12_VIDEO_ENCODER_LEVELS_H264_3,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_31, D3D12_VIDEO_ENCODER_LEVELS_H264_32,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_4, D3D12_VIDEO_ENCODER_LEVELS_H264_41,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_42, D3D12_VIDEO_ENCODER_LEVELS_H264_5,
-    D3D12_VIDEO_ENCODER_LEVELS_H264_51, D3D12_VIDEO_ENCODER_LEVELS_H264_52,
-    D3D12_VIDEO_ENCODER_LEVEL_SETTING, D3D12_VIDEO_ENCODER_LEVEL_SETTING_0,
+    D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME, D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_IDR_FRAME,
+    D3D12_VIDEO_ENCODER_HEAP_DESC, D3D12_VIDEO_ENCODER_HEAP_FLAGS,
+    D3D12_VIDEO_ENCODER_INTRA_REFRESH, D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE,
+    D3D12_VIDEO_ENCODER_LEVELS_H264, D3D12_VIDEO_ENCODER_LEVELS_H264_1,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_11, D3D12_VIDEO_ENCODER_LEVELS_H264_12,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_13, D3D12_VIDEO_ENCODER_LEVELS_H264_2,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_21, D3D12_VIDEO_ENCODER_LEVELS_H264_22,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_3, D3D12_VIDEO_ENCODER_LEVELS_H264_31,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_32, D3D12_VIDEO_ENCODER_LEVELS_H264_4,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_41, D3D12_VIDEO_ENCODER_LEVELS_H264_42,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_5, D3D12_VIDEO_ENCODER_LEVELS_H264_51,
+    D3D12_VIDEO_ENCODER_LEVELS_H264_52, D3D12_VIDEO_ENCODER_LEVELS_HEVC,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_1, D3D12_VIDEO_ENCODER_LEVELS_HEVC_2,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_21, D3D12_VIDEO_ENCODER_LEVELS_HEVC_3,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_31, D3D12_VIDEO_ENCODER_LEVELS_HEVC_4,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_41, D3D12_VIDEO_ENCODER_LEVELS_HEVC_5,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_51, D3D12_VIDEO_ENCODER_LEVELS_HEVC_52,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_6, D3D12_VIDEO_ENCODER_LEVELS_HEVC_61,
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC_62, D3D12_VIDEO_ENCODER_LEVEL_SETTING,
+    D3D12_VIDEO_ENCODER_LEVEL_SETTING_0, D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC,
     D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_FULL_PIXEL,
     D3D12_VIDEO_ENCODER_OUTPUT_METADATA, D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_0,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264_FLAG_NONE,
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC,
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_NONE,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA,
     D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC, D3D12_VIDEO_ENCODER_PROFILE_DESC,
     D3D12_VIDEO_ENCODER_PROFILE_DESC_0, D3D12_VIDEO_ENCODER_PROFILE_H264,
-    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_RATE_CONTROL,
+    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN, D3D12_VIDEO_ENCODER_RATE_CONTROL,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0, D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP,
@@ -72,7 +89,9 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS,
     D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC, D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAGS,
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE, D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_0,
-    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264, D3D12_VIDEO_ENCODE_REFERENCE_FRAMES,
+    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
+    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC, D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN,
+    D3D12_VIDEO_ENCODE_REFERENCE_FRAMES,
 };
 
 /// Macroblock edge in luma samples.
@@ -101,29 +120,73 @@ const LEVELS: &[(u32, u8)] = &[
     (36864, 52),
 ];
 
+/// Level ceiling per luma sample count, H.265 Table A-1.
+const LEVELS_HEVC: &[(u32, u8)] = &[
+    (36864, 30),
+    (122_880, 60),
+    (245_760, 63),
+    (552_960, 90),
+    (983_040, 93),
+    (2_228_224, 120),
+    (8_912_896, 150),
+    (35_651_584, 180),
+];
+
+/// Coded extent for `visible` on the macroblock grid.
+fn pad_grid(visible: u32) -> Result<u32, D3d12Error> {
+    visible
+        .div_ceil(MB)
+        .checked_mul(MB)
+        .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))
+}
+
+/// Right and bottom pad in luma samples under `visible` in `coded`.
+fn pad_crop(
+    coded: (u32, u32),
+    visible: (u32, u32),
+) -> Result<Option<crate::h264::Crop>, D3d12Error> {
+    let right = coded.0.saturating_sub(visible.0);
+    let bottom = coded.1.saturating_sub(visible.1);
+    if right == 0 && bottom == 0 {
+        return Ok(None);
+    }
+    if !right.is_multiple_of(2) || !bottom.is_multiple_of(2) {
+        return Err(D3d12Error::Unsupported("odd visible extent".to_owned()));
+    }
+    Ok(Some(crate::h264::Crop {
+        left: 0,
+        right,
+        top: 0,
+        bottom,
+    }))
+}
+
 /// Annex B sequence headers matching the encoder configuration.
 pub(crate) struct H264Headers {
     /// Start-coded SPS plus PPS.
     bytes: Vec<u8>,
     /// Level idc behind the headers.
     level_idc: u8,
+    /// Coded extent on the macroblock grid.
+    coded: (u32, u32),
 }
 
 impl H264Headers {
-    /// Headers for `width` by `height` on the macroblock grid.
+    /// Headers for `width` by `height`, padded to the macroblock grid.
+    ///
+    /// A padded extent carries a frame crop rectangle over the visible
+    /// size; the encoder session codes the padded grid.
     ///
     /// # Errors
     ///
-    /// Returns `Err` off the macroblock grid or past level 5.2.
+    /// Returns `Err` for an odd visible extent or past level 5.2.
     pub(crate) fn build(width: u32, height: u32) -> Result<Self, D3d12Error> {
-        if !width.is_multiple_of(MB) || !height.is_multiple_of(MB) {
-            return Err(D3d12Error::Unsupported(
-                "extent outside macroblock grid".to_owned(),
-            ));
-        }
-        let mbs = width
+        let coded = (pad_grid(width)?, pad_grid(height)?);
+        let crop = pad_crop(coded, (width, height))?;
+        let mbs = coded
+            .0
             .checked_div(MB)
-            .and_then(|w| height.checked_div(MB).and_then(|h| w.checked_mul(h)))
+            .and_then(|w| coded.1.checked_div(MB).and_then(|h| w.checked_mul(h)))
             .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))?;
         let level_idc = LEVELS.iter().find(|entry| mbs <= entry.0).map_or_else(
             || Err(D3d12Error::Unsupported("extent above level 5.2".to_owned())),
@@ -131,26 +194,44 @@ impl H264Headers {
         )?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x67]);
-        bytes.extend_from_slice(&sps_body(width / MB - 1, height / MB - 1, level_idc));
+        bytes.extend_from_slice(&sps_body(
+            coded.0 / MB - 1,
+            coded.1 / MB - 1,
+            level_idc,
+            crop,
+        ));
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x68]);
         bytes.extend_from_slice(&pps_body());
-        Ok(Self { bytes, level_idc })
-    }
-
-    /// Start-coded header bytes.
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
+        Ok(Self {
+            bytes,
+            level_idc,
+            coded,
+        })
     }
 
     /// Level idc behind the headers.
     pub(crate) fn level_idc(&self) -> u8 {
         self.level_idc
     }
+
+    /// Coded extent on the macroblock grid.
+    pub(crate) fn coded(&self) -> (u32, u32) {
+        self.coded
+    }
+
+    /// Start-coded header bytes.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Sequence set body for the encoder configuration.
-fn sps_body(width_mbs_minus1: u32, height_mbs_minus1: u32, level_idc: u8) -> Vec<u8> {
+fn sps_body(
+    width_mbs_minus1: u32,
+    height_mbs_minus1: u32,
+    level_idc: u8,
+    crop: Option<crate::h264::Crop>,
+) -> Vec<u8> {
     let mut writer = BitWriter::new();
     writer.bits(u32::from(PROFILE_IDC), 8);
     writer.bits(0, 8);
@@ -170,6 +251,202 @@ fn sps_body(width_mbs_minus1: u32, height_mbs_minus1: u32, level_idc: u8) -> Vec
     writer.ue(height_mbs_minus1);
     writer.bit(true);
     writer.bit(true);
+    if let Some(crop) = crop {
+        writer.bit(true);
+        writer.ue(0);
+        writer.ue(crop.right / 2);
+        writer.ue(0);
+        writer.ue(crop.bottom / 2);
+    } else {
+        writer.bit(false);
+    }
+    writer.bit(false);
+    writer.finish()
+}
+
+/// Annex B parameter sets matching the HEVC encoder configuration.
+pub(crate) struct HevcHeaders {
+    /// Start-coded VPS plus SPS plus PPS.
+    bytes: Vec<u8>,
+    /// Level idc behind the headers.
+    level_idc: u8,
+    /// Coded extent on the macroblock grid.
+    coded: (u32, u32),
+}
+
+impl HevcHeaders {
+    /// Headers for `width` by `height`, padded to the macroblock grid.
+    ///
+    /// Block sizes match the encoder configuration: 8 to 32 luma
+    /// coding blocks, 4 to 32 luma transform blocks, depth one. A
+    /// padded extent carries a conformance window over the visible
+    /// size; the encoder session codes the padded grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an odd visible extent or past level 6.2.
+    pub(crate) fn build(width: u32, height: u32) -> Result<Self, D3d12Error> {
+        let coded = (pad_grid(width)?, pad_grid(height)?);
+        let crop = pad_crop(coded, (width, height))?;
+        let samples = coded
+            .0
+            .checked_mul(coded.1)
+            .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))?;
+        let level_idc = LEVELS_HEVC
+            .iter()
+            .find(|entry| samples <= entry.0)
+            .map_or_else(
+                || Err(D3d12Error::Unsupported("extent above level 6.2".to_owned())),
+                |entry| Ok(entry.1),
+            )?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x40, 0x01]);
+        bytes.extend_from_slice(&hevc_vps_body(level_idc));
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01]);
+        bytes.extend_from_slice(&hevc_sps_body(coded.0, coded.1, level_idc, crop));
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01]);
+        bytes.extend_from_slice(&hevc_pps_body());
+        Ok(Self {
+            bytes,
+            level_idc,
+            coded,
+        })
+    }
+
+    /// Level idc behind the headers.
+    pub(crate) fn level_idc(&self) -> u8 {
+        self.level_idc
+    }
+
+    /// Coded extent on the macroblock grid.
+    pub(crate) fn coded(&self) -> (u32, u32) {
+        self.coded
+    }
+
+    /// Start-coded header bytes.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Video set body for the encoder configuration.
+fn hevc_vps_body(level_idc: u8) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    writer.bits(0, 4);
+    writer.bit(true);
+    writer.bit(true);
+    writer.bits(0, 6);
+    writer.bits(0, 3);
+    writer.bit(true);
+    writer.bits(0xFFFF, 16);
+    hevc_profile_tier(&mut writer, level_idc);
+    writer.bit(true);
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);
+    writer.bits(0, 6);
+    writer.ue(0);
+    writer.bit(false);
+    writer.bit(false);
+    writer.finish()
+}
+
+/// Sequence set body for the encoder configuration.
+fn hevc_sps_body(
+    width: u32,
+    height: u32,
+    level_idc: u8,
+    crop: Option<crate::h264::Crop>,
+) -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    writer.bits(0, 4);
+    writer.bits(0, 3);
+    writer.bit(true);
+    hevc_profile_tier(&mut writer, level_idc);
+    writer.ue(0);
+    writer.ue(1);
+    writer.ue(width);
+    writer.ue(height);
+    if let Some(crop) = crop {
+        writer.bit(true);
+        writer.ue(0);
+        writer.ue(crop.right / 2);
+        writer.ue(0);
+        writer.ue(crop.bottom / 2);
+    } else {
+        writer.bit(false);
+    }
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);
+    writer.bit(true);
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(2);
+    writer.ue(0);
+    writer.ue(3);
+    writer.ue(1);
+    writer.ue(1);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.ue(0);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(true);
+    writer.bit(false);
+    writer.bit(false);
+    writer.finish()
+}
+
+/// General profile, tier, and level for the encoder configuration.
+fn hevc_profile_tier(writer: &mut BitWriter, level_idc: u8) {
+    writer.bits(0, 2);
+    writer.bit(false);
+    writer.bits(1, 5);
+    writer.bits(0x4000_0000, 32);
+    writer.bit(true);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(true);
+    writer.bits(0, 32);
+    writer.bits(0, 11);
+    writer.bit(false);
+    writer.bits(u32::from(level_idc), 8);
+}
+
+/// Picture set body for the encoder configuration.
+fn hevc_pps_body() -> Vec<u8> {
+    let mut writer = BitWriter::new();
+    writer.ue(0);
+    writer.ue(0);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bits(0, 3);
+    writer.bit(false);
+    writer.bit(false);
+    writer.ue(0);
+    writer.ue(0);
+    writer.se(0);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.se(0);
+    writer.se(0);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.ue(0);
     writer.bit(false);
     writer.bit(false);
     writer.finish()
@@ -197,6 +474,61 @@ fn pps_body() -> Vec<u8> {
     writer.bit(false);
     writer.se(0);
     writer.finish()
+}
+
+/// Tight NV12 bytes padded from `visible` to `coded` by edge replication.
+///
+/// Both extents are even; the chroma plane halves the row counts.
+///
+/// # Errors
+///
+/// Returns `Err` when `visible` bytes fall short of the visible extent.
+fn pad_nv12(
+    visible: &[u8],
+    visible_extent: (u32, u32),
+    coded_extent: (u32, u32),
+) -> Result<Vec<u8>, D3d12Error> {
+    let (vis_w, vis_h) = (visible_extent.0 as usize, visible_extent.1 as usize);
+    let (coded_w, coded_h) = (coded_extent.0 as usize, coded_extent.1 as usize);
+    let y_len = vis_w.saturating_mul(vis_h);
+    if visible.len() < y_len + y_len / 2 {
+        return Err(D3d12Error::Unsupported(
+            "nv12 short of its extent".to_owned(),
+        ));
+    }
+    let mut out = Vec::with_capacity(coded_w * coded_h * 3 / 2);
+    pad_plane(&visible[..y_len], vis_w, vis_h, coded_w, coded_h, &mut out);
+    pad_plane(
+        &visible[y_len..y_len + y_len / 2],
+        vis_w,
+        vis_h / 2,
+        coded_w,
+        coded_h / 2,
+        &mut out,
+    );
+    Ok(out)
+}
+
+/// `rows` of `width` bytes padded to `coded` geometry by edge replication.
+fn pad_plane(
+    plane: &[u8],
+    width: usize,
+    rows: usize,
+    coded_width: usize,
+    coded_rows: usize,
+    out: &mut Vec<u8>,
+) {
+    for row in 0..coded_rows {
+        let start = row
+            .min(rows.saturating_sub(1))
+            .saturating_mul(width)
+            .min(plane.len());
+        let end = start.saturating_add(width).min(plane.len());
+        let src = &plane[start..end];
+        let edge = src.last().copied().unwrap_or(0);
+        out.extend_from_slice(src);
+        out.resize(out.len() + coded_width.saturating_sub(width), edge);
+    }
 }
 
 /// Test bit writer with emulation prevention.
@@ -383,12 +715,21 @@ pub(crate) struct EncodeSession {
     /// Resolved staging buffer.
     #[cfg(target_os = "windows")]
     resolved_staging: ID3D12Resource,
+    /// Codec behind the session.
+    #[cfg(target_os = "windows")]
+    codec: crate::guid::Codec,
     /// Coded width in luma samples.
     #[cfg(target_os = "windows")]
     width: u32,
     /// Coded height in luma samples.
     #[cfg(target_os = "windows")]
     height: u32,
+    /// Visible width in luma samples.
+    #[cfg(target_os = "windows")]
+    visible_width: u32,
+    /// Visible height in luma samples.
+    #[cfg(target_os = "windows")]
+    visible_height: u32,
     /// Creation descriptors behind the encoder and heap.
     #[cfg(target_os = "windows")]
     descriptors: Box<EncoderDescriptors>,
@@ -399,13 +740,35 @@ pub(crate) struct EncodeSession {
 
 /// Encoder creation descriptors with a stable heap address.
 #[cfg(target_os = "windows")]
-struct EncoderDescriptors {
+enum EncoderDescriptors {
+    /// H.264 descriptors.
+    H264(H264Descriptors),
+    /// HEVC descriptors.
+    Hevc(HevcDescriptors),
+}
+
+/// H.264 creation descriptors with a stable heap address.
+#[cfg(target_os = "windows")]
+struct H264Descriptors {
     /// Encoder profile behind the encoder, heap, and resolve calls.
     profile: D3D12_VIDEO_ENCODER_PROFILE_H264,
     /// Encoder level behind the heap.
     level_setting: D3D12_VIDEO_ENCODER_LEVELS_H264,
     /// Codec configuration behind the encoder.
     codec_config: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264,
+    /// Coded resolution behind the heap.
+    resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC,
+}
+
+/// HEVC creation descriptors with a stable heap address.
+#[cfg(target_os = "windows")]
+struct HevcDescriptors {
+    /// Encoder profile behind the encoder, heap, and resolve calls.
+    profile: D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+    /// Encoder level behind the heap.
+    level_setting: D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC,
+    /// Codec configuration behind the encoder.
+    codec_config: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC,
     /// Coded resolution behind the heap.
     resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC,
 }
@@ -442,30 +805,18 @@ impl EncodeSession {
         width: u32,
         height: u32,
     ) -> Result<Self, D3d12Error> {
-        if codec != crate::guid::Codec::H264 {
+        if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
             return Err(D3d12Error::Unsupported(format!(
                 "{codec} encode args pending"
             )));
         }
-        let headers = H264Headers::build(width, height)?;
-        let level = Self::level(headers.level_idc())?;
+        let (mut descriptors, header_bytes) = Self::descriptors(codec, width, height)?;
+        let (coded_width, coded_height) = match descriptors.as_ref() {
+            EncoderDescriptors::H264(h264) => (h264.resolution.Width, h264.resolution.Height),
+            EncoderDescriptors::Hevc(hevc) => (hevc.resolution.Width, hevc.resolution.Height),
+        };
         let video3 = device.video3()?;
-        let mut descriptors = Box::new(EncoderDescriptors {
-            profile: D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH,
-            level_setting: level,
-            codec_config: Self::codec_config(),
-            resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
-                Width: width,
-                Height: height,
-            },
-        });
-        let (encoder, heap) = Self::create_codec(
-            &video3,
-            &mut descriptors.profile,
-            &mut descriptors.level_setting,
-            &mut descriptors.codec_config,
-            &descriptors.resolution,
-        )?;
+        let (encoder, heap) = Self::create_codec(&video3, &mut descriptors)?;
         let resources = DeviceResources::new(device.device());
         let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
         let video_alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
@@ -487,9 +838,10 @@ impl EncodeSession {
         })?;
         let fence = Fence::open(device.device())?;
         let meta_cap =
-            Self::query_requirements(device.video(), &mut descriptors.profile, width, height);
-        let buffers = Self::open_buffers(&resources, width, height, meta_cap)?;
+            Self::query_requirements(device.video(), &mut descriptors, coded_width, coded_height);
+        let buffers = Self::open_buffers(&resources, coded_width, coded_height, meta_cap)?;
         Ok(Self {
+            codec,
             video_queue,
             video_alloc,
             video_list,
@@ -509,22 +861,68 @@ impl EncodeSession {
             bitstream_state: D3D12_RESOURCE_STATE_COMMON,
             staging: buffers.staging,
             bitstream_cap: buffers.bitstream_cap,
-            headers: headers.bytes,
+            headers: header_bytes,
             meta: buffers.meta,
             meta_state: D3D12_RESOURCE_STATE_COMMON,
             resolved: buffers.resolved,
             resolved_state: D3D12_RESOURCE_STATE_COMMON,
             resolved_staging: buffers.resolved_staging,
-            width,
-            height,
+            width: coded_width,
+            height: coded_height,
+            visible_width: width,
+            visible_height: height,
             descriptors,
             idr_pic_id: 0,
         })
     }
 
+    /// Descriptors plus header bytes for `codec` at visible `width` by `height`.
+    #[cfg(target_os = "windows")]
+    fn descriptors(
+        codec: crate::guid::Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<(Box<EncoderDescriptors>, Vec<u8>), D3d12Error> {
+        match codec {
+            crate::guid::Codec::H264 => {
+                let headers = H264Headers::build(width, height)?;
+                let level = Self::level_h264(headers.level_idc())?;
+                let (coded_width, coded_height) = headers.coded();
+                let descriptors = EncoderDescriptors::H264(H264Descriptors {
+                    profile: D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH,
+                    level_setting: level,
+                    codec_config: Self::codec_config_h264(),
+                    resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
+                        Width: coded_width,
+                        Height: coded_height,
+                    },
+                });
+                Ok((Box::new(descriptors), headers.into_bytes()))
+            }
+            crate::guid::Codec::Hevc => {
+                let headers = HevcHeaders::build(width, height)?;
+                let level = Self::level_hevc(headers.level_idc())?;
+                let (coded_width, coded_height) = headers.coded();
+                let descriptors = EncoderDescriptors::Hevc(HevcDescriptors {
+                    profile: D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN,
+                    level_setting: level,
+                    codec_config: Self::codec_config_hevc(),
+                    resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
+                        Width: coded_width,
+                        Height: coded_height,
+                    },
+                });
+                Ok((Box::new(descriptors), headers.into_bytes()))
+            }
+            _ => Err(D3d12Error::Unsupported(format!(
+                "{codec} encode args pending"
+            ))),
+        }
+    }
+
     /// Encoder level for `level_idc`.
     #[cfg(target_os = "windows")]
-    fn level(level_idc: u8) -> Result<D3D12_VIDEO_ENCODER_LEVELS_H264, D3d12Error> {
+    fn level_h264(level_idc: u8) -> Result<D3D12_VIDEO_ENCODER_LEVELS_H264, D3d12Error> {
         match level_idc {
             10 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_1),
             11 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_11),
@@ -546,9 +944,38 @@ impl EncodeSession {
         }
     }
 
+    /// Encoder level for `level_idc` on the main tier.
+    #[cfg(target_os = "windows")]
+    fn level_hevc(
+        level_idc: u8,
+    ) -> Result<D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC, D3d12Error> {
+        let level: D3D12_VIDEO_ENCODER_LEVELS_HEVC = match level_idc {
+            30 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_1,
+            60 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_2,
+            63 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_21,
+            90 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_3,
+            93 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_31,
+            120 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_4,
+            123 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_41,
+            150 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_5,
+            153 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_51,
+            156 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_52,
+            180 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_6,
+            183 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_61,
+            186 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_62,
+            _ => {
+                return Err(D3d12Error::Unsupported("level outside 6.2".to_owned()));
+            }
+        };
+        Ok(D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC {
+            Level: level,
+            Tier: D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN,
+        })
+    }
+
     /// Intra-only codec configuration.
     #[cfg(target_os = "windows")]
-    fn codec_config() -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 {
+    fn codec_config_h264() -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 {
         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 {
             ConfigurationFlags:
                 D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264_FLAG_ENABLE_CABAC_ENCODING,
@@ -559,14 +986,40 @@ impl EncodeSession {
         }
     }
 
+    /// Intra-only codec configuration matching the HEVC headers.
+    ///
+    /// <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
+    #[cfg(target_os = "windows")]
+    fn codec_config_hevc() -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC {
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC {
+            ConfigurationFlags: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE,
+            MinLumaCodingUnitSize: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_8x8,
+            MaxLumaCodingUnitSize: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_32x32,
+            MinLumaTransformUnitSize: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_4x4,
+            MaxLumaTransformUnitSize: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_TUSIZE_32x32,
+            max_transform_hierarchy_depth_inter: 1,
+            max_transform_hierarchy_depth_intra: 1,
+        }
+    }
+
     /// Single-IDR group of pictures.
     #[cfg(target_os = "windows")]
-    fn gop() -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 {
+    fn gop_h264() -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 {
         D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 {
             GOPLength: 1,
             PPicturePeriod: 1,
             pic_order_cnt_type: 0,
             log2_max_frame_num_minus4: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 0,
+        }
+    }
+
+    /// Single-IDR group of pictures.
+    #[cfg(target_os = "windows")]
+    fn gop_hevc() -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC {
+        D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC {
+            GOPLength: 1,
+            PPicturePeriod: 1,
             log2_max_pic_order_cnt_lsb_minus4: 0,
         }
     }
@@ -608,42 +1061,87 @@ impl EncodeSession {
     #[cfg(target_os = "windows")]
     fn create_codec(
         video3: &ID3D12VideoDevice3,
-        profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
-        level_setting: &mut D3D12_VIDEO_ENCODER_LEVELS_H264,
-        codec_config: &mut D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264,
-        resolution: &D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC,
+        descriptors: &mut EncoderDescriptors,
     ) -> Result<(ID3D12VideoEncoder, ID3D12VideoEncoderHeap), D3d12Error> {
         // Sound: the boxed descriptors outlive the encoder and heap.
-        let mut encoder_desc = D3D12_VIDEO_ENCODER_DESC {
-            NodeMask: 0,
-            Flags: D3D12_VIDEO_ENCODER_FLAGS(0),
-            EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
-            EncodeProfile: Self::profile_desc(profile),
-            InputFormat: DXGI_FORMAT_NV12,
-            CodecConfiguration: crate::device::codec_configuration_h264(codec_config),
-            MaxMotionEstimationPrecision:
-                D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_FULL_PIXEL,
-        };
-        let mut heap_desc = D3D12_VIDEO_ENCODER_HEAP_DESC {
-            NodeMask: 0,
-            Flags: D3D12_VIDEO_ENCODER_HEAP_FLAGS(0),
-            EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
-            EncodeProfile: Self::profile_desc(profile),
-            EncodeLevel: D3D12_VIDEO_ENCODER_LEVEL_SETTING {
-                DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_LEVELS_H264>())
-                    .unwrap_or(u32::MAX),
-                Anonymous: D3D12_VIDEO_ENCODER_LEVEL_SETTING_0 {
-                    pH264LevelSetting: std::ptr::from_mut(level_setting),
-                },
-            },
-            ResolutionsListCount: 1,
-            pResolutionList: std::ptr::from_ref(resolution),
+        let (mut encoder_desc, mut heap_desc) = match descriptors {
+            EncoderDescriptors::H264(h264) => {
+                let encoder_desc = D3D12_VIDEO_ENCODER_DESC {
+                    NodeMask: 0,
+                    Flags: D3D12_VIDEO_ENCODER_FLAGS(0),
+                    EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
+                    EncodeProfile: Self::profile_desc_h264(&mut h264.profile),
+                    InputFormat: DXGI_FORMAT_NV12,
+                    CodecConfiguration: crate::device::codec_configuration_h264(
+                        &mut h264.codec_config,
+                    ),
+                    MaxMotionEstimationPrecision:
+                        D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_FULL_PIXEL,
+                };
+                let heap_desc = D3D12_VIDEO_ENCODER_HEAP_DESC {
+                    NodeMask: 0,
+                    Flags: D3D12_VIDEO_ENCODER_HEAP_FLAGS(0),
+                    EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
+                    EncodeProfile: Self::profile_desc_h264(&mut h264.profile),
+                    EncodeLevel: D3D12_VIDEO_ENCODER_LEVEL_SETTING {
+                        DataSize: u32::try_from(
+                            std::mem::size_of::<D3D12_VIDEO_ENCODER_LEVELS_H264>(),
+                        )
+                        .unwrap_or(u32::MAX),
+                        Anonymous: D3D12_VIDEO_ENCODER_LEVEL_SETTING_0 {
+                            pH264LevelSetting: std::ptr::from_mut(&mut h264.level_setting),
+                        },
+                    },
+                    ResolutionsListCount: 1,
+                    pResolutionList: std::ptr::from_ref(&h264.resolution),
+                };
+                (encoder_desc, heap_desc)
+            }
+            EncoderDescriptors::Hevc(hevc) => {
+                let encoder_desc = D3D12_VIDEO_ENCODER_DESC {
+                    NodeMask: 0,
+                    Flags: D3D12_VIDEO_ENCODER_FLAGS(0),
+                    EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_HEVC,
+                    EncodeProfile: Self::profile_desc_hevc(&mut hevc.profile),
+                    InputFormat: DXGI_FORMAT_NV12,
+                    CodecConfiguration: crate::device::codec_configuration_hevc(
+                        &mut hevc.codec_config,
+                    ),
+                    MaxMotionEstimationPrecision:
+                        D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_FULL_PIXEL,
+                };
+                let heap_desc = D3D12_VIDEO_ENCODER_HEAP_DESC {
+                    NodeMask: 0,
+                    Flags: D3D12_VIDEO_ENCODER_HEAP_FLAGS(0),
+                    EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_HEVC,
+                    EncodeProfile: Self::profile_desc_hevc(&mut hevc.profile),
+                    EncodeLevel: D3D12_VIDEO_ENCODER_LEVEL_SETTING {
+                        DataSize: u32::try_from(std::mem::size_of::<
+                            D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC,
+                        >())
+                        .unwrap_or(u32::MAX),
+                        Anonymous: D3D12_VIDEO_ENCODER_LEVEL_SETTING_0 {
+                            pHEVCLevelSetting: std::ptr::from_mut(&mut hevc.level_setting),
+                        },
+                    },
+                    ResolutionsListCount: 1,
+                    pResolutionList: std::ptr::from_ref(&hevc.resolution),
+                };
+                (encoder_desc, heap_desc)
+            }
         };
         let encoder: ID3D12VideoEncoder =
             unsafe { video3.CreateVideoEncoder(std::ptr::from_mut(&mut encoder_desc)) }.map_err(
-                |error| D3d12Error::Call {
-                    call: "CreateVideoEncoder",
-                    hresult: error.code().0,
+                |error| {
+                    if error.code() == windows::Win32::Foundation::E_INVALIDARG {
+                        return D3d12Error::OverCaps {
+                            what: "encode configuration",
+                        };
+                    }
+                    D3d12Error::Call {
+                        call: "CreateVideoEncoder",
+                        hresult: error.code().0,
+                    }
                 },
             )?;
         let heap: ID3D12VideoEncoderHeap =
@@ -667,14 +1165,24 @@ impl EncodeSession {
     #[cfg(target_os = "windows")]
     fn query_requirements(
         video: &ID3D12VideoDevice,
-        profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
+        descriptors: &mut EncoderDescriptors,
         width: u32,
         height: u32,
     ) -> u64 {
+        let (codec, profile) = match descriptors {
+            EncoderDescriptors::H264(h264) => (
+                D3D12_VIDEO_ENCODER_CODEC_H264,
+                Self::profile_desc_h264(&mut h264.profile),
+            ),
+            EncoderDescriptors::Hevc(hevc) => (
+                D3D12_VIDEO_ENCODER_CODEC_HEVC,
+                Self::profile_desc_hevc(&mut hevc.profile),
+            ),
+        };
         let mut requirements = D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS {
             NodeIndex: 0,
-            Codec: D3D12_VIDEO_ENCODER_CODEC_H264,
-            Profile: Self::profile_desc(profile),
+            Codec: codec,
+            Profile: profile,
             InputFormat: DXGI_FORMAT_NV12,
             PictureTargetResolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
                 Width: width,
@@ -779,7 +1287,7 @@ impl EncodeSession {
 
     /// Profile descriptor over `profile`.
     #[cfg(target_os = "windows")]
-    fn profile_desc(
+    fn profile_desc_h264(
         profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
     ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
         D3D12_VIDEO_ENCODER_PROFILE_DESC {
@@ -788,6 +1296,29 @@ impl EncodeSession {
             Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
                 pH264Profile: std::ptr::from_mut(profile),
             },
+        }
+    }
+
+    /// Profile descriptor over `profile`.
+    #[cfg(target_os = "windows")]
+    fn profile_desc_hevc(
+        profile: &mut D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+    ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
+        D3D12_VIDEO_ENCODER_PROFILE_DESC {
+            DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_PROFILE_HEVC>())
+                .unwrap_or(u32::MAX),
+            Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
+                pHEVCProfile: std::ptr::from_mut(profile),
+            },
+        }
+    }
+
+    /// Profile descriptor over the session descriptors.
+    #[cfg(target_os = "windows")]
+    fn profile_desc(descriptors: &mut EncoderDescriptors) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
+        match descriptors {
+            EncoderDescriptors::H264(h264) => Self::profile_desc_h264(&mut h264.profile),
+            EncoderDescriptors::Hevc(hevc) => Self::profile_desc_hevc(&mut hevc.profile),
         }
     }
 
@@ -812,7 +1343,18 @@ impl EncodeSession {
     /// Bitstream bytes encoded from NV12 on the GPU.
     #[cfg(target_os = "windows")]
     fn encode_windows(&mut self, nv12: &[u8]) -> Result<Vec<u8>, D3d12Error> {
-        let staged = self.layout.stride(nv12, self.width, self.height)?;
+        let padded;
+        let coded = if (self.visible_width, self.visible_height) == (self.width, self.height) {
+            nv12
+        } else {
+            padded = pad_nv12(
+                nv12,
+                (self.visible_width, self.visible_height),
+                (self.width, self.height),
+            )?;
+            &padded
+        };
+        let staged = self.layout.stride(coded, self.width, self.height)?;
         DeviceResources::write_upload(&self.upload, &staged)?;
         self.submit_copy()?;
         self.finish_picture()
@@ -826,12 +1368,12 @@ impl EncodeSession {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, D3d12Error> {
-        if (width, height) != (self.width, self.height) {
+        if (width, height) != (self.visible_width, self.visible_height) {
             return Err(D3d12Error::Unsupported(
                 "texture extent outside session".to_owned(),
             ));
         }
-        self.submit_copy_from(src)?;
+        self.submit_copy_from(src, width, height)?;
         self.finish_picture()
     }
 
@@ -929,9 +1471,17 @@ impl EncodeSession {
         self.close_copy()
     }
 
-    /// `src` texture planes through the direct queue into the input texture.
+    /// `src` visible planes through the direct queue into the input texture.
+    ///
+    /// Pad samples outside the visible rectangle stay stale; the crop
+    /// rectangle hides them from decoders.
     #[cfg(target_os = "windows")]
-    fn submit_copy_from(&mut self, src: &ID3D12Resource) -> Result<(), D3d12Error> {
+    fn submit_copy_from(
+        &mut self,
+        src: &ID3D12Resource,
+        width: u32,
+        height: u32,
+    ) -> Result<(), D3d12Error> {
         self.reset_copy()?;
         // Sound: the barriers name live textures; the list is open.
         unsafe {
@@ -948,9 +1498,17 @@ impl EncodeSession {
                 ),
             ]);
         }
+        let boxes = [[0, 0, width, height], [0, 0, width / 2, height / 2]].map(|edges| D3D12_BOX {
+            left: edges[0],
+            top: edges[1],
+            front: 0,
+            right: edges[2],
+            bottom: edges[3],
+            back: 1,
+        });
         // Sound: the copy locations name live resources; the list is open.
         unsafe {
-            for index in [0u32, 1u32] {
+            for (index, src_box) in [0u32, 1u32].into_iter().zip(boxes.iter()) {
                 let dst = DeviceResources::subresource_location(&self.input, index);
                 let src_loc = DeviceResources::subresource_location(src, index);
                 self.copy_list.CopyTextureRegion(
@@ -959,7 +1517,7 @@ impl EncodeSession {
                     0,
                     0,
                     std::ptr::from_ref(&src_loc),
-                    None,
+                    Some(std::ptr::from_ref(src_box)),
                 );
             }
             self.copy_list.ResourceBarrier(&[
@@ -978,12 +1536,12 @@ impl EncodeSession {
         self.close_copy()
     }
 
-    /// Picture control over `pic_data`.
+    /// Picture control data over `pic_data`.
     #[cfg(target_os = "windows")]
-    fn picture_control(
+    fn picture_data_h264(
         pic_data: &mut D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264,
-    ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC {
-        let codec_data = D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
+    ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
+        D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
             DataSize: u32::try_from(std::mem::size_of::<
                 D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264,
             >())
@@ -991,7 +1549,30 @@ impl EncodeSession {
             Anonymous: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_0 {
                 pH264PicData: std::ptr::from_mut(pic_data),
             },
-        };
+        }
+    }
+
+    /// Picture control data over `pic_data`.
+    #[cfg(target_os = "windows")]
+    fn picture_data_hevc(
+        pic_data: &mut D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC,
+    ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
+        D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
+            DataSize: u32::try_from(std::mem::size_of::<
+                D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC,
+            >())
+            .unwrap_or(u32::MAX),
+            Anonymous: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_0 {
+                pHEVCPicData: std::ptr::from_mut(pic_data),
+            },
+        }
+    }
+
+    /// Picture control over `codec_data`.
+    #[cfg(target_os = "windows")]
+    fn picture_control(
+        codec_data: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA,
+    ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC {
         D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC {
             IntraRefreshFrameIndex: 0,
             // The driver removes the device without a validation message when
@@ -1002,11 +1583,43 @@ impl EncodeSession {
         }
     }
 
+    /// Group-of-pictures structure over `gop`.
+    #[cfg(target_os = "windows")]
+    fn sequence_gop_h264(
+        gop: &mut D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
+    ) -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
+        D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
+            DataSize: u32::try_from(std::mem::size_of::<
+                D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
+            >())
+            .unwrap_or(u32::MAX),
+            Anonymous: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_0 {
+                pH264GroupOfPictures: std::ptr::from_mut(gop),
+            },
+        }
+    }
+
+    /// Group-of-pictures structure over `gop`.
+    #[cfg(target_os = "windows")]
+    fn sequence_gop_hevc(
+        gop: &mut D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC,
+    ) -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
+        D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
+            DataSize: u32::try_from(std::mem::size_of::<
+                D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC,
+            >())
+            .unwrap_or(u32::MAX),
+            Anonymous: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_0 {
+                pHEVCGroupOfPictures: std::ptr::from_mut(gop),
+            },
+        }
+    }
+
     /// Sequence control over `cqp` and `gop` at `width` by `height`.
     #[cfg(target_os = "windows")]
     fn sequence_control(
         cqp: &D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
-        gop: &mut D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
+        gop: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE,
         width: u32,
         height: u32,
     ) -> D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC {
@@ -1024,15 +1637,34 @@ impl EncodeSession {
             SelectedLayoutMode: D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME,
             FrameSubregionsLayoutData:
                 D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA::default(),
-            CodecGopSequence: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
-                DataSize: u32::try_from(std::mem::size_of::<
-                    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
-                >())
-                .unwrap_or(u32::MAX),
-                Anonymous: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_0 {
-                    pH264GroupOfPictures: std::ptr::from_mut(gop),
-                },
-            },
+            CodecGopSequence: gop,
+        }
+    }
+
+    /// IDR picture data over `idr_pic_id`.
+    #[cfg(target_os = "windows")]
+    fn pic_h264(idr_pic_id: u16) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 {
+        D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 {
+            Flags: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264_FLAG_NONE,
+            FrameType: D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME,
+            pic_parameter_set_id: 0,
+            idr_pic_id: u32::from(idr_pic_id),
+            PictureOrderCountNumber: 0,
+            FrameDecodingOrderNumber: 0,
+            ..Default::default()
+        }
+    }
+
+    /// IDR picture data.
+    #[cfg(target_os = "windows")]
+    fn pic_hevc() -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC {
+        D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC {
+            Flags: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_NONE,
+            FrameType: D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_IDR_FRAME,
+            slice_pic_parameter_set_id: 0,
+            PictureOrderCountNumber: 0,
+            TemporalLayerIndex: 0,
+            ..Default::default()
         }
     }
 
@@ -1049,19 +1681,24 @@ impl EncodeSession {
             call: "ResetList",
             hresult: error.code().0,
         })?;
-        let mut pic_data = D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 {
-            Flags: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264_FLAG_NONE,
-            FrameType: D3D12_VIDEO_ENCODER_FRAME_TYPE_H264_IDR_FRAME,
-            pic_parameter_set_id: 0,
-            idr_pic_id: u32::from(self.idr_pic_id),
-            PictureOrderCountNumber: 0,
-            FrameDecodingOrderNumber: 0,
-            ..Default::default()
+        let hevc = matches!(self.codec, crate::guid::Codec::Hevc);
+        let mut pic_h264 = Self::pic_h264(self.idr_pic_id);
+        let mut pic_hevc = Self::pic_hevc();
+        let codec_data = if hevc {
+            Self::picture_data_hevc(&mut pic_hevc)
+        } else {
+            Self::picture_data_h264(&mut pic_h264)
         };
-        let picture_control = Self::picture_control(&mut pic_data);
+        let picture_control = Self::picture_control(codec_data);
         let cqp = Self::cqp();
-        let mut gop = Self::gop();
-        let sequence = Self::sequence_control(&cqp, &mut gop, self.width, self.height);
+        let mut gop_h264 = Self::gop_h264();
+        let mut gop_hevc = Self::gop_hevc();
+        let gop = if hevc {
+            Self::sequence_gop_hevc(&mut gop_hevc)
+        } else {
+            Self::sequence_gop_h264(&mut gop_h264)
+        };
+        let sequence = Self::sequence_control(&cqp, gop, self.width, self.height);
         let input_args = D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS {
             SequenceControlDesc: sequence,
             PictureControlDesc: picture_control,
@@ -1084,8 +1721,12 @@ impl EncodeSession {
             },
         };
         let resolve_in = D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS {
-            EncoderCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
-            EncoderProfile: Self::profile_desc(&mut self.descriptors.profile),
+            EncoderCodec: if hevc {
+                D3D12_VIDEO_ENCODER_CODEC_HEVC
+            } else {
+                D3D12_VIDEO_ENCODER_CODEC_H264
+            },
+            EncoderProfile: Self::profile_desc(&mut self.descriptors),
             EncoderInputFormat: DXGI_FORMAT_NV12,
             EncodedPictureEffectiveResolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
                 Width: self.width,
@@ -1288,15 +1929,17 @@ impl EncodeSession {
 
 #[cfg(test)]
 mod tests {
-    use super::H264Headers;
+    use super::{pad_nv12, H264Headers, HevcHeaders};
 
     use crate::h264::{parse_pps, parse_sps, rbsp, split_nals};
+    use crate::hevc;
 
     #[test]
     fn headers_round_trip_through_parser() {
         let headers = H264Headers::build(64, 48).expect("headers");
         assert_eq!(headers.level_idc(), 10);
-        let nals = split_nals(headers.bytes());
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
         assert_eq!(nals.len(), 2);
         let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
         assert_eq!((sps.width(), sps.height()), (64, 48));
@@ -1324,5 +1967,96 @@ mod tests {
         assert!(H264Headers::build(65, 48).is_err());
         assert!(H264Headers::build(64, 47).is_err());
         assert!(H264Headers::build(8192, 8192).is_err());
+    }
+
+    #[test]
+    fn headers_crop_360p_to_grid() {
+        let headers = H264Headers::build(640, 360).expect("headers");
+        assert_eq!(headers.coded(), (640, 368));
+        assert_eq!(headers.level_idc(), 22);
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
+        assert_eq!(nals.len(), 2);
+        let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
+        assert_eq!((sps.width(), sps.height()), (640, 368));
+        assert_eq!((sps.visible_width(), sps.visible_height()), (640, 360));
+    }
+
+    #[test]
+    fn headers_crop_1080p_to_grid() {
+        let headers = H264Headers::build(1920, 1080).expect("headers");
+        assert_eq!(headers.coded(), (1920, 1088));
+        assert_eq!(headers.level_idc(), 40);
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
+        assert_eq!(nals.len(), 2);
+        let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
+        assert_eq!((sps.width(), sps.height()), (1920, 1088));
+        assert_eq!((sps.visible_width(), sps.visible_height()), (1920, 1080));
+    }
+
+    #[test]
+    fn pad_replicates_edge() {
+        let visible = vec![1, 2, 3, 4, 5, 6];
+        let padded = pad_nv12(&visible, (2, 2), (4, 4)).expect("padded");
+        assert_eq!(
+            padded,
+            vec![1, 2, 2, 2, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4, 5, 6, 6, 6, 5, 6, 6, 6,]
+        );
+    }
+
+    #[test]
+    fn pad_rejects_short_input() {
+        assert!(pad_nv12(&[0; 5], (2, 2), (4, 4)).is_err());
+    }
+
+    #[test]
+    fn hevc_headers_round_trip_through_parser() {
+        let headers = HevcHeaders::build(64, 48).expect("headers");
+        assert_eq!(headers.level_idc(), 30);
+        assert_eq!(headers.coded(), (64, 48));
+        let bytes = headers.into_bytes();
+        let nals = hevc::split_nals(&bytes);
+        assert_eq!(nals.len(), 3);
+        let kinds: Vec<u8> = nals.iter().map(|nal| nal[0] >> 1).collect();
+        assert_eq!(kinds, vec![32, 33, 34]);
+        let sps = hevc::parse_sps(&hevc::rbsp(nals[1])[2..]).expect("sps");
+        assert_eq!((sps.width(), sps.height()), (64, 48));
+        assert!(sps.crop.is_none());
+        assert_eq!(sps.min_cb(), 8);
+        assert_eq!(sps.log2_diff_max_min_cb, 2);
+        assert_eq!(sps.log2_min_tb_minus2, 0);
+        assert_eq!(sps.log2_diff_max_min_tb, 3);
+        assert!(!sps.amp());
+        assert!(!sps.sao());
+        hevc::parse_pps(&hevc::rbsp(nals[2])[2..], &sps).expect("pps");
+    }
+
+    #[test]
+    fn hevc_headers_crop_to_window() {
+        let headers = HevcHeaders::build(640, 360).expect("headers");
+        assert_eq!(headers.coded(), (640, 368));
+        assert_eq!(headers.level_idc(), 63);
+        let bytes = headers.into_bytes();
+        let nals = hevc::split_nals(&bytes);
+        assert_eq!(nals.len(), 3);
+        let sps = hevc::parse_sps(&hevc::rbsp(nals[1])[2..]).expect("sps");
+        assert_eq!((sps.width(), sps.height()), (640, 368));
+        assert_eq!((sps.visible_width(), sps.visible_height()), (640, 360));
+    }
+
+    #[test]
+    fn hevc_headers_pick_level_by_extent() {
+        assert_eq!(HevcHeaders::build(64, 48).expect("headers").level_idc(), 30);
+        assert_eq!(
+            HevcHeaders::build(320, 240).expect("headers").level_idc(),
+            60
+        );
+        assert_eq!(
+            HevcHeaders::build(1920, 1080).expect("headers").level_idc(),
+            120
+        );
+        assert!(HevcHeaders::build(65, 48).is_err());
+        assert!(HevcHeaders::build(8192, 8192).is_err());
     }
 }

@@ -1,6 +1,6 @@
 //! D3D12 video decode: picture arguments plus GPU submission.
 //!
-//! Single-picture intra decode; reference pictures stay pending.
+//! H.264 decodes through the DPB; HEVC stays intra-only.
 
 #![allow(unsafe_code)]
 
@@ -10,23 +10,21 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 
 use crate::dxva::{
-    PicEntryH264, PicEntryHevc, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc,
-    SliceShortH264, SliceShortHevc, BITS_CHROMA_420, BITS_CONSTRAINED_INTRA, BITS_FRAME_MBS_ONLY,
-    BITS_INTRA_PIC, BITS_MBS_CONSECUTIVE, BITS_MIN_LUMA_BIPRED_8X8, BITS_REF_PIC,
-    BITS_TRANSFORM_8X8, BITS_WEIGHTED_BIPRED_SHIFT, BITS_WEIGHTED_PRED, HEVC_CHROMA_420,
-    HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC, HEVC_POC_LSB_SHIFT, HEVC_PROP_CHROMA_QP_OFFSETS,
-    HEVC_PROP_CONSTRAINED_INTRA, HEVC_PROP_CU_QP_DELTA, HEVC_PROP_DEBLOCK_DISABLED,
-    HEVC_PROP_DEBLOCK_OVERRIDE, HEVC_PROP_ENTROPY_SYNC, HEVC_PROP_LISTS_MOD, HEVC_PROP_LOOP_SLICES,
-    HEVC_PROP_LOOP_TILES, HEVC_PROP_SLICE_EXT, HEVC_PROP_TILES, HEVC_PROP_TRANSFORM_SKIP,
-    HEVC_PROP_TRANSQUANT_BYPASS, HEVC_PROP_UNIFORM_SPACING, HEVC_PROP_WEIGHTED_BIPRED,
-    HEVC_PROP_WEIGHTED_PRED, HEVC_TOOL_AMP, HEVC_TOOL_CABAC_INIT, HEVC_TOOL_DEPENDENT_SLICES,
-    HEVC_TOOL_EXTRA_BITS_SHIFT, HEVC_TOOL_OUTPUT_FLAG, HEVC_TOOL_SAO, HEVC_TOOL_SIGN_HIDING,
-    HEVC_TOOL_STRONG_INTRA, HEVC_TOOL_TEMPORAL_MVP,
+    PicEntryHevc, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264,
+    SliceShortHevc, HEVC_CHROMA_420, HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC,
+    HEVC_POC_LSB_SHIFT, HEVC_PROP_CHROMA_QP_OFFSETS, HEVC_PROP_CONSTRAINED_INTRA,
+    HEVC_PROP_CU_QP_DELTA, HEVC_PROP_DEBLOCK_DISABLED, HEVC_PROP_DEBLOCK_OVERRIDE,
+    HEVC_PROP_ENTROPY_SYNC, HEVC_PROP_LISTS_MOD, HEVC_PROP_LOOP_SLICES, HEVC_PROP_LOOP_TILES,
+    HEVC_PROP_SLICE_EXT, HEVC_PROP_TILES, HEVC_PROP_TRANSFORM_SKIP, HEVC_PROP_TRANSQUANT_BYPASS,
+    HEVC_PROP_UNIFORM_SPACING, HEVC_PROP_WEIGHTED_BIPRED, HEVC_PROP_WEIGHTED_PRED, HEVC_TOOL_AMP,
+    HEVC_TOOL_CABAC_INIT, HEVC_TOOL_DEPENDENT_SLICES, HEVC_TOOL_EXTRA_BITS_SHIFT,
+    HEVC_TOOL_OUTPUT_FLAG, HEVC_TOOL_SAO, HEVC_TOOL_SIGN_HIDING, HEVC_TOOL_STRONG_INTRA,
+    HEVC_TOOL_TEMPORAL_MVP,
 };
 use crate::error::D3d12Error;
 #[cfg(not(target_os = "windows"))]
 use crate::error::SkipReason;
-use crate::h264::{Crop, Picture, PocType, Pps, Sps};
+use crate::h264::Crop;
 #[cfg(target_os = "windows")]
 use crate::submit::{DeviceResources, Fence, Nv12Layout};
 
@@ -35,11 +33,12 @@ use windows::core::Interface;
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
-    ID3D12Resource, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
-    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATE_COMMON,
+    ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
+    D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
+    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATE_COMMON,
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
@@ -55,151 +54,30 @@ use windows::Win32::Media::MediaFoundation::{
 /// Bitstream upload capacity in bytes.
 const BITSTREAM_CAP: u64 = 8 << 20;
 
+/// Output texture pool behind the DPB slots.
+#[cfg(target_os = "windows")]
+const POOL: usize = 16;
+
 /// H.264 picture arguments for one `DecodeFrame` call.
+#[derive(Debug)]
 pub(crate) struct H264Submission {
     /// Picture parameters.
-    params: PicParamsH264,
+    pub(crate) params: PicParamsH264,
     /// Inverse quantization matrices.
-    qmatrix: QmatrixH264,
+    pub(crate) qmatrix: QmatrixH264,
     /// Slice control entries.
-    slices: Vec<SliceShortH264>,
+    pub(crate) slices: Vec<SliceShortH264>,
     /// Start-coded slices padded to 128 bytes.
-    bitstream: Vec<u8>,
-}
-
-impl H264Submission {
-    /// Arguments for `picture` under its parameter sets.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for inter pictures, non-IDR intra pictures, type 1
-    /// POC, or a bitstream past the driver buffer.
-    pub(crate) fn build(
-        sps: &Sps,
-        pps: &Pps,
-        picture: &Picture,
-        feedback: u32,
-    ) -> Result<Self, D3d12Error> {
-        if !picture.intra() {
-            return Err(D3d12Error::Unsupported(
-                "inter picture needs references".to_owned(),
-            ));
-        }
-        if !picture.idr {
-            return Err(D3d12Error::Unsupported(
-                "non-IDR intra needs POC tracking".to_owned(),
-            ));
-        }
-        let first = picture
-            .slices
-            .first()
-            .ok_or_else(|| D3d12Error::Unsupported("picture without slices".to_owned()))?;
-        let poc = Self::idr_poc(sps, picture.frame_num(), &first.header.poc)?;
-        let mut params = PicParamsH264::empty();
-        params.frame_width_in_mbs_minus1 = sps.width_in_mbs_minus1;
-        params.frame_height_in_mbs_minus1 = sps.height_in_mbs_minus1;
-        params.curr_pic = PicEntryH264::frame(0);
-        params.num_ref_frames = sps.max_num_ref_frames;
-        params.bit_fields = Self::bit_fields(picture, sps, pps);
-        params.reserved_16_a = 3;
-        params.status_report_feedback_number = feedback;
-        params.curr_field_order_cnt = [poc, poc];
-        params.pic_init_qs_minus26 = pps.pic_init_qs;
-        params.chroma_qp_index_offset = pps.chroma_qp;
-        params.second_chroma_qp_index_offset = pps.second_chroma_qp;
-        params.continuation_flag = 1;
-        params.pic_init_qp_minus26 = pps.pic_init_qp;
-        params.num_ref_idx_l0_active_minus1 = pps.num_ref_l0;
-        params.num_ref_idx_l1_active_minus1 = pps.num_ref_l1;
-        params.frame_num = u16::try_from(picture.frame_num())
-            .map_err(|_| D3d12Error::Parse("frame_num range".to_owned()))?;
-        params.log2_max_frame_num_minus4 = sps.log2_max_frame_num_minus4;
-        params.pic_order_cnt_type = sps.poc_type.id();
-        params.log2_max_pic_order_cnt_lsb_minus4 = sps.log2_max_poc_lsb_minus4;
-        params.delta_pic_order_always_zero_flag = u8::from(sps.delta_zero);
-        params.direct_8x8_inference_flag = u8::from(sps.direct_8x8);
-        params.entropy_coding_mode_flag = u8::from(pps.entropy());
-        params.pic_order_present_flag = u8::from(pps.pic_order_present());
-        params.deblocking_filter_control_present_flag = u8::from(pps.deblocking_present());
-        params.redundant_pic_cnt_present_flag = u8::from(pps.redundant_present());
-        let qmatrix = QmatrixH264 {
-            lists_4x4: pps.scaling.four,
-            lists_8x8: pps.scaling.eight,
-        };
-        let (slices, bitstream) = Self::bitstream(picture)?;
-        Ok(Self {
-            params,
-            qmatrix,
-            slices,
-            bitstream,
-        })
-    }
-
-    /// Picture order count for an IDR slice.
-    fn idr_poc(sps: &Sps, frame_num: u32, poc: &crate::h264::SlicePoc) -> Result<i32, D3d12Error> {
-        match sps.poc_type {
-            PocType::Lsb => match poc {
-                crate::h264::SlicePoc::Lsb(lsb) if *lsb < sps.max_poc_lsb() => i32::try_from(*lsb)
-                    .map_err(|_| D3d12Error::Parse("pic_order_cnt_lsb range".to_owned())),
-                _ => Err(D3d12Error::Parse("IDR without POC LSB".to_owned())),
-            },
-            PocType::FrameNum => i32::try_from(frame_num.saturating_mul(2))
-                .map_err(|_| D3d12Error::Parse("frame_num range".to_owned())),
-            PocType::Delta => Err(D3d12Error::Unsupported("type 1 POC pending".to_owned())),
-        }
-    }
-
-    /// Packed picture bit fields.
-    fn bit_fields(picture: &Picture, sps: &Sps, pps: &Pps) -> u16 {
-        let mut fields = BITS_CHROMA_420 | BITS_FRAME_MBS_ONLY;
-        if picture.ref_pic() {
-            fields |= BITS_REF_PIC;
-        }
-        if pps.constrained_intra() {
-            fields |= BITS_CONSTRAINED_INTRA;
-        }
-        if pps.weighted_pred() {
-            fields |= BITS_WEIGHTED_PRED;
-        }
-        fields |= u16::from(pps.weighted_bipred()) << BITS_WEIGHTED_BIPRED_SHIFT;
-        fields |= BITS_MBS_CONSECUTIVE;
-        if pps.transform_8x8() {
-            fields |= BITS_TRANSFORM_8X8;
-        }
-        if sps.level_idc >= 31 {
-            fields |= BITS_MIN_LUMA_BIPRED_8X8;
-        }
-        if picture.intra() {
-            fields |= BITS_INTRA_PIC;
-        }
-        fields
-    }
-
-    /// Slice controls plus the padded start-coded bitstream.
-    fn bitstream(picture: &Picture) -> Result<(Vec<SliceShortH264>, Vec<u8>), D3d12Error> {
-        let nals: Vec<&[u8]> = picture
-            .slices
-            .iter()
-            .map(|slice| slice.nal.as_slice())
-            .collect();
-        let (spans, bitstream) = start_coded_bitstream(&nals)?;
-        let slices = spans
-            .into_iter()
-            .map(|(location, bytes)| SliceShortH264 {
-                location,
-                bytes,
-                chopping: 0,
-            })
-            .collect();
-        Ok((slices, bitstream))
-    }
+    pub(crate) bitstream: Vec<u8>,
+    /// Output texture slot.
+    pub(crate) slot: u8,
 }
 
 /// Span table plus the padded bitstream over NAL units.
 type CodedBitstream = (Vec<(u32, u32)>, Vec<u8>);
 
 /// Span table plus the padded start-coded bitstream over `nals`.
-fn start_coded_bitstream(nals: &[&[u8]]) -> Result<CodedBitstream, D3d12Error> {
+pub(crate) fn start_coded_bitstream(nals: &[&[u8]]) -> Result<CodedBitstream, D3d12Error> {
     let mut bitstream =
         Vec::with_capacity(nals.iter().map(|nal| nal.len() + 3).sum::<usize>() + 128);
     let mut spans = Vec::with_capacity(nals.len());
@@ -447,17 +325,6 @@ pub(crate) trait PictureSubmission {
     fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error>;
 }
 
-impl PictureSubmission for H264Submission {
-    fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error> {
-        session.decode(self)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
-        session.decode_texture(self)
-    }
-}
-
 impl PictureSubmission for HevcSubmission {
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error> {
         session.decode_hevc(self)
@@ -467,6 +334,59 @@ impl PictureSubmission for HevcSubmission {
     fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
         session.decode_texture_hevc(self)
     }
+}
+
+/// Pool texture tables behind one decode call.
+#[cfg(target_os = "windows")]
+struct RefTables {
+    /// Pool textures in slot order.
+    textures: [Option<ID3D12Resource>; POOL],
+    /// Subresource per pool texture.
+    subs: [u32; POOL],
+}
+
+/// Visible extent plus per-plane source boxes under a crop.
+#[cfg(target_os = "windows")]
+struct CropPlan {
+    /// Visible width in luma samples.
+    width: u32,
+    /// Visible height in luma samples.
+    height: u32,
+    /// Luma box edges: left, top, right, bottom.
+    luma: [u32; 4],
+    /// Chroma box edges in R8G8 texels: left, top, right, bottom.
+    chroma: [u32; 4],
+}
+
+/// Crop copy plan for `crop` in `width` by `height`, absent when uncropped.
+#[cfg(target_os = "windows")]
+fn crop_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
+    let crop = crop?;
+    let left = crop.left;
+    let top = crop.top;
+    let visible_width = width.saturating_sub(left.saturating_add(crop.right));
+    let visible_height = height.saturating_sub(top.saturating_add(crop.bottom));
+    if left == 0 && top == 0 && visible_width == width && visible_height == height {
+        return None;
+    }
+    let chroma_left = left / 2;
+    let chroma_top = top / 2;
+    Some(CropPlan {
+        width: visible_width,
+        height: visible_height,
+        luma: [
+            left,
+            top,
+            left.saturating_add(visible_width),
+            top.saturating_add(visible_height),
+        ],
+        chroma: [
+            chroma_left,
+            chroma_top,
+            chroma_left.saturating_add(visible_width / 2),
+            chroma_top.saturating_add(visible_height / 2),
+        ],
+    })
 }
 
 /// D3D12 video decode session over one codec geometry.
@@ -498,12 +418,12 @@ pub(crate) struct DecodeSession {
     /// Decoder behind pictures.
     #[cfg(target_os = "windows")]
     decoder: ID3D12VideoDecoder,
-    /// NV12 output texture.
+    /// NV12 output texture pool, one per DPB slot.
     #[cfg(target_os = "windows")]
-    output: ID3D12Resource,
-    /// Output texture state.
+    outputs: Vec<ID3D12Resource>,
+    /// Visible-size crop targets, one per pool slot, empty when uncropped.
     #[cfg(target_os = "windows")]
-    output_state: D3D12_RESOURCE_STATES,
+    crops: Vec<ID3D12Resource>,
     /// Bitstream upload buffer.
     #[cfg(target_os = "windows")]
     bitstream: ID3D12Resource,
@@ -592,12 +512,28 @@ impl DecodeSession {
         })?;
         let fence = Fence::open(device.device())?;
         let texture_desc = DeviceResources::texture_desc(width, height);
-        let output = resources.committed(
-            D3D12_HEAP_TYPE_DEFAULT,
-            &texture_desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            "CreateOutput",
-        )?;
+        let mut outputs = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            outputs.push(resources.committed(
+                D3D12_HEAP_TYPE_DEFAULT,
+                &texture_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                "CreateOutput",
+            )?);
+        }
+        let mut crops = Vec::new();
+        if let Some(plan) = crop_plan(width, height, crop) {
+            let crop_desc = DeviceResources::texture_desc(plan.width, plan.height);
+            crops.reserve(POOL);
+            for _ in 0..POOL {
+                crops.push(resources.committed(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &crop_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    "CreateCrop",
+                )?);
+            }
+        }
         let upload_desc = DeviceResources::buffer_desc(BITSTREAM_CAP);
         let bitstream = resources.committed(
             D3D12_HEAP_TYPE_UPLOAD,
@@ -623,8 +559,8 @@ impl DecodeSession {
             fence,
             heap,
             decoder,
-            output,
-            output_state: D3D12_RESOURCE_STATE_COMMON,
+            outputs,
+            crops,
             bitstream,
             staging,
             layout,
@@ -635,22 +571,77 @@ impl DecodeSession {
         })
     }
 
-    /// NV12 bytes decoded from `submission` on the GPU.
+    /// Decode `submission` onto its pool slot.
     ///
     /// # Errors
     ///
     /// Returns `Err` off Windows, past the bitstream buffer, or when the
     /// driver refuses the picture.
-    pub(crate) fn decode(&mut self, submission: &H264Submission) -> Result<Vec<u8>, D3d12Error> {
+    pub(crate) fn submit(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
         #[cfg(target_os = "windows")]
         {
-            self.decode_windows(submission)
+            self.submit_h264(submission)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (submission, self);
+            let _ = (
+                self,
+                &submission.params,
+                &submission.qmatrix,
+                &submission.slices,
+                &submission.bitstream,
+                submission.slot,
+            );
             Err(SkipReason::PlatformUnsupported.into())
         }
+    }
+
+    /// NV12 bytes for pool `slot` cropped to the visible rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` off Windows, for a slot outside the pool, or when
+    /// the copy fails.
+    pub(crate) fn download(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
+        #[cfg(target_os = "windows")]
+        {
+            self.download_windows(slot)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (self, slot);
+            Err(SkipReason::PlatformUnsupported.into())
+        }
+    }
+
+    /// Pool texture behind `slot`, without readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn texture(&self, slot: u8) -> Result<ID3D12Resource, D3d12Error> {
+        self.outputs
+            .get(usize::from(slot))
+            .cloned()
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))
+    }
+
+    /// Pool `slot` cropped to the visible rectangle on the GPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool or when the copy fails.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn texture_cropped(&mut self, slot: u8) -> Result<ID3D12Resource, D3d12Error> {
+        if self.crops.is_empty() {
+            return self.texture(slot);
+        }
+        self.submit_crop(slot)?;
+        self.crops
+            .get(usize::from(slot))
+            .cloned()
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
@@ -674,37 +665,21 @@ impl DecodeSession {
         }
     }
 
-    /// NV12 bytes decoded from `submission` on the GPU.
-    #[cfg(target_os = "windows")]
-    fn decode_windows(&mut self, submission: &H264Submission) -> Result<Vec<u8>, D3d12Error> {
-        self.submit_h264(submission)?;
-        self.download()
-    }
-
-    /// Output texture behind `submission` decode, without readback.
-    #[cfg(target_os = "windows")]
-    pub(crate) fn decode_texture(
-        &mut self,
-        submission: &H264Submission,
-    ) -> Result<ID3D12Resource, D3d12Error> {
-        self.submit_h264(submission)?;
-        Ok(self.output.clone())
-    }
-
-    /// `submission` through the video queue into the output texture.
+    /// `submission` through the video queue into its pool slot.
     #[cfg(target_os = "windows")]
     fn submit_h264(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
-        let input = self.input_args(submission)?;
-        self.submit_video(&input)
+        let mut refs = self.ref_tables();
+        let input = self.input_args(submission, &mut refs)?;
+        self.submit_video(&input, submission.slot)
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
     #[cfg(target_os = "windows")]
     fn decode_hevc_windows(&mut self, submission: &HevcSubmission) -> Result<Vec<u8>, D3d12Error> {
         self.submit_hevc(submission)?;
-        self.download()
+        self.download(0)
     }
 
     /// Output texture behind `submission` decode, without readback.
@@ -714,16 +689,16 @@ impl DecodeSession {
         submission: &HevcSubmission,
     ) -> Result<ID3D12Resource, D3d12Error> {
         self.submit_hevc(submission)?;
-        Ok(self.output.clone())
+        self.texture_cropped(0)
     }
 
-    /// `submission` through the video queue into the output texture.
+    /// `submission` through the video queue into pool slot zero.
     #[cfg(target_os = "windows")]
     fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let input = self.input_args_hevc(submission)?;
-        self.submit_video(&input)
+        self.submit_video(&input, 0)
     }
 
     /// Bitstream length against the upload capacity.
@@ -738,10 +713,23 @@ impl DecodeSession {
         Ok(())
     }
 
-    /// Output texture through staging into tight NV12 bytes.
+    /// Pool tables behind the reference frame arguments.
     #[cfg(target_os = "windows")]
-    fn download(&mut self) -> Result<Vec<u8>, D3d12Error> {
-        self.submit_copy()?;
+    fn ref_tables(&self) -> RefTables {
+        let mut textures: [Option<ID3D12Resource>; POOL] = core::array::from_fn(|_| None);
+        for (slot, texture) in textures.iter_mut().zip(self.outputs.iter()) {
+            *slot = Some(texture.clone());
+        }
+        RefTables {
+            textures,
+            subs: [0; POOL],
+        }
+    }
+
+    /// Pool `slot` through staging into tight NV12 bytes.
+    #[cfg(target_os = "windows")]
+    fn download_windows(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
+        self.submit_copy(slot)?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
@@ -750,12 +738,18 @@ impl DecodeSession {
             .tighten(&staged, self.width, self.height, self.crop)
     }
 
-    /// `DecodeFrame` for `input` through the video queue.
+    /// `DecodeFrame` for `input` through the video queue into pool `slot`.
     #[cfg(target_os = "windows")]
     fn submit_video(
         &mut self,
         input: &D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS,
+        slot: u8,
     ) -> Result<(), D3d12Error> {
+        let target = self
+            .outputs
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.video_alloc.Reset() }.map_err(|error| D3d12Error::Call {
             call: "ResetAllocator",
@@ -767,28 +761,46 @@ impl DecodeSession {
             hresult: error.code().0,
         })?;
         let output = D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS {
-            pOutputTexture2D: ManuallyDrop::new(Some(self.output.clone())),
+            pOutputTexture2D: ManuallyDrop::new(Some(target.clone())),
             OutputSubresource: 0,
             ConversionArguments: D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS::default(),
         };
-        // Sound: the barriers name a live texture; the list is open.
+        let enter: Vec<_> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, texture)| {
+                let after = if u8::try_from(index).is_ok_and(|at| at == slot) {
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
+                } else {
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
+                };
+                DeviceResources::barrier(texture, D3D12_RESOURCE_STATE_COMMON, after)
+            })
+            .collect();
+        let leave: Vec<_> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, texture)| {
+                let before = if u8::try_from(index).is_ok_and(|at| at == slot) {
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
+                } else {
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
+                };
+                DeviceResources::barrier(texture, before, D3D12_RESOURCE_STATE_COMMON)
+            })
+            .collect();
+        // Sound: the barriers name live textures; the list is open.
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.output,
-                self.output_state,
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
-            )]);
+            self.video_list.ResourceBarrier(&enter);
             self.video_list.DecodeFrame(
                 &self.decoder,
                 std::ptr::from_ref(&output),
                 std::ptr::from_ref(input),
             );
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.output,
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
+            self.video_list.ResourceBarrier(&leave);
         }
         // Sound: the list holds only the barriers and decode above.
         unsafe { self.video_list.Close() }.map_err(|error| D3d12Error::Call {
@@ -802,15 +814,15 @@ impl DecodeSession {
                 hresult: error.code().0,
             })?;
         self.fence.submit(&self.video_queue, &command)?;
-        self.output_state = D3D12_RESOURCE_STATE_COMMON;
         Ok(())
     }
 
-    /// Decode input arguments borrowing `submission`.
+    /// Decode input arguments borrowing `submission` and `refs`.
     #[cfg(target_os = "windows")]
     fn input_args(
         &self,
         submission: &H264Submission,
+        refs: &mut RefTables,
     ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
         let params_len = u32::try_from(std::mem::size_of::<PicParamsH264>())
             .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
@@ -842,10 +854,16 @@ impl DecodeSession {
             Size: slices_len,
             pData: submission.slices.as_ptr().cast_mut().cast::<c_void>(),
         };
+        let count = u32::try_from(POOL).unwrap_or(u32::MAX);
         Ok(D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS {
             NumFrameArguments: 3,
             FrameArguments: args,
-            ReferenceFrames: D3D12_VIDEO_DECODE_REFERENCE_FRAMES::default(),
+            ReferenceFrames: D3D12_VIDEO_DECODE_REFERENCE_FRAMES {
+                NumTexture2Ds: count,
+                ppTexture2Ds: refs.textures.as_mut_ptr(),
+                pSubresources: refs.subs.as_mut_ptr(),
+                ppHeaps: std::ptr::null_mut(),
+            },
             CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
                 pBuffer: ManuallyDrop::new(Some(self.bitstream.clone())),
                 Offset: 0,
@@ -904,50 +922,25 @@ impl DecodeSession {
         })
     }
 
-    /// Output texture planes through the direct queue into staging.
+    /// Copy allocator plus list reset for one submission.
     #[cfg(target_os = "windows")]
-    fn submit_copy(&mut self) -> Result<(), D3d12Error> {
+    fn reset_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
             call: "ResetAllocator",
             hresult: error.code().0,
         })?;
         // Sound: the allocator outlives the reset; no initial pipeline.
-        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| {
-            D3d12Error::Call {
-                call: "ResetList",
-                hresult: error.code().0,
-            }
-        })?;
-        // Sound: the barriers name a live texture; the list is open.
-        unsafe {
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.output,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-        }
-        // Sound: the copy locations name live resources; the list is open.
-        unsafe {
-            for (index, placed) in [0u32, 1u32].into_iter().zip(self.footprints.iter()) {
-                let dst = DeviceResources::footprint_location(&self.staging, placed);
-                let src = DeviceResources::subresource_location(&self.output, index);
-                self.copy_list.CopyTextureRegion(
-                    std::ptr::from_ref(&dst),
-                    0,
-                    0,
-                    0,
-                    std::ptr::from_ref(&src),
-                    None,
-                );
-            }
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.output,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-        }
-        // Sound: the list holds only the barriers and copies above.
+        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    /// Closed copy list through the direct queue.
+    #[cfg(target_os = "windows")]
+    fn close_copy(&mut self) -> Result<(), D3d12Error> {
+        // Sound: the list holds the caller's barriers and copies.
         unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
             call: "Close",
             hresult: error.code().0,
@@ -960,13 +953,180 @@ impl DecodeSession {
             })?;
         self.fence.submit(&self.copy_queue, &command)
     }
+
+    /// Pool `slot` planes through the direct queue into staging.
+    #[cfg(target_os = "windows")]
+    fn submit_copy(&mut self, slot: u8) -> Result<(), D3d12Error> {
+        let source = self
+            .outputs
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        self.reset_copy()?;
+        // Sound: the barriers name a live texture; the list is open.
+        unsafe {
+            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
+                &source,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        // Sound: the copy locations name live resources; the list is open.
+        unsafe {
+            for (index, placed) in [0u32, 1u32].into_iter().zip(self.footprints.iter()) {
+                let dst = DeviceResources::footprint_location(&self.staging, placed);
+                let src = DeviceResources::subresource_location(&source, index);
+                self.copy_list.CopyTextureRegion(
+                    std::ptr::from_ref(&dst),
+                    0,
+                    0,
+                    0,
+                    std::ptr::from_ref(&src),
+                    None,
+                );
+            }
+            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
+                &source,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        self.close_copy()
+    }
+
+    /// Pool `slot` visible rectangle through the direct queue into its crop target.
+    #[cfg(target_os = "windows")]
+    fn submit_crop(&mut self, slot: u8) -> Result<(), D3d12Error> {
+        let source = self
+            .outputs
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        let target = self
+            .crops
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        let plan = crop_plan(self.width, self.height, self.crop)
+            .ok_or_else(|| D3d12Error::BrokenReference("crop target without crop".to_owned()))?;
+        self.reset_copy()?;
+        // Sound: the barriers name live textures; the list is open.
+        unsafe {
+            self.copy_list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &source,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+                DeviceResources::barrier(
+                    &target,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+            ]);
+        }
+        let boxes = [plan.luma, plan.chroma].map(|edges| D3D12_BOX {
+            left: edges[0],
+            top: edges[1],
+            front: 0,
+            right: edges[2],
+            bottom: edges[3],
+            back: 1,
+        });
+        // Sound: the copy locations name live resources; the list is open.
+        unsafe {
+            for (index, src_box) in [0u32, 1u32].into_iter().zip(boxes.iter()) {
+                let dst = DeviceResources::subresource_location(&target, index);
+                let src = DeviceResources::subresource_location(&source, index);
+                self.copy_list.CopyTextureRegion(
+                    std::ptr::from_ref(&dst),
+                    0,
+                    0,
+                    0,
+                    std::ptr::from_ref(&src),
+                    Some(std::ptr::from_ref(src_box)),
+                );
+            }
+            self.copy_list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &source,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+                DeviceResources::barrier(
+                    &target,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+            ]);
+        }
+        self.close_copy()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::H264Submission;
-
+    #[cfg(target_os = "windows")]
+    use crate::h264::Crop;
     use crate::h264::{parse_pps, parse_sps, Ingest};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn crop_plan_absent_when_uncropped() {
+        assert!(super::crop_plan(640, 368, None).is_none());
+        let zero = Crop {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 0,
+        };
+        assert!(super::crop_plan(640, 368, Some(zero)).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn crop_plan_maps_360p_chroma_half_height() {
+        let crop = Crop {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        };
+        let plan = super::crop_plan(640, 368, Some(crop)).expect("cropped");
+        assert_eq!((plan.width, plan.height), (640, 360));
+        assert_eq!(plan.luma, [0, 0, 640, 360]);
+        assert_eq!(plan.chroma, [0, 0, 320, 180]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn crop_plan_maps_1080p_chroma_half_height() {
+        let crop = Crop {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        };
+        let plan = super::crop_plan(1920, 1088, Some(crop)).expect("cropped");
+        assert_eq!((plan.width, plan.height), (1920, 1080));
+        assert_eq!(plan.luma, [0, 0, 1920, 1080]);
+        assert_eq!(plan.chroma, [0, 0, 960, 540]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn crop_plan_offsets_symmetric_crop() {
+        let crop = Crop {
+            left: 8,
+            right: 8,
+            top: 8,
+            bottom: 8,
+        };
+        let plan = super::crop_plan(336, 256, Some(crop)).expect("cropped");
+        assert_eq!((plan.width, plan.height), (320, 240));
+        assert_eq!(plan.luma, [8, 8, 328, 248]);
+        assert_eq!(plan.chroma, [4, 4, 164, 124]);
+    }
 
     /// Test bit writer.
     struct BitWriter {
@@ -1160,15 +1320,18 @@ mod tests {
         assert_eq!(pictures.len(), 1);
         let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
         let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        let submission = H264Submission::build(&sps, &pps, &pictures[0], 7).expect("submission");
-        assert_eq!(submission.params.frame_width_in_mbs_minus1, 3);
-        assert_eq!(submission.params.frame_height_in_mbs_minus1, 2);
-        assert_eq!(submission.params.status_report_feedback_number, 7);
-        assert_eq!(submission.params.curr_field_order_cnt, [0, 0]);
-        assert_eq!(submission.slices.len(), 1);
-        assert_eq!(submission.slices[0].location, 0);
-        assert_eq!(&submission.bitstream[..4], &[0, 0, 1, 0x65]);
-        assert_eq!(submission.bitstream.len() % 128, 0);
+        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
+        assert!(decoded.outputs.is_empty());
+        assert_eq!(decoded.submission.slot, 0);
+        assert_eq!(decoded.submission.params.frame_width_in_mbs_minus1, 3);
+        assert_eq!(decoded.submission.params.frame_height_in_mbs_minus1, 2);
+        assert_eq!(decoded.submission.params.status_report_feedback_number, 1);
+        assert_eq!(decoded.submission.params.curr_field_order_cnt, [0, 0]);
+        assert_eq!(decoded.submission.slices.len(), 1);
+        assert_eq!(decoded.submission.slices[0].location, 0);
+        assert_eq!(&decoded.submission.bitstream[..4], &[0, 0, 1, 0x65]);
+        assert_eq!(decoded.submission.bitstream.len() % 128, 0);
     }
 
     #[test]
@@ -1194,8 +1357,9 @@ mod tests {
         assert_eq!(header.first_mb, 0);
         assert!(header.slice_type.is_intra());
         assert_eq!(header.qp_delta, -11);
-        let submission = H264Submission::build(&sps, &pps, picture, 7).expect("submission");
-        let params = &submission.params;
+        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let decoded = dpb.decode(picture, &sps, &pps).expect("submission");
+        let params = &decoded.submission.params;
         assert_eq!(params.frame_width_in_mbs_minus1, 19);
         assert_eq!(params.frame_height_in_mbs_minus1, 14);
         assert_eq!(params.num_ref_frames, 1);
@@ -1210,9 +1374,9 @@ mod tests {
         assert_eq!(params.deblocking_filter_control_present_flag, 1);
         assert_eq!(params.chroma_qp_index_offset, 0);
         assert_eq!(params.second_chroma_qp_index_offset, 0);
-        assert_eq!(submission.qmatrix.lists_4x4[0], [16; 16]);
-        assert_eq!(submission.qmatrix.lists_4x4[3], [16; 16]);
-        assert_eq!(submission.qmatrix.lists_8x8[0], [16; 64]);
+        assert_eq!(decoded.submission.qmatrix.lists_4x4[0], [16; 16]);
+        assert_eq!(decoded.submission.qmatrix.lists_4x4[3], [16; 16]);
+        assert_eq!(decoded.submission.qmatrix.lists_8x8[0], [16; 64]);
     }
 
     #[test]
@@ -1233,17 +1397,18 @@ mod tests {
         assert!(!pps.entropy());
         assert_eq!(pps.pic_init_qp, -3);
         assert_eq!(pps.second_chroma_qp, 0);
-        let submission = H264Submission::build(&sps, &pps, &pictures[0], 7).expect("submission");
-        let params = &submission.params;
+        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
+        let params = &decoded.submission.params;
         assert_eq!(params.bit_fields, 0xBD50);
         assert_eq!(params.pic_order_cnt_type, 0);
         assert_eq!(params.log2_max_pic_order_cnt_lsb_minus4, 2);
         assert_eq!(params.curr_field_order_cnt, [0, 0]);
         assert_eq!(params.num_ref_frames, 4);
-        assert_eq!(submission.qmatrix.lists_4x4[0], [16; 16]);
-        assert_eq!(submission.qmatrix.lists_4x4[3], [16; 16]);
-        assert_eq!(submission.qmatrix.lists_8x8[0], [16; 64]);
-        assert_eq!(submission.qmatrix.lists_8x8[1], [16; 64]);
+        assert_eq!(decoded.submission.qmatrix.lists_4x4[0], [16; 16]);
+        assert_eq!(decoded.submission.qmatrix.lists_4x4[3], [16; 16]);
+        assert_eq!(decoded.submission.qmatrix.lists_8x8[0], [16; 64]);
+        assert_eq!(decoded.submission.qmatrix.lists_8x8[1], [16; 64]);
     }
 
     /// Bytes from even-length hex `text`.
@@ -1258,28 +1423,29 @@ mod tests {
     }
 
     #[test]
-    fn submission_rejects_inter_pictures() {
-        let data = packet(&[
+    fn submission_accepts_p_with_references() {
+        let idr = packet(&[
             nal(7, 3, &sps_body()),
             nal(8, 3, &pps_body()),
-            nal(1, 3, &p_body()),
+            nal(5, 3, &idr_body()),
         ]);
-        let pictures = ingest(&data);
-        assert_eq!(pictures.len(), 1);
+        let next = packet(&[nal(1, 3, &p_body())]);
+        let mut live = Ingest::new();
+        let idr = live.ingest_packet(&idr).expect("idr");
+        assert_eq!(idr.len(), 1);
         let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
         let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        assert!(H264Submission::build(&sps, &pps, &pictures[0], 1).is_err());
-    }
-
-    #[test]
-    fn submission_rejects_empty_pictures() {
-        let sps = parse_sps(&sps_body()).expect("sps");
-        let pps = parse_pps(&pps_body(), &sps).expect("pps");
-        let picture = crate::h264::Picture {
-            slices: Vec::new(),
-            idr: true,
-        };
-        assert!(H264Submission::build(&sps, &pps, &picture, 1).is_err());
+        let mut dpb = crate::dpb::Dpb::new(&sps);
+        dpb.decode(&idr[0], &sps, &pps).expect("idr");
+        let pictures = live.ingest_packet(&next).expect("p");
+        assert_eq!(pictures.len(), 1);
+        assert!(!pictures[0].intra());
+        let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("p");
+        assert_eq!(decoded.submission.slot, 1);
+        assert_eq!(decoded.submission.params.ref_frame_list[0].entry, 0);
+        assert_eq!(decoded.submission.params.used_for_reference_flags, 0b11);
+        assert_eq!(decoded.outputs.len(), 1);
+        assert_eq!(decoded.outputs[0].slot(), 0);
     }
 
     #[test]

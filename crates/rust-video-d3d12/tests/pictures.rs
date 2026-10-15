@@ -55,7 +55,22 @@ fn pictures_hold_frames_and_bitstreams() {
     drive_shell(&mut Av1Decoder::open(&device), Codec::Av1, &garbage);
     drive_shell(&mut Mpeg2Decoder::open(&device), Codec::Mpeg2, &garbage);
     drive_shell(&mut Vc1Decoder::open(&device), Codec::Vc1, &garbage);
-    drive_encode_roundtrip(&device, 320, 240);
+    drive_encode_roundtrip(
+        &device,
+        Codec::H264,
+        320,
+        240,
+        &[0, 0, 0, 1, 0x67],
+        H264Decoder::open(&device),
+    );
+    drive_encode_roundtrip(
+        &device,
+        Codec::Hevc,
+        320,
+        240,
+        &[0, 0, 0, 1, 0x40, 0x01],
+        HevcDecoder::open(&device),
+    );
     for codec in [
         Codec::Hevc,
         Codec::Vp9,
@@ -101,6 +116,10 @@ fn drive_hevc_decode(device: &D3d12Device) {
     let y_len = 320usize * 240usize;
     assert_eq!(proven.nv12().len(), y_len + y_len / 2);
     assert!(proven.to_cpu().is_some());
+    assert!(
+        proven.nv12().iter().any(|sample| *sample != 0),
+        "decoded content is nonzero"
+    );
     let sum: u64 = proven.nv12()[..y_len]
         .iter()
         .map(|sample| u64::from(*sample))
@@ -122,12 +141,21 @@ fn drive_hevc_decode(device: &D3d12Device) {
     println!("hevc decode: 320x240 GPU frame proven, luma mean {mean}");
 }
 
-/// H.264 encode plus decode roundtrip through the GPU.
-fn drive_encode_roundtrip(device: &D3d12Device, width: u32, height: u32) {
-    let mut encoder = match D3d12Encoder::open(device, Codec::H264) {
+/// `codec` encode plus decode roundtrip through the GPU.
+fn drive_encode_roundtrip<D>(
+    device: &D3d12Device,
+    codec: Codec,
+    width: u32,
+    height: u32,
+    header: &[u8],
+    mut decoder: D,
+) where
+    D: Decoder<Frame = D3d12Frame, Error = D3d12Error>,
+{
+    let mut encoder = match D3d12Encoder::open(device, codec) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("h264 encode unavailable: {error}");
+            println!("{codec} encode unavailable: {error}");
             assert!(matches!(error, D3d12Error::Unsupported(_)));
             return;
         }
@@ -136,7 +164,7 @@ fn drive_encode_roundtrip(device: &D3d12Device, width: u32, height: u32) {
     let packets = match encoder.encode(&frame) {
         Ok(packets) => packets,
         Err(error) => {
-            println!("h264 encode pending: {error}");
+            println!("{codec} encode pending: {error}");
             assert!(matches!(
                 error,
                 D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
@@ -149,12 +177,15 @@ fn drive_encode_roundtrip(device: &D3d12Device, width: u32, height: u32) {
         .iter()
         .flat_map(|packet| packet.data().to_vec())
         .collect();
-    assert!(bytes.len() > 4);
-    assert_eq!(&bytes[..5], &[0, 0, 0, 1, 0x67]);
-    println!("h264 encode: {width}x{height} bitstream {}B", bytes.len());
-    let mut decoder = H264Decoder::open(device);
+    assert!(bytes.len() >= header.len());
+    assert_eq!(&bytes[..header.len()], header);
+    println!(
+        "{codec} encode: {width}x{height} bitstream {}B",
+        bytes.len()
+    );
     let packet = Packet::new(Bytes::from(bytes));
-    let frames = decoder.decode(&packet).expect("roundtrip decode");
+    let mut frames = decoder.decode(&packet).expect("roundtrip decode");
+    frames.extend(decoder.flush().expect("roundtrip drain"));
     assert_eq!(frames.len(), 1);
     let proven = frames.first().expect("frame");
     assert_eq!(proven.identity().size().width(), width);
@@ -168,7 +199,7 @@ fn drive_encode_roundtrip(device: &D3d12Device, width: u32, height: u32) {
         .sum();
     let mean = sum / u64::try_from(y_len).expect("nonzero extent");
     assert!(mean.abs_diff(128) < 16, "grey roundtrip mean {mean}");
-    println!("h264 roundtrip: {width}x{height} GPU frame proven, luma mean {mean}");
+    println!("{codec} roundtrip: {width}x{height} GPU frame proven, luma mean {mean}");
 }
 
 /// Bitstream or loud fallback for `codec`.
@@ -190,7 +221,10 @@ fn drive_encode_loud(device: &D3d12Device, codec: Codec, width: u32, height: u32
         }
         Err(error) => {
             println!("{codec} encode pending: {error}");
-            assert!(matches!(error, D3d12Error::Unsupported(_)));
+            assert!(matches!(
+                error,
+                D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ));
         }
     }
 }

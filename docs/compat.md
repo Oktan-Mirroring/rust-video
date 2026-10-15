@@ -92,11 +92,22 @@ D3D12: floor is Windows 10, the `ID3D12VideoDevice` minimum [T1, MS Learn].
 The tier probes decode profiles and encode support per adapter over
 `CheckFeatureSupport` with the `windows` binding at pin 0.62.2 [T1];
 decoder GUIDs come from the windows-crate constants only, never hand-copy
-hex. Video encode probes H.264, HEVC, and AV1 per adapter; sessions open H.264 only while the other args builders stay pending, and other codecs decline loudly.
+hex. Video encode probes H.264, HEVC, and AV1 per adapter; sessions open H.264 and HEVC while the AV1 args builder stays pending, and other codecs decline loudly.
 D3D12 H.264 encode on NVIDIA 596.36 emits corrupt IDR slices on
 noise-like input (2026-10-15 inquest, RTX 3060 Laptop): byte-identical
 corruption through this tier and ffmpeg `h264_d3d12va`, parameter sets
 exonerated; retest on 617.42 or later.
+D3D12 HEVC encode on NVIDIA 596.36 reports codec support but fails the
+codec-configuration support query, so the runtime rejects encoder
+creation with a loud over-caps miss; retest on 617.42 or later.
+HEVC decode is IDR-only: inter pictures miss loud (`inter picture needs
+references`) and non-IDR intra pictures miss loud (`non-IDR intra needs POC
+tracking`); H.264 carries a full decoded picture buffer. Cropped streams
+decode to visible-size GPU textures; encode sessions pad the visible
+extent to the macroblock grid and signal the visible rectangle (frame
+crop, conformance window), pixels staying device-resident. H.264 encode
+marks every IDR as a reference picture; the driver removes the device
+without a validation message otherwise.
 
 wgpu is not a decode tier: its `Backends` list has no D3D11 and no
 video API [T1, docs.rs]. Allowed roles are upload/render interop

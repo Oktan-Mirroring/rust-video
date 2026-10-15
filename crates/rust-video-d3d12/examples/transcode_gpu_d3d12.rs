@@ -8,7 +8,9 @@ mod bits;
 #[path = "common/h264.rs"]
 mod h264;
 
-use h264::annex_b_h264_packets;
+use h264::{
+    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
+};
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
@@ -43,17 +45,18 @@ fn main() {
     );
     let mut packets = 0;
     let mut bytes = 0;
-    for (index, raw) in annex_b_h264_packets().into_iter().enumerate() {
+    let inputs = annex_b_h264_packets()
+        .into_iter()
+        .chain(annex_b_h264_packets_cropped())
+        .chain(annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
+        .chain(annex_b_h264_packets_cropped_sized(119, 67, 4, 40));
+    for (index, raw) in inputs.enumerate() {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
             Ok(outcome) => {
                 report(index, &outcome);
                 packets += outcome.packets().len();
-                bytes += outcome
-                    .packets()
-                    .iter()
-                    .map(|packet| packet.data().len())
-                    .sum::<usize>();
+                bytes += bytes_of(&outcome);
             }
             Err(error) => {
                 println!("ERROR: transcode packet {index}: {error}");
@@ -69,11 +72,7 @@ fn main() {
                 outcome.plan().route()
             );
             packets += outcome.packets().len();
-            bytes += outcome
-                .packets()
-                .iter()
-                .map(|packet| packet.data().len())
-                .sum::<usize>();
+            bytes += bytes_of(&outcome);
         }
         Err(error) => {
             println!("ERROR: flush: {error}");
@@ -86,7 +85,7 @@ fn main() {
     }
     println!("transcoded {packets} packet(s), {bytes} byte(s)");
     println!("parity: size-proven only; pixel content unverified vs oracle");
-    probe_scale_miss(&device);
+    probe_scale(&device);
 }
 
 /// One transcode outcome on stdout.
@@ -106,9 +105,19 @@ fn report(index: usize, outcome: &Outcome) {
     }
 }
 
-/// Scale request against the GPU-only scale hop; the miss stays loud.
-fn probe_scale_miss(device: &D3d12Device) {
-    let target = PictureSize::new(160, 120).expect("nonzero extent");
+/// Bitstream bytes behind `outcome`.
+fn bytes_of(outcome: &Outcome) -> usize {
+    outcome
+        .packets()
+        .iter()
+        .map(|packet| packet.data().len())
+        .sum()
+}
+
+/// Scale request through the GPU scale hop; a box without video
+/// process support keeps the loud miss.
+fn probe_scale(device: &D3d12Device) {
+    let target = PictureSize::new(160, 112).expect("nonzero extent");
     let mut transcoder = match Transcoder::open(device, Codec::H264, Codec::H264) {
         Ok(transcoder) => transcoder.with_target(target),
         Err(error) => {
@@ -116,33 +125,45 @@ fn probe_scale_miss(device: &D3d12Device) {
             return;
         }
     };
-    let raw = annex_b_h264_packets()
+    let mut packets = 0;
+    let mut bytes = 0;
+    let inputs = annex_b_h264_packets()
         .into_iter()
-        .next()
-        .expect("one packet");
-    let packet = Packet::new(Bytes::from(raw));
-    match transcoder.transcode(&packet) {
-        Ok(outcome) => {
-            let bytes: usize = outcome
-                .packets()
-                .iter()
-                .map(|packet| packet.data().len())
-                .sum();
-            if outcome.packets().is_empty() || bytes == 0 {
-                println!("ERROR: scale probe produced no bitstream");
+        .chain(annex_b_h264_packets_cropped());
+    for (index, raw) in inputs.enumerate() {
+        let packet = Packet::new(Bytes::from(raw));
+        match transcoder.transcode(&packet) {
+            Ok(outcome) => {
+                packets += outcome.packets().len();
+                bytes += bytes_of(&outcome);
+            }
+            Err(D3d12Error::Unsupported(error)) if error.contains("scale") => {
+                println!("MISS: {error}");
+                return;
+            }
+            Err(error) => {
+                println!("ERROR: scale packet {index}: {error}");
                 std::process::exit(1);
             }
-            println!(
-                "scale: to 160x120 bitstream {bytes}B route={:?}",
-                outcome.plan().route()
-            );
+        }
+    }
+    match transcoder.flush() {
+        Ok(outcome) => {
+            packets += outcome.packets().len();
+            bytes += bytes_of(&outcome);
         }
         Err(D3d12Error::Unsupported(error)) if error.contains("scale") => {
             println!("MISS: {error}");
+            return;
         }
         Err(error) => {
-            println!("ERROR: scale probe: {error}");
+            println!("ERROR: scale flush: {error}");
             std::process::exit(1);
         }
     }
+    if packets == 0 || bytes == 0 {
+        println!("ERROR: scale probe produced no bitstream");
+        std::process::exit(1);
+    }
+    println!("scale: to 160x112 bitstream {bytes}B route=gpu");
 }

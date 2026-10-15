@@ -12,6 +12,8 @@ mod error;
 mod guid;
 mod h264;
 mod mf;
+#[cfg(target_os = "windows")]
+mod scale;
 mod session;
 mod transcode;
 

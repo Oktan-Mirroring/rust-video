@@ -51,8 +51,8 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_DECODE_TIER, D3D12_VIDEO_DECODE_TIER_2, D3D12_VIDEO_ENCODER_CODEC,
     D3D12_VIDEO_ENCODER_CODEC_AV1, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_0, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264,
-    D3D12_VIDEO_ENCODER_CODEC_H264, D3D12_VIDEO_ENCODER_CODEC_HEVC,
-    D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC, D3D12_VIDEO_ENCODER_CODEC_H264,
+    D3D12_VIDEO_ENCODER_CODEC_HEVC, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
 };
 
 /// H.264 profile name the tier decodes.
@@ -590,6 +590,22 @@ pub(crate) fn codec_configuration_h264(
         .unwrap_or(u32::MAX),
         Anonymous: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_0 {
             pH264Config: std::ptr::from_mut(config),
+        },
+    }
+}
+
+/// HEVC codec configuration over `config`.
+#[cfg(target_os = "windows")]
+pub(crate) fn codec_configuration_hevc(
+    config: &mut D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC,
+) -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION {
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION {
+        DataSize: u32::try_from(std::mem::size_of::<
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC,
+        >())
+        .unwrap_or(u32::MAX),
+        Anonymous: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_0 {
+            pHEVCConfig: std::ptr::from_mut(config),
         },
     }
 }

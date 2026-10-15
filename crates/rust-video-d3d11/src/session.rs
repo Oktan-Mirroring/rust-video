@@ -588,7 +588,7 @@ fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
 
 /// Flag bits as the descriptor word.
 #[cfg(target_os = "windows")]
-fn flag_word(bits: i32) -> u32 {
+pub(crate) fn flag_word(bits: i32) -> u32 {
     u32::try_from(bits).unwrap_or(0)
 }
 

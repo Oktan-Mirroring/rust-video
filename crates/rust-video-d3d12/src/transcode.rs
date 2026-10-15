@@ -8,11 +8,15 @@ use crate::error::D3d12Error;
 use crate::error::SkipReason;
 use crate::guid::Codec;
 #[cfg(target_os = "windows")]
+use crate::scale::Scaler;
+#[cfg(target_os = "windows")]
 use crate::texture::GpuTexture;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
+#[cfg(target_os = "windows")]
+use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
 
 /// Decode source behind transcode packets.
@@ -69,6 +73,12 @@ pub struct Transcoder<'a> {
     caps: GpuCaps,
     /// Optional scale hop.
     scale: Scale,
+    /// Device behind the scale hop.
+    #[cfg(target_os = "windows")]
+    device: &'a D3d12Device,
+    /// Scale hop, opened on first use.
+    #[cfg(target_os = "windows")]
+    scaler: Option<Scaler>,
     /// Executed plan for passthrough frames.
     plan: Plan,
 }
@@ -100,14 +110,19 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
+            #[cfg(target_os = "windows")]
+            device,
+            #[cfg(target_os = "windows")]
+            scaler: None,
             plan,
         })
     }
 
     /// Transcoder retargeted to `target`.
     ///
-    /// A size change without GPU scale fails loud at `transcode` and
-    /// `flush` with `Unsupported`, never silently.
+    /// A size change scales on the GPU where the box supports it, else
+    /// fails loud at `transcode` and `flush` with `Unsupported`, never
+    /// silently.
     #[must_use]
     pub fn with_target(mut self, target: PictureSize) -> Self {
         self.scale = Scale::to(target);
@@ -188,12 +203,43 @@ impl<'a> Transcoder<'a> {
     fn encode_textures(&mut self, textures: &[GpuTexture]) -> Result<Vec<Packet>, D3d12Error> {
         let mut packets = Vec::new();
         for texture in textures {
-            if let Some(cause) = self.scale.miss(texture.size()) {
-                return Err(D3d12Error::Unsupported(cause.to_string()));
-            }
-            packets.append(&mut self.encoder.encode_texture(texture)?);
+            let scaled;
+            let input = if let Some(cause) = self.scale.miss(texture.size()) {
+                scaled = self.scaled_or_miss(texture, cause)?;
+                &scaled
+            } else {
+                texture
+            };
+            packets.append(&mut self.encoder.encode_texture(input)?);
         }
         Ok(packets)
+    }
+
+    /// Scaled `texture` for a `cause` miss, or the loud miss itself.
+    #[cfg(target_os = "windows")]
+    fn scaled_or_miss(
+        &mut self,
+        texture: &GpuTexture,
+        cause: FallbackCause,
+    ) -> Result<GpuTexture, D3d12Error> {
+        let FallbackCause::ScaleNeeded { from, to } = cause else {
+            return Err(D3d12Error::Unsupported(cause.to_string()));
+        };
+        if self
+            .scaler
+            .as_ref()
+            .is_none_or(|scaler| scaler.from() != from || scaler.to() != to)
+        {
+            match Scaler::open(self.device, from, to) {
+                Ok(scaler) => self.scaler = Some(scaler),
+                Err(D3d12Error::Unsupported(_)) => {
+                    return Err(D3d12Error::Unsupported(cause.to_string()));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let scaler = self.scaler.as_mut().ok_or(D3d12Error::NoSession)?;
+        scaler.scale(texture)
     }
 
     /// `frames` through the proven CPU path.
@@ -214,12 +260,39 @@ impl<'a> Transcoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[path = "../../../examples/common/bits.rs"]
+    mod bits;
+    #[path = "../../../examples/common/h264.rs"]
+    mod h264;
+
     use bytes::Bytes;
+    use rust_video_caps::common::PictureSize;
     use rust_video_caps::packet::Packet;
+    use rust_video_caps::transcode::{FallbackCause, GpuCaps, Plan, Route, Scale};
 
     /// Live H.264 transcoder, absent without hardware.
     fn transcoder(device: &crate::device::D3d12Device) -> Option<super::Transcoder<'_>> {
         super::Transcoder::open(device, crate::guid::Codec::H264, crate::guid::Codec::H264).ok()
+    }
+
+    /// Transcoder with `caps` forced past `open`, absent without hardware.
+    fn forced(
+        device: &crate::device::D3d12Device,
+        caps: GpuCaps,
+        cause: FallbackCause,
+    ) -> Option<super::Transcoder<'_>> {
+        let encoder = crate::encoder::D3d12Encoder::open(device, crate::guid::Codec::H264).ok()?;
+        Some(super::Transcoder {
+            source: super::Source::H264(Box::new(crate::decoder::H264Decoder::open(device))),
+            encoder,
+            caps,
+            scale: Scale::passthrough(),
+            #[cfg(target_os = "windows")]
+            device,
+            #[cfg(target_os = "windows")]
+            scaler: None,
+            plan: Plan::cpu(cause),
+        })
     }
 
     #[test]
@@ -315,5 +388,57 @@ mod tests {
         };
         let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0xFF, 0xFF, 0x00]));
         assert!(transcoder.transcode(&packet).is_err());
+    }
+
+    #[test]
+    fn cpu_fallback_transcodes_off_gpu() {
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let caps = GpuCaps::new(true, true, false);
+        assert!(!caps.ready());
+        let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
+            return;
+        };
+        let mut count = 0;
+        for raw in h264::annex_b_h264_packets()
+            .into_iter()
+            .chain(h264::annex_b_h264_packets_cropped())
+        {
+            let packet = Packet::new(Bytes::from(raw));
+            let outcome = transcoder.transcode(&packet).expect("cpu transcode");
+            assert_eq!(outcome.plan().route(), Route::Cpu);
+            assert_eq!(outcome.plan().cause(), Some(FallbackCause::EncoderCpuOnly));
+            count += outcome.packets().len();
+        }
+        let drained = transcoder.flush().expect("cpu drain");
+        assert_eq!(drained.plan().route(), Route::Cpu);
+        assert!(count + drained.packets().len() > 0);
+    }
+
+    #[test]
+    fn cpu_fallback_scale_miss_fails_loud() {
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let caps = GpuCaps::new(true, true, false);
+        let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
+            return;
+        };
+        transcoder.scale = Scale::to(PictureSize::new(160, 112).expect("nonzero extent"));
+        let raw = h264::annex_b_h264_packets_cropped_sized(39, 22, 4, 22)
+            .into_iter()
+            .next()
+            .expect("sets plus IDR");
+        let packet = Packet::new(Bytes::from(raw));
+        let drained = transcoder
+            .transcode(&packet)
+            .and_then(|_| transcoder.flush());
+        match drained {
+            Err(crate::error::D3d12Error::Unsupported(error)) => {
+                assert!(error.contains("scale"), "names the hop: {error}");
+            }
+            outcome => panic!("expected scale miss, got {outcome:?}"),
+        }
     }
 }

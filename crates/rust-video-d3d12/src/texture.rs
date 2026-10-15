@@ -27,6 +27,15 @@ impl GpuTexture {
         self.identity.size()
     }
 
+    /// Texture over `resource` at `size` keeping the generation.
+    #[must_use]
+    pub(crate) fn rescaled(&self, resource: ID3D12Resource, size: PictureSize) -> Self {
+        Self {
+            identity: GpuFrame::new(size, PixelFormat::Nv12, self.identity.generation()),
+            resource,
+        }
+    }
+
     /// NV12 output texture.
     #[must_use]
     pub(crate) fn resource(&self) -> &ID3D12Resource {

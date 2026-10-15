@@ -8,7 +8,9 @@ mod grey;
 mod h264;
 
 use grey::grey_nv12;
-use h264::annex_b_h264_packets;
+use h264::{
+    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
+};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
@@ -27,7 +29,12 @@ fn main() {
     println!("supports h264: {}", device.supports(Codec::H264));
     let mut decoder = H264Decoder::open(&device);
     let mut total = 0;
-    for (index, bytes) in annex_b_h264_packets().into_iter().enumerate() {
+    let packets = annex_b_h264_packets()
+        .into_iter()
+        .chain(annex_b_h264_packets_cropped())
+        .chain(annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
+        .chain(annex_b_h264_packets_cropped_sized(119, 67, 4, 40));
+    for (index, bytes) in packets.enumerate() {
         let packet = Packet::new(Bytes::from(bytes));
         match decoder.decode(&packet) {
             Ok(frames) => {

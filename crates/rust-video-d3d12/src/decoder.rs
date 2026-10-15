@@ -1,10 +1,11 @@
 //! H.264 and HEVC decode plus probed shells behind the caps `Decoder` trait.
 
-use crate::decode::{DecodeSession, H264Submission, HevcSubmission, PictureSubmission};
+use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission};
 use crate::device::D3d12Device;
+use crate::dpb::{Decoded, Dpb};
 use crate::error::{D3d12Error, SkipReason};
 use crate::guid::Codec;
-use crate::h264::Crop;
+use crate::h264::{Crop, Ingest, Picture};
 #[cfg(target_os = "windows")]
 use crate::texture::GpuTexture;
 
@@ -224,17 +225,6 @@ macro_rules! real_decoder {
                 textures: &mut Vec<GpuTexture>,
             ) -> Result<(), D3d12Error> {
                 let (active, submission) = self.prepare_picture(picture)?;
-                if active.visible.width() != active.width
-                    || active.visible.height() != active.height
-                {
-                    return Err(D3d12Error::Unsupported(format!(
-                        "crop {}x{} in {}x{} needs crop copy",
-                        active.visible.width(),
-                        active.visible.height(),
-                        active.width,
-                        active.height
-                    )));
-                }
                 let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
                 let resource = submission.submit_texture(session)?;
                 let texture = GpuTexture::new(resource, active.visible, self.generation);
@@ -339,21 +329,366 @@ macro_rules! real_decoder {
 }
 
 real_decoder!(
-    H264Decoder,
-    H264,
-    crate::h264::Ingest,
-    crate::h264::Picture,
-    H264Submission,
-    "H.264 decoder over a D3D12 device."
-);
-real_decoder!(
     HevcDecoder,
     Hevc,
     crate::hevc::Ingest,
     crate::hevc::Picture,
     HevcSubmission,
-    "HEVC decoder over a D3D12 device."
+    "HEVC decoder over a D3D12 device. Decodes IDR pictures only; inter pictures and non-IDR intra pictures miss loud."
 );
+
+/// H.264 decoder over a D3D12 device.
+pub struct H264Decoder<'a> {
+    /// Device owning the decode session.
+    device: &'a D3d12Device,
+    /// Annex B ingest: sets plus picture assembly.
+    ingest: Ingest,
+    /// Live picture buffer, created from the first sequence set.
+    dpb: Option<Dpb>,
+    /// Live decode session, created from the first sequence set.
+    session: Option<DecodeSession>,
+    /// VRAM budget sized to the adapter memory.
+    shared: SharedDevice,
+    /// Sequence behind the live session.
+    active: Option<Active>,
+    /// Next frame generation number.
+    generation: u64,
+}
+
+impl<'a> H264Decoder<'a> {
+    /// Decoder over `device`; the session starts on the first picture.
+    #[must_use]
+    pub fn open(device: &'a D3d12Device) -> Self {
+        Self {
+            device,
+            ingest: Ingest::new(),
+            dpb: None,
+            session: None,
+            shared: device.shared().clone(),
+            active: None,
+            generation: 0,
+        }
+    }
+
+    /// Decode `picture` into `frames`.
+    fn decode_picture(
+        &mut self,
+        picture: &Picture,
+        frames: &mut Vec<D3d12Frame>,
+    ) -> Result<(), D3d12Error> {
+        let active = self.sequence(picture)?;
+        if self.active != Some(active) {
+            self.reconfigure(active, frames)?;
+        }
+        let active = self.active.ok_or(D3d12Error::NoSession)?;
+        let decoded = match self.decode_dpb(picture) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.submit_frames(&decoded, &active, frames) {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// `decoded` submission plus display-order outputs into `frames`.
+    fn submit_frames(
+        &mut self,
+        decoded: &Decoded,
+        active: &Active,
+        frames: &mut Vec<D3d12Frame>,
+    ) -> Result<(), D3d12Error> {
+        let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+        // Submit before any readback: outputs may name the submission slot.
+        session.submit(&decoded.submission)?;
+        for output in &decoded.outputs {
+            let nv12 = session.download(output.slot())?;
+            let frame = emit_frame(&self.shared, nv12, active, self.generation)?;
+            self.generation = self.generation.wrapping_add(1);
+            frames.push(frame);
+        }
+        Ok(())
+    }
+
+    /// Drop the live session, buffer, and sequence after a mid-picture failure.
+    fn reset_stream(&mut self) {
+        self.dpb = None;
+        self.session = None;
+        self.active = None;
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    fn reconfigure(
+        &mut self,
+        active: Active,
+        frames: &mut Vec<D3d12Frame>,
+    ) -> Result<(), D3d12Error> {
+        if let Some(previous) = self.active {
+            self.drain_live(&previous, frames)?;
+        }
+        self.open_session(active)
+    }
+
+    /// Session plus picture buffer for `active`.
+    fn open_session(&mut self, active: Active) -> Result<(), D3d12Error> {
+        let session = DecodeSession::open(
+            self.device,
+            Codec::H264,
+            active.width,
+            active.height,
+            active.crop,
+        )?;
+        self.session = Some(session);
+        let sps = self
+            .ingest
+            .sps(active.sps_id)
+            .ok_or(D3d12Error::NoSession)?;
+        self.dpb = Some(Dpb::new(sps));
+        self.active = Some(active);
+        Ok(())
+    }
+
+    /// Active sequence behind `picture`'s parameter sets.
+    fn sequence(&self, picture: &Picture) -> Result<Active, D3d12Error> {
+        let pps = self
+            .ingest
+            .pps(picture.pps_id())
+            .ok_or(D3d12Error::NoSession)?;
+        let sps = self
+            .ingest
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d12Error::NoSession)?;
+        let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
+            .ok_or_else(|| D3d12Error::Parse("crop empties picture".to_owned()))?;
+        Ok(Active {
+            sps_id: sps.seq_parameter_set_id,
+            width: sps.width(),
+            height: sps.height(),
+            crop: sps.crop,
+            visible,
+        })
+    }
+
+    /// Submission plus display-order outputs for `picture`.
+    fn decode_dpb(&mut self, picture: &Picture) -> Result<Decoded, D3d12Error> {
+        let pps = self
+            .ingest
+            .pps(picture.pps_id())
+            .ok_or(D3d12Error::NoSession)?;
+        let sps = self
+            .ingest
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d12Error::NoSession)?;
+        self.dpb
+            .as_mut()
+            .ok_or(D3d12Error::NoSession)?
+            .decode(picture, sps, pps)
+    }
+
+    /// Live DPB outputs into `frames`.
+    fn drain_live(
+        &mut self,
+        active: &Active,
+        frames: &mut Vec<D3d12Frame>,
+    ) -> Result<(), D3d12Error> {
+        let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
+            return Ok(());
+        };
+        for output in dpb.drain() {
+            let nv12 = session.download(output.slot())?;
+            let frame = emit_frame(&self.shared, nv12, active, self.generation)?;
+            self.generation = self.generation.wrapping_add(1);
+            frames.push(frame);
+        }
+        Ok(())
+    }
+
+    /// Decode `picture` into GPU `textures`.
+    #[cfg(target_os = "windows")]
+    fn texture_picture(
+        &mut self,
+        picture: &Picture,
+        textures: &mut Vec<GpuTexture>,
+    ) -> Result<(), D3d12Error> {
+        let outcome = self.texture_inner(picture, textures);
+        if outcome.is_err() {
+            self.reset_stream();
+        }
+        outcome
+    }
+
+    /// Decode `picture` into GPU `textures` without resetting on failure.
+    #[cfg(target_os = "windows")]
+    fn texture_inner(
+        &mut self,
+        picture: &Picture,
+        textures: &mut Vec<GpuTexture>,
+    ) -> Result<(), D3d12Error> {
+        let active = self.sequence(picture)?;
+        if self.active != Some(active) {
+            self.reconfigure_texture(active, textures)?;
+        }
+        let active = self.active.ok_or(D3d12Error::NoSession)?;
+        let decoded = match self.decode_dpb(picture) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.submit_textures(&decoded, &active, textures) {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// `decoded` submission plus display-order outputs into GPU `textures`.
+    #[cfg(target_os = "windows")]
+    fn submit_textures(
+        &mut self,
+        decoded: &Decoded,
+        active: &Active,
+        textures: &mut Vec<GpuTexture>,
+    ) -> Result<(), D3d12Error> {
+        let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+        // Submit before any texture handoff: outputs may name the submission slot.
+        session.submit(&decoded.submission)?;
+        for output in &decoded.outputs {
+            let resource = session.texture_cropped(output.slot())?;
+            textures.push(GpuTexture::new(resource, active.visible, self.generation));
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    #[cfg(target_os = "windows")]
+    fn reconfigure_texture(
+        &mut self,
+        active: Active,
+        textures: &mut Vec<GpuTexture>,
+    ) -> Result<(), D3d12Error> {
+        if let Some(previous) = self.active {
+            self.drain_live_texture(&previous, textures)?;
+        }
+        self.open_session(active)
+    }
+
+    /// Live DPB outputs into GPU `textures`.
+    #[cfg(target_os = "windows")]
+    fn drain_live_texture(
+        &mut self,
+        active: &Active,
+        textures: &mut Vec<GpuTexture>,
+    ) -> Result<(), D3d12Error> {
+        let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
+            return Ok(());
+        };
+        for output in dpb.drain() {
+            let resource = session.texture_cropped(output.slot())?;
+            textures.push(GpuTexture::new(resource, active.visible, self.generation));
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// GPU textures decoded from `packet`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without an H.264 profile or when the backend
+    /// cannot decode `packet`.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn decode_texture(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<Vec<GpuTexture>, D3d12Error> {
+        if !self.device.supports(Codec::H264) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::H264 }.into());
+        }
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut textures = Vec::new();
+        for picture in &pictures {
+            self.texture_picture(picture, &mut textures)?;
+        }
+        Ok(textures)
+    }
+
+    /// GPU textures held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
+        let mut textures = Vec::new();
+        if let Some(picture) = self.ingest.finish()? {
+            self.texture_picture(&picture, &mut textures)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live_texture(&active, &mut textures)?;
+        }
+        Ok(textures)
+    }
+}
+
+impl Decoder for H264Decoder<'_> {
+    type Frame = D3d12Frame;
+    type Error = D3d12Error;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
+        if !self.device.supports(Codec::H264) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::H264 }.into());
+        }
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut frames = Vec::new();
+        for picture in &pictures {
+            self.decode_picture(picture, &mut frames)?;
+        }
+        Ok(frames)
+    }
+
+    fn flush(&mut self) -> Result<Vec<D3d12Frame>, D3d12Error> {
+        let mut frames = Vec::new();
+        if let Some(picture) = self.ingest.finish()? {
+            self.decode_picture(&picture, &mut frames)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live(&active, &mut frames)?;
+        }
+        Ok(frames)
+    }
+}
+
+/// Frame for NV12 `nv12` at `generation`.
+fn emit_frame(
+    shared: &SharedDevice,
+    nv12: Vec<u8>,
+    active: &Active,
+    generation: u64,
+) -> Result<D3d12Frame, D3d12Error> {
+    let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
+    let y_len = usize::try_from(luma)
+        .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+    if nv12.len() != y_len + y_len / 2 {
+        return Err(D3d12Error::Unsupported(
+            "readback short of extent".to_owned(),
+        ));
+    }
+    let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, generation);
+    let bytes = Bytes::from(nv12);
+    let lease = shared.try_acquire(bytes.len() as u64)?;
+    Ok(D3d12Frame {
+        identity,
+        data: bytes,
+        lease,
+    })
+}
 
 /// Probed decoder shell; the picture builder is pending.
 macro_rules! shell {

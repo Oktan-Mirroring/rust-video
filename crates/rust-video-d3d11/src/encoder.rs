@@ -9,6 +9,8 @@ use crate::device::D3d11Device;
 use crate::error::D3d11Error;
 use crate::guid::Codec;
 use crate::mf::Session;
+#[cfg(target_os = "windows")]
+use crate::scale::ScaledSurface;
 
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
@@ -82,6 +84,22 @@ impl D3d11Encoder {
             size.width(),
             size.height(),
         )
+    }
+
+    /// Packets coded from `scaled`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without a D3D11 bind or when the backend cannot
+    /// encode `scaled`.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn encode_scaled(
+        &mut self,
+        scaled: &ScaledSurface,
+    ) -> Result<Vec<Packet>, D3d11Error> {
+        let size = scaled.size();
+        self.session
+            .encode_texture(scaled.texture(), 0, 0, 0, size.width(), size.height())
     }
 }
 
