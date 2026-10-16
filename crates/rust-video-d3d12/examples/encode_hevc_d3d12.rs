@@ -1,13 +1,18 @@
 //! HEVC encode on the D3D12 tier, from synthetic NV12 to packets.
 
 #[path = "common/grey.rs"]
+#[cfg(target_os = "windows")]
 mod grey;
 
+#[cfg(target_os = "windows")]
 use grey::grey_nv12;
 
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
+#[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Encoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d12Device::open() {
         Ok(device) => device,
@@ -56,3 +61,6 @@ fn main() {
     }
     println!("encoded {packets} packet(s), {bytes} byte(s) (flat input only)");
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

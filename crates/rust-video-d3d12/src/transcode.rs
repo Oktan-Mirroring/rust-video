@@ -4,18 +4,13 @@ use crate::decoder::{D3d12Frame, H264Decoder, HevcDecoder};
 use crate::device::D3d12Device;
 use crate::encoder::D3d12Encoder;
 use crate::error::D3d12Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
 use crate::guid::Codec;
-#[cfg(target_os = "windows")]
 use crate::scale::Scaler;
-#[cfg(target_os = "windows")]
 use crate::texture::GpuTexture;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
 
@@ -37,7 +32,6 @@ impl Source<'_> {
     }
 
     /// GPU textures decoded from `packet`, possibly none.
-    #[cfg(target_os = "windows")]
     fn decode_texture(&mut self, packet: &Packet) -> Result<Vec<GpuTexture>, D3d12Error> {
         match self {
             Self::H264(decoder) => decoder.decode_texture(packet),
@@ -54,7 +48,6 @@ impl Source<'_> {
     }
 
     /// GPU textures held back for reordering or buffering.
-    #[cfg(target_os = "windows")]
     fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
         match self {
             Self::H264(decoder) => decoder.flush_texture(),
@@ -74,10 +67,8 @@ pub struct Transcoder<'a> {
     /// Optional scale hop.
     scale: Scale,
     /// Device behind the scale hop.
-    #[cfg(target_os = "windows")]
     device: &'a D3d12Device,
     /// Scale hop, opened on first use.
-    #[cfg(target_os = "windows")]
     scaler: Option<Scaler>,
     /// Executed plan for passthrough frames.
     plan: Plan,
@@ -100,7 +91,7 @@ impl<'a> Transcoder<'a> {
         };
         let encoder = D3d12Encoder::open(device, encode)?;
         let caps = GpuCaps::new(
-            cfg!(target_os = "windows"),
+            true,
             device.supports(decode),
             device.supports_encode(encode),
         );
@@ -110,9 +101,7 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
-            #[cfg(target_os = "windows")]
             device,
-            #[cfg(target_os = "windows")]
             scaler: None,
             plan,
         })
@@ -169,22 +158,13 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Packets transcoded from `packet` through GPU textures.
-    #[cfg(target_os = "windows")]
     fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, D3d12Error> {
         let textures = self.source.decode_texture(packet)?;
         let packets = self.encode_textures(&textures)?;
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Packets transcoded from `packet` through GPU textures.
-    #[cfg(not(target_os = "windows"))]
-    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, D3d12Error> {
-        let _ = packet;
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Drained packets through GPU textures.
-    #[cfg(target_os = "windows")]
     fn flush_gpu(&mut self) -> Result<Outcome, D3d12Error> {
         let textures = self.source.flush_texture()?;
         let mut packets = self.encode_textures(&textures)?;
@@ -192,14 +172,7 @@ impl<'a> Transcoder<'a> {
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Drained packets through GPU textures.
-    #[cfg(not(target_os = "windows"))]
-    fn flush_gpu(&mut self) -> Result<Outcome, D3d12Error> {
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Packets coded from GPU `textures`.
-    #[cfg(target_os = "windows")]
     fn encode_textures(&mut self, textures: &[GpuTexture]) -> Result<Vec<Packet>, D3d12Error> {
         let mut packets = Vec::new();
         for texture in textures {
@@ -216,7 +189,6 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Scaled `texture` for a `cause` miss, or the loud miss itself.
-    #[cfg(target_os = "windows")]
     fn scaled_or_miss(
         &mut self,
         texture: &GpuTexture,
@@ -287,9 +259,7 @@ mod tests {
             encoder,
             caps,
             scale: Scale::passthrough(),
-            #[cfg(target_os = "windows")]
             device,
-            #[cfg(target_os = "windows")]
             scaler: None,
             plan: Plan::cpu(cause),
         })

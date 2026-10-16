@@ -1,22 +1,32 @@
 //! H.264 decode on the D3D12 tier, from synthetic Annex B to frames.
 
 #[path = "common/bits.rs"]
+#[cfg(target_os = "windows")]
 mod bits;
 #[path = "common/grey.rs"]
+#[cfg(target_os = "windows")]
 mod grey;
 #[path = "common/h264.rs"]
+#[cfg(target_os = "windows")]
 mod h264;
 
+#[cfg(target_os = "windows")]
 use grey::grey_nv12;
+#[cfg(target_os = "windows")]
 use h264::{
     annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
 };
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
+#[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Encoder, D3d12Frame, H264Decoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d12Device::open() {
         Ok(device) => device,
@@ -73,6 +83,7 @@ fn main() {
 }
 
 /// One decoded frame on stdout.
+#[cfg(target_os = "windows")]
 fn report(frame: &D3d12Frame) {
     let identity = frame.identity();
     let size = identity.size();
@@ -92,6 +103,7 @@ fn report(frame: &D3d12Frame) {
 }
 
 /// H.264 encode probe on flat input.
+#[cfg(target_os = "windows")]
 fn probe_encode(device: &D3d12Device) {
     let mut encoder = match D3d12Encoder::open(device, Codec::H264) {
         Ok(encoder) => encoder,
@@ -109,3 +121,6 @@ fn probe_encode(device: &D3d12Device) {
         Err(error) => println!("MISS: h264 encode failed ({error})"),
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

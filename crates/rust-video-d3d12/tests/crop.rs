@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! Cropped-stream GPU transcode: passthrough plus scale.
 //!
 //! Skips without hardware.
@@ -11,8 +13,6 @@ use h264::{
     annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
 };
 
-#[cfg(not(target_os = "windows"))]
-use rust_video_d3d12::SkipReason;
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, H264Decoder, Transcoder};
 
 use bytes::Bytes;
@@ -27,11 +27,6 @@ fn device() -> Option<D3d12Device> {
         Ok(device) => Some(device),
         Err(error) => {
             println!("d3d12 skipped: {error}");
-            #[cfg(not(target_os = "windows"))]
-            assert!(matches!(
-                error,
-                D3d12Error::Skipped(SkipReason::PlatformUnsupported)
-            ));
             None
         }
     }

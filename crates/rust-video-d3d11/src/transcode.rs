@@ -1,21 +1,16 @@
 //! GPU transcode: decode surface to encoder texture without readback.
 
-#[cfg(target_os = "windows")]
 use crate::decoder::GpuSurface;
 use crate::decoder::{D3d11Frame, H264Decoder};
 use crate::device::D3d11Device;
 use crate::encoder::D3d11Encoder;
 use crate::error::D3d11Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
 use crate::guid::Codec;
-#[cfg(target_os = "windows")]
 use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
 
@@ -30,10 +25,8 @@ pub struct Transcoder<'a> {
     /// Optional scale hop.
     scale: Scale,
     /// Device behind the scale hop.
-    #[cfg(target_os = "windows")]
     device: &'a D3d11Device,
     /// Scale hop, opened on first use.
-    #[cfg(target_os = "windows")]
     scaler: Option<Scaler>,
     /// Executed plan for passthrough frames.
     plan: Plan,
@@ -51,11 +44,7 @@ impl<'a> Transcoder<'a> {
             return Err(D3d11Error::Unsupported(format!("{decode} decode pending")));
         }
         let encoder = D3d11Encoder::open(device, encode)?;
-        let caps = GpuCaps::new(
-            cfg!(target_os = "windows"),
-            device.supports(decode),
-            encoder.gpu_ready(),
-        );
+        let caps = GpuCaps::new(true, device.supports(decode), encoder.gpu_ready());
         let plan = Plan::for_caps(&caps);
         let decoder = Box::new(H264Decoder::open(device));
         Ok(Self {
@@ -63,9 +52,7 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
-            #[cfg(target_os = "windows")]
             device,
-            #[cfg(target_os = "windows")]
             scaler: None,
             plan,
         })
@@ -122,22 +109,13 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Packets transcoded from `packet` through GPU surfaces.
-    #[cfg(target_os = "windows")]
     fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, D3d11Error> {
         let surfaces = self.decoder.decode_surface(packet)?;
         let packets = self.encode_surfaces(&surfaces)?;
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Packets transcoded from `packet` through GPU surfaces.
-    #[cfg(not(target_os = "windows"))]
-    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, D3d11Error> {
-        let _ = packet;
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Drained packets through GPU surfaces.
-    #[cfg(target_os = "windows")]
     fn flush_gpu(&mut self) -> Result<Outcome, D3d11Error> {
         let surfaces = self.decoder.flush_surface()?;
         let mut packets = self.encode_surfaces(&surfaces)?;
@@ -145,14 +123,7 @@ impl<'a> Transcoder<'a> {
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Drained packets through GPU surfaces.
-    #[cfg(not(target_os = "windows"))]
-    fn flush_gpu(&mut self) -> Result<Outcome, D3d11Error> {
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Packets coded from GPU `surfaces`.
-    #[cfg(target_os = "windows")]
     fn encode_surfaces(&mut self, surfaces: &[GpuSurface]) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         for surface in surfaces {
@@ -167,7 +138,6 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Scaled `surface` for a `cause` miss, or the loud miss itself.
-    #[cfg(target_os = "windows")]
     fn scaled_or_miss(
         &mut self,
         surface: &GpuSurface,

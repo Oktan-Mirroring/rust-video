@@ -4,18 +4,12 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::mem::ManuallyDrop;
 
 use crate::error::D3d12Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
-#[cfg(target_os = "windows")]
 use crate::submit::{DeviceResources, Fence, Nv12Layout};
 
-#[cfg(target_os = "windows")]
 use windows::core::Interface;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
     ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -25,9 +19,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL};
-#[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_32x32,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_8x8,
@@ -612,7 +604,6 @@ impl BitWriter {
 }
 
 /// Input, bitstream, and metadata buffers behind encode.
-#[cfg(target_os = "windows")]
 struct Buffers {
     /// NV12 input texture.
     input: ID3D12Resource,
@@ -641,105 +632,72 @@ struct Buffers {
 /// D3D12 video encode session over one codec geometry.
 pub(crate) struct EncodeSession {
     /// Video encode queue.
-    #[cfg(target_os = "windows")]
     video_queue: ID3D12CommandQueue,
     /// Video encode allocator.
-    #[cfg(target_os = "windows")]
     video_alloc: ID3D12CommandAllocator,
     /// Video encode list.
-    #[cfg(target_os = "windows")]
     video_list: ID3D12VideoEncodeCommandList2,
     /// Direct queue behind uploads.
-    #[cfg(target_os = "windows")]
     copy_queue: ID3D12CommandQueue,
     /// Direct allocator behind uploads.
-    #[cfg(target_os = "windows")]
     copy_alloc: ID3D12CommandAllocator,
     /// Direct list behind uploads.
-    #[cfg(target_os = "windows")]
     copy_list: ID3D12GraphicsCommandList,
     /// Fence behind both queues.
-    #[cfg(target_os = "windows")]
     fence: Fence,
     /// Encoder behind pictures.
-    #[cfg(target_os = "windows")]
     encoder: ID3D12VideoEncoder,
     /// Encoder heap behind pictures.
-    #[cfg(target_os = "windows")]
     heap: ID3D12VideoEncoderHeap,
     /// NV12 input texture.
-    #[cfg(target_os = "windows")]
     input: ID3D12Resource,
     /// Reconstructed picture texture.
-    #[cfg(target_os = "windows")]
     recon: ID3D12Resource,
     /// Reconstructed texture state.
-    #[cfg(target_os = "windows")]
     recon_state: D3D12_RESOURCE_STATES,
     /// Input upload buffer.
-    #[cfg(target_os = "windows")]
     upload: ID3D12Resource,
     /// Staging layout.
-    #[cfg(target_os = "windows")]
     layout: Nv12Layout,
     /// Driver footprints behind staging copies.
-    #[cfg(target_os = "windows")]
     footprints: [D3D12_PLACED_SUBRESOURCE_FOOTPRINT; 2],
     /// Bitstream encoder buffer.
-    #[cfg(target_os = "windows")]
     bitstream: ID3D12Resource,
     /// Bitstream buffer state.
-    #[cfg(target_os = "windows")]
     bitstream_state: D3D12_RESOURCE_STATES,
     /// Bitstream staging buffer.
-    #[cfg(target_os = "windows")]
     staging: ID3D12Resource,
     /// Bitstream capacity in bytes.
-    #[cfg(target_os = "windows")]
     bitstream_cap: u64,
     /// Start-coded headers written before the slices.
-    #[cfg(target_os = "windows")]
     headers: Vec<u8>,
     /// Encoder metadata buffer.
-    #[cfg(target_os = "windows")]
     meta: ID3D12Resource,
     /// Metadata buffer state.
-    #[cfg(target_os = "windows")]
     meta_state: D3D12_RESOURCE_STATES,
     /// Resolved metadata buffer.
-    #[cfg(target_os = "windows")]
     resolved: ID3D12Resource,
     /// Resolved buffer state.
-    #[cfg(target_os = "windows")]
     resolved_state: D3D12_RESOURCE_STATES,
     /// Resolved staging buffer.
-    #[cfg(target_os = "windows")]
     resolved_staging: ID3D12Resource,
     /// Codec behind the session.
-    #[cfg(target_os = "windows")]
     codec: crate::guid::Codec,
     /// Coded width in luma samples.
-    #[cfg(target_os = "windows")]
     width: u32,
     /// Coded height in luma samples.
-    #[cfg(target_os = "windows")]
     height: u32,
     /// Visible width in luma samples.
-    #[cfg(target_os = "windows")]
     visible_width: u32,
     /// Visible height in luma samples.
-    #[cfg(target_os = "windows")]
     visible_height: u32,
     /// Creation descriptors behind the encoder and heap.
-    #[cfg(target_os = "windows")]
     descriptors: Box<EncoderDescriptors>,
     /// IDR id behind frames.
-    #[cfg(target_os = "windows")]
     idr_pic_id: u16,
 }
 
 /// Encoder creation descriptors with a stable heap address.
-#[cfg(target_os = "windows")]
 enum EncoderDescriptors {
     /// H.264 descriptors.
     H264(H264Descriptors),
@@ -748,7 +706,6 @@ enum EncoderDescriptors {
 }
 
 /// H.264 creation descriptors with a stable heap address.
-#[cfg(target_os = "windows")]
 struct H264Descriptors {
     /// Encoder profile behind the encoder, heap, and resolve calls.
     profile: D3D12_VIDEO_ENCODER_PROFILE_H264,
@@ -761,7 +718,6 @@ struct H264Descriptors {
 }
 
 /// HEVC creation descriptors with a stable heap address.
-#[cfg(target_os = "windows")]
 struct HevcDescriptors {
     /// Encoder profile behind the encoder, heap, and resolve calls.
     profile: D3D12_VIDEO_ENCODER_PROFILE_HEVC,
@@ -778,7 +734,7 @@ impl EncodeSession {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without a `codec` encoder, past the
+    /// Returns `Err` without a `codec` encoder, past the
     /// adapter encode caps, or when the driver refuses the session.
     pub(crate) fn open(
         device: &crate::device::D3d12Device,
@@ -786,19 +742,10 @@ impl EncodeSession {
         width: u32,
         height: u32,
     ) -> Result<Self, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows(device, codec, width, height)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (device, codec, width, height);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows(device, codec, width, height)
     }
 
     /// Session over `device` for `codec` at `width` by `height`.
-    #[cfg(target_os = "windows")]
     fn open_windows(
         device: &crate::device::D3d12Device,
         codec: crate::guid::Codec,
@@ -877,7 +824,6 @@ impl EncodeSession {
     }
 
     /// Descriptors plus header bytes for `codec` at visible `width` by `height`.
-    #[cfg(target_os = "windows")]
     fn descriptors(
         codec: crate::guid::Codec,
         width: u32,
@@ -921,7 +867,6 @@ impl EncodeSession {
     }
 
     /// Encoder level for `level_idc`.
-    #[cfg(target_os = "windows")]
     fn level_h264(level_idc: u8) -> Result<D3D12_VIDEO_ENCODER_LEVELS_H264, D3d12Error> {
         match level_idc {
             10 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_1),
@@ -945,7 +890,6 @@ impl EncodeSession {
     }
 
     /// Encoder level for `level_idc` on the main tier.
-    #[cfg(target_os = "windows")]
     fn level_hevc(
         level_idc: u8,
     ) -> Result<D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC, D3d12Error> {
@@ -974,7 +918,6 @@ impl EncodeSession {
     }
 
     /// Intra-only codec configuration.
-    #[cfg(target_os = "windows")]
     fn codec_config_h264() -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 {
         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264 {
             ConfigurationFlags:
@@ -989,7 +932,6 @@ impl EncodeSession {
     /// Intra-only codec configuration matching the HEVC headers.
     ///
     /// <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
-    #[cfg(target_os = "windows")]
     fn codec_config_hevc() -> D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC {
         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC {
             ConfigurationFlags: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE,
@@ -1003,7 +945,6 @@ impl EncodeSession {
     }
 
     /// Single-IDR group of pictures.
-    #[cfg(target_os = "windows")]
     fn gop_h264() -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 {
         D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264 {
             GOPLength: 1,
@@ -1015,7 +956,6 @@ impl EncodeSession {
     }
 
     /// Single-IDR group of pictures.
-    #[cfg(target_os = "windows")]
     fn gop_hevc() -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC {
         D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC {
             GOPLength: 1,
@@ -1025,7 +965,6 @@ impl EncodeSession {
     }
 
     /// Constant quantizer behind every frame type.
-    #[cfg(target_os = "windows")]
     fn cqp() -> D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP {
         D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP {
             ConstantQP_FullIntracodedFrame: INTRA_QP,
@@ -1035,7 +974,6 @@ impl EncodeSession {
     }
 
     /// Rate control over `cqp`.
-    #[cfg(target_os = "windows")]
     fn rate_control(
         cqp: &D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
     ) -> D3D12_VIDEO_ENCODER_RATE_CONTROL {
@@ -1058,7 +996,6 @@ impl EncodeSession {
     }
 
     /// Encoder plus heap over the descriptors.
-    #[cfg(target_os = "windows")]
     fn create_codec(
         video3: &ID3D12VideoDevice3,
         descriptors: &mut EncoderDescriptors,
@@ -1166,7 +1103,6 @@ impl EncodeSession {
     /// # Errors
     ///
     /// Returns `Err` when the requirements query fails.
-    #[cfg(target_os = "windows")]
     fn query_requirements(
         video: &ID3D12VideoDevice,
         descriptors: &mut EncoderDescriptors,
@@ -1210,7 +1146,6 @@ impl EncodeSession {
     }
 
     /// Buffers for `width` by `height` behind `meta_cap` metadata bytes.
-    #[cfg(target_os = "windows")]
     fn open_buffers(
         resources: &DeviceResources,
         width: u32,
@@ -1292,7 +1227,6 @@ impl EncodeSession {
     }
 
     /// Profile descriptor over `profile`.
-    #[cfg(target_os = "windows")]
     fn profile_desc_h264(
         profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
     ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
@@ -1306,7 +1240,6 @@ impl EncodeSession {
     }
 
     /// Profile descriptor over `profile`.
-    #[cfg(target_os = "windows")]
     fn profile_desc_hevc(
         profile: &mut D3D12_VIDEO_ENCODER_PROFILE_HEVC,
     ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
@@ -1320,7 +1253,6 @@ impl EncodeSession {
     }
 
     /// Profile descriptor over the session descriptors.
-    #[cfg(target_os = "windows")]
     fn profile_desc(descriptors: &mut EncoderDescriptors) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
         match descriptors {
             EncoderDescriptors::H264(h264) => Self::profile_desc_h264(&mut h264.profile),
@@ -1332,22 +1264,13 @@ impl EncodeSession {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, for NV12 short of the extent, or when
+    /// Returns `Err` for NV12 short of the extent, or when
     /// the driver refuses the picture.
     pub(crate) fn encode(&mut self, nv12: &[u8]) -> Result<Vec<u8>, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.encode_windows(nv12)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (nv12, self);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.encode_windows(nv12)
     }
 
     /// Bitstream bytes encoded from NV12 on the GPU.
-    #[cfg(target_os = "windows")]
     fn encode_windows(&mut self, nv12: &[u8]) -> Result<Vec<u8>, D3d12Error> {
         let padded;
         let coded = if (self.visible_width, self.visible_height) == (self.width, self.height) {
@@ -1367,7 +1290,6 @@ impl EncodeSession {
     }
 
     /// Bitstream bytes encoded from the `src` texture on the GPU.
-    #[cfg(target_os = "windows")]
     pub(crate) fn encode_texture(
         &mut self,
         src: &ID3D12Resource,
@@ -1384,7 +1306,6 @@ impl EncodeSession {
     }
 
     /// Picture through the video queue plus metadata into Annex B bytes.
-    #[cfg(target_os = "windows")]
     fn finish_picture(&mut self) -> Result<Vec<u8>, D3d12Error> {
         self.submit_video()?;
         self.submit_download()?;
@@ -1411,7 +1332,6 @@ impl EncodeSession {
     }
 
     /// Copy allocator plus list reset for one submission.
-    #[cfg(target_os = "windows")]
     fn reset_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
@@ -1426,7 +1346,6 @@ impl EncodeSession {
     }
 
     /// Closed copy list through the direct queue.
-    #[cfg(target_os = "windows")]
     fn close_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the list holds the caller's barriers and copies.
         unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
@@ -1443,7 +1362,6 @@ impl EncodeSession {
     }
 
     /// NV12 upload through the direct queue into the input texture.
-    #[cfg(target_os = "windows")]
     fn submit_copy(&mut self) -> Result<(), D3d12Error> {
         self.reset_copy()?;
         // Sound: the barriers name a live texture; the list is open.
@@ -1481,7 +1399,6 @@ impl EncodeSession {
     ///
     /// Pad samples outside the visible rectangle stay stale; the crop
     /// rectangle hides them from decoders.
-    #[cfg(target_os = "windows")]
     fn submit_copy_from(
         &mut self,
         src: &ID3D12Resource,
@@ -1543,7 +1460,6 @@ impl EncodeSession {
     }
 
     /// Picture control data over `pic_data`.
-    #[cfg(target_os = "windows")]
     fn picture_data_h264(
         pic_data: &mut D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264,
     ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
@@ -1559,7 +1475,6 @@ impl EncodeSession {
     }
 
     /// Picture control data over `pic_data`.
-    #[cfg(target_os = "windows")]
     fn picture_data_hevc(
         pic_data: &mut D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC,
     ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA {
@@ -1575,7 +1490,6 @@ impl EncodeSession {
     }
 
     /// Picture control over `codec_data`.
-    #[cfg(target_os = "windows")]
     fn picture_control(
         codec_data: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA,
     ) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC {
@@ -1590,7 +1504,6 @@ impl EncodeSession {
     }
 
     /// Group-of-pictures structure over `gop`.
-    #[cfg(target_os = "windows")]
     fn sequence_gop_h264(
         gop: &mut D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
     ) -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
@@ -1606,7 +1519,6 @@ impl EncodeSession {
     }
 
     /// Group-of-pictures structure over `gop`.
-    #[cfg(target_os = "windows")]
     fn sequence_gop_hevc(
         gop: &mut D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC,
     ) -> D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE {
@@ -1622,7 +1534,6 @@ impl EncodeSession {
     }
 
     /// Sequence control over `cqp` and `gop` at `width` by `height`.
-    #[cfg(target_os = "windows")]
     fn sequence_control(
         cqp: &D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
         gop: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE,
@@ -1648,7 +1559,6 @@ impl EncodeSession {
     }
 
     /// IDR picture data over `idr_pic_id`.
-    #[cfg(target_os = "windows")]
     fn pic_h264(idr_pic_id: u16) -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 {
         D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264 {
             Flags: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_H264_FLAG_NONE,
@@ -1662,7 +1572,6 @@ impl EncodeSession {
     }
 
     /// IDR picture data.
-    #[cfg(target_os = "windows")]
     fn pic_hevc() -> D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC {
         D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC {
             Flags: D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_NONE,
@@ -1675,7 +1584,6 @@ impl EncodeSession {
     }
 
     /// `EncodeFrame` plus metadata resolve through the video queue.
-    #[cfg(target_os = "windows")]
     fn submit_video(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.video_alloc.Reset() }.map_err(|error| D3d12Error::Call {
@@ -1770,7 +1678,6 @@ impl EncodeSession {
     }
 
     /// Encode plus resolve records behind the argument structs.
-    #[cfg(target_os = "windows")]
     fn record_video(
         &self,
         input_args: &D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS,
@@ -1848,7 +1755,6 @@ impl EncodeSession {
     }
 
     /// Bitstream and metadata through the direct queue into staging.
-    #[cfg(target_os = "windows")]
     fn submit_download(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
@@ -1919,7 +1825,6 @@ impl EncodeSession {
     }
 
     /// Output metadata from the resolved staging buffer.
-    #[cfg(target_os = "windows")]
     fn read_metadata(&self) -> Result<D3D12_VIDEO_ENCODER_OUTPUT_METADATA, D3d12Error> {
         let len = std::mem::size_of::<D3D12_VIDEO_ENCODER_OUTPUT_METADATA>();
         let bytes = DeviceResources::read_readback(&self.resolved_staging, len)?;

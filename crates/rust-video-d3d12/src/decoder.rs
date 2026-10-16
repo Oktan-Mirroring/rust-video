@@ -1,19 +1,25 @@
 //! H.264 and HEVC decode plus probed shells behind the caps `Decoder` trait.
 
+#[cfg(target_os = "windows")]
 use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission};
 use crate::device::D3d12Device;
+#[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb};
 use crate::error::{D3d12Error, SkipReason};
 use crate::guid::Codec;
+#[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
 #[cfg(target_os = "windows")]
 use crate::texture::GpuTexture;
 
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+#[cfg(target_os = "windows")]
+use rust_video_caps::traits::SharedDevice;
+use rust_video_caps::traits::{Decoder, Lease};
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d12Frame {
@@ -74,6 +80,7 @@ impl D3d12Frame {
 }
 
 /// Active sequence behind the live session.
+#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Active {
     /// Sequence set id.
@@ -89,6 +96,7 @@ struct Active {
 }
 
 /// Real decoder over ingest plus a video decode session.
+#[cfg(target_os = "windows")]
 macro_rules! real_decoder {
     ($decoder:ident, $codec:ident, $ingest:ty, $picture:ty, $submission:ty, $doc:literal) => {
         #[doc = $doc]
@@ -218,7 +226,6 @@ macro_rules! real_decoder {
             }
 
             /// `picture` into GPU `textures` without resetting on failure.
-            #[cfg(target_os = "windows")]
             fn texture_inner(
                 &mut self,
                 picture: &$picture,
@@ -234,7 +241,6 @@ macro_rules! real_decoder {
             }
 
             /// `picture` into GPU `textures`.
-            #[cfg(target_os = "windows")]
             fn texture_picture(
                 &mut self,
                 picture: &$picture,
@@ -259,7 +265,6 @@ macro_rules! real_decoder {
             ///
             /// Returns `Err` without a `codec` profile or when the backend
             /// cannot decode `packet`.
-            #[cfg(target_os = "windows")]
             pub(crate) fn decode_texture(
                 &mut self,
                 packet: &Packet,
@@ -288,7 +293,6 @@ macro_rules! real_decoder {
             /// # Errors
             ///
             /// Returns `Err` when the backend cannot release its held frames.
-            #[cfg(target_os = "windows")]
             pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
                 let mut textures = Vec::new();
                 if let Some(picture) = self.ingest.finish()? {
@@ -328,6 +332,7 @@ macro_rules! real_decoder {
     };
 }
 
+#[cfg(target_os = "windows")]
 real_decoder!(
     HevcDecoder,
     Hevc,
@@ -338,6 +343,7 @@ real_decoder!(
 );
 
 /// H.264 decoder over a D3D12 device.
+#[cfg(target_os = "windows")]
 pub struct H264Decoder<'a> {
     /// Device owning the decode session.
     device: &'a D3d12Device,
@@ -355,6 +361,7 @@ pub struct H264Decoder<'a> {
     generation: u64,
 }
 
+#[cfg(target_os = "windows")]
 impl<'a> H264Decoder<'a> {
     /// Decoder over `device`; the session starts on the first picture.
     #[must_use]
@@ -508,7 +515,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Decode `picture` into GPU `textures`.
-    #[cfg(target_os = "windows")]
     fn texture_picture(
         &mut self,
         picture: &Picture,
@@ -522,7 +528,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Decode `picture` into GPU `textures` without resetting on failure.
-    #[cfg(target_os = "windows")]
     fn texture_inner(
         &mut self,
         picture: &Picture,
@@ -548,7 +553,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// `decoded` submission plus display-order outputs into GPU `textures`.
-    #[cfg(target_os = "windows")]
     fn submit_textures(
         &mut self,
         decoded: &Decoded,
@@ -567,7 +571,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Session for `active`, draining the previous sequence first.
-    #[cfg(target_os = "windows")]
     fn reconfigure_texture(
         &mut self,
         active: Active,
@@ -580,7 +583,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Live DPB outputs into GPU `textures`.
-    #[cfg(target_os = "windows")]
     fn drain_live_texture(
         &mut self,
         active: &Active,
@@ -603,7 +605,6 @@ impl<'a> H264Decoder<'a> {
     ///
     /// Returns `Err` without an H.264 profile or when the backend
     /// cannot decode `packet`.
-    #[cfg(target_os = "windows")]
     pub(crate) fn decode_texture(
         &mut self,
         packet: &Packet,
@@ -624,7 +625,6 @@ impl<'a> H264Decoder<'a> {
     /// # Errors
     ///
     /// Returns `Err` when the backend cannot release its held frames.
-    #[cfg(target_os = "windows")]
     pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
         let mut textures = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
@@ -637,6 +637,7 @@ impl<'a> H264Decoder<'a> {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl Decoder for H264Decoder<'_> {
     type Frame = D3d12Frame;
     type Error = D3d12Error;
@@ -666,6 +667,7 @@ impl Decoder for H264Decoder<'_> {
 }
 
 /// Frame for NV12 `nv12` at `generation`.
+#[cfg(target_os = "windows")]
 fn emit_frame(
     shared: &SharedDevice,
     nv12: Vec<u8>,

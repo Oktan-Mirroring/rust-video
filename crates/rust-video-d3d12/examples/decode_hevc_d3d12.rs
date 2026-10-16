@@ -3,20 +3,30 @@
 //! Encode stays a named miss until the args builder lands.
 
 #[path = "common/bits.rs"]
+#[cfg(target_os = "windows")]
 mod bits;
 #[path = "common/grey.rs"]
+#[cfg(target_os = "windows")]
 mod grey;
 #[path = "common/hevc.rs"]
+#[cfg(target_os = "windows")]
 mod hevc;
 
+#[cfg(target_os = "windows")]
 use grey::grey_nv12;
+#[cfg(target_os = "windows")]
 use hevc::annex_b_packets;
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
+#[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Encoder, D3d12Frame, HevcDecoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d12Device::open() {
         Ok(device) => device,
@@ -68,6 +78,7 @@ fn main() {
 }
 
 /// One decoded frame on stdout.
+#[cfg(target_os = "windows")]
 fn report(frame: &D3d12Frame) {
     let identity = frame.identity();
     let size = identity.size();
@@ -87,6 +98,7 @@ fn report(frame: &D3d12Frame) {
 }
 
 /// HEVC encode attempt; names the miss when the box declines it.
+#[cfg(target_os = "windows")]
 fn probe_encode_miss(device: &D3d12Device) {
     let mut encoder = match D3d12Encoder::open(device, Codec::Hevc) {
         Ok(encoder) => encoder,
@@ -104,3 +116,6 @@ fn probe_encode_miss(device: &D3d12Device) {
         Err(error) => println!("MISS: hevc encode miss ({error})"),
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

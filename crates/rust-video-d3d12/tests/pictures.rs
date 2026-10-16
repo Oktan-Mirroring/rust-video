@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! Picture proof: GPU-sourced frames and bitstreams.
 //!
 //! Skips without hardware.
@@ -12,8 +14,6 @@ mod hevc;
 use grey::grey_nv12;
 use hevc::annex_b_packets;
 
-#[cfg(not(target_os = "windows"))]
-use rust_video_d3d12::SkipReason;
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
     Mpeg2Decoder, Vc1Decoder, Vp9Decoder,
@@ -30,11 +30,6 @@ fn pictures_hold_frames_and_bitstreams() {
         Ok(device) => device,
         Err(error) => {
             println!("d3d12 skipped: {error}");
-            #[cfg(not(target_os = "windows"))]
-            assert!(matches!(
-                error,
-                D3d12Error::Skipped(SkipReason::PlatformUnsupported)
-            ));
             return;
         }
     };

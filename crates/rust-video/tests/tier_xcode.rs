@@ -3,10 +3,10 @@
 //! Resolution runs everywhere; the live hop needs `--features d3d12`
 //! on Windows hardware and skips without it.
 
-#[cfg(all(feature = "d3d12", target_os = "windows"))]
+#[cfg(d3d12_available)]
 #[path = "../../rust-video-d3d12/examples/common/bits.rs"]
 mod bits;
-#[cfg(all(feature = "d3d12", target_os = "windows"))]
+#[cfg(d3d12_available)]
 #[path = "../../rust-video-d3d12/examples/common/h264.rs"]
 mod h264;
 
@@ -102,7 +102,7 @@ fn failure_names_codec_and_preference() {
 }
 
 /// Resolved tier drives one live transcode hop on Windows hardware.
-#[cfg(all(feature = "d3d12", target_os = "windows"))]
+#[cfg(d3d12_available)]
 #[test]
 fn resolved_tier_transcodes_one_hop() {
     use rust_video::d3d12::{Codec, D3d12Device, Transcoder};

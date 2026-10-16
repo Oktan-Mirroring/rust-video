@@ -1,42 +1,26 @@
 //! `MediaFoundation` encoder session behind the D3D11 encode path.
-//!
-//! The live implementation targets Windows; other platforms decline at
-//! `open` with a typed skip.
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::collections::VecDeque;
-#[cfg(target_os = "windows")]
 use std::mem::ManuallyDrop;
-#[cfg(target_os = "windows")]
 use std::sync::OnceLock;
-#[cfg(target_os = "windows")]
 use std::time::Duration;
 
 use crate::device::D3d11Device;
 use crate::error::D3d11Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
 use crate::guid::Codec;
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use windows::core::Interface;
-#[cfg(target_os = "windows")]
 use windows::core::GUID;
-#[cfg(target_os = "windows")]
 use windows::core::PWSTR;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
-#[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType,
     IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
@@ -57,91 +41,66 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
     MF_VERSION,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
 };
 
 /// Output frame rate in frames per second.
-#[cfg(target_os = "windows")]
 const FRAME_RATE: u32 = 30;
 
 /// Sample duration in 100ns units at the output frame rate.
-#[cfg(target_os = "windows")]
 const FRAME_HNS: i64 = 10_000_000 / 30;
 
 /// Input buffer alignment in bytes without a stream report.
-#[cfg(target_os = "windows")]
 const SAMPLE_ALIGN: u32 = 16;
 
 /// Bitrate floor in bits per second.
-#[cfg(target_os = "windows")]
 const MIN_BITRATE: u64 = 100_000;
 
 /// Bitrate ceiling in bits per second.
-#[cfg(target_os = "windows")]
 const MAX_BITRATE: u64 = 50_000_000;
 
 /// Catalog walk bound in entries.
-#[cfg(target_os = "windows")]
 const AVAILABLE_TYPES: u32 = 64;
 
 /// Catalog entry reader behind the type walk.
-#[cfg(target_os = "windows")]
 type Available = unsafe fn(&IMFTransform, u32, u32) -> windows::core::Result<IMFMediaType>;
 
 /// Negotiated encoder session over one `MediaFoundation` transform.
 pub struct Session {
     /// Encoder transform.
-    #[cfg(target_os = "windows")]
     transform: IMFTransform,
     /// Input stream id.
-    #[cfg(target_os = "windows")]
     input: u32,
     /// Output stream id.
-    #[cfg(target_os = "windows")]
     output: u32,
     /// Transform allocates its own output samples.
-    #[cfg(target_os = "windows")]
     provides: bool,
     /// Output buffer length in bytes.
-    #[cfg(target_os = "windows")]
     out_size: u32,
     /// Output buffer alignment in bytes.
-    #[cfg(target_os = "windows")]
     out_align: u32,
     /// Input buffer alignment in bytes.
-    #[cfg(target_os = "windows")]
     in_align: u32,
     /// Async event source, absent on synchronous transforms.
-    #[cfg(target_os = "windows")]
     events: Option<IMFMediaEventGenerator>,
     /// Transform D3D11 awareness.
-    #[cfg(target_os = "windows")]
     d3d11_aware: bool,
     /// D3D11 bind behind GPU samples, absent without a bound transform.
-    #[cfg(target_os = "windows")]
     gpu: Option<GpuBind>,
     /// Serving encoder MFT name.
-    #[cfg(target_os = "windows")]
     name: String,
     /// Untried encoder activates in priority order.
-    #[cfg(target_os = "windows")]
     standby: VecDeque<IMFActivate>,
     /// Output subtype behind the negotiated media type.
-    #[cfg(target_os = "windows")]
     subtype: GUID,
     /// Codec the session encodes.
-    #[cfg(target_os = "windows")]
     codec: Codec,
     /// Negotiated extent, absent before the first frame.
-    #[cfg(target_os = "windows")]
     size: Option<(u32, u32)>,
     /// Next input timestamp in 100ns units.
-    #[cfg(target_os = "windows")]
     pts: i64,
     /// Queued input credits from the event pump.
-    #[cfg(target_os = "windows")]
     credits: u32,
 }
 
@@ -150,22 +109,13 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without `MediaFoundation`, or without a
+    /// Returns `Err` without `MediaFoundation`, or without a
     /// `codec` encoder MFT on the machine.
     pub fn open(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows(device, codec)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (device, codec);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows(device, codec)
     }
 
     /// Session over `device` for `codec`.
-    #[cfg(target_os = "windows")]
     fn open_windows(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
         let _com = ComGuard::enter();
         startup()?;
@@ -205,7 +155,6 @@ impl Session {
     }
 
     /// Next activating transform from the standby queue.
-    #[cfg(target_os = "windows")]
     fn adopt(&mut self) -> Result<(), D3d11Error> {
         let Some(opened) = elect(&mut self.standby, self.codec) else {
             return Err(missing_encoder(self.codec));
@@ -224,50 +173,26 @@ impl Session {
     /// True when the transform reports D3D11 awareness.
     #[must_use]
     pub fn uses_d3d11(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            self.d3d11_aware
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = self;
-            false
-        }
+        self.d3d11_aware
     }
 
     /// True when the session encodes from GPU textures.
     #[must_use]
     pub(crate) fn gpu_bound(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            self.gpu.is_some()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = self;
-            false
-        }
+        self.gpu.is_some()
     }
 
     /// Name of the serving encoder MFT.
     #[must_use]
     pub fn mft_name(&self) -> &str {
-        #[cfg(target_os = "windows")]
-        {
-            &self.name
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = self;
-            "unavailable"
-        }
+        &self.name
     }
 
     /// Packets coded from one NV12 frame of `width` x `height`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, when the bytes miss the extent, or when
+    /// Returns `Err` when the bytes miss the extent, or when
     /// the transform refuses the frame.
     pub fn encode(
         &mut self,
@@ -275,19 +200,10 @@ impl Session {
         height: u32,
         nv12: &[u8],
     ) -> Result<Vec<Packet>, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.encode_windows(width, height, nv12)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (self, width, height, nv12);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.encode_windows(width, height, nv12)
     }
 
     /// Packets coded from one NV12 frame of `width` x `height`.
-    #[cfg(target_os = "windows")]
     fn encode_windows(
         &mut self,
         width: u32,
@@ -308,7 +224,6 @@ impl Session {
     }
 
     /// Drained packets across the size switch to `width` x `height`.
-    #[cfg(target_os = "windows")]
     fn ensure_size(&mut self, width: u32, height: u32) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         if self.size != Some((width, height)) {
@@ -322,7 +237,6 @@ impl Session {
     }
 
     /// `sample` through the sync or async submit path into `packets`.
-    #[cfg(target_os = "windows")]
     fn submit_sample(
         &mut self,
         sample: &IMFSample,
@@ -342,7 +256,6 @@ impl Session {
     ///
     /// Returns `Err` without a D3D11 bind, for an odd extent, or when the
     /// transform refuses the frame.
-    #[cfg(target_os = "windows")]
     pub(crate) fn encode_texture(
         &mut self,
         texture: &ID3D11Texture2D,
@@ -377,25 +290,16 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows or when the transform refuses the drain.
+    /// Returns `Err` when the transform refuses the drain.
     pub fn flush(&mut self) -> Result<Vec<Packet>, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            let _com = ComGuard::enter();
-            if self.size.is_none() {
-                return Ok(Vec::new());
-            }
-            self.drain()
+        let _com = ComGuard::enter();
+        if self.size.is_none() {
+            return Ok(Vec::new());
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = self;
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.drain()
     }
 
     /// Media types for `width` x `height`, falling back across MFTs.
-    #[cfg(target_os = "windows")]
     fn configure(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
         loop {
             match self.configure_try(width, height) {
@@ -407,7 +311,6 @@ impl Session {
     }
 
     /// Media types for `width` x `height` plus streaming start.
-    #[cfg(target_os = "windows")]
     fn configure_try(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
         self.set_output_type(width, height)?;
         self.set_input_type(width, height)?;
@@ -436,7 +339,6 @@ impl Session {
     }
 
     /// Output media type for `width` x `height` behind the target bitrate.
-    #[cfg(target_os = "windows")]
     fn set_output_type(&self, width: u32, height: u32) -> Result<(), D3d11Error> {
         let target = bitrate(width, height);
         let output_type = find_available(
@@ -455,7 +357,6 @@ impl Session {
     }
 
     /// Input NV12 media type for `width` x `height`.
-    #[cfg(target_os = "windows")]
     fn set_input_type(&self, width: u32, height: u32) -> Result<(), D3d11Error> {
         let input_type = find_available(
             &self.transform,
@@ -473,7 +374,6 @@ impl Session {
     }
 
     /// Output buffer shape behind the current output type.
-    #[cfg(target_os = "windows")]
     fn refresh_output_info(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
         // Sound: the transform is live past the output set.
         let info = call(
@@ -492,7 +392,6 @@ impl Session {
     }
 
     /// Output type behind a stream change.
-    #[cfg(target_os = "windows")]
     fn renegotiate(&mut self) -> Result<(), D3d11Error> {
         // Sound: the transform is live past the stream change.
         let media = call(
@@ -508,7 +407,6 @@ impl Session {
     }
 
     /// `message` through the transform.
-    #[cfg(target_os = "windows")]
     fn message(&self, message: MFT_MESSAGE_TYPE) -> Result<(), D3d11Error> {
         // Sound: the transform is live.
         call(
@@ -518,7 +416,6 @@ impl Session {
     }
 
     /// `sample` through a synchronous transform into `packets`.
-    #[cfg(target_os = "windows")]
     fn submit_sync(
         &mut self,
         sample: &IMFSample,
@@ -540,7 +437,6 @@ impl Session {
     }
 
     /// `sample` through an asynchronous transform into `packets`.
-    #[cfg(target_os = "windows")]
     fn submit_async(
         &mut self,
         sample: &IMFSample,
@@ -556,7 +452,6 @@ impl Session {
     }
 
     /// One input credit, collecting outputs queued ahead of it.
-    #[cfg(target_os = "windows")]
     fn await_credit(&mut self, packets: &mut Vec<Packet>) -> Result<(), D3d11Error> {
         if self.credits > 0 {
             self.credits -= 1;
@@ -575,7 +470,6 @@ impl Session {
     }
 
     /// Queued outputs into `packets` without blocking.
-    #[cfg(target_os = "windows")]
     fn poll(&mut self, packets: &mut Vec<Packet>) -> Result<(), D3d11Error> {
         let events = self.event_source()?;
         loop {
@@ -596,7 +490,6 @@ impl Session {
     }
 
     /// Cloned async event source.
-    #[cfg(target_os = "windows")]
     fn event_source(&self) -> Result<IMFMediaEventGenerator, D3d11Error> {
         self.events
             .clone()
@@ -604,7 +497,6 @@ impl Session {
     }
 
     /// Drained outputs with the session left streaming.
-    #[cfg(target_os = "windows")]
     fn drain(&mut self) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         self.message(MFT_MESSAGE_COMMAND_DRAIN)?;
@@ -626,14 +518,12 @@ impl Session {
     }
 
     /// Available outputs into `packets` until the transform starves.
-    #[cfg(target_os = "windows")]
     fn collect_sync(&mut self, packets: &mut Vec<Packet>) -> Result<(), D3d11Error> {
         while self.try_output(packets)? {}
         Ok(())
     }
 
     /// One output attempt; true when a sample may follow.
-    #[cfg(target_os = "windows")]
     fn try_output(&mut self, packets: &mut Vec<Packet>) -> Result<bool, D3d11Error> {
         loop {
             let mut buffer = self.output_buffer()?;
@@ -670,7 +560,6 @@ impl Session {
     }
 
     /// Output buffer with a sample unless the transform provides.
-    #[cfg(target_os = "windows")]
     fn output_buffer(&self) -> Result<MFT_OUTPUT_DATA_BUFFER, D3d11Error> {
         let sample = if self.provides {
             None
@@ -694,13 +583,11 @@ impl Session {
 }
 
 /// COM apartment guard; uninitializes only a self-owned entry.
-#[cfg(target_os = "windows")]
 struct ComGuard {
     /// Thread entry owned by this guard.
     owned: bool,
 }
 
-#[cfg(target_os = "windows")]
 impl ComGuard {
     /// Multithreaded entry for the calling thread.
     fn enter() -> Self {
@@ -712,7 +599,6 @@ impl ComGuard {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.owned {
@@ -725,7 +611,6 @@ impl Drop for ComGuard {
 }
 
 /// Live parts behind one encoder activate.
-#[cfg(target_os = "windows")]
 struct Opened {
     /// Encoder transform.
     transform: IMFTransform,
@@ -742,7 +627,6 @@ struct Opened {
 }
 
 /// D3D11 bind behind GPU encoder samples.
-#[cfg(target_os = "windows")]
 struct GpuBind {
     /// DXGI device manager behind the bound transform.
     manager: IMFDXGIDeviceManager,
@@ -754,7 +638,6 @@ struct GpuBind {
     input: Option<(ID3D11Texture2D, u32, u32)>,
 }
 
-#[cfg(target_os = "windows")]
 impl GpuBind {
     /// Manager over `device`, absent without D3D11 awareness.
     fn open(device: &D3d11Device, aware: bool) -> Option<Self> {
@@ -893,7 +776,6 @@ impl GpuBind {
 }
 
 /// Visible NV12 region inside a decode texture.
-#[cfg(target_os = "windows")]
 struct Region {
     /// Array slice behind the picture.
     slice: u32,
@@ -908,7 +790,6 @@ struct Region {
 }
 
 /// `manager` through `transform` as its D3D11 device manager.
-#[cfg(target_os = "windows")]
 fn send_manager(
     transform: &IMFTransform,
     manager: &IMFDXGIDeviceManager,
@@ -921,7 +802,6 @@ fn send_manager(
 }
 
 /// MFT input bind flags behind `stream`, shader-resource without the hint.
-#[cfg(target_os = "windows")]
 fn bind_flags(transform: &IMFTransform, stream: u32) -> u32 {
     // Sound: the transform is live; absent keys read as unset.
     let hint = unsafe { transform.GetInputStreamAttributes(stream) }
@@ -932,7 +812,6 @@ fn bind_flags(transform: &IMFTransform, stream: u32) -> u32 {
 }
 
 /// `MediaFoundation` platform, started once per process.
-#[cfg(target_os = "windows")]
 fn startup() -> Result<(), D3d11Error> {
     // The platform starts once per process; per-instance shutdown races sibling encoders.
     static STARTED: OnceLock<Result<(), i32>> = OnceLock::new();
@@ -950,13 +829,11 @@ fn startup() -> Result<(), D3d11Error> {
 }
 
 /// Unsupported error naming the absent `codec` encoder MFT.
-#[cfg(target_os = "windows")]
 fn missing_encoder(codec: Codec) -> D3d11Error {
     D3d11Error::Unsupported(format!("no {codec} encoder MFT on this machine"))
 }
 
 /// Output subtypes for `codec`, preferred first.
-#[cfg(target_os = "windows")]
 fn subtypes(codec: Codec) -> &'static [GUID] {
     match codec {
         Codec::H264 => &[MFVideoFormat_H264],
@@ -968,7 +845,6 @@ fn subtypes(codec: Codec) -> &'static [GUID] {
 }
 
 /// Encoder activates for `subtype`, hardware before software.
-#[cfg(target_os = "windows")]
 fn enumerate(subtype: &GUID) -> Vec<IMFActivate> {
     let info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
@@ -986,7 +862,6 @@ fn enumerate(subtype: &GUID) -> Vec<IMFActivate> {
 }
 
 /// Encoder activates for `info` under one flag set.
-#[cfg(target_os = "windows")]
 fn enumerate_flags(info: &MFT_REGISTER_TYPE_INFO, flags: MFT_ENUM_FLAG) -> Vec<IMFActivate> {
     let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
@@ -1019,7 +894,6 @@ fn enumerate_flags(info: &MFT_REGISTER_TYPE_INFO, flags: MFT_ENUM_FLAG) -> Vec<I
 }
 
 /// Catalog array behind `activates` back to COM.
-#[cfg(target_os = "windows")]
 fn free_catalog(activates: *mut Option<IMFActivate>) {
     if !activates.is_null() {
         // Sound: the array came from the enum call.
@@ -1030,7 +904,6 @@ fn free_catalog(activates: *mut Option<IMFActivate>) {
 }
 
 /// First activating transform from `standby`, consumed in order.
-#[cfg(target_os = "windows")]
 fn elect(standby: &mut VecDeque<IMFActivate>, codec: Codec) -> Option<Opened> {
     while let Some(next) = standby.pop_front() {
         if let Ok(opened) = activate_one(&next, codec) {
@@ -1041,7 +914,6 @@ fn elect(standby: &mut VecDeque<IMFActivate>, codec: Codec) -> Option<Opened> {
 }
 
 /// Live parts behind `activate`.
-#[cfg(target_os = "windows")]
 fn activate_one(activate: &IMFActivate, codec: Codec) -> Result<Opened, D3d11Error> {
     // Sound: the activate is live.
     let transform: IMFTransform = call(unsafe { activate.ActivateObject() }, "ActivateObject")?;
@@ -1067,7 +939,6 @@ fn activate_one(activate: &IMFActivate, codec: Codec) -> Result<Opened, D3d11Err
 }
 
 /// Attribute store plus async and D3D11-aware flags.
-#[cfg(target_os = "windows")]
 fn attributes(transform: &IMFTransform) -> (Option<IMFAttributes>, bool, bool) {
     // Sound: the transform is live.
     let Ok(store) = (unsafe { transform.GetAttributes() }) else {
@@ -1080,7 +951,6 @@ fn attributes(transform: &IMFTransform) -> (Option<IMFAttributes>, bool, bool) {
 }
 
 /// Asynchronous unlock behind `store`.
-#[cfg(target_os = "windows")]
 fn unlock(store: Option<&IMFAttributes>) -> Result<(), D3d11Error> {
     let Some(store) = store else {
         return Err(D3d11Error::Unsupported(
@@ -1095,7 +965,6 @@ fn unlock(store: Option<&IMFAttributes>) -> Result<(), D3d11Error> {
 }
 
 /// Friendly name behind `activate`, absent without the attribute.
-#[cfg(target_os = "windows")]
 fn friendly(activate: &IMFActivate) -> Option<String> {
     let mut name = PWSTR::null();
     let mut len = 0u32;
@@ -1118,7 +987,6 @@ fn friendly(activate: &IMFActivate) -> Option<String> {
 }
 
 /// Stream ids, zero when the transform numbers its streams.
-#[cfg(target_os = "windows")]
 fn stream_ids(transform: &IMFTransform) -> (u32, u32) {
     let (mut inputs, mut outputs) = ([0u32; 1], [0u32; 1]);
     // Sound: the arrays stay live for the call; fixed streams read as zero.
@@ -1133,7 +1001,6 @@ fn stream_ids(transform: &IMFTransform) -> (u32, u32) {
 }
 
 /// Catalog type for `subtype` on `stream`, walked through `get`.
-#[cfg(target_os = "windows")]
 fn find_available(
     transform: &IMFTransform,
     stream: u32,
@@ -1156,7 +1023,6 @@ fn find_available(
 }
 
 /// Video media type for `subtype` at `width` x `height`.
-#[cfg(target_os = "windows")]
 fn media_type(
     subtype: GUID,
     width: u32,
@@ -1178,7 +1044,6 @@ fn media_type(
 }
 
 /// Frame geometry plus rate on `media`.
-#[cfg(target_os = "windows")]
 fn stamp(
     media: &IMFMediaType,
     width: u32,
@@ -1216,13 +1081,11 @@ fn stamp(
 }
 
 /// Two 32-bit halves packed into one 64-bit attribute.
-#[cfg(target_os = "windows")]
 fn pack(high: u32, low: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
 /// Packed NV12 byte length for `width` x `height`.
-#[cfg(target_os = "windows")]
 fn nv12_len(width: u32, height: u32) -> u64 {
     u64::from(width)
         .saturating_mul(u64::from(height))
@@ -1231,7 +1094,6 @@ fn nv12_len(width: u32, height: u32) -> u64 {
 }
 
 /// Bitrate in bits per second scaled to the frame area.
-#[cfg(target_os = "windows")]
 fn bitrate(width: u32, height: u32) -> u32 {
     let estimate = u64::from(width)
         .saturating_mul(u64::from(height))
@@ -1240,13 +1102,11 @@ fn bitrate(width: u32, height: u32) -> u32 {
 }
 
 /// Flag bits as the comparison word.
-#[cfg(target_os = "windows")]
 fn u32_flag(bits: i32) -> u32 {
     u32::try_from(bits).unwrap_or(0)
 }
 
 /// Input sample over `nv12` stamped at `pts`.
-#[cfg(target_os = "windows")]
 fn input_sample(nv12: &[u8], align: u32, pts: i64) -> Result<IMFSample, D3d11Error> {
     let len = u32::try_from(nv12.len())
         .map_err(|_| D3d11Error::Unsupported("frame over 4 GiB".to_owned()))?;
@@ -1277,7 +1137,6 @@ fn input_sample(nv12: &[u8], align: u32, pts: i64) -> Result<IMFSample, D3d11Err
 }
 
 /// Packet behind one output sample.
-#[cfg(target_os = "windows")]
 fn extract(sample: &IMFSample) -> Result<Packet, D3d11Error> {
     // Sound: the sample is live past output.
     let buffer = call(unsafe { sample.GetBufferByIndex(0) }, "GetBufferByIndex")?;
@@ -1303,14 +1162,12 @@ fn extract(sample: &IMFSample) -> Result<Packet, D3d11Error> {
 }
 
 /// Duration behind `hns` 100ns units.
-#[cfg(target_os = "windows")]
 fn pts_duration(hns: i64) -> Duration {
     let hns = u64::try_from(hns).unwrap_or(0);
     Duration::from_nanos(hns.saturating_mul(100))
 }
 
 /// Next event type behind `events`, checked for failure.
-#[cfg(target_os = "windows")]
 fn event_type(events: &IMFMediaEventGenerator) -> Result<u32, D3d11Error> {
     // Sound: the event source is live.
     let event = call(
@@ -1329,13 +1186,11 @@ fn event_type(events: &IMFMediaEventGenerator) -> Result<u32, D3d11Error> {
 }
 
 /// True when `typ` names `want`.
-#[cfg(target_os = "windows")]
 fn is_event(typ: u32, want: MF_EVENT_TYPE) -> bool {
     u32::try_from(want.0).is_ok_and(|want| typ == want)
 }
 
 /// Windows result behind `result` as a tier failure naming `call`.
-#[cfg(target_os = "windows")]
 fn call<T>(result: windows::core::Result<T>, call: &'static str) -> Result<T, D3d11Error> {
     result.map_err(|error| D3d11Error::Call {
         call,

@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 //! GPU transcode throughput: 1080p hops against the 60 fps bar.
 //!
 //! Skips without hardware. Prints measured fps; fails below the bar only

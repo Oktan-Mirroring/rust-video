@@ -4,21 +4,31 @@
 //! loud to the proven CPU path, never silently.
 
 #[path = "common/bits.rs"]
+#[cfg(target_os = "windows")]
 mod bits;
 #[path = "common/h264.rs"]
+#[cfg(target_os = "windows")]
 mod h264;
 
+#[cfg(target_os = "windows")]
 use h264::{
     annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
 };
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Device;
+#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::{Outcome, Route};
+#[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, Transcoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d12Device::open() {
         Ok(device) => device,
@@ -89,6 +99,7 @@ fn main() {
 }
 
 /// One transcode outcome on stdout.
+#[cfg(target_os = "windows")]
 fn report(index: usize, outcome: &Outcome) {
     let plan = outcome.plan();
     match plan.route() {
@@ -106,6 +117,7 @@ fn report(index: usize, outcome: &Outcome) {
 }
 
 /// Bitstream bytes behind `outcome`.
+#[cfg(target_os = "windows")]
 fn bytes_of(outcome: &Outcome) -> usize {
     outcome
         .packets()
@@ -116,6 +128,7 @@ fn bytes_of(outcome: &Outcome) -> usize {
 
 /// Scale request through the GPU scale hop; a box without video
 /// process support keeps the loud miss.
+#[cfg(target_os = "windows")]
 fn probe_scale(device: &D3d12Device) {
     let target = PictureSize::new(160, 112).expect("nonzero extent");
     let mut transcoder = match Transcoder::open(device, Codec::H264, Codec::H264) {
@@ -167,3 +180,6 @@ fn probe_scale(device: &D3d12Device) {
     }
     println!("scale: to 160x112 bitstream {bytes}B route=gpu");
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

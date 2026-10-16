@@ -1,24 +1,29 @@
 //! D3D11 hardware encode over `MediaFoundation` encoder MFTs.
-//!
-//! The live path targets Windows; other platforms decline at `open`
-//! with a typed skip.
 
 #[cfg(target_os = "windows")]
 use crate::decoder::GpuSurface;
+#[cfg(target_os = "windows")]
 use crate::device::D3d11Device;
+#[cfg(target_os = "windows")]
 use crate::error::D3d11Error;
+#[cfg(target_os = "windows")]
 use crate::guid::Codec;
+#[cfg(target_os = "windows")]
 use crate::mf::Session;
 #[cfg(target_os = "windows")]
 use crate::scale::ScaledSurface;
 
+#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Encoder;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
 ///
 /// Encoders run 30 fps progressive with an area-scaled bitrate; input is NV12.
+#[cfg(target_os = "windows")]
 pub struct D3d11Encoder {
     /// Negotiated MF session.
     session: Session,
@@ -26,12 +31,14 @@ pub struct D3d11Encoder {
     codec: Codec,
 }
 
+#[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
 impl D3d11Encoder {
     /// Encoder over `device` for `codec`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without `MediaFoundation`, or without a
+    /// Returns `Err` without `MediaFoundation`, or without a
     /// `codec` encoder MFT on the machine.
     pub fn open(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
         Ok(Self {
@@ -70,7 +77,6 @@ impl D3d11Encoder {
     ///
     /// Returns `Err` without a D3D11 bind or when the backend cannot
     /// encode `surface`.
-    #[cfg(target_os = "windows")]
     pub(crate) fn encode_surface(
         &mut self,
         surface: &GpuSurface,
@@ -92,7 +98,6 @@ impl D3d11Encoder {
     ///
     /// Returns `Err` without a D3D11 bind or when the backend cannot
     /// encode `scaled`.
-    #[cfg(target_os = "windows")]
     pub(crate) fn encode_scaled(
         &mut self,
         scaled: &ScaledSurface,
@@ -103,6 +108,8 @@ impl D3d11Encoder {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
 impl Encoder for D3d11Encoder {
     type Error = D3d11Error;
 
@@ -117,6 +124,7 @@ impl Encoder for D3d11Encoder {
 }
 
 /// Contiguous NV12 bytes plus extents for `frame`.
+#[cfg(target_os = "windows")]
 fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d11Error> {
     if frame.format() != PixelFormat::Nv12 {
         return Err(D3d11Error::Unsupported(format!(
@@ -143,6 +151,7 @@ fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d11Error> {
 }
 
 /// `rows` of `width` bytes from a strided `data` plane into `out`.
+#[cfg(target_os = "windows")]
 fn copy_plane(
     data: &[u8],
     stride: u32,
@@ -174,7 +183,7 @@ fn copy_plane(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{copy_plane, pack_nv12};
 

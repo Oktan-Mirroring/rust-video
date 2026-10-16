@@ -1,16 +1,10 @@
 //! Negotiated decode session: decoder, views, staging, readback.
-//!
-//! The live implementation targets Windows; other platforms decline at
-//! `open` with a typed skip.
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
 
-#[cfg(target_os = "windows")]
 use windows::core::Interface;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDecoder,
     ID3D11VideoDecoderOutputView, D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE,
@@ -22,66 +16,48 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_DECODER_BUFFER_TYPE, D3D11_VIDEO_DECODER_CONFIG, D3D11_VIDEO_DECODER_DESC,
     D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC, D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC_0,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::IDXGIResource;
-#[cfg(target_os = "windows")]
 use windows::Win32::Media::DirectShow::DXVA_NoEncrypt;
 
 use crate::device::D3d11Device;
 use crate::dpb::SubmittedPicture;
 use crate::error::D3d11Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
 use crate::h264::Crop;
 
 use bytes::Bytes;
 
 /// Reference surface count.
-#[cfg(target_os = "windows")]
 const VIEWS: u32 = 16;
 
 /// Pipeline margin past the reference surfaces.
-#[cfg(target_os = "windows")]
 const SPARE_VIEWS: u32 = 4;
 
 /// Negotiated H.264 decode session.
 pub struct Session {
     /// Hardware decoder.
-    #[cfg(target_os = "windows")]
     decoder: ID3D11VideoDecoder,
     /// Output view per reference surface.
-    #[cfg(target_os = "windows")]
     views: Vec<ID3D11VideoDecoderOutputView>,
     /// Array texture behind the views.
-    #[cfg(target_os = "windows")]
     texture: ID3D11Texture2D,
     /// CPU-visible copy target.
-    #[cfg(target_os = "windows")]
     staging: ID3D11Texture2D,
     /// Video context behind frame submission.
-    #[cfg(target_os = "windows")]
     video_context: ID3D11VideoContext,
     /// Immediate context behind copies and readback.
-    #[cfg(target_os = "windows")]
     context: ID3D11DeviceContext,
     /// Shared-texture export, absent without NT-handle sharing.
-    #[cfg(target_os = "windows")]
     export: Option<SharedExport>,
     /// Coded width in luma samples.
-    #[cfg(target_os = "windows")]
     width: u32,
     /// Coded height in luma samples.
-    #[cfg(target_os = "windows")]
     height: u32,
     /// Short slice controls behind a raw-2 config.
-    #[cfg(target_os = "windows")]
     slice_short: bool,
 }
 
 /// Shared decode texture with its NT handle.
-#[cfg(target_os = "windows")]
 #[derive(Clone)]
 pub(crate) struct SharedExport {
     /// Texture owning the handle.
@@ -90,7 +66,6 @@ pub(crate) struct SharedExport {
     handle: isize,
 }
 
-#[cfg(target_os = "windows")]
 impl SharedExport {
     /// NT handle value.
     pub(crate) fn handle(&self) -> isize {
@@ -98,7 +73,6 @@ impl SharedExport {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl std::ops::Deref for SharedExport {
     type Target = ID3D11Texture2D;
 
@@ -112,22 +86,13 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without a raw bitstream config, past
+    /// Returns `Err` without a raw bitstream config, past
     /// the adapter surface floor, or when the driver refuses the decoder.
     pub fn open(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows(device, width, height)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (device, width, height);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows(device, width, height)
     }
 
     /// Session over `device` for `width` x `height` H.264 pictures.
-    #[cfg(target_os = "windows")]
     fn open_windows(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
         let guid = crate::device::h264_guid();
         let desc = D3D11_VIDEO_DECODER_DESC {
@@ -201,14 +166,12 @@ impl Session {
     }
 
     /// Shared-texture export, absent without NT-handle sharing.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) fn export(&self) -> Option<SharedExport> {
         self.export.clone()
     }
 
     /// Shared decode texture plus `slot`, absent without NT-handle sharing.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) fn surface(&self, slot: u8) -> Option<(SharedExport, u8)> {
         if usize::from(slot) >= self.views.len() {
@@ -221,46 +184,22 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, when a buffer overruns the driver
+    /// Returns `Err` when a buffer overruns the driver
     /// allocation, or when the driver refuses the submission.
     pub fn submit(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.submit_windows(submission)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (
-                self,
-                &submission.params,
-                &submission.qmatrix,
-                &submission.slices,
-                &submission.bitstream,
-                submission.slot,
-            );
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.submit_windows(submission)
     }
 
     /// NV12 bytes for `slot` cropped to the visible rectangle.
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows or when the copy or map fails.
+    /// Returns `Err` when the copy or map fails.
     pub fn readback(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.readback_windows(slot, crop)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (self, slot, crop);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.readback_windows(slot, crop)
     }
 
     /// Decode `submission` onto its surface slot.
-    #[cfg(target_os = "windows")]
     fn submit_windows(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
         let view = self
             .views
@@ -289,7 +228,6 @@ impl Session {
     }
 
     /// Picture, matrix, bitstream, and slice buffers in one submit.
-    #[cfg(target_os = "windows")]
     fn submit_buffers(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);
         let matrix = struct_slice(&submission.qmatrix);
@@ -335,7 +273,6 @@ impl Session {
     }
 
     /// Driver buffer of `buffer_type` filled with `bytes` over `macroblocks`.
-    #[cfg(target_os = "windows")]
     fn fill_buffer(
         &self,
         buffer_type: D3D11_VIDEO_DECODER_BUFFER_TYPE,
@@ -396,7 +333,6 @@ impl Session {
     }
 
     /// NV12 bytes for `slot` cropped to the visible rectangle.
-    #[cfg(target_os = "windows")]
     fn readback_windows(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
         // Sound: both textures are live with matching extents; the slot is a valid slice.
         unsafe {
@@ -436,7 +372,6 @@ impl Session {
 }
 
 /// Raw bitstream config without encryption.
-#[cfg(target_os = "windows")]
 fn select_config(
     video_device: &windows::Win32::Graphics::Direct3D11::ID3D11VideoDevice,
     desc: &D3D11_VIDEO_DECODER_DESC,
@@ -475,7 +410,6 @@ fn select_config(
 }
 
 /// Array texture behind the decode views, shared when the driver allows.
-#[cfg(target_os = "windows")]
 fn create_texture(
     device: &D3d11Device,
     width: u32,
@@ -531,7 +465,6 @@ fn create_texture(
 }
 
 /// CPU-visible texture behind readback.
-#[cfg(target_os = "windows")]
 fn create_staging(
     device: &D3d11Device,
     width: u32,
@@ -572,7 +505,6 @@ fn create_staging(
 }
 
 /// NT-handle export for a shared texture, absent without sharing.
-#[cfg(target_os = "windows")]
 fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
     let resource: IDXGIResource = texture.cast().ok()?;
     // Sound: the resource is live.
@@ -587,13 +519,11 @@ fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
 }
 
 /// Flag bits as the descriptor word.
-#[cfg(target_os = "windows")]
 pub(crate) fn flag_word(bits: i32) -> u32 {
     u32::try_from(bits).unwrap_or(0)
 }
 
 /// Plain-data struct as bytes.
-#[cfg(target_os = "windows")]
 fn struct_slice<T>(value: &T) -> &[u8] {
     // Sound: the value is a live `repr(C)` plain-data struct.
     unsafe {
@@ -605,7 +535,6 @@ fn struct_slice<T>(value: &T) -> &[u8] {
 }
 
 /// Slice control entries as bytes.
-#[cfg(target_os = "windows")]
 fn slice_slice<T>(values: &[T]) -> &[u8] {
     // Sound: the slice is live with a plain-data element type.
     unsafe {
@@ -614,7 +543,6 @@ fn slice_slice<T>(values: &[T]) -> &[u8] {
 }
 
 /// Short slice controls with cleared trailing pad.
-#[cfg(target_os = "windows")]
 fn short_bytes(slices: &[crate::dxva::SliceLongH264]) -> Vec<u8> {
     let mut out = Vec::with_capacity(slices.len() * 12);
     for slice in slices {
@@ -627,7 +555,6 @@ fn short_bytes(slices: &[crate::dxva::SliceLongH264]) -> Vec<u8> {
 }
 
 /// NV12 bytes from a mapped staging texture under `crop`.
-#[cfg(target_os = "windows")]
 fn copy_nv12(
     mapped: &D3D11_MAPPED_SUBRESOURCE,
     width: u32,
@@ -669,7 +596,6 @@ fn copy_nv12(
 }
 
 /// Visible rectangle inside the coded extent.
-#[cfg(target_os = "windows")]
 fn visible_rect(width: u32, height: u32, crop: Option<Crop>) -> (u32, u32, u32, u32) {
     crop.map_or((0, 0, width, height), |crop| {
         (
@@ -684,7 +610,6 @@ fn visible_rect(width: u32, height: u32, crop: Option<Crop>) -> (u32, u32, u32, 
 #[cfg(test)]
 mod tests {
     /// Session negotiation plus staging roundtrip on hardware, skipped without.
-    #[cfg(target_os = "windows")]
     #[test]
     fn negotiate_and_copy_on_hardware() {
         use crate::device::D3d11Device;

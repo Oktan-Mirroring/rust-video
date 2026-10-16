@@ -1,19 +1,25 @@
 //! H.264 decode plus probed shells behind the caps `Decoder` trait.
 
 use crate::device::D3d11Device;
+#[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb, Output};
 use crate::error::{D3d11Error, SkipReason};
 use crate::guid::Codec;
+#[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture, Sps};
+#[cfg(target_os = "windows")]
 use crate::session::Session;
 #[cfg(target_os = "windows")]
 use crate::session::SharedExport;
 
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+#[cfg(target_os = "windows")]
+use rust_video_caps::traits::SharedDevice;
+use rust_video_caps::traits::{Decoder, Lease};
 #[cfg(target_os = "windows")]
 use rust_video_caps::transcode::FallbackCause;
 
@@ -134,6 +140,7 @@ impl GpuSurface {
 }
 
 /// Active sequence behind the live session.
+#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Active {
     /// Sequence set id.
@@ -148,6 +155,8 @@ struct Active {
     visible: PictureSize,
 }
 
+#[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
 impl Active {
     /// Active sequence behind `sps`.
     fn new(sps: &Sps) -> Result<Self, D3d11Error> {
@@ -164,6 +173,7 @@ impl Active {
 }
 
 /// H.264 decoder over a D3D11 device.
+#[cfg(target_os = "windows")]
 pub struct H264Decoder<'a> {
     /// Device owning the decode session.
     device: &'a D3d11Device,
@@ -181,6 +191,8 @@ pub struct H264Decoder<'a> {
     generation: u64,
 }
 
+#[cfg(target_os = "windows")]
+#[cfg(target_os = "windows")]
 impl<'a> H264Decoder<'a> {
     /// Decoder over `device`; the session starts on the first picture.
     #[must_use]
@@ -329,7 +341,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Decode `picture` into GPU `surfaces`.
-    #[cfg(target_os = "windows")]
     fn surface_picture(
         &mut self,
         picture: &Picture,
@@ -343,7 +354,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Decode `picture` into GPU `surfaces` without resetting on failure.
-    #[cfg(target_os = "windows")]
     fn surface_inner(
         &mut self,
         picture: &Picture,
@@ -390,7 +400,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Session for `active`, draining the previous sequence first.
-    #[cfg(target_os = "windows")]
     fn reconfigure_surface(
         &mut self,
         active: Active,
@@ -403,7 +412,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Live DPB outputs into GPU `surfaces`.
-    #[cfg(target_os = "windows")]
     fn drain_live_surface(
         &mut self,
         active: &Active,
@@ -425,7 +433,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// GPU surfaces decoded from `packet`, possibly none.
-    #[cfg(target_os = "windows")]
     pub(crate) fn decode_surface(
         &mut self,
         packet: &Packet,
@@ -439,7 +446,6 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// GPU surfaces held back for reordering or buffering.
-    #[cfg(target_os = "windows")]
     pub(crate) fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
         let mut surfaces = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
@@ -452,6 +458,7 @@ impl<'a> H264Decoder<'a> {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl Decoder for H264Decoder<'_> {
     type Frame = D3d11Frame;
     type Error = D3d11Error;
@@ -478,6 +485,7 @@ impl Decoder for H264Decoder<'_> {
 }
 
 /// Frame for `output`.
+#[cfg(target_os = "windows")]
 fn emit_frame(
     session: &Session,
     shared: &SharedDevice,
@@ -491,7 +499,6 @@ fn emit_frame(
         identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
         data,
         lease,
-        #[cfg(target_os = "windows")]
         shared: session.export(),
     })
 }

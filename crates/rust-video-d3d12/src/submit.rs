@@ -3,15 +3,11 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::ffi::c_void;
-#[cfg(target_os = "windows")]
 use std::mem::ManuallyDrop;
 
 use crate::error::D3d12Error;
-#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::WAIT_TIMEOUT;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
     ID3D12Resource, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC,
@@ -26,7 +22,6 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
     D3D12_TEXTURE_LAYOUT_UNKNOWN,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
@@ -166,13 +161,11 @@ fn copy_plane(
 }
 
 /// Logical device behind resource creation.
-#[cfg(target_os = "windows")]
 pub(crate) struct DeviceResources {
     /// Logical device.
     device: ID3D12Device,
 }
 
-#[cfg(target_os = "windows")]
 impl DeviceResources {
     /// Resources over `device`.
     pub(crate) fn new(device: &ID3D12Device) -> Self {
@@ -480,7 +473,6 @@ impl DeviceResources {
 }
 
 /// Fence behind queue waits.
-#[cfg(target_os = "windows")]
 pub(crate) struct Fence {
     /// Fence behind queue waits.
     fence: ID3D12Fence,
@@ -488,7 +480,6 @@ pub(crate) struct Fence {
     value: u64,
 }
 
-#[cfg(target_os = "windows")]
 impl Fence {
     /// Fence over `device`.
     pub(crate) fn open(device: &ID3D12Device) -> Result<Self, D3d12Error> {

@@ -1,11 +1,17 @@
 //! H264 encode on the D3D11 tier, from synthetic NV12 to packets.
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
+#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d11Device::open() {
         Ok(device) => device,
@@ -56,6 +62,7 @@ fn main() {
 }
 
 /// Mid-grey NV12 frame of `width` x `height`.
+#[cfg(target_os = "windows")]
 fn grey(width: u32, height: u32) -> CpuFrame {
     let size = PictureSize::new(width, height).expect("nonzero extent");
     let y_len = width as usize * height as usize;
@@ -69,3 +76,6 @@ fn grey(width: u32, height: u32) -> CpuFrame {
     )
     .expect("frame")
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

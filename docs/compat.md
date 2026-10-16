@@ -128,7 +128,7 @@ never silent.
 
 | Axis | Mechanism | Why |
 |---|---|---|
-| OS tier inclusion | facade tier features; default enables `vulkan`, `vaapi`, `mediacodec`, each compiling on every target | a target builds only the tiers it enables |
+| OS tier inclusion | facade tier features; default enables `vulkan`, `vaapi`, `mediacodec`; platform-only modules compile out off their target behind derived `*_available` cfgs | a target builds only the tiers it enables |
 | NDK API ladder | fixed `api-level-28` plus `ApiLevel` gates (21 floor, 28 async notify) | features expose symbols, gates pick paths |
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
@@ -157,9 +157,13 @@ One dependency: the `rust-video` facade. Tiers arrive as facade
 features: `av1`, `av2`, `h264`, `h265`, `vp9`, `d3d11`, `d3d12`,
 `mediacodec`, `vaapi`, and `vulkan`, each wired to its crate.
 Default carries the three portable tiers (`vulkan`, `vaapi`,
-`mediacodec`); every tier crate compiles on every target, and the
-Linux-only modules inside the VA-API crate compile out where its
-platform is absent. Codecs, `d3d11`, and `d3d12` stay opt-in. No
+`mediacodec`); every tier crate compiles on every target, and
+each tier's platform-only modules compile out where its platform
+is absent: VA-API on Linux, `MediaCodec` natives on Android,
+D3D11 and D3D12 on Windows. The facade build script derives one
+`*_available` cfg per tier from feature plus target; use sites
+name the cfg, not the pair. Codecs, `d3d11`, and `d3d12` stay
+opt-in. No
 `vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
 Shared vocabulary (frames, packets, backend traits) lives in the
 leaf `rust-video-caps`; tier crates build on it, never on the

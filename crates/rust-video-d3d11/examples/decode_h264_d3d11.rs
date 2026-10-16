@@ -1,15 +1,22 @@
 //! H264 decode on the D3D11 tier, from synthetic Annex B to frames.
 
 #[path = "common/h264.rs"]
+#[cfg(target_os = "windows")]
 mod h264;
 
+#[cfg(target_os = "windows")]
 use h264::annex_b_packets;
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device};
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{D3d11Device, D3d11Frame, H264Decoder};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d11Device::open() {
         Ok(device) => device,
@@ -54,6 +61,7 @@ fn main() {
 }
 
 /// One decoded frame on stdout.
+#[cfg(target_os = "windows")]
 fn report(frame: &D3d11Frame) {
     let identity = frame.identity();
     let size = identity.size();
@@ -71,3 +79,6 @@ fn report(frame: &D3d11Frame) {
         None => println!("cpu: unavailable"),
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

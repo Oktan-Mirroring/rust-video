@@ -1,9 +1,9 @@
+#![cfg(target_os = "windows")]
+
 //! Device-tier probe: adapter, profiles, pictures, encoder.
 //!
 //! Prints the adapter matrix on hardware; passes without hardware.
 
-#[cfg(not(target_os = "windows"))]
-use rust_video_d3d12::SkipReason;
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
     Mpeg2Decoder, Vc1Decoder, Vp9Decoder,
@@ -23,11 +23,6 @@ fn probe_reports_or_skips() {
         Ok(device) => device,
         Err(error) => {
             println!("d3d12 skipped: {error}");
-            #[cfg(not(target_os = "windows"))]
-            assert!(matches!(
-                error,
-                D3d12Error::Skipped(SkipReason::PlatformUnsupported)
-            ));
             return;
         }
     };

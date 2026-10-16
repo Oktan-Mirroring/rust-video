@@ -1,10 +1,17 @@
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(vaapi_available)");
-    let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
-    if linux && std::env::var("CARGO_FEATURE_VAAPI").is_ok() {
-        println!("cargo::rustc-cfg=vaapi_available");
+    let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    for (feature, os, cfg) in [
+        ("VAAPI", "linux", "vaapi_available"),
+        ("MEDIACODEC", "android", "mediacodec_available"),
+        ("D3D11", "windows", "d3d11_available"),
+        ("D3D12", "windows", "d3d12_available"),
+    ] {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+        if target == os && std::env::var(format!("CARGO_FEATURE_{feature}")).is_ok() {
+            println!("cargo::rustc-cfg={cfg}");
+        }
     }
     println!("cargo::rustc-check-cfg=cfg(have_corpus)");
     println!("cargo::rerun-if-env-changed=RUST_VIDEO_CORPUS");

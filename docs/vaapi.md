@@ -31,8 +31,8 @@ Dormant means the subdirectory files are not declared with `mod` and
 do not join the build; the sibling shim (`h265.rs`, `vp8.rs`,
 `vp9.rs`, `av1.rs`) exports the decoder handle whose `decode`
 declines every packet with typed `Unsupported`, covered by unit
-tests. Off Linux the crate compiles and every entry point declines
-with typed `Skipped`.
+tests. Off Linux the crate compiles empty: every module is
+Linux-gated at the crate root.
 
 ## Per-codec now / later
 

@@ -1,10 +1,15 @@
 //! AV1 decode probe on the D3D11 tier: profile check plus pending-builder handling.
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device};
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device, D3d11Error};
 
+#[cfg(target_os = "windows")]
 fn main() {
     let device = match D3d11Device::open() {
         Ok(device) => device,
@@ -27,3 +32,6 @@ fn main() {
         Err(error) => println!("flush: {error}"),
     }
 }
+
+#[cfg(not(target_os = "windows"))]
+fn main() {}

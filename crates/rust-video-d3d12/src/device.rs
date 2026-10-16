@@ -1,17 +1,19 @@
 //! D3D12 device with enumerated decoder profiles behind the caps `Device` trait.
-//!
-//! The live implementation targets Windows; other platforms decline at
-//! `open` with a typed skip.
 
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 
-use crate::error::{D3d12Error, SkipReason};
+#[cfg(target_os = "windows")]
+use crate::error::D3d12Error;
+#[cfg(target_os = "windows")]
+use crate::error::SkipReason;
 use crate::guid::{Codec, Profile};
 
-use rust_video_caps::traits::{Device, SharedDevice};
+use rust_video_caps::traits::Device;
+#[cfg(target_os = "windows")]
+use rust_video_caps::traits::SharedDevice;
 #[cfg(target_os = "windows")]
 use windows::core::IUnknown;
 #[cfg(target_os = "windows")]
@@ -144,6 +146,7 @@ pub struct D3d12Device {
     /// Matched decoder profiles.
     profiles: Vec<Profile>,
     /// VRAM budget shared with decoders.
+    #[cfg(target_os = "windows")]
     shared: SharedDevice,
     /// Negotiated feature level.
     level: i32,
@@ -156,18 +159,12 @@ impl D3d12Device {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without a hardware device, without
+    /// Returns `Err` without a hardware device, without
     /// video interfaces, without decoder profiles, or without an
     /// NV12 H.264 profile.
+    #[cfg(target_os = "windows")]
     pub fn open() -> Result<Self, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows()
     }
 
     /// Device over the default hardware adapter.
@@ -207,31 +204,24 @@ impl D3d12Device {
     }
 
     /// True when the adapter encodes `codec` over the video encoder.
+    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn supports_encode(&self, codec: Codec) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            let Some(encoder) = encoder_codec(codec) else {
-                return false;
-            };
-            let mut probe = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC {
-                Codec: encoder,
-                ..Default::default()
-            };
-            feature_support(
-                &self.video,
-                D3D12_FEATURE_VIDEO_ENCODER_CODEC,
-                &mut probe,
-                "EncoderCodec",
-            )
-            .is_ok()
-                && probe.IsSupported.as_bool()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = codec;
-            false
-        }
+        let Some(encoder) = encoder_codec(codec) else {
+            return false;
+        };
+        let mut probe = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC {
+            Codec: encoder,
+            ..Default::default()
+        };
+        feature_support(
+            &self.video,
+            D3D12_FEATURE_VIDEO_ENCODER_CODEC,
+            &mut probe,
+            "EncoderCodec",
+        )
+        .is_ok()
+            && probe.IsSupported.as_bool()
     }
 
     /// Matched decoder profiles on the adapter.
@@ -240,13 +230,14 @@ impl D3d12Device {
         &self.profiles
     }
 
-    /// Negotiated feature level, zero off Windows.
+    /// Negotiated feature level.
     #[must_use]
     pub fn feature_level(&self) -> i32 {
         self.level
     }
 
     /// VRAM budget shared with decoders.
+    #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) fn shared(&self) -> &SharedDevice {
         &self.shared
@@ -629,17 +620,5 @@ mod tests {
         let profile = super::match_profile(&D3D12_VIDEO_DECODE_PROFILE_VC1).expect("vc1");
         assert_eq!(profile.codec(), super::Codec::Vc1);
         assert!(super::match_profile(&GUID::zeroed()).is_none());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn open_declines_off_windows() {
-        let Err(error) = super::D3d12Device::open() else {
-            panic!("device opened off windows");
-        };
-        assert!(matches!(
-            error,
-            super::D3d12Error::Skipped(super::SkipReason::PlatformUnsupported)
-        ));
     }
 }

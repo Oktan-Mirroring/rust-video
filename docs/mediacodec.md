@@ -78,10 +78,11 @@ fallback everywhere and the entry stays `suspected`.
 
 ## Host behavior
 
-Off Android everything native is compiled out. `open` returns the
-typed `BackendAbsent`; format builders, quirk matching, the
-`DecodeState` machine, plane splitting, and the event queue all run
-as host unit tests (37 tests). Device-only code is covered by
+Off Android everything native is compiled out: `open`, `reset`,
+and the `Decoder` impl exist on Android only. Format builders,
+quirk matching, the `DecodeState` machine, plane splitting, and
+the event queue all run as host unit tests (34 tests).
+Device-only code is covered by
 `cargo check --target aarch64-linux-android`.
 
 ## Limits

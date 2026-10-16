@@ -4,9 +4,7 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::ffi::c_void;
-#[cfg(target_os = "windows")]
 use std::mem::ManuallyDrop;
 
 use crate::dxva::{
@@ -22,15 +20,10 @@ use crate::dxva::{
     HEVC_TOOL_TEMPORAL_MVP,
 };
 use crate::error::D3d12Error;
-#[cfg(not(target_os = "windows"))]
-use crate::error::SkipReason;
 use crate::h264::Crop;
-#[cfg(target_os = "windows")]
 use crate::submit::{DeviceResources, Fence, Nv12Layout};
 
-#[cfg(target_os = "windows")]
 use windows::core::Interface;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
     ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -40,7 +33,6 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Media::MediaFoundation::{
     ID3D12VideoDecodeCommandList, ID3D12VideoDecoder, ID3D12VideoDecoderHeap,
     D3D12_VIDEO_DECODE_ARGUMENT_TYPE_INVERSE_QUANTIZATION_MATRIX,
@@ -55,7 +47,6 @@ use windows::Win32::Media::MediaFoundation::{
 const BITSTREAM_CAP: u64 = 8 << 20;
 
 /// Output texture pool behind the DPB slots.
-#[cfg(target_os = "windows")]
 const POOL: usize = 16;
 
 /// H.264 picture arguments for one `DecodeFrame` call.
@@ -311,7 +302,7 @@ pub(crate) trait PictureSubmission {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, past the bitstream buffer, or when the
+    /// Returns `Err` past the bitstream buffer, or when the
     /// driver refuses the picture.
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error>;
 
@@ -321,7 +312,6 @@ pub(crate) trait PictureSubmission {
     ///
     /// Returns `Err` past the bitstream buffer or when the driver refuses
     /// the picture.
-    #[cfg(target_os = "windows")]
     fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error>;
 }
 
@@ -330,14 +320,12 @@ impl PictureSubmission for HevcSubmission {
         session.decode_hevc(self)
     }
 
-    #[cfg(target_os = "windows")]
     fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
         session.decode_texture_hevc(self)
     }
 }
 
 /// Pool texture tables behind one decode call.
-#[cfg(target_os = "windows")]
 struct RefTables {
     /// Pool textures in slot order.
     textures: [Option<ID3D12Resource>; POOL],
@@ -346,7 +334,6 @@ struct RefTables {
 }
 
 /// Picture arguments behind one `DecodeFrame` call.
-#[cfg(target_os = "windows")]
 trait Submission {
     /// Picture parameters type.
     type Params;
@@ -364,7 +351,6 @@ trait Submission {
     fn bitstream_len(&self) -> usize;
 }
 
-#[cfg(target_os = "windows")]
 impl Submission for H264Submission {
     type Params = PicParamsH264;
     type Matrix = QmatrixH264;
@@ -387,7 +373,6 @@ impl Submission for H264Submission {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Submission for HevcSubmission {
     type Params = PicParamsHevc;
     type Matrix = QmatrixHevc;
@@ -411,7 +396,6 @@ impl Submission for HevcSubmission {
 }
 
 /// Visible extent plus per-plane source boxes under a crop.
-#[cfg(target_os = "windows")]
 struct CropPlan {
     /// Visible width in luma samples.
     width: u32,
@@ -424,7 +408,6 @@ struct CropPlan {
 }
 
 /// Crop copy plan for `crop` in `width` by `height`, absent when uncropped.
-#[cfg(target_os = "windows")]
 fn crop_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
     let crop = crop?;
     let left = crop.left;
@@ -457,58 +440,40 @@ fn crop_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
 /// D3D12 video decode session over one codec geometry.
 pub(crate) struct DecodeSession {
     /// Video decode queue.
-    #[cfg(target_os = "windows")]
     video_queue: ID3D12CommandQueue,
     /// Video decode allocator.
-    #[cfg(target_os = "windows")]
     video_alloc: ID3D12CommandAllocator,
     /// Video decode list.
-    #[cfg(target_os = "windows")]
     video_list: ID3D12VideoDecodeCommandList,
     /// Direct queue behind downloads.
-    #[cfg(target_os = "windows")]
     copy_queue: ID3D12CommandQueue,
     /// Direct allocator behind downloads.
-    #[cfg(target_os = "windows")]
     copy_alloc: ID3D12CommandAllocator,
     /// Direct list behind downloads.
-    #[cfg(target_os = "windows")]
     copy_list: ID3D12GraphicsCommandList,
     /// Fence behind both queues.
-    #[cfg(target_os = "windows")]
     fence: Fence,
     /// Decoder heap behind pictures.
-    #[cfg(target_os = "windows")]
     heap: ID3D12VideoDecoderHeap,
     /// Decoder behind pictures.
-    #[cfg(target_os = "windows")]
     decoder: ID3D12VideoDecoder,
     /// NV12 output texture pool, one per DPB slot.
-    #[cfg(target_os = "windows")]
     outputs: Vec<ID3D12Resource>,
     /// Visible-size crop targets, one per pool slot, empty when uncropped.
-    #[cfg(target_os = "windows")]
     crops: Vec<ID3D12Resource>,
     /// Bitstream upload buffer.
-    #[cfg(target_os = "windows")]
     bitstream: ID3D12Resource,
     /// Download staging buffer.
-    #[cfg(target_os = "windows")]
     staging: ID3D12Resource,
     /// Staging layout.
-    #[cfg(target_os = "windows")]
     layout: Nv12Layout,
     /// Driver footprints behind staging copies.
-    #[cfg(target_os = "windows")]
     footprints: [D3D12_PLACED_SUBRESOURCE_FOOTPRINT; 2],
     /// Coded width in luma samples.
-    #[cfg(target_os = "windows")]
     width: u32,
     /// Coded height in luma samples.
-    #[cfg(target_os = "windows")]
     height: u32,
     /// Visible rectangle, absent when uncropped.
-    #[cfg(target_os = "windows")]
     crop: Option<Crop>,
 }
 
@@ -517,7 +482,7 @@ impl DecodeSession {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without a `codec` profile, past the
+    /// Returns `Err` without a `codec` profile, past the
     /// adapter decode caps, or when the driver refuses the session.
     pub(crate) fn open(
         device: &crate::device::D3d12Device,
@@ -526,19 +491,10 @@ impl DecodeSession {
         height: u32,
         crop: Option<Crop>,
     ) -> Result<Self, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows(device, codec, width, height, crop)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (device, codec, width, height, crop);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows(device, codec, width, height, crop)
     }
 
     /// Session over `device` for `codec` at `width` by `height`.
-    #[cfg(target_os = "windows")]
     fn open_windows(
         device: &crate::device::D3d12Device,
         codec: crate::guid::Codec,
@@ -640,43 +596,20 @@ impl DecodeSession {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, past the bitstream buffer, or when the
+    /// Returns `Err` past the bitstream buffer, or when the
     /// driver refuses the picture.
     pub(crate) fn submit(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.submit_h264(submission)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (
-                self,
-                &submission.params,
-                &submission.qmatrix,
-                &submission.slices,
-                &submission.bitstream,
-                submission.slot,
-            );
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.submit_h264(submission)
     }
 
     /// NV12 bytes for pool `slot` cropped to the visible rectangle.
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, for a slot outside the pool, or when
+    /// Returns `Err` for a slot outside the pool, or when
     /// the copy fails.
     pub(crate) fn download(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.download_windows(slot)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (self, slot);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.download_windows(slot)
     }
 
     /// Pool texture behind `slot`, without readback.
@@ -684,7 +617,6 @@ impl DecodeSession {
     /// # Errors
     ///
     /// Returns `Err` for a slot outside the pool.
-    #[cfg(target_os = "windows")]
     pub(crate) fn texture(&self, slot: u8) -> Result<ID3D12Resource, D3d12Error> {
         self.outputs
             .get(usize::from(slot))
@@ -697,7 +629,6 @@ impl DecodeSession {
     /// # Errors
     ///
     /// Returns `Err` for a slot outside the pool or when the copy fails.
-    #[cfg(target_os = "windows")]
     pub(crate) fn texture_cropped(&mut self, slot: u8) -> Result<ID3D12Resource, D3d12Error> {
         if self.crops.is_empty() {
             return self.texture(slot);
@@ -713,25 +644,16 @@ impl DecodeSession {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, past the bitstream buffer, or when the
+    /// Returns `Err` past the bitstream buffer, or when the
     /// driver refuses the picture.
     pub(crate) fn decode_hevc(
         &mut self,
         submission: &HevcSubmission,
     ) -> Result<Vec<u8>, D3d12Error> {
-        #[cfg(target_os = "windows")]
-        {
-            self.decode_hevc_windows(submission)
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = (submission, self);
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        self.decode_hevc_windows(submission)
     }
 
     /// `submission` through the video queue into its pool slot.
-    #[cfg(target_os = "windows")]
     fn submit_h264(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
@@ -741,14 +663,12 @@ impl DecodeSession {
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
-    #[cfg(target_os = "windows")]
     fn decode_hevc_windows(&mut self, submission: &HevcSubmission) -> Result<Vec<u8>, D3d12Error> {
         self.submit_hevc(submission)?;
         self.download(0)
     }
 
     /// Output texture behind `submission` decode, without readback.
-    #[cfg(target_os = "windows")]
     pub(crate) fn decode_texture_hevc(
         &mut self,
         submission: &HevcSubmission,
@@ -758,7 +678,6 @@ impl DecodeSession {
     }
 
     /// `submission` through the video queue into pool slot zero.
-    #[cfg(target_os = "windows")]
     fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<(), D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
@@ -767,7 +686,6 @@ impl DecodeSession {
     }
 
     /// Bitstream length against the upload capacity.
-    #[cfg(target_os = "windows")]
     fn check_bitstream_len(len: usize) -> Result<(), D3d12Error> {
         if u64::try_from(len).unwrap_or(u64::MAX) > BITSTREAM_CAP {
             return Err(D3d12Error::BitstreamTooLarge {
@@ -779,7 +697,6 @@ impl DecodeSession {
     }
 
     /// Pool tables behind the reference frame arguments.
-    #[cfg(target_os = "windows")]
     fn ref_tables(&self) -> RefTables {
         let mut textures: [Option<ID3D12Resource>; POOL] = core::array::from_fn(|_| None);
         for (slot, texture) in textures.iter_mut().zip(self.outputs.iter()) {
@@ -792,7 +709,6 @@ impl DecodeSession {
     }
 
     /// Pool `slot` through staging into tight NV12 bytes.
-    #[cfg(target_os = "windows")]
     fn download_windows(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
         self.submit_copy(slot)?;
         let total = usize::try_from(self.layout.total)
@@ -805,7 +721,6 @@ impl DecodeSession {
     }
 
     /// `DecodeFrame` for `input` through the video queue into pool `slot`.
-    #[cfg(target_os = "windows")]
     fn submit_video(
         &mut self,
         input: &D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS,
@@ -875,7 +790,6 @@ impl DecodeSession {
     }
 
     /// Decode input arguments borrowing `submission`, plus `refs` when present.
-    #[cfg(target_os = "windows")]
     fn input_args<S: Submission>(
         &self,
         submission: &S,
@@ -934,7 +848,6 @@ impl DecodeSession {
     }
 
     /// Copy allocator plus list reset for one submission.
-    #[cfg(target_os = "windows")]
     fn reset_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the queue is idle; reset reuses the allocator and list.
         unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
@@ -949,7 +862,6 @@ impl DecodeSession {
     }
 
     /// Closed copy list through the direct queue.
-    #[cfg(target_os = "windows")]
     fn close_copy(&mut self) -> Result<(), D3d12Error> {
         // Sound: the list holds the caller's barriers and copies.
         unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
@@ -966,7 +878,6 @@ impl DecodeSession {
     }
 
     /// Pool `slot` planes through the direct queue into staging.
-    #[cfg(target_os = "windows")]
     fn submit_copy(&mut self, slot: u8) -> Result<(), D3d12Error> {
         let source = self
             .outputs
@@ -1006,7 +917,6 @@ impl DecodeSession {
     }
 
     /// Pool `slot` visible rectangle through the direct queue into its crop target.
-    #[cfg(target_os = "windows")]
     fn submit_crop(&mut self, slot: u8) -> Result<(), D3d12Error> {
         let source = self
             .outputs
@@ -1077,11 +987,9 @@ impl DecodeSession {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
     use crate::h264::Crop;
     use crate::h264::{parse_pps, parse_sps, Ingest};
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn crop_plan_absent_when_uncropped() {
         assert!(super::crop_plan(640, 368, None).is_none());
@@ -1094,7 +1002,6 @@ mod tests {
         assert!(super::crop_plan(640, 368, Some(zero)).is_none());
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn crop_plan_maps_360p_chroma_half_height() {
         let crop = Crop {
@@ -1109,7 +1016,6 @@ mod tests {
         assert_eq!(plan.chroma, [0, 0, 320, 180]);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn crop_plan_maps_1080p_chroma_half_height() {
         let crop = Crop {
@@ -1124,7 +1030,6 @@ mod tests {
         assert_eq!(plan.chroma, [0, 0, 960, 540]);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn crop_plan_offsets_symmetric_crop() {
         let crop = Crop {

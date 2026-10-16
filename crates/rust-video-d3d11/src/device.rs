@@ -1,7 +1,4 @@
 //! D3D11 device with enumerated decoder profiles behind the caps `Device` trait.
-//!
-//! The live implementation targets Windows; other platforms decline at
-//! `open` with a typed skip.
 
 #![allow(unsafe_code)]
 
@@ -25,10 +22,15 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
-use crate::error::{D3d11Error, SkipReason};
+#[cfg(target_os = "windows")]
+use crate::error::D3d11Error;
+#[cfg(target_os = "windows")]
+use crate::error::SkipReason;
 use crate::guid::{Codec, Profile};
 
-use rust_video_caps::traits::{Device, SharedDevice};
+use rust_video_caps::traits::Device;
+#[cfg(target_os = "windows")]
+use rust_video_caps::traits::SharedDevice;
 
 /// H.264 VLD profile name the tier decodes.
 #[cfg(target_os = "windows")]
@@ -51,6 +53,7 @@ pub struct D3d11Device {
     /// Matched decoder profiles.
     profiles: Vec<Profile>,
     /// VRAM budget shared with decoders.
+    #[cfg(target_os = "windows")]
     shared: SharedDevice,
     /// Negotiated feature level.
     level: i32,
@@ -63,18 +66,12 @@ impl D3d11Device {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Windows, without a hardware device, without
+    /// Returns `Err` without a hardware device, without
     /// video interfaces, without decoder profiles, or without an
     /// NV12 H.264 profile.
+    #[cfg(target_os = "windows")]
     pub fn open() -> Result<Self, D3d11Error> {
-        #[cfg(target_os = "windows")]
-        {
-            Self::open_windows()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(SkipReason::PlatformUnsupported.into())
-        }
+        Self::open_windows()
     }
 
     /// Device over the default hardware adapter.
@@ -129,13 +126,14 @@ impl D3d11Device {
         &self.profiles
     }
 
-    /// Negotiated feature level, zero off Windows.
+    /// Negotiated feature level.
     #[must_use]
     pub fn feature_level(&self) -> i32 {
         self.level
     }
 
     /// VRAM budget shared with decoders.
+    #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) fn shared(&self) -> &SharedDevice {
         &self.shared
@@ -383,17 +381,5 @@ mod tests {
         let profile = super::match_profile(&D3D11_DECODER_PROFILE_VC1_VLD).expect("vc1 vld");
         assert_eq!(profile.codec(), super::Codec::Vc1);
         assert!(super::match_profile(&GUID::zeroed()).is_none());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn open_declines_off_windows() {
-        let Err(error) = super::D3d11Device::open() else {
-            panic!("device opened off windows");
-        };
-        assert!(matches!(
-            error,
-            super::D3d11Error::Skipped(super::SkipReason::PlatformUnsupported)
-        ));
     }
 }

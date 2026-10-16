@@ -5,9 +5,6 @@ use crate::guid::Codec;
 /// Machine declined by the D3D12 tier, with the cause.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum SkipReason {
-    /// D3D12 exists on Windows only.
-    #[error("d3d12 needs windows")]
-    PlatformUnsupported,
     /// No hardware D3D12 device on the machine.
     #[error("no hardware d3d12 device: {hresult:#x}")]
     NoHardwareDevice {
@@ -87,10 +84,6 @@ mod tests {
 
     #[test]
     fn skip_reasons_name_cause() {
-        assert_eq!(
-            SkipReason::PlatformUnsupported.to_string(),
-            "d3d12 needs windows"
-        );
         assert_eq!(
             SkipReason::VideoSupportMissing.to_string(),
             "device without video support"
