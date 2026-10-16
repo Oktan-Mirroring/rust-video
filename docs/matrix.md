@@ -52,3 +52,10 @@ where marked.
 
 Vulkan, VA-API, D3D11, D3D12, and MediaCodec carry their platform's own
 implementation. No software politics apply: the driver is the fast path.
+
+Live now: Vulkan decodes and encodes H.264/H.265 with GPU transcode
+between them; VA-API decodes H.264, encodes H.264/H.265, and transcodes
+from H.264; D3D11 decodes H.264 and encodes H.264/H.265/VP9/AV1 over
+Media Foundation MFTs; D3D12 decodes H.264 plus IDR-only H.265 and
+encodes both; MediaCodec decodes all five codecs. The README matrix
+names every cell.

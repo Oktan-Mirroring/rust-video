@@ -13,17 +13,53 @@ In: realtime frame encode and decode for H.264, H.265, AV1, VP9, VP8, the platfo
 
 Out: archival demuxing, subtitles, filters, audio.
 
+## Features
+
+- One `Decoder`/`Encoder` API over every backend; `tier::resolve` picks the tier for the platform.
+- Per-tier transcoders stay on device surfaces where ready; Vulkan and VA-API transcode on the GPU over DMA-BUF, VA-API proven live on hardware.
+- Loud CPU fallback: `FallbackCause` names the failed hop, `Plan` records the route taken.
+- Livepack packs coded video into TS and fMP4/CMAF with bounded memory, no full-file buffering.
+- 427 golden vectors pin pixel output against ffmpeg; rules in `docs/testing/goldens.md`.
+
 ## Codec support
 
-| Codec | Decode | Encode | Hardware | Packing |
-|---|---|---|---|---|
-| H.264 | native ffmpeg | openh264 | Vulkan, VA-API, MediaCodec, D3D11, D3D12 | TS and fMP4 |
-| H.265 | native ffmpeg | libx265 (`gpl` feature) | Vulkan, VA-API stub, MediaCodec, D3D11 stub, D3D12 | TS and fMP4 |
-| AV1 | libdav1d wrapper | libaom-av1 wrapper | VA-API stub, MediaCodec, D3D11 stub, D3D12 stub | fMP4 only |
-| VP9 | native ffmpeg | libvpx-vp9 wrapper | VA-API stub, MediaCodec, D3D11 stub, D3D12 stub | fMP4 only |
-| VP8 | native ffmpeg | none | VA-API stub; MediaCodec, D3D11 absent | fMP4 only |
+### Decode
 
-Backend policy lives in `docs/matrix.md`. Hardware detail lives in `docs/vaapi.md` and `docs/mediacodec.md`. Packing detail lives in `docs/livepack-ts-fmp4.md`. AV2 has no backend yet; the gating bar is in `docs/matrix.md`.
+| Backend | H.264 | H.265 | AV1 | VP9 | VP8 |
+|---|---|---|---|---|---|
+| Software | ● | ● | ● | ● | ● |
+| Vulkan | ● | ● | – | – | – |
+| VA-API | ● | ◐ | ◐ | ◐ | ◐ |
+| D3D11 | ● | ◐ | ◐ | ◐ | – |
+| D3D12 | ● | ●⁵ | ◐ | ◐ | – |
+| MediaCodec | ●⁷ | ●⁷ | ●⁷ | ●⁷ | ●⁷ |
+
+### Encode
+
+| Backend | H.264 | H.265 | AV1 | VP9 | VP8 | Xcode |
+|---|---|---|---|---|---|---|
+| Software | ● | ●¹ | ● | ● | – | – |
+| Vulkan | ● | ● | – | – | – | ●² |
+| VA-API | ● | ● | – | – | – | ●³ |
+| D3D11 | ●⁴ | ●⁴ | ●⁴ | ●⁴ | – | ●³⁴ |
+| D3D12 | ● | ● | ◐ | – | – | ●⁶ |
+| MediaCodec | – | – | – | – | – | – |
+
+| Mark | Means |
+|---|---|
+| ● | live |
+| ◐ | decline stub: typed `Unsupported`, wired later |
+| – | absent, no module |
+
+¹ `gpl` feature, libx265.
+² GPU route live over DMA-BUF; `export()` is opaque where no DMA-BUF export exists.
+³ H.264 source only.
+⁴ Media Foundation MFT, present per machine.
+⁵ IDR pictures only.
+⁶ H.264/H.265 in and out.
+⁷ Decoder per device mime; needs the device codec.
+
+Backend policy and platform detail: `docs/matrix.md`, `docs/compat.md`.
 
 ## Requirements
 

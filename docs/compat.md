@@ -158,11 +158,12 @@ features: `av1`, `av2`, `h264`, `h265`, `vp9`, `d3d11`, `d3d12`,
 `mediacodec`, `vaapi`, and `vulkan`, each wired to its crate.
 Default carries the three portable tiers (`vulkan`, `vaapi`,
 `mediacodec`); every tier crate compiles on every target, and
-each tier's platform-only modules compile out where its platform
+each tier's platform-only code compiles out where its platform
 is absent: VA-API on Linux, `MediaCodec` natives on Android,
 D3D11 and D3D12 on Windows. The facade build script derives one
-`*_available` cfg per tier from feature plus target; use sites
-name the cfg, not the pair. Codecs, `d3d11`, and `d3d12` stay
+`*_available` cfg per OS-gated tier from feature plus target; use sites
+name the cfg, not the pair. Vulkan compiles on every target, so its
+gates name the feature directly. Codecs, `d3d11`, and `d3d12` stay
 opt-in. No
 `vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
 Shared vocabulary (frames, packets, backend traits) lives in the

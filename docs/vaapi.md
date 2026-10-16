@@ -1,23 +1,27 @@
-# VA-API decode tier
+# VA-API tier
 
-H.264 decode over DRM render nodes behind the facade `Decoder` shape:
-`crates/rust-video-vaapi`. H.265, VP8, VP9, and AV1 carry staged
-frontends: parser sources on disk with typed decline until each is
-wired. The libva binding is a minimal hand rebind; syntax and
-parameters meet in a portable layer. The crate builds on every
-platform and decodes on Linux where a render node offers the matching
-VLD profile into NV12.
+H.264 decode, H.264/H.265 encode, and GPU transcode over DRM render
+nodes behind the facade shapes: `crates/rust-video-vaapi`. H.265,
+VP8, VP9, and AV1 decode carry staged frontends: parser sources on
+disk with typed decline until each is wired. The libva binding is a
+minimal hand rebind; syntax and parameters meet in a portable layer.
+The crate builds on every platform and runs on Linux where a render
+node offers the matching profile into NV12.
 
 ## Module map
 
 | Path | Owns |
 |---|---|
-| `lib.rs` | crate root, public decoders and errors |
-| `device.rs` | `VaApiDevice`, first capable render node |
-| `backend.rs` | config, context, surface pool, submit, NV12 readback with crop |
-| `decoder.rs` | `H264Decoder`: ingest → begin → submit → commit → readback; `VaApiFrame` |
+| `lib.rs` | crate root, public decoders, encoder, scaler, transcoder, errors |
+| `device.rs` | `VaApiDevice`, first capable render node, entrypoint/config/export probes |
+| `backend.rs` | config, context, surface pool, pipelined submit, NV12 readback with crop |
+| `decoder.rs` | `H264Decoder`: ingest → begin → submit → commit → readback; `VaApiFrame` with lazy DMA-BUF export |
+| `encoder.rs` | `VaApiEncoder`: all-intra CQP sessions, hand-written packed headers |
+| `scale.rs` | `Scaler`: on-device VPP scale |
+| `transcode.rs` | `Transcoder`: decode surface to encoder input, CPU split on probe miss |
 | `frontend.rs` | Annex B into ordered `Picture`s over DPB slots, POC, reference lists |
 | `params.rs` | syntax onto VA-API picture/slice buffers |
+| `buffer.rs` | owned data buffers: create, map-rewrite, destroy on drop |
 | `ffi.rs` | hand rebind of the used libva subset, layouts pinned against `/usr/include/va/va.h` (libva 1.22.0) with size tests |
 | `error.rs` | `VaApiError`/`SkipReason` |
 | `bitstream.rs` | `BitReader`: bits, Exp-Golomb, emulation prevention, `more_rbsp_data` |
@@ -150,6 +154,34 @@ Budgets: output frames are readback copies, so they lease their byte
 count against an unbounded readback budget that documents exactly that;
 the fixed surface pool cannot overrun, and pool-sized accounting would
 spuriously trip on streams longer than the pool.
+
+Decode submits without stalling: each picture renders on a rotating
+buffer set (async depth four) and the sync moved to consumption
+(readback, DMA-BUF export), so reorder depth overlaps submit with
+the GPU. Parameter buffers rewrite in place across pictures; a
+buffer recreates only when a payload overflows it, so steady-state
+pictures never create or destroy buffers. Slice payloads sub-slice
+the packet bytes without copying, and reference lists rebuild in
+decoder scratch. `decode` copies pixels and releases
+its pool slot at once; `decode_surface` hands out the surface with
+the slot leased until the frame drops, which is what makes the lazy
+export sound. `export()` syncs and calls `vaExportSurfaceHandle`
+per call, two NV12 planes, opaque without a surface or when the
+driver refuses.
+
+Encode sessions open `EntrypointEncSlice` for H.264 High and H.265
+Main with CQP rate control and sequence/picture/slice packed
+headers, all probed before the config. Every picture is an IDR at
+CQP 26: no reference management, no reorder delay, every packet a
+keyframe. The picture header packs once per quantization and the
+upload image is created once per session. The headers are
+hand-written and verified three ways: the H.264 writer round-trips
+through this crate's own parser, the H.265 writer pins its layout
+byte offsets, and both streams decode under ffmpeg. Transcode keeps decode
+surfaces on the device into the encoder, scales through a VPP
+pipeline on miss, and splits through the CPU loudly (logged
+`FallbackCause` plus `Plan::cpu`) only when the export or encode
+probe fails.
 
 ## References
 

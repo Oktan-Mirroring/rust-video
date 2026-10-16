@@ -29,6 +29,8 @@ GPL, `libvpx*` external, and hardware wrappers).
 | ffmpeg libdav1d wrapper, hand sys | AV1 decode | **wins** (`Av1Decoder`) | 604 fps, 4 threads; ~347 fps, 1 thread | 60/60 + 60/60 + 60/60 `cmp`-clean vs ffmpeg |
 | openh264 0.9.8 | H.264 encode | **wins** (`H264Encoder`) | 272 fps, 4 threads | 120/120 frames ffmpeg-valid |
 | libvpx 1.15.0 via ffmpeg `libvpx-vp9` wrapper, hand sys | VP9 encode | **wins** (`Vp9Encoder`) | 368 fps, 4 threads | 120/120 frames ffmpeg-valid |
+| ffmpeg `libaom-av1` wrapper, hand sys | AV1 encode | **live** (`Av1Encoder`) | unmeasured | roundtrip through `Av1Decoder`, keyframe-marked |
+| ffmpeg `libx265` wrapper, hand sys, `gpl` | H.265 encode | **live** (`H265Encoder`) | unmeasured | roundtrip through `H265Decoder`, keyframe-marked |
 | openh264 0.9.8 | H.264 decode | **loses** | 127 fps single-thread | 27/60 vs ffmpeg; B-frame trigger isolated |
 | native `av1` decoder | AV1 decode | rejected, cited | n/a | hardware-only, fails without a HW pixel format |
 | rusty_h264, rusty_h265 | H.264/H.265 | rejected, cited | n/a | single-threaded, far off realtime (`docs/matrix.md`) |
@@ -186,7 +188,7 @@ and a drifted libavcodec fails the major guard first.
 
 ## License, per path
 
-LGPL-only throughout, each link verified on disk: the invoked
+LGPL-only throughout the default set, each link verified on disk: the invoked
 decoder files in the 7.1.5 source all carry LGPL-2.1-or-later
 headers (`libavcodec/h264dec.c`, `libavcodec/hevc/hevcdec.c`,
 `libavcodec/vp9.c`, `libavcodec/vp8.c`, `libavcodec/libdav1d.c`),
@@ -197,8 +199,10 @@ external libraries are BSD (`libdav1d7/copyright` BSD-2-Clause,
 LGPL with GPL triggered only by optional parts, and every decoder
 here is native (no `lib*` external; `ffmpeg -h decoder=X` shows
 frame and slice threading) except AV1, which is the BSD dav1d.
+Exception: the `gpl` feature's `libx265` path is GPL-2+ by x265's
+license and flips an ffmpeg build GPL; it stays opt-in only.
 Caveat, unchanged: the Debian system library itself is an
-`--enable-gpl` build; this path invokes no GPL component, but a
+`--enable-gpl` build; the default path invokes no GPL component, but a
 distributable LGPL product links an LGPL-built libavcodec (vcpkg
 default, or the minimal configure above), not Debian's.
 
@@ -278,3 +282,5 @@ decode the 4:2:2/4:4:4 goldens at all (I420 output only). Throughput
 3. Re-read the sys layer against libavcodec 62/63 headers when the
    Windows vcpkg build lands (same surface, offsets re-probed,
    guard extended).
+4. Throughput numbers for `Av1Encoder` and `H265Encoder`: probe
+   modes plus 1080p fps before any realtime claim.

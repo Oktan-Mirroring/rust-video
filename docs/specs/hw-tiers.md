@@ -45,5 +45,5 @@ P0-3 with levels; AV1 Main 8/10-bit with levels 2-7.3. Maximum
 resolution and bitrate are per-device only: supported widths, heights,
 bitrate ranges, and performance points, with presets reaching
 3840x2160 at 240 fps. Vendor variance is real: performance points may
-be null on stale vendor codecs. Certification minimum floors are
-unmapped.
+be null on stale vendor codecs. Certification minimum floors live in
+`docs/compat.md` (CDD 14 handhelds, API 34).

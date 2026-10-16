@@ -2,7 +2,7 @@
 <!-- date: 2026-10-11; author: rust-video -->
 # MediaCodec tier
 
-`rust-video-mediacodec` decodes H.264, H.265, AV1, and VP9 through the
+`rust-video-mediacodec` decodes H.264, H.265, AV1, VP9, and VP8 through the
 platform `MediaCodec` on Android, behind the facade `Decoder` trait.
 Byte buffers in, `CpuFrame` out. No surface path yet.
 
@@ -81,7 +81,7 @@ fallback everywhere and the entry stays `suspected`.
 Off Android everything native is compiled out: `open`, `reset`,
 and the `Decoder` impl exist on Android only. Format builders,
 quirk matching, the `DecodeState` machine, plane splitting, and
-the event queue all run as host unit tests (34 tests).
+the event queue all run as host unit tests (35 tests).
 Device-only code is covered by
 `cargo check --target aarch64-linux-android`.
 
