@@ -2,15 +2,11 @@
 
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "linux")]
 use std::ffi::CStr;
-#[cfg(target_os = "linux")]
 use std::fs::File;
-#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::error::{SkipReason, VaApiError};
-#[cfg(target_os = "linux")]
 use crate::ffi;
 
 use rust_video_caps::traits::Device;
@@ -19,10 +15,8 @@ use rust_video_caps::traits::Device;
 #[derive(Debug)]
 pub struct VaApiDevice {
     /// Initialized VA-API display; terminated before the node below closes.
-    #[cfg(target_os = "linux")]
     display: ffi::VaDisplay,
     /// Render-node file, held open for the display lifetime.
-    #[cfg(target_os = "linux")]
     _node: OwnedFd,
     /// Driver description.
     name: String,
@@ -30,7 +24,6 @@ pub struct VaApiDevice {
 
 impl VaApiDevice {
     /// DRM render-node directory.
-    #[cfg(target_os = "linux")]
     const DRI_DIR: &'static str = "/dev/dri";
 
     /// Display over the first H.264-capable render node.
@@ -39,7 +32,6 @@ impl VaApiDevice {
     ///
     /// Returns `Err` when the machine has no render node, no display
     /// initializes, or no display decodes H.264 into NV12.
-    #[cfg(target_os = "linux")]
     pub fn open() -> Result<Self, VaApiError> {
         let mut nodes = render_nodes()?;
         if nodes.is_empty() {
@@ -81,19 +73,8 @@ impl VaApiDevice {
         Err(SkipReason::NoNv12Target.into())
     }
 
-    /// Display over the first H.264-capable render node.
-    ///
-    /// # Errors
-    ///
-    /// Always returns `Err`: VA-API exists on Linux only.
-    #[cfg(not(target_os = "linux"))]
-    pub fn open() -> Result<Self, VaApiError> {
-        Err(SkipReason::PlatformUnsupported.into())
-    }
-
     /// Initialized VA-API display.
     #[must_use]
-    #[cfg(target_os = "linux")]
     pub(crate) fn display(&self) -> ffi::VaDisplay {
         self.display
     }
@@ -107,7 +88,6 @@ impl Device for VaApiDevice {
 
 impl Drop for VaApiDevice {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
         // Sound: `display` initialized in `open` and never terminated before drop.
         unsafe {
             ffi::vaTerminate(self.display);
@@ -116,7 +96,6 @@ impl Drop for VaApiDevice {
 }
 
 /// Render-node paths under `/dev/dri`.
-#[cfg(target_os = "linux")]
 fn render_nodes() -> Result<Vec<std::path::PathBuf>, VaApiError> {
     let Ok(entries) = std::fs::read_dir(VaApiDevice::DRI_DIR) else {
         return Err(SkipReason::NoRenderNode.into());
@@ -135,13 +114,11 @@ fn render_nodes() -> Result<Vec<std::path::PathBuf>, VaApiError> {
 }
 
 /// Initialized VA-API display, terminated on drop unless leaked.
-#[cfg(target_os = "linux")]
 struct Display {
     /// Initialized display handle.
     display: ffi::VaDisplay,
 }
 
-#[cfg(target_os = "linux")]
 impl Display {
     /// Display over `node`, or `None` when initialization fails.
     fn open(node: &OwnedFd) -> Option<Self> {
@@ -257,7 +234,6 @@ impl Display {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Drop for Display {
     fn drop(&mut self) {
         // Sound: `display` initialized in `open` and never terminated before drop.
@@ -270,19 +246,7 @@ impl Drop for Display {
 #[cfg(test)]
 mod tests {
     use super::VaApiDevice;
-    #[cfg(not(target_os = "linux"))]
-    use crate::error::SkipReason;
 
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn open_declines_off_linux() {
-        assert_eq!(
-            VaApiDevice::open().unwrap_err().to_string(),
-            crate::error::VaApiError::from(SkipReason::PlatformUnsupported).to_string()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
     fn open_selects_an_h264_node() {
         match VaApiDevice::open() {

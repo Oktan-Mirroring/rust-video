@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::bridge::{CodecEvent, EventQueue};
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
+#[cfg(target_os = "android")]
 use crate::quirks::QuirkTable;
 #[cfg(target_os = "android")]
 use crate::sdk::ApiLevel;
@@ -22,6 +23,7 @@ use ndk::media::media_codec::{
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "android")]
 use rust_video_caps::traits::Decoder;
 
 /// Decoder lifecycle state.
@@ -437,19 +439,13 @@ impl MediaCodecDecoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Android, below the device floor, or when no decoder
-    /// answers the mime.
+    /// Returns `Err` below the device floor, or when no decoder answers the mime.
+    #[cfg(target_os = "android")]
     pub fn open(
         spec: &FormatSpec,
         soc: &str,
         quirks: &QuirkTable,
     ) -> Result<Self, MediaCodecError> {
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = (spec, soc, quirks);
-            Err(MediaCodecError::BackendAbsent)
-        }
-        #[cfg(target_os = "android")]
         Self::open_android(spec, soc, quirks)
     }
 
@@ -525,22 +521,19 @@ impl MediaCodecDecoder {
     /// # Errors
     ///
     /// Returns `Err` unless started, or when the codec faults.
+    #[cfg(target_os = "android")]
     pub fn reset(&mut self) -> Result<Vec<CpuFrame>, MediaCodecError> {
         self.state.ensure_started("reset")?;
-        #[cfg(target_os = "android")]
-        {
-            let frames = self.inner.drain_outputs(&mut self.output)?;
-            self.inner.codec.flush()?;
-            if matches!(self.inner.mode, DrainMode::Async(_)) {
-                self.inner.codec.start()?;
-            }
-            Ok(frames)
+        let frames = self.inner.drain_outputs(&mut self.output)?;
+        self.inner.codec.flush()?;
+        if matches!(self.inner.mode, DrainMode::Async(_)) {
+            self.inner.codec.start()?;
         }
-        #[cfg(not(target_os = "android"))]
-        Err(MediaCodecError::BackendAbsent)
+        Ok(frames)
     }
 }
 
+#[cfg(target_os = "android")]
 impl Decoder for MediaCodecDecoder {
     type Frame = CpuFrame;
     type Error = MediaCodecError;
@@ -549,33 +542,22 @@ impl Decoder for MediaCodecDecoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless started, off Android, or when the codec faults.
+    /// Returns `Err` unless started, or when the codec faults.
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.state.ensure_started("decode")?;
-        #[cfg(target_os = "android")]
-        {
-            let mut frames = self.inner.push_packet(packet, &mut self.output)?;
-            frames.extend(self.inner.drain_outputs(&mut self.output)?);
-            Ok(frames)
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            let _ = packet;
-            Err(MediaCodecError::BackendAbsent)
-        }
+        let mut frames = self.inner.push_packet(packet, &mut self.output)?;
+        frames.extend(self.inner.drain_outputs(&mut self.output)?);
+        Ok(frames)
     }
 
     /// Frames held back for reordering or buffering.
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless started, off Android, or when the codec faults.
+    /// Returns `Err` unless started, or when the codec faults.
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.state.ensure_started("flush")?;
-        #[cfg(target_os = "android")]
-        return self.inner.drain_outputs(&mut self.output);
-        #[cfg(not(target_os = "android"))]
-        Err(MediaCodecError::BackendAbsent)
+        self.inner.drain_outputs(&mut self.output)
     }
 }
 
@@ -792,8 +774,6 @@ mod tests {
     use super::{ranged_bytes, DecodeState, MediaCodecDecoder, MediaCodecError, OutputLayout};
 
     use crate::format::FormatSpec;
-    #[cfg(not(target_os = "android"))]
-    use crate::quirks::QuirkTable;
 
     fn layout_16x16_nv12() -> OutputLayout {
         let spec = FormatSpec::h264(16, 16).expect("valid dims");
@@ -975,16 +955,5 @@ mod tests {
         assert_eq!(MediaCodecDecoder::pts_us(&bare), 0);
         let huge = Packet::new(Bytes::from_static(&[0])).with_pts(Duration::from_secs(u64::MAX));
         assert_eq!(MediaCodecDecoder::pts_us(&huge), u64::MAX);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "android"))]
-    fn open_reports_absent_off_android() {
-        let spec = FormatSpec::h264(16, 16).expect("valid dims");
-        let quirks = QuirkTable::load().expect("embedded table parses");
-        assert!(matches!(
-            MediaCodecDecoder::open(&spec, "test", &quirks),
-            Err(MediaCodecError::BackendAbsent)
-        ));
     }
 }

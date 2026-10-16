@@ -6,32 +6,24 @@
 #![allow(unsafe_code)]
 
 use std::os::raw::c_int;
-#[cfg(target_os = "linux")]
 use std::os::raw::{c_char, c_uint, c_ushort, c_void};
 
 /// Opaque VA-API display handle.
-#[cfg(target_os = "linux")]
 pub type VaDisplay = *mut c_void;
 /// VA-API call status.
-#[cfg(target_os = "linux")]
 pub type VaStatus = c_int;
 /// VA-API surface handle.
 pub type VaSurfaceId = u32;
 /// VA-API context handle.
-#[cfg(target_os = "linux")]
 pub type VaContextId = u32;
 /// VA-API buffer handle.
-#[cfg(target_os = "linux")]
 pub type VaBufferId = u32;
 /// VA-API config handle.
-#[cfg(target_os = "linux")]
 pub type VaConfigId = u32;
 /// VA-API image handle.
-#[cfg(target_os = "linux")]
 pub type VaImageId = u32;
 
 /// Successful VA-API call.
-#[cfg(target_os = "linux")]
 pub const VA_STATUS_SUCCESS: VaStatus = 0;
 /// Invalid VA-API handle.
 pub const VA_INVALID_ID: u32 = 0xffff_ffff;
@@ -42,36 +34,26 @@ pub const VA_PROFILE_H264_MAIN: c_int = 6;
 /// H.264 High profile.
 pub const VA_PROFILE_H264_HIGH: c_int = 7;
 /// Variable-length decode entrypoint.
-#[cfg(target_os = "linux")]
 pub const VA_ENTRYPOINT_VLD: c_int = 1;
 /// 8-bit 4:2:0 render-target format.
-#[cfg(target_os = "linux")]
 pub const VA_RT_FORMAT_YUV420: c_uint = 0x0000_0001;
 /// Render-target attribute type.
-#[cfg(target_os = "linux")]
 pub const VA_CONFIG_ATTRIB_RT_FORMAT: c_int = 0;
 /// Attribute unsupported marker.
-#[cfg(target_os = "linux")]
 pub const VA_ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
 /// Picture-parameter buffer kind.
-#[cfg(target_os = "linux")]
 pub const VA_PICTURE_PARAMETER_BUFFER_TYPE: c_int = 0;
 /// Inverse-quantization-matrix buffer kind.
-#[cfg(target_os = "linux")]
 pub const VA_IQ_MATRIX_BUFFER_TYPE: c_int = 1;
 /// Slice-parameter buffer kind.
-#[cfg(target_os = "linux")]
 pub const VA_SLICE_PARAMETER_BUFFER_TYPE: c_int = 4;
 /// Slice-data buffer kind.
-#[cfg(target_os = "linux")]
 pub const VA_SLICE_DATA_BUFFER_TYPE: c_int = 5;
 /// Whole slice carried in one buffer.
 pub const VA_SLICE_DATA_FLAG_ALL: u32 = 0x00;
 /// NV12 image fourcc.
-#[cfg(target_os = "linux")]
 pub const VA_FOURCC_NV12: u32 = 0x3231_564e;
 /// Progressive-only context flag.
-#[cfg(target_os = "linux")]
 pub const VA_PROGRESSIVE: c_int = 0x1;
 
 /// `VAPictureH264` reference flags.
@@ -266,7 +248,6 @@ pub struct VaSliceParameterBufferH264 {
 }
 
 /// VA-API image format descriptor.
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct VaImageFormat {
@@ -291,7 +272,6 @@ pub struct VaImageFormat {
 }
 
 /// VA-API image descriptor.
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct VaImage {
@@ -324,7 +304,6 @@ pub struct VaImage {
 }
 
 /// VA-API config attribute.
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct VaConfigAttrib {
@@ -334,7 +313,6 @@ pub struct VaConfigAttrib {
     pub value: u32,
 }
 
-#[cfg(target_os = "linux")]
 #[link(name = "va")]
 #[link(name = "va-drm")]
 unsafe extern "C" {
@@ -479,7 +457,6 @@ mod tests {
         assert_eq!(align_of::<VaSliceParameterBufferH264>(), 4);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn image_layout_matches_libva() {
         use super::{VaImage, VaImageFormat};
@@ -488,7 +465,6 @@ mod tests {
         assert_eq!(size_of::<VaImage>(), 120);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn config_attrib_layout_matches_libva() {
         use super::VaConfigAttrib;

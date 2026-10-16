@@ -1,4 +1,5 @@
 #![cfg(have_corpus)]
+#![cfg(target_os = "linux")]
 
 //! VA-API end-to-end: synth vectors in, hashed frames out.
 

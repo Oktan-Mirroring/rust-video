@@ -3,9 +3,6 @@
 /// Machine declined by the VA-API tier, with the cause.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum SkipReason {
-    /// VA-API exists on Linux only.
-    #[error("va-api needs linux")]
-    PlatformUnsupported,
     /// No DRM render node under `/dev/dri`.
     #[error("no drm render node")]
     NoRenderNode,
@@ -60,10 +57,6 @@ mod tests {
 
     #[test]
     fn skip_reasons_name_cause() {
-        assert_eq!(
-            SkipReason::PlatformUnsupported.to_string(),
-            "va-api needs linux"
-        );
         assert_eq!(SkipReason::NoRenderNode.to_string(), "no drm render node");
         assert_eq!(
             SkipReason::NoDisplay.to_string(),

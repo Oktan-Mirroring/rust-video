@@ -1,11 +1,16 @@
 //! VA-API H.264 decode over the first capable render node.
 
+#[cfg(target_os = "linux")]
 use bytes::Bytes;
 
+#[cfg(target_os = "linux")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "linux")]
 use rust_video_caps::traits::{Decoder, Device};
+#[cfg(target_os = "linux")]
 use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError};
 
+#[cfg(target_os = "linux")]
 fn main() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
@@ -30,3 +35,6 @@ fn main() {
         Err(error) => println!("va-api h264: flush rejected ({error})"),
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {}

@@ -128,14 +128,14 @@ never silent.
 
 | Axis | Mechanism | Why |
 |---|---|---|
-| OS tier inclusion | facade `tier-*` features; default enables `tier-vulkan`, `tier-vaapi`, `tier-mediacodec`, each compiling on every target | a target builds only the tiers it enables |
+| OS tier inclusion | facade tier features; default enables `vulkan`, `vaapi`, `mediacodec`, each compiling on every target | a target builds only the tiers it enables |
 | NDK API ladder | fixed `api-level-28` plus `ApiLevel` gates (21 floor, 28 async notify) | features expose symbols, gates pick paths |
 | Vulkan ladder | runtime only | one binary spans 1.0 loaders to 1.4 drivers |
 | VA-API caps | runtime only | driver mix unknown until init |
 | D3D11 adapter/GUID/format | runtime only [T1] | per-adapter enumeration |
 | D3D12 adapter/GUID/format | runtime only [T1] | per-adapter enumeration |
 | wgpu backend | planned [?]; runtime `Backends` flags when it lands | one binary, many GPUs |
-| software codecs | `rust-video-sw` features (`ffmpeg`, `gpl`, `h264-openh264`); facade `codec-*` map to stub crates | compile cost and binary size |
+| software codecs | `rust-video-sw` features (`ffmpeg`, `gpl`, `h264-openh264`); facade codec features map to stub crates | compile cost and binary size |
 | quirk table | runtime data file | per-device values, suspected until measured |
 
 Anti-rule: no `cfg` on driver versions, no `cfg` on OS API levels,
@@ -154,13 +154,13 @@ self-hosted GPU runners, an Android device lab for hardware e2e.
 ## Packaging
 
 One dependency: the `rust-video` facade. Tiers arrive as facade
-features: `codec-av1`, `codec-av2`, `codec-h264`, `codec-h265`,
-`codec-vp9`, `tier-d3d11`, `tier-d3d12`, `tier-mediacodec`, `tier-vaapi`,
-and `tier-vulkan`, each wired to its crate. Default carries the three
-portable tiers (`tier-vulkan`, `tier-vaapi`, `tier-mediacodec`);
-every tier crate compiles on every target and declines at runtime
-where its platform is absent. Codecs and `tier-d3d11` stay opt-in.
-No `codec-vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
+features: `av1`, `av2`, `h264`, `h265`, `vp9`, `d3d11`, `d3d12`,
+`mediacodec`, `vaapi`, and `vulkan`, each wired to its crate.
+Default carries the three portable tiers (`vulkan`, `vaapi`,
+`mediacodec`); every tier crate compiles on every target, and the
+Linux-only modules inside the VA-API crate compile out where its
+platform is absent. Codecs, `d3d11`, and `d3d12` stay opt-in. No
+`vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
 Shared vocabulary (frames, packets, backend traits) lives in the
 leaf `rust-video-caps`; tier crates build on it, never on the
 facade outside dev-dependencies, and never on each other. The

@@ -1,13 +1,18 @@
 //! `MediaCodec` decode matrix over the five shipped codecs.
 
+#[cfg(target_os = "android")]
 use bytes::Bytes;
 
+#[cfg(target_os = "android")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "android")]
 use rust_video_caps::traits::{Decoder, Device};
+#[cfg(target_os = "android")]
 use rust_video_mediacodec::{
     FormatSpec, MediaCodecDecoder, MediaCodecDevice, OutputLayout, QuirkTable,
 };
 
+#[cfg(target_os = "android")]
 fn main() {
     let device = MediaCodecDevice::probe();
     println!(
@@ -57,3 +62,6 @@ fn main() {
         }
     }
 }
+
+#[cfg(not(target_os = "android"))]
+fn main() {}
