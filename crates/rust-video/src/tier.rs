@@ -20,22 +20,17 @@ impl Platform {
     /// True when `tier` is native hardware on the platform.
     #[must_use]
     fn supports_hardware(self, tier: Tier) -> bool {
-        matches!(
-            (self, tier),
-            (Self::Windows, Tier::D3d11 | Tier::D3d12)
-                | (Self::Linux, Tier::VaApi)
-                | (Self::Android, Tier::MediaCodec)
-        )
+        self.hardware_tiers().contains(&tier)
     }
 
-    /// Hardware tier native to the platform, if any.
+    /// Hardware tiers native to the platform, in probe order.
     #[must_use]
-    fn hardware_tier(self) -> Option<Tier> {
+    fn hardware_tiers(self) -> &'static [Tier] {
         match self {
-            Self::Windows => Some(Tier::D3d11),
-            Self::Linux => Some(Tier::VaApi),
-            Self::Android => Some(Tier::MediaCodec),
-            Self::Other => None,
+            Self::Windows => &[Tier::D3d11, Tier::D3d12],
+            Self::Linux => &[Tier::VaApi],
+            Self::Android => &[Tier::MediaCodec],
+            Self::Other => &[],
         }
     }
 }
@@ -203,18 +198,19 @@ impl std::error::Error for TierError {}
 ///
 /// # Arguments
 ///
-/// * `platform` - host OS; its hardware tier fills the middle slot.
+/// * `platform` - host OS; its hardware tiers fill the middle slots.
 ///
 /// # Returns
 ///
-/// Three tiers in probe order. Platforms without a hardware tier collapse the middle slot to software.
+/// Tiers in probe order. Platforms without a hardware tier skip the middle slots.
 #[must_use]
-pub fn auto_order(platform: Platform) -> [Tier; 3] {
-    [
-        Tier::Vulkan,
-        platform.hardware_tier().unwrap_or(Tier::Software),
-        Tier::Software,
-    ]
+pub fn auto_order(platform: Platform) -> &'static [Tier] {
+    match platform {
+        Platform::Windows => &[Tier::Vulkan, Tier::D3d11, Tier::D3d12, Tier::Software],
+        Platform::Linux => &[Tier::Vulkan, Tier::VaApi, Tier::Software],
+        Platform::Android => &[Tier::Vulkan, Tier::MediaCodec, Tier::Software],
+        Platform::Other => &[Tier::Vulkan, Tier::Software],
+    }
 }
 
 /// Host OS family.
@@ -238,7 +234,7 @@ pub fn host_platform() -> Platform {
 /// * `codec` - codec to encode or decode.
 /// * `pref` - automatic order or one forced tier.
 /// * `caps` - tier availability on this machine.
-/// * `platform` - host OS; selects the hardware tier.
+/// * `platform` - host OS; selects the hardware tiers.
 ///
 /// # Errors
 ///
@@ -262,12 +258,7 @@ pub fn resolve(
             }
         }
         TierPreference::Auto => {
-            let mut previous: Option<Tier> = None;
-            for tier in auto_order(platform) {
-                if previous == Some(tier) {
-                    continue;
-                }
-                previous = Some(tier);
+            for tier in auto_order(platform).iter().copied() {
                 if caps.supports(codec, tier, platform) {
                     return Ok(tier);
                 }
@@ -288,8 +279,22 @@ mod tests {
     fn auto_order_windows() {
         assert_eq!(
             auto_order(Platform::Windows),
-            [Tier::Vulkan, Tier::D3d11, Tier::Software]
+            [Tier::Vulkan, Tier::D3d11, Tier::D3d12, Tier::Software]
         );
+    }
+
+    #[test]
+    fn auto_order_brackets_platform_hardware() {
+        for platform in [
+            Platform::Windows,
+            Platform::Linux,
+            Platform::Android,
+            Platform::Other,
+        ] {
+            let order = auto_order(platform);
+            assert_eq!(order.first(), Some(&Tier::Vulkan), "{platform:?}");
+            assert_eq!(order.last(), Some(&Tier::Software), "{platform:?}");
+        }
     }
 
     #[test]
@@ -309,11 +314,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_order_other_collapses_middle_slot() {
-        assert_eq!(
-            auto_order(Platform::Other),
-            [Tier::Vulkan, Tier::Software, Tier::Software]
-        );
+    fn auto_order_other_skips_middle_slots() {
+        assert_eq!(auto_order(Platform::Other), [Tier::Vulkan, Tier::Software]);
     }
 
     #[test]
