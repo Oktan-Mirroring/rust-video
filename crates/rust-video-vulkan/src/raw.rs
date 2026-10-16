@@ -9,14 +9,22 @@
 //! exposes only safe methods. No other module uses `unsafe`.
 
 use std::ffi::{c_char, CString};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::sync::Arc;
 
 use crate::error::{SkipReason, VulkanError};
 use crate::inflight::Fence;
-use crate::ladder::{AdapterFacts, Backend, CodecOp, DecodeFacts, EncodeFacts, LadderError};
+use crate::ladder::{
+    AdapterFacts, AdapterFingerprint, Backend, CodecOp, DecodeFacts, EncodeFacts, LadderError,
+};
 
 use ash::{khr, vk};
+use rust_video_caps::frame::GpuExport;
+#[cfg(unix)]
+use rust_video_caps::frame::{DmaBufPlane, PixelFormat};
 
-/// Loaded Vulkan entry plus a 1.0 instance for negotiation.
+/// Loaded Vulkan entry plus a 1.3 instance for negotiation.
 pub(crate) struct AshBackend {
     /// Dlopened loader entry.
     entry: ash::Entry,
@@ -40,20 +48,26 @@ const H265_PROFILES: [vk::native::StdVideoH265ProfileIdc; 2] = [
 ];
 
 impl AshBackend {
-    /// Entry plus 1.0 instance over the system loader.
+    /// Entry plus 1.3 instance over the system loader.
     ///
     /// # Errors
     ///
-    /// Returns `Err` on skip when the loader is absent, or when the
-    /// instance fails to create.
+    /// Returns `Err` on skip when the loader is absent or backs no
+    /// driver, or on hard failure when the instance fails to create.
     pub fn load() -> Result<Self, LadderError> {
         // SAFETY: loads the system loader; the entry owns the handle.
         let entry = unsafe { ash::Entry::load() }
             .map_err(|_| LadderError::Skip(SkipReason::LoaderAbsent))?;
-        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         // SAFETY: descriptors point at live info structs, no extensions.
-        let instance = unsafe { entry.create_instance(&create_info, None) }?;
+        let instance = match unsafe { entry.create_instance(&create_info, None) } {
+            Ok(instance) => instance,
+            Err(vk::Result::ERROR_INCOMPATIBLE_DRIVER) => {
+                return Err(LadderError::Skip(SkipReason::NoPhysicalDevice));
+            }
+            Err(error) => return Err(VulkanError::Vulkan(error).into()),
+        };
         let video = khr::video_queue::Instance::new(&entry, &instance);
         Ok(Self {
             entry,
@@ -81,6 +95,18 @@ impl AshBackend {
     ) -> Result<AdapterFacts<vk::PhysicalDevice>, LadderError> {
         // SAFETY: adapter came from this instance's enumeration.
         let properties = unsafe { self.instance.get_physical_device_properties(adapter) };
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        // SAFETY: the properties chain is plain descriptors.
+        unsafe {
+            self.instance
+                .get_physical_device_properties2(adapter, &mut properties2);
+        }
+        let luid = if id.device_luid_valid == vk::TRUE {
+            id.device_luid
+        } else {
+            [0; 8]
+        };
         // SAFETY: extension list query writes into ash-owned storage.
         let extensions = unsafe { self.instance.enumerate_device_extension_properties(adapter) }?;
         let mut names = Vec::with_capacity(extensions.len());
@@ -114,8 +140,14 @@ impl AshBackend {
         let h264 = self.h264_caps(adapter, &names);
         let h265 = self.h265_caps(adapter, &names);
         let h264_encode = self.h264_encode_caps(adapter, &names);
+        let h265_encode = self.h265_encode_caps(adapter, &names);
         Ok(AdapterFacts {
             handle: adapter,
+            fingerprint: AdapterFingerprint {
+                vendor: properties.vendor_id,
+                device: properties.device_id,
+                luid,
+            },
             api_version: properties.api_version,
             extensions: names,
             decode_queue_families: decode,
@@ -123,6 +155,7 @@ impl AshBackend {
             h264,
             h265,
             h264_encode,
+            h265_encode,
         })
     }
 
@@ -136,6 +169,22 @@ impl AshBackend {
     /// Instance behind the backend.
     pub(crate) fn instance(&self) -> &ash::Instance {
         &self.instance
+    }
+
+    /// DMA-BUF export extensions, each present on `adapter` or none at all.
+    fn export_extensions(&self, adapter: vk::PhysicalDevice) -> Vec<&'static std::ffi::CStr> {
+        // SAFETY: enumeration writes into ash-owned storage.
+        let list = unsafe { self.instance.enumerate_device_extension_properties(adapter) }
+            .unwrap_or_default();
+        let names: Vec<CString> = list
+            .iter()
+            .filter_map(|entry| entry.extension_name_as_c_str().ok().map(CString::from))
+            .collect();
+        if external_memory_present(&names) {
+            export_extension_names()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Video picture formats for `profile`, if the query runs.
@@ -172,8 +221,8 @@ impl AshBackend {
         if status != vk::Result::SUCCESS {
             return Err(VulkanError::Vulkan(status));
         }
-        let mut formats = Vec::with_capacity(count as usize);
-        // SAFETY: count came from the driver; length set after the call.
+        let mut formats = vec![vk::VideoFormatPropertiesKHR::default(); count as usize];
+        // SAFETY: structs outlive the call; the driver fills each entry.
         let status = unsafe {
             (self
                 .video
@@ -188,8 +237,7 @@ impl AshBackend {
         if status != vk::Result::SUCCESS {
             return Err(VulkanError::Vulkan(status));
         }
-        // SAFETY: the driver wrote `count` entries.
-        unsafe { formats.set_len(count as usize) };
+        formats.truncate(count as usize);
         Ok(formats)
     }
 
@@ -235,6 +283,7 @@ impl AshBackend {
                     caps.max_dpb_slots,
                     caps.max_active_reference_pictures,
                     caps.std_header_version.spec_version,
+                    caps.min_bitstream_buffer_size_alignment,
                 );
                 (status, facts)
             };
@@ -245,6 +294,7 @@ impl AshBackend {
                     active_refs: facts.3,
                     max_level: crate::session::geometry::h264_std_to_wire(codec_caps.max_level_idc),
                     std_version: facts.4,
+                    min_bitstream_align: facts.5,
                 })
             } else {
                 None
@@ -292,6 +342,7 @@ impl AshBackend {
                     caps.max_dpb_slots,
                     caps.max_active_reference_pictures,
                     caps.std_header_version.spec_version,
+                    caps.min_bitstream_buffer_size_alignment,
                 );
                 (status, facts)
             };
@@ -302,6 +353,7 @@ impl AshBackend {
                     active_refs: facts.3,
                     max_level: crate::session::geometry::h265_std_to_wire(codec_caps.max_level_idc),
                     std_version: facts.4,
+                    min_bitstream_align: facts.5,
                 })
             } else {
                 None
@@ -347,6 +399,8 @@ impl AshBackend {
                     caps.max_coded_extent.width,
                     caps.max_coded_extent.height,
                     caps.std_header_version.spec_version,
+                    encode_caps.supported_encode_feedback_flags,
+                    encode_caps.rate_control_modes,
                 );
                 (status, facts)
             };
@@ -356,6 +410,68 @@ impl AshBackend {
                     quality_levels: encode_caps.max_quality_levels,
                     max_bitrate: encode_caps.max_bitrate,
                     std_version: facts.2,
+                    profile: *profile,
+                    feedback: facts.3,
+                    rate_control_modes: facts.4,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// H.265 encode caps from the first supported profile, if any.
+    ///
+    /// Skips the query unless every video extension string is present:
+    /// ash loads a panicking stub for missing extension entry points.
+    fn h265_encode_caps(
+        &self,
+        adapter: vk::PhysicalDevice,
+        extensions: &[CString],
+    ) -> Option<EncodeFacts> {
+        if !Self::gated(CodecOp::H265Encode, extensions) {
+            return None;
+        }
+        H265_PROFILES.iter().find_map(|profile| {
+            let mut h265 = vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(*profile);
+            let query = vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .push_next(&mut h265);
+            let mut codec_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+            let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+            let (status, facts) = {
+                let mut caps = vk::VideoCapabilitiesKHR::default()
+                    .push_next(&mut codec_caps)
+                    .push_next(&mut encode_caps);
+                // SAFETY: gated on extension strings; structs outlive the call.
+                let status = unsafe {
+                    (self.video.fp().get_physical_device_video_capabilities_khr)(
+                        adapter,
+                        &raw const query,
+                        &raw mut caps,
+                    )
+                };
+                let facts = (
+                    caps.max_coded_extent.width,
+                    caps.max_coded_extent.height,
+                    caps.std_header_version.spec_version,
+                    encode_caps.supported_encode_feedback_flags,
+                    encode_caps.rate_control_modes,
+                );
+                (status, facts)
+            };
+            if status == vk::Result::SUCCESS {
+                Some(EncodeFacts {
+                    coded_extent: (facts.0, facts.1),
+                    quality_levels: encode_caps.max_quality_levels,
+                    max_bitrate: encode_caps.max_bitrate,
+                    std_version: facts.2,
+                    profile: *profile,
+                    feedback: facts.3,
+                    rate_control_modes: facts.4,
                 })
             } else {
                 None
@@ -405,13 +521,22 @@ impl Backend for AshBackend {
                     .queue_priorities(&priorities),
             );
         }
-        let names: Vec<*const c_char> = op.extensions().iter().map(|name| name.as_ptr()).collect();
+        let mut names: Vec<*const c_char> =
+            op.extensions().iter().map(|name| name.as_ptr()).collect();
+        let extra = self.export_extensions(*adapter);
+        names.extend(extra.iter().map(|name| name.as_ptr()));
+        let mut sync2 =
+            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&infos)
-            .enabled_extension_names(&names);
+            .enabled_extension_names(&names)
+            .push_next(&mut sync2);
         // SAFETY: families passed the ladder; names point at static strings.
         let device = unsafe { self.instance.create_device(*adapter, &create_info, None) }?;
-        Ok(RawDevice { device })
+        Ok(RawDevice {
+            device,
+            external: !extra.is_empty(),
+        })
     }
 }
 
@@ -441,6 +566,39 @@ impl Backend for &AshBackend {
 pub(crate) struct RawDevice {
     /// Logical device handle.
     device: ash::Device,
+    /// DMA-BUF export extensions enabled.
+    external: bool,
+}
+
+/// DMA-BUF export extensions for this platform.
+#[cfg(unix)]
+fn export_extension_names() -> Vec<&'static std::ffi::CStr> {
+    vec![
+        vk::KHR_EXTERNAL_MEMORY_NAME,
+        vk::KHR_EXTERNAL_MEMORY_FD_NAME,
+    ]
+}
+
+/// DMA-BUF export extensions for this platform.
+#[cfg(not(unix))]
+fn export_extension_names() -> Vec<&'static std::ffi::CStr> {
+    Vec::new()
+}
+
+/// True when `extensions` carry the DMA-BUF export pair.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn external_memory_present(extensions: &[CString]) -> bool {
+    use std::ffi::CStr;
+    let present = |want: &CStr| extensions.iter().any(|have| have.as_c_str() == want);
+    present(vk::KHR_EXTERNAL_MEMORY_NAME) && present(vk::KHR_EXTERNAL_MEMORY_FD_NAME)
+}
+
+/// True when `extensions` carry the DMA-BUF export pair.
+#[cfg(not(unix))]
+#[must_use]
+pub(crate) fn external_memory_present(_extensions: &[CString]) -> bool {
+    false
 }
 
 impl RawDevice {
@@ -448,6 +606,12 @@ impl RawDevice {
     #[must_use]
     pub fn device(&self) -> &ash::Device {
         &self.device
+    }
+
+    /// DMA-BUF export extensions enabled.
+    #[must_use]
+    pub(crate) fn external_memory(&self) -> bool {
+        self.external
     }
 
     /// Queue of `family` at index zero.
@@ -467,6 +631,35 @@ impl RawDevice {
                 .instance()
                 .get_physical_device_memory_properties(adapter)
         }
+    }
+}
+
+/// Owned logical device plus the instance behind it, shared with escaped frames.
+///
+/// Field order is the drop order: the device destroys before its instance.
+pub(crate) struct OwnedDevice {
+    /// Logical device; drops before the instance below.
+    device: RawDevice,
+    /// Entry plus instance owning the device above.
+    backend: AshBackend,
+}
+
+impl OwnedDevice {
+    /// Owned pair of `device` on `backend`.
+    pub fn new(device: RawDevice, backend: AshBackend) -> Self {
+        Self { device, backend }
+    }
+
+    /// Logical device behind the pair.
+    #[must_use]
+    pub fn device(&self) -> &RawDevice {
+        &self.device
+    }
+
+    /// Entry plus instance behind the pair.
+    #[must_use]
+    pub fn backend(&self) -> &AshBackend {
+        &self.backend
     }
 }
 
@@ -645,6 +838,78 @@ impl GpuMemory {
         })
     }
 
+    /// Allocation of `size` bytes of `type_index`, exportable as DMA-BUF.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when allocation fails or the platform exports nothing.
+    pub fn allocate_exportable(
+        device: &ash::Device,
+        size: vk::DeviceSize,
+        type_index: u32,
+    ) -> Result<Self, VulkanError> {
+        #[cfg(unix)]
+        {
+            let mut export = vk::ExportMemoryAllocateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::MemoryAllocateInfo::default()
+                .allocation_size(size)
+                .memory_type_index(type_index)
+                .push_next(&mut export);
+            // SAFETY: plain descriptor; the memory is owned on success.
+            let memory = unsafe { device.allocate_memory(&info, None) }?;
+            Ok(Self {
+                device: device.clone(),
+                memory,
+                size,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, size, type_index);
+            Err(VulkanError::Unsupported {
+                what: "dma-buf export".to_owned(),
+            })
+        }
+    }
+
+    /// Allocation of `size` bytes of `type_index` importing `fd` as DMA-BUF.
+    ///
+    /// The import consumes `fd` on success and closes it on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the import fails or the platform imports nothing.
+    #[cfg(unix)]
+    pub fn allocate_imported(
+        device: &ash::Device,
+        size: vk::DeviceSize,
+        type_index: u32,
+        fd: OwnedFd,
+    ) -> Result<Self, VulkanError> {
+        let raw = fd.into_raw_fd();
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(raw);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(type_index)
+            .push_next(&mut import);
+        // SAFETY: plain descriptor; the driver owns the fd on success.
+        match unsafe { device.allocate_memory(&info, None) } {
+            Ok(memory) => Ok(Self {
+                device: device.clone(),
+                memory,
+                size,
+            }),
+            Err(error) => {
+                // SAFETY: the import failed, so the fd is still ours.
+                drop(unsafe { OwnedFd::from_raw_fd(raw) });
+                Err(VulkanError::Vulkan(error))
+            }
+        }
+    }
+
     /// Memory handle.
     #[must_use]
     pub fn memory(&self) -> vk::DeviceMemory {
@@ -653,40 +918,88 @@ impl GpuMemory {
 
     /// Copy `bytes` into the allocation at offset zero.
     ///
+    /// Maps `bytes.len`, never the allocation size.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when `bytes` overruns the allocation or mapping fails.
     pub fn fill(&self, bytes: &[u8]) -> Result<(), VulkanError> {
-        if bytes.len() as vk::DeviceSize > self.size {
+        let len = vk::DeviceSize::try_from(bytes.len())
+            .map_err(|_| VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))?;
+        if len > self.size {
             return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
         }
         // SAFETY: the memory is host-visible and owned; the copy stays in range.
         unsafe {
-            let ptr =
-                self.device
-                    .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())?;
+            let ptr = self
+                .device
+                .map_memory(self.memory, 0, len, vk::MemoryMapFlags::empty())?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
             self.device.unmap_memory(self.memory);
         }
         Ok(())
     }
 
-    /// Copy the allocation prefix into `out`.
+    /// Copy `bytes` into the allocation, zeroing through `total`.
+    ///
+    /// Maps `total`, never the allocation size.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `out` overruns the allocation or mapping fails.
-    pub fn read_into(&self, out: &mut [u8]) -> Result<(), VulkanError> {
-        if out.len() as vk::DeviceSize > self.size {
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+    /// Returns `Err` when `total` overruns the allocation, `bytes` overruns
+    /// `total`, or mapping fails.
+    pub fn fill_padded(&self, bytes: &[u8], total: u64) -> Result<(), VulkanError> {
+        let overrun = || VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        let len = u64::try_from(bytes.len()).map_err(|_| overrun())?;
+        if total > self.size || len > total {
+            return Err(overrun());
         }
-        // SAFETY: the memory is host-visible and owned; the copy stays in range.
+        // SAFETY: the memory is host-visible and owned; writes stay in range.
         unsafe {
-            let ptr =
-                self.device
-                    .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())?;
-            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), out.len());
+            let ptr = self
+                .device
+                .map_memory(self.memory, 0, total, vk::MemoryMapFlags::empty())?;
+            let dst = ptr.cast::<u8>();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            let pad = usize::try_from(total - len).map_err(|_| overrun())?;
+            std::ptr::write_bytes(dst.add(bytes.len()), 0, pad);
             self.device.unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+
+    /// Copy the allocation prefix of `len` bytes into `out`, reusing it.
+    ///
+    /// Maps `len`, never the allocation size; skips the zero-fill a
+    /// `resize` would write before the overwrite.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `len` overruns the allocation or mapping fails.
+    pub fn read_to_vec(&self, out: &mut Vec<u8>, len: usize) -> Result<(), VulkanError> {
+        let overrun = || VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        let want = vk::DeviceSize::try_from(len).map_err(|_| overrun())?;
+        if want > self.size {
+            return Err(overrun());
+        }
+        out.clear();
+        if len == 0 {
+            return Ok(());
+        }
+        out.reserve(len);
+        // SAFETY: the memory is host-visible and owned; the copy lands in
+        // reserved spare capacity, and the length sets only after it.
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(self.memory, 0, want, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(
+                ptr.cast::<u8>(),
+                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                len,
+            );
+            self.device.unmap_memory(self.memory);
+            out.set_len(len);
         }
         Ok(())
     }
@@ -712,6 +1025,8 @@ pub(crate) struct GpuBuffer {
 impl GpuBuffer {
     /// Buffer of `size` bytes with `usage`, backed by `flags` memory.
     ///
+    /// `profiles` rides a video profile list for video usages; empty otherwise.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when creation, type picking, or binding fails.
@@ -721,11 +1036,20 @@ impl GpuBuffer {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         flags: vk::MemoryPropertyFlags,
+        profiles: &[vk::VideoProfileInfoKHR<'_>],
     ) -> Result<Self, VulkanError> {
-        let info = vk::BufferCreateInfo::default()
+        let mut list = vk::VideoProfileListInfoKHR {
+            profile_count: u32::try_from(profiles.len()).unwrap_or(u32::MAX),
+            p_profiles: profiles.as_ptr(),
+            ..Default::default()
+        };
+        let mut info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        if !profiles.is_empty() {
+            info = info.push_next(&mut list);
+        }
         // SAFETY: plain descriptor; the buffer is owned on success.
         let buffer = unsafe { device.create_buffer(&info, None) }?;
         // SAFETY: the buffer is live and owned.
@@ -787,9 +1111,7 @@ pub(crate) struct GpuImage {
     device: ash::Device,
     /// Image handle.
     image: vk::Image,
-    /// Full image view.
-    view: vk::ImageView,
-    /// Backing memory, freed after image and view in `Drop`.
+    /// Backing memory, freed after the image in `Drop`.
     memory: Option<GpuMemory>,
     /// Image format.
     format: vk::Format,
@@ -798,6 +1120,8 @@ pub(crate) struct GpuImage {
 impl GpuImage {
     /// Image over `desc`, memory bound.
     ///
+    /// `profiles` rides a video profile list for video usages; empty otherwise.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when creation, type picking, or binding fails.
@@ -805,8 +1129,14 @@ impl GpuImage {
         device: &ash::Device,
         properties: &vk::PhysicalDeviceMemoryProperties,
         desc: &GpuImageDesc,
+        profiles: &[vk::VideoProfileInfoKHR<'_>],
     ) -> Result<Self, VulkanError> {
-        let info = vk::ImageCreateInfo::default()
+        let mut list = vk::VideoProfileListInfoKHR {
+            profile_count: u32::try_from(profiles.len()).unwrap_or(u32::MAX),
+            p_profiles: profiles.as_ptr(),
+            ..Default::default()
+        };
+        let mut info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(desc.format)
             .extent(vk::Extent3D {
@@ -821,6 +1151,9 @@ impl GpuImage {
             .usage(desc.usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        if !profiles.is_empty() {
+            info = info.push_next(&mut list);
+        }
         // SAFETY: plain descriptor; the image is owned on success.
         let image = unsafe { device.create_image(&info, None) }?;
         // SAFETY: the image is live and owned.
@@ -834,23 +1167,9 @@ impl GpuImage {
         let memory = GpuMemory::allocate(device, requirements.size, type_index)?;
         // SAFETY: the memory covers the requirements at offset zero.
         unsafe { device.bind_image_memory(image, memory.memory(), 0) }?;
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(desc.format)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: desc.layers,
-            });
-        // SAFETY: the image is live and owned; the range covers it.
-        let view = unsafe { device.create_image_view(&view_info, None) }?;
         Ok(Self {
             device: device.clone(),
             image,
-            view,
             memory: Some(memory),
             format: desc.format,
         })
@@ -925,14 +1244,594 @@ impl Drop for GpuView {
 
 impl Drop for GpuImage {
     fn drop(&mut self) {
-        // SAFETY: view and image are live and owned by this device.
+        // SAFETY: the image is live and owned by this device.
         unsafe {
-            self.device.destroy_image_view(self.view, None);
             self.device.destroy_image(self.image, None);
         }
         // Bound memory frees after the image regardless of field order.
         let _memory = self.memory.take();
     }
+}
+
+/// Linear DRM format modifier: tightly packed rows, no tiling.
+#[cfg(unix)]
+pub(crate) const DRM_MODIFIER_LINEAR: u64 = 0;
+
+/// True when `format` exports as NV12 DMA-BUF planes.
+#[must_use]
+pub(crate) fn two_plane_nv12(format: vk::Format) -> bool {
+    format == vk::Format::G8_B8R8_2PLANE_420_UNORM
+}
+
+/// One exportable linear plane: image plus exportable memory.
+pub(crate) struct ExportPlane {
+    /// Device that destroys the image.
+    #[cfg(not(unix))]
+    device: ash::Device,
+    /// Image handle.
+    image: vk::Image,
+    /// Backing memory, freed after the image in `Drop`.
+    #[cfg(unix)]
+    memory: GpuMemory,
+    /// Bytes per row.
+    #[cfg(unix)]
+    stride: u32,
+    /// Byte offset of the first row.
+    #[cfg(unix)]
+    offset: u32,
+    /// Instance plus device behind the image; drops last.
+    #[cfg(unix)]
+    keep: Arc<OwnedDevice>,
+}
+
+impl ExportPlane {
+    /// Linear `format` plane at `extent` with `usage`, exportable as DMA-BUF.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when creation, type picking, binding, or the layout
+    /// query fails, or the platform exports nothing.
+    fn create(
+        device: &ash::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        usage: vk::ImageUsageFlags,
+        keep: Arc<OwnedDevice>,
+    ) -> Result<Self, VulkanError> {
+        #[cfg(unix)]
+        {
+            let mut external = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut external);
+            // SAFETY: plain descriptor; the image is owned on success.
+            let image = unsafe { device.create_image(&info, None) }?;
+            // SAFETY: the image is live and owned.
+            let requirements = unsafe { device.get_image_memory_requirements(image) };
+            let picked = pick_memory_type_preferred(
+                requirements,
+                properties,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            let Some(type_index) = picked else {
+                // SAFETY: the image is live and owned.
+                unsafe { device.destroy_image(image, None) };
+                return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            };
+            let memory = GpuMemory::allocate_exportable(device, requirements.size, type_index)
+                .inspect_err(|_| {
+                    // SAFETY: the image is live and owned.
+                    unsafe { device.destroy_image(image, None) };
+                })?;
+            // SAFETY: the memory covers the requirements at offset zero.
+            unsafe { device.bind_image_memory(image, memory.memory(), 0) }?;
+            let subresource = vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            };
+            // SAFETY: the image is live and owned.
+            let layout = unsafe { device.get_image_subresource_layout(image, subresource) };
+            let stride = u32::try_from(layout.row_pitch).map_err(|_| {
+                crate::error::ParseError::OutOfRange {
+                    syntax: "export stride",
+                }
+            })?;
+            let offset =
+                u32::try_from(layout.offset).map_err(|_| crate::error::ParseError::OutOfRange {
+                    syntax: "export offset",
+                })?;
+            Ok(Self {
+                image,
+                memory,
+                stride,
+                offset,
+                keep,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, properties, format, extent, usage, keep);
+            Err(VulkanError::Unsupported {
+                what: "dma-buf export".to_owned(),
+            })
+        }
+    }
+
+    /// Image handle.
+    #[must_use]
+    fn image(&self) -> vk::Image {
+        self.image
+    }
+}
+
+/// DMA-BUF file descriptor of `memory`, freshly owned by the caller.
+#[cfg(unix)]
+fn export_fd(ext: &khr::external_memory_fd::Device, memory: vk::DeviceMemory) -> Option<OwnedFd> {
+    let info = vk::MemoryGetFdInfoKHR::default()
+        .memory(memory)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    // SAFETY: the memory is live and owned; the fd is owned on success.
+    let fd = unsafe { ext.get_memory_fd(&info) }.ok()?;
+    // SAFETY: the fd is freshly returned and owned.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+impl ExportPlane {
+    /// DMA-BUF plane over a fresh descriptor of the backing memory.
+    #[cfg(unix)]
+    fn dmabuf(&self, ext: &khr::external_memory_fd::Device) -> Option<DmaBufPlane> {
+        let fd = export_fd(ext, self.memory.memory())?;
+        Some(DmaBufPlane::new(
+            fd,
+            self.stride,
+            self.offset,
+            DRM_MODIFIER_LINEAR,
+        ))
+    }
+}
+
+impl Drop for ExportPlane {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let device = self.keep.device().device();
+        #[cfg(not(unix))]
+        let device = &self.device;
+        // SAFETY: the image is live and owned by this device.
+        unsafe { device.destroy_image(self.image, None) };
+    }
+}
+
+/// NV12 frame as two exportable linear planes: luma plus chroma.
+pub(crate) struct ExportPair {
+    /// DMA-BUF export functions.
+    #[cfg(unix)]
+    ext: khr::external_memory_fd::Device,
+    /// Luma plane.
+    y: ExportPlane,
+    /// Chroma plane.
+    uv: ExportPlane,
+    /// Frame extent in luma samples.
+    extent: vk::Extent2D,
+    /// Decoded picture format the planes were copied from.
+    source: vk::Format,
+}
+
+impl ExportPair {
+    /// NV12 pair at `extent` copied from `source`, exportable as DMA-BUF.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a degenerate extent or when creation fails.
+    pub fn create(
+        device: &ash::Device,
+        ext: &khr::external_memory_fd::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        extent: (u32, u32),
+        source: vk::Format,
+        keep: Arc<OwnedDevice>,
+    ) -> Result<Self, VulkanError> {
+        #[cfg(not(unix))]
+        let _ = ext;
+        if extent.0 == 0
+            || extent.1 == 0
+            || !extent.0.is_multiple_of(2)
+            || !extent.1.is_multiple_of(2)
+        {
+            return Err(VulkanError::BadExtent {
+                width: extent.0,
+                height: extent.1,
+            });
+        }
+        let luma = vk::Extent2D {
+            width: extent.0,
+            height: extent.1,
+        };
+        let chroma = vk::Extent2D {
+            width: extent.0 / 2,
+            height: extent.1 / 2,
+        };
+        let usage = vk::ImageUsageFlags::TRANSFER_DST;
+        let y = ExportPlane::create(
+            device,
+            properties,
+            vk::Format::R8_UNORM,
+            luma,
+            usage,
+            keep.clone(),
+        )?;
+        let uv = ExportPlane::create(
+            device,
+            properties,
+            vk::Format::R8G8_UNORM,
+            chroma,
+            usage,
+            keep,
+        )?;
+        Ok(Self {
+            #[cfg(unix)]
+            ext: ext.clone(),
+            y,
+            uv,
+            extent: luma,
+            source,
+        })
+    }
+
+    /// Frame extent in luma samples.
+    #[must_use]
+    pub fn extent(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
+    }
+
+    /// Decoded picture format the planes were copied from.
+    #[must_use]
+    pub fn source(&self) -> vk::Format {
+        self.source
+    }
+
+    /// Luma image handle.
+    #[must_use]
+    pub fn y_image(&self) -> vk::Image {
+        self.y.image()
+    }
+
+    /// Chroma image handle.
+    #[must_use]
+    pub fn uv_image(&self) -> vk::Image {
+        self.uv.image()
+    }
+
+    /// Platform export handle for the planes.
+    ///
+    /// DMA-BUF planes while both descriptors export; an opaque backend
+    /// descriptor otherwise. Infallible by shape.
+    #[must_use]
+    pub fn export(&self) -> GpuExport {
+        #[cfg(unix)]
+        {
+            match (self.y.dmabuf(&self.ext), self.uv.dmabuf(&self.ext)) {
+                (Some(y), Some(uv)) => GpuExport::DmaBuf {
+                    format: PixelFormat::Nv12,
+                    planes: [y, uv],
+                },
+                _ => GpuExport::Opaque { name: "vulkan" },
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            GpuExport::Opaque { name: "vulkan" }
+        }
+    }
+
+    /// Fresh descriptors of both planes, in plane order.
+    #[cfg(unix)]
+    fn fresh_fds(&self) -> Option<[OwnedFd; 2]> {
+        Some([
+            export_fd(&self.ext, self.y.memory.memory())?,
+            export_fd(&self.ext, self.uv.memory.memory())?,
+        ])
+    }
+}
+
+/// Device export behind a decoded frame: shared exportable planes.
+pub(crate) struct DeviceExport {
+    /// Exportable planes; the pool slot stays out of reuse while live.
+    pair: std::sync::Arc<ExportPair>,
+}
+
+impl DeviceExport {
+    /// Export over shared `pair`.
+    #[must_use]
+    pub fn new(pair: std::sync::Arc<ExportPair>) -> Self {
+        Self { pair }
+    }
+
+    /// Shared exportable planes.
+    #[must_use]
+    pub(crate) fn pair(&self) -> &Arc<ExportPair> {
+        &self.pair
+    }
+
+    /// Platform export handle for the frame.
+    #[must_use]
+    pub fn export(&self) -> GpuExport {
+        self.pair.export()
+    }
+
+    /// Frame extent in luma samples.
+    #[must_use]
+    pub fn extent(&self) -> (u32, u32) {
+        self.pair.extent()
+    }
+
+    /// Decoded picture format the planes were copied from.
+    #[must_use]
+    pub fn source(&self) -> vk::Format {
+        self.pair.source()
+    }
+}
+
+/// One imported linear plane: image plus imported memory.
+#[cfg(unix)]
+struct ImportPlane {
+    /// Device that destroys the image.
+    device: ash::Device,
+    /// Image handle.
+    image: vk::Image,
+    /// Imported backing memory, freed after the image in `Drop`.
+    memory: Option<GpuMemory>,
+}
+
+#[cfg(unix)]
+impl ImportPlane {
+    /// Linear `format` plane at `extent` importing `fd` as DMA-BUF.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when creation, type picking, or binding fails.
+    fn import(
+        device: &ash::Device,
+        ext: &khr::external_memory_fd::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        fd: OwnedFd,
+    ) -> Result<Self, VulkanError> {
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        // SAFETY: plain descriptor; the image is owned on success.
+        let image = unsafe { device.create_image(&info, None) }?;
+        // SAFETY: the image is live and owned.
+        let mut requirements = unsafe { device.get_image_memory_requirements(image) };
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        // SAFETY: the fd is live and owned.
+        let queried = unsafe {
+            ext.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            )
+        };
+        if let Err(error) = queried {
+            // SAFETY: the image is live and owned.
+            unsafe { device.destroy_image(image, None) };
+            return Err(VulkanError::Vulkan(error));
+        }
+        requirements.memory_type_bits &= fd_props.memory_type_bits;
+        let picked = pick_memory_type_preferred(
+            requirements,
+            properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let Some(type_index) = picked else {
+            // SAFETY: the image is live and owned.
+            unsafe { device.destroy_image(image, None) };
+            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+        };
+        let memory = GpuMemory::allocate_imported(device, requirements.size, type_index, fd)
+            .inspect_err(|_| {
+                // SAFETY: the image is live and owned.
+                unsafe { device.destroy_image(image, None) };
+            })?;
+        // SAFETY: the memory covers the requirements at offset zero.
+        unsafe { device.bind_image_memory(image, memory.memory(), 0) }?;
+        Ok(Self {
+            device: device.clone(),
+            image,
+            memory: Some(memory),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ImportPlane {
+    fn drop(&mut self) {
+        // SAFETY: the image is live and owned by this device.
+        unsafe { self.device.destroy_image(self.image, None) };
+        // Bound memory frees after the image regardless of field order.
+        let _memory = self.memory.take();
+    }
+}
+
+/// NV12 frame imported from a decode-side export.
+pub(crate) struct ImportPair {
+    /// Luma plane.
+    #[cfg(unix)]
+    y: ImportPlane,
+    /// Chroma plane.
+    #[cfg(unix)]
+    uv: ImportPlane,
+}
+
+impl ImportPair {
+    /// Pair importing `export` as DMA-BUF planes on `device`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a descriptor fails to export or import.
+    pub fn import(
+        device: &ash::Device,
+        ext: &khr::external_memory_fd::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        export: &DeviceExport,
+    ) -> Result<Self, VulkanError> {
+        #[cfg(unix)]
+        {
+            let (width, height) = export.extent();
+            let luma = vk::Extent2D { width, height };
+            let chroma = vk::Extent2D {
+                width: width / 2,
+                height: height / 2,
+            };
+            let Some([y_fd, uv_fd]) = export.pair.fresh_fds() else {
+                return Err(VulkanError::Unsupported {
+                    what: "dma-buf export".to_owned(),
+                });
+            };
+            let y = ImportPlane::import(device, ext, properties, vk::Format::R8_UNORM, luma, y_fd)?;
+            let uv = ImportPlane::import(
+                device,
+                ext,
+                properties,
+                vk::Format::R8G8_UNORM,
+                chroma,
+                uv_fd,
+            )?;
+            Ok(Self { y, uv })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, ext, properties, export);
+            Err(VulkanError::Unsupported {
+                what: "dma-buf import".to_owned(),
+            })
+        }
+    }
+
+    /// Luma image handle.
+    #[must_use]
+    pub fn y_image(&self) -> vk::Image {
+        #[cfg(unix)]
+        {
+            self.y.image
+        }
+        #[cfg(not(unix))]
+        {
+            vk::Image::null()
+        }
+    }
+
+    /// Chroma image handle.
+    #[must_use]
+    pub fn uv_image(&self) -> vk::Image {
+        #[cfg(unix)]
+        {
+            self.uv.image
+        }
+        #[cfg(not(unix))]
+        {
+            vk::Image::null()
+        }
+    }
+}
+
+/// True when `owned` exports linear planes as DMA-BUF descriptors.
+#[must_use]
+pub(crate) fn probe_export(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice) -> bool {
+    #[cfg(unix)]
+    {
+        let instance = owned.backend().instance();
+        let device = owned.device().device();
+        // SAFETY: query writes into ash-owned storage.
+        let properties = unsafe { instance.get_physical_device_memory_properties(adapter) };
+        let ext = khr::external_memory_fd::Device::new(instance, device);
+        let pair = ExportPair::create(
+            device,
+            &ext,
+            &properties,
+            (64, 64),
+            two_plane_format(),
+            owned.clone(),
+        );
+        match pair {
+            Ok(pair) => matches!(pair.export(), GpuExport::DmaBuf { .. }),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (owned, adapter);
+        false
+    }
+}
+
+/// True when `owned` imports DMA-BUF planes it just exported.
+#[must_use]
+pub(crate) fn probe_import(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice) -> bool {
+    #[cfg(unix)]
+    {
+        let instance = owned.backend().instance();
+        let device = owned.device().device();
+        // SAFETY: query writes into ash-owned storage.
+        let properties = unsafe { instance.get_physical_device_memory_properties(adapter) };
+        let ext = khr::external_memory_fd::Device::new(instance, device);
+        let pair = ExportPair::create(
+            device,
+            &ext,
+            &properties,
+            (64, 64),
+            two_plane_format(),
+            owned.clone(),
+        );
+        let Ok(pair) = pair else {
+            return false;
+        };
+        let export = DeviceExport::new(std::sync::Arc::new(pair));
+        ImportPair::import(device, &ext, &properties, &export).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (owned, adapter);
+        false
+    }
+}
+
+/// Two-plane NV12 picture format behind export probes.
+#[cfg(unix)]
+fn two_plane_format() -> vk::Format {
+    vk::Format::G8_B8R8_2PLANE_420_UNORM
 }
 
 /// Session description for [`VideoSession::create`].
@@ -986,6 +1885,147 @@ impl DecodeQueue {
             (self.decode.fp().cmd_decode_video_khr)(cmd, &raw const *info);
         }
     }
+}
+
+/// Encoded parameter-set staging in bytes; sets are tens of bytes.
+const ENCODED_SETS_BYTES: usize = 4096;
+
+/// Encode-queue video commands.
+pub(crate) struct EncodeQueue {
+    /// Encode functions.
+    encode: khr::video_encode_queue::Device,
+}
+
+impl EncodeQueue {
+    /// Encode functions over `device`.
+    pub fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
+        Self {
+            encode: khr::video_encode_queue::Device::new(instance, device),
+        }
+    }
+
+    /// Record an encode command.
+    pub fn encode_video(&self, cmd: vk::CommandBuffer, info: &vk::VideoEncodeInfoKHR<'_>) {
+        // SAFETY: inside video coding; resources are live and laid out.
+        unsafe {
+            (self.encode.fp().cmd_encode_video_khr)(cmd, &raw const *info);
+        }
+    }
+
+    /// Driver-encoded H.264 parameter sets behind `params`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the query fails.
+    pub fn encoded_parameters_h264(
+        &self,
+        params: vk::VideoSessionParametersKHR,
+    ) -> Result<Vec<u8>, VulkanError> {
+        let mut codec = vk::VideoEncodeH264SessionParametersGetInfoKHR {
+            write_std_sps: vk::TRUE,
+            write_std_pps: vk::TRUE,
+            std_sps_id: 0,
+            std_pps_id: 0,
+            ..Default::default()
+        };
+        let get = vk::VideoEncodeSessionParametersGetInfoKHR {
+            video_session_parameters: params,
+            ..Default::default()
+        };
+        let get = get.push_next(&mut codec);
+        self.encoded_parameters(&get)
+    }
+
+    /// Driver-encoded H.265 parameter sets behind `params`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the query fails.
+    pub fn encoded_parameters_h265(
+        &self,
+        params: vk::VideoSessionParametersKHR,
+    ) -> Result<Vec<u8>, VulkanError> {
+        let mut codec = vk::VideoEncodeH265SessionParametersGetInfoKHR {
+            write_std_vps: vk::TRUE,
+            write_std_sps: vk::TRUE,
+            write_std_pps: vk::TRUE,
+            std_vps_id: 0,
+            std_sps_id: 0,
+            std_pps_id: 0,
+            ..Default::default()
+        };
+        let get = vk::VideoEncodeSessionParametersGetInfoKHR {
+            video_session_parameters: params,
+            ..Default::default()
+        };
+        let get = get.push_next(&mut codec);
+        self.encoded_parameters(&get)
+    }
+
+    /// Driver-encoded parameter sets behind `get`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the query fails.
+    fn encoded_parameters(
+        &self,
+        get: &vk::VideoEncodeSessionParametersGetInfoKHR<'_>,
+    ) -> Result<Vec<u8>, VulkanError> {
+        let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR::default();
+        let mut data = vec![0_u8; ENCODED_SETS_BYTES];
+        let mut size = data.len();
+        // SAFETY: descriptors outlive the call; the buffer holds `size` bytes.
+        let status = unsafe {
+            (self.encode.fp().get_encoded_video_session_parameters_khr)(
+                self.encode.device(),
+                &raw const *get,
+                &raw mut feedback,
+                &raw mut size,
+                data.as_mut_ptr().cast(),
+            )
+        };
+        if status == vk::Result::INCOMPLETE {
+            return Err(VulkanError::OverCaps {
+                what: "encoded sets",
+            });
+        }
+        if status != vk::Result::SUCCESS {
+            return Err(VulkanError::Vulkan(status));
+        }
+        data.truncate(size);
+        Ok(data)
+    }
+}
+
+/// Fence wait per submission in nanoseconds.
+pub(crate) const SUBMIT_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// Submit `cmd` on `queue`, wait `timeout_ns` for `fence`, then reset it.
+///
+/// The queue `lock` stays held through the wait.
+///
+/// # Errors
+///
+/// Returns `Err` when the lock poisons, submission fails, the wait
+/// fails or times out, or the reset fails.
+pub(crate) fn submit_and_wait(
+    device: &ash::Device,
+    lock: &std::sync::Mutex<()>,
+    queue: vk::Queue,
+    cmd: vk::CommandBuffer,
+    fence: &VkFence,
+    timeout_ns: u64,
+) -> Result<(), VulkanError> {
+    let buffers = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+    let held = lock.lock().map_err(|_| VulkanError::QueuePoisoned)?;
+    submit_to_queue(device, queue, &[submit], fence.fence())?;
+    if !fence.wait(timeout_ns)? {
+        return Err(VulkanError::Timeout);
+    }
+    fence.reset()?;
+    drop(held);
+    Ok(())
 }
 
 /// Queue submission on a raw device.
@@ -1091,7 +2131,7 @@ impl VideoSession {
         }
         let mut binds = Vec::with_capacity(requirements.len());
         let mut memories = Vec::with_capacity(requirements.len());
-        for (index, requirement) in requirements.iter().enumerate() {
+        for requirement in &requirements {
             let memory_requirements = requirement.memory_requirements;
             let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
             let Some(type_index) =
@@ -1100,11 +2140,9 @@ impl VideoSession {
                 return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
             };
             let memory = GpuMemory::allocate(device, memory_requirements.size, type_index)?;
-            let bind_index = u32::try_from(index)
-                .map_err(|_| VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))?;
             binds.push(
                 vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(bind_index)
+                    .memory_bind_index(requirement.memory_bind_index)
                     .memory(memory.memory())
                     .memory_offset(0)
                     .memory_size(memory_requirements.size),
@@ -1316,10 +2354,18 @@ impl CommandPool {
         Ok(buffers[0])
     }
 
-    /// Return `buffer` to the pool.
-    pub fn free(&self, buffer: vk::CommandBuffer) {
+    /// Reset `buffer` for reuse without freeing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the reset fails.
+    pub fn reset_buffer(&self, buffer: vk::CommandBuffer) -> Result<(), VulkanError> {
         // SAFETY: the buffer came from this pool and finished its submit.
-        unsafe { self.device.free_command_buffers(self.pool, &[buffer]) };
+        unsafe {
+            self.device
+                .reset_command_buffer(buffer, vk::CommandBufferResetFlags::empty())
+        }?;
+        Ok(())
     }
 
     /// Begin a one-time recording on `buffer`.
@@ -1383,6 +2429,132 @@ impl Recorder<'_> {
             self.device
                 .cmd_copy_image_to_buffer(self.buffer, image, layout, buffer, regions);
         }
+    }
+
+    /// Record a tightly packed buffer-to-image copy.
+    pub fn copy_buffer_to_image(
+        &self,
+        buffer: vk::Buffer,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        regions: &[vk::BufferImageCopy],
+    ) {
+        // SAFETY: regions unpack the owned source buffer exactly.
+        unsafe {
+            self.device
+                .cmd_copy_buffer_to_image(self.buffer, buffer, image, layout, regions);
+        }
+    }
+
+    /// Record a plane-to-plane image copy.
+    pub fn copy_image(
+        &self,
+        src: vk::Image,
+        src_layout: vk::ImageLayout,
+        dst: vk::Image,
+        dst_layout: vk::ImageLayout,
+        regions: &[vk::ImageCopy],
+    ) {
+        // SAFETY: regions name live owned images in the named layouts.
+        unsafe {
+            self.device
+                .cmd_copy_image(self.buffer, src, src_layout, dst, dst_layout, regions);
+        }
+    }
+
+    /// Reset `count` queries of `pool` from `first`.
+    pub fn reset_queries(&self, pool: vk::QueryPool, first: u32, count: u32) {
+        // SAFETY: the pool is live and owned; the range is in bounds.
+        unsafe {
+            self.device
+                .cmd_reset_query_pool(self.buffer, pool, first, count);
+        }
+    }
+
+    /// Begin query `index` of `pool`.
+    pub fn begin_query(&self, pool: vk::QueryPool, index: u32) {
+        // SAFETY: the pool is live and owned; the index is in bounds.
+        unsafe {
+            self.device
+                .cmd_begin_query(self.buffer, pool, index, vk::QueryControlFlags::empty());
+        }
+    }
+
+    /// End query `index` of `pool`.
+    pub fn end_query(&self, pool: vk::QueryPool, index: u32) {
+        // SAFETY: the pool is live and owned; the index is in bounds.
+        unsafe { self.device.cmd_end_query(self.buffer, pool, index) };
+    }
+}
+
+/// Owned encode-feedback query pool, freed on drop.
+pub(crate) struct EncodeFeedback {
+    /// Device that destroys the pool.
+    device: ash::Device,
+    /// Pool handle.
+    pool: vk::QueryPool,
+}
+
+impl EncodeFeedback {
+    /// Pool of `count` encode-feedback queries reporting `flags` for `profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when creation fails.
+    pub fn create(
+        device: &ash::Device,
+        count: u32,
+        flags: vk::VideoEncodeFeedbackFlagsKHR,
+        profile: &vk::VideoProfileInfoKHR<'_>,
+    ) -> Result<Self, VulkanError> {
+        let mut feedback =
+            vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default().encode_feedback_flags(flags);
+        let mut chained = *profile;
+        // Push order is load-bearing: ash prepends, so the profile goes
+        // first and keeps its shared codec tail; the feedback node lands
+        // on top with a null tail of its own.
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+            .query_count(count)
+            .push_next(&mut chained)
+            .push_next(&mut feedback);
+        // SAFETY: plain descriptor; the pool is owned on success.
+        let pool = unsafe { device.create_query_pool(&info, None) }?;
+        Ok(Self {
+            device: device.clone(),
+            pool,
+        })
+    }
+
+    /// Pool handle.
+    #[must_use]
+    pub fn pool(&self) -> vk::QueryPool {
+        self.pool
+    }
+
+    /// 64-bit results from `first` into `out`, waiting for each.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the query read fails.
+    pub fn results(&self, first: u32, out: &mut [u64]) -> Result<(), VulkanError> {
+        // SAFETY: the pool is live and owned; the range is in bounds.
+        unsafe {
+            self.device.get_query_pool_results(
+                self.pool,
+                first,
+                out,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+        }?;
+        Ok(())
+    }
+}
+
+impl Drop for EncodeFeedback {
+    fn drop(&mut self) {
+        // SAFETY: the pool is live and owned by this device.
+        unsafe { self.device.destroy_query_pool(self.pool, None) };
     }
 }
 

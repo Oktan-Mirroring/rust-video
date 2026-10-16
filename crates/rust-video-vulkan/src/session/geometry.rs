@@ -181,6 +181,8 @@ pub(crate) struct SessionGeometry {
     format: vk::Format,
     /// Video Std header spec version the session pins.
     std_version: u32,
+    /// Bitstream range granularity in bytes.
+    bitstream_align: u64,
 }
 
 impl std::fmt::Debug for SessionGeometry {
@@ -194,6 +196,7 @@ impl std::fmt::Debug for SessionGeometry {
             .field("active_refs", &self.active_refs)
             .field("format", &self.format.as_raw())
             .field("std_version", &self.std_version)
+            .field("bitstream_align", &self.bitstream_align)
             .finish()
     }
 }
@@ -227,6 +230,12 @@ impl SessionGeometry {
     #[must_use]
     pub fn format(&self) -> vk::Format {
         self.format
+    }
+
+    /// Bitstream range granularity in bytes.
+    #[must_use]
+    pub fn bitstream_align(&self) -> u64 {
+        self.bitstream_align
     }
 
     /// Geometry from an H.264 sequence set.
@@ -357,6 +366,7 @@ impl SessionGeometry {
             active_refs: caps.active_refs.min(dpb_slots),
             format,
             std_version: caps.std_version,
+            bitstream_align: caps.min_bitstream_align.max(1),
         })
     }
 }
@@ -378,6 +388,7 @@ mod tests {
             active_refs: 8,
             max_level: 52,
             std_version: 1,
+            min_bitstream_align: 256,
         }
     }
 

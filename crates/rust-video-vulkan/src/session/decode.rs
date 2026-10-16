@@ -5,23 +5,19 @@
 //! Per-frame command assembly is pure data over these resources; only the
 //! final record-and-submit touches the device.
 
-use ash::vk;
+use ash::{khr, vk};
 
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
-use crate::inflight::Fence;
 use crate::parse::refs::SlotBook;
 use crate::raw::{
-    CommandPool, DecodeQueue, GpuBuffer, GpuImage, GpuView, SessionParameters, VideoSession,
-    VkFence,
+    CommandPool, DecodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView, SessionParameters,
+    VideoSession, VkFence,
 };
 use crate::session::geometry::SessionGeometry;
 
 /// Bitstream staging size in bytes: the largest access unit the session takes.
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
-
-/// Fence wait per submission in nanoseconds.
-const SUBMIT_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// Decoded-picture metadata of one DPB slot.
 #[derive(Clone, Copy)]
@@ -32,38 +28,67 @@ pub(crate) enum DpbMeta {
     H265(vk::native::StdVideoDecodeH265ReferenceInfo),
 }
 
+/// Exportable planes behind one GPU submit.
+pub(crate) struct ExportTarget<'a> {
+    /// Planes receiving the decoded picture.
+    pair: &'a ExportPair,
+    /// First submit into the planes since creation.
+    first: bool,
+}
+
+impl<'a> ExportTarget<'a> {
+    /// Target over `pair`, `first` on its first submit.
+    #[must_use]
+    pub fn new(pair: &'a ExportPair, first: bool) -> Self {
+        Self { pair, first }
+    }
+}
+
 /// Owned decode session over a negotiated device.
+///
+/// Field order is the drop order: parameters free before the session they
+/// belong to, and GPU objects free before the pool and device clones.
 pub(crate) struct Session {
     /// Logical device.
     device: ash::Device,
     /// Video queue.
     queue: vk::Queue,
+    /// Queue submission mutex, shared with the device.
+    queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// Decode queue functions.
     decode: DecodeQueue,
+    /// Session parameters; drops before `video` below.
+    params: SessionParameters,
     /// Video session.
     video: VideoSession,
-    /// Session parameters.
-    params: SessionParameters,
     /// Validated session sizing.
     geometry: SessionGeometry,
+    /// One view per DPB layer; drops before `dpb` below.
+    dpb_views: Vec<GpuView>,
     /// DPB array image, one layer per slot.
     dpb: GpuImage,
-    /// One view per DPB layer.
-    dpb_views: Vec<GpuView>,
     /// Tracked layout per DPB layer.
     dpb_layouts: Vec<vk::ImageLayout>,
     /// Bitstream staging buffer.
     bitstream: GpuBuffer,
     /// Tight-NV12 readback buffer.
     readback: GpuBuffer,
-    /// One-shot command pool.
+    /// Command pool behind the submit slot.
     pool: CommandPool,
-    /// Submission fence, reset per frame.
+    /// Command buffer, allocated once and reset per submit.
+    cmd: vk::CommandBuffer,
+    /// Submission fence, reset per submit.
     fence: VkFence,
+    /// True after a submit failure; the fence state is unknown.
+    wedged: bool,
     /// Reference-id to slot map.
     slots: SlotBook,
     /// Decode metadata per slot.
     meta: Vec<Option<DpbMeta>>,
+    /// Memory properties behind exportable-plane allocation.
+    props: vk::PhysicalDeviceMemoryProperties,
+    /// DMA-BUF export functions, absent without the extensions.
+    ext: Option<khr::external_memory_fd::Device>,
 }
 
 impl Session {
@@ -104,6 +129,10 @@ impl Session {
             crate::session::params::ParamsTemplate::H265(codec) => {
                 SessionParameters::create(&session, &create.push_next(codec))?
             }
+            crate::session::params::ParamsTemplate::H264Encode(_)
+            | crate::session::params::ParamsTemplate::H265Encode(_) => {
+                return Err(VulkanError::OverCaps { what: "codec op" });
+            }
         };
         let image = crate::raw::GpuImageDesc {
             format: geometry.format(),
@@ -115,7 +144,8 @@ impl Session {
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
         };
-        let dpb = GpuImage::create(raw, &properties, &image)?;
+        let profiles = std::slice::from_ref(profile);
+        let dpb = GpuImage::create(raw, &properties, &image, profiles)?;
         let mut dpb_views = Vec::with_capacity(slots);
         for layer in 0..geometry.dpb_slots() {
             dpb_views.push(dpb.layer_view(layer)?);
@@ -127,6 +157,7 @@ impl Session {
             BITSTREAM_BYTES,
             vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
             host,
+            profiles,
         )?;
         let readback = GpuBuffer::create(
             raw,
@@ -134,26 +165,34 @@ impl Session {
             nv12_bytes(coded_extent(geometry.coded())),
             vk::BufferUsageFlags::TRANSFER_DST,
             host,
+            &[],
         )?;
         let pool = CommandPool::create(raw, device.queue_family())?;
-        let fence = VkFence::new(raw, false)?;
         let decode = DecodeQueue::new(device.backend().instance(), raw);
+        let cmd = pool.allocate()?;
+        let fence = VkFence::new(raw, false)?;
+        let ext = device.external_fd();
         Ok(Self {
             device: raw.clone(),
             queue: device.queue(),
+            queue_lock: device.queue_lock().clone(),
             decode,
-            video: session,
             params,
+            video: session,
             geometry: *geometry,
-            dpb,
             dpb_views,
+            dpb,
             dpb_layouts: vec![vk::ImageLayout::UNDEFINED; slots],
             bitstream,
             readback,
             pool,
+            cmd,
             fence,
+            wedged: false,
             slots: SlotBook::with_slots(slots),
             meta: vec![None; slots],
+            props: properties,
+            ext,
         })
     }
 
@@ -199,36 +238,70 @@ impl Session {
         self.dpb_views.get(slot).map(GpuView::view)
     }
 
+    /// Handles behind exportable-plane allocation, absent without fd export.
+    pub(crate) fn export_alloc(
+        &self,
+    ) -> Option<(
+        &ash::Device,
+        &khr::external_memory_fd::Device,
+        &vk::PhysicalDeviceMemoryProperties,
+    )> {
+        self.ext
+            .as_ref()
+            .map(|ext| (&self.device, ext, &self.props))
+    }
+
     /// Upload `bytes` to the bitstream staging buffer.
+    ///
+    /// Zero-pads through the aligned range the decode consumes.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `bytes` exceeds the staging buffer.
-    pub(crate) fn upload(&self, bytes: &[u8]) -> Result<(), VulkanError> {
+    /// Returns `Err` when the aligned range exceeds the staging buffer.
+    pub(crate) fn upload(&self, bytes: &[u8]) -> Result<u64, VulkanError> {
         let len = u64::try_from(bytes.len()).map_err(|_| VulkanError::OverCaps {
             what: "access unit",
         })?;
-        if len > BITSTREAM_BYTES {
+        let total = len.next_multiple_of(self.geometry.bitstream_align());
+        if total > BITSTREAM_BYTES {
             return Err(VulkanError::OverCaps {
                 what: "access unit",
             });
         }
-        self.bitstream.memory().fill(bytes)?;
-        Ok(())
+        self.bitstream.memory().fill_padded(bytes, total)?;
+        Ok(total)
     }
 
-    /// Decode one submission, returning tight coded-extent NV12 bytes.
+    /// Decode one submission into `out`, reusing its allocation.
     ///
     /// # Errors
     ///
     /// Returns `Err` when recording, submission, or the fence wait fails.
-    pub(crate) fn submit(&mut self, sub: &Submission<'_>) -> Result<Vec<u8>, VulkanError> {
-        self.upload(sub.bytes)?;
-        let cmd = self.pool.allocate()?;
-        let recorded = self.record(cmd, sub);
-        let result = recorded.and_then(|planned| self.dispatch(cmd, planned));
-        self.pool.free(cmd);
-        result
+    pub(crate) fn submit_into(
+        &mut self,
+        sub: &Submission<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VulkanError> {
+        let range = self.upload(sub.bytes)?;
+        self.pool.reset_buffer(self.cmd)?;
+        let planned = self.record(self.cmd, sub, range, None)?;
+        self.dispatch(self.cmd, planned, out)
+    }
+
+    /// Decode one submission into `target`, leaving pixels on the GPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when recording, submission, or the fence wait fails.
+    pub(crate) fn submit_gpu(
+        &mut self,
+        sub: &Submission<'_>,
+        target: &ExportTarget<'_>,
+    ) -> Result<(), VulkanError> {
+        let range = self.upload(sub.bytes)?;
+        self.pool.reset_buffer(self.cmd)?;
+        let planned = self.record(self.cmd, sub, range, Some(target))?;
+        self.dispatch_gpu(self.cmd, planned)
     }
 
     /// Record decode commands, returning the planned layout commits.
@@ -236,19 +309,18 @@ impl Session {
         &self,
         cmd: vk::CommandBuffer,
         sub: &Submission<'_>,
+        range: u64,
+        export: Option<&ExportTarget<'_>>,
     ) -> Result<Vec<(usize, vk::ImageLayout)>, VulkanError> {
         self.pool.begin_buffer(cmd)?;
         let recorder = self.pool.recorder(cmd);
         let mut planned = Vec::new();
         let mut barriers = Vec::new();
         for (slot, layout) in self.dpb_layouts.iter().enumerate() {
-            let target = if slot == sub.setup_slot {
-                vk::ImageLayout::VIDEO_DECODE_DST_KHR
-            } else if self.meta[slot].is_some() {
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR
-            } else {
+            if slot != sub.setup_slot && self.meta[slot].is_none() {
                 continue;
-            };
+            }
+            let target = vk::ImageLayout::VIDEO_DECODE_DPB_KHR;
             if *layout != target {
                 barriers.push(layout_barrier(
                     self.dpb.image(),
@@ -280,11 +352,7 @@ impl Session {
         let decode = vk::VideoDecodeInfoKHR {
             src_buffer: self.bitstream.buffer(),
             src_buffer_offset: 0,
-            src_buffer_range: u64::try_from(sub.bytes.len()).map_err(|_| {
-                crate::error::ParseError::OutOfRange {
-                    syntax: "bitstream range",
-                }
-            })?,
+            src_buffer_range: range,
             dst_picture_resource: sub.dst,
             p_setup_reference_slot: std::ptr::from_ref(sub.setup),
             reference_slot_count: narrow_u32(sub.refs.len(), "decode refs")?,
@@ -296,38 +364,124 @@ impl Session {
         self.video
             .end_coding(cmd, &vk::VideoEndCodingInfoKHR::default());
         let layer = narrow_u32(sub.setup_slot, "setup slot")?;
-        for (old, new) in [
-            (
-                vk::ImageLayout::VIDEO_DECODE_DST_KHR,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            ),
-            (
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
-            ),
-        ] {
-            let barrier = layout_barrier(
+        let to_src = layout_barrier(
+            self.dpb.image(),
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageAspectFlags::COLOR,
+            layer,
+            1,
+        );
+        recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[to_src]));
+        if let Some(target) = export {
+            self.record_export(&recorder, layer, target);
+        } else {
+            let regions = nv12_copy_regions(coded_extent(self.geometry.coded()), layer);
+            recorder.copy_image_to_buffer(
                 self.dpb.image(),
-                old,
-                new,
-                vk::ImageAspectFlags::COLOR,
-                layer,
-                1,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.readback.buffer(),
+                &regions,
             );
-            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[barrier]));
-            if new == vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                let regions = nv12_copy_regions(coded_extent(self.geometry.coded()), layer);
-                recorder.copy_image_to_buffer(
-                    self.dpb.image(),
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    self.readback.buffer(),
-                    &regions,
-                );
-            }
         }
+        let to_dpb = layout_barrier(
+            self.dpb.image(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::VIDEO_DECODE_DPB_KHR,
+            vk::ImageAspectFlags::COLOR,
+            layer,
+            1,
+        );
+        recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[to_dpb]));
         planned.push((sub.setup_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR));
         self.pool.end_buffer(cmd)?;
         Ok(planned)
+    }
+
+    /// Record the decoded `layer` into `target`, cropping to display extent.
+    fn record_export(
+        &self,
+        recorder: &crate::raw::Recorder<'_>,
+        layer: u32,
+        target: &ExportTarget<'_>,
+    ) {
+        let old = if target.first {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL
+        };
+        for image in [target.pair.y_image(), target.pair.uv_image()] {
+            let barrier = layout_barrier(
+                image,
+                old,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+                0,
+                1,
+            );
+            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[barrier]));
+        }
+        let (width, height) = self.geometry.display();
+        let luma = vk::Extent2D { width, height };
+        let chroma = vk::Extent2D {
+            width: width / 2,
+            height: height / 2,
+        };
+        let y_copy = plane_copy(
+            vk::ImageAspectFlags::PLANE_0,
+            layer,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            luma,
+        );
+        recorder.copy_image(
+            self.dpb.image(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            target.pair.y_image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[y_copy],
+        );
+        let uv_copy = plane_copy(
+            vk::ImageAspectFlags::PLANE_1,
+            layer,
+            vk::ImageAspectFlags::COLOR,
+            0,
+            chroma,
+        );
+        recorder.copy_image(
+            self.dpb.image(),
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            target.pair.uv_image(),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[uv_copy],
+        );
+    }
+
+    /// Submit recorded commands and wait for the fence.
+    ///
+    /// A failure wedges the session: the fence may still be submitted,
+    /// so later submits fail without touching the queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when submission or the fence wait fails, or when a
+    /// past submit wedged the session.
+    fn submit_wait(&mut self, cmd: vk::CommandBuffer) -> Result<(), VulkanError> {
+        if self.wedged {
+            return Err(VulkanError::Timeout);
+        }
+        if let Err(error) = crate::raw::submit_and_wait(
+            &self.device,
+            &self.queue_lock,
+            self.queue,
+            cmd,
+            &self.fence,
+            crate::raw::SUBMIT_TIMEOUT_NS,
+        ) {
+            self.wedged = true;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Submit recorded commands, wait, and map the readback buffer.
@@ -335,14 +489,9 @@ impl Session {
         &mut self,
         cmd: vk::CommandBuffer,
         planned: Vec<(usize, vk::ImageLayout)>,
-    ) -> Result<Vec<u8>, VulkanError> {
-        let buffers = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&buffers);
-        crate::raw::submit_to_queue(&self.device, self.queue, &[submit], self.fence.fence())?;
-        if !self.fence.wait(SUBMIT_TIMEOUT_NS)? {
-            return Err(VulkanError::Timeout);
-        }
-        self.fence.reset()?;
+        out: &mut Vec<u8>,
+    ) -> Result<(), VulkanError> {
+        self.submit_wait(cmd)?;
         for (slot, layout) in planned {
             self.dpb_layouts[slot] = layout;
         }
@@ -352,9 +501,21 @@ impl Session {
                     syntax: "readback size",
                 }
             })?;
-        let mut bytes = vec![0_u8; len];
-        self.readback.memory().read_into(&mut bytes)?;
-        Ok(bytes)
+        self.readback.memory().read_to_vec(out, len)?;
+        Ok(())
+    }
+
+    /// Submit recorded commands and wait, leaving pixels on the GPU.
+    fn dispatch_gpu(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        planned: Vec<(usize, vk::ImageLayout)>,
+    ) -> Result<(), VulkanError> {
+        self.submit_wait(cmd)?;
+        for (slot, layout) in planned {
+            self.dpb_layouts[slot] = layout;
+        }
+        Ok(())
     }
 }
 
@@ -392,6 +553,8 @@ pub(crate) fn picture_resource(
 }
 
 /// Reference slot `index` over `resource`, without codec metadata.
+///
+/// A negative `index` binds the resource without claiming slot state.
 pub(crate) fn reference_slot<'a>(
     index: i32,
     resource: &'a vk::VideoPictureResourceInfoKHR<'a>,
@@ -437,7 +600,12 @@ fn stage_for(layout: vk::ImageLayout) -> vk::PipelineStageFlags2 {
         vk::ImageLayout::VIDEO_DECODE_DST_KHR | vk::ImageLayout::VIDEO_DECODE_DPB_KHR => {
             vk::PipelineStageFlags2::VIDEO_DECODE_KHR
         }
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => vk::PipelineStageFlags2::TRANSFER,
+        vk::ImageLayout::VIDEO_ENCODE_SRC_KHR | vk::ImageLayout::VIDEO_ENCODE_DPB_KHR => {
+            vk::PipelineStageFlags2::VIDEO_ENCODE_KHR
+        }
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL | vk::ImageLayout::TRANSFER_DST_OPTIMAL => {
+            vk::PipelineStageFlags2::TRANSFER
+        }
         _ => vk::PipelineStageFlags2::TOP_OF_PIPE,
     }
 }
@@ -449,8 +617,44 @@ fn access_for(layout: vk::ImageLayout) -> vk::AccessFlags2 {
         vk::ImageLayout::VIDEO_DECODE_DPB_KHR => {
             vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR | vk::AccessFlags2::VIDEO_DECODE_READ_KHR
         }
+        vk::ImageLayout::VIDEO_ENCODE_SRC_KHR => vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+        vk::ImageLayout::VIDEO_ENCODE_DPB_KHR => {
+            vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR | vk::AccessFlags2::VIDEO_ENCODE_READ_KHR
+        }
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL => vk::AccessFlags2::TRANSFER_READ,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => vk::AccessFlags2::TRANSFER_WRITE,
         _ => vk::AccessFlags2::empty(),
+    }
+}
+
+/// Image copy of one plane at `src_layer` into `dst_layer` over `extent`.
+pub(crate) fn plane_copy(
+    src_aspect: vk::ImageAspectFlags,
+    src_layer: u32,
+    dst_aspect: vk::ImageAspectFlags,
+    dst_layer: u32,
+    extent: vk::Extent2D,
+) -> vk::ImageCopy {
+    vk::ImageCopy {
+        src_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: src_aspect,
+            mip_level: 0,
+            base_array_layer: src_layer,
+            layer_count: 1,
+        },
+        src_offset: vk::Offset3D::default(),
+        dst_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: dst_aspect,
+            mip_level: 0,
+            base_array_layer: dst_layer,
+            layer_count: 1,
+        },
+        dst_offset: vk::Offset3D::default(),
+        extent: vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        },
     }
 }
 
@@ -515,45 +719,91 @@ pub(crate) struct Submission<'a> {
     pub picture_next: *const std::ffi::c_void,
 }
 
-/// Crop tight coded NV12 `bytes` down to `display`.
+/// Crop tight coded NV12 `bytes` down to `display`, appended to `out`.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when `bytes` is shorter than the coded frame.
-pub(crate) fn crop_nv12(coded: vk::Extent2D, display: vk::Extent2D, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    crop_nv12_into(coded, display, bytes, &mut out);
-    out
-}
-
-/// Crop tight coded NV12 `bytes` down to `display`, into `out`.
-///
-/// # Panics
-///
-/// Panics when `bytes` is shorter than the coded frame.
-pub(crate) fn crop_nv12_into(
+/// Returns `Err` when the display window escapes the coded extent or
+/// `bytes` is shorter than the coded frame.
+pub(crate) fn crop_nv12_extend(
     coded: vk::Extent2D,
     display: vk::Extent2D,
     bytes: &[u8],
-    out: &mut Vec<u8>,
-) {
-    out.clear();
+    out: &mut bytes::BytesMut,
+) -> Result<(), VulkanError> {
+    use bytes::BufMut;
+    let window = crop_window(coded, display, bytes)?;
     if coded == display {
-        out.extend_from_slice(bytes);
-        return;
+        out.extend_from_slice(&bytes[..window.coded_len]);
+        return Ok(());
     }
+    out.reserve(window.display_len);
+    copy_crop_rows(&window, bytes, &mut |row| out.put_slice(row));
+    Ok(())
+}
+
+/// Validated crop geometry of one frame.
+struct CropWindow {
+    /// Coded luma row width in bytes.
+    coded_w: usize,
+    /// Display width in bytes.
+    display_w: usize,
+    /// Display height in rows.
+    display_h: usize,
+    /// Coded chroma plane base in bytes.
+    chroma_base: usize,
+    /// Coded frame length in bytes.
+    coded_len: usize,
+    /// Display frame length in bytes.
+    display_len: usize,
+}
+
+/// Validated crop geometry, or the bound it breaks.
+///
+/// # Errors
+///
+/// Returns `Err` when the display window escapes the coded extent or
+/// `bytes` is shorter than the coded frame.
+fn crop_window(
+    coded: vk::Extent2D,
+    display: vk::Extent2D,
+    bytes: &[u8],
+) -> Result<CropWindow, VulkanError> {
     let coded_w = coded.width as usize;
+    let coded_h = coded.height as usize;
     let display_w = display.width as usize;
     let display_h = display.height as usize;
-    out.reserve(display_w * display_h * 3 / 2);
-    for row in 0..display_h {
-        let start = row * coded_w;
-        out.extend_from_slice(&bytes[start..start + display_w]);
+    if display_w > coded_w || display_h > coded_h {
+        return Err(VulkanError::OverCaps {
+            what: "crop window",
+        });
     }
-    let chroma_base = coded_w * coded.height as usize;
-    for row in 0..display_h / 2 {
-        let start = chroma_base + row * coded_w;
-        out.extend_from_slice(&bytes[start..start + display_w]);
+    let coded_len = coded_w * coded_h * 3 / 2;
+    if bytes.len() < coded_len {
+        return Err(VulkanError::ShortReadback {
+            expected: coded_len,
+            found: bytes.len(),
+        });
+    }
+    Ok(CropWindow {
+        coded_w,
+        display_w,
+        display_h,
+        chroma_base: coded_w * coded_h,
+        coded_len,
+        display_len: display_w * display_h * 3 / 2,
+    })
+}
+
+/// Visible luma rows then chroma rows of `bytes` into `push`.
+fn copy_crop_rows(window: &CropWindow, bytes: &[u8], push: &mut impl FnMut(&[u8])) {
+    for row in 0..window.display_h {
+        let start = row * window.coded_w;
+        push(&bytes[start..start + window.display_w]);
+    }
+    for row in 0..window.display_h / 2 {
+        let start = window.chroma_base + row * window.coded_w;
+        push(&bytes[start..start + window.display_w]);
     }
 }
 
@@ -623,6 +873,28 @@ mod tests {
     }
 
     #[test]
+    fn plane_copy_pins_aspects_layers_and_extent() {
+        let extent = ash::vk::Extent2D {
+            width: 64,
+            height: 32,
+        };
+        let copy = super::plane_copy(
+            ash::vk::ImageAspectFlags::PLANE_0,
+            2,
+            ash::vk::ImageAspectFlags::COLOR,
+            0,
+            extent,
+        );
+        assert!(copy.src_subresource.aspect_mask == ash::vk::ImageAspectFlags::PLANE_0);
+        assert_eq!(copy.src_subresource.base_array_layer, 2);
+        assert!(copy.dst_subresource.aspect_mask == ash::vk::ImageAspectFlags::COLOR);
+        assert_eq!(copy.dst_subresource.base_array_layer, 0);
+        assert_eq!(copy.extent.width, 64);
+        assert_eq!(copy.extent.height, 32);
+        assert_eq!(copy.extent.depth, 1);
+    }
+
+    #[test]
     fn copy_regions_pack_planes_tightly() {
         let extent = ash::vk::Extent2D {
             width: 64,
@@ -652,13 +924,9 @@ mod tests {
             height: 2,
         };
         let bytes: Vec<u8> = (0..24).collect();
-        let cropped = super::crop_nv12(coded, display, &bytes);
-        assert_eq!(cropped, vec![0, 1, 4, 5, 16, 17]);
-        let mut reused = Vec::with_capacity(1);
-        super::crop_nv12_into(coded, display, &bytes, &mut reused);
-        assert_eq!(reused, cropped);
-        super::crop_nv12_into(display, display, &cropped, &mut reused);
-        assert_eq!(reused, cropped);
+        let mut pooled = bytes::BytesMut::new();
+        super::crop_nv12_extend(coded, display, &bytes, &mut pooled).expect("in bounds");
+        assert_eq!(pooled.freeze().as_ref(), &[0, 1, 4, 5, 16, 17]);
     }
 
     #[test]
@@ -668,6 +936,30 @@ mod tests {
             height: 4,
         };
         let bytes: Vec<u8> = (0..24).collect();
-        assert_eq!(super::crop_nv12(extent, extent, &bytes), bytes);
+        let mut pooled = bytes::BytesMut::new();
+        super::crop_nv12_extend(extent, extent, &bytes, &mut pooled).expect("in bounds");
+        assert_eq!(pooled.freeze().as_ref(), bytes.as_slice());
+    }
+
+    #[test]
+    fn crop_rejects_window_escape_and_short_bytes() {
+        let coded = ash::vk::Extent2D {
+            width: 4,
+            height: 4,
+        };
+        let wide = ash::vk::Extent2D {
+            width: 8,
+            height: 4,
+        };
+        let bytes: Vec<u8> = (0..24).collect();
+        let mut pooled = bytes::BytesMut::new();
+        assert!(matches!(
+            super::crop_nv12_extend(coded, wide, &bytes, &mut pooled),
+            Err(super::VulkanError::OverCaps { .. })
+        ));
+        assert!(matches!(
+            super::crop_nv12_extend(coded, coded, &bytes[..23], &mut pooled),
+            Err(super::VulkanError::ShortReadback { .. })
+        ));
     }
 }

@@ -36,6 +36,9 @@ pub enum SkipReason {
     /// No H.264 profile reports encode capabilities.
     #[error("no H.264 encode capabilities")]
     NoH264EncodeCaps,
+    /// No H.265 profile reports encode capabilities.
+    #[error("no H.265 encode capabilities")]
+    NoH265EncodeCaps,
 }
 
 /// Annex-B bitstream the parser rejects.
@@ -128,6 +131,23 @@ pub enum VulkanError {
         /// Pixel layout the caller supplied.
         format: rust_video_caps::frame::PixelFormat,
     },
+    /// Readback shorter than the coded frame.
+    #[error("readback holds {found} of {expected} bytes")]
+    ShortReadback {
+        /// Coded-frame byte count.
+        expected: usize,
+        /// Bytes actually mapped.
+        found: usize,
+    },
+    /// Queue mutex poisoned by a panicking holder.
+    #[error("queue lock poisoned")]
+    QueuePoisoned,
+    /// Legal request the tier does not run.
+    #[error("unsupported {what}")]
+    Unsupported {
+        /// Construct the tier declines.
+        what: String,
+    },
 }
 
 #[cfg(test)]
@@ -160,6 +180,10 @@ mod tests {
         assert_eq!(
             SkipReason::NoH264EncodeCaps.to_string(),
             "no H.264 encode capabilities"
+        );
+        assert_eq!(
+            SkipReason::NoH265EncodeCaps.to_string(),
+            "no H.265 encode capabilities"
         );
     }
 
@@ -235,6 +259,27 @@ mod tests {
         let error = VulkanError::OverCaps { what: "dpb slots" };
         assert_eq!(error.to_string(), "stream dpb slots above adapter caps");
         assert_eq!(VulkanError::NoSession.to_string(), "picture before session");
+    }
+
+    #[test]
+    fn short_readback_names_counts() {
+        let error = VulkanError::ShortReadback {
+            expected: 24,
+            found: 11,
+        };
+        assert_eq!(error.to_string(), "readback holds 11 of 24 bytes");
+        assert_eq!(
+            VulkanError::QueuePoisoned.to_string(),
+            "queue lock poisoned"
+        );
+    }
+
+    #[test]
+    fn unsupported_names_request() {
+        let error = VulkanError::Unsupported {
+            what: "gpu scale".to_owned(),
+        };
+        assert_eq!(error.to_string(), "unsupported gpu scale");
     }
 
     #[test]

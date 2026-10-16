@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use ash::vk::native::{
-    StdVideoDecodeH265PictureInfo, StdVideoDecodeH265PictureInfoFlags,
+    __BindgenBitfieldUnit, StdVideoDecodeH265PictureInfo, StdVideoDecodeH265PictureInfoFlags,
     StdVideoDecodeH265ReferenceInfo, StdVideoDecodeH265ReferenceInfoFlags,
     StdVideoH265AspectRatioIdc_STD_VIDEO_H265_ASPECT_RATIO_IDC_INVALID,
     StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420,
@@ -20,7 +20,7 @@ use ash::vk::native::{
     StdVideoH265SequenceParameterSet, StdVideoH265SequenceParameterSetVui,
     StdVideoH265ShortTermRefPicSet, StdVideoH265ShortTermRefPicSetFlags, StdVideoH265SpsFlags,
     StdVideoH265SpsVuiFlags, StdVideoH265SubLayerHrdParameters, StdVideoH265VideoParameterSet,
-    StdVideoH265VpsFlags, __BindgenBitfieldUnit,
+    StdVideoH265VpsFlags,
 };
 
 use crate::error::ParseError;

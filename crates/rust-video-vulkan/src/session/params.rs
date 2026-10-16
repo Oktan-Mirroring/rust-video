@@ -25,6 +25,10 @@ pub(crate) const H265_MAX_PPS: u32 = 64;
 pub(crate) const H264_DECODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h264_decode";
 /// H.265 decode Std header extension name.
 pub(crate) const H265_DECODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h265_decode";
+/// H.264 encode Std header extension name.
+pub(crate) const H264_ENCODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h264_encode";
+/// H.265 encode Std header extension name.
+pub(crate) const H265_ENCODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h265_encode";
 
 /// Session-parameters template per codec.
 pub(crate) enum ParamsTemplate {
@@ -32,6 +36,10 @@ pub(crate) enum ParamsTemplate {
     H264(vk::VideoDecodeH264SessionParametersCreateInfoKHR<'static>),
     /// H.265 template.
     H265(vk::VideoDecodeH265SessionParametersCreateInfoKHR<'static>),
+    /// H.264 encode template.
+    H264Encode(vk::VideoEncodeH264SessionParametersCreateInfoKHR<'static>),
+    /// H.265 encode template.
+    H265Encode(vk::VideoEncodeH265SessionParametersCreateInfoKHR<'static>),
 }
 
 /// Owned H.264 decode profile chain.
@@ -86,6 +94,66 @@ impl H265ProfileChain {
     pub(crate) fn base(&self) -> vk::VideoProfileInfoKHR<'_> {
         vk::VideoProfileInfoKHR {
             video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+            chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            p_next: std::ptr::from_ref(self.codec.as_ref()).cast(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Owned H.264 encode profile chain.
+pub(crate) struct H264EncodeProfileChain {
+    /// Codec tail, box-stable; every `base` borrows it.
+    codec: Box<vk::VideoEncodeH264ProfileInfoKHR<'static>>,
+}
+
+impl H264EncodeProfileChain {
+    /// 8-bit 4:2:0 H.264 encode profile for `std_profile_idc`.
+    pub(crate) fn new(std_profile_idc: u32) -> Self {
+        Self {
+            codec: Box::new(vk::VideoEncodeH264ProfileInfoKHR {
+                std_profile_idc,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Base profile for session creation and format queries.
+    pub(crate) fn base(&self) -> vk::VideoProfileInfoKHR<'_> {
+        vk::VideoProfileInfoKHR {
+            video_codec_operation: vk::VideoCodecOperationFlagsKHR::ENCODE_H264,
+            chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            p_next: std::ptr::from_ref(self.codec.as_ref()).cast(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Owned H.265 encode profile chain.
+pub(crate) struct H265EncodeProfileChain {
+    /// Codec tail, box-stable; every `base` borrows it.
+    codec: Box<vk::VideoEncodeH265ProfileInfoKHR<'static>>,
+}
+
+impl H265EncodeProfileChain {
+    /// 8-bit 4:2:0 H.265 encode profile for `std_profile_idc`.
+    pub(crate) fn new(std_profile_idc: u32) -> Self {
+        Self {
+            codec: Box::new(vk::VideoEncodeH265ProfileInfoKHR {
+                std_profile_idc,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Base profile for session creation and format queries.
+    pub(crate) fn base(&self) -> vk::VideoProfileInfoKHR<'_> {
+        vk::VideoProfileInfoKHR {
+            video_codec_operation: vk::VideoCodecOperationFlagsKHR::ENCODE_H265,
             chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
             luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
             chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
@@ -153,6 +221,66 @@ pub(crate) fn h265_params_add<'a>(
     })
 }
 
+/// H.264 encode template over one sequence and one picture set.
+pub(crate) fn h264_encode_params_create(
+) -> vk::VideoEncodeH264SessionParametersCreateInfoKHR<'static> {
+    vk::VideoEncodeH264SessionParametersCreateInfoKHR {
+        max_std_sps_count: 1,
+        max_std_pps_count: 1,
+        ..Default::default()
+    }
+}
+
+/// H.264 encode addition over `sps` and `pps`.
+///
+/// # Errors
+///
+/// Returns `Err` when a set count exceeds its field width.
+pub(crate) fn h264_encode_params_add<'a>(
+    sps: &'a [StdVideoH264SequenceParameterSet],
+    pps: &'a [StdVideoH264PictureParameterSet],
+) -> Result<vk::VideoEncodeH264SessionParametersAddInfoKHR<'a>, crate::error::ParseError> {
+    Ok(vk::VideoEncodeH264SessionParametersAddInfoKHR {
+        std_sps_count: count_of(sps.len(), "params sps")?,
+        p_std_sp_ss: sps.as_ptr(),
+        std_pps_count: count_of(pps.len(), "params pps")?,
+        p_std_pp_ss: pps.as_ptr(),
+        ..Default::default()
+    })
+}
+
+/// H.265 encode template over one video, sequence, and picture set.
+pub(crate) fn h265_encode_params_create(
+) -> vk::VideoEncodeH265SessionParametersCreateInfoKHR<'static> {
+    vk::VideoEncodeH265SessionParametersCreateInfoKHR {
+        max_std_vps_count: 1,
+        max_std_sps_count: 1,
+        max_std_pps_count: 1,
+        ..Default::default()
+    }
+}
+
+/// H.265 encode addition over `vps`, `sps`, and `pps`.
+///
+/// # Errors
+///
+/// Returns `Err` when a set count exceeds its field width.
+pub(crate) fn h265_encode_params_add<'a>(
+    vps: &'a [StdVideoH265VideoParameterSet],
+    sps: &'a [StdVideoH265SequenceParameterSet],
+    pps: &'a [StdVideoH265PictureParameterSet],
+) -> Result<vk::VideoEncodeH265SessionParametersAddInfoKHR<'a>, crate::error::ParseError> {
+    Ok(vk::VideoEncodeH265SessionParametersAddInfoKHR {
+        std_vps_count: count_of(vps.len(), "params vps")?,
+        p_std_vp_ss: vps.as_ptr(),
+        std_sps_count: count_of(sps.len(), "params sps")?,
+        p_std_sp_ss: sps.as_ptr(),
+        std_pps_count: count_of(pps.len(), "params pps")?,
+        p_std_pp_ss: pps.as_ptr(),
+        ..Default::default()
+    })
+}
+
 /// Checked narrowing of a set count.
 fn count_of(len: usize, syntax: &'static str) -> Result<u32, crate::error::ParseError> {
     u32::try_from(len).map_err(|_| crate::error::ParseError::OutOfRange { syntax })
@@ -187,6 +315,31 @@ mod tests {
         let codec = std::ptr::from_ref(chain.codec.as_ref()).cast();
         assert_eq!(base.p_next, codec);
         assert_eq!(chain.codec.std_profile_idc, 1);
+    }
+
+    #[test]
+    fn encode_chains_carry_encode_profiles() {
+        let h264 = super::H264EncodeProfileChain::new(77);
+        let base = h264.base();
+        assert!(base.video_codec_operation == ash::vk::VideoCodecOperationFlagsKHR::ENCODE_H264);
+        assert!(!base.p_next.is_null());
+        assert_eq!(h264.codec.std_profile_idc, 77);
+        let h265 = super::H265EncodeProfileChain::new(1);
+        let base = h265.base();
+        assert!(base.video_codec_operation == ash::vk::VideoCodecOperationFlagsKHR::ENCODE_H265);
+        assert!(!base.p_next.is_null());
+        assert_eq!(h265.codec.std_profile_idc, 1);
+    }
+
+    #[test]
+    fn encode_templates_hold_one_set_each() {
+        let h264 = super::h264_encode_params_create();
+        assert_eq!(h264.max_std_sps_count, 1);
+        assert_eq!(h264.max_std_pps_count, 1);
+        let h265 = super::h265_encode_params_create();
+        assert_eq!(h265.max_std_vps_count, 1);
+        assert_eq!(h265.max_std_sps_count, 1);
+        assert_eq!(h265.max_std_pps_count, 1);
     }
 
     #[test]

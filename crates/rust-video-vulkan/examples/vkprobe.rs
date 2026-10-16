@@ -2,12 +2,18 @@ use bytes::Bytes;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_vulkan::{CodecOp, H264Decoder, VulkanDevice};
+use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice, VulkanFrame};
 
 fn main() {
+    let codec = std::env::var("VKPROBE_CODEC").unwrap_or_else(|_| "h264".to_owned());
+    let default_vector = if codec == "h265" {
+        "h265-main.h265"
+    } else {
+        "h264-high.h264"
+    };
     let vector = std::env::var("VKPROBE_VECTOR").unwrap_or_else(|_| {
         std::env::temp_dir()
-            .join("h264-high.h264")
+            .join(default_vector)
             .to_string_lossy()
             .into_owned()
     });
@@ -28,7 +34,12 @@ fn main() {
         Some(k) => truncate_nals(&bytes, k),
         None => bytes,
     };
-    let device = match VulkanDevice::open(CodecOp::H264Decode) {
+    let op = if codec == "h265" {
+        CodecOp::H265Decode
+    } else {
+        CodecOp::H264Decode
+    };
+    let device = match VulkanDevice::open(op) {
         Ok(Some(device)) => device,
         Ok(None) => {
             println!("vkprobe: no vulkan device; skipped");
@@ -39,7 +50,20 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut decoder = H264Decoder::open(&device).expect("decoder");
+    if codec == "h265" {
+        let decoder = H265Decoder::open(&device).expect("decoder");
+        run(decoder, bytes, &out_path);
+    } else {
+        let decoder = H264Decoder::open(&device).expect("decoder");
+        run(decoder, bytes, &out_path);
+    }
+}
+
+/// Decode `bytes` through `decoder`, writing planar output to `out_path`.
+fn run<D>(mut decoder: D, bytes: Vec<u8>, out_path: &str)
+where
+    D: Decoder<Frame = VulkanFrame>,
+{
     let mut out = Vec::new();
     let mut scratch = Vec::new();
     let mut count = 0;
@@ -56,7 +80,7 @@ fn main() {
         out.extend_from_slice(&scratch);
         count += 1;
     }
-    std::fs::write(&out_path, &out).expect("write");
+    std::fs::write(out_path, &out).expect("write");
     eprintln!("decoded={count} bytes={}", out.len());
 }
 

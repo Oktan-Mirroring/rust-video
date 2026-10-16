@@ -17,6 +17,8 @@ pub enum CodecOp {
     H265Decode,
     /// H.264 encode.
     H264Encode,
+    /// H.265 encode.
+    H265Encode,
 }
 
 impl CodecOp {
@@ -42,13 +44,18 @@ impl CodecOp {
                 ash::vk::KHR_VIDEO_ENCODE_QUEUE_NAME,
                 ash::vk::KHR_VIDEO_ENCODE_H264_NAME,
             ],
+            Self::H265Encode => [
+                ash::vk::KHR_VIDEO_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_ENCODE_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_ENCODE_H265_NAME,
+            ],
         }
     }
 
     /// True for encode ops, false for decode ops.
     #[must_use]
     pub fn is_encode(self) -> bool {
-        matches!(self, Self::H264Encode)
+        matches!(self, Self::H264Encode | Self::H265Encode)
     }
 }
 
@@ -88,10 +95,12 @@ pub(crate) struct DecodeFacts {
     pub max_level: u8,
     /// Video Std header spec version the session pins.
     pub std_version: u32,
+    /// Bitstream range granularity in bytes.
+    pub min_bitstream_align: u64,
 }
 
 /// Encode capabilities of one adapter for one codec.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct EncodeFacts {
     /// Largest coded picture in luma samples.
     pub coded_extent: (u32, u32),
@@ -101,6 +110,26 @@ pub(crate) struct EncodeFacts {
     pub max_bitrate: u64,
     /// Video Std header spec version the session pins.
     pub std_version: u32,
+    /// Winning std profile idc behind the session.
+    pub profile: u32,
+    /// Feedback queries the pool may request.
+    pub feedback: ash::vk::VideoEncodeFeedbackFlagsKHR,
+    /// Rate control modes the session may run.
+    pub rate_control_modes: ash::vk::VideoEncodeRateControlModeFlagsKHR,
+}
+
+impl std::fmt::Debug for EncodeFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodeFacts")
+            .field("coded_extent", &self.coded_extent)
+            .field("quality_levels", &self.quality_levels)
+            .field("max_bitrate", &self.max_bitrate)
+            .field("std_version", &self.std_version)
+            .field("profile", &self.profile)
+            .field("feedback", &self.feedback.as_raw())
+            .field("rate_control_modes", &self.rate_control_modes.as_raw())
+            .finish()
+    }
 }
 
 /// Video capabilities of one adapter for `op`.
@@ -112,11 +141,44 @@ pub(crate) enum OpCaps {
     Encode(EncodeFacts),
 }
 
+/// Adapter identity stable across instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdapterFingerprint {
+    /// PCI vendor id.
+    pub vendor: u32,
+    /// PCI device id.
+    pub device: u32,
+    /// Device LUID, zero when the driver reports none.
+    pub luid: [u8; 8],
+}
+
+impl AdapterFingerprint {
+    /// FNV-1a hash over the identity fields.
+    pub fn uid(self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0100_0000_01b3;
+        let mut hash = OFFSET;
+        for word in [self.vendor, self.device] {
+            for byte in word.to_ne_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        for byte in self.luid {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+}
+
 /// One adapter as the ladder sees it.
 #[derive(Clone, Debug)]
 pub(crate) struct AdapterFacts<A> {
     /// Backend handle for device creation.
     pub handle: A,
+    /// Identity stable across instances.
+    pub fingerprint: AdapterFingerprint,
     /// Packed device API version.
     pub api_version: u32,
     /// Device extension strings.
@@ -131,6 +193,8 @@ pub(crate) struct AdapterFacts<A> {
     pub h265: Option<DecodeFacts>,
     /// H.264 encode caps, when a profile reports them.
     pub h264_encode: Option<EncodeFacts>,
+    /// H.265 encode caps, when a profile reports them.
+    pub h265_encode: Option<EncodeFacts>,
 }
 
 impl<A> AdapterFacts<A> {
@@ -224,6 +288,10 @@ impl<A> AdapterFacts<A> {
                 .h264_encode
                 .map(OpCaps::Encode)
                 .ok_or(LadderError::Skip(SkipReason::NoH264EncodeCaps)),
+            CodecOp::H265Encode => self
+                .h265_encode
+                .map(OpCaps::Encode)
+                .ok_or(LadderError::Skip(SkipReason::NoH265EncodeCaps)),
         }
     }
 }
@@ -362,7 +430,8 @@ mod tests {
     use std::ffi::CString;
 
     use super::{
-        AdapterFacts, Backend, CodecOp, DecodeFacts, EncodeFacts, Ladder, LadderError, OpCaps,
+        AdapterFacts, AdapterFingerprint, Backend, CodecOp, DecodeFacts, EncodeFacts, Ladder,
+        LadderError, OpCaps,
     };
     use crate::error::{SkipReason, VulkanError};
 
@@ -461,6 +530,7 @@ mod tests {
             active_refs: 8,
             max_level: 52,
             std_version: 1,
+            min_bitstream_align: 256,
         }
     }
 
@@ -471,6 +541,9 @@ mod tests {
             quality_levels: 4,
             max_bitrate: 100_000_000,
             std_version: 1,
+            profile: 100,
+            feedback: ash::vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
+            rate_control_modes: ash::vk::VideoEncodeRateControlModeFlagsKHR::CBR,
         }
     }
 
@@ -482,10 +555,36 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn fingerprint_uid_stable_and_distinct() {
+        let left = AdapterFingerprint {
+            vendor: 0x10de,
+            device: 0x2b85,
+            luid: [9; 8],
+        };
+        let same = AdapterFingerprint {
+            vendor: 0x10de,
+            device: 0x2b85,
+            luid: [9; 8],
+        };
+        let other = AdapterFingerprint {
+            vendor: 0x1002,
+            device: 0x15bf,
+            luid: [0; 8],
+        };
+        assert_eq!(left.uid(), same.uid());
+        assert_ne!(left.uid(), other.uid());
+    }
+
     /// Adapter passing every rung for `op`.
     fn green_for(op: CodecOp) -> AdapterFacts<usize> {
         AdapterFacts {
             handle: 0,
+            fingerprint: AdapterFingerprint {
+                vendor: 0,
+                device: 0,
+                luid: [0; 8],
+            },
             api_version: ash::vk::make_api_version(0, 1, 3, 0),
             extensions: extensions_for(op),
             decode_queue_families: vec![2],
@@ -493,6 +592,7 @@ mod tests {
             h264: Some(caps()),
             h265: Some(caps()),
             h264_encode: Some(encode_caps()),
+            h265_encode: Some(encode_caps()),
         }
     }
 
@@ -618,6 +718,7 @@ mod tests {
         assert!(!CodecOp::H264Decode.is_encode());
         assert!(!CodecOp::H265Decode.is_encode());
         assert!(CodecOp::H264Encode.is_encode());
+        assert!(CodecOp::H265Encode.is_encode());
     }
 
     #[test]
@@ -646,6 +747,19 @@ mod tests {
                 "VK_KHR_video_queue",
                 "VK_KHR_video_encode_queue",
                 "VK_KHR_video_encode_h264",
+            ]
+        );
+        let hevc: Vec<String> = CodecOp::H265Encode
+            .extensions()
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            hevc.as_slice(),
+            [
+                "VK_KHR_video_queue",
+                "VK_KHR_video_encode_queue",
+                "VK_KHR_video_encode_h265",
             ]
         );
     }
@@ -718,6 +832,22 @@ mod tests {
         assert_eq!(
             skip(facts.check_video_caps(CodecOp::H264Encode)),
             SkipReason::NoH264EncodeCaps
+        );
+    }
+
+    #[test]
+    fn h265_encode_caps_cover_both_rungs() {
+        assert_eq!(
+            green_for(CodecOp::H265Encode)
+                .check_video_caps(CodecOp::H265Encode)
+                .expect("caps"),
+            OpCaps::Encode(encode_caps())
+        );
+        let mut facts = green_for(CodecOp::H265Encode);
+        facts.h265_encode = None;
+        assert_eq!(
+            skip(facts.check_video_caps(CodecOp::H265Encode)),
+            SkipReason::NoH265EncodeCaps
         );
     }
 
