@@ -22,6 +22,8 @@ mod scale;
 #[cfg(target_os = "windows")]
 mod session;
 #[cfg(target_os = "windows")]
+mod submit;
+#[cfg(target_os = "windows")]
 mod transcode;
 
 #[cfg(target_os = "windows")]

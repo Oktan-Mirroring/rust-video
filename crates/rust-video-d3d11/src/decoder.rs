@@ -94,16 +94,10 @@ impl D3d11Frame {
 /// Device-resident decode surface without CPU access.
 #[cfg(target_os = "windows")]
 pub(crate) struct GpuSurface {
-    /// Frame identity: size, format, generation.
-    identity: GpuFrame,
     /// Shared decode texture plus its NT handle.
     export: SharedExport,
-    /// Array slice behind the picture.
-    slot: u8,
-    /// Visible left offset in luma samples.
-    left: u32,
-    /// Visible top offset in luma samples.
-    top: u32,
+    /// Two-plane export description behind the surface.
+    layout: ExportLayout,
 }
 
 #[cfg(target_os = "windows")]
@@ -111,7 +105,7 @@ impl GpuSurface {
     /// Picture dimensions in luma samples.
     #[must_use]
     pub(crate) fn size(&self) -> PictureSize {
-        self.identity.size()
+        self.layout.visible()
     }
 
     /// Shared decode texture plus its NT handle.
@@ -120,10 +114,60 @@ impl GpuSurface {
         &self.export
     }
 
+    /// Two-plane export description behind the surface.
+    #[must_use]
+    pub(crate) fn layout(&self) -> &ExportLayout {
+        &self.layout
+    }
+}
+
+/// NV12 two-plane export description over one array slice.
+#[cfg(target_os = "windows")]
+pub(crate) struct ExportLayout {
+    /// Pixel layout; NV12 stores luma plus one chroma plane.
+    format: PixelFormat,
+    /// Array slice behind the picture.
+    slice: u8,
+    /// Visible left offset in luma samples.
+    left: u32,
+    /// Visible top offset in luma samples.
+    top: u32,
+    /// Visible extent in luma samples.
+    visible: PictureSize,
+}
+
+#[cfg(target_os = "windows")]
+impl ExportLayout {
+    /// Layout for `slot` at `visible` inside the coded extent, absent when empty.
+    #[must_use]
+    pub(crate) fn for_output(
+        coded_width: u32,
+        coded_height: u32,
+        slot: u8,
+        crop: Option<Crop>,
+        visible: PictureSize,
+    ) -> Option<Self> {
+        PictureSize::new(coded_width, coded_height)?;
+        let (left, top) = crop.map_or((0, 0), |crop| (crop.left, crop.top));
+        Some(Self {
+            format: PixelFormat::Nv12,
+            slice: slot,
+            left,
+            top,
+            visible,
+        })
+    }
+
+    /// Pixel layout behind the export.
+    #[must_use]
+    pub(crate) fn format(&self) -> PixelFormat {
+        self.format
+    }
+
     /// Array slice behind the picture.
     #[must_use]
-    pub(crate) fn slot(&self) -> u8 {
-        self.slot
+    pub(crate) fn slice(&self) -> u8 {
+        self.slice
     }
 
     /// Visible left offset in luma samples.
@@ -136,6 +180,12 @@ impl GpuSurface {
     #[must_use]
     pub(crate) fn top(&self) -> u32 {
         self.top
+    }
+
+    /// Visible extent in luma samples.
+    #[must_use]
+    pub(crate) fn visible(&self) -> PictureSize {
+        self.visible
     }
 }
 
@@ -189,6 +239,10 @@ pub struct H264Decoder<'a> {
     active: Option<Active>,
     /// Next frame generation number.
     generation: u64,
+    /// Stream resets after mid-picture failures.
+    resets: u64,
+    /// Peak outputs queued before readback in one call.
+    inflight_max: usize,
 }
 
 #[cfg(target_os = "windows")]
@@ -205,17 +259,34 @@ impl<'a> H264Decoder<'a> {
             shared: None,
             active: None,
             generation: 0,
+            resets: 0,
+            inflight_max: 0,
         }
     }
 
-    /// Decode `picture` into `frames`.
-    fn decode_picture(
+    /// Stream resets after mid-picture failures.
+    #[must_use]
+    pub fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// Peak outputs queued before readback in one call.
+    #[must_use]
+    pub fn max_inflight(&self) -> usize {
+        self.inflight_max
+    }
+
+    /// Decode `picture`, queueing its outputs for readback into `pending`.
+    fn submit_picture(
         &mut self,
         picture: &Picture,
+        pending: &mut Vec<(u8, Active)>,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
+            self.consume_pending(pending, frames)?;
+            pending.clear();
             self.reconfigure(active, frames)?;
         }
         let active = self.active.ok_or(D3d11Error::NoSession)?;
@@ -230,22 +301,16 @@ impl<'a> H264Decoder<'a> {
         let mut failed = None;
         {
             let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
-            let shared = self.shared.as_ref().ok_or(D3d11Error::NoSession)?;
-            // Submit before any readback: outputs may name the submission slot.
+            // Submit before any copy: outputs may name the submission slot.
             if let Err(error) = session.submit(&decoded.submission) {
                 failed = Some(error);
             } else {
                 for output in &decoded.outputs {
-                    match emit_frame(session, shared, output, &active, self.generation) {
-                        Ok(frame) => {
-                            self.generation = self.generation.wrapping_add(1);
-                            frames.push(frame);
-                        }
-                        Err(error) => {
-                            failed = Some(error);
-                            break;
-                        }
+                    if let Err(error) = session.copy_slot(output.slot()) {
+                        failed = Some(error);
+                        break;
                     }
+                    pending.push((output.slot(), active));
                 }
             }
         }
@@ -256,12 +321,38 @@ impl<'a> H264Decoder<'a> {
         Ok(())
     }
 
+    /// Readback for queued `pending` outputs into `frames`.
+    fn consume_pending(
+        &mut self,
+        pending: &[(u8, Active)],
+        frames: &mut Vec<D3d11Frame>,
+    ) -> Result<(), D3d11Error> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let (Some(session), Some(shared)) = (self.session.as_ref(), self.shared.as_ref()) else {
+            return Err(D3d11Error::NoSession);
+        };
+        for (slot, active) in pending {
+            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
+            self.generation = self.generation.wrapping_add(1);
+            frames.push(frame);
+        }
+        Ok(())
+    }
+
     /// Drop the live session, buffer, and sequence after a mid-picture failure.
     fn reset_stream(&mut self) {
         self.dpb = None;
         self.session = None;
         self.shared = None;
         self.active = None;
+        self.resets = self.resets.wrapping_add(1);
+    }
+
+    /// Peak outputs queued before readback against `depth`.
+    fn note_inflight(&mut self, depth: usize) {
+        self.inflight_max = self.inflight_max.max(depth);
     }
 
     /// Session for `active`, draining the previous sequence first.
@@ -332,11 +423,16 @@ impl<'a> H264Decoder<'a> {
         ) else {
             return Ok(());
         };
-        for output in dpb.drain() {
-            let frame = emit_frame(session, shared, &output, active, self.generation)?;
+        let slots: Vec<u8> = dpb.drain().iter().map(Output::slot).collect();
+        for slot in &slots {
+            session.copy_slot(*slot)?;
+        }
+        for slot in &slots {
+            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
             self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }
+        self.note_inflight(slots.len());
         Ok(())
     }
 
@@ -380,14 +476,12 @@ impl<'a> H264Decoder<'a> {
                 failed = Some(error);
             } else {
                 for output in &decoded.outputs {
-                    let Some(surface) = emit_surface(session, output, &active, self.generation)
-                    else {
+                    let Some(surface) = emit_surface(session, output, &active) else {
                         failed = Some(D3d11Error::Unsupported(
                             FallbackCause::NoSharedExport.to_string(),
                         ));
                         break;
                     };
-                    self.generation = self.generation.wrapping_add(1);
                     surfaces.push(surface);
                 }
             }
@@ -421,12 +515,11 @@ impl<'a> H264Decoder<'a> {
             return Ok(());
         };
         for output in dpb.drain() {
-            let Some(surface) = emit_surface(session, &output, active, self.generation) else {
+            let Some(surface) = emit_surface(session, &output, active) else {
                 return Err(D3d11Error::Unsupported(
                     FallbackCause::NoSharedExport.to_string(),
                 ));
             };
-            self.generation = self.generation.wrapping_add(1);
             surfaces.push(surface);
         }
         Ok(())
@@ -466,16 +559,34 @@ impl Decoder for H264Decoder<'_> {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut frames = Vec::new();
+        let mut pending = Vec::new();
         for picture in &pictures {
-            self.decode_picture(picture, &mut frames)?;
+            if let Err(error) = self.submit_picture(picture, &mut pending, &mut frames) {
+                pending.clear();
+                return Err(error);
+            }
+        }
+        self.note_inflight(pending.len());
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+            self.reset_stream();
+            return Err(error);
         }
         Ok(frames)
     }
 
     fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
+        let mut pending = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            self.decode_picture(&picture, &mut frames)?;
+            if let Err(error) = self.submit_picture(&picture, &mut pending, &mut frames) {
+                pending.clear();
+                return Err(error);
+            }
+        }
+        self.note_inflight(pending.len());
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+            self.reset_stream();
+            return Err(error);
         }
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
@@ -484,16 +595,16 @@ impl Decoder for H264Decoder<'_> {
     }
 }
 
-/// Frame for `output`.
+/// Frame for copied `slot`.
 #[cfg(target_os = "windows")]
 fn emit_frame(
     session: &Session,
     shared: &SharedDevice,
-    output: &Output,
+    slot: u8,
     active: &Active,
     generation: u64,
 ) -> Result<D3d11Frame, D3d11Error> {
-    let data = session.readback(output.slot(), active.crop)?;
+    let data = session.read_slot(slot, active.crop)?;
     let lease = shared.try_acquire(data.len() as u64)?;
     Ok(D3d11Frame {
         identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
@@ -505,21 +616,16 @@ fn emit_frame(
 
 /// Surface for `output`, absent without NT-handle sharing.
 #[cfg(target_os = "windows")]
-fn emit_surface(
-    session: &Session,
-    output: &Output,
-    active: &Active,
-    generation: u64,
-) -> Option<GpuSurface> {
+fn emit_surface(session: &Session, output: &Output, active: &Active) -> Option<GpuSurface> {
     let (export, slot) = session.surface(output.slot())?;
-    let (left, top) = active.crop.map_or((0, 0), |crop| (crop.left, crop.top));
-    Some(GpuSurface {
-        identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
-        export,
+    let layout = ExportLayout::for_output(
+        active.width,
+        active.height,
         slot,
-        left,
-        top,
-    })
+        active.crop,
+        active.visible,
+    )?;
+    Some(GpuSurface { export, layout })
 }
 
 /// HEVC decoder; the picture builder is pending.
@@ -688,6 +794,10 @@ impl Decoder for Vc1Decoder<'_> {
 #[cfg(test)]
 mod tests {
     use super::D3d11Frame;
+    #[cfg(target_os = "windows")]
+    use super::ExportLayout;
+    #[cfg(target_os = "windows")]
+    use crate::h264::Crop;
 
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
@@ -756,5 +866,40 @@ mod tests {
         let shared = SharedDevice::new("d3d11", 100);
         let held = frame(&shared, 4, 2, vec![0; 11]);
         assert!(held.to_cpu().is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn layout_names_both_planes() {
+        let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
+        let layout = ExportLayout::for_output(1920, 1088, 3, None, visible).expect("nonzero coded");
+        assert_eq!(layout.format(), PixelFormat::Nv12);
+        assert_eq!(layout.format().plane_count(), 2);
+        assert_eq!(layout.slice(), 3);
+        assert_eq!((layout.left(), layout.top()), (0, 0));
+        assert_eq!(layout.visible(), visible);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn layout_carries_crop_origin() {
+        let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
+        let crop = Crop {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        };
+        let layout =
+            ExportLayout::for_output(1920, 1088, 0, Some(crop), visible).expect("nonzero coded");
+        assert_eq!((layout.left(), layout.top()), (0, 0));
+        assert_eq!(layout.visible(), visible);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn layout_rejects_empty_coded() {
+        let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
+        assert!(ExportLayout::for_output(0, 1088, 0, None, visible).is_none());
     }
 }

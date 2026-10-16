@@ -350,6 +350,7 @@ dependencies = [
  "rust-video-caps",
  "thiserror",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

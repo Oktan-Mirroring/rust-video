@@ -10,11 +10,13 @@
 mod fixture;
 
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 
 use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
 use crate::error::D3d11Error;
-use crate::session::flag_word;
+use crate::submit::flag_word;
+use crate::submit::SubmitLock;
 
 use rust_video_caps::common::PictureSize;
 use windows::Win32::Foundation::{RECT, TRUE};
@@ -46,6 +48,8 @@ pub(crate) struct Scaler {
     video_device: ID3D11VideoDevice,
     /// Video context behind the scale.
     video_context: ID3D11VideoContext,
+    /// Single-submitter lock over the immediate context.
+    submit: Arc<SubmitLock>,
     /// Source extent.
     from: PictureSize,
     /// Target extent.
@@ -175,6 +179,7 @@ impl Scaler {
             target,
             video_device: device.video_device().clone(),
             video_context: device.video_context().clone(),
+            submit: device.submit_lock().clone(),
             from,
             to,
         })
@@ -204,13 +209,14 @@ impl Scaler {
                 "scale source outside scaler".to_owned(),
             ));
         }
+        let layout = surface.layout();
         let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_VPIV {
                     MipSlice: 0,
-                    ArraySlice: u32::from(surface.slot()),
+                    ArraySlice: u32::from(layout.slice()),
                 },
             },
         };
@@ -235,9 +241,10 @@ impl Scaler {
                 hresult: windows::Win32::Foundation::E_FAIL.0,
             });
         };
-        let size = surface.size();
-        let source = crop_rect(surface.left(), surface.top(), size)?;
+        let size = layout.visible();
+        let source = crop_rect(layout.left(), layout.top(), size)?;
         let target = full_rect(self.to)?;
+        let _submit = self.submit.enter()?;
         // Sound: the processor and rects stay live for each call.
         unsafe {
             self.video_context.VideoProcessorSetStreamSourceRect(

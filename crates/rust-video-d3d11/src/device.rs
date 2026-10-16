@@ -3,6 +3,9 @@
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "windows")]
+use std::sync::Arc;
+
+#[cfg(target_os = "windows")]
 use windows::core::Interface;
 #[cfg(target_os = "windows")]
 use windows::core::GUID;
@@ -27,6 +30,8 @@ use crate::error::D3d11Error;
 #[cfg(target_os = "windows")]
 use crate::error::SkipReason;
 use crate::guid::{Codec, Profile};
+#[cfg(target_os = "windows")]
+use crate::submit::SubmitLock;
 
 use rust_video_caps::traits::Device;
 #[cfg(target_os = "windows")]
@@ -55,6 +60,9 @@ pub struct D3d11Device {
     /// VRAM budget shared with decoders.
     #[cfg(target_os = "windows")]
     shared: SharedDevice,
+    /// Single-submitter lock over the immediate context.
+    #[cfg(target_os = "windows")]
+    submit: Arc<SubmitLock>,
     /// Negotiated feature level.
     level: i32,
     /// Adapter description.
@@ -109,6 +117,7 @@ impl D3d11Device {
             video_context,
             profiles,
             shared: SharedDevice::new("d3d11", budget),
+            submit: Arc::new(SubmitLock::new()),
             level: level.0,
             name,
         })
@@ -165,6 +174,13 @@ impl D3d11Device {
     #[must_use]
     pub(crate) fn video_context(&self) -> &ID3D11VideoContext {
         &self.video_context
+    }
+
+    /// Single-submitter lock over the immediate context.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn submit_lock(&self) -> &Arc<SubmitLock> {
+        &self.submit
     }
 }
 

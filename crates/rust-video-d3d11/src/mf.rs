@@ -1,19 +1,28 @@
 //! `MediaFoundation` encoder session behind the D3D11 encode path.
+//!
+//! <https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts>
+//! <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
 
 #![allow(unsafe_code)]
+#![allow(clippy::inline_always, clippy::ref_as_ptr)]
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::device::D3d11Device;
 use crate::error::D3d11Error;
 use crate::guid::Codec;
+use crate::submit::SubmitLock;
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
+use windows::core::implement;
+use windows::core::ComObject;
+use windows::core::IUnknown;
 use windows::core::Interface;
+use windows::core::Ref;
 use windows::core::GUID;
 use windows::core::PWSTR;
 use windows::Win32::Graphics::Direct3D11::{
@@ -22,24 +31,24 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    IMFActivate, IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MFCreateAlignedMemoryBuffer, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
     MFCreateMediaType, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint, MFStartup,
     MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_AV1, MFVideoFormat_H264,
     MFVideoFormat_H265, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoFormat_VP90,
-    MFVideoInterlace_Progressive, MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, MFSTARTUP_FULL,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFVideoInterlace_Progressive, MFASYNC_CALLBACK_QUEUE_MULTITHREADED,
+    MFASYNC_FAST_IO_PROCESSING_CALLBACK, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_MESSAGE_TYPE,
     MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
-    MF_EVENT_TYPE, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MF_VERSION,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_TYPE, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -82,8 +91,8 @@ pub struct Session {
     out_align: u32,
     /// Input buffer alignment in bytes.
     in_align: u32,
-    /// Async event source, absent on synchronous transforms.
-    events: Option<IMFMediaEventGenerator>,
+    /// Async event pump, absent on synchronous transforms.
+    pump: Option<EventPump>,
     /// Transform D3D11 awareness.
     d3d11_aware: bool,
     /// D3D11 bind behind GPU samples, absent without a bound transform.
@@ -129,7 +138,7 @@ impl Session {
                 break;
             }
         }
-        let Some(opened) = elect(&mut standby, codec) else {
+        let Some((opened, pump)) = elect_armed(&mut standby, codec) else {
             return Err(missing_encoder(codec));
         };
         let gpu = GpuBind::open(device, opened.d3d11_aware);
@@ -141,7 +150,7 @@ impl Session {
             out_size: 0,
             out_align: 1,
             in_align: SAMPLE_ALIGN,
-            events: opened.events,
+            pump,
             d3d11_aware: opened.d3d11_aware,
             gpu,
             name: opened.name,
@@ -154,13 +163,13 @@ impl Session {
         })
     }
 
-    /// Next activating transform from the standby queue.
+    /// Next arming transform from the standby queue.
     fn adopt(&mut self) -> Result<(), D3d11Error> {
-        let Some(opened) = elect(&mut self.standby, self.codec) else {
+        let Some((opened, pump)) = elect_armed(&mut self.standby, self.codec) else {
             return Err(missing_encoder(self.codec));
         };
         self.transform = opened.transform;
-        self.events = opened.events;
+        self.pump = pump;
         self.d3d11_aware = opened.d3d11_aware;
         self.name = opened.name;
         self.input = opened.input;
@@ -243,10 +252,22 @@ impl Session {
         packets: &mut Vec<Packet>,
     ) -> Result<(), D3d11Error> {
         self.pts = self.pts.wrapping_add(FRAME_HNS);
-        if self.events.is_some() {
+        let outcome = if self.pump.is_some() {
             self.submit_async(sample, packets)
         } else {
             self.submit_sync(sample, packets)
+        };
+        if outcome.is_err() {
+            self.reset_after_failure();
+        }
+        outcome
+    }
+
+    /// Transform flushed plus the pump reset behind a submit failure.
+    fn reset_after_failure(&self) {
+        let _ = self.message(MFT_MESSAGE_COMMAND_FLUSH);
+        if let Some(pump) = &self.pump {
+            pump.reset();
         }
     }
 
@@ -457,9 +478,8 @@ impl Session {
             self.credits -= 1;
             return Ok(());
         }
-        let events = self.event_source()?;
         loop {
-            let typ = event_type(&events)?;
+            let typ = self.async_pump()?.pop()?;
             if is_event(typ, METransformNeedInput) {
                 return Ok(());
             }
@@ -471,39 +491,30 @@ impl Session {
 
     /// Queued outputs into `packets` without blocking.
     fn poll(&mut self, packets: &mut Vec<Packet>) -> Result<(), D3d11Error> {
-        let events = self.event_source()?;
-        loop {
-            // Sound: the event source is live.
-            let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => event,
-                Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
-                Err(error) => return call(Err(error), "GetEvent"),
-            };
-            // Sound: the event is live.
-            let typ = call(unsafe { event.GetType() }, "GetType")?;
+        for typ in self.async_pump()?.drain()? {
             if is_event(typ, METransformHaveOutput) {
                 self.try_output(packets)?;
             } else if is_event(typ, METransformNeedInput) {
                 self.credits += 1;
             }
         }
+        Ok(())
     }
 
-    /// Cloned async event source.
-    fn event_source(&self) -> Result<IMFMediaEventGenerator, D3d11Error> {
-        self.events
-            .clone()
-            .ok_or_else(|| D3d11Error::Unsupported("async MFT without an event source".to_owned()))
+    /// Async pump, absent on synchronous transforms.
+    fn async_pump(&self) -> Result<&EventPump, D3d11Error> {
+        self.pump
+            .as_ref()
+            .ok_or_else(|| D3d11Error::Unsupported("async MFT without an event pump".to_owned()))
     }
 
     /// Drained outputs with the session left streaming.
     fn drain(&mut self) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         self.message(MFT_MESSAGE_COMMAND_DRAIN)?;
-        if self.events.is_some() {
-            let events = self.event_source()?;
+        if self.pump.is_some() {
             loop {
-                let typ = event_type(&events)?;
+                let typ = self.async_pump()?.pop()?;
                 if is_event(typ, METransformDrainComplete) {
                     break;
                 }
@@ -582,6 +593,208 @@ impl Session {
     }
 }
 
+/// Asynchronous event pump over one transform event source.
+struct EventPump {
+    /// Async event source.
+    events: IMFMediaEventGenerator,
+    /// Callback object behind outstanding requests.
+    callback: IMFAsyncCallback,
+    /// Next-event queue.
+    queue: Arc<EventQueue>,
+}
+
+impl EventPump {
+    /// Pump over `events` with one outstanding request.
+    fn open(events: IMFMediaEventGenerator) -> Result<Self, D3d11Error> {
+        let queue = Arc::new(EventQueue::new());
+        let callback: IMFAsyncCallback = ComObject::new(PumpCallback {
+            events: events.clone(),
+            queue: queue.clone(),
+        })
+        .into_interface();
+        let state: Option<&IUnknown> = None;
+        // Sound: the source and callback are live; no state object.
+        call(
+            unsafe { events.BeginGetEvent(&callback, state) },
+            "BeginGetEvent",
+        )?;
+        Ok(Self {
+            events,
+            callback,
+            queue,
+        })
+    }
+
+    /// Next event type, re-arming the request chain.
+    fn pop(&self) -> Result<u32, D3d11Error> {
+        let event = self.queue.pop();
+        self.rearm();
+        event.map_err(|hresult| D3d11Error::Call {
+            call: "GetEvent",
+            hresult,
+        })
+    }
+
+    /// Queued event types without waiting, re-arming per event.
+    fn drain(&self) -> Result<Vec<u32>, D3d11Error> {
+        let mut types = Vec::new();
+        for event in self.queue.drain() {
+            self.rearm();
+            types.push(event.map_err(|hresult| D3d11Error::Call {
+                call: "GetEvent",
+                hresult,
+            })?);
+        }
+        Ok(types)
+    }
+
+    /// Queue cleared plus a fresh request behind failures.
+    fn reset(&self) {
+        self.queue.reset();
+        self.rearm();
+    }
+
+    /// One request behind the consumed event, failing the queue when refused.
+    fn rearm(&self) {
+        let state: Option<&IUnknown> = None;
+        // Sound: the source and callback are live past the consumed request.
+        if let Err(error) = unsafe { self.events.BeginGetEvent(&self.callback, state) } {
+            self.queue.push(Err(error.code().0));
+        }
+    }
+}
+
+/// Next-event queue behind one asynchronous transform.
+struct EventQueue {
+    /// Pending event types plus sticky failure.
+    state: Mutex<QueueState>,
+    /// Signalled on every push.
+    ready: Condvar,
+}
+
+/// Pending event types plus sticky failure.
+struct QueueState {
+    /// Event types in arrival order.
+    pending: VecDeque<u32>,
+    /// Fatal pump failure, reported until reset.
+    failed: Option<i32>,
+}
+
+impl EventQueue {
+    /// Empty queue.
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                pending: VecDeque::new(),
+                failed: None,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// `event` queued for the submitter thread.
+    fn push(&self, event: Result<u32, i32>) {
+        {
+            let mut state = self.guard();
+            match event {
+                Ok(typ) => state.pending.push_back(typ),
+                Err(hresult) => {
+                    state.failed.get_or_insert(hresult);
+                }
+            }
+        }
+        self.ready.notify_one();
+    }
+
+    /// Next event type, waiting for arrival.
+    fn pop(&self) -> Result<u32, i32> {
+        let mut state = self.guard();
+        loop {
+            if let Some(hresult) = state.failed {
+                return Err(hresult);
+            }
+            if let Some(typ) = state.pending.pop_front() {
+                return Ok(typ);
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Queued event types without waiting.
+    fn drain(&self) -> Vec<Result<u32, i32>> {
+        let mut state = self.guard();
+        if let Some(hresult) = state.failed {
+            return vec![Err(hresult)];
+        }
+        state.pending.drain(..).map(Ok).collect()
+    }
+
+    /// Pending types and failures cleared.
+    fn reset(&self) {
+        let mut state = self.guard();
+        state.pending.clear();
+        state.failed = None;
+    }
+
+    /// Queue state, recovered past a poisoned lock.
+    fn guard(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Event callback behind the pump; signals only, never GPU work.
+#[implement(IMFAsyncCallback)]
+struct PumpCallback {
+    /// Async event source behind completions.
+    events: IMFMediaEventGenerator,
+    /// Next-event queue.
+    queue: Arc<EventQueue>,
+}
+
+impl IMFAsyncCallback_Impl for PumpCallback_Impl {
+    fn GetParameters(&self, flags: *mut u32, queue: *mut u32) -> windows::core::Result<()> {
+        // Sound: Media Foundation provides valid out-pointers.
+        unsafe {
+            *flags = MFASYNC_FAST_IO_PROCESSING_CALLBACK;
+            *queue = MFASYNC_CALLBACK_QUEUE_MULTITHREADED;
+        }
+        Ok(())
+    }
+
+    fn Invoke(&self, result: Ref<'_, IMFAsyncResult>) -> windows::core::Result<()> {
+        self.queue.push(self.completed(&result));
+        Ok(())
+    }
+}
+
+impl PumpCallback {
+    /// Finished event behind `result`, without GPU work.
+    fn completed(&self, result: &Ref<'_, IMFAsyncResult>) -> Result<u32, i32> {
+        let completed = match result.ok() {
+            Ok(completed) => completed,
+            Err(error) => return Err(error.code().0),
+        };
+        // Sound: the source and result are live on the callback thread.
+        let event = match unsafe { self.events.EndGetEvent(completed) } {
+            Ok(event) => event,
+            Err(error) => return Err(error.code().0),
+        };
+        // Sound: the event is live.
+        let status = match unsafe { event.GetStatus() } {
+            Ok(status) => status,
+            Err(error) => return Err(error.code().0),
+        };
+        if status.is_err() {
+            return Err(status.0);
+        }
+        // Sound: the event is live.
+        unsafe { event.GetType() }.map_err(|error| error.code().0)
+    }
+}
+
 /// COM apartment guard; uninitializes only a self-owned entry.
 struct ComGuard {
     /// Thread entry owned by this guard.
@@ -634,6 +847,8 @@ struct GpuBind {
     device: ID3D11Device,
     /// Immediate context behind GPU copies.
     context: ID3D11DeviceContext,
+    /// Single-submitter lock over the immediate context.
+    submit: Arc<SubmitLock>,
     /// Input texture plus its extent, recreated per size.
     input: Option<(ID3D11Texture2D, u32, u32)>,
 }
@@ -661,6 +876,7 @@ impl GpuBind {
             manager,
             device: device.device().clone(),
             context: device.context().clone(),
+            submit: device.submit_lock().clone(),
             input: None,
         })
     }
@@ -689,6 +905,7 @@ impl GpuBind {
             bottom: region.top.saturating_add(region.height),
             back: 1,
         };
+        let _submit = self.submit.enter()?;
         // Sound: both textures are live; the slice and box name the decode extent.
         unsafe {
             self.context.CopySubresourceRegion(
@@ -908,6 +1125,24 @@ fn elect(standby: &mut VecDeque<IMFActivate>, codec: Codec) -> Option<Opened> {
     while let Some(next) = standby.pop_front() {
         if let Ok(opened) = activate_one(&next, codec) {
             return Some(opened);
+        }
+    }
+    None
+}
+
+/// First arming transform from `standby` plus its pump, consumed in order.
+fn elect_armed(
+    standby: &mut VecDeque<IMFActivate>,
+    codec: Codec,
+) -> Option<(Opened, Option<EventPump>)> {
+    while let Some(opened) = elect(standby, codec) {
+        match &opened.events {
+            Some(source) => {
+                if let Ok(armed) = EventPump::open(source.clone()) {
+                    return Some((opened, Some(armed)));
+                }
+            }
+            None => return Some((opened, None)),
         }
     }
     None
@@ -1167,24 +1402,6 @@ fn pts_duration(hns: i64) -> Duration {
     Duration::from_nanos(hns.saturating_mul(100))
 }
 
-/// Next event type behind `events`, checked for failure.
-fn event_type(events: &IMFMediaEventGenerator) -> Result<u32, D3d11Error> {
-    // Sound: the event source is live.
-    let event = call(
-        unsafe { events.GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0)) },
-        "GetEvent",
-    )?;
-    // Sound: the event is live.
-    let status = call(unsafe { event.GetStatus() }, "GetStatus")?;
-    if status.is_err() {
-        return Err(D3d11Error::Call {
-            call: "GetEvent",
-            hresult: status.0,
-        });
-    }
-    call(unsafe { event.GetType() }, "GetType")
-}
-
 /// True when `typ` names `want`.
 fn is_event(typ: u32, want: MF_EVENT_TYPE) -> bool {
     u32::try_from(want.0).is_ok_and(|want| typ == want)
@@ -1196,4 +1413,56 @@ fn call<T>(result: windows::core::Result<T>, call: &'static str) -> Result<T, D3
         call,
         hresult: error.code().0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventQueue;
+
+    #[test]
+    fn pop_returns_pushed_type() {
+        let queue = EventQueue::new();
+        queue.push(Ok(7));
+        assert_eq!(queue.pop(), Ok(7));
+    }
+
+    #[test]
+    fn pop_surfaces_failure() {
+        let queue = EventQueue::new();
+        queue.push(Err(-1));
+        assert_eq!(queue.pop(), Err(-1));
+    }
+
+    #[test]
+    fn failure_sticks_until_reset() {
+        let queue = EventQueue::new();
+        queue.push(Err(-1));
+        assert_eq!(queue.pop(), Err(-1));
+        assert_eq!(queue.pop(), Err(-1));
+        queue.reset();
+        queue.push(Ok(7));
+        assert_eq!(queue.pop(), Ok(7));
+    }
+
+    #[test]
+    fn drain_collects_without_blocking() {
+        let queue = EventQueue::new();
+        assert!(queue.drain().is_empty());
+        queue.push(Ok(1));
+        queue.push(Ok(2));
+        assert_eq!(queue.drain(), vec![Ok(1), Ok(2)]);
+        assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn waiting_pop_wakes_on_push() {
+        let queue = std::sync::Arc::new(EventQueue::new());
+        let pushed = queue.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            pushed.push(Ok(9));
+        });
+        assert_eq!(queue.pop(), Ok(9));
+        worker.join().expect("worker joins");
+    }
 }

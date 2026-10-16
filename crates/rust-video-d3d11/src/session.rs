@@ -8,8 +8,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDecoder,
     ID3D11VideoDecoderOutputView, D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_SHARED,
-    D3D11_TEX2D_VDOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_RESOURCE_MISC_SHARED, D3D11_TEX2D_VDOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_VDOV_DIMENSION_TEXTURE2D, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
     D3D11_VIDEO_DECODER_BUFFER_DESC, D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
     D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
@@ -24,6 +23,8 @@ use crate::device::D3d11Device;
 use crate::dpb::SubmittedPicture;
 use crate::error::D3d11Error;
 use crate::h264::Crop;
+use crate::submit::flag_word;
+use crate::submit::{CopySlot, SubmitLock};
 
 use bytes::Bytes;
 
@@ -41,12 +42,14 @@ pub struct Session {
     views: Vec<ID3D11VideoDecoderOutputView>,
     /// Array texture behind the views.
     texture: ID3D11Texture2D,
-    /// CPU-visible copy target.
-    staging: ID3D11Texture2D,
+    /// Copy lane per reference surface.
+    slots: Vec<CopySlot>,
     /// Video context behind frame submission.
     video_context: ID3D11VideoContext,
     /// Immediate context behind copies and readback.
     context: ID3D11DeviceContext,
+    /// Single-submitter lock over the immediate context.
+    submit: Arc<SubmitLock>,
     /// Shared-texture export, absent without NT-handle sharing.
     export: Option<SharedExport>,
     /// Coded width in luma samples.
@@ -148,16 +151,20 @@ impl Session {
             };
             views.push(view);
         }
-        let staging = create_staging(device, width, height)?;
+        let mut slots = Vec::with_capacity(usize::try_from(VIEWS).unwrap_or(0));
+        for _ in 0..VIEWS {
+            slots.push(CopySlot::open(device.device(), width, height)?);
+        }
         let export = shared_export(&texture);
         let slice_short = config.ConfigBitstreamRaw == 2;
         Ok(Self {
             decoder,
             views,
             texture,
-            staging,
+            slots,
             video_context: device.video_context().clone(),
             context: device.context().clone(),
+            submit: device.submit_lock().clone(),
             export,
             width,
             height,
@@ -190,13 +197,36 @@ impl Session {
         self.submit_windows(submission)
     }
 
+    /// Array `slot` copied to its lane staging through the immediate context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views or when the driver
+    /// refuses the copy.
+    pub fn copy_slot(&self, slot: u8) -> Result<(), D3d11Error> {
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+        let list = lane.record(&self.texture, slot)?;
+        let _submit = self.submit.enter()?;
+        lane.complete(&self.context, &list);
+        Ok(())
+    }
+
     /// NV12 bytes for `slot` cropped to the visible rectangle.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the copy or map fails.
-    pub fn readback(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
-        self.readback_windows(slot, crop)
+    /// Returns `Err` for a slot outside the views, when the copy
+    /// misses its completion budget, or when the map fails.
+    pub fn read_slot(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+        lane.wait(&self.context)?;
+        lane.read(&self.context, crop)
     }
 
     /// Decode `submission` onto its surface slot.
@@ -205,6 +235,7 @@ impl Session {
             .views
             .get(usize::from(submission.slot))
             .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+        let _submit = self.submit.enter()?;
         // Sound: the decoder and view are live; no content key.
         unsafe {
             self.video_context
@@ -331,44 +362,6 @@ impl Session {
             ..Default::default()
         })
     }
-
-    /// NV12 bytes for `slot` cropped to the visible rectangle.
-    fn readback_windows(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
-        // Sound: both textures are live with matching extents; the slot is a valid slice.
-        unsafe {
-            self.context.CopySubresourceRegion(
-                &self.staging,
-                0,
-                0,
-                0,
-                0,
-                &self.texture,
-                u32::from(slot),
-                None,
-            );
-        }
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // Sound: the staging texture is live with read access.
-        unsafe {
-            self.context.Map(
-                &self.staging,
-                0,
-                D3D11_MAP_READ,
-                0,
-                Some(std::ptr::addr_of_mut!(mapped)),
-            )
-        }
-        .map_err(|error| D3d11Error::Call {
-            call: "Map",
-            hresult: error.code().0,
-        })?;
-        let bytes = copy_nv12(&mapped, self.width, self.height, crop);
-        // Sound: the staging texture mapped above.
-        unsafe {
-            self.context.Unmap(&self.staging, 0);
-        }
-        bytes
-    }
 }
 
 /// Raw bitstream config without encryption.
@@ -464,46 +457,6 @@ fn create_texture(
     })
 }
 
-/// CPU-visible texture behind readback.
-fn create_staging(
-    device: &D3d11Device,
-    width: u32,
-    height: u32,
-) -> Result<ID3D11Texture2D, D3d11Error> {
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_NV12,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_STAGING,
-        BindFlags: 0,
-        CPUAccessFlags: flag_word(D3D11_CPU_ACCESS_READ.0),
-        MiscFlags: 0,
-    };
-    let mut staging = None;
-    // Sound: the descriptor stays live for the call.
-    unsafe {
-        device.device().CreateTexture2D(
-            std::ptr::addr_of!(desc),
-            None,
-            Some(std::ptr::addr_of_mut!(staging)),
-        )
-    }
-    .map_err(|error| D3d11Error::Call {
-        call: "CreateTexture2D",
-        hresult: error.code().0,
-    })?;
-    staging.ok_or(D3d11Error::Call {
-        call: "CreateTexture2D",
-        hresult: windows::Win32::Foundation::E_FAIL.0,
-    })
-}
-
 /// NT-handle export for a shared texture, absent without sharing.
 fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
     let resource: IDXGIResource = texture.cast().ok()?;
@@ -516,11 +469,6 @@ fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
         texture: Arc::new(texture.clone()),
         handle: handle.0 as isize,
     })
-}
-
-/// Flag bits as the descriptor word.
-pub(crate) fn flag_word(bits: i32) -> u32 {
-    u32::try_from(bits).unwrap_or(0)
 }
 
 /// Plain-data struct as bytes.
@@ -554,59 +502,6 @@ fn short_bytes(slices: &[crate::dxva::SliceLongH264]) -> Vec<u8> {
     out
 }
 
-/// NV12 bytes from a mapped staging texture under `crop`.
-fn copy_nv12(
-    mapped: &D3D11_MAPPED_SUBRESOURCE,
-    width: u32,
-    height: u32,
-    crop: Option<Crop>,
-) -> Result<Bytes, D3d11Error> {
-    if mapped.RowPitch < width {
-        return Err(D3d11Error::Call {
-            call: "Map",
-            hresult: windows::Win32::Foundation::E_FAIL.0,
-        });
-    }
-    let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
-    let pitch = usize::try_from(mapped.RowPitch).unwrap_or(0);
-    let left = usize::try_from(left).unwrap_or(0);
-    let top = usize::try_from(top).unwrap_or(0);
-    let visible_width = usize::try_from(visible_width).unwrap_or(0);
-    let visible_height = usize::try_from(visible_height).unwrap_or(0);
-    let height = usize::try_from(height).unwrap_or(0);
-    let capacity = visible_width
-        .saturating_mul(visible_height)
-        .saturating_mul(3)
-        / 2;
-    let mut bytes = Vec::with_capacity(capacity);
-    // Sound: the pitch and extents bound every row inside the mapped staging texture.
-    unsafe {
-        let base = mapped.pData.cast::<u8>();
-        for row in 0..visible_height {
-            let src = base.add(top * pitch + row * pitch + left);
-            bytes.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
-        }
-        let chroma = base.add(height * pitch);
-        for row in 0..visible_height / 2 {
-            let src = chroma.add(top * pitch / 2 + row * pitch + left);
-            bytes.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
-        }
-    }
-    Ok(Bytes::from(bytes))
-}
-
-/// Visible rectangle inside the coded extent.
-fn visible_rect(width: u32, height: u32, crop: Option<Crop>) -> (u32, u32, u32, u32) {
-    crop.map_or((0, 0, width, height), |crop| {
-        (
-            crop.left,
-            crop.top,
-            width - crop.left - crop.right,
-            height - crop.top - crop.bottom,
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     /// Session negotiation plus staging roundtrip on hardware, skipped without.
@@ -621,7 +516,8 @@ mod tests {
             return;
         };
         let session = Session::open(&device, 1920, 1088).expect("1080p session");
-        let full = session.readback(0, None).expect("readback");
+        session.copy_slot(0).expect("copy");
+        let full = session.read_slot(0, None).expect("readback");
         assert_eq!(full.len(), 1920 * 1088 * 3 / 2);
         let crop = Crop {
             left: 0,
@@ -629,12 +525,14 @@ mod tests {
             top: 0,
             bottom: 8,
         };
-        let visible = session.readback(0, Some(crop)).expect("cropped readback");
+        session.copy_slot(0).expect("copy");
+        let visible = session.read_slot(0, Some(crop)).expect("cropped readback");
         assert_eq!(visible.len(), 1920 * 1080 * 3 / 2);
         let rounds = 60u32;
         let start = std::time::Instant::now();
         for _ in 0..rounds {
-            session.readback(0, None).expect("readback");
+            session.copy_slot(0).expect("copy");
+            session.read_slot(0, None).expect("readback");
         }
         let elapsed = start.elapsed();
         let frame_bytes = 1920u128 * 1088 * 3 / 2;

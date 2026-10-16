@@ -81,12 +81,19 @@ impl D3d11Encoder {
         &mut self,
         surface: &GpuSurface,
     ) -> Result<Vec<Packet>, D3d11Error> {
-        let size = surface.size();
+        let layout = surface.layout();
+        if layout.format() != PixelFormat::Nv12 {
+            return Err(D3d11Error::Unsupported(format!(
+                "encoder input {:?}; nv12 only",
+                layout.format()
+            )));
+        }
+        let size = layout.visible();
         self.session.encode_texture(
             surface.export(),
-            u32::from(surface.slot()),
-            surface.left(),
-            surface.top(),
+            u32::from(layout.slice()),
+            layout.left(),
+            layout.top(),
             size.width(),
             size.height(),
         )
