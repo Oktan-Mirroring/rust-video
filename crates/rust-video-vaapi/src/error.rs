@@ -1,5 +1,11 @@
 //! Typed VA-API tier failures and skip reasons.
 
+#![allow(unsafe_code)]
+
+use std::ffi::CStr;
+
+use crate::ffi;
+
 /// Machine declined by the VA-API tier, with the cause.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum SkipReason {
@@ -23,9 +29,14 @@ pub enum VaApiError {
     /// Machine declined; the tier cannot run here.
     #[error("va-api skipped: {0}")]
     Skipped(#[from] SkipReason),
-    /// VA-API call failure.
-    #[error("va-api call failed with status {0}")]
-    Call(i32),
+    /// VA-API call failure, with the driver status text.
+    #[error("va-api call failed with status {status} ({message})")]
+    Call {
+        /// Raw driver status.
+        status: i32,
+        /// Driver status text.
+        message: String,
+    },
     /// Bitstream the tier refuses: interlaced, FMO, odd chroma, or a gap it cannot bridge.
     #[error("unsupported stream: {0}")]
     Unsupported(String),
@@ -49,6 +60,26 @@ pub enum VaApiError {
         /// Returned height in luma samples.
         height: u32,
     },
+}
+
+impl VaApiError {
+    /// VA-API status as a result, carrying the driver status text.
+    pub(crate) fn status(status: i32) -> Result<(), Self> {
+        if status == ffi::VA_STATUS_SUCCESS {
+            return Ok(());
+        }
+        // Sound: `vaStatusStr` returns a static NUL-terminated string.
+        let raw = unsafe { ffi::vaStatusStr(status) };
+        let message = if raw.is_null() {
+            format!("status {status}")
+        } else {
+            // Sound: `vaStatusStr` returned non-null above.
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Err(Self::Call { status, message })
+    }
 }
 
 #[cfg(test)]
@@ -77,9 +108,13 @@ mod tests {
 
     #[test]
     fn call_names_status() {
+        let error = VaApiError::Call {
+            status: 7,
+            message: "invalid buffer".to_owned(),
+        };
         assert_eq!(
-            VaApiError::Call(7).to_string(),
-            "va-api call failed with status 7"
+            error.to_string(),
+            "va-api call failed with status 7 (invalid buffer)"
         );
     }
 

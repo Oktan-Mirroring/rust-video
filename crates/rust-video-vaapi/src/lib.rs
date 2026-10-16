@@ -1,4 +1,4 @@
-//! VA-API decode tier over DRM render nodes.
+//! VA-API tiers over DRM render nodes: decode, encode, and transcode.
 
 #[cfg(target_os = "linux")]
 mod av1;
@@ -7,9 +7,13 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod bitstream;
 #[cfg(target_os = "linux")]
+mod buffer;
+#[cfg(target_os = "linux")]
 mod decoder;
 #[cfg(target_os = "linux")]
 mod device;
+#[cfg(target_os = "linux")]
+mod encoder;
 #[cfg(target_os = "linux")]
 mod error;
 #[cfg(target_os = "linux")]
@@ -23,6 +27,10 @@ mod h265;
 #[cfg(target_os = "linux")]
 mod params;
 #[cfg(target_os = "linux")]
+mod scale;
+#[cfg(target_os = "linux")]
+mod transcode;
+#[cfg(target_os = "linux")]
 mod vp8;
 #[cfg(target_os = "linux")]
 mod vp9;
@@ -34,9 +42,15 @@ pub use decoder::{H264Decoder, VaApiFrame};
 #[cfg(target_os = "linux")]
 pub use device::VaApiDevice;
 #[cfg(target_os = "linux")]
+pub use encoder::{EncodeCodec, VaApiEncoder};
+#[cfg(target_os = "linux")]
 pub use error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]
 pub use h265::H265Decoder;
+#[cfg(target_os = "linux")]
+pub use scale::{ScaledSurface, Scaler};
+#[cfg(target_os = "linux")]
+pub use transcode::Transcoder;
 #[cfg(target_os = "linux")]
 pub use vp8::Vp8Decoder;
 #[cfg(target_os = "linux")]

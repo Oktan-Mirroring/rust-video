@@ -1,4 +1,4 @@
-//! Minimal libva rebind for H.264 decode over DRM.
+//! Minimal libva rebind for decode, encode, and video processing over DRM.
 //!
 //! Layouts mirror `/usr/include/va/va.h` from libva 1.22.0; the byte
 //! sizes pinned below are that contract.
@@ -55,6 +55,58 @@ pub const VA_SLICE_DATA_FLAG_ALL: u32 = 0x00;
 pub const VA_FOURCC_NV12: u32 = 0x3231_564e;
 /// Progressive-only context flag.
 pub const VA_PROGRESSIVE: c_int = 0x1;
+/// HEVC Main profile.
+pub const VA_PROFILE_HEVC_MAIN: c_int = 17;
+/// No profile, for video processing configs.
+pub const VA_PROFILE_NONE: c_int = -1;
+/// Slice-level encode entrypoint.
+pub const VA_ENTRYPOINT_ENC_SLICE: c_int = 6;
+/// Video processing entrypoint.
+pub const VA_ENTRYPOINT_VIDEO_PROC: c_int = 10;
+/// Rate-control attribute type.
+pub const VA_CONFIG_ATTRIB_RATE_CONTROL: c_int = 5;
+/// Packed-header attribute type.
+pub const VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS: c_int = 10;
+/// Constant-QP rate control.
+pub const VA_RC_CQP: u32 = 0x0000_0010;
+/// Packed sequence header support flag.
+pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
+/// Packed picture header support flag.
+pub const VA_ENC_PACKED_HEADER_PICTURE: u32 = 0x0000_0002;
+/// Packed slice header support flag.
+pub const VA_ENC_PACKED_HEADER_SLICE: u32 = 0x0000_0004;
+/// Coded-bitstream buffer kind.
+pub const VA_ENC_CODED_BUFFER_TYPE: c_int = 21;
+/// Encode sequence-parameter buffer kind.
+pub const VA_ENC_SEQUENCE_PARAMETER_BUFFER_TYPE: c_int = 22;
+/// Encode picture-parameter buffer kind.
+pub const VA_ENC_PICTURE_PARAMETER_BUFFER_TYPE: c_int = 23;
+/// Encode slice-parameter buffer kind.
+pub const VA_ENC_SLICE_PARAMETER_BUFFER_TYPE: c_int = 24;
+/// Packed-header parameter buffer kind.
+pub const VA_ENC_PACKED_HEADER_PARAMETER_BUFFER_TYPE: c_int = 25;
+/// Packed-header data buffer kind.
+pub const VA_ENC_PACKED_HEADER_DATA_BUFFER_TYPE: c_int = 26;
+/// Packed sequence header type.
+pub const VA_ENC_PACKED_HEADER_TYPE_SEQUENCE: u32 = 1;
+/// Packed picture header type.
+pub const VA_ENC_PACKED_HEADER_TYPE_PICTURE: u32 = 2;
+/// Packed slice header type.
+pub const VA_ENC_PACKED_HEADER_TYPE_SLICE: u32 = 3;
+/// Packed raw header type.
+pub const VA_ENC_PACKED_HEADER_TYPE_RAW_DATA: u32 = 4;
+/// Video-processing pipeline-parameter buffer kind.
+pub const VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE: c_int = 41;
+/// Default processing mode.
+pub const VA_PROC_DEFAULT_MODE: c_int = 0;
+/// Unspecified input/output color standard.
+pub const VA_PROC_COLOR_STANDARD_NONE: c_int = 0;
+/// DRM PRIME version-two memory type.
+pub const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+/// Export handle for reading by the importer.
+pub const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x0001;
+/// Export planes as separate layers.
+pub const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x0004;
 
 /// `VAPictureH264` reference flags.
 pub const VA_PICTURE_H264_INVALID: u32 = 0x0000_0001;
@@ -62,6 +114,9 @@ pub const VA_PICTURE_H264_INVALID: u32 = 0x0000_0001;
 pub const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x0000_0008;
 /// Long-term reference flag.
 pub const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x0000_0010;
+
+/// HEVC invalid-picture flag.
+pub const VA_PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
 
 /// `seq_fields` bit shifts inside `VAPictureParameterBufferH264`.
 pub const SEQ_CHROMA_FORMAT_IDC: u32 = 0;
@@ -313,6 +368,538 @@ pub struct VaConfigAttrib {
     pub value: u32,
 }
 
+/// HEVC reference picture descriptor.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaPictureHevc {
+    /// Reconstructed surface handle.
+    pub picture_id: VaSurfaceId,
+    /// Picture order count.
+    pub pic_order_cnt: i32,
+    /// `VA_PICTURE_HEVC_*` flags.
+    pub flags: u32,
+    /// Reserved, zero.
+    pub reserved: [u32; 4],
+}
+
+/// H.264 encode sequence-parameter buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaEncSequenceParameterBufferH264 {
+    /// Sequence set id.
+    pub seq_parameter_set_id: u8,
+    /// Level idc.
+    pub level_idc: u8,
+    /// Period between I frames.
+    pub intra_period: u32,
+    /// Period between IDR frames.
+    pub intra_idr_period: u32,
+    /// Period between I/P frames.
+    pub ip_period: u32,
+    /// Initial bitrate, CBR/VBR only.
+    pub bits_per_second: u32,
+    /// Maximum reference frames.
+    pub max_num_ref_frames: u32,
+    /// Picture width in macroblocks.
+    pub picture_width_in_mbs: u16,
+    /// Picture height in macroblocks.
+    pub picture_height_in_mbs: u16,
+    /// Packed sequence flags.
+    pub seq_fields: u32,
+    /// Luma bit depth, minus eight.
+    pub bit_depth_luma_minus8: u8,
+    /// Chroma bit depth, minus eight.
+    pub bit_depth_chroma_minus8: u8,
+    /// Reference frames in the order-count cycle.
+    pub num_ref_frames_in_pic_order_cnt_cycle: u8,
+    /// Non-reference order-count offset.
+    pub offset_for_non_ref_pic: i32,
+    /// Top-to-bottom order-count offset.
+    pub offset_for_top_to_bottom_field: i32,
+    /// Per-frame order-count offsets.
+    pub offset_for_ref_frame: [i32; 256],
+    /// Frame cropping flag.
+    pub frame_cropping_flag: u8,
+    /// Left crop offset.
+    pub frame_crop_left_offset: u32,
+    /// Right crop offset.
+    pub frame_crop_right_offset: u32,
+    /// Top crop offset.
+    pub frame_crop_top_offset: u32,
+    /// Bottom crop offset.
+    pub frame_crop_bottom_offset: u32,
+    /// VUI present flag.
+    pub vui_parameters_present_flag: u8,
+    /// Packed VUI flags.
+    pub vui_fields: u32,
+    /// Aspect-ratio idc.
+    pub aspect_ratio_idc: u8,
+    /// Sample aspect width.
+    pub sar_width: u32,
+    /// Sample aspect height.
+    pub sar_height: u32,
+    /// Ticks per frame numerator.
+    pub num_units_in_tick: u32,
+    /// Ticks per second.
+    pub time_scale: u32,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// H.264 encode picture-parameter buffer.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaEncPictureParameterBufferH264 {
+    /// Picture under encode, plus the scratch reconstruction surface.
+    pub curr_pic: VaPictureH264,
+    /// Decoded-picture-buffer contents.
+    pub reference_frames: [VaPictureH264; 16],
+    /// Coded-bitstream buffer.
+    pub coded_buf: VaBufferId,
+    /// Picture set id.
+    pub pic_parameter_set_id: u8,
+    /// Sequence set id.
+    pub seq_parameter_set_id: u8,
+    /// Last-picture flags.
+    pub last_picture: u8,
+    /// Picture frame number.
+    pub frame_num: u16,
+    /// Initial quantization.
+    pub pic_init_qp: u8,
+    /// Active list-0 references, minus one.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Active list-1 references, minus one.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// Cb quantization offset.
+    pub chroma_qp_index_offset: i8,
+    /// Cr quantization offset.
+    pub second_chroma_qp_index_offset: i8,
+    /// Packed picture flags.
+    pub pic_fields: u32,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// H.264 encode slice-parameter buffer.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaEncSliceParameterBufferH264 {
+    /// Starting macroblock address.
+    pub macroblock_address: u32,
+    /// Macroblock count in the slice.
+    pub num_macroblocks: u32,
+    /// Per-macroblock buffer, or invalid.
+    pub macroblock_info: VaBufferId,
+    /// Slice type.
+    pub slice_type: u8,
+    /// Picture set id.
+    pub pic_parameter_set_id: u8,
+    /// IDR id.
+    pub idr_pic_id: u16,
+    /// Order count modulo the lsb range.
+    pub pic_order_cnt_lsb: u16,
+    /// Bottom-field order delta.
+    pub delta_pic_order_cnt_bottom: i32,
+    /// Order-count deltas, top then bottom.
+    pub delta_pic_order_cnt: [i32; 2],
+    /// Direct-spatial-motion-prediction flag.
+    pub direct_spatial_mv_pred_flag: u8,
+    /// Reference-override flag.
+    pub num_ref_idx_active_override_flag: u8,
+    /// Active list-0 references, minus one.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Active list-1 references, minus one.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// List-0 reference pictures.
+    pub ref_pic_list0: [VaPictureH264; 32],
+    /// List-1 reference pictures.
+    pub ref_pic_list1: [VaPictureH264; 32],
+    /// Luma weight denominator.
+    pub luma_log2_weight_denom: u8,
+    /// Chroma weight denominator.
+    pub chroma_log2_weight_denom: u8,
+    /// List-0 luma weights present.
+    pub luma_weight_l0_flag: u8,
+    /// List-0 luma weights.
+    pub luma_weight_l0: [i16; 32],
+    /// List-0 luma offsets.
+    pub luma_offset_l0: [i16; 32],
+    /// List-0 chroma weights present.
+    pub chroma_weight_l0_flag: u8,
+    /// List-0 chroma weights.
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    /// List-0 chroma offsets.
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    /// List-1 luma weights present.
+    pub luma_weight_l1_flag: u8,
+    /// List-1 luma weights.
+    pub luma_weight_l1: [i16; 32],
+    /// List-1 luma offsets.
+    pub luma_offset_l1: [i16; 32],
+    /// List-1 chroma weights present.
+    pub chroma_weight_l1_flag: u8,
+    /// List-1 chroma weights.
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    /// List-1 chroma offsets.
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    /// CABAC init table index.
+    pub cabac_init_idc: u8,
+    /// Slice quantization delta.
+    pub slice_qp_delta: i8,
+    /// Deblocking-filter disable index.
+    pub disable_deblocking_filter_idc: u8,
+    /// Deblocking alpha offset, divided by two.
+    pub slice_alpha_c0_offset_div2: i8,
+    /// Deblocking beta offset, divided by two.
+    pub slice_beta_offset_div2: i8,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// HEVC encode sequence-parameter buffer.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaEncSequenceParameterBufferHevc {
+    /// General profile idc.
+    pub general_profile_idc: u8,
+    /// General level idc, thirty times the level.
+    pub general_level_idc: u8,
+    /// General tier flag.
+    pub general_tier_flag: u8,
+    /// Period between I frames.
+    pub intra_period: u32,
+    /// Period between IDR frames.
+    pub intra_idr_period: u32,
+    /// Period between I/P frames.
+    pub ip_period: u32,
+    /// Initial bitrate, CBR/VBR only.
+    pub bits_per_second: u32,
+    /// Picture width in luma samples.
+    pub pic_width_in_luma_samples: u16,
+    /// Picture height in luma samples.
+    pub pic_height_in_luma_samples: u16,
+    /// Packed sequence flags.
+    pub seq_fields: u32,
+    /// Minimum luma block size, minus three.
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    /// Block-size range.
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    /// Minimum transform size, minus two.
+    pub log2_min_transform_block_size_minus2: u8,
+    /// Transform-size range.
+    pub log2_diff_max_min_transform_block_size: u8,
+    /// Maximum inter hierarchy depth.
+    pub max_transform_hierarchy_depth_inter: u8,
+    /// Maximum intra hierarchy depth.
+    pub max_transform_hierarchy_depth_intra: u8,
+    /// PCM luma depth, minus one.
+    pub pcm_sample_bit_depth_luma_minus1: u32,
+    /// PCM chroma depth, minus one.
+    pub pcm_sample_bit_depth_chroma_minus1: u32,
+    /// Minimum PCM block size, minus three.
+    pub log2_min_pcm_luma_coding_block_size_minus3: u32,
+    /// Maximum PCM block size, minus three.
+    pub log2_max_pcm_luma_coding_block_size_minus3: u32,
+    /// VUI present flag.
+    pub vui_parameters_present_flag: u8,
+    /// Packed VUI flags.
+    pub vui_fields: u32,
+    /// Aspect-ratio idc.
+    pub aspect_ratio_idc: u8,
+    /// Sample aspect width.
+    pub sar_width: u32,
+    /// Sample aspect height.
+    pub sar_height: u32,
+    /// Ticks per frame numerator.
+    pub vui_num_units_in_tick: u32,
+    /// Ticks per second.
+    pub vui_time_scale: u32,
+    /// Minimum spatial segmentation idc.
+    pub min_spatial_segmentation_idc: u16,
+    /// Maximum bytes per picture denominator.
+    pub max_bytes_per_pic_denom: u8,
+    /// Maximum bits per block denominator.
+    pub max_bits_per_min_cu_denom: u8,
+    /// Packed screen-content flags.
+    pub scc_fields: u32,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 7],
+}
+
+/// HEVC encode picture-parameter buffer.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaEncPictureParameterBufferHevc {
+    /// Picture under encode, plus the scratch reconstruction surface.
+    pub decoded_curr_pic: VaPictureHevc,
+    /// Decoded-picture-buffer contents.
+    pub reference_frames: [VaPictureHevc; 15],
+    /// Coded-bitstream buffer.
+    pub coded_buf: VaBufferId,
+    /// Collocated reference index, or `0xFF` without temporal MVP.
+    pub collocated_ref_pic_index: u8,
+    /// Last-picture flags.
+    pub last_picture: u8,
+    /// Initial quantization.
+    pub pic_init_qp: u8,
+    /// CU QP delta depth.
+    pub diff_cu_qp_delta_depth: u8,
+    /// PPS Cb quantization offset.
+    pub pps_cb_qp_offset: i8,
+    /// PPS Cr quantization offset.
+    pub pps_cr_qp_offset: i8,
+    /// Tile columns, minus one.
+    pub num_tile_columns_minus1: u8,
+    /// Tile rows, minus one.
+    pub num_tile_rows_minus1: u8,
+    /// Tile column widths, minus one.
+    pub column_width_minus1: [u8; 19],
+    /// Tile row heights, minus one.
+    pub row_height_minus1: [u8; 21],
+    /// Parallel merge level, minus two.
+    pub log2_parallel_merge_level_minus2: u8,
+    /// CTU bit-size limit, zero for none.
+    pub ctu_max_bitsize_allowed: u8,
+    /// Default active list-0 references, minus one.
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    /// Default active list-1 references, minus one.
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    /// Picture set id for generated slice headers.
+    pub slice_pic_parameter_set_id: u8,
+    /// NAL unit type for generated slice headers.
+    pub nal_unit_type: u8,
+    /// Packed picture flags.
+    pub pic_fields: u32,
+    /// Hierarchical level, plus one.
+    pub hierarchical_level_plus1: u8,
+    /// Reserved, zero.
+    pub va_byte_reserved: u8,
+    /// Packed screen-content flags.
+    pub scc_fields: u16,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 15],
+}
+
+/// HEVC encode slice-parameter buffer.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaEncSliceParameterBufferHevc {
+    /// Starting CTU address.
+    pub slice_segment_address: u32,
+    /// CTU count in the slice.
+    pub num_ctu_in_slice: u32,
+    /// Slice type.
+    pub slice_type: u8,
+    /// Picture set id.
+    pub slice_pic_parameter_set_id: u8,
+    /// Active list-0 references, minus one.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Active list-1 references, minus one.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// List-0 reference pictures.
+    pub ref_pic_list0: [VaPictureHevc; 15],
+    /// List-1 reference pictures.
+    pub ref_pic_list1: [VaPictureHevc; 15],
+    /// Luma weight denominator.
+    pub luma_log2_weight_denom: u8,
+    /// Chroma weight denominator delta.
+    pub delta_chroma_log2_weight_denom: i8,
+    /// List-0 luma weight deltas.
+    pub delta_luma_weight_l0: [i8; 15],
+    /// List-0 luma offsets.
+    pub luma_offset_l0: [i8; 15],
+    /// List-0 chroma weight deltas.
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    /// List-0 chroma offsets.
+    pub chroma_offset_l0: [[i8; 2]; 15],
+    /// List-1 luma weight deltas.
+    pub delta_luma_weight_l1: [i8; 15],
+    /// List-1 luma offsets.
+    pub luma_offset_l1: [i8; 15],
+    /// List-1 chroma weight deltas.
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    /// List-1 chroma offsets.
+    pub chroma_offset_l1: [[i8; 2]; 15],
+    /// Maximum merge candidates.
+    pub max_num_merge_cand: u8,
+    /// Slice quantization delta.
+    pub slice_qp_delta: i8,
+    /// Slice Cb quantization offset.
+    pub slice_cb_qp_offset: i8,
+    /// Slice Cr quantization offset.
+    pub slice_cr_qp_offset: i8,
+    /// Slice beta offset, divided by two.
+    pub slice_beta_offset_div2: i8,
+    /// Slice Tc offset, divided by two.
+    pub slice_tc_offset_div2: i8,
+    /// Packed slice flags.
+    pub slice_fields: u32,
+    /// Weight-table bit offset in the packed header.
+    pub pred_weight_table_bit_offset: u32,
+    /// Weight-table bit length in the packed header.
+    pub pred_weight_table_bit_length: u32,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 6],
+}
+
+/// Encode packed-header parameter buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaEncPackedHeaderParameterBuffer {
+    /// Packed header type.
+    pub header_type: u32,
+    /// Data-buffer size in bits.
+    pub bit_length: u32,
+    /// Data holds emulation-prevention bytes.
+    pub has_emulation_bytes: u8,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// Coded-buffer segment: one link of the encode output list.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaCodedBufferSegment {
+    /// Data bytes in this segment.
+    pub size: u32,
+    /// Bit offset of the video data.
+    pub bit_offset: u32,
+    /// Driver status flags.
+    pub status: u32,
+    /// Reserved, zero.
+    pub reserved: u32,
+    /// Segment data.
+    pub buf: *mut c_void,
+    /// Next segment, or null.
+    pub next: *mut c_void,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// DRM PRIME object: one exported file descriptor.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaDrmPrimeObject {
+    /// PRIME file descriptor, owned by the caller.
+    pub fd: c_int,
+    /// Object size in bytes.
+    pub size: u32,
+    /// Format modifier.
+    pub drm_format_modifier: u64,
+}
+
+/// DRM PRIME layer: one exported plane set.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaDrmPrimeLayer {
+    /// DRM format fourcc.
+    pub drm_format: u32,
+    /// Plane count in this layer.
+    pub num_planes: u32,
+    /// Object index per plane.
+    pub object_index: [u32; 4],
+    /// Byte offset per plane.
+    pub offset: [u32; 4],
+    /// Row pitch per plane.
+    pub pitch: [u32; 4],
+}
+
+/// DRM PRIME version-two surface descriptor.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaDrmPrimeDescriptor {
+    /// Surface fourcc.
+    pub fourcc: u32,
+    /// Surface width in samples.
+    pub width: u32,
+    /// Surface height in samples.
+    pub height: u32,
+    /// Object count.
+    pub num_objects: u32,
+    /// Exported objects.
+    pub objects: [VaDrmPrimeObject; 4],
+    /// Layer count.
+    pub num_layers: u32,
+    /// Exported layers.
+    pub layers: [VaDrmPrimeLayer; 4],
+}
+
+/// Video-processing color properties.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaProcColorProperties {
+    /// Chroma sample location.
+    pub chroma_sample_location: u8,
+    /// Color range.
+    pub color_range: u8,
+    /// Colour primaries.
+    pub colour_primaries: u8,
+    /// Transfer characteristics.
+    pub transfer_characteristics: u8,
+    /// Matrix coefficients.
+    pub matrix_coefficients: u8,
+    /// Reserved, zero.
+    pub reserved: [u8; 3],
+}
+
+/// Video-processing pipeline-parameter buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaProcPipelineParameterBuffer {
+    /// Source surface.
+    pub surface: VaSurfaceId,
+    /// Source region, null for the whole surface.
+    pub surface_region: *const c_void,
+    /// Requested input color standard.
+    pub surface_color_standard: c_int,
+    /// Output region, null for the whole surface.
+    pub output_region: *const c_void,
+    /// Background fill color.
+    pub output_background_color: u32,
+    /// Requested output color standard.
+    pub output_color_standard: c_int,
+    /// Pipeline flags.
+    pub pipeline_flags: u32,
+    /// Filter flags.
+    pub filter_flags: u32,
+    /// Filter buffers.
+    pub filters: *mut VaBufferId,
+    /// Filter count.
+    pub num_filters: u32,
+    /// Forward references.
+    pub forward_references: *mut VaSurfaceId,
+    /// Forward-reference count.
+    pub num_forward_references: u32,
+    /// Backward references.
+    pub backward_references: *mut VaSurfaceId,
+    /// Backward-reference count.
+    pub num_backward_references: u32,
+    /// Rotation state.
+    pub rotation_state: u32,
+    /// Blend state, null for none.
+    pub blend_state: *const c_void,
+    /// Mirror state.
+    pub mirror_state: u32,
+    /// Additional outputs.
+    pub additional_outputs: *mut VaSurfaceId,
+    /// Additional-output count.
+    pub num_additional_outputs: u32,
+    /// Input surface flags.
+    pub input_surface_flag: u32,
+    /// Output surface flags.
+    pub output_surface_flag: u32,
+    /// Input color properties.
+    pub input_color_properties: VaProcColorProperties,
+    /// Output color properties.
+    pub output_color_properties: VaProcColorProperties,
+    /// Processing mode.
+    pub processing_mode: c_int,
+    /// Output HDR metadata, null for SDR.
+    pub output_hdr_metadata: *mut c_void,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 16],
+}
+
 #[link(name = "va")]
 #[link(name = "va-drm")]
 unsafe extern "C" {
@@ -423,6 +1010,47 @@ unsafe extern "C" {
     pub fn vaMapBuffer(dpy: VaDisplay, buffer: VaBufferId, data: *mut *mut c_void) -> VaStatus;
     /// Unmap `buffer`.
     pub fn vaUnmapBuffer(dpy: VaDisplay, buffer: VaBufferId) -> VaStatus;
+    /// Static text for `status`.
+    pub fn vaStatusStr(status: VaStatus) -> *const c_char;
+    /// Export `surface` into `descriptor` for `mem_type`.
+    pub fn vaExportSurfaceHandle(
+        dpy: VaDisplay,
+        surface: VaSurfaceId,
+        mem_type: c_uint,
+        flags: c_uint,
+        descriptor: *mut c_void,
+    ) -> VaStatus;
+    /// Image-format-list capacity.
+    pub fn vaMaxNumImageFormats(dpy: VaDisplay) -> c_int;
+    /// Image formats supported by `dpy`.
+    pub fn vaQueryImageFormats(
+        dpy: VaDisplay,
+        formats: *mut VaImageFormat,
+        count: *mut c_int,
+    ) -> VaStatus;
+    /// Image of `format` at `width` x `height`.
+    pub fn vaCreateImage(
+        dpy: VaDisplay,
+        format: *mut VaImageFormat,
+        width: c_int,
+        height: c_int,
+        image: *mut VaImage,
+    ) -> VaStatus;
+    /// Copy `image` onto `surface`, scaled to the destination rectangle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vaPutImage(
+        dpy: VaDisplay,
+        surface: VaSurfaceId,
+        image: VaImageId,
+        src_x: c_int,
+        src_y: c_int,
+        src_width: c_uint,
+        src_height: c_uint,
+        dest_x: c_int,
+        dest_y: c_int,
+        dest_width: c_uint,
+        dest_height: c_uint,
+    ) -> VaStatus;
 }
 
 #[cfg(test)]
@@ -470,5 +1098,44 @@ mod tests {
         use super::VaConfigAttrib;
 
         assert_eq!(size_of::<VaConfigAttrib>(), 8);
+    }
+
+    #[test]
+    fn encode_layouts_match_libva() {
+        use super::{
+            VaEncPackedHeaderParameterBuffer, VaEncPictureParameterBufferH264,
+            VaEncPictureParameterBufferHevc, VaEncSequenceParameterBufferH264,
+            VaEncSequenceParameterBufferHevc, VaEncSliceParameterBufferH264,
+            VaEncSliceParameterBufferHevc, VaPictureHevc,
+        };
+
+        assert_eq!(size_of::<VaPictureHevc>(), 28);
+        assert_eq!(size_of::<VaEncSequenceParameterBufferH264>(), 1132);
+        assert_eq!(size_of::<VaEncPictureParameterBufferH264>(), 648);
+        assert_eq!(size_of::<VaEncSliceParameterBufferH264>(), 3140);
+        assert_eq!(size_of::<VaEncSequenceParameterBufferHevc>(), 116);
+        assert_eq!(size_of::<VaEncPictureParameterBufferHevc>(), 576);
+        assert_eq!(size_of::<VaEncSliceParameterBufferHevc>(), 1076);
+        assert_eq!(size_of::<VaEncPackedHeaderParameterBuffer>(), 28);
+    }
+
+    #[test]
+    fn export_layouts_match_libva() {
+        use super::{
+            VaCodedBufferSegment, VaDrmPrimeDescriptor, VaDrmPrimeLayer, VaDrmPrimeObject,
+        };
+
+        assert_eq!(size_of::<VaCodedBufferSegment>(), 48);
+        assert_eq!(size_of::<VaDrmPrimeObject>(), 16);
+        assert_eq!(size_of::<VaDrmPrimeLayer>(), 56);
+        assert_eq!(size_of::<VaDrmPrimeDescriptor>(), 312);
+    }
+
+    #[test]
+    fn vpp_layout_matches_libva() {
+        use super::{VaProcColorProperties, VaProcPipelineParameterBuffer};
+
+        assert_eq!(size_of::<VaProcColorProperties>(), 8);
+        assert_eq!(size_of::<VaProcPipelineParameterBuffer>(), 224);
     }
 }

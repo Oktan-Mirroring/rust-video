@@ -1,8 +1,8 @@
-//! Minimal MP4 demux for H.264 test vectors: video samples as Annex B.
+//! Minimal MP4 demux for H.264/H.265 test vectors: video samples as Annex B.
 
 use std::path::Path;
 
-/// H.264 stream: samples in decode order with sets injected at IDRs.
+/// Video stream: samples in decode order with sets injected at IDRs.
 pub struct Stream {
     /// Samples in decode order, Annex B with start codes.
     pub samples: Vec<Vec<u8>>,
@@ -117,7 +117,7 @@ impl<'a> Demux<'a> {
         while let Some(play) = reader.next_box()? {
             match &play.fourcc {
                 b"stsd" => {
-                    (track.length_size, track.extradata) = Self::avcc(play.payload)?;
+                    (track.length_size, track.extradata, track.hevc) = Self::config(play.payload)?;
                     found = true;
                 }
                 b"stsc" => track.chunks = Self::chunk_runs(play.payload)?,
@@ -129,7 +129,7 @@ impl<'a> Demux<'a> {
             }
         }
         if !found {
-            return Err("video track without avc1".to_owned());
+            return Err("video track without avc1/hvc1/hev1".to_owned());
         }
         if track.offsets.len() != track.chunk_count() {
             return Err("chunk table mismatch".to_owned());
@@ -137,20 +137,26 @@ impl<'a> Demux<'a> {
         Ok(track)
     }
 
-    /// NAL length size and extradata sets from `stsd`.
-    fn avcc(stsd: &[u8]) -> Result<(usize, Vec<u8>), String> {
+    /// NAL length size, extradata sets, and HEVC flag from `stsd`.
+    fn config(stsd: &[u8]) -> Result<(usize, Vec<u8>, bool), String> {
         let mut reader = Reader::new(stsd.get(8..).ok_or("short stsd")?);
         let entry = reader.next_box()?.ok_or("stsd without entry")?;
-        if entry.fourcc != *b"avc1" {
-            return Err("video entry not avc1".to_owned());
+        let hevc = matches!(&entry.fourcc, b"hvc1" | b"hev1");
+        if entry.fourcc != *b"avc1" && !hevc {
+            return Err("video entry not avc1/hvc1/hev1".to_owned());
         }
-        let mut reader = Reader::new(entry.payload.get(78..).ok_or("short avc1")?);
+        let mut reader = Reader::new(entry.payload.get(78..).ok_or("short entry")?);
         while let Some(play) = reader.next_box()? {
             if play.fourcc == *b"avcC" {
-                return Self::avcc_config(play.payload);
+                let (length_size, extradata) = Self::avcc_config(play.payload)?;
+                return Ok((length_size, extradata, false));
+            }
+            if play.fourcc == *b"hvcC" {
+                let (length_size, extradata) = Self::hvcc_config(play.payload)?;
+                return Ok((length_size, extradata, true));
             }
         }
-        Err("avc1 without avcC".to_owned())
+        Err("entry without avcC/hvcC".to_owned())
     }
 
     /// NAL length size and extradata sets from `avcC`.
@@ -173,6 +179,30 @@ impl<'a> Demux<'a> {
             let len = reader.u16()? as usize;
             extradata.extend_from_slice(&[0, 0, 0, 1]);
             extradata.extend_from_slice(reader.bytes(len)?);
+        }
+        Ok((length_size, extradata))
+    }
+
+    /// NAL length size and extradata sets from `hvcC`.
+    fn hvcc_config(hvcc: &[u8]) -> Result<(usize, Vec<u8>), String> {
+        let mut reader = Reader::new(hvcc);
+        let _version = reader.u8()?;
+        let _profile = reader.u8()?;
+        let _compat = reader.bytes(4)?;
+        let _constraints = reader.bytes(6)?;
+        let _level = reader.u8()?;
+        let _packings = reader.bytes(8)?;
+        let length_size = usize::from(reader.u8()? & 0x03) + 1;
+        let arrays = reader.u8()?;
+        let mut extradata = Vec::new();
+        for _ in 0..arrays {
+            let _header = reader.u8()?;
+            let count = reader.u16()?;
+            for _ in 0..count {
+                let len = reader.u16()? as usize;
+                extradata.extend_from_slice(&[0, 0, 0, 1]);
+                extradata.extend_from_slice(reader.bytes(len)?);
+            }
         }
         Ok((length_size, extradata))
     }
@@ -225,10 +255,12 @@ impl<'a> Demux<'a> {
 /// Video sample table.
 #[derive(Default)]
 struct Track {
-    /// AVCC NAL length in bytes.
+    /// NAL length in bytes.
     length_size: usize,
     /// Extradata sets with start codes.
     extradata: Vec<u8>,
+    /// HEVC NAL headers, not H.264.
+    hevc: bool,
     /// `(first_chunk_1based, samples_per_chunk)` runs.
     chunks: Vec<(usize, usize)>,
     /// Sample sizes in decode order.
@@ -294,7 +326,7 @@ impl Track {
                 len = len * 256 + usize::from(*byte);
             }
             let body = sample.get(end..end + len).ok_or("short nal body")?;
-            if !*injected && body.first().is_some_and(|header| header & 0x1f == 5) {
+            if !*injected && self.is_idr(body) {
                 out.extend_from_slice(&self.extradata);
                 *injected = true;
             }
@@ -309,6 +341,18 @@ impl Track {
             return Ok(headed);
         }
         Ok(out)
+    }
+
+    /// True when `body` opens a random access point.
+    fn is_idr(&self, body: &[u8]) -> bool {
+        let Some(header) = body.first() else {
+            return false;
+        };
+        if self.hevc {
+            matches!((header >> 1) & 0x3f, 16..=23)
+        } else {
+            header & 0x1f == 5
+        }
     }
 }
 
@@ -447,5 +491,36 @@ mod tests {
         assert!(track
             .sample_annex_b(&[0, 0, 0, 9, 0x67], false, &mut true)
             .is_err());
+    }
+
+    #[test]
+    fn hvcc_reports_length_and_sets() {
+        let mut hvcc = vec![1, 1, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 90];
+        hvcc.extend_from_slice(&[0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8, 0, 0]);
+        hvcc.push(0x0F);
+        hvcc.push(1);
+        hvcc.push(0xA0);
+        hvcc.extend_from_slice(&[0, 1, 0, 2, 0x42, 0x01]);
+        let (length_size, extradata) = super::Demux::hvcc_config(&hvcc).expect("hvcc");
+        assert_eq!(length_size, 4);
+        assert_eq!(extradata, vec![0, 0, 0, 1, 0x42, 0x01]);
+    }
+
+    #[test]
+    fn annex_b_injects_sets_before_hevc_irap() {
+        let track = Track {
+            length_size: 4,
+            extradata: vec![0, 0, 0, 1, 0x42],
+            hevc: true,
+            ..Track::default()
+        };
+        let sample = [0, 0, 0, 2, 0x02, 0x01, 0, 0, 0, 2, 0x26, 0x01];
+        let annex_b = track
+            .sample_annex_b(&sample, false, &mut false)
+            .expect("convert");
+        assert_eq!(
+            annex_b,
+            vec![0, 0, 0, 1, 0x02, 0x01, 0, 0, 0, 1, 0x42, 0, 0, 0, 1, 0x26, 0x01]
+        );
     }
 }

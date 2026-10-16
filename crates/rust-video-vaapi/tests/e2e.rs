@@ -6,15 +6,23 @@
 #[path = "support/mp4.rs"]
 mod mp4;
 
+#[path = "../examples/common/synth.rs"]
+mod synth;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use bytes::Bytes;
-use rust_video_caps::frame::PixelFormat;
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{GpuExport, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Device};
+use rust_video_caps::traits::{Decoder, Device, Encoder};
+use rust_video_caps::transcode::Route;
 use rust_video_harness::FrameHash;
-use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaApiFrame};
+use rust_video_vaapi::{
+    EncodeCodec, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder, VaApiError,
+    VaApiFrame,
+};
 
 /// Corpus root: `$RUST_VIDEO_CORPUS` or the checkout's `corpus/`.
 fn corpus() -> PathBuf {
@@ -29,11 +37,11 @@ fn corpus() -> PathBuf {
     )
 }
 
-/// Scratch dir for ffmpeg oracle output, removed after each oracle run.
-fn scratch() -> PathBuf {
+/// Scratch dir for one ffmpeg oracle run, removed after it.
+fn scratch(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../.tmp")
-        .join(format!("vaapi-e2e-{}", std::process::id()))
+        .join(format!("vaapi-e2e-{}-{name}", std::process::id()))
 }
 
 /// NAL units of Annex B `bytes`, start codes stripped.
@@ -69,10 +77,10 @@ fn annex_b(stream: &mp4::Stream) -> Vec<u8> {
     out
 }
 
-/// ffmpeg remux of `path` to Annex B, or `None` without ffmpeg.
-fn ffmpeg_remux(path: &Path, scratch: &Path) -> Option<Vec<u8>> {
+/// ffmpeg remux of `path` to Annex B `ext`, or `None` without ffmpeg.
+fn ffmpeg_remux(path: &Path, scratch: &Path, ext: &str) -> Option<Vec<u8>> {
     std::fs::create_dir_all(scratch).ok()?;
-    let out = scratch.join("remux.h264");
+    let out = scratch.join(format!("remux.{ext}"));
     let status = Command::new("ffmpeg")
         .arg("-v")
         .arg("error")
@@ -95,9 +103,15 @@ fn ffmpeg_remux(path: &Path, scratch: &Path) -> Option<Vec<u8>> {
 }
 
 /// ffmpeg software decode of `path` as planar hashes, or `None` without ffmpeg.
-fn ffmpeg_hashes(path: &Path, scratch: &Path, width: u32, height: u32) -> Option<Vec<String>> {
+fn ffmpeg_hashes(
+    path: &Path,
+    scratch: &Path,
+    name: &str,
+    width: u32,
+    height: u32,
+) -> Option<Vec<String>> {
     std::fs::create_dir_all(scratch).ok()?;
-    let out = scratch.join("oracle.yuv");
+    let out = scratch.join(format!("{name}.yuv"));
     let status = Command::new("ffmpeg")
         .arg("-v")
         .arg("error")
@@ -199,7 +213,7 @@ fn demux_matches_ffmpeg_remux() {
     assert_eq!(stream.samples.len(), 60);
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x67)));
-    let Some(remux) = ffmpeg_remux(&path, &scratch()) else {
+    let Some(remux) = ffmpeg_remux(&path, &scratch("remux264"), "h264") else {
         skip("ffmpeg remux oracle (install ffmpeg)");
         return;
     };
@@ -231,7 +245,7 @@ fn vaapi_decodes_synth_high() {
         assert_eq!(nv12.len(), 1920 * 1080 * 3 / 2, "frame {index}");
         hashes.push(FrameHash::of(&to_planar(nv12, 1920, 1080)).hex());
     }
-    let Some(expected) = ffmpeg_hashes(&path, &scratch(), 1920, 1080) else {
+    let Some(expected) = ffmpeg_hashes(&path, &scratch("decode264"), "oracle", 1920, 1080) else {
         skip("ffmpeg decode oracle (install ffmpeg)");
         return;
     };
@@ -256,4 +270,206 @@ fn vaapi_declines_high_chroma() {
             Ok(_) => panic!("{name}: expected unsupported chroma, decoded"),
         }
     }
+}
+
+#[test]
+fn demux_matches_ffmpeg_remux_h265() {
+    let path = corpus().join("synth/h265/h265-main.mp4");
+    let stream = mp4::demux(&path).expect("demux synth main");
+    assert_eq!(stream.samples.len(), 60);
+    let first = nal_units(&stream.samples[0]);
+    assert!(first.iter().any(|nal| nal.first() == Some(&0x40)));
+    let Some(remux) = ffmpeg_remux(&path, &scratch("remux265"), "h265") else {
+        skip("ffmpeg remux oracle (install ffmpeg)");
+        return;
+    };
+    let blob = annex_b(&stream);
+    let ours = nal_units(&blob);
+    let theirs = nal_units(&remux);
+    assert_eq!(ours.len(), theirs.len(), "nal unit count");
+    for (index, (left, right)) in ours.iter().zip(theirs.iter()).enumerate() {
+        assert_eq!(left, right, "nal unit {index}");
+    }
+}
+
+#[test]
+fn h265_frontend_gap_is_loud() {
+    let path = corpus().join("synth/h265/h265-main.mp4");
+    let stream = mp4::demux(&path).expect("demux synth main");
+    assert!(!stream.samples.is_empty());
+    let mut decoder = H265Decoder;
+    let packet = Packet::new(Bytes::copy_from_slice(&stream.samples[0]));
+    let Err(VaApiError::Unsupported(message)) = decoder.decode(&packet) else {
+        panic!("staged frontend declines");
+    };
+    assert!(message.contains("h265"), "loud codec name: {message}");
+}
+
+#[test]
+fn vaapi_exports_dmabuf() {
+    let Some(device) = device() else {
+        return;
+    };
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut decoder = H264Decoder::open(&device);
+    let mut exported = 0;
+    for sample in stream.samples.iter().take(4) {
+        let frames = decoder
+            .decode_surface(&Packet::new(Bytes::copy_from_slice(sample)))
+            .expect("va-api decode");
+        for (index, frame) in frames.iter().enumerate() {
+            assert!(
+                matches!(frame.export(), GpuExport::DmaBuf { .. }),
+                "frame {index} exports dmabuf"
+            );
+            exported += 1;
+        }
+    }
+    let frames = decoder.flush_surface().expect("flush");
+    for (index, frame) in frames.iter().enumerate() {
+        assert!(
+            matches!(frame.export(), GpuExport::DmaBuf { .. }),
+            "flushed frame {index} exports dmabuf"
+        );
+        exported += 1;
+    }
+    assert!(exported > 0);
+}
+
+/// First NAL header byte of Annex B `bytes`.
+fn first_nal_header(bytes: &[u8]) -> u8 {
+    let units = nal_units(bytes);
+    units
+        .first()
+        .and_then(|nal| nal.first())
+        .copied()
+        .expect("one nal")
+}
+
+#[test]
+fn vaapi_encodes_h264_all_intra() {
+    let Some(device) = device() else {
+        return;
+    };
+    let size = PictureSize::new(320, 240).expect("synth size");
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+        Ok(encoder) => encoder,
+        Err(VaApiError::Unsupported(message)) => {
+            skip(&format!("h264 encode entrypoint ({message})"));
+            return;
+        }
+        Err(error) => panic!("unexpected encode failure: {error}"),
+    };
+    let mut annex_b = Vec::new();
+    let mut coded = 0;
+    for index in 0..8 {
+        let frame = synth::frame(size, index);
+        for packet in encoder.encode(&frame).expect("encode") {
+            assert!(packet.is_keyframe(), "all-intra keyframe");
+            annex_b.extend_from_slice(packet.data());
+            coded += 1;
+        }
+    }
+    for packet in encoder.flush().expect("flush") {
+        annex_b.extend_from_slice(packet.data());
+        coded += 1;
+    }
+    assert_eq!(coded, 8);
+    assert_eq!(first_nal_header(&annex_b) & 0x1f, 7, "sps first");
+    let mut decoder = H264Decoder::open(&device);
+    let mut frames = decoder
+        .decode(&Packet::new(Bytes::from(annex_b.clone())))
+        .expect("self decode");
+    frames.extend(decoder.flush().expect("self flush"));
+    assert_eq!(frames.len(), coded);
+    let mut hashes = Vec::with_capacity(frames.len());
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.identity().size(), size, "frame {index}");
+        hashes.push(FrameHash::of(&to_planar(frame.nv12(), 320, 240)).hex());
+    }
+    let dir = scratch("encode264");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let coded_path = dir.join("coded.h264");
+    std::fs::write(&coded_path, &annex_b).expect("coded stream");
+    let Some(expected) = ffmpeg_hashes(&coded_path, &dir, "oracle", 320, 240) else {
+        skip("ffmpeg decode oracle (install ffmpeg)");
+        return;
+    };
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(hashes.len(), expected.len(), "frame count");
+    for (index, (left, right)) in hashes.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(left, right, "frame {index}");
+    }
+}
+
+#[test]
+fn vaapi_encodes_h265_keyframes() {
+    let Some(device) = device() else {
+        return;
+    };
+    let size = PictureSize::new(320, 240).expect("synth size");
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
+        Ok(encoder) => encoder,
+        Err(VaApiError::Unsupported(message)) => {
+            skip(&format!("h265 encode entrypoint ({message})"));
+            return;
+        }
+        Err(error) => panic!("unexpected encode failure: {error}"),
+    };
+    let mut annex_b = Vec::new();
+    let mut coded = 0;
+    for index in 0..4 {
+        let frame = synth::frame(size, index);
+        for packet in encoder.encode(&frame).expect("encode") {
+            assert!(packet.is_keyframe(), "all-intra keyframe");
+            assert!(!packet.data().is_empty());
+            annex_b.extend_from_slice(packet.data());
+            coded += 1;
+        }
+    }
+    for packet in encoder.flush().expect("flush") {
+        annex_b.extend_from_slice(packet.data());
+        coded += 1;
+    }
+    assert_eq!(coded, 4);
+    assert_eq!((first_nal_header(&annex_b) >> 1) & 0x3f, 32, "vps first");
+    let dir = scratch("encode265");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let coded_path = dir.join("coded.h265");
+    std::fs::write(&coded_path, &annex_b).expect("coded stream");
+    let Some(expected) = ffmpeg_hashes(&coded_path, &dir, "oracle", 320, 240) else {
+        skip("ffmpeg decode oracle (install ffmpeg)");
+        return;
+    };
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(expected.len(), coded, "ffmpeg frame count");
+}
+
+#[test]
+fn vaapi_transcodes_on_device() {
+    let Some(device) = device() else {
+        return;
+    };
+    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264);
+    if !transcoder.caps().ready() {
+        skip("transcode export+encode caps");
+        return;
+    }
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut coded = 0;
+    for sample in &stream.samples {
+        let outcome = transcoder
+            .transcode(&Packet::new(Bytes::copy_from_slice(sample)))
+            .expect("transcode");
+        assert_eq!(outcome.plan().route(), Route::Gpu);
+        for packet in outcome.packets() {
+            assert!(packet.is_keyframe(), "all-intra keyframe");
+            coded += 1;
+        }
+    }
+    let outcome = transcoder.flush().expect("flush");
+    coded += outcome.packets().len();
+    assert_eq!(coded, stream.samples.len());
 }

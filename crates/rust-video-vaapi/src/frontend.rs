@@ -12,6 +12,8 @@ use crate::h264::dpb::{Dpb, ReferencePicLists};
 use crate::h264::parser::{MaxLongTermFrameIdx, Nalu, NaluType, Parser, Pps, SliceHeader, Sps};
 use crate::h264::picture::{Field, IsIdr, PictureData, Reference};
 
+use bytes::Bytes;
+
 /// DPB surface slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SurfaceSlot {
@@ -39,7 +41,7 @@ pub struct PendingSlice {
     /// Parsed slice header.
     header: SliceHeader,
     /// NAL bytes past the start code, header byte included.
-    data: Vec<u8>,
+    data: Bytes,
 }
 
 impl PendingSlice {
@@ -254,11 +256,13 @@ impl Frontend {
 
     /// Pictures finished by Annex B `bytes`.
     ///
+    /// Slice payloads sub-slice `bytes` without copying.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when a NAL fails to parse or names an unknown
     /// parameter set.
-    pub fn ingest(&mut self, bytes: &[u8]) -> Result<Ingest, VaApiError> {
+    pub fn ingest(&mut self, bytes: &Bytes) -> Result<Ingest, VaApiError> {
         let mut out = Ingest {
             pictures: Vec::new(),
             drained: Vec::new(),
@@ -266,7 +270,7 @@ impl Frontend {
             drained_size: None,
             drained_crop: None,
         };
-        let mut cursor = Cursor::new(bytes);
+        let mut cursor = Cursor::new(bytes.as_ref());
         loop {
             let Ok(nalu) = Nalu::next(&mut cursor) else {
                 if Self::start_code_ahead(&cursor) {
@@ -284,7 +288,7 @@ impl Frontend {
                     self.parser.parse_pps(&nalu).map_err(VaApiError::Parse)?;
                 }
                 NaluType::Slice | NaluType::SliceIdr => {
-                    self.ingest_slice(nalu, &mut out.pictures)?;
+                    self.ingest_slice(nalu, bytes, &mut out.pictures)?;
                 }
                 NaluType::SliceDpa | NaluType::SliceDpb | NaluType::SliceDpc => {
                     return Err(VaApiError::Unsupported("slice partitions".to_owned()));
@@ -363,6 +367,7 @@ impl Frontend {
     fn ingest_slice(
         &mut self,
         nalu: Nalu<'_>,
+        bytes: &Bytes,
         pictures: &mut Vec<PendingPicture>,
     ) -> Result<(), VaApiError> {
         let ref_idc = nalu.header.ref_idc;
@@ -398,9 +403,14 @@ impl Frontend {
             self.pending_sets = Some((sps, pps));
             self.pending_flags = Some((ref_idc, is_idr));
         }
+        let payload = slice.nalu.as_ref();
+        let base = bytes.as_ptr() as usize;
+        let offset = payload.as_ptr() as usize - base;
+        debug_assert!(offset + payload.len() <= bytes.len());
+        let data = bytes.slice(offset..offset + payload.len());
         self.pending.push(PendingSlice {
             header: slice.header,
-            data: slice.nalu.as_ref().to_vec(),
+            data,
         });
         Ok(())
     }
@@ -474,20 +484,21 @@ impl Frontend {
         ))
     }
 
-    /// Reference lists for one slice: initial lists plus 8.2.4.3 modification.
+    /// Reference lists for one slice, rebuilt in `out` without allocating.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a modification command names a picture the
     /// DPB cannot supply, or uses multiview commands.
-    pub fn modify(
+    pub fn modify_into(
         &self,
         header: &SliceHeader,
         initial: &[usize],
         second: bool,
         curr_pic_num: i32,
         max_pic_num: i32,
-    ) -> Result<Vec<usize>, VaApiError> {
+        out: &mut Vec<usize>,
+    ) -> Result<(), VaApiError> {
         let (flag, active, mods) = if second {
             (
                 header.list_modification.l1,
@@ -501,9 +512,10 @@ impl Frontend {
                 &header.ref_pic_list_modification_l0,
             )
         };
-        let mut list: Vec<usize> = initial.iter().copied().take(active as usize + 1).collect();
+        out.clear();
+        out.extend(initial.iter().copied().take(active as usize + 1));
         if !flag {
-            return Ok(list);
+            return Ok(());
         }
         let mut pred = curr_pic_num;
         let mut ref_idx = 0usize;
@@ -546,7 +558,7 @@ impl Frontend {
                         .ok_or_else(|| {
                             VaApiError::BrokenReference(format!("short-term {num} absent"))
                         })?;
-                    Self::shift_insert(&mut list, ref_idx, position, active, |index| {
+                    Self::shift_insert(out, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
                             .pic
                             .borrow()
@@ -570,7 +582,7 @@ impl Frontend {
                             VaApiError::BrokenReference(format!("long-term {num} absent"))
                         })?;
                     let cap = self.max_long_term_frame_idx;
-                    Self::shift_insert(&mut list, ref_idx, position, active, |index| {
+                    Self::shift_insert(out, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
                             .pic
                             .borrow()
@@ -585,8 +597,8 @@ impl Frontend {
                 }
             }
         }
-        list.truncate(active as usize + 1);
-        Ok(list)
+        out.truncate(active as usize + 1);
+        Ok(())
     }
 
     /// Mark, store, and bump `picture` on `slot`, returning output slots.
@@ -1350,8 +1362,9 @@ mod tests {
             ],
             ..SliceHeader::default()
         };
-        let list = frontend
-            .modify(&header, &initial, false, 7, 16)
+        let mut list = Vec::new();
+        frontend
+            .modify_into(&header, &initial, false, 7, 16, &mut list)
             .expect("reorder");
         assert_eq!(list, vec![1, 0]);
     }
@@ -1371,8 +1384,9 @@ mod tests {
             }],
             ..SliceHeader::default()
         };
+        let mut list = Vec::new();
         assert!(matches!(
-            frontend.modify(&header, &[0, 1], false, 7, 16),
+            frontend.modify_into(&header, &[0, 1], false, 7, 16, &mut list),
             Err(VaApiError::BrokenReference(_))
         ));
     }

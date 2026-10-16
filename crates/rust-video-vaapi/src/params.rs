@@ -122,7 +122,8 @@ impl<'a> Params<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when a listed reference lost its surface.
+    /// Returns `Err` when a listed reference lost its surface, or when a
+    /// corrupt slice size falls outside the parameter range.
     pub fn slice(
         &self,
         header: &SliceHeader,
@@ -133,12 +134,15 @@ impl<'a> Params<'a> {
         pps: &Pps,
     ) -> Result<VaSliceParameterBufferH264, VaApiError> {
         let weights = Weights::new(header, sps, pps);
+        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
         Ok(VaSliceParameterBufferH264 {
-            slice_data_size: u32::try_from(data_len).unwrap_or(u32::MAX),
+            slice_data_size: u32::try_from(data_len).map_err(|_| range("data size"))?,
             slice_data_offset: 0,
             slice_data_flag: crate::ffi::VA_SLICE_DATA_FLAG_ALL,
-            slice_data_bit_offset: u16::try_from(header.header_bit_size).unwrap_or(u16::MAX),
-            first_mb_in_slice: u16::try_from(header.first_mb_in_slice).unwrap_or(u16::MAX),
+            slice_data_bit_offset: u16::try_from(header.header_bit_size)
+                .map_err(|_| range("bit offset"))?,
+            first_mb_in_slice: u16::try_from(header.first_mb_in_slice)
+                .map_err(|_| range("first macroblock"))?,
             slice_type: header.slice_type as u8,
             direct_spatial_mv_pred_flag: u8::from(header.direct_spatial_mv_pred_flag),
             num_ref_idx_l0_active_minus1: header.num_ref_idx_l0_active_minus1,
@@ -572,5 +576,27 @@ mod tests {
             crate::ffi::VA_PICTURE_H264_INVALID
         );
         assert_eq!(raw.slice_data_size, 64);
+    }
+
+    #[test]
+    fn slice_rejects_corrupt_sizes() {
+        let sps = sps();
+        let pps = PpsBuilder::new(sps.clone()).build();
+        let dpb: Dpb<SurfaceSlot> = Dpb::default();
+        let params = Params::new(&dpb, &[7]);
+        let header = SliceHeader {
+            header_bit_size: usize::from(u16::MAX) + 1,
+            ..SliceHeader::default()
+        };
+        assert!(matches!(
+            params.slice(&header, 64, &[], &[], &sps, &pps),
+            Err(VaApiError::Parse(_))
+        ));
+        let header = SliceHeader::default();
+        let huge = usize::try_from(u64::from(u32::MAX) + 1).expect("test size");
+        assert!(matches!(
+            params.slice(&header, huge, &[], &[], &sps, &pps),
+            Err(VaApiError::Parse(_))
+        ));
     }
 }
