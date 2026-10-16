@@ -102,8 +102,20 @@ impl<'a> D3d12Encoder<'a> {
         let size = texture.size();
         let (width, height) = (size.width(), size.height());
         let session = self.ensure_session(width, height)?;
-        let bitstream = session.encode_texture(texture.resource(), width, height)?;
-        Ok(vec![Packet::new(Bytes::from(bitstream))])
+        let outcome = session.encode_texture(texture.resource(), width, height);
+        match outcome {
+            Ok(bitstream) => Ok(vec![Packet::new(Bytes::from(bitstream))]),
+            Err(error) => {
+                self.reset_session();
+                Err(error)
+            }
+        }
+    }
+
+    /// Drop the live session and geometry after a mid-picture failure.
+    fn reset_session(&mut self) {
+        self.session = None;
+        self.active = None;
     }
 }
 
@@ -114,8 +126,14 @@ impl Encoder for D3d12Encoder<'_> {
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, D3d12Error> {
         let (width, height, nv12) = pack_nv12(frame)?;
         let session = self.ensure_session(width, height)?;
-        let bitstream = session.encode(&nv12)?;
-        Ok(vec![Packet::new(Bytes::from(bitstream))])
+        let outcome = session.encode(&nv12);
+        match outcome {
+            Ok(bitstream) => Ok(vec![Packet::new(Bytes::from(bitstream))]),
+            Err(error) => {
+                self.reset_session();
+                Err(error)
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, D3d12Error> {

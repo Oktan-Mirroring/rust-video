@@ -1,19 +1,16 @@
 //! Full-GPU transcode on the D3D12 tier: decode texture to encoder texture.
 //!
 //! Pixels stay device-resident on the GPU route; any hop miss falls back
-//! loud to the proven CPU path, never silently.
+//! loud to the proven CPU path, never silently. The committed vector
+//! transcodes without readback and the bitstream lands in the temp dir
+//! for the ffmpeg oracle.
 
-#[path = "common/bits.rs"]
+#[path = "common/annexb.rs"]
 #[cfg(target_os = "windows")]
-mod bits;
-#[path = "common/h264.rs"]
-#[cfg(target_os = "windows")]
-mod h264;
+mod annexb;
 
 #[cfg(target_os = "windows")]
-use h264::{
-    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
-};
+use annexb::picture_packets;
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -47,26 +44,25 @@ fn main() {
     };
     let caps = transcoder.caps();
     println!(
-        "caps: platform={} decode_export={} encode_import={} ready={}",
-        caps.platform(),
+        "caps: share={:?} decode_export={} encode_import={} ready={}",
+        caps.share(),
         caps.decode_export(),
         caps.encode_import(),
         caps.ready()
     );
     let mut packets = 0;
     let mut bytes = 0;
-    let inputs = annex_b_h264_packets()
-        .into_iter()
-        .chain(annex_b_h264_packets_cropped())
-        .chain(annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
-        .chain(annex_b_h264_packets_cropped_sized(119, 67, 4, 40));
-    for (index, raw) in inputs.enumerate() {
+    let mut out = Vec::new();
+    for (index, raw) in picture_packets().into_iter().enumerate() {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
             Ok(outcome) => {
                 report(index, &outcome);
                 packets += outcome.packets().len();
                 bytes += bytes_of(&outcome);
+                for coded in outcome.packets() {
+                    out.extend_from_slice(coded.data());
+                }
             }
             Err(error) => {
                 println!("ERROR: transcode packet {index}: {error}");
@@ -83,6 +79,9 @@ fn main() {
             );
             packets += outcome.packets().len();
             bytes += bytes_of(&outcome);
+            for coded in outcome.packets() {
+                out.extend_from_slice(coded.data());
+            }
         }
         Err(error) => {
             println!("ERROR: flush: {error}");
@@ -93,8 +92,18 @@ fn main() {
         println!("ERROR: transcode produced no bitstream");
         std::process::exit(1);
     }
+    let path = std::env::temp_dir().join("rust-video-d3d12-transcode.h264");
+    match std::fs::write(&path, &out) {
+        Ok(()) => println!(
+            "bitstream: {} (oracle: ffmpeg -v error -i <file> -f null -)",
+            path.display()
+        ),
+        Err(error) => {
+            println!("ERROR: bitstream unwritable: {error}");
+            std::process::exit(1);
+        }
+    }
     println!("transcoded {packets} packet(s), {bytes} byte(s)");
-    println!("parity: size-proven only; pixel content unverified vs oracle");
     probe_scale(&device);
 }
 
@@ -140,10 +149,7 @@ fn probe_scale(device: &D3d12Device) {
     };
     let mut packets = 0;
     let mut bytes = 0;
-    let inputs = annex_b_h264_packets()
-        .into_iter()
-        .chain(annex_b_h264_packets_cropped());
-    for (index, raw) in inputs.enumerate() {
+    for (index, raw) in picture_packets().into_iter().enumerate() {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
             Ok(outcome) => {

@@ -1,6 +1,9 @@
 //! D3D12 video decode: picture arguments plus GPU submission.
 //!
 //! H.264 decodes through the DPB; HEVC stays intra-only.
+//!
+//! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle>
+//! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
 
 #![allow(unsafe_code)]
 
@@ -21,15 +24,17 @@ use crate::dxva::{
 };
 use crate::error::D3d12Error;
 use crate::h264::Crop;
-use crate::submit::{DeviceResources, Fence, Nv12Layout};
+use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 
 use windows::core::Interface;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
-    ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
-    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    ID3D12CommandQueue, ID3D12Device, ID3D12DeviceChild, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
 };
@@ -437,22 +442,46 @@ fn crop_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
     })
 }
 
+/// Owned NT handle behind one pool texture export.
+pub(crate) struct SharedExport {
+    /// NT handle value.
+    handle: isize,
+}
+
+impl SharedExport {
+    /// NT handle value.
+    pub(crate) fn handle(&self) -> isize {
+        self.handle
+    }
+}
+
+impl Drop for SharedExport {
+    fn drop(&mut self) {
+        // Sound: the handle is live; the close ends the export.
+        let _ = unsafe { CloseHandle(HANDLE(self.handle as *mut c_void)) };
+    }
+}
+
 /// D3D12 video decode session over one codec geometry.
 pub(crate) struct DecodeSession {
+    /// Logical device behind shared-handle export.
+    device: ID3D12Device,
     /// Video decode queue.
     video_queue: ID3D12CommandQueue,
-    /// Video decode allocator.
-    video_alloc: ID3D12CommandAllocator,
-    /// Video decode list.
-    video_list: ID3D12VideoDecodeCommandList,
+    /// Video decode slots, one per pool texture.
+    video_slots: Vec<CommandSlot<ID3D12VideoDecodeCommandList>>,
+    /// In-flight video ticket, waited before the next video submit.
+    video_busy: Option<Ticket>,
     /// Direct queue behind downloads.
     copy_queue: ID3D12CommandQueue,
-    /// Direct allocator behind downloads.
-    copy_alloc: ID3D12CommandAllocator,
-    /// Direct list behind downloads.
-    copy_list: ID3D12GraphicsCommandList,
-    /// Fence behind both queues.
-    fence: Fence,
+    /// Download slots, one per pool texture.
+    copy_slots: Vec<CommandSlot<ID3D12GraphicsCommandList>>,
+    /// In-flight copy ticket per slot, waited before the slot re-records.
+    copy_busy: Vec<Option<Ticket>>,
+    /// Fence behind the video queue.
+    video_fence: Fence,
+    /// Fence behind the direct queue.
+    copy_fence: Fence,
     /// Decoder heap behind pictures.
     heap: ID3D12VideoDecoderHeap,
     /// Decoder behind pictures.
@@ -463,8 +492,8 @@ pub(crate) struct DecodeSession {
     crops: Vec<ID3D12Resource>,
     /// Bitstream upload buffer.
     bitstream: ID3D12Resource,
-    /// Download staging buffer.
-    staging: ID3D12Resource,
+    /// Download staging buffers, one per pool slot.
+    staging: Vec<ID3D12Resource>,
     /// Staging layout.
     layout: Nv12Layout,
     /// Driver footprints behind staging copies.
@@ -514,28 +543,27 @@ impl DecodeSession {
         let heap = crate::device::create_decoder_heap(device.video(), profile, width, height)?;
         let decoder = crate::device::create_decoder(device.video(), profile)?;
         let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE)?;
-        let video_alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE)?;
-        let video_list: ID3D12VideoDecodeCommandList =
-            resources.command_list(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, &video_alloc)?;
-        // Sound: the fresh list is open with no recorded work.
-        unsafe { video_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
+        let mut video_slots = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            video_slots.push(CommandSlot::open(
+                &resources,
+                D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+            )?);
+        }
         let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let copy_alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let copy_list: ID3D12GraphicsCommandList =
-            resources.command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, &copy_alloc)?;
-        // Sound: the fresh list is open with no recorded work.
-        unsafe { copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        let fence = Fence::open(device.device())?;
+        let mut copy_slots = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            copy_slots.push(CommandSlot::open(
+                &resources,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+            )?);
+        }
+        let video_fence = Fence::open(device.device())?;
+        let copy_fence = Fence::open(device.device())?;
         let texture_desc = DeviceResources::texture_desc(width, height);
         let mut outputs = Vec::with_capacity(POOL);
         for _ in 0..POOL {
-            outputs.push(resources.committed(
+            outputs.push(resources.committed_shared(
                 D3D12_HEAP_TYPE_DEFAULT,
                 &texture_desc,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -564,20 +592,25 @@ impl DecodeSession {
         )?;
         let (layout, footprints) = resources.nv12_layout(width, height)?;
         let staging_desc = DeviceResources::buffer_desc(layout.total);
-        let staging = resources.committed(
-            D3D12_HEAP_TYPE_READBACK,
-            &staging_desc,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            "CreateStaging",
-        )?;
+        let mut staging = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            staging.push(resources.committed(
+                D3D12_HEAP_TYPE_READBACK,
+                &staging_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                "CreateStaging",
+            )?);
+        }
         Ok(Self {
+            device: device.device().clone(),
             video_queue,
-            video_alloc,
-            video_list,
+            video_slots,
+            video_busy: None,
             copy_queue,
-            copy_alloc,
-            copy_list,
-            fence,
+            copy_slots,
+            copy_busy: vec![None; POOL],
+            video_fence,
+            copy_fence,
             heap,
             decoder,
             outputs,
@@ -592,14 +625,25 @@ impl DecodeSession {
         })
     }
 
-    /// Decode `submission` onto its pool slot.
+    /// `submission` through the video queue, without waiting.
+    ///
+    /// The ticket completes before the next submit reuses the pool barriers.
     ///
     /// # Errors
     ///
     /// Returns `Err` past the bitstream buffer, or when the
     /// driver refuses the picture.
-    pub(crate) fn submit(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
+    pub(crate) fn submit(&mut self, submission: &H264Submission) -> Result<Ticket, D3d12Error> {
         self.submit_h264(submission)
+    }
+
+    /// Video `ticket` completion through the fence event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU misses the wait budget.
+    pub(crate) fn wait_video(&self, ticket: Ticket) -> Result<(), D3d12Error> {
+        self.video_fence.wait(ticket)
     }
 
     /// NV12 bytes for pool `slot` cropped to the visible rectangle.
@@ -609,7 +653,119 @@ impl DecodeSession {
     /// Returns `Err` for a slot outside the pool, or when
     /// the copy fails.
     pub(crate) fn download(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
-        self.download_windows(slot)
+        let ticket = self.start_download(slot)?;
+        self.finish_download(slot, ticket)
+    }
+
+    /// Pool `slot` planes through the direct queue, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, or when
+    /// the copy fails.
+    pub(crate) fn start_download(&mut self, slot: u8) -> Result<Ticket, D3d12Error> {
+        let index = usize::from(slot);
+        let source = self
+            .outputs
+            .get(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        self.wait_copy_slot(index)?;
+        let pair = self
+            .copy_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        pair.reset()?;
+        let list = pair.list();
+        // Sound: the barriers name a live texture; the list is open.
+        unsafe {
+            list.ResourceBarrier(&[DeviceResources::barrier(
+                &source,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        let staging = self
+            .staging
+            .get(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        // Sound: the copy locations name live resources; the list is open.
+        unsafe {
+            for (plane, placed) in [0u32, 1u32].into_iter().zip(self.footprints.iter()) {
+                let dst = DeviceResources::footprint_location(&staging, placed);
+                let src = DeviceResources::subresource_location(&source, plane);
+                list.CopyTextureRegion(
+                    std::ptr::from_ref(&dst),
+                    0,
+                    0,
+                    0,
+                    std::ptr::from_ref(&src),
+                    None,
+                );
+            }
+            list.ResourceBarrier(&[DeviceResources::barrier(
+                &source,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        let pair = self
+            .copy_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
+        self.copy_busy[index] = Some(ticket);
+        Ok(ticket)
+    }
+
+    /// Tight NV12 bytes for a started `slot` once `ticket` completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, when the GPU misses
+    /// the wait budget, or when staging falls short of the layout.
+    pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Vec<u8>, D3d12Error> {
+        let index = usize::from(slot);
+        let staging = self
+            .staging
+            .get(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        self.copy_fence.wait(ticket)?;
+        let total = usize::try_from(self.layout.total)
+            .unwrap_or(usize::MAX)
+            .min(isize::MAX as usize);
+        DeviceResources::with_readback(staging, total, |mapped| {
+            self.layout
+                .tighten(mapped, self.width, self.height, self.crop)
+        })
+    }
+
+    /// Prior copy ticket on `index` completion.
+    fn wait_copy_slot(&self, index: usize) -> Result<(), D3d12Error> {
+        if let Some(Some(ticket)) = self.copy_busy.get(index) {
+            self.copy_fence.wait(*ticket)?;
+        }
+        Ok(())
+    }
+
+    /// NT-handle export for pool `slot`, absent when cropped or refused.
+    pub(crate) fn shared_handle(&self, slot: u8) -> Option<SharedExport> {
+        if !self.crops.is_empty() {
+            return None;
+        }
+        let resource = self.outputs.get(usize::from(slot))?.clone();
+        // Sound: the resource is live; every resource exposes the device-child face.
+        let child: ID3D12DeviceChild = resource.cast().ok()?;
+        // Sound: the device and resource are live; default security, unnamed.
+        let handle = unsafe {
+            self.device
+                .CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
+        }
+        .ok()?;
+        (!handle.is_invalid()).then(|| SharedExport {
+            handle: handle.0 as isize,
+        })
     }
 
     /// Pool texture behind `slot`, without readback.
@@ -633,7 +789,113 @@ impl DecodeSession {
         if self.crops.is_empty() {
             return self.texture(slot);
         }
-        self.submit_crop(slot)?;
+        let ticket = self.start_crop(slot)?;
+        self.finish_crop(slot, ticket)
+    }
+
+    /// True with per-slot crop targets behind the session.
+    pub(crate) fn cropped(&self) -> bool {
+        !self.crops.is_empty()
+    }
+
+    /// Pool `slot` visible rectangle through the direct queue, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, without a crop plan,
+    /// or when the copy fails.
+    pub(crate) fn start_crop(&mut self, slot: u8) -> Result<Ticket, D3d12Error> {
+        let index = usize::from(slot);
+        let source = self
+            .outputs
+            .get(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        let target = self
+            .crops
+            .get(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .clone();
+        let plan = crop_plan(self.width, self.height, self.crop)
+            .ok_or_else(|| D3d12Error::BrokenReference("crop target without crop".to_owned()))?;
+        self.wait_copy_slot(index)?;
+        let pair = self
+            .copy_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        pair.reset()?;
+        let list = pair.list();
+        // Sound: the barriers name live textures; the list is open.
+        unsafe {
+            list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &source,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+                DeviceResources::barrier(
+                    &target,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+            ]);
+        }
+        let boxes = [plan.luma, plan.chroma].map(|edges| D3D12_BOX {
+            left: edges[0],
+            top: edges[1],
+            front: 0,
+            right: edges[2],
+            bottom: edges[3],
+            back: 1,
+        });
+        // Sound: the copy locations name live resources; the list is open.
+        unsafe {
+            for (plane, src_box) in [0u32, 1u32].into_iter().zip(boxes.iter()) {
+                let dst = DeviceResources::subresource_location(&target, plane);
+                let src = DeviceResources::subresource_location(&source, plane);
+                list.CopyTextureRegion(
+                    std::ptr::from_ref(&dst),
+                    0,
+                    0,
+                    0,
+                    std::ptr::from_ref(&src),
+                    Some(std::ptr::from_ref(src_box)),
+                );
+            }
+            list.ResourceBarrier(&[
+                DeviceResources::barrier(
+                    &source,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+                DeviceResources::barrier(
+                    &target,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ),
+            ]);
+        }
+        let pair = self
+            .copy_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
+        self.copy_busy[index] = Some(ticket);
+        Ok(ticket)
+    }
+
+    /// Crop target for a started `slot` once `ticket` completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool or when the GPU
+    /// misses the wait budget.
+    pub(crate) fn finish_crop(
+        &self,
+        slot: u8,
+        ticket: Ticket,
+    ) -> Result<ID3D12Resource, D3d12Error> {
+        self.copy_fence.wait(ticket)?;
         self.crops
             .get(usize::from(slot))
             .cloned()
@@ -654,7 +916,7 @@ impl DecodeSession {
     }
 
     /// `submission` through the video queue into its pool slot.
-    fn submit_h264(&mut self, submission: &H264Submission) -> Result<(), D3d12Error> {
+    fn submit_h264(&mut self, submission: &H264Submission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let mut refs = self.ref_tables();
@@ -664,7 +926,8 @@ impl DecodeSession {
 
     /// NV12 bytes decoded from `submission` on the GPU.
     fn decode_hevc_windows(&mut self, submission: &HevcSubmission) -> Result<Vec<u8>, D3d12Error> {
-        self.submit_hevc(submission)?;
+        let ticket = self.submit_hevc(submission)?;
+        self.wait_video(ticket)?;
         self.download(0)
     }
 
@@ -673,12 +936,13 @@ impl DecodeSession {
         &mut self,
         submission: &HevcSubmission,
     ) -> Result<ID3D12Resource, D3d12Error> {
-        self.submit_hevc(submission)?;
+        let ticket = self.submit_hevc(submission)?;
+        self.wait_video(ticket)?;
         self.texture_cropped(0)
     }
 
     /// `submission` through the video queue into pool slot zero.
-    fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<(), D3d12Error> {
+    fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
         let input = self.input_args(submission, None)?;
@@ -708,39 +972,27 @@ impl DecodeSession {
         }
     }
 
-    /// Pool `slot` through staging into tight NV12 bytes.
-    fn download_windows(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
-        self.submit_copy(slot)?;
-        let total = usize::try_from(self.layout.total)
-            .unwrap_or(usize::MAX)
-            .min(isize::MAX as usize);
-        DeviceResources::with_readback(&self.staging, total, |mapped| {
-            self.layout
-                .tighten(mapped, self.width, self.height, self.crop)
-        })
-    }
-
     /// `DecodeFrame` for `input` through the video queue into pool `slot`.
     fn submit_video(
         &mut self,
         input: &D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS,
         slot: u8,
-    ) -> Result<(), D3d12Error> {
+    ) -> Result<Ticket, D3d12Error> {
+        if let Some(ticket) = self.video_busy {
+            self.video_fence.wait(ticket)?;
+        }
+        let index = usize::from(slot);
         let target = self
             .outputs
-            .get(usize::from(slot))
+            .get(index)
             .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
             .clone();
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.video_alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset.
-        unsafe { self.video_list.Reset(&self.video_alloc) }.map_err(|error| D3d12Error::Call {
-            call: "ResetList",
-            hresult: error.code().0,
-        })?;
+        let pair = self
+            .video_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        pair.reset()?;
+        let list = pair.list();
         let output = D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS {
             pOutputTexture2D: ManuallyDrop::new(Some(target.clone())),
             OutputSubresource: 0,
@@ -766,27 +1018,21 @@ impl DecodeSession {
         // Sound: the barriers name live textures; the list is open.
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
-            self.video_list.ResourceBarrier(&enter);
-            self.video_list.DecodeFrame(
+            list.ResourceBarrier(&enter);
+            list.DecodeFrame(
                 &self.decoder,
                 std::ptr::from_ref(&output),
                 std::ptr::from_ref(input),
             );
-            self.video_list.ResourceBarrier(&leave);
+            list.ResourceBarrier(&leave);
         }
-        // Sound: the list holds only the barriers and decode above.
-        unsafe { self.video_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.video_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.video_queue, &command)?;
-        Ok(())
+        let pair = self
+            .video_slots
+            .get_mut(index)
+            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        let ticket = pair.close_execute(&self.video_queue, &mut self.video_fence)?;
+        self.video_busy = Some(ticket);
+        Ok(ticket)
     }
 
     /// Decode input arguments borrowing `submission`, plus `refs` when present.
@@ -845,143 +1091,6 @@ impl DecodeSession {
             },
             pHeap: ManuallyDrop::new(Some(self.heap.clone())),
         })
-    }
-
-    /// Copy allocator plus list reset for one submission.
-    fn reset_copy(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset; no initial pipeline.
-        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| D3d12Error::Call {
-            call: "ResetList",
-            hresult: error.code().0,
-        })
-    }
-
-    /// Closed copy list through the direct queue.
-    fn close_copy(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the list holds the caller's barriers and copies.
-        unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.copy_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.copy_queue, &command)
-    }
-
-    /// Pool `slot` planes through the direct queue into staging.
-    fn submit_copy(&mut self, slot: u8) -> Result<(), D3d12Error> {
-        let source = self
-            .outputs
-            .get(usize::from(slot))
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
-            .clone();
-        self.reset_copy()?;
-        // Sound: the barriers name a live texture; the list is open.
-        unsafe {
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
-                &source,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-        }
-        // Sound: the copy locations name live resources; the list is open.
-        unsafe {
-            for (index, placed) in [0u32, 1u32].into_iter().zip(self.footprints.iter()) {
-                let dst = DeviceResources::footprint_location(&self.staging, placed);
-                let src = DeviceResources::subresource_location(&source, index);
-                self.copy_list.CopyTextureRegion(
-                    std::ptr::from_ref(&dst),
-                    0,
-                    0,
-                    0,
-                    std::ptr::from_ref(&src),
-                    None,
-                );
-            }
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
-                &source,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-        }
-        self.close_copy()
-    }
-
-    /// Pool `slot` visible rectangle through the direct queue into its crop target.
-    fn submit_crop(&mut self, slot: u8) -> Result<(), D3d12Error> {
-        let source = self
-            .outputs
-            .get(usize::from(slot))
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
-            .clone();
-        let target = self
-            .crops
-            .get(usize::from(slot))
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
-            .clone();
-        let plan = crop_plan(self.width, self.height, self.crop)
-            .ok_or_else(|| D3d12Error::BrokenReference("crop target without crop".to_owned()))?;
-        self.reset_copy()?;
-        // Sound: the barriers name live textures; the list is open.
-        unsafe {
-            self.copy_list.ResourceBarrier(&[
-                DeviceResources::barrier(
-                    &source,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                DeviceResources::barrier(
-                    &target,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-        }
-        let boxes = [plan.luma, plan.chroma].map(|edges| D3D12_BOX {
-            left: edges[0],
-            top: edges[1],
-            front: 0,
-            right: edges[2],
-            bottom: edges[3],
-            back: 1,
-        });
-        // Sound: the copy locations name live resources; the list is open.
-        unsafe {
-            for (index, src_box) in [0u32, 1u32].into_iter().zip(boxes.iter()) {
-                let dst = DeviceResources::subresource_location(&target, index);
-                let src = DeviceResources::subresource_location(&source, index);
-                self.copy_list.CopyTextureRegion(
-                    std::ptr::from_ref(&dst),
-                    0,
-                    0,
-                    0,
-                    std::ptr::from_ref(&src),
-                    Some(std::ptr::from_ref(src_box)),
-                );
-            }
-            self.copy_list.ResourceBarrier(&[
-                DeviceResources::barrier(
-                    &source,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ),
-                DeviceResources::barrier(
-                    &target,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ),
-            ]);
-        }
-        self.close_copy()
     }
 }
 

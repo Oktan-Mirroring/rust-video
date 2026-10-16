@@ -1,7 +1,7 @@
 //! H.264 and HEVC decode plus probed shells behind the caps `Decoder` trait.
 
 #[cfg(target_os = "windows")]
-use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission};
+use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission, SharedExport};
 use crate::device::D3d12Device;
 #[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb};
@@ -9,6 +9,8 @@ use crate::error::{D3d12Error, SkipReason};
 use crate::guid::Codec;
 #[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
+#[cfg(target_os = "windows")]
+use crate::submit::Ticket;
 #[cfg(target_os = "windows")]
 use crate::texture::GpuTexture;
 
@@ -29,6 +31,9 @@ pub struct D3d12Frame {
     data: Bytes,
     /// VRAM budget held for the bytes.
     lease: Lease,
+    /// Shared-texture export, absent without NT-handle sharing.
+    #[cfg(target_os = "windows")]
+    shared: Option<SharedExport>,
 }
 
 impl D3d12Frame {
@@ -52,9 +57,16 @@ impl D3d12Frame {
 
     /// Platform export handle for the frame.
     ///
-    /// Opaque backend descriptor.
+    /// NT handle over the shared pool texture, or an opaque backend
+    /// descriptor when the driver declines sharing.
     #[must_use]
     pub fn export(&self) -> GpuExport {
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.shared {
+            return GpuExport::NtHandle {
+                handle: shared.handle(),
+            };
+        }
         GpuExport::Opaque { name: "d3d12" }
     }
 
@@ -170,6 +182,7 @@ macro_rules! real_decoder {
                     identity,
                     data: bytes,
                     lease,
+                    shared: session.shared_handle(0),
                 });
                 Ok(())
             }
@@ -359,6 +372,10 @@ pub struct H264Decoder<'a> {
     active: Option<Active>,
     /// Next frame generation number.
     generation: u64,
+    /// Stream resets after mid-picture failures.
+    resets: u64,
+    /// Peak outputs queued before readback in one call.
+    inflight_max: usize,
 }
 
 #[cfg(target_os = "windows")]
@@ -374,17 +391,34 @@ impl<'a> H264Decoder<'a> {
             shared: device.shared().clone(),
             active: None,
             generation: 0,
+            resets: 0,
+            inflight_max: 0,
         }
     }
 
-    /// Decode `picture` into `frames`.
-    fn decode_picture(
+    /// Stream resets after mid-picture failures.
+    #[must_use]
+    pub fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// Peak outputs queued before readback in one call.
+    #[must_use]
+    pub fn max_inflight(&self) -> usize {
+        self.inflight_max
+    }
+
+    /// Decode `picture`, queueing its outputs for readback into `pending`.
+    fn submit_picture(
         &mut self,
         picture: &Picture,
+        pending: &mut Vec<(u8, Ticket, Active)>,
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
+            self.consume_pending(pending, frames)?;
+            pending.clear();
             self.reconfigure(active, frames)?;
         }
         let active = self.active.ok_or(D3d12Error::NoSession)?;
@@ -395,26 +429,52 @@ impl<'a> H264Decoder<'a> {
                 return Err(error);
             }
         };
-        if let Err(error) = self.submit_frames(&decoded, &active, frames) {
+        let mut failed = None;
+        {
+            let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
+            // Submit before any copy: outputs may name the submission slot.
+            match session.submit(&decoded.submission) {
+                Ok(ticket) => {
+                    if let Err(error) = session.wait_video(ticket) {
+                        failed = Some(error);
+                    } else {
+                        for output in &decoded.outputs {
+                            match session.start_download(output.slot()) {
+                                Ok(ticket) => pending.push((output.slot(), ticket, active)),
+                                Err(error) => {
+                                    failed = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => failed = Some(error),
+            }
+        }
+        if let Some(error) = failed {
             self.reset_stream();
             return Err(error);
         }
         Ok(())
     }
 
-    /// `decoded` submission plus display-order outputs into `frames`.
-    fn submit_frames(
+    /// Readback for queued `pending` outputs into `frames`.
+    fn consume_pending(
         &mut self,
-        decoded: &Decoded,
-        active: &Active,
+        pending: &[(u8, Ticket, Active)],
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
-        let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-        // Submit before any readback: outputs may name the submission slot.
-        session.submit(&decoded.submission)?;
-        for output in &decoded.outputs {
-            let nv12 = session.download(output.slot())?;
-            let frame = emit_frame(&self.shared, nv12, active, self.generation)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let Some(session) = self.session.as_ref() else {
+            return Err(D3d12Error::NoSession);
+        };
+        for (slot, ticket, active) in pending {
+            let nv12 = session.finish_download(*slot, *ticket)?;
+            let export = session.shared_handle(*slot);
+            let frame = emit_frame(&self.shared, nv12, export, active, self.generation)?;
             self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }
@@ -426,6 +486,12 @@ impl<'a> H264Decoder<'a> {
         self.dpb = None;
         self.session = None;
         self.active = None;
+        self.resets = self.resets.wrapping_add(1);
+    }
+
+    /// Peak outputs queued before readback against `depth`.
+    fn note_inflight(&mut self, depth: usize) {
+        self.inflight_max = self.inflight_max.max(depth);
     }
 
     /// Session for `active`, draining the previous sequence first.
@@ -505,12 +571,20 @@ impl<'a> H264Decoder<'a> {
         let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
             return Ok(());
         };
-        for output in dpb.drain() {
-            let nv12 = session.download(output.slot())?;
-            let frame = emit_frame(&self.shared, nv12, active, self.generation)?;
+        let outputs = dpb.drain();
+        let mut pending = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            pending.push((output.slot(), session.start_download(output.slot())?));
+        }
+        let depth = pending.len();
+        for (slot, ticket) in pending {
+            let nv12 = session.finish_download(slot, ticket)?;
+            let export = session.shared_handle(slot);
+            let frame = emit_frame(&self.shared, nv12, export, active, self.generation)?;
             self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }
+        self.note_inflight(depth);
         Ok(())
     }
 
@@ -561,9 +635,22 @@ impl<'a> H264Decoder<'a> {
     ) -> Result<(), D3d12Error> {
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
         // Submit before any texture handoff: outputs may name the submission slot.
-        session.submit(&decoded.submission)?;
+        let ticket = session.submit(&decoded.submission)?;
+        session.wait_video(ticket)?;
+        if !session.cropped() {
+            for output in &decoded.outputs {
+                let resource = session.texture(output.slot())?;
+                textures.push(GpuTexture::new(resource, active.visible, self.generation));
+                self.generation = self.generation.wrapping_add(1);
+            }
+            return Ok(());
+        }
+        let mut pending = Vec::with_capacity(decoded.outputs.len());
         for output in &decoded.outputs {
-            let resource = session.texture_cropped(output.slot())?;
+            pending.push((output.slot(), session.start_crop(output.slot())?));
+        }
+        for (slot, ticket) in pending {
+            let resource = session.finish_crop(slot, ticket)?;
             textures.push(GpuTexture::new(resource, active.visible, self.generation));
             self.generation = self.generation.wrapping_add(1);
         }
@@ -591,8 +678,21 @@ impl<'a> H264Decoder<'a> {
         let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
             return Ok(());
         };
-        for output in dpb.drain() {
-            let resource = session.texture_cropped(output.slot())?;
+        let outputs = dpb.drain();
+        if !session.cropped() {
+            for output in &outputs {
+                let resource = session.texture(output.slot())?;
+                textures.push(GpuTexture::new(resource, active.visible, self.generation));
+                self.generation = self.generation.wrapping_add(1);
+            }
+            return Ok(());
+        }
+        let mut pending = Vec::with_capacity(outputs.len());
+        for output in &outputs {
+            pending.push((output.slot(), session.start_crop(output.slot())?));
+        }
+        for (slot, ticket) in pending {
+            let resource = session.finish_crop(slot, ticket)?;
             textures.push(GpuTexture::new(resource, active.visible, self.generation));
             self.generation = self.generation.wrapping_add(1);
         }
@@ -648,16 +748,34 @@ impl Decoder for H264Decoder<'_> {
         }
         let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut frames = Vec::new();
+        let mut pending = Vec::new();
         for picture in &pictures {
-            self.decode_picture(picture, &mut frames)?;
+            if let Err(error) = self.submit_picture(picture, &mut pending, &mut frames) {
+                pending.clear();
+                return Err(error);
+            }
+        }
+        self.note_inflight(pending.len());
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+            self.reset_stream();
+            return Err(error);
         }
         Ok(frames)
     }
 
     fn flush(&mut self) -> Result<Vec<D3d12Frame>, D3d12Error> {
         let mut frames = Vec::new();
+        let mut pending = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            self.decode_picture(&picture, &mut frames)?;
+            if let Err(error) = self.submit_picture(&picture, &mut pending, &mut frames) {
+                pending.clear();
+                return Err(error);
+            }
+        }
+        self.note_inflight(pending.len());
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+            self.reset_stream();
+            return Err(error);
         }
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
@@ -669,8 +787,9 @@ impl Decoder for H264Decoder<'_> {
 /// Frame for NV12 `nv12` at `generation`.
 #[cfg(target_os = "windows")]
 fn emit_frame(
-    shared: &SharedDevice,
+    budget: &SharedDevice,
     nv12: Vec<u8>,
+    export: Option<SharedExport>,
     active: &Active,
     generation: u64,
 ) -> Result<D3d12Frame, D3d12Error> {
@@ -684,11 +803,12 @@ fn emit_frame(
     }
     let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, generation);
     let bytes = Bytes::from(nv12);
-    let lease = shared.try_acquire(bytes.len() as u64)?;
+    let lease = budget.try_acquire(bytes.len() as u64)?;
     Ok(D3d12Frame {
         identity,
         data: bytes,
         lease,
+        shared: export,
     })
 }
 
@@ -774,6 +894,8 @@ mod tests {
             identity,
             data: bytes,
             lease,
+            #[cfg(target_os = "windows")]
+            shared: None,
         }
     }
 

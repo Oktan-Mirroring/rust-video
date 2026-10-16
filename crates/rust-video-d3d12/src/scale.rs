@@ -9,16 +9,15 @@ use std::mem::ManuallyDrop;
 
 use crate::device::D3d12Device;
 use crate::error::D3d12Error;
-use crate::submit::{DeviceResources, Fence};
+use crate::submit::{CommandSlot, DeviceResources, Fence};
 use crate::texture::GpuTexture;
 
 use rust_video_caps::common::PictureSize;
-use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Resource,
-    D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ, D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE,
+    ID3D12CommandQueue, ID3D12Resource, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+    D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ,
+    D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT_NV12, DXGI_RATIONAL,
@@ -42,10 +41,8 @@ pub(crate) struct Scaler {
     processor: ID3D12VideoProcessor,
     /// Video process queue.
     queue: ID3D12CommandQueue,
-    /// Video process allocator.
-    alloc: ID3D12CommandAllocator,
-    /// Video process list.
-    list: ID3D12VideoProcessCommandList,
+    /// Video process slot.
+    slot: CommandSlot<ID3D12VideoProcessCommandList>,
     /// Fence behind the queue.
     fence: Fence,
     /// NV12 target texture.
@@ -72,14 +69,7 @@ impl Scaler {
         let processor = create_processor(device.video(), from, to)?;
         let resources = DeviceResources::new(device.device());
         let queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)?;
-        let alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)?;
-        let list: ID3D12VideoProcessCommandList =
-            resources.command_list(D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, &alloc)?;
-        // Sound: the fresh list is open with no recorded work.
-        unsafe { list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
+        let slot = CommandSlot::open(&resources, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS)?;
         let fence = Fence::open(device.device())?;
         let desc = DeviceResources::texture_desc(to.width(), to.height());
         let target = resources.committed(
@@ -91,8 +81,7 @@ impl Scaler {
         Ok(Self {
             processor,
             queue,
-            alloc,
-            list,
+            slot,
             fence,
             target,
             from,
@@ -124,20 +113,12 @@ impl Scaler {
                 "scale source outside scaler".to_owned(),
             ));
         }
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset.
-        unsafe { self.list.Reset(&self.alloc) }.map_err(|error| D3d12Error::Call {
-            call: "ResetList",
-            hresult: error.code().0,
-        })?;
+        self.slot.reset()?;
         let source = texture.resource();
+        let list = self.slot.list();
         // Sound: the barriers name live textures; the list is open.
         unsafe {
-            self.list.ResourceBarrier(&[
+            list.ResourceBarrier(&[
                 DeviceResources::barrier(
                     source,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -161,12 +142,12 @@ impl Scaler {
         output.TargetRectangle = full_rect(self.to)?;
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
-            self.list.ProcessFrames(
+            list.ProcessFrames(
                 &self.processor,
                 std::ptr::from_ref(&output),
                 std::slice::from_ref(&input),
             );
-            self.list.ResourceBarrier(&[
+            list.ResourceBarrier(&[
                 DeviceResources::barrier(
                     source,
                     D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ,
@@ -179,17 +160,8 @@ impl Scaler {
                 ),
             ]);
         }
-        // Sound: the list holds only the barriers and scale above.
-        unsafe { self.list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList = self.list.cast().map_err(|error| D3d12Error::Call {
-            call: "CastCommandList",
-            hresult: error.code().0,
-        })?;
-        self.fence.submit(&self.queue, &command)?;
+        let ticket = self.slot.close_execute(&self.queue, &mut self.fence)?;
+        self.fence.wait(ticket)?;
         Ok(texture.rescaled(self.target.clone(), self.to))
     }
 }

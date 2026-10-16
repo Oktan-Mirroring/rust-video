@@ -20,6 +20,7 @@ use rust_video_d3d12::{
 };
 
 use bytes::Bytes;
+use rust_video_caps::frame::GpuExport;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 
@@ -134,6 +135,14 @@ fn drive_hevc_decode(device: &D3d12Device) {
         "neutral chroma u={u_mean} v={v_mean}"
     );
     println!("hevc decode: 320x240 GPU frame proven, luma mean {mean}");
+    match proven.export() {
+        GpuExport::NtHandle { handle } => {
+            assert_ne!(handle, 0, "shared export carries a live handle");
+            println!("hevc decode: nt-handle export proven");
+        }
+        GpuExport::Opaque { name } => println!("hevc decode: opaque export ({name})"),
+        _ => panic!("unproven export shape"),
+    }
 }
 
 /// `codec` encode plus decode roundtrip through the GPU.

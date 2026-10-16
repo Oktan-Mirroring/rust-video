@@ -1,5 +1,8 @@
 //! GPU submit plumbing shared by decode and encode.
 //! Fence waits, resource creation, pitched NV12 transfers.
+//!
+//! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12fence-seteventoncompletion>
+//! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
 
 #![allow(unsafe_code)]
 
@@ -7,14 +10,15 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 
 use crate::error::D3d12Error;
-use windows::Win32::Foundation::WAIT_TIMEOUT;
+use windows::core::{Interface, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    ID3D12Resource, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC,
+    ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_FENCE_FLAG_NONE,
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE, D3D12_MEMORY_POOL_UNKNOWN,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RANGE, D3D12_RESOURCE_BARRIER,
-    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES,
+    D3D12_HEAP_TYPE, D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RANGE,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE,
     D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
@@ -25,6 +29,99 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
+use windows::Win32::Media::MediaFoundation::{
+    ID3D12VideoDecodeCommandList, ID3D12VideoEncodeCommandList2, ID3D12VideoProcessCommandList,
+};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+/// Command list behind one submit slot.
+pub(crate) trait SlotList: Interface {
+    /// List reset over `allocator`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the reset.
+    fn reset_list(&self, allocator: &ID3D12CommandAllocator) -> Result<(), D3d12Error>;
+
+    /// List close before execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the close.
+    fn close_list(&self) -> Result<(), D3d12Error>;
+}
+
+impl SlotList for ID3D12VideoDecodeCommandList {
+    fn reset_list(&self, allocator: &ID3D12CommandAllocator) -> Result<(), D3d12Error> {
+        // Sound: the allocator outlives the reset.
+        unsafe { self.Reset(allocator) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    fn close_list(&self) -> Result<(), D3d12Error> {
+        // Sound: the list holds only recorded barriers and work.
+        unsafe { self.Close() }.map_err(|error| D3d12Error::Call {
+            call: "Close",
+            hresult: error.code().0,
+        })
+    }
+}
+
+impl SlotList for ID3D12VideoEncodeCommandList2 {
+    fn reset_list(&self, allocator: &ID3D12CommandAllocator) -> Result<(), D3d12Error> {
+        // Sound: the allocator outlives the reset.
+        unsafe { self.Reset(allocator) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    fn close_list(&self) -> Result<(), D3d12Error> {
+        // Sound: the list holds only recorded barriers and work.
+        unsafe { self.Close() }.map_err(|error| D3d12Error::Call {
+            call: "Close",
+            hresult: error.code().0,
+        })
+    }
+}
+
+impl SlotList for ID3D12VideoProcessCommandList {
+    fn reset_list(&self, allocator: &ID3D12CommandAllocator) -> Result<(), D3d12Error> {
+        // Sound: the allocator outlives the reset.
+        unsafe { self.Reset(allocator) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    fn close_list(&self) -> Result<(), D3d12Error> {
+        // Sound: the list holds only recorded barriers and work.
+        unsafe { self.Close() }.map_err(|error| D3d12Error::Call {
+            call: "Close",
+            hresult: error.code().0,
+        })
+    }
+}
+
+impl SlotList for ID3D12GraphicsCommandList {
+    fn reset_list(&self, allocator: &ID3D12CommandAllocator) -> Result<(), D3d12Error> {
+        // Sound: the allocator outlives the reset; no initial pipeline.
+        unsafe { self.Reset(allocator, None) }.map_err(|error| D3d12Error::Call {
+            call: "ResetList",
+            hresult: error.code().0,
+        })
+    }
+
+    fn close_list(&self) -> Result<(), D3d12Error> {
+        // Sound: the list holds only recorded barriers and work.
+        unsafe { self.Close() }.map_err(|error| D3d12Error::Call {
+            call: "Close",
+            hresult: error.code().0,
+        })
+    }
+}
 
 /// Pitched plane behind NV12 transfers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,13 +333,36 @@ impl DeviceResources {
         state: D3D12_RESOURCE_STATES,
         call: &'static str,
     ) -> Result<ID3D12Resource, D3d12Error> {
+        self.committed_flags(heap, D3D12_HEAP_FLAG_NONE, desc, state, call)
+    }
+
+    /// Committed shareable resource of `desc` on a `heap` type.
+    pub(crate) fn committed_shared(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        call: &'static str,
+    ) -> Result<ID3D12Resource, D3d12Error> {
+        self.committed_flags(heap, D3D12_HEAP_FLAG_SHARED, desc, state, call)
+    }
+
+    /// Committed resource of `desc` on a `heap` type with `flags`.
+    fn committed_flags(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        flags: D3D12_HEAP_FLAGS,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        call: &'static str,
+    ) -> Result<ID3D12Resource, D3d12Error> {
         let props = Self::heap_props(heap);
         let mut out: Option<ID3D12Resource> = None;
         // Sound: `props` and `desc` outlive the call; `out` receives the resource.
         unsafe {
             self.device.CreateCommittedResource(
                 std::ptr::addr_of!(props),
-                D3D12_HEAP_FLAG_NONE,
+                flags,
                 std::ptr::from_ref(desc),
                 state,
                 None,
@@ -472,15 +592,35 @@ impl DeviceResources {
     }
 }
 
-/// Fence behind queue waits.
-pub(crate) struct Fence {
-    /// Fence behind queue waits.
-    fence: ID3D12Fence,
-    /// Monotonic fence value.
+/// Completion ticket behind one queue submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Ticket {
+    /// Fence value the queue signals.
     value: u64,
 }
 
+impl Ticket {
+    /// Fence value the queue signals.
+    #[must_use]
+    pub(crate) fn value(self) -> u64 {
+        self.value
+    }
+}
+
+/// Fence behind queue waits.
+pub(crate) struct Fence {
+    /// Fence behind queue waits.
+    inner: ID3D12Fence,
+    /// Monotonic fence value.
+    value: u64,
+    /// Completion event behind waits.
+    event: HANDLE,
+}
+
 impl Fence {
+    /// Fence completion wait budget in milliseconds.
+    const WAIT_MS: u32 = 5_000;
+
     /// Fence over `device`.
     pub(crate) fn open(device: &ID3D12Device) -> Result<Self, D3d12Error> {
         // Sound: no inputs beyond the initial value and flags.
@@ -491,43 +631,168 @@ impl Fence {
                     hresult: error.code().0,
                 }
             })?;
-        Ok(Self { fence, value: 0 })
+        // Sound: default security, auto-reset, unnamed.
+        let event =
+            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(|error| {
+                D3d12Error::Call {
+                    call: "CreateEvent",
+                    hresult: error.code().0,
+                }
+            })?;
+        Ok(Self {
+            inner: fence,
+            value: 0,
+            event,
+        })
     }
 
-    /// `command` through `queue`, then the fence wait.
-    pub(crate) fn submit(
+    /// Closed `command` through `queue`, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the queue refuses the signal.
+    pub(crate) fn execute(
         &mut self,
         queue: &ID3D12CommandQueue,
         command: &ID3D12CommandList,
-    ) -> Result<(), D3d12Error> {
+    ) -> Result<Ticket, D3d12Error> {
         // Sound: the command and queue outlive the call.
         unsafe {
             queue.ExecuteCommandLists(&[Some(command.clone())]);
         }
-        self.wait(queue)
+        self.signal(queue)
     }
 
-    /// Signal the fence and spin until it completes.
-    fn wait(&mut self, queue: &ID3D12CommandQueue) -> Result<(), D3d12Error> {
+    /// True once the GPU signals `ticket`.
+    pub(crate) fn poll(&self, ticket: Ticket) -> bool {
+        // Sound: polling a live fence for a signalled value.
+        let completed = unsafe { self.inner.GetCompletedValue() };
+        completed >= ticket.value()
+    }
+
+    /// `queue` signaled past the last submission.
+    pub(crate) fn signal(&mut self, queue: &ID3D12CommandQueue) -> Result<Ticket, D3d12Error> {
         self.value = self.value.wrapping_add(1);
         let value = self.value;
         // Sound: the fence is live; the value is monotonic.
-        unsafe { queue.Signal(&self.fence, value) }.map_err(|error| D3d12Error::Call {
+        unsafe { queue.Signal(&self.inner, value) }.map_err(|error| D3d12Error::Call {
             call: "Signal",
             hresult: error.code().0,
         })?;
-        for _ in 0..50_000 {
-            // Sound: polling a live fence for a signalled value.
-            let done = unsafe { self.fence.GetCompletedValue() };
-            if done >= value {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_micros(100));
+        Ok(Ticket { value })
+    }
+
+    /// `ticket` completion through the fence event, outside any lock.
+    pub(crate) fn wait(&self, ticket: Ticket) -> Result<(), D3d12Error> {
+        if self.poll(ticket) {
+            return Ok(());
+        }
+        // Sound: the fence and event are live.
+        unsafe { self.inner.SetEventOnCompletion(ticket.value(), self.event) }.map_err(
+            |error| D3d12Error::Call {
+                call: "SetEventOnCompletion",
+                hresult: error.code().0,
+            },
+        )?;
+        // Sound: the event is live with a bounded wait.
+        let outcome = unsafe { WaitForSingleObject(self.event, Self::WAIT_MS) };
+        if outcome == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+        if outcome == WAIT_TIMEOUT {
+            return Err(D3d12Error::Call {
+                call: "FenceWait",
+                hresult: WAIT_TIMEOUT.0.cast_signed(),
+            });
         }
         Err(D3d12Error::Call {
-            call: "FenceWait",
-            hresult: WAIT_TIMEOUT.0.cast_signed(),
+            call: "WaitForSingleObject",
+            hresult: outcome.0.cast_signed(),
         })
+    }
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        // Sound: the event is live; the close owns no further state.
+        let _ = unsafe { CloseHandle(self.event) };
+    }
+}
+
+/// Allocator plus list behind one submit slot.
+pub(crate) struct CommandSlot<L> {
+    /// Allocator behind the list.
+    allocator: ID3D12CommandAllocator,
+    /// List behind submissions.
+    list: L,
+}
+
+impl<L: SlotList> CommandSlot<L> {
+    /// Slot over `resources` for a `queue_type` queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the allocator, the list,
+    /// or the fresh-list close.
+    pub(crate) fn open(
+        resources: &DeviceResources,
+        queue_type: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<Self, D3d12Error> {
+        let allocator = resources.allocator(queue_type)?;
+        let list: L = resources.command_list(queue_type, &allocator)?;
+        let slot = Self { allocator, list };
+        // Sound: the fresh list is open with no recorded work.
+        slot.list.close_list()?;
+        Ok(slot)
+    }
+
+    /// List behind submissions.
+    pub(crate) fn list(&self) -> &L {
+        &self.list
+    }
+
+    /// Pair reset for one submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the reset.
+    pub(crate) fn reset(&mut self) -> Result<(), D3d12Error> {
+        // Sound: the slot is idle; reset reuses the allocator and list.
+        unsafe { self.allocator.Reset() }.map_err(|error| D3d12Error::Call {
+            call: "ResetAllocator",
+            hresult: error.code().0,
+        })?;
+        self.list.reset_list(&self.allocator)
+    }
+
+    /// Closed list through `queue`, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the close, the cast, or the
+    /// signal. Close and cast failures reset the pair first; a signal
+    /// failure leaves submitted work in flight for the session drop.
+    pub(crate) fn close_execute(
+        &mut self,
+        queue: &ID3D12CommandQueue,
+        fence: &mut Fence,
+    ) -> Result<Ticket, D3d12Error> {
+        if let Err(error) = self.list.close_list() {
+            let _ = self.reset();
+            return Err(error);
+        }
+        // Sound: the list is closed; the cast holds the live list.
+        let command: ID3D12CommandList = match self.list.cast() {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = self.reset();
+                return Err(D3d12Error::Call {
+                    call: "CastCommandList",
+                    hresult: error.code().0,
+                });
+            }
+        };
+        fence.execute(queue, &command)
     }
 }
 

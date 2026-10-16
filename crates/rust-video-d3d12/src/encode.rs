@@ -7,17 +7,15 @@
 use std::mem::ManuallyDrop;
 
 use crate::error::D3d12Error;
-use crate::submit::{DeviceResources, Fence, Nv12Layout};
+use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12GraphicsCommandList,
-    ID3D12Resource, D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
-    D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
-    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+    ID3D12CommandQueue, ID3D12GraphicsCommandList, ID3D12Resource, D3D12_BOX,
+    D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ, D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL};
 use windows::Win32::Media::MediaFoundation::{
@@ -633,18 +631,16 @@ struct Buffers {
 pub(crate) struct EncodeSession {
     /// Video encode queue.
     video_queue: ID3D12CommandQueue,
-    /// Video encode allocator.
-    video_alloc: ID3D12CommandAllocator,
-    /// Video encode list.
-    video_list: ID3D12VideoEncodeCommandList2,
+    /// Video encode slot.
+    video: CommandSlot<ID3D12VideoEncodeCommandList2>,
     /// Direct queue behind uploads.
     copy_queue: ID3D12CommandQueue,
-    /// Direct allocator behind uploads.
-    copy_alloc: ID3D12CommandAllocator,
-    /// Direct list behind uploads.
-    copy_list: ID3D12GraphicsCommandList,
-    /// Fence behind both queues.
-    fence: Fence,
+    /// Upload slot.
+    copy: CommandSlot<ID3D12GraphicsCommandList>,
+    /// Fence behind the video queue.
+    video_fence: Fence,
+    /// Fence behind the direct queue.
+    copy_fence: Fence,
     /// Encoder behind pictures.
     encoder: ID3D12VideoEncoder,
     /// Encoder heap behind pictures.
@@ -766,36 +762,22 @@ impl EncodeSession {
         let (encoder, heap) = Self::create_codec(&video3, &mut descriptors)?;
         let resources = DeviceResources::new(device.device());
         let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
-        let video_alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
-        let video_list: ID3D12VideoEncodeCommandList2 =
-            resources.command_list(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, &video_alloc)?;
-        // Sound: the fresh list is open with no recorded work.
-        unsafe { video_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
+        let video = CommandSlot::open(&resources, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
         let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let copy_alloc = resources.allocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let copy_list: ID3D12GraphicsCommandList =
-            resources.command_list(D3D12_COMMAND_LIST_TYPE_DIRECT, &copy_alloc)?;
-        // Sound: the fresh list is open with no recorded work.
-        unsafe { copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        let fence = Fence::open(device.device())?;
+        let copy = CommandSlot::open(&resources, D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let video_fence = Fence::open(device.device())?;
+        let copy_fence = Fence::open(device.device())?;
         let meta_cap =
             Self::query_requirements(device.video(), &mut descriptors, coded_width, coded_height)?;
         let buffers = Self::open_buffers(&resources, coded_width, coded_height, meta_cap)?;
         Ok(Self {
             codec,
             video_queue,
-            video_alloc,
-            video_list,
+            video,
             copy_queue,
-            copy_alloc,
-            copy_list,
-            fence,
+            copy,
+            video_fence,
+            copy_fence,
             encoder,
             heap,
             input: buffers.input,
@@ -1285,7 +1267,8 @@ impl EncodeSession {
         };
         let staged = self.layout.stride(coded, self.width, self.height)?;
         DeviceResources::write_upload(&self.upload, &staged)?;
-        self.submit_copy()?;
+        let ticket = self.submit_copy()?;
+        self.copy_fence.wait(ticket)?;
         self.finish_picture()
     }
 
@@ -1301,14 +1284,17 @@ impl EncodeSession {
                 "texture extent outside session".to_owned(),
             ));
         }
-        self.submit_copy_from(src, width, height)?;
+        let ticket = self.submit_copy_from(src, width, height)?;
+        self.copy_fence.wait(ticket)?;
         self.finish_picture()
     }
 
     /// Picture through the video queue plus metadata into Annex B bytes.
     fn finish_picture(&mut self) -> Result<Vec<u8>, D3d12Error> {
-        self.submit_video()?;
-        self.submit_download()?;
+        let ticket = self.submit_video()?;
+        self.video_fence.wait(ticket)?;
+        let ticket = self.submit_download()?;
+        self.copy_fence.wait(ticket)?;
         let meta = self.read_metadata()?;
         if meta.EncodeErrorFlags != 0 {
             return Err(D3d12Error::Unsupported(format!(
@@ -1331,42 +1317,18 @@ impl EncodeSession {
         Ok(out)
     }
 
-    /// Copy allocator plus list reset for one submission.
-    fn reset_copy(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset; no initial pipeline.
-        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| D3d12Error::Call {
-            call: "ResetList",
-            hresult: error.code().0,
-        })
-    }
-
-    /// Closed copy list through the direct queue.
-    fn close_copy(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the list holds the caller's barriers and copies.
-        unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.copy_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.copy_queue, &command)
+    /// Closed upload list through the direct queue, without waiting.
+    fn close_copy(&mut self) -> Result<Ticket, D3d12Error> {
+        self.copy
+            .close_execute(&self.copy_queue, &mut self.copy_fence)
     }
 
     /// NV12 upload through the direct queue into the input texture.
-    fn submit_copy(&mut self) -> Result<(), D3d12Error> {
-        self.reset_copy()?;
+    fn submit_copy(&mut self) -> Result<Ticket, D3d12Error> {
+        self.copy.reset()?;
         // Sound: the barriers name a live texture; the list is open.
         unsafe {
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
+            self.copy.list().ResourceBarrier(&[DeviceResources::barrier(
                 &self.input,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1377,7 +1339,7 @@ impl EncodeSession {
             for (index, placed) in [0u32, 1u32].into_iter().zip(self.footprints.iter()) {
                 let dst = DeviceResources::subresource_location(&self.input, index);
                 let src = DeviceResources::footprint_location(&self.upload, placed);
-                self.copy_list.CopyTextureRegion(
+                self.copy.list().CopyTextureRegion(
                     std::ptr::from_ref(&dst),
                     0,
                     0,
@@ -1386,7 +1348,7 @@ impl EncodeSession {
                     None,
                 );
             }
-            self.copy_list.ResourceBarrier(&[DeviceResources::barrier(
+            self.copy.list().ResourceBarrier(&[DeviceResources::barrier(
                 &self.input,
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -1404,11 +1366,11 @@ impl EncodeSession {
         src: &ID3D12Resource,
         width: u32,
         height: u32,
-    ) -> Result<(), D3d12Error> {
-        self.reset_copy()?;
+    ) -> Result<Ticket, D3d12Error> {
+        self.copy.reset()?;
         // Sound: the barriers name live textures; the list is open.
         unsafe {
-            self.copy_list.ResourceBarrier(&[
+            self.copy.list().ResourceBarrier(&[
                 DeviceResources::barrier(
                     &self.input,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -1434,7 +1396,7 @@ impl EncodeSession {
             for (index, src_box) in [0u32, 1u32].into_iter().zip(boxes.iter()) {
                 let dst = DeviceResources::subresource_location(&self.input, index);
                 let src_loc = DeviceResources::subresource_location(src, index);
-                self.copy_list.CopyTextureRegion(
+                self.copy.list().CopyTextureRegion(
                     std::ptr::from_ref(&dst),
                     0,
                     0,
@@ -1443,7 +1405,7 @@ impl EncodeSession {
                     Some(std::ptr::from_ref(src_box)),
                 );
             }
-            self.copy_list.ResourceBarrier(&[
+            self.copy.list().ResourceBarrier(&[
                 DeviceResources::barrier(
                     &self.input,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1584,17 +1546,8 @@ impl EncodeSession {
     }
 
     /// `EncodeFrame` plus metadata resolve through the video queue.
-    fn submit_video(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.video_alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset.
-        unsafe { self.video_list.Reset(&self.video_alloc) }.map_err(|error| D3d12Error::Call {
-            call: "ResetList",
-            hresult: error.code().0,
-        })?;
+    fn submit_video(&mut self) -> Result<Ticket, D3d12Error> {
+        self.video.reset()?;
         let hevc = matches!(self.codec, crate::guid::Codec::Hevc);
         let mut pic_h264 = Self::pic_h264(self.idr_pic_id);
         let mut pic_hevc = Self::pic_hevc();
@@ -1658,23 +1611,14 @@ impl EncodeSession {
             },
         };
         self.record_video(&input_args, &output_args, &resolve_in, &resolve_out);
-        // Sound: the list holds only the encode and resolve above.
-        unsafe { self.video_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.video_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.video_queue, &command)?;
+        let ticket = self
+            .video
+            .close_execute(&self.video_queue, &mut self.video_fence)?;
         self.recon_state = D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
         self.bitstream_state = D3D12_RESOURCE_STATE_COMMON;
         self.meta_state = D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ;
         self.resolved_state = D3D12_RESOURCE_STATE_COMMON;
-        Ok(())
+        Ok(ticket)
     }
 
     /// Encode plus resolve records behind the argument structs.
@@ -1689,88 +1633,95 @@ impl EncodeSession {
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
             if self.recon_state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE {
-                self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                    &self.recon,
-                    self.recon_state,
-                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                )]);
+                self.video
+                    .list()
+                    .ResourceBarrier(&[DeviceResources::barrier(
+                        &self.recon,
+                        self.recon_state,
+                        D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    )]);
             }
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.input,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
-            )]);
-            if self.bitstream_state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE {
-                self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                    &self.bitstream,
-                    self.bitstream_state,
-                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+            self.video
+                .list()
+                .ResourceBarrier(&[DeviceResources::barrier(
+                    &self.input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
                 )]);
+            if self.bitstream_state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE {
+                self.video
+                    .list()
+                    .ResourceBarrier(&[DeviceResources::barrier(
+                        &self.bitstream,
+                        self.bitstream_state,
+                        D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    )]);
             }
             if self.meta_state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE {
-                self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                    &self.meta,
-                    self.meta_state,
-                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                )]);
+                self.video
+                    .list()
+                    .ResourceBarrier(&[DeviceResources::barrier(
+                        &self.meta,
+                        self.meta_state,
+                        D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    )]);
             }
             if self.resolved_state != D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE {
-                self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                    &self.resolved,
-                    self.resolved_state,
-                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                )]);
+                self.video
+                    .list()
+                    .ResourceBarrier(&[DeviceResources::barrier(
+                        &self.resolved,
+                        self.resolved_state,
+                        D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    )]);
             }
-            self.video_list.EncodeFrame(
+            self.video.list().EncodeFrame(
                 &self.encoder,
                 &self.heap,
                 std::ptr::from_ref(input_args),
                 std::ptr::from_ref(output_args),
             );
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.meta,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
-            )]);
-            self.video_list.ResolveEncoderOutputMetadata(
+            self.video
+                .list()
+                .ResourceBarrier(&[DeviceResources::barrier(
+                    &self.meta,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
+                )]);
+            self.video.list().ResolveEncoderOutputMetadata(
                 std::ptr::from_ref(resolve_in),
                 std::ptr::from_ref(resolve_out),
             );
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.input,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.bitstream,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
-            self.video_list.ResourceBarrier(&[DeviceResources::barrier(
-                &self.resolved,
-                D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
+            self.video
+                .list()
+                .ResourceBarrier(&[DeviceResources::barrier(
+                    &self.input,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            self.video
+                .list()
+                .ResourceBarrier(&[DeviceResources::barrier(
+                    &self.bitstream,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            self.video
+                .list()
+                .ResourceBarrier(&[DeviceResources::barrier(
+                    &self.resolved,
+                    D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
         }
     }
 
     /// Bitstream and metadata through the direct queue into staging.
-    fn submit_download(&mut self) -> Result<(), D3d12Error> {
-        // Sound: the queue is idle; reset reuses the allocator and list.
-        unsafe { self.copy_alloc.Reset() }.map_err(|error| D3d12Error::Call {
-            call: "ResetAllocator",
-            hresult: error.code().0,
-        })?;
-        // Sound: the allocator outlives the reset; no initial pipeline.
-        unsafe { self.copy_list.Reset(&self.copy_alloc, None) }.map_err(|error| {
-            D3d12Error::Call {
-                call: "ResetList",
-                hresult: error.code().0,
-            }
-        })?;
+    fn submit_download(&mut self) -> Result<Ticket, D3d12Error> {
+        self.copy.reset()?;
         // Sound: the buffers outlive the fence wait below.
         unsafe {
-            self.copy_list.ResourceBarrier(&[
+            self.copy.list().ResourceBarrier(&[
                 DeviceResources::barrier(
                     &self.bitstream,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -1782,14 +1733,14 @@ impl EncodeSession {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 ),
             ]);
-            self.copy_list.CopyBufferRegion(
+            self.copy.list().CopyBufferRegion(
                 &self.staging,
                 0,
                 &self.bitstream,
                 0,
                 self.bitstream_cap,
             );
-            self.copy_list.CopyBufferRegion(
+            self.copy.list().CopyBufferRegion(
                 &self.resolved_staging,
                 0,
                 &self.resolved,
@@ -1797,7 +1748,7 @@ impl EncodeSession {
                 u64::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_OUTPUT_METADATA>())
                     .unwrap_or(0),
             );
-            self.copy_list.ResourceBarrier(&[
+            self.copy.list().ResourceBarrier(&[
                 DeviceResources::barrier(
                     &self.bitstream,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1810,18 +1761,7 @@ impl EncodeSession {
                 ),
             ]);
         }
-        // Sound: the list holds only the copy above.
-        unsafe { self.copy_list.Close() }.map_err(|error| D3d12Error::Call {
-            call: "Close",
-            hresult: error.code().0,
-        })?;
-        // Sound: the list is closed; the cast holds the live list.
-        let command: ID3D12CommandList =
-            self.copy_list.cast().map_err(|error| D3d12Error::Call {
-                call: "CastCommandList",
-                hresult: error.code().0,
-            })?;
-        self.fence.submit(&self.copy_queue, &command)
+        self.close_copy()
     }
 
     /// Output metadata from the resolved staging buffer.

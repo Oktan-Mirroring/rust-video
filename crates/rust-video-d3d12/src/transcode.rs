@@ -236,7 +236,9 @@ impl<'a> Transcoder<'a> {
             }
         }
         let scaler = self.scaler.as_mut().ok_or(D3d12Error::NoSession)?;
-        scaler.scale(texture)
+        scaler.scale(texture).inspect_err(|_| {
+            self.scaler = None;
+        })
     }
 
     /// `frames` through the proven CPU path.
