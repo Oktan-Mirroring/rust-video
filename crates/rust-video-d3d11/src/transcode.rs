@@ -9,10 +9,11 @@ use crate::guid::Codec;
 use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::FallbackCause;
-use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
+use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
 
 /// GPU transcode from decode surface to encoder texture.
 pub struct Transcoder<'a> {
@@ -24,6 +25,8 @@ pub struct Transcoder<'a> {
     caps: GpuCaps,
     /// Optional scale hop.
     scale: Scale,
+    /// Optional format convert.
+    convert: Convert,
     /// Device behind the scale hop.
     device: &'a D3d11Device,
     /// Scale hop, opened on first use.
@@ -44,7 +47,11 @@ impl<'a> Transcoder<'a> {
             return Err(D3d11Error::Unsupported(format!("{decode} decode pending")));
         }
         let encoder = D3d11Encoder::open(device, encode)?;
-        let caps = GpuCaps::new(true, device.supports(decode), encoder.gpu_ready());
+        let caps = GpuCaps::new(
+            Some(ShareMechanism::NtHandle),
+            device.supports(decode),
+            encoder.gpu_ready(),
+        );
         let plan = Plan::for_caps(&caps);
         let decoder = Box::new(H264Decoder::open(device));
         Ok(Self {
@@ -52,6 +59,7 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
             device,
             scaler: None,
             plan,
@@ -66,6 +74,17 @@ impl<'a> Transcoder<'a> {
     #[must_use]
     pub fn with_target(mut self, target: PictureSize) -> Self {
         self.scale = Scale::to(target);
+        self
+    }
+
+    /// Transcoder retargeted to `format`.
+    ///
+    /// A layout change converts on the GPU where the box supports it, else
+    /// fails loud at `transcode` and `flush` with `Unsupported`, never
+    /// silently.
+    #[must_use]
+    pub fn with_target_format(mut self, format: PixelFormat) -> Self {
+        self.convert = Convert::to(format);
         self
     }
 
@@ -127,6 +146,9 @@ impl<'a> Transcoder<'a> {
     fn encode_surfaces(&mut self, surfaces: &[GpuSurface]) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         for surface in surfaces {
+            if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
+                return Err(D3d11Error::Unsupported(cause.to_string()));
+            }
             if let Some(cause) = self.scale.miss(surface.size()) {
                 let scaled = self.scaled_or_miss(surface, cause)?;
                 packets.append(&mut self.encoder.encode_scaled(&scaled)?);
@@ -170,6 +192,9 @@ impl<'a> Transcoder<'a> {
             let cpu = frame
                 .to_cpu()
                 .ok_or_else(|| D3d11Error::Unsupported("nv12 short of its extent".to_owned()))?;
+            if let Some(cause) = self.convert.miss(cpu.format()) {
+                return Err(D3d11Error::Unsupported(cause.to_string()));
+            }
             if let Some(cause) = self.scale.miss(cpu.size()) {
                 return Err(D3d11Error::Unsupported(cause.to_string()));
             }

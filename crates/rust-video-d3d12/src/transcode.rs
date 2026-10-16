@@ -1,5 +1,12 @@
 //! GPU transcode: decode texture to encoder texture without readback.
 
+#[cfg(test)]
+#[path = "../examples/common/bits.rs"]
+mod bits;
+#[cfg(test)]
+#[path = "../examples/common/h264.rs"]
+mod h264;
+
 use crate::decoder::{D3d12Frame, H264Decoder, HevcDecoder};
 use crate::device::D3d12Device;
 use crate::encoder::D3d12Encoder;
@@ -9,10 +16,11 @@ use crate::scale::Scaler;
 use crate::texture::GpuTexture;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::FallbackCause;
-use rust_video_caps::transcode::{GpuCaps, Outcome, Plan, Scale};
+use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
 
 /// Decode source behind transcode packets.
 enum Source<'a> {
@@ -66,6 +74,8 @@ pub struct Transcoder<'a> {
     caps: GpuCaps,
     /// Optional scale hop.
     scale: Scale,
+    /// Optional format convert.
+    convert: Convert,
     /// Device behind the scale hop.
     device: &'a D3d12Device,
     /// Scale hop, opened on first use.
@@ -91,7 +101,7 @@ impl<'a> Transcoder<'a> {
         };
         let encoder = D3d12Encoder::open(device, encode)?;
         let caps = GpuCaps::new(
-            true,
+            Some(ShareMechanism::NtHandle),
             device.supports(decode),
             device.supports_encode(encode),
         );
@@ -101,6 +111,7 @@ impl<'a> Transcoder<'a> {
             encoder,
             caps,
             scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
             device,
             scaler: None,
             plan,
@@ -115,6 +126,17 @@ impl<'a> Transcoder<'a> {
     #[must_use]
     pub fn with_target(mut self, target: PictureSize) -> Self {
         self.scale = Scale::to(target);
+        self
+    }
+
+    /// Transcoder retargeted to `format`.
+    ///
+    /// A layout change converts on the GPU where the box supports it, else
+    /// fails loud at `transcode` and `flush` with `Unsupported`, never
+    /// silently.
+    #[must_use]
+    pub fn with_target_format(mut self, format: PixelFormat) -> Self {
+        self.convert = Convert::to(format);
         self
     }
 
@@ -176,6 +198,9 @@ impl<'a> Transcoder<'a> {
     fn encode_textures(&mut self, textures: &[GpuTexture]) -> Result<Vec<Packet>, D3d12Error> {
         let mut packets = Vec::new();
         for texture in textures {
+            if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
+                return Err(D3d12Error::Unsupported(cause.to_string()));
+            }
             let scaled;
             let input = if let Some(cause) = self.scale.miss(texture.size()) {
                 scaled = self.scaled_or_miss(texture, cause)?;
@@ -221,6 +246,9 @@ impl<'a> Transcoder<'a> {
             let cpu = frame
                 .to_cpu()
                 .ok_or_else(|| D3d12Error::Unsupported("readback short of extent".to_owned()))?;
+            if let Some(cause) = self.convert.miss(cpu.format()) {
+                return Err(D3d12Error::Unsupported(cause.to_string()));
+            }
             if let Some(cause) = self.scale.miss(cpu.size()) {
                 return Err(D3d12Error::Unsupported(cause.to_string()));
             }
@@ -232,15 +260,12 @@ impl<'a> Transcoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    #[path = "../../../examples/common/bits.rs"]
-    mod bits;
-    #[path = "../../../examples/common/h264.rs"]
-    mod h264;
-
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
     use rust_video_caps::packet::Packet;
-    use rust_video_caps::transcode::{FallbackCause, GpuCaps, Plan, Route, Scale};
+    use rust_video_caps::transcode::{
+        Convert, FallbackCause, GpuCaps, Plan, Route, Scale, ShareMechanism,
+    };
 
     /// Live H.264 transcoder, absent without hardware.
     fn transcoder(device: &crate::device::D3d12Device) -> Option<super::Transcoder<'_>> {
@@ -259,6 +284,7 @@ mod tests {
             encoder,
             caps,
             scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
             device,
             scaler: None,
             plan: Plan::cpu(cause),
@@ -365,15 +391,15 @@ mod tests {
         let Ok(device) = crate::device::D3d12Device::open() else {
             return;
         };
-        let caps = GpuCaps::new(true, true, false);
+        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, false);
         assert!(!caps.ready());
         let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
             return;
         };
         let mut count = 0;
-        for raw in h264::annex_b_h264_packets()
+        for raw in super::h264::annex_b_h264_packets()
             .into_iter()
-            .chain(h264::annex_b_h264_packets_cropped())
+            .chain(super::h264::annex_b_h264_packets_cropped())
         {
             let packet = Packet::new(Bytes::from(raw));
             let outcome = transcoder.transcode(&packet).expect("cpu transcode");
@@ -391,12 +417,12 @@ mod tests {
         let Ok(device) = crate::device::D3d12Device::open() else {
             return;
         };
-        let caps = GpuCaps::new(true, true, false);
+        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, false);
         let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
             return;
         };
         transcoder.scale = Scale::to(PictureSize::new(160, 112).expect("nonzero extent"));
-        let raw = h264::annex_b_h264_packets_cropped_sized(39, 22, 4, 22)
+        let raw = super::h264::annex_b_h264_packets_cropped_sized(39, 22, 4, 22)
             .into_iter()
             .next()
             .expect("sets plus IDR");

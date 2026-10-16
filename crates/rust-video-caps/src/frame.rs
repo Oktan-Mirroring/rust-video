@@ -33,19 +33,15 @@ pub enum GpuExport {
     /// DMA-BUF descriptor.
     #[cfg(unix)]
     DmaBuf {
-        /// Buffer file descriptor.
-        fd: OwnedFd,
-        /// Bytes per row.
-        stride: u32,
-        /// Byte offset of the first row.
-        offset: u32,
-        /// Format modifier.
-        modifier: u64,
+        /// Pixel layout; two-plane NV12 or P010 matching `planes`.
+        format: PixelFormat,
+        /// Image planes in plane order.
+        planes: [DmaBufPlane; 2],
     },
-    /// NT handle descriptor.
+    /// NT handle descriptor; the exporter owns and closes the handle.
     #[cfg(windows)]
     NtHandle {
-        /// Buffer handle.
+        /// Borrowed handle value, valid while the source frame lives; the importer must not close it.
         handle: isize,
     },
     /// Opaque backend descriptor.
@@ -133,6 +129,58 @@ impl CpuFrame {
     #[must_use]
     pub fn planes(&self) -> &[Plane] {
         &self.planes
+    }
+}
+
+/// One DMA-BUF plane: descriptor plus layout.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DmaBufPlane {
+    /// Buffer file descriptor.
+    fd: OwnedFd,
+    /// Bytes per row.
+    stride: u32,
+    /// Byte offset of the first row.
+    offset: u32,
+    /// Format modifier.
+    modifier: u64,
+}
+
+#[cfg(unix)]
+impl DmaBufPlane {
+    /// Plane over `fd` with `stride` bytes per row, `offset` first-row bytes, and `modifier`.
+    #[must_use]
+    pub fn new(fd: OwnedFd, stride: u32, offset: u32, modifier: u64) -> Self {
+        Self {
+            fd,
+            stride,
+            offset,
+            modifier,
+        }
+    }
+
+    /// Buffer file descriptor.
+    #[must_use]
+    pub fn fd(&self) -> &OwnedFd {
+        &self.fd
+    }
+
+    /// Bytes per row.
+    #[must_use]
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Byte offset of the first row.
+    #[must_use]
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Format modifier.
+    #[must_use]
+    pub fn modifier(&self) -> u64 {
+        self.modifier
     }
 }
 
@@ -303,6 +351,12 @@ impl Plane {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::{
+        fs::File,
+        os::fd::{AsRawFd, OwnedFd},
+    };
+
     use super::{CpuFrame, CpuReadback, FramePool, GpuFrame, PixelFormat, Plane};
     use crate::common::PictureSize;
 
@@ -428,5 +482,42 @@ mod tests {
             CpuReadback::BackendAbsent.to_string(),
             "no backend attached"
         );
+    }
+
+    #[cfg(unix)]
+    fn null_fd() -> OwnedFd {
+        File::open("/dev/null").expect("null fd").into()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dmabuf_plane_reports_layout() {
+        use super::DmaBufPlane;
+
+        let plane = DmaBufPlane::new(null_fd(), 64, 128, 7);
+        assert!(plane.fd().as_raw_fd() >= 0);
+        assert_eq!(plane.stride(), 64);
+        assert_eq!(plane.offset(), 128);
+        assert_eq!(plane.modifier(), 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dmabuf_export_carries_two_planes() {
+        use super::{DmaBufPlane, GpuExport};
+
+        let export = GpuExport::DmaBuf {
+            format: PixelFormat::Nv12,
+            planes: [
+                DmaBufPlane::new(null_fd(), 64, 0, 0),
+                DmaBufPlane::new(null_fd(), 64, 1024, 0),
+            ],
+        };
+        let GpuExport::DmaBuf { format, planes } = export else {
+            panic!("dma-buf variant");
+        };
+        assert_eq!(format, PixelFormat::Nv12);
+        assert_eq!(planes[0].offset(), 0);
+        assert_eq!(planes[1].offset(), 1024);
     }
 }

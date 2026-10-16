@@ -52,6 +52,12 @@ impl Packet {
         &self.data
     }
 
+    /// Coded bytes as shared buffer.
+    #[must_use]
+    pub fn bytes(&self) -> Bytes {
+        self.data.clone()
+    }
+
     /// Presentation timestamp, if stamped.
     #[must_use]
     pub fn pts(&self) -> Option<Duration> {
@@ -86,6 +92,14 @@ mod tests {
         assert_eq!(packet.pts(), None);
         assert_eq!(packet.dts(), None);
         assert!(!packet.is_keyframe());
+    }
+
+    #[test]
+    fn bytes_shares_backing_without_copy() {
+        let packet = Packet::new(Bytes::from_static(&[0x65, 0x88]));
+        let shared = packet.bytes();
+        assert_eq!(shared, Bytes::from_static(&[0x65, 0x88]));
+        assert_eq!(shared.as_ptr(), packet.data().as_ptr());
     }
 
     #[test]
