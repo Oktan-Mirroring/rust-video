@@ -27,15 +27,11 @@ use rust_video_caps::traits::Encoder;
 ///
 /// # Usage Notes
 ///
-/// Driver 596.36 emits corrupt H.264 IDR slices on noise-like input,
-/// byte-identical through this tier and ffmpeg `h264_d3d12va` (decoder
-/// reports intra4x4 mode -1 at MB 0,0); parameter sets are exonerated.
-/// Corruption spans high/main profiles, CQP/default rate control, and
-/// GOP lengths; only main profile with CQP and intra-only stays clean.
-/// Retest on 617.42 or later; flat input is unaffected. HEVC encode
-/// needs driver configuration support: boxes reporting the codec but
-/// refusing its configuration fail the first frame loud with
-/// `OverCaps`; retest on 617.42 or later.
+/// Emitted parameter sets describe the encoder output: High
+/// profile CABAC without 8x8 transform signaling, matching the
+/// fixed slice assumptions. HEVC encode needs driver
+/// configuration support: boxes reporting the codec but refusing
+/// its configuration fail the first frame loud with `OverCaps`.
 #[cfg(target_os = "windows")]
 pub struct D3d12Encoder<'a> {
     /// Device owning the encode session.

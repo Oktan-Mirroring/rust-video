@@ -460,7 +460,8 @@ fn pps_body() -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.bit(false);
-    writer.bit(true);
+    // The encoder signals no 8x8 transform; the flag stays clear.
+    writer.bit(false);
     writer.bit(false);
     writer.se(0);
     writer.finish()
@@ -1798,7 +1799,7 @@ mod tests {
         assert_eq!(sps.level_idc, 10);
         let pps = parse_pps(&rbsp(nals[1])[1..], &sps).expect("pps");
         assert!(pps.entropy());
-        assert!(pps.transform_8x8());
+        assert!(!pps.transform_8x8());
     }
 
     #[test]

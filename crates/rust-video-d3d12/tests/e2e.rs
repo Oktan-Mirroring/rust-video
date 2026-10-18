@@ -121,13 +121,9 @@ fn reset_after_failure_recovers() {
     assert_eq!(decoder.resets(), 1, "recovery adds no reset");
 }
 
-/// GPU transcode output stays on the GPU and decodes under ffmpeg.
-///
-/// Driver 596.36 corrupts H.264 IDR slices on noise-like input, so the
-/// oracle verdict is decodable rather than warning-free; the tier
-/// proves the bitstream by its Annex-B IDR prefix instead.
+/// GPU transcode output decodes clean under ffmpeg.
 #[test]
-fn gpu_transcode_stays_on_gpu() {
+fn gpu_transcode_stays_ffmpeg_clean() {
     let Some(device) = device() else {
         return;
     };
@@ -173,19 +169,13 @@ fn gpu_transcode_stays_on_gpu() {
     assert_eq!(&out[..header.len()], &header, "bitstream opens on SPS");
     let path = std::env::temp_dir().join("rust-video-d3d12-e2e.h264");
     std::fs::write(&path, &out).expect("oracle input writable");
-    let warnings = ffmpeg_decodable(&path);
+    ffmpeg_clean(&path);
     std::fs::remove_file(&path).ok();
-    println!(
-        "transcode: {coded_packets} packets, {coded_bytes} bytes, route=gpu, ffmpeg-decodable warnings={warnings}"
-    );
+    println!("transcode: {coded_packets} packets, {coded_bytes} bytes, route=gpu, ffmpeg-clean");
 }
 
-/// ffmpeg decode over `path`, returning its stderr line count.
-///
-/// Fails loud without the oracle or when ffmpeg rejects the
-/// bitstream; concealment warnings stay informational on the
-/// corrupting driver.
-fn ffmpeg_decodable(path: &std::path::Path) -> usize {
+/// ffmpeg decode over `path`, failing loud without the oracle.
+fn ffmpeg_clean(path: &std::path::Path) {
     let output = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-v", "error", "-i"])
         .arg(path)
@@ -197,10 +187,5 @@ fn ffmpeg_decodable(path: &std::path::Path) -> usize {
         output.status.success(),
         "ffmpeg rejects the bitstream: {stderr}"
     );
-    if stderr.is_empty() {
-        0
-    } else {
-        println!("ffmpeg warnings:\n{stderr}");
-        stderr.lines().count()
-    }
+    assert!(output.stderr.is_empty(), "ffmpeg warnings: {stderr}");
 }

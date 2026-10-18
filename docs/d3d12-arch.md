@@ -126,23 +126,22 @@ current picture at 4 and 6, the reference lists at 16 and
 124, and the order counts at 40 and 140 (`dxva.rs`). Decode
 needs tier 2 or later; tier 1 fails loud (`device.rs`).
 
-Driver 596.36 emits corrupt H.264 IDR slices on noise-like
-input, byte-identical through this tier and ffmpeg
-`h264_d3d12va`; flat input is unaffected, retest on 617.42
-or later (`encoder.rs`). HEVC encode on boxes reporting the
-codec but refusing its configuration fails the first frame
-loud with `OverCaps`; retest on 617.42 or later
-(`encoder.rs`).
+Emitted H.264 parameter sets match the encoder: High
+profile CABAC without 8x8 transform signaling, and the
+ffmpeg oracle decodes the transcode output warning-free
+(`encode.rs`, `encoder.rs`, `tests/e2e.rs`). HEVC encode on
+boxes reporting the codec but refusing its configuration
+fails the first frame loud with `OverCaps` (`encoder.rs`).
 
 Shell decoders report `ProfileUnsupported` without a profile
 and the pending picture builder with one; flush returns
 empty (`decoder.rs`).
 
 `tests/e2e.rs` drives the committed 15-picture vector through
-overlap (`max_inflight` above 1), GPU transcode decoded by
-the ffmpeg oracle, failure reset plus recovery, and a
-zero-reset steady run; `H264Decoder::resets` counts stream
-resets (`decoder.rs`, `tests/e2e.rs`).
+overlap (`max_inflight` above 1), GPU transcode verified
+clean by the ffmpeg oracle, failure reset plus recovery,
+and a zero-reset steady run; `H264Decoder::resets` counts
+stream resets (`decoder.rs`, `tests/e2e.rs`).
 
 ## Examples
 
