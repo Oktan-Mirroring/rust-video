@@ -121,6 +121,72 @@ fn reset_after_failure_recovers() {
     assert_eq!(decoder.resets(), 1, "recovery adds no reset");
 }
 
+/// Hardware NV12 bytes match the ffmpeg software oracle byte-exact.
+#[test]
+fn hardware_matches_software_oracle() {
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 240;
+    const FRAME_BYTES: usize = WIDTH * HEIGHT * 3 / 2;
+    let Some(device) = device() else {
+        return;
+    };
+    let raws = picture_packets();
+    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
+    let mut decoder = H264Decoder::open(&device);
+    let mut frames = Vec::new();
+    for (index, raw) in raws.iter().enumerate() {
+        let packet = Packet::new(Bytes::copy_from_slice(raw));
+        match decoder.decode(&packet) {
+            Ok(out) => frames.extend(out),
+            Err(error) => panic!("steady packet {index}: {error}"),
+        }
+    }
+    frames.extend(decoder.flush().expect("flush drains"));
+    assert_eq!(frames.len(), PICTURES, "steady vector yields every picture");
+    let mut hardware = Vec::with_capacity(PICTURES * FRAME_BYTES);
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.nv12().len(),
+            FRAME_BYTES,
+            "frame {index} holds tight NV12"
+        );
+        hardware.extend_from_slice(frame.nv12());
+    }
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-i"])
+        .arg(vector())
+        .args(["-f", "rawvideo", "-pix_fmt", "nv12", "-"])
+        .output()
+        .unwrap_or_else(|error| panic!("ffmpeg oracle missing: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "ffmpeg oracle failed: {stderr}");
+    let software = output.stdout;
+    assert_eq!(
+        software.len(),
+        hardware.len(),
+        "oracle byte count matches hardware"
+    );
+    if hardware != software {
+        let offset = hardware
+            .iter()
+            .zip(software.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "parity mismatch at frame {} offset {} (global {offset}): hw={} sw={}",
+            offset / FRAME_BYTES,
+            offset % FRAME_BYTES,
+            hardware[offset],
+            software[offset]
+        );
+    }
+    println!(
+        "parity: {} frames, {} bytes compared, 0 mismatches",
+        frames.len(),
+        hardware.len()
+    );
+}
+
 /// GPU transcode output decodes clean under ffmpeg.
 #[test]
 fn gpu_transcode_stays_ffmpeg_clean() {

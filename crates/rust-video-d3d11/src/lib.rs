@@ -1,6 +1,7 @@
 //! Direct3D 11 video tier: hardware decode and encode behind the caps traits.
 //!
-//! Hardware decode pixel parity against the software oracle is unverified.
+//! Hardware decode matches the ffmpeg software oracle byte-exact
+//! (`tests/e2e.rs hardware_matches_software_oracle`).
 
 #[cfg(target_os = "windows")]
 mod bits;

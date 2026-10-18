@@ -147,14 +147,24 @@ impl Dpb {
         }
         self.check_gap(picture, sps)?;
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
-        let refs = self.ref_snapshot();
+        let refs;
+        let slot;
         if picture.idr {
+            refs = self.ref_snapshot();
             self.reset_idr(picture, &mut emits);
+            slot = self.alloc()?;
+        } else if let Ok(free) = self.alloc() {
+            // Reserve before marking: submitted lists name pre-marking
+            // surfaces, and reuse of an evicted surface corrupts the decode.
+            refs = self.ref_snapshot();
+            self.mark(picture, &mut emits)?;
+            slot = free;
         } else {
             self.mark(picture, &mut emits)?;
+            refs = self.ref_snapshot();
+            slot = self.alloc()?;
         }
         let poc = self.picture_poc(picture, sps)?;
-        let slot = self.alloc()?;
         let wrap = Self::current_wrap(picture, frame_num)?;
         let (long_term, long_term_idx) = Self::current_long_term(picture);
         self.slots[slot] = Some(Occupant {

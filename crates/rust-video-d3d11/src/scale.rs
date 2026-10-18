@@ -353,7 +353,17 @@ mod tests {
         };
         let mut decoder = crate::decoder::H264Decoder::open(&device);
         let mut surfaces = Vec::new();
-        for raw in super::fixture::annex_b_packets() {
+        for raw in super::fixture::annex_b_packets()
+            .into_iter()
+            .chain(super::fixture::annex_b_h264_packets())
+            .chain(super::fixture::annex_b_h264_packets_cropped())
+            .chain(super::fixture::annex_b_h264_packets_cropped_sized(
+                39, 22, 4, 22,
+            ))
+            .chain(super::fixture::annex_b_h264_packets_cropped_sized(
+                119, 67, 4, 40,
+            ))
+        {
             let packet = rust_video_caps::packet::Packet::new(bytes::Bytes::from(raw));
             match decoder.decode_surface(&packet) {
                 Ok(more) => surfaces.extend(more),

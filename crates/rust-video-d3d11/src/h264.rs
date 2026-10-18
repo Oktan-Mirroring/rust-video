@@ -389,18 +389,11 @@ fn sequence_list_8x8(reader: &mut BitReader, index: usize) -> Result<[u8; 64], D
     }
 }
 
-/// Table 7-2 defaults.
+/// Flat scaling lists, H.264 7.4.2.1.1 absent-matrix inference.
 fn fallback_scaling() -> ScalingSets {
     ScalingSets {
-        four: [
-            DEFAULT_4X4_INTRA,
-            DEFAULT_4X4_INTRA,
-            DEFAULT_4X4_INTRA,
-            DEFAULT_4X4_INTER,
-            DEFAULT_4X4_INTER,
-            DEFAULT_4X4_INTER,
-        ],
-        eight: [DEFAULT_8X8_INTRA, DEFAULT_8X8_INTER],
+        four: [[16; 16]; 6],
+        eight: [[16; 64]; 2],
     }
 }
 
@@ -637,7 +630,8 @@ pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d11Error> {
     if reader.read_bit("redundant_pic_cnt_present_flag")? {
         flags |= PPS_REDUNDANT;
     }
-    let mut second_chroma_qp = 0;
+    // H.264 7.4.2.2 absent-tail inference.
+    let mut second_chroma_qp = chroma_qp;
     let mut scaling = sps.scaling.clone();
     if reader.more_data() {
         if reader.read_bit("transform_8x8_mode_flag")? {
@@ -1702,8 +1696,8 @@ mod tests {
         assert_eq!(sps.max_poc_lsb(), 16);
         assert_eq!(sps.visible_width(), 1920);
         assert_eq!(sps.visible_height(), 1088);
-        assert_eq!(sps.scaling.four[0][0], 6);
-        assert_eq!(sps.scaling.four[0][1], 13);
+        assert_eq!(sps.scaling.four[0][0], 16);
+        assert_eq!(sps.scaling.four[0][1], 16);
     }
 
     #[test]
