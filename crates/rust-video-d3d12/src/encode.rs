@@ -68,10 +68,9 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_FLAG_USED_AS_REFERENCE_PICTURE,
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA,
     D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC, D3D12_VIDEO_ENCODER_PROFILE_DESC,
-    D3D12_VIDEO_ENCODER_PROFILE_DESC_0, D3D12_VIDEO_ENCODER_PROFILE_H264,
-    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_PROFILE_HEVC,
-    D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN, D3D12_VIDEO_ENCODER_RATE_CONTROL,
-    D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS,
+    D3D12_VIDEO_ENCODER_PROFILE_H264, D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH,
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC, D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN,
+    D3D12_VIDEO_ENCODER_RATE_CONTROL, D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0, D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP,
     D3D12_VIDEO_ENCODER_RECONSTRUCTED_PICTURE,
@@ -990,7 +989,7 @@ impl EncodeSession {
                     NodeMask: 0,
                     Flags: D3D12_VIDEO_ENCODER_FLAGS(0),
                     EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
-                    EncodeProfile: Self::profile_desc_h264(&mut h264.profile),
+                    EncodeProfile: crate::device::profile_desc_h264(&mut h264.profile),
                     InputFormat: DXGI_FORMAT_NV12,
                     CodecConfiguration: crate::device::codec_configuration_h264(
                         &mut h264.codec_config,
@@ -1002,7 +1001,7 @@ impl EncodeSession {
                     NodeMask: 0,
                     Flags: D3D12_VIDEO_ENCODER_HEAP_FLAGS(0),
                     EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_H264,
-                    EncodeProfile: Self::profile_desc_h264(&mut h264.profile),
+                    EncodeProfile: crate::device::profile_desc_h264(&mut h264.profile),
                     EncodeLevel: D3D12_VIDEO_ENCODER_LEVEL_SETTING {
                         DataSize: u32::try_from(
                             std::mem::size_of::<D3D12_VIDEO_ENCODER_LEVELS_H264>(),
@@ -1022,7 +1021,7 @@ impl EncodeSession {
                     NodeMask: 0,
                     Flags: D3D12_VIDEO_ENCODER_FLAGS(0),
                     EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_HEVC,
-                    EncodeProfile: Self::profile_desc_hevc(&mut hevc.profile),
+                    EncodeProfile: crate::device::profile_desc_hevc(&mut hevc.profile),
                     InputFormat: DXGI_FORMAT_NV12,
                     CodecConfiguration: crate::device::codec_configuration_hevc(
                         &mut hevc.codec_config,
@@ -1034,7 +1033,7 @@ impl EncodeSession {
                     NodeMask: 0,
                     Flags: D3D12_VIDEO_ENCODER_HEAP_FLAGS(0),
                     EncodeCodec: D3D12_VIDEO_ENCODER_CODEC_HEVC,
-                    EncodeProfile: Self::profile_desc_hevc(&mut hevc.profile),
+                    EncodeProfile: crate::device::profile_desc_hevc(&mut hevc.profile),
                     EncodeLevel: D3D12_VIDEO_ENCODER_LEVEL_SETTING {
                         DataSize: u32::try_from(std::mem::size_of::<
                             D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC,
@@ -1095,11 +1094,11 @@ impl EncodeSession {
         let (codec, profile) = match descriptors {
             EncoderDescriptors::H264(h264) => (
                 D3D12_VIDEO_ENCODER_CODEC_H264,
-                Self::profile_desc_h264(&mut h264.profile),
+                crate::device::profile_desc_h264(&mut h264.profile),
             ),
             EncoderDescriptors::Hevc(hevc) => (
                 D3D12_VIDEO_ENCODER_CODEC_HEVC,
-                Self::profile_desc_hevc(&mut hevc.profile),
+                crate::device::profile_desc_hevc(&mut hevc.profile),
             ),
         };
         let mut requirements = D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS {
@@ -1209,37 +1208,11 @@ impl EncodeSession {
         })
     }
 
-    /// Profile descriptor over `profile`.
-    fn profile_desc_h264(
-        profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
-    ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
-        D3D12_VIDEO_ENCODER_PROFILE_DESC {
-            DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_PROFILE_H264>())
-                .unwrap_or(u32::MAX),
-            Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
-                pH264Profile: std::ptr::from_mut(profile),
-            },
-        }
-    }
-
-    /// Profile descriptor over `profile`.
-    fn profile_desc_hevc(
-        profile: &mut D3D12_VIDEO_ENCODER_PROFILE_HEVC,
-    ) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
-        D3D12_VIDEO_ENCODER_PROFILE_DESC {
-            DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_PROFILE_HEVC>())
-                .unwrap_or(u32::MAX),
-            Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
-                pHEVCProfile: std::ptr::from_mut(profile),
-            },
-        }
-    }
-
     /// Profile descriptor over the session descriptors.
     fn profile_desc(descriptors: &mut EncoderDescriptors) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
         match descriptors {
-            EncoderDescriptors::H264(h264) => Self::profile_desc_h264(&mut h264.profile),
-            EncoderDescriptors::Hevc(hevc) => Self::profile_desc_hevc(&mut hevc.profile),
+            EncoderDescriptors::H264(h264) => crate::device::profile_desc_h264(&mut h264.profile),
+            EncoderDescriptors::Hevc(hevc) => crate::device::profile_desc_hevc(&mut hevc.profile),
         }
     }
 

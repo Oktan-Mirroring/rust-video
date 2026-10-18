@@ -200,7 +200,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d12Error> {
         reader.read_bit("strong_intra_smoothing_enabled_flag")?,
     );
     if reader.read_bit("vui_parameters_present_flag")? {
-        return Err(D3d12Error::Unsupported("vui pending".to_owned()));
+        skip_vui(&mut reader)?;
     }
     if reader.read_bit("sps_extension_present_flag")? {
         return Err(D3d12Error::Unsupported("sps extension pending".to_owned()));
@@ -301,6 +301,62 @@ fn parse_window(
         })),
         _ => Err(D3d12Error::Parse("conf_win outside coded size".to_owned())),
     }
+}
+
+/// Video usability information, H.265 E.2.1.
+fn skip_vui(reader: &mut BitReader) -> Result<(), D3d12Error> {
+    if reader.read_bit("aspect_ratio_info_present_flag")?
+        && reader.read_bits(8, "aspect_ratio_idc")? == 255
+    {
+        reader.read_bits(16, "sar_width")?;
+        reader.read_bits(16, "sar_height")?;
+    }
+    if reader.read_bit("overscan_info_present_flag")? {
+        reader.read_bit("overscan_appropriate_flag")?;
+    }
+    if reader.read_bit("video_signal_type_present_flag")? {
+        reader.read_bits(3, "video_format")?;
+        reader.read_bit("video_full_range_flag")?;
+        if reader.read_bit("colour_description_present_flag")? {
+            reader.read_bits(8, "colour_primaries")?;
+            reader.read_bits(8, "transfer_characteristics")?;
+            reader.read_bits(8, "matrix_coeffs")?;
+        }
+    }
+    if reader.read_bit("chroma_loc_info_present_flag")? {
+        reader.read_ue("chroma_sample_loc_type_top_field")?;
+        reader.read_ue("chroma_sample_loc_type_bottom_field")?;
+    }
+    reader.read_bit("neutral_chroma_indication_flag")?;
+    reader.read_bit("field_seq_flag")?;
+    reader.read_bit("frame_field_info_present_flag")?;
+    if reader.read_bit("default_display_window_flag")? {
+        reader.read_ue("def_disp_win_left_offset")?;
+        reader.read_ue("def_disp_win_right_offset")?;
+        reader.read_ue("def_disp_win_top_offset")?;
+        reader.read_ue("def_disp_win_bottom_offset")?;
+    }
+    if reader.read_bit("vui_timing_info_present_flag")? {
+        reader.read_bits(32, "vui_num_units_in_tick")?;
+        reader.read_bits(32, "vui_time_scale")?;
+        if reader.read_bit("vui_poc_proportional_to_timing_flag")? {
+            reader.read_ue("vui_num_ticks_poc_diff_one_minus1")?;
+        }
+    }
+    if reader.read_bit("vui_hrd_parameters_present_flag")? {
+        return Err(D3d12Error::Unsupported("hrd pending".to_owned()));
+    }
+    if reader.read_bit("bitstream_restriction_flag")? {
+        reader.read_bit("tiles_fixed_structure_flag")?;
+        reader.read_bit("motion_vectors_over_pic_boundaries_flag")?;
+        reader.read_bit("restricted_ref_pic_lists_flag")?;
+        reader.read_ue("min_spatial_segmentation_idc")?;
+        reader.read_ue("max_bytes_per_pic_denom")?;
+        reader.read_ue("max_bits_per_min_cu_denom")?;
+        reader.read_ue("log2_max_mv_length_horizontal")?;
+        reader.read_ue("log2_max_mv_length_vertical")?;
+    }
+    Ok(())
 }
 
 /// Parsed picture parameter set.
@@ -1369,7 +1425,21 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{idr_body, nal, p_body, packet, pps_body, pps_body_merge, sps_body};
+    use super::skip_vui;
     use super::{parse_pps, parse_sps, rbsp, split_nals, Ingest};
+    use crate::bits::BitReader;
+    use crate::error::D3d12Error;
+
+    #[test]
+    fn skip_vui_reads_hrd_without_timing() {
+        let mut flagged = BitReader::new(&[0x00, 0x50]);
+        assert!(matches!(
+            skip_vui(&mut flagged),
+            Err(D3d12Error::Unsupported(_))
+        ));
+        let mut bare = BitReader::new(&[0x00, 0x10]);
+        skip_vui(&mut bare).expect("vui without timing");
+    }
 
     #[test]
     fn split_nals_strips_start_codes() {

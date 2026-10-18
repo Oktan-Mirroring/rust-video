@@ -36,10 +36,12 @@ use windows::Win32::Media::MediaFoundation::{
     ID3D12VideoDecoder, ID3D12VideoDecoderHeap, ID3D12VideoDevice, ID3D12VideoDevice3,
     D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE, D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILES,
     D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT, D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT,
-    D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC, D3D12_FEATURE_VIDEO,
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC,
+    D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT, D3D12_FEATURE_VIDEO,
     D3D12_FEATURE_VIDEO_DECODE_PROFILES, D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT,
     D3D12_FEATURE_VIDEO_DECODE_SUPPORT, D3D12_FEATURE_VIDEO_ENCODER_CODEC,
-    D3D12_VIDEO_DECODER_DESC, D3D12_VIDEO_DECODER_HEAP_DESC, D3D12_VIDEO_DECODE_CONFIGURATION,
+    D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT, D3D12_VIDEO_DECODER_DESC,
+    D3D12_VIDEO_DECODER_HEAP_DESC, D3D12_VIDEO_DECODE_CONFIGURATION,
     D3D12_VIDEO_DECODE_CONFIGURATION_FLAGS, D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2,
     D3D12_VIDEO_DECODE_PROFILE_AV1_12BIT_PROFILE2_420, D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0,
     D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1, D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2,
@@ -53,8 +55,14 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_DECODE_TIER, D3D12_VIDEO_DECODE_TIER_2, D3D12_VIDEO_ENCODER_CODEC,
     D3D12_VIDEO_ENCODER_CODEC_AV1, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION,
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_0, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_H264,
-    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC, D3D12_VIDEO_ENCODER_CODEC_H264,
-    D3D12_VIDEO_ENCODER_CODEC_HEVC, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC, D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_0,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC, D3D12_VIDEO_ENCODER_CODEC_H264,
+    D3D12_VIDEO_ENCODER_CODEC_HEVC, D3D12_VIDEO_ENCODER_PROFILE_DESC,
+    D3D12_VIDEO_ENCODER_PROFILE_DESC_0, D3D12_VIDEO_ENCODER_PROFILE_H264,
+    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
 };
 
 /// H.264 profile name the tier decodes.
@@ -204,6 +212,9 @@ impl D3d12Device {
     }
 
     /// True when the adapter encodes `codec` over the video encoder.
+    ///
+    /// The codec probe passes on adapters that refuse the tier
+    /// configuration, so H.264 and HEVC also probe their profile.
     #[cfg(target_os = "windows")]
     #[must_use]
     pub fn supports_encode(&self, codec: Codec) -> bool {
@@ -214,11 +225,79 @@ impl D3d12Device {
             Codec: encoder,
             ..Default::default()
         };
-        feature_support(
+        if feature_support(
             &self.video,
             D3D12_FEATURE_VIDEO_ENCODER_CODEC,
             &mut probe,
             "EncoderCodec",
+        )
+        .is_err()
+            || !probe.IsSupported.as_bool()
+        {
+            return false;
+        }
+        match codec {
+            Codec::H264 => self.supports_h264_config(),
+            Codec::Hevc => self.supports_hevc_config(),
+            _ => true,
+        }
+    }
+
+    /// True when the adapter encodes the tier H.264 configuration.
+    #[cfg(target_os = "windows")]
+    fn supports_h264_config(&self) -> bool {
+        let mut profile = D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH;
+        let mut details = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264::default();
+        let mut probe = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT {
+            NodeIndex: 0,
+            Codec: D3D12_VIDEO_ENCODER_CODEC_H264,
+            Profile: profile_desc_h264(&mut profile),
+            IsSupported: false.into(),
+            CodecSupportLimits: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT {
+                DataSize: u32::try_from(std::mem::size_of::<
+                    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264,
+                >())
+                .unwrap_or(u32::MAX),
+                Anonymous: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_0 {
+                    pH264Support: std::ptr::from_mut(&mut details),
+                },
+            },
+        };
+        feature_support(
+            &self.video,
+            D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT,
+            &mut probe,
+            "EncoderConfigH264",
+        )
+        .is_ok()
+            && probe.IsSupported.as_bool()
+    }
+
+    /// True when the adapter encodes the tier HEVC configuration.
+    #[cfg(target_os = "windows")]
+    fn supports_hevc_config(&self) -> bool {
+        let mut profile = D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN;
+        let mut details = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC::default();
+        let mut probe = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT {
+            NodeIndex: 0,
+            Codec: D3D12_VIDEO_ENCODER_CODEC_HEVC,
+            Profile: profile_desc_hevc(&mut profile),
+            IsSupported: false.into(),
+            CodecSupportLimits: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT {
+                DataSize: u32::try_from(std::mem::size_of::<
+                    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC,
+                >())
+                .unwrap_or(u32::MAX),
+                Anonymous: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_0 {
+                    pHEVCSupport: std::ptr::from_mut(&mut details),
+                },
+            },
+        };
+        feature_support(
+            &self.video,
+            D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT,
+            &mut probe,
+            "EncoderConfigHevc",
         )
         .is_ok()
             && probe.IsSupported.as_bool()
@@ -597,6 +676,34 @@ pub(crate) fn codec_configuration_hevc(
         .unwrap_or(u32::MAX),
         Anonymous: D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_0 {
             pHEVCConfig: std::ptr::from_mut(config),
+        },
+    }
+}
+
+/// H.264 profile descriptor over `profile`.
+#[cfg(target_os = "windows")]
+pub(crate) fn profile_desc_h264(
+    profile: &mut D3D12_VIDEO_ENCODER_PROFILE_H264,
+) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
+    D3D12_VIDEO_ENCODER_PROFILE_DESC {
+        DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_PROFILE_H264>())
+            .unwrap_or(u32::MAX),
+        Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
+            pH264Profile: std::ptr::from_mut(profile),
+        },
+    }
+}
+
+/// HEVC profile descriptor over `profile`.
+#[cfg(target_os = "windows")]
+pub(crate) fn profile_desc_hevc(
+    profile: &mut D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+) -> D3D12_VIDEO_ENCODER_PROFILE_DESC {
+    D3D12_VIDEO_ENCODER_PROFILE_DESC {
+        DataSize: u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_PROFILE_HEVC>())
+            .unwrap_or(u32::MAX),
+        Anonymous: D3D12_VIDEO_ENCODER_PROFILE_DESC_0 {
+            pHEVCProfile: std::ptr::from_mut(profile),
         },
     }
 }
