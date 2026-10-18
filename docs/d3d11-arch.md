@@ -129,14 +129,20 @@ copy test asserts above 186 MB/s over 1080p frames
 
 Shell decoders report `ProfileUnsupported` without a profile and
 the pending picture builder with one; flush returns empty
-(`decoder.rs`). Hardware decode pixel parity against the software
-oracle is unverified (`lib.rs`).
+(`decoder.rs`). Hardware decode matches the ffmpeg
+software oracle byte-exact over the committed vector: 15
+frames, 1,728,000 NV12 bytes, 0 mismatches
+(`tests/e2e.rs hardware_matches_software_oracle`).
 
 `tests/e2e.rs` drives the committed 15-picture vector through
 overlap (`max_inflight` above 1), GPU transcode verified clean
 by the ffmpeg oracle, failure reset plus recovery, and a
 zero-reset steady run; `H264Decoder::resets` counts stream
 resets (`decoder.rs`, `tests/e2e.rs`).
+
+`tests/throughput.rs` measures 30 1080p GPU hops against
+the 60 fps bar (305.5 fps); `RUST_VIDEO_BENCH_STRICT=1`
+fails below the bar.
 
 ## Examples
 

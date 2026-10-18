@@ -131,17 +131,29 @@ profile CABAC without 8x8 transform signaling, and the
 ffmpeg oracle decodes the transcode output warning-free
 (`encode.rs`, `encoder.rs`, `tests/e2e.rs`). HEVC encode on
 boxes reporting the codec but refusing its configuration
-fails the first frame loud with `OverCaps` (`encoder.rs`).
+declines at open with `Unsupported`, after the codec probe
+passes and the configuration probe fails (`device.rs`,
+`encoder.rs`).
 
 Shell decoders report `ProfileUnsupported` without a profile
 and the pending picture builder with one; flush returns
 empty (`decoder.rs`).
 
-`tests/e2e.rs` drives the committed 15-picture vector through
-overlap (`max_inflight` above 1), GPU transcode verified
-clean by the ffmpeg oracle, failure reset plus recovery,
-and a zero-reset steady run; `H264Decoder::resets` counts
-stream resets (`decoder.rs`, `tests/e2e.rs`).
+`tests/e2e.rs` drives the committed 15-picture H.264 vector
+through overlap (`max_inflight` above 1), GPU transcode
+verified clean by the ffmpeg oracle, failure reset plus
+recovery, and a zero-reset steady run; `H264Decoder::resets`
+counts stream resets (`decoder.rs`, `tests/e2e.rs`). The
+committed 15-picture HEVC vector (320x240 Main, every
+picture an IDR) decodes all 15 pictures on the GPU; its
+transcode proof arms on adapters that encode HEVC and
+skips loud where the configuration probe fails. Its x265
+Rext label is relabeled Main across 30 parameter-set
+sites, and an unpatched regen fails loud with profile
+outside main (`tests/e2e.rs`, `device.rs`).
+`tests/throughput.rs` measures 30 1080p GPU hops against
+the 60 fps bar (64.2 fps); `RUST_VIDEO_BENCH_STRICT=1`
+fails below the bar.
 
 ## Examples
 
