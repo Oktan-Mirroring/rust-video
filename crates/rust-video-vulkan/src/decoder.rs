@@ -21,12 +21,14 @@ use crate::parse::refs::{
 };
 use crate::raw::{DeviceExport, ExportPair, OwnedDevice};
 use crate::session::decode::{
-    crop_nv12_extend, picture_resource, reference_slot, DpbMeta, ExportTarget, Session, Submission,
+    crop_nv12_extend, picture_resource, reference_slot, DpbMeta, ExportTarget, PendingDecode,
+    Session, Submission,
 };
 use crate::session::geometry::{h264_profile_to_std, SessionGeometry};
 use crate::session::params::{
     h264_params_add, h264_params_create, H264ProfileChain, ParamsTemplate, H264_DECODE_STD_NAME,
 };
+use crate::session::slots::SubmitStats;
 use crate::session::std_h264::{fill_picture, fill_reference, H264Tables};
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
@@ -402,6 +404,12 @@ pub struct H264Decoder<'a> {
         ash::vk::native::StdVideoDecodeH264ReferenceInfo,
         vk::VideoDecodeH264DpbSlotInfoKHR<'static>,
     >,
+    /// Submitted but uncollected pictures.
+    pending: Vec<PendingPicture>,
+    /// Accumulated submit-core gauges.
+    stats: SubmitStats,
+    /// Armed fault for the next submit, applied once a session runs.
+    fault: bool,
 }
 
 impl<'a> H264Decoder<'a> {
@@ -428,7 +436,27 @@ impl<'a> H264Decoder<'a> {
             scratch: ReferenceId(1 << 30),
             begin_bufs: ChainBufs::new(),
             ref_bufs: ChainBufs::new(),
+            pending: Vec::new(),
+            stats: SubmitStats::new(),
+            fault: false,
         })
+    }
+
+    /// Submit-core gauges of the decoder.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        self.stats
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    ///
+    /// Armed before any session, the fault fires on the first submit.
+    pub fn inject_submit_fault(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.inject_fault();
+        } else {
+            self.fault = true;
+        }
     }
 
     /// Session for `sps`, recreated on geometry change; reports recreation.
@@ -486,18 +514,16 @@ impl<'a> H264Decoder<'a> {
         Ok(true)
     }
 
-    /// Submit one decoded picture, returning display-ready frames.
-    fn submit_picture(
-        &mut self,
-        picture: &Picture,
-        gpu: bool,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+    /// Queue-submit one decoded picture without waiting.
+    fn submit_picture(&mut self, picture: &Picture, gpu: bool) -> Result<(), VulkanError> {
+        apply_armed_fault(&mut self.session, &mut self.fault);
         let Self {
             session,
             sink,
             scratch,
             begin_bufs,
             ref_bufs,
+            pending,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -545,7 +571,7 @@ impl<'a> H264Decoder<'a> {
         if session.meta(setup_slot).is_none() {
             begin_all.push(setup_bind);
         }
-        finish_submit(
+        let submitted = plan_submit(
             session,
             sink,
             picture,
@@ -561,7 +587,9 @@ impl<'a> H264Decoder<'a> {
                 flush_on_reset: true,
             },
             gpu,
-        )
+        )?;
+        pending.push(submitted);
+        Ok(())
     }
 
     /// Run one access unit through the context, submitting its picture.
@@ -574,6 +602,13 @@ impl<'a> H264Decoder<'a> {
         for instruction in self.context.compile(unit) {
             match instruction {
                 H264Instruction::Sps(sps) => {
+                    let drained = drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?;
+                    out.extend(drained);
                     self.tables.insert_sps(&sps)?;
                     self.sink
                         .reorder()
@@ -594,6 +629,13 @@ impl<'a> H264Decoder<'a> {
                     }
                 }
                 H264Instruction::Pps(pps) => {
+                    let drained = drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?;
+                    out.extend(drained);
                     self.tables.insert_pps(&pps)?;
                     let fresh = self.pps.insert(pps.id(), pps.clone()).is_none();
                     if fresh {
@@ -609,7 +651,7 @@ impl<'a> H264Decoder<'a> {
                     }
                 }
                 H264Instruction::Picture(picture) => {
-                    out.extend(self.submit_picture(&picture, gpu)?);
+                    self.submit_picture(&picture, gpu)?;
                 }
             }
         }
@@ -626,6 +668,13 @@ impl<'a> H264Decoder<'a> {
                 out.extend(self.run_unit(unit, gpu)?);
             }
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
+        out.extend(drained);
         Ok(out)
     }
 
@@ -663,6 +712,13 @@ impl<'a> H264Decoder<'a> {
         if let Some(unit) = self.aus.flush() {
             out.extend(self.run_unit(unit, gpu)?);
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
+        out.extend(drained);
         out.extend(self.sink.reorder().flush());
         Ok(out)
     }
@@ -897,14 +953,28 @@ struct SubmitPlan<'a, 'b, 'c> {
     flush_on_reset: bool,
 }
 
-/// Submission, slot bookkeeping, and display frames of one picture.
-fn finish_submit(
+/// Submitted but uncollected picture.
+struct PendingPicture {
+    /// Submitted decode behind the picture.
+    pending: PendingDecode,
+    /// Picture order count.
+    poc: i32,
+    /// Picture starts a DPB reset.
+    resets: bool,
+    /// Flush the reorder buffer on a DPB reset.
+    flush_on_reset: bool,
+    /// Export lease behind a GPU submit, absent on the CPU path.
+    lease: Option<ExportLease>,
+}
+
+/// Queue-submit one picture without waiting.
+fn plan_submit(
     session: &mut Session,
     sink: &mut FrameSink,
     body: &Picture,
     plan: &SubmitPlan<'_, '_, '_>,
     gpu: bool,
-) -> Result<Vec<VulkanFrame>, VulkanError> {
+) -> Result<PendingPicture, VulkanError> {
     let sub = Submission {
         bytes: body.bytes(),
         setup_slot: plan.setup_slot,
@@ -922,27 +992,82 @@ fn finish_submit(
     } else {
         None
     };
-    let submitted = if let Some(lease) = &lease {
-        let target = ExportTarget::new(lease.pair(), lease.first());
-        session.submit_gpu(&sub, &target)
-    } else {
-        session.submit_into(&sub, sink.coded_mut())
+    let export = lease
+        .as_ref()
+        .map(|held| ExportTarget::new(held.pair(), held.first()));
+    let pending = match session.submit_async(&sub, export.as_ref()) {
+        Ok(pending) => pending,
+        Err(error) => {
+            session.slots_mut().release(plan.setup_id);
+            session.set_meta(plan.setup_slot, None);
+            return Err(error);
+        }
     };
-    if let Err(error) = submitted {
-        session.slots_mut().release(plan.setup_id);
-        session.set_meta(plan.setup_slot, None);
-        return Err(error);
-    }
     if body.is_reference() {
         session.set_meta(plan.setup_slot, Some(plan.meta));
     } else {
         session.slots_mut().release(plan.setup_id);
     }
-    if plan.flush_on_reset {
-        sink.emit(session, body.poc(), body.resets_dpb(), lease)
+    Ok(PendingPicture {
+        pending,
+        poc: body.poc(),
+        resets: body.resets_dpb(),
+        flush_on_reset: plan.flush_on_reset,
+        lease,
+    })
+}
+
+/// Collect one submitted picture into display frames.
+fn collect_pending(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    picture: PendingPicture,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    if picture.lease.is_some() {
+        session.collect_gpu(picture.pending)?;
     } else {
-        sink.emit_queued(session, body.poc(), lease)
+        session.collect_into(picture.pending, sink.coded_mut())?;
     }
+    if picture.flush_on_reset {
+        sink.emit(session, picture.poc, picture.resets, picture.lease)
+    } else {
+        sink.emit_queued(session, picture.poc, picture.lease)
+    }
+}
+
+/// Collect every submitted picture into display frames.
+fn drain_pending(
+    session: &mut Option<Session>,
+    sink: &mut FrameSink,
+    pending: &mut Vec<PendingPicture>,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(session) = session.as_mut() else {
+        return Err(VulkanError::NoSession);
+    };
+    let mut out = Vec::new();
+    for picture in pending.drain(..) {
+        out.extend(collect_pending(session, sink, picture)?);
+    }
+    let snapshot = session.submit_stats();
+    stats.peak_inflight = stats.peak_inflight.max(snapshot.peak_inflight);
+    stats.resets += session.take_resets();
+    Ok(out)
+}
+
+/// Fire an armed fault on the live session, if any.
+fn apply_armed_fault(session: &mut Option<Session>, fault: &mut bool) {
+    if !*fault {
+        return;
+    }
+    let Some(session) = session.as_mut() else {
+        return;
+    };
+    session.inject_fault();
+    *fault = false;
 }
 
 /// Deduplicated reference slots of one H.265 picture in DPB order.
@@ -1057,6 +1182,12 @@ pub struct H265Decoder<'a> {
         ash::vk::native::StdVideoDecodeH265ReferenceInfo,
         vk::VideoDecodeH265DpbSlotInfoKHR<'static>,
     >,
+    /// Submitted but uncollected pictures.
+    pending: Vec<PendingPicture>,
+    /// Accumulated submit-core gauges.
+    stats: SubmitStats,
+    /// Armed fault for the next submit, applied once a session runs.
+    fault: bool,
 }
 
 impl<'a> H265Decoder<'a> {
@@ -1084,7 +1215,27 @@ impl<'a> H265Decoder<'a> {
             scratch: ReferenceId(1 << 30),
             begin_bufs: ChainBufs::new(),
             ref_bufs: ChainBufs::new(),
+            pending: Vec::new(),
+            stats: SubmitStats::new(),
+            fault: false,
         })
+    }
+
+    /// Submit-core gauges of the decoder.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        self.stats
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    ///
+    /// Armed before any session, the fault fires on the first submit.
+    pub fn inject_submit_fault(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.inject_fault();
+        } else {
+            self.fault = true;
+        }
     }
 
     /// Session for `sps`, recreated on geometry change; reports recreation.
@@ -1150,21 +1301,23 @@ impl<'a> H265Decoder<'a> {
         Ok(true)
     }
 
-    /// Submit one decoded picture, returning display-ready frames.
+    /// Queue-submit one decoded picture without waiting.
     fn submit_picture(
         &mut self,
         picture: &crate::parse::refs::H265Picture,
         gpu: bool,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+    ) -> Result<(), VulkanError> {
         use crate::session::std_h265::{fill_picture, fill_reference};
         let body = picture.picture();
         let echo = picture.echo();
+        apply_armed_fault(&mut self.session, &mut self.fault);
         let Self {
             session,
             sink,
             scratch,
             begin_bufs,
             ref_bufs,
+            pending,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -1212,7 +1365,7 @@ impl<'a> H265Decoder<'a> {
         if session.meta(setup_slot).is_none() {
             begin_all.push(setup_bind);
         }
-        finish_submit(
+        let submitted = plan_submit(
             session,
             sink,
             body,
@@ -1228,7 +1381,9 @@ impl<'a> H265Decoder<'a> {
                 flush_on_reset: false,
             },
             gpu,
-        )
+        )?;
+        pending.push(submitted);
+        Ok(())
     }
 
     /// Run one access unit through the context, submitting its picture.
@@ -1242,6 +1397,13 @@ impl<'a> H265Decoder<'a> {
         for instruction in self.context.compile(unit) {
             match instruction {
                 H265Instruction::Vps(vps) => {
+                    let drained = drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?;
+                    out.extend(drained);
                     self.tables.insert_vps(&vps)?;
                     let fresh = self.vps.insert(vps.id(), vps.clone()).is_none();
                     if fresh {
@@ -1258,6 +1420,13 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Sps(sps) => {
+                    let drained = drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?;
+                    out.extend(drained);
                     self.tables.insert_sps(&sps)?;
                     self.sink.reorder().set_capacity(sps.max_num_reorder_pics());
                     let fresh = self.sps.insert(sps.id(), sps.clone()).is_none();
@@ -1277,6 +1446,13 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Pps(pps) => {
+                    let drained = drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?;
+                    out.extend(drained);
                     let sps_id = pps.sps_id();
                     let Some(sps) = self.sps.get(&sps_id).cloned() else {
                         return Err(ParseError::MissingSet {
@@ -1300,7 +1476,7 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Picture(picture) => {
-                    out.extend(self.submit_picture(&picture, gpu)?);
+                    self.submit_picture(&picture, gpu)?;
                 }
             }
         }
@@ -1317,6 +1493,13 @@ impl<'a> H265Decoder<'a> {
                 out.extend(self.run_unit(unit, gpu)?);
             }
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
+        out.extend(drained);
         Ok(out)
     }
 
@@ -1354,6 +1537,13 @@ impl<'a> H265Decoder<'a> {
         if let Some(unit) = self.aus.flush() {
             out.extend(self.run_unit(unit, gpu)?);
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
+        out.extend(drained);
         out.extend(self.sink.reorder().flush());
         Ok(out)
     }

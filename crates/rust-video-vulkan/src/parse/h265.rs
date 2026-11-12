@@ -2619,7 +2619,7 @@ impl H265Parser {
         }
         let (rps, short) = parse_slice_rps(reader, &sps, nal.unit_type())?;
         let mut temporal_mvp = false;
-        if sps.temporal_mvp_enabled() {
+        if sps.temporal_mvp_enabled() && !nal.unit_type().is_idr() {
             temporal_mvp = reader.bit("slice temporal mvp")?;
         }
         reader.skip(
@@ -2669,6 +2669,11 @@ fn parse_slice_inter(
         sao: false,
         deblocking_disabled: pps.deblocking_filter_disabled(),
     };
+    if sps.sao_enabled() {
+        let sao_luma = reader.bit("slice sao luma")?;
+        let sao_chroma = reader.bit("slice sao chroma")?;
+        filter.sao = sao_luma || sao_chroma;
+    }
     if slice_type == SliceType::I {
         return Ok(filter);
     }
@@ -2688,11 +2693,6 @@ fn parse_slice_inter(
                 parse_ref_list(reader, num_ref_idx_l1_active)?;
             }
         }
-    }
-    if sps.sao_enabled() {
-        let sao_luma = reader.bit("slice sao luma")?;
-        let sao_chroma = reader.bit("slice sao chroma")?;
-        filter.sao = sao_luma || sao_chroma;
     }
     if slice_type == SliceType::B {
         reader.bit("slice mvd l1 zero")?;
@@ -2814,11 +2814,7 @@ struct ShortRps {
 
 /// Short-term reference set from the slice header.
 fn parse_short_rps(reader: &mut BitReader<'_>, sps: &Sps) -> Result<ShortRps, ParseError> {
-    let sps_flag = if sps.rps_sets().is_empty() {
-        false
-    } else {
-        reader.bit("slice rps sps flag")?
-    };
+    let sps_flag = reader.bit("slice rps sps flag")?;
     let before = reader.consumed();
     let (deltas, ref_count) = parse_short_set(reader, sps, sps_flag)?;
     let bits = u16::try_from(reader.consumed() - before).unwrap_or(u16::MAX);

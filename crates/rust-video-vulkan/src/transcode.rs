@@ -356,6 +356,7 @@ mod tests {
     use rust_video_caps::packet::Packet;
     use rust_video_caps::transcode::Route;
 
+    use crate::error::VulkanError;
     use crate::ladder::CodecOp;
 
     /// Live H.264 transcode pair, absent without hardware.
@@ -368,10 +369,22 @@ mod tests {
 
     /// Live H.264 decode plus encode devices, absent without hardware.
     fn devices() -> Option<(crate::device::VulkanDevice, crate::device::VulkanDevice)> {
-        let decode =
-            crate::device::VulkanDevice::open(CodecOp::H264Decode).expect("negotiation runs")?;
-        let encode =
-            crate::device::VulkanDevice::open(CodecOp::H264Encode).expect("negotiation runs")?;
+        let decode = match crate::device::VulkanDevice::open_or_skip(CodecOp::H264Decode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: h264 decode device: {reason}");
+                return None;
+            }
+            Err(error) => panic!("negotiation runs: {error}"),
+        };
+        let encode = match crate::device::VulkanDevice::open_or_skip(CodecOp::H264Encode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: h264 encode device: {reason}");
+                return None;
+            }
+            Err(error) => panic!("negotiation runs: {error}"),
+        };
         Some((decode, encode))
     }
 

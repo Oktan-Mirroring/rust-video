@@ -1,15 +1,15 @@
-//! Vulkan H.264 IDR encode over a real input file.
+//! Vulkan H.264 GOP encode over a real input file.
 //!
-//! Reads `VK_VECTOR` (raw NV12 at `VK_WIDTH`x`VK_HEIGHT`), encodes each
-//! frame as IDR on the Vulkan tier, and writes Annex-B to `VK_OUT`.
-//! Loud skip without hardware or input.
+//! Reads `VK_VECTOR` (raw NV12 at `VK_WIDTH`x`VK_HEIGHT`), encodes on the
+//! Vulkan tier with an IDR every `VK_GOP` frames, and writes Annex-B to
+//! `VK_OUT`. Loud skip without hardware or input.
 
 use bytes::Bytes;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::traits::Encoder;
-use rust_video_vulkan::{CodecOp, H264Encoder, VulkanDevice};
+use rust_video_vulkan::{CodecOp, Gop, H264Encoder, VulkanDevice};
 
 fn main() {
     let width: u32 = std::env::var("VK_WIDTH")
@@ -32,6 +32,11 @@ fn main() {
             .to_string_lossy()
             .into_owned()
     });
+    let gop = std::env::var("VK_GOP")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .map(Gop::interval)
+        .unwrap_or_default();
     let Ok(bytes) = std::fs::read(&vector) else {
         println!("encode_h264_vk: no vector at {vector}; skipped");
         return;
@@ -47,7 +52,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut encoder = match H264Encoder::open(&device, width, height) {
+    let mut encoder = match H264Encoder::open_with_gop(&device, width, height, gop) {
         Ok(encoder) => encoder,
         Err(error) => {
             eprintln!("encode_h264_vk: open failed ({error})");

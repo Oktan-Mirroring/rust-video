@@ -104,6 +104,10 @@ pub(crate) struct DecodeFacts {
 pub(crate) struct EncodeFacts {
     /// Largest coded picture in luma samples.
     pub coded_extent: (u32, u32),
+    /// Decoded-picture-buffer slot count.
+    pub dpb_slots: u32,
+    /// Active reference picture count.
+    pub active_refs: u32,
     /// Encoder quality level count.
     pub quality_levels: u32,
     /// Peak bitrate in bits per second.
@@ -122,6 +126,8 @@ impl std::fmt::Debug for EncodeFacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EncodeFacts")
             .field("coded_extent", &self.coded_extent)
+            .field("dpb_slots", &self.dpb_slots)
+            .field("active_refs", &self.active_refs)
             .field("quality_levels", &self.quality_levels)
             .field("max_bitrate", &self.max_bitrate)
             .field("std_version", &self.std_version)
@@ -538,6 +544,8 @@ mod tests {
     fn encode_caps() -> EncodeFacts {
         EncodeFacts {
             coded_extent: (1920, 1080),
+            dpb_slots: 4,
+            active_refs: 1,
             quality_levels: 4,
             max_bitrate: 100_000_000,
             std_version: 1,

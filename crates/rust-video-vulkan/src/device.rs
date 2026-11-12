@@ -215,6 +215,14 @@ impl VulkanDevice {
         self.owned.backend().device_local_bytes(self.adapter)
     }
 
+    /// Free then total device-local megabytes behind the picked adapter.
+    ///
+    /// Live re-query of the memory budget behind the heap size.
+    #[must_use]
+    pub fn memory_budget_mb(&self) -> (u64, u64) {
+        self.owned.backend().device_local_budget_mb(self.adapter)
+    }
+
     /// VRAM budget shared with decoders.
     #[must_use]
     pub(crate) fn shared(&self) -> &SharedDevice {
@@ -262,7 +270,7 @@ mod tests {
     fn open_reports_skip_or_device() {
         match VulkanDevice::open(CodecOp::H264Decode) {
             Ok(Some(device)) => assert_eq!(device.name(), "vulkan"),
-            Ok(None) => {}
+            Ok(None) => println!("declined: no vulkan decode device"),
             Err(error) => panic!("unexpected hard failure: {error}"),
         }
     }
@@ -303,7 +311,24 @@ mod tests {
         match VulkanDevice::open_or_skip(CodecOp::H264Decode) {
             Ok(device) => assert_eq!(device.name(), "vulkan"),
             Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: {reason}");
                 assert!(!reason.to_string().is_empty());
+            }
+            Err(error) => panic!("unexpected hard failure: {error}"),
+        }
+    }
+
+    #[test]
+    fn budget_reports_heap_or_skips() {
+        match VulkanDevice::open_or_skip(CodecOp::H264Decode) {
+            Ok(device) => {
+                let (free_mb, total_mb) = device.memory_budget_mb();
+                println!("budget: free {free_mb}MB of {total_mb}MB");
+                assert!(total_mb > 0);
+                assert!(free_mb <= total_mb);
+            }
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: {reason}");
             }
             Err(error) => panic!("unexpected hard failure: {error}"),
         }

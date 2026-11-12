@@ -39,6 +39,14 @@ pub enum SkipReason {
     /// No H.265 profile reports encode capabilities.
     #[error("no H.265 encode capabilities")]
     NoH265EncodeCaps,
+    /// Device creation ran out of VRAM.
+    #[error("out of device memory (free {free_mb}MB of {total_mb}MB)")]
+    OutOfDeviceMemory {
+        /// Free device-local megabytes at decline time.
+        free_mb: u64,
+        /// Total device-local megabytes at decline time.
+        total_mb: u64,
+    },
 }
 
 /// Annex-B bitstream the parser rejects.
@@ -148,6 +156,32 @@ pub enum VulkanError {
         /// Construct the tier declines.
         what: String,
     },
+    /// No memory type satisfies the requirements.
+    #[error("no memory type for bits {bits:#x}")]
+    NoMemoryType {
+        /// Allowed type bits from the requirements.
+        bits: u32,
+    },
+    /// Access past the allocation end.
+    #[error("range {len} past allocation {capacity}")]
+    OutOfBounds {
+        /// Requested byte count.
+        len: u64,
+        /// Allocation byte count.
+        capacity: u64,
+    },
+}
+
+impl VulkanError {
+    /// True for VRAM exhaustion, hard or declined.
+    #[must_use]
+    pub fn is_out_of_device_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Vulkan(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+                | Self::BackendAbsent(SkipReason::OutOfDeviceMemory { .. })
+        )
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +322,47 @@ mod tests {
             format: rust_video_caps::frame::PixelFormat::Rgba8,
         };
         assert_eq!(error.to_string(), "encoder wants NV12 input, got Rgba8");
+    }
+
+    #[test]
+    fn oom_reason_carries_budget() {
+        let reason = SkipReason::OutOfDeviceMemory {
+            free_mb: 244,
+            total_mb: 16303,
+        };
+        assert_eq!(
+            reason.to_string(),
+            "out of device memory (free 244MB of 16303MB)"
+        );
+    }
+
+    #[test]
+    fn oom_detects_hard_and_declined() {
+        let hard = VulkanError::Vulkan(ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert!(hard.is_out_of_device_memory());
+        let reason = SkipReason::OutOfDeviceMemory {
+            free_mb: 1,
+            total_mb: 2,
+        };
+        assert!(VulkanError::BackendAbsent(reason).is_out_of_device_memory());
+        assert!(!VulkanError::Timeout.is_out_of_device_memory());
+        assert!(!VulkanError::BackendAbsent(SkipReason::NoEncodeQueue).is_out_of_device_memory());
+        assert!(!VulkanError::NoMemoryType { bits: 1 }.is_out_of_device_memory());
+        assert!(!VulkanError::OutOfBounds {
+            len: 9,
+            capacity: 8
+        }
+        .is_out_of_device_memory());
+    }
+
+    #[test]
+    fn allocation_errors_name_cause() {
+        let error = VulkanError::NoMemoryType { bits: 3 };
+        assert_eq!(error.to_string(), "no memory type for bits 0x3");
+        let error = VulkanError::OutOfBounds {
+            len: 100,
+            capacity: 64,
+        };
+        assert_eq!(error.to_string(), "range 100 past allocation 64");
     }
 }

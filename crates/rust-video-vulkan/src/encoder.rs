@@ -1,4 +1,4 @@
-//! IDR encode behind the caps `Encoder` trait.
+//! GOP encode behind the caps `Encoder` trait.
 
 use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
@@ -10,9 +10,50 @@ use crate::decoder::VulkanFrame;
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
 use crate::ladder::CodecOp;
-use crate::session::encode::{EncodeCodec, EncodeSession, IdrStamp};
+use crate::session::encode::{EncodeCodec, EncodeSession, PictureStamp};
+use crate::session::slots::SubmitStats;
 
-/// Shared IDR encode engine over one session.
+/// H.264 frame-number modulus: `log2_max_frame_num_minus4` is 0.
+const MAX_FRAME_NUM: u16 = 16;
+
+/// IDR cadence of one encode session.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Gop {
+    /// Frames between IDR pictures, at least 1.
+    interval: u32,
+}
+
+impl Gop {
+    /// Cadence coding an IDR every `frames` pictures.
+    ///
+    /// `0` clamps to 1, coding every picture as IDR.
+    #[must_use]
+    pub fn interval(frames: u32) -> Self {
+        Self {
+            interval: frames.max(1),
+        }
+    }
+
+    /// Cadence coding every picture as IDR.
+    #[must_use]
+    pub fn all_intra() -> Self {
+        Self { interval: 1 }
+    }
+
+    /// True when picture `index` codes as IDR.
+    fn is_idr(self, index: u64) -> bool {
+        index.is_multiple_of(u64::from(self.interval))
+    }
+}
+
+impl Default for Gop {
+    /// Short low-latency GOP: an IDR every 30 pictures.
+    fn default() -> Self {
+        Self { interval: 30 }
+    }
+}
+
+/// Shared GOP encode engine over one session.
 struct Engine {
     /// Encode session behind the frames.
     session: EncodeSession,
@@ -22,6 +63,12 @@ struct Engine {
     poc: i32,
     /// Picture order step per frame.
     poc_step: i32,
+    /// Frame number of the last coded picture, H.264 only.
+    frame_num: u16,
+    /// Index of the next picture.
+    index: u64,
+    /// IDR cadence.
+    gop: Gop,
     /// Tight NV12 packing scratch.
     tight: Vec<u8>,
     /// Coded bytes scratch.
@@ -29,7 +76,9 @@ struct Engine {
 }
 
 impl Engine {
-    /// Engine over `device` for `op` at `width`x`height`.
+    /// Engine over `device` for `op` at `width`x`height` with `gop` cadence.
+    ///
+    /// A session without P support codes all-intra whatever `gop` holds.
     ///
     /// # Errors
     ///
@@ -42,15 +91,25 @@ impl Engine {
         width: u32,
         height: u32,
         poc_step: i32,
+        gop: Gop,
     ) -> Result<Self, VulkanError> {
         if device.op() != op {
             return Err(VulkanError::OverCaps { what: "codec op" });
         }
+        let session = EncodeSession::open(device, codec, width, height)?;
+        let gop = if session.supports_p_frames() {
+            gop
+        } else {
+            Gop::all_intra()
+        };
         Ok(Self {
-            session: EncodeSession::open(device, codec, width, height)?,
+            session,
             idr_id: 0,
             poc: 0,
             poc_step,
+            frame_num: 0,
+            index: 0,
+            gop,
             tight: Vec::new(),
             coded: Vec::new(),
         })
@@ -61,7 +120,22 @@ impl Engine {
         self.session.extent()
     }
 
-    /// Keyframe packet coded from `frame`.
+    /// Submit-core gauges of the engine.
+    fn submit_stats(&self) -> SubmitStats {
+        self.session.submit_stats()
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    fn inject_submit_fault(&mut self) {
+        self.session.inject_fault();
+    }
+
+    /// True when the session backs P pictures.
+    fn supports_p_frames(&self) -> bool {
+        self.session.supports_p_frames()
+    }
+
+    /// Packet coded from `frame`, keyframe on IDR pictures.
     ///
     /// # Errors
     ///
@@ -82,12 +156,21 @@ impl Engine {
         }
         pack_nv12(frame, &mut self.tight)?;
         let stamp = self.next_stamp();
-        self.session
-            .encode_into(&self.tight, stamp, &mut self.coded)?;
-        Ok(self.packet())
+        let keyframe = match self
+            .session
+            .encode_into(&self.tight, stamp, &mut self.coded)
+        {
+            Ok(keyframe) => keyframe,
+            Err(error) => {
+                self.reset_cadence();
+                return Err(error);
+            }
+        };
+        self.resync(stamp, keyframe);
+        Ok(self.packet(keyframe))
     }
 
-    /// Keyframe packet coded from the device export behind `frame`.
+    /// Packet coded from the device export behind `frame`, keyframe on IDR.
     ///
     /// # Errors
     ///
@@ -112,25 +195,66 @@ impl Engine {
             });
         }
         let stamp = self.next_stamp();
-        self.session.encode_import(export, stamp, &mut self.coded)?;
-        Ok(self.packet())
+        let keyframe = match self.session.encode_import(export, stamp, &mut self.coded) {
+            Ok(keyframe) => keyframe,
+            Err(error) => {
+                self.reset_cadence();
+                return Err(error);
+            }
+        };
+        self.resync(stamp, keyframe);
+        Ok(self.packet(keyframe))
     }
 
-    /// Stamp for the next IDR, advancing the counters.
-    fn next_stamp(&mut self) -> IdrStamp {
-        let stamp = IdrStamp::new(self.idr_id, self.poc);
-        self.idr_id = self.idr_id.wrapping_add(1);
+    /// Stamp for the next picture, advancing the counters.
+    fn next_stamp(&mut self) -> PictureStamp {
+        let is_idr = self.gop.is_idr(self.index);
+        if is_idr {
+            self.frame_num = 0;
+        } else {
+            self.frame_num = (self.frame_num + 1) % MAX_FRAME_NUM;
+        }
+        let stamp = PictureStamp::new(self.idr_id, self.poc, self.frame_num, is_idr);
+        if is_idr {
+            self.idr_id = self.idr_id.wrapping_add(1);
+        }
         self.poc += self.poc_step;
+        self.index += 1;
         stamp
     }
 
-    /// Keyframe packet over the coded bytes plus session headers.
-    fn packet(&self) -> Packet {
-        let headers = self.session.headers();
+    /// Align counters when the session coded an IDR for a P stamp.
+    fn resync(&mut self, stamp: PictureStamp, keyframe: bool) {
+        if keyframe && !stamp.is_idr() {
+            self.frame_num = 0;
+            self.idr_id = self.idr_id.wrapping_add(1);
+        }
+    }
+
+    /// Restart GOP cadence after a failed encode reset the session.
+    fn reset_cadence(&mut self) {
+        self.idr_id = 0;
+        self.poc = 0;
+        self.frame_num = 0;
+        self.index = 0;
+    }
+
+    /// Packet over the coded bytes, headers ahead of keyframes only.
+    fn packet(&self, keyframe: bool) -> Packet {
+        let headers = if keyframe {
+            self.session.headers()
+        } else {
+            &[]
+        };
         let mut bytes = Vec::with_capacity(headers.len() + self.coded.len());
         bytes.extend_from_slice(headers);
         bytes.extend_from_slice(&self.coded);
-        Packet::new(Bytes::from(bytes)).mark_keyframe()
+        let packet = Packet::new(Bytes::from(bytes));
+        if keyframe {
+            packet.mark_keyframe()
+        } else {
+            packet
+        }
     }
 }
 
@@ -188,7 +312,7 @@ fn pack_plane(
     Ok(())
 }
 
-/// H.264 IDR encoder over a negotiated Vulkan device.
+/// H.264 GOP encoder over a negotiated Vulkan device.
 ///
 /// Thread-local: the session submits on its creating thread while
 /// queue access takes the device lock.
@@ -200,11 +324,28 @@ pub struct H264Encoder {
 impl H264Encoder {
     /// Encoder over `device` at `width`x`height`, negotiated for H.264 encode.
     ///
+    /// Codes the default GOP cadence.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when `device` negotiated another operation or the
     /// session fails to open.
     pub fn open(device: &VulkanDevice, width: u32, height: u32) -> Result<Self, VulkanError> {
+        Self::open_with_gop(device, width, height, Gop::default())
+    }
+
+    /// Encoder over `device` at `width`x`height` with `gop` cadence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `device` negotiated another operation or the
+    /// session fails to open.
+    pub fn open_with_gop(
+        device: &VulkanDevice,
+        width: u32,
+        height: u32,
+        gop: Gop,
+    ) -> Result<Self, VulkanError> {
         Ok(Self {
             engine: Engine::open(
                 device,
@@ -213,6 +354,7 @@ impl H264Encoder {
                 width,
                 height,
                 2,
+                gop,
             )?,
         })
     }
@@ -221,6 +363,23 @@ impl H264Encoder {
     #[must_use]
     pub fn extent(&self) -> (u32, u32) {
         self.engine.extent()
+    }
+
+    /// True when the session backs P pictures.
+    #[must_use]
+    pub fn supports_p_frames(&self) -> bool {
+        self.engine.supports_p_frames()
+    }
+
+    /// Submit-core gauges of the encoder.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        self.engine.submit_stats()
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    pub fn inject_submit_fault(&mut self) {
+        self.engine.inject_submit_fault();
     }
 
     /// Packets coded from the device export behind `frame`, possibly none.
@@ -249,7 +408,7 @@ impl Encoder for H264Encoder {
     }
 }
 
-/// H.265 IDR encoder over a negotiated Vulkan device.
+/// H.265 GOP encoder over a negotiated Vulkan device.
 ///
 /// Thread-local: the session submits on its creating thread while
 /// queue access takes the device lock.
@@ -261,11 +420,28 @@ pub struct H265Encoder {
 impl H265Encoder {
     /// Encoder over `device` at `width`x`height`, negotiated for H.265 encode.
     ///
+    /// Codes the default GOP cadence.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when `device` negotiated another operation or the
     /// session fails to open.
     pub fn open(device: &VulkanDevice, width: u32, height: u32) -> Result<Self, VulkanError> {
+        Self::open_with_gop(device, width, height, Gop::default())
+    }
+
+    /// Encoder over `device` at `width`x`height` with `gop` cadence.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `device` negotiated another operation or the
+    /// session fails to open.
+    pub fn open_with_gop(
+        device: &VulkanDevice,
+        width: u32,
+        height: u32,
+        gop: Gop,
+    ) -> Result<Self, VulkanError> {
         Ok(Self {
             engine: Engine::open(
                 device,
@@ -274,6 +450,7 @@ impl H265Encoder {
                 width,
                 height,
                 1,
+                gop,
             )?,
         })
     }
@@ -282,6 +459,23 @@ impl H265Encoder {
     #[must_use]
     pub fn extent(&self) -> (u32, u32) {
         self.engine.extent()
+    }
+
+    /// True when the session backs P pictures.
+    #[must_use]
+    pub fn supports_p_frames(&self) -> bool {
+        self.engine.supports_p_frames()
+    }
+
+    /// Submit-core gauges of the encoder.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        self.engine.submit_stats()
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    pub fn inject_submit_fault(&mut self) {
+        self.engine.inject_submit_fault();
     }
 
     /// Packets coded from the device export behind `frame`, possibly none.
@@ -328,6 +522,28 @@ mod tests {
             ],
         )
         .expect("two planes")
+    }
+
+    #[test]
+    fn gop_idr_cadence_exact() {
+        let gop = super::Gop::interval(4);
+        let marks: Vec<bool> = (0..10).map(|index| gop.is_idr(index)).collect();
+        assert_eq!(
+            marks,
+            vec![true, false, false, false, true, false, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn gop_all_intra_and_default() {
+        let intra = super::Gop::all_intra();
+        assert!((0..4).all(|index| intra.is_idr(index)));
+        let clamped = super::Gop::interval(0);
+        assert!((0..4).all(|index| clamped.is_idr(index)));
+        let default = super::Gop::default();
+        assert!(default.is_idr(0));
+        assert!(default.is_idr(30));
+        assert!(!default.is_idr(29));
     }
 
     #[test]

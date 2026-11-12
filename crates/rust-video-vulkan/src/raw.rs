@@ -88,6 +88,41 @@ impl AshBackend {
             .fold(0, u64::saturating_add)
     }
 
+    /// Free then total device-local megabytes behind `adapter`.
+    ///
+    /// Full when the driver reports no budget.
+    #[must_use]
+    pub fn device_local_budget_mb(&self, adapter: vk::PhysicalDevice) -> (u64, u64) {
+        const MB: u64 = 1024 * 1024;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: adapter came from this instance's enumeration; budget outlives the call.
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(adapter, &mut properties);
+        }
+        let memory = properties.memory_properties;
+        let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
+        let mut free: u64 = 0;
+        let mut total: u64 = 0;
+        let mut reported = false;
+        for (index, heap) in heaps.iter().enumerate() {
+            if !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                continue;
+            }
+            total = total.saturating_add(heap.size);
+            let room = budget.heap_budget[index].saturating_sub(budget.heap_usage[index]);
+            free = free.saturating_add(room);
+            if budget.heap_budget[index] > 0 {
+                reported = true;
+            }
+        }
+        if !reported {
+            free = total;
+        }
+        (free / MB, total / MB)
+    }
+
     /// Facts for one enumerated adapter.
     fn facts(
         &self,
@@ -398,6 +433,8 @@ impl AshBackend {
                 let facts = (
                     caps.max_coded_extent.width,
                     caps.max_coded_extent.height,
+                    caps.max_dpb_slots,
+                    caps.max_active_reference_pictures,
                     caps.std_header_version.spec_version,
                     encode_caps.supported_encode_feedback_flags,
                     encode_caps.rate_control_modes,
@@ -407,12 +444,14 @@ impl AshBackend {
             if status == vk::Result::SUCCESS {
                 Some(EncodeFacts {
                     coded_extent: (facts.0, facts.1),
+                    dpb_slots: facts.2,
+                    active_refs: facts.3,
                     quality_levels: encode_caps.max_quality_levels,
                     max_bitrate: encode_caps.max_bitrate,
-                    std_version: facts.2,
+                    std_version: facts.4,
                     profile: *profile,
-                    feedback: facts.3,
-                    rate_control_modes: facts.4,
+                    feedback: facts.5,
+                    rate_control_modes: facts.6,
                 })
             } else {
                 None
@@ -457,6 +496,8 @@ impl AshBackend {
                 let facts = (
                     caps.max_coded_extent.width,
                     caps.max_coded_extent.height,
+                    caps.max_dpb_slots,
+                    caps.max_active_reference_pictures,
                     caps.std_header_version.spec_version,
                     encode_caps.supported_encode_feedback_flags,
                     encode_caps.rate_control_modes,
@@ -466,12 +507,14 @@ impl AshBackend {
             if status == vk::Result::SUCCESS {
                 Some(EncodeFacts {
                     coded_extent: (facts.0, facts.1),
+                    dpb_slots: facts.2,
+                    active_refs: facts.3,
                     quality_levels: encode_caps.max_quality_levels,
                     max_bitrate: encode_caps.max_bitrate,
-                    std_version: facts.2,
+                    std_version: facts.4,
                     profile: *profile,
-                    feedback: facts.3,
-                    rate_control_modes: facts.4,
+                    feedback: facts.5,
+                    rate_control_modes: facts.6,
                 })
             } else {
                 None
@@ -532,7 +575,16 @@ impl Backend for AshBackend {
             .enabled_extension_names(&names)
             .push_next(&mut sync2);
         // SAFETY: families passed the ladder; names point at static strings.
-        let device = unsafe { self.instance.create_device(*adapter, &create_info, None) }?;
+        let created = unsafe { self.instance.create_device(*adapter, &create_info, None) };
+        let device = match created {
+            Ok(device) => device,
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+                let (free_mb, total_mb) = self.device_local_budget_mb(*adapter);
+                let reason = SkipReason::OutOfDeviceMemory { free_mb, total_mb };
+                return Err(LadderError::Skip(reason));
+            }
+            Err(error) => return Err(VulkanError::Vulkan(error).into()),
+        };
         Ok(RawDevice {
             device,
             external: !extra.is_empty(),
@@ -924,10 +976,12 @@ impl GpuMemory {
     ///
     /// Returns `Err` when `bytes` overruns the allocation or mapping fails.
     pub fn fill(&self, bytes: &[u8]) -> Result<(), VulkanError> {
-        let len = vk::DeviceSize::try_from(bytes.len())
-            .map_err(|_| VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))?;
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         if len > self.size {
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            return Err(VulkanError::OutOfBounds {
+                len,
+                capacity: self.size,
+            });
         }
         // SAFETY: the memory is host-visible and owned; the copy stays in range.
         unsafe {
@@ -949,10 +1003,18 @@ impl GpuMemory {
     /// Returns `Err` when `total` overruns the allocation, `bytes` overruns
     /// `total`, or mapping fails.
     pub fn fill_padded(&self, bytes: &[u8], total: u64) -> Result<(), VulkanError> {
-        let overrun = || VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
-        let len = u64::try_from(bytes.len()).map_err(|_| overrun())?;
-        if total > self.size || len > total {
-            return Err(overrun());
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if total > self.size {
+            return Err(VulkanError::OutOfBounds {
+                len: total,
+                capacity: self.size,
+            });
+        }
+        if len > total {
+            return Err(VulkanError::OutOfBounds {
+                len,
+                capacity: total,
+            });
         }
         // SAFETY: the memory is host-visible and owned; writes stay in range.
         unsafe {
@@ -961,7 +1023,10 @@ impl GpuMemory {
                 .map_memory(self.memory, 0, total, vk::MemoryMapFlags::empty())?;
             let dst = ptr.cast::<u8>();
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-            let pad = usize::try_from(total - len).map_err(|_| overrun())?;
+            let pad = usize::try_from(total - len).map_err(|_| VulkanError::OutOfBounds {
+                len: total - len,
+                capacity: self.size,
+            })?;
             std::ptr::write_bytes(dst.add(bytes.len()), 0, pad);
             self.device.unmap_memory(self.memory);
         }
@@ -977,10 +1042,12 @@ impl GpuMemory {
     ///
     /// Returns `Err` when `len` overruns the allocation or mapping fails.
     pub fn read_to_vec(&self, out: &mut Vec<u8>, len: usize) -> Result<(), VulkanError> {
-        let overrun = || VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
-        let want = vk::DeviceSize::try_from(len).map_err(|_| overrun())?;
+        let want = u64::try_from(len).unwrap_or(u64::MAX);
         if want > self.size {
-            return Err(overrun());
+            return Err(VulkanError::OutOfBounds {
+                len: want,
+                capacity: self.size,
+            });
         }
         out.clear();
         if len == 0 {
@@ -1057,7 +1124,8 @@ impl GpuBuffer {
         let Some(type_index) = pick_memory_type(requirements, properties, flags) else {
             // SAFETY: the buffer is live and owned.
             unsafe { device.destroy_buffer(buffer, None) };
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            let bits = requirements.memory_type_bits;
+            return Err(VulkanError::NoMemoryType { bits });
         };
         let memory = GpuMemory::allocate(device, requirements.size, type_index)?;
         // SAFETY: the memory covers the requirements at offset zero.
@@ -1162,7 +1230,8 @@ impl GpuImage {
         else {
             // SAFETY: the image is live and owned.
             unsafe { device.destroy_image(image, None) };
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            let bits = requirements.memory_type_bits;
+            return Err(VulkanError::NoMemoryType { bits });
         };
         let memory = GpuMemory::allocate(device, requirements.size, type_index)?;
         // SAFETY: the memory covers the requirements at offset zero.
@@ -1331,7 +1400,8 @@ impl ExportPlane {
             let Some(type_index) = picked else {
                 // SAFETY: the image is live and owned.
                 unsafe { device.destroy_image(image, None) };
-                return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+                let bits = requirements.memory_type_bits;
+                return Err(VulkanError::NoMemoryType { bits });
             };
             let memory = GpuMemory::allocate_exportable(device, requirements.size, type_index)
                 .inspect_err(|_| {
@@ -1658,7 +1728,8 @@ impl ImportPlane {
         let Some(type_index) = picked else {
             // SAFETY: the image is live and owned.
             unsafe { device.destroy_image(image, None) };
-            return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+            let bits = requirements.memory_type_bits;
+            return Err(VulkanError::NoMemoryType { bits });
         };
         let memory = GpuMemory::allocate_imported(device, requirements.size, type_index, fd)
             .inspect_err(|_| {
@@ -2000,31 +2071,37 @@ impl EncodeQueue {
 /// Fence wait per submission in nanoseconds.
 pub(crate) const SUBMIT_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// Submit `cmd` on `queue`, wait `timeout_ns` for `fence`, then reset it.
+/// Queue-submit `cmd` on `queue`, signaled by `fence`.
 ///
-/// The queue `lock` stays held through the wait.
+/// The `lock` covers the submit call only. Fence waits and resets run
+/// outside it, so a waited submit never blocks another thread's submit.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the lock poisons, submission fails, the wait
-/// fails or times out, or the reset fails.
-pub(crate) fn submit_and_wait(
+/// Returns `Err` when the lock poisons or submission fails.
+pub(crate) fn submit_nowait(
     device: &ash::Device,
     lock: &std::sync::Mutex<()>,
     queue: vk::Queue,
     cmd: vk::CommandBuffer,
-    fence: &VkFence,
-    timeout_ns: u64,
+    fence: vk::Fence,
 ) -> Result<(), VulkanError> {
     let buffers = [cmd];
     let submit = vk::SubmitInfo::default().command_buffers(&buffers);
     let held = lock.lock().map_err(|_| VulkanError::QueuePoisoned)?;
-    submit_to_queue(device, queue, &[submit], fence.fence())?;
-    if !fence.wait(timeout_ns)? {
-        return Err(VulkanError::Timeout);
-    }
-    fence.reset()?;
+    let result = submit_to_queue(device, queue, &[submit], fence);
     drop(held);
+    result
+}
+
+/// Block until `device` runs no work.
+///
+/// # Errors
+///
+/// Returns `Err` when the wait fails.
+pub(crate) fn wait_idle(device: &ash::Device) -> Result<(), VulkanError> {
+    // SAFETY: the device is live; the call names no other object.
+    unsafe { device.device_wait_idle() }?;
     Ok(())
 }
 
@@ -2137,7 +2214,8 @@ impl VideoSession {
             let Some(type_index) =
                 pick_memory_type_preferred(memory_requirements, properties, flags)
             else {
-                return Err(VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+                let bits = memory_requirements.memory_type_bits;
+                return Err(VulkanError::NoMemoryType { bits });
             };
             let memory = GpuMemory::allocate(device, memory_requirements.size, type_index)?;
             binds.push(
@@ -2149,8 +2227,10 @@ impl VideoSession {
             );
             memories.push(memory);
         }
-        let count = u32::try_from(binds.len())
-            .map_err(|_| VulkanError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))?;
+        let count = u32::try_from(binds.len()).map_err(|_| VulkanError::OutOfBounds {
+            len: u64::try_from(binds.len()).unwrap_or(u64::MAX),
+            capacity: u64::from(u32::MAX),
+        })?;
         // SAFETY: memories cover their requirements; the session is live.
         let status = unsafe {
             (video.fp().bind_video_session_memory_khr)(

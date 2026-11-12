@@ -11,10 +11,10 @@ use crate::device::VulkanDevice;
 use crate::error::VulkanError;
 use crate::parse::refs::SlotBook;
 use crate::raw::{
-    CommandPool, DecodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView, SessionParameters,
-    VideoSession, VkFence,
+    DecodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView, SessionParameters, VideoSession,
 };
 use crate::session::geometry::SessionGeometry;
+use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
 
 /// Bitstream staging size in bytes: the largest access unit the session takes.
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
@@ -46,15 +46,14 @@ impl<'a> ExportTarget<'a> {
 
 /// Owned decode session over a negotiated device.
 ///
-/// Field order is the drop order: parameters free before the session they
-/// belong to, and GPU objects free before the pool and device clones.
+/// Field order is the drop order: the submit ring idles the device
+/// before dependents free, parameters free before the session they
+/// belong to, and GPU objects free before the device clone.
 pub(crate) struct Session {
+    /// Submit-slot ring; drops first, idling the device.
+    submit: SubmitSlots,
     /// Logical device.
     device: ash::Device,
-    /// Video queue.
-    queue: vk::Queue,
-    /// Queue submission mutex, shared with the device.
-    queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// Decode queue functions.
     decode: DecodeQueue,
     /// Session parameters; drops before `video` below.
@@ -69,18 +68,10 @@ pub(crate) struct Session {
     dpb: GpuImage,
     /// Tracked layout per DPB layer.
     dpb_layouts: Vec<vk::ImageLayout>,
-    /// Bitstream staging buffer.
-    bitstream: GpuBuffer,
-    /// Tight-NV12 readback buffer.
-    readback: GpuBuffer,
-    /// Command pool behind the submit slot.
-    pool: CommandPool,
-    /// Command buffer, allocated once and reset per submit.
-    cmd: vk::CommandBuffer,
-    /// Submission fence, reset per submit.
-    fence: VkFence,
-    /// True after a submit failure; the fence state is unknown.
-    wedged: bool,
+    /// Bitstream staging buffer per submit slot.
+    bitstreams: Vec<GpuBuffer>,
+    /// Tight-NV12 readback buffer per submit slot.
+    readbacks: Vec<GpuBuffer>,
     /// Reference-id to slot map.
     slots: SlotBook,
     /// Decode metadata per slot.
@@ -151,31 +142,37 @@ impl Session {
             dpb_views.push(dpb.layer_view(layer)?);
         }
         let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let bitstream = GpuBuffer::create(
-            raw,
-            &properties,
-            BITSTREAM_BYTES,
-            vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
-            host,
-            profiles,
-        )?;
-        let readback = GpuBuffer::create(
-            raw,
-            &properties,
-            nv12_bytes(coded_extent(geometry.coded())),
-            vk::BufferUsageFlags::TRANSFER_DST,
-            host,
-            &[],
-        )?;
-        let pool = CommandPool::create(raw, device.queue_family())?;
+        let mut bitstreams = Vec::with_capacity(SUBMIT_SLOTS);
+        let mut readbacks = Vec::with_capacity(SUBMIT_SLOTS);
+        for _ in 0..SUBMIT_SLOTS {
+            bitstreams.push(GpuBuffer::create(
+                raw,
+                &properties,
+                BITSTREAM_BYTES,
+                vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
+                host,
+                profiles,
+            )?);
+            readbacks.push(GpuBuffer::create(
+                raw,
+                &properties,
+                nv12_bytes(coded_extent(geometry.coded())),
+                vk::BufferUsageFlags::TRANSFER_DST,
+                host,
+                &[],
+            )?);
+        }
         let decode = DecodeQueue::new(device.backend().instance(), raw);
-        let cmd = pool.allocate()?;
-        let fence = VkFence::new(raw, false)?;
+        let submit = SubmitSlots::open(
+            raw,
+            device.queue_family(),
+            device.queue(),
+            device.queue_lock().clone(),
+        )?;
         let ext = device.external_fd();
         Ok(Self {
+            submit,
             device: raw.clone(),
-            queue: device.queue(),
-            queue_lock: device.queue_lock().clone(),
             decode,
             params,
             video: session,
@@ -183,12 +180,8 @@ impl Session {
             dpb_views,
             dpb,
             dpb_layouts: vec![vk::ImageLayout::UNDEFINED; slots],
-            bitstream,
-            readback,
-            pool,
-            cmd,
-            fence,
-            wedged: false,
+            bitstreams,
+            readbacks,
             slots: SlotBook::with_slots(slots),
             meta: vec![None; slots],
             props: properties,
@@ -251,14 +244,14 @@ impl Session {
             .map(|ext| (&self.device, ext, &self.props))
     }
 
-    /// Upload `bytes` to the bitstream staging buffer.
+    /// Upload `bytes` to the bitstream staging buffer of `slot`.
     ///
     /// Zero-pads through the aligned range the decode consumes.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the aligned range exceeds the staging buffer.
-    pub(crate) fn upload(&self, bytes: &[u8]) -> Result<u64, VulkanError> {
+    pub(crate) fn upload(&self, slot: usize, bytes: &[u8]) -> Result<u64, VulkanError> {
         let len = u64::try_from(bytes.len()).map_err(|_| VulkanError::OverCaps {
             what: "access unit",
         })?;
@@ -268,52 +261,121 @@ impl Session {
                 what: "access unit",
             });
         }
-        self.bitstream.memory().fill_padded(bytes, total)?;
+        self.bitstreams[slot].memory().fill_padded(bytes, total)?;
         Ok(total)
     }
 
-    /// Decode one submission into `out`, reusing its allocation.
+    /// Queue-submit one decode without waiting, into `export` when present.
+    ///
+    /// Records on a free ring slot and commits the planned layouts once
+    /// the submit queues; same-queue submission order plus the recorded
+    /// barriers carry the layout assumptions to the device. Collect the
+    /// returned pending through `collect_into` or `collect_gpu`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when recording, submission, or the fence wait fails.
-    pub(crate) fn submit_into(
+    /// Returns `Err` when the upload, recording, or submission fails.
+    pub(crate) fn submit_async(
         &mut self,
         sub: &Submission<'_>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), VulkanError> {
-        let range = self.upload(sub.bytes)?;
-        self.pool.reset_buffer(self.cmd)?;
-        let planned = self.record(self.cmd, sub, range, None)?;
-        self.dispatch(self.cmd, planned, out)
+        export: Option<&ExportTarget<'_>>,
+    ) -> Result<PendingDecode, VulkanError> {
+        let index = self.submit.acquire().inspect_err(|_| self.reset_state())?;
+        let range = match self.upload(index, sub.bytes) {
+            Ok(range) => range,
+            Err(error) => {
+                self.submit.release(index);
+                return Err(error);
+            }
+        };
+        let cmd = self.submit.cmd(index);
+        let planned = match self.record(index, cmd, sub, range, export) {
+            Ok(planned) => planned,
+            Err(error) => {
+                self.submit.release(index);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.submit.submit(index) {
+            self.reset_state();
+            return Err(error);
+        }
+        for (slot, layout) in planned {
+            self.dpb_layouts[slot] = layout;
+        }
+        Ok(PendingDecode { slot: index })
     }
 
-    /// Decode one submission into `target`, leaving pixels on the GPU.
+    /// Wait `pending` out, then map its readback into `out`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when recording, submission, or the fence wait fails.
-    pub(crate) fn submit_gpu(
+    /// Returns `Err` when the fence wait or the readback map fails.
+    pub(crate) fn collect_into(
         &mut self,
-        sub: &Submission<'_>,
-        target: &ExportTarget<'_>,
+        pending: PendingDecode,
+        out: &mut Vec<u8>,
     ) -> Result<(), VulkanError> {
-        let range = self.upload(sub.bytes)?;
-        self.pool.reset_buffer(self.cmd)?;
-        let planned = self.record(self.cmd, sub, range, Some(target))?;
-        self.dispatch_gpu(self.cmd, planned)
+        self.submit
+            .poll(pending.slot)
+            .inspect_err(|_| self.reset_state())?;
+        let len =
+            usize::try_from(nv12_bytes(coded_extent(self.geometry.coded()))).map_err(|_| {
+                crate::error::ParseError::OutOfRange {
+                    syntax: "readback size",
+                }
+            })?;
+        self.readbacks[pending.slot]
+            .memory()
+            .read_to_vec(out, len)?;
+        Ok(())
+    }
+
+    /// Wait `pending` out, leaving pixels on the GPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the fence wait fails.
+    pub(crate) fn collect_gpu(&mut self, pending: PendingDecode) -> Result<(), VulkanError> {
+        self.submit
+            .poll(pending.slot)
+            .inspect_err(|_| self.reset_state())
+    }
+
+    /// Submit-core gauges snapshot.
+    #[must_use]
+    pub(crate) fn submit_stats(&self) -> SubmitStats {
+        self.submit.stats()
+    }
+
+    /// Resets since the last take, zeroing the counter.
+    pub(crate) fn take_resets(&mut self) -> u64 {
+        self.submit.take_resets()
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    pub(crate) fn inject_fault(&mut self) {
+        self.submit.inject_fault();
+    }
+
+    /// Forget DPB layouts and references after a submit-core reset.
+    fn reset_state(&mut self) {
+        self.dpb_layouts.fill(vk::ImageLayout::UNDEFINED);
+        self.slots.release_all();
+        self.clear_meta();
     }
 
     /// Record decode commands, returning the planned layout commits.
     fn record(
         &self,
+        slot: usize,
         cmd: vk::CommandBuffer,
         sub: &Submission<'_>,
         range: u64,
         export: Option<&ExportTarget<'_>>,
     ) -> Result<Vec<(usize, vk::ImageLayout)>, VulkanError> {
-        self.pool.begin_buffer(cmd)?;
-        let recorder = self.pool.recorder(cmd);
+        self.submit.pool().begin_buffer(cmd)?;
+        let recorder = self.submit.pool().recorder(cmd);
         let mut planned = Vec::new();
         let mut barriers = Vec::new();
         for (slot, layout) in self.dpb_layouts.iter().enumerate() {
@@ -350,7 +412,7 @@ impl Session {
             self.video.control_coding(cmd, &control);
         }
         let decode = vk::VideoDecodeInfoKHR {
-            src_buffer: self.bitstream.buffer(),
+            src_buffer: self.bitstreams[slot].buffer(),
             src_buffer_offset: 0,
             src_buffer_range: range,
             dst_picture_resource: sub.dst,
@@ -380,7 +442,7 @@ impl Session {
             recorder.copy_image_to_buffer(
                 self.dpb.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.readback.buffer(),
+                self.readbacks[slot].buffer(),
                 &regions,
             );
         }
@@ -394,7 +456,7 @@ impl Session {
         );
         recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[to_dpb]));
         planned.push((sub.setup_slot, vk::ImageLayout::VIDEO_DECODE_DPB_KHR));
-        self.pool.end_buffer(cmd)?;
+        self.submit.pool().end_buffer(cmd)?;
         Ok(planned)
     }
 
@@ -456,71 +518,10 @@ impl Session {
             &[uv_copy],
         );
     }
-
-    /// Submit recorded commands and wait for the fence.
-    ///
-    /// A failure wedges the session: the fence may still be submitted,
-    /// so later submits fail without touching the queue.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when submission or the fence wait fails, or when a
-    /// past submit wedged the session.
-    fn submit_wait(&mut self, cmd: vk::CommandBuffer) -> Result<(), VulkanError> {
-        if self.wedged {
-            return Err(VulkanError::Timeout);
-        }
-        if let Err(error) = crate::raw::submit_and_wait(
-            &self.device,
-            &self.queue_lock,
-            self.queue,
-            cmd,
-            &self.fence,
-            crate::raw::SUBMIT_TIMEOUT_NS,
-        ) {
-            self.wedged = true;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// Submit recorded commands, wait, and map the readback buffer.
-    fn dispatch(
-        &mut self,
-        cmd: vk::CommandBuffer,
-        planned: Vec<(usize, vk::ImageLayout)>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), VulkanError> {
-        self.submit_wait(cmd)?;
-        for (slot, layout) in planned {
-            self.dpb_layouts[slot] = layout;
-        }
-        let len =
-            usize::try_from(nv12_bytes(coded_extent(self.geometry.coded()))).map_err(|_| {
-                crate::error::ParseError::OutOfRange {
-                    syntax: "readback size",
-                }
-            })?;
-        self.readback.memory().read_to_vec(out, len)?;
-        Ok(())
-    }
-
-    /// Submit recorded commands and wait, leaving pixels on the GPU.
-    fn dispatch_gpu(
-        &mut self,
-        cmd: vk::CommandBuffer,
-        planned: Vec<(usize, vk::ImageLayout)>,
-    ) -> Result<(), VulkanError> {
-        self.submit_wait(cmd)?;
-        for (slot, layout) in planned {
-            self.dpb_layouts[slot] = layout;
-        }
-        Ok(())
-    }
 }
 
 /// Checked narrowing of an index to `u32`.
-fn narrow_u32(value: usize, syntax: &'static str) -> Result<u32, VulkanError> {
+pub(crate) fn narrow_u32(value: usize, syntax: &'static str) -> Result<u32, VulkanError> {
     u32::try_from(value).map_err(|_| crate::error::ParseError::OutOfRange { syntax }.into())
 }
 
@@ -695,6 +696,13 @@ pub(crate) fn nv12_copy_regions(extent: vk::Extent2D, layer: u32) -> [vk::Buffer
         },
     };
     [luma, chroma]
+}
+
+/// Submitted but uncollected decode.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingDecode {
+    /// Ring slot behind the submit.
+    slot: usize,
 }
 
 /// One decoded picture's submission bundle.

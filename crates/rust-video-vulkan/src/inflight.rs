@@ -72,17 +72,26 @@ impl<F: Fence> Inflight<F> {
     ///
     /// Returns `Err` when a fence query fails.
     pub fn reap(&mut self) -> Result<usize, VulkanError> {
+        self.reap_ready().map(|ready| ready.len())
+    }
+
+    /// Take signaled fences without blocking, keeping pending ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a fence query fails.
+    pub fn reap_ready(&mut self) -> Result<Vec<F>, VulkanError> {
         let mut kept = Vec::with_capacity(self.pending.len());
-        let mut reaped = 0;
+        let mut ready = Vec::new();
         for fence in self.pending.drain(..) {
             if fence.signaled()? {
-                reaped += 1;
+                ready.push(fence);
             } else {
                 kept.push(fence);
             }
         }
         self.pending = kept;
-        Ok(reaped)
+        Ok(ready)
     }
 
     /// Wait each pending fence out, then drop all.
@@ -174,6 +183,18 @@ mod tests {
         inflight.submit(quick);
         inflight.submit(Stub::pending());
         assert_eq!(inflight.reap().expect("reap"), 1);
+        assert_eq!(inflight.len(), 1);
+    }
+
+    #[test]
+    fn reap_ready_returns_signaled_only() {
+        let mut inflight = Inflight::new();
+        let quick = Stub::pending();
+        quick.signal();
+        inflight.submit(quick);
+        inflight.submit(Stub::pending());
+        let ready = inflight.reap_ready().expect("reap");
+        assert_eq!(ready.len(), 1);
         assert_eq!(inflight.len(), 1);
     }
 

@@ -1,8 +1,8 @@
 //! Encode session core: owned GPU resources shared by both codecs.
 //!
-//! IDR-only encode: every picture codes without references, so one DPB
-//! slot and no reference lists. The driver emits parameter sets from the
-//! session sets below, and the feedback query reports the coded size.
+//! GOP encode: IDR pictures code without references, P pictures predict
+//! from the single live reference. The driver emits parameter sets from
+//! the session sets below, and the feedback query reports the coded size.
 
 use std::sync::Arc;
 
@@ -10,28 +10,32 @@ use ash::vk::native::{
     __BindgenBitfieldUnit, StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
     StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
     StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_ENABLED,
-    StdVideoH264PictureParameterSet, StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_I,
-    StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR,
+    StdVideoH264PictureParameterSet, StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR,
+    StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P,
     StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_0,
     StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
     StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH, StdVideoH264SequenceParameterSet,
     StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I,
+    StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P,
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT,
     StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420, StdVideoH265DecPicBufMgr,
     StdVideoH265PictureParameterSet, StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR,
-    StdVideoH265ProfileTierLevel, StdVideoH265SequenceParameterSet, StdVideoH265ShortTermRefPicSet,
-    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I, StdVideoH265VideoParameterSet,
+    StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P, StdVideoH265ProfileTierLevel,
+    StdVideoH265SequenceParameterSet, StdVideoH265ShortTermRefPicSet,
+    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
+    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P, StdVideoH265VideoParameterSet,
 };
 use ash::{khr, vk};
 
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
+use crate::parse::refs::{ReferenceId, SlotBook};
 use crate::raw::{
-    CommandPool, DeviceExport, EncodeFeedback, EncodeQueue, ExportPair, GpuBuffer, GpuImage,
-    GpuView, ImportPair, SessionParameters, VideoSession, VkFence,
+    DeviceExport, EncodeFeedback, EncodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView,
+    ImportPair, SessionParameters, VideoSession,
 };
 use crate::session::decode::{
-    layout_barrier, nv12_copy_regions, picture_resource, plane_copy, reference_slot,
+    layout_barrier, narrow_u32, nv12_copy_regions, picture_resource, plane_copy, reference_slot,
 };
 use crate::session::geometry::{h264_level_to_std, h265_level_to_std};
 use crate::session::params::{
@@ -39,6 +43,7 @@ use crate::session::params::{
     h265_encode_params_create, H264EncodeProfileChain, H265EncodeProfileChain,
     H264_ENCODE_STD_NAME, H265_ENCODE_STD_NAME,
 };
+use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
 
 /// Bitstream staging size in bytes: the largest coded picture the session takes.
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
@@ -49,6 +54,15 @@ const RC_FPS: u32 = 30;
 /// Rate-control frame rate denominator.
 const RC_FPS_DENOM: u32 = 1;
 
+/// DPB slots of a P-capable encode session: one reference plus one reconstructed.
+const ENCODE_DPB_SLOTS: u32 = 2;
+
+/// Reference-list entry meaning no reference picture.
+///
+/// `STD_VIDEO_H264_NO_REFERENCE_PICTURE` and
+/// `STD_VIDEO_H265_NO_REFERENCE_PICTURE` share the value; ash exports neither.
+const NO_REF_PICTURE: u8 = 0xFF;
+
 /// Encode codec behind one session.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum EncodeCodec {
@@ -58,21 +72,47 @@ pub(crate) enum EncodeCodec {
     H265,
 }
 
-/// IDR stamp of one coded picture.
+/// Coding stamp of one picture.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct IdrStamp {
-    /// IDR id wrapping per picture.
+pub(crate) struct PictureStamp {
+    /// IDR id wrapping per IDR picture.
     idr_id: u16,
     /// Picture order count.
     poc: i32,
+    /// Frame number, H.264 only.
+    frame_num: u16,
+    /// Picture codes as IDR.
+    is_idr: bool,
 }
 
-impl IdrStamp {
-    /// Stamp with `idr_id` and `poc`.
+impl PictureStamp {
+    /// Stamp with `idr_id`, `poc`, `frame_num`, and `is_idr`.
     #[must_use]
-    pub fn new(idr_id: u16, poc: i32) -> Self {
-        Self { idr_id, poc }
+    pub fn new(idr_id: u16, poc: i32, frame_num: u16, is_idr: bool) -> Self {
+        Self {
+            idr_id,
+            poc,
+            frame_num,
+            is_idr,
+        }
     }
+
+    /// True when the picture codes as IDR.
+    #[must_use]
+    pub(crate) fn is_idr(&self) -> bool {
+        self.is_idr
+    }
+}
+
+/// Reconstructed picture behind one DPB slot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EncodeMeta {
+    /// Picture order count.
+    poc: i32,
+    /// Frame number, H.264 only.
+    frame_num: u16,
+    /// Picture coded as IDR.
+    idr: bool,
 }
 
 /// CBR rate control for one extent.
@@ -420,6 +460,32 @@ fn check_extent(
     Ok(())
 }
 
+/// Encode feedback plus CBR rate control behind `facts`.
+///
+/// # Errors
+///
+/// Returns `Err` when the adapter reports neither the coded-size
+/// feedback flag nor the CBR control mode.
+fn check_caps(facts: &crate::ladder::EncodeFacts) -> Result<(), VulkanError> {
+    if !facts
+        .feedback
+        .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN)
+    {
+        return Err(VulkanError::OverCaps {
+            what: "encode feedback",
+        });
+    }
+    if !facts
+        .rate_control_modes
+        .contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
+    {
+        return Err(VulkanError::OverCaps {
+            what: "rate control",
+        });
+    }
+    Ok(())
+}
+
 /// Standard sets of `codec` for `width`x`height` under `facts`.
 ///
 /// # Errors
@@ -484,6 +550,263 @@ fn rc_control<'a>(
     }
 }
 
+/// H.264 single-reference L0 list over `ref_slot`.
+fn h264_ref_lists(ref_slot: u8) -> ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
+    let mut l0 = [NO_REF_PICTURE; 32];
+    l0[0] = ref_slot;
+    ash::vk::native::StdVideoEncodeH264ReferenceListsInfo {
+        flags: ash::vk::native::StdVideoEncodeH264ReferenceListsInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+        },
+        num_ref_idx_l0_active_minus1: 0,
+        num_ref_idx_l1_active_minus1: 0,
+        RefPicList0: l0,
+        RefPicList1: [NO_REF_PICTURE; 32],
+        refList0ModOpCount: 0,
+        refList1ModOpCount: 0,
+        refPicMarkingOpCount: 0,
+        reserved1: [0; 7],
+        pRefList0ModOperations: std::ptr::null(),
+        pRefList1ModOperations: std::ptr::null(),
+        pRefPicMarkingOperations: std::ptr::null(),
+    }
+}
+
+/// H.265 single-reference L0 list over `ref_slot`.
+fn h265_ref_lists(ref_slot: u8) -> ash::vk::native::StdVideoEncodeH265ReferenceListsInfo {
+    let mut l0 = [NO_REF_PICTURE; 15];
+    l0[0] = ref_slot;
+    ash::vk::native::StdVideoEncodeH265ReferenceListsInfo {
+        flags: ash::vk::native::StdVideoEncodeH265ReferenceListsInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+        },
+        num_ref_idx_l0_active_minus1: 0,
+        num_ref_idx_l1_active_minus1: 0,
+        RefPicList0: l0,
+        RefPicList1: [NO_REF_PICTURE; 15],
+        list_entry_l0: [0; 15],
+        list_entry_l1: [0; 15],
+    }
+}
+
+/// H.265 short-term set holding one negative picture `delta_minus1` back.
+fn h265_rps(delta_minus1: u16) -> StdVideoH265ShortTermRefPicSet {
+    let mut s0 = [0_u16; 16];
+    s0[0] = delta_minus1;
+    StdVideoH265ShortTermRefPicSet {
+        flags: ash::vk::native::StdVideoH265ShortTermRefPicSetFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 1]),
+            __bindgen_padding_0: [0; 3],
+        },
+        delta_idx_minus1: 0,
+        use_delta_flag: 0,
+        abs_delta_rps_minus1: 0,
+        used_by_curr_pic_flag: 0,
+        used_by_curr_pic_s0_flag: 1,
+        used_by_curr_pic_s1_flag: 0,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        num_negative_pics: 1,
+        num_positive_pics: 0,
+        delta_poc_s0_minus1: s0,
+        delta_poc_s1_minus1: [0; 16],
+    }
+}
+
+/// H.264 encode reference info of a `pic_type` picture at `frame_num`/`poc`.
+fn h264_encode_ref_info(
+    pic_type: ash::vk::native::StdVideoH264PictureType,
+    frame_num: u32,
+    poc: i32,
+) -> ash::vk::native::StdVideoEncodeH264ReferenceInfo {
+    ash::vk::native::StdVideoEncodeH264ReferenceInfo {
+        flags: ash::vk::native::StdVideoEncodeH264ReferenceInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+        },
+        primary_pic_type: pic_type,
+        FrameNum: frame_num,
+        PicOrderCnt: poc,
+        long_term_pic_num: 0,
+        long_term_frame_idx: 0,
+        temporal_id: 0,
+    }
+}
+
+/// H.264 encode picture info, IDR shape when `idr` holds.
+fn h264_encode_picture(
+    idr: bool,
+    idr_pic_id: u16,
+    pic_type: ash::vk::native::StdVideoH264PictureType,
+    frame_num: u32,
+    poc: i32,
+    ref_lists: Option<&ash::vk::native::StdVideoEncodeH264ReferenceListsInfo>,
+) -> ash::vk::native::StdVideoEncodeH264PictureInfo {
+    let mut flags = ash::vk::native::StdVideoEncodeH264PictureInfoFlags {
+        _bitfield_align_1: [],
+        _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+    };
+    flags.set_IdrPicFlag(u32::from(idr));
+    flags.set_is_reference(1);
+    ash::vk::native::StdVideoEncodeH264PictureInfo {
+        flags,
+        seq_parameter_set_id: 0,
+        pic_parameter_set_id: 0,
+        idr_pic_id,
+        primary_pic_type: pic_type,
+        frame_num,
+        PicOrderCnt: poc,
+        temporal_id: 0,
+        reserved1: [0; 3],
+        pRefLists: ref_lists.map_or(std::ptr::null(), std::ptr::from_ref),
+    }
+}
+
+/// H.264 encode slice header, P type when `p` holds.
+fn h264_encode_slice(p: bool) -> ash::vk::native::StdVideoEncodeH264SliceHeader {
+    ash::vk::native::StdVideoEncodeH264SliceHeader {
+        flags: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+        },
+        first_mb_in_slice: 0,
+        slice_type: if p {
+            StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P
+        } else {
+            StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I
+        },
+        slice_alpha_c0_offset_div2: 0,
+        slice_beta_offset_div2: 0,
+        slice_qp_delta: 0,
+        reserved1: 0,
+        cabac_init_idc: StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
+        disable_deblocking_filter_idc:
+            StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_ENABLED,
+        pWeightTable: std::ptr::null(),
+    }
+}
+
+/// H.265 encode reference info of a `pic_type` picture at `poc`.
+fn h265_encode_ref_info(
+    pic_type: ash::vk::native::StdVideoH265PictureType,
+    poc: i32,
+) -> ash::vk::native::StdVideoEncodeH265ReferenceInfo {
+    ash::vk::native::StdVideoEncodeH265ReferenceInfo {
+        flags: ash::vk::native::StdVideoEncodeH265ReferenceInfoFlags {
+            _bitfield_align_1: [],
+            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+        },
+        pic_type,
+        PicOrderCntVal: poc,
+        TemporalId: 0,
+    }
+}
+
+/// H.265 encode picture info, IDR shape when `idr` holds.
+fn h265_encode_picture(
+    idr: bool,
+    pic_type: ash::vk::native::StdVideoH265PictureType,
+    poc: i32,
+    ref_lists: Option<&ash::vk::native::StdVideoEncodeH265ReferenceListsInfo>,
+    rps: Option<&StdVideoH265ShortTermRefPicSet>,
+) -> ash::vk::native::StdVideoEncodeH265PictureInfo {
+    let mut flags = ash::vk::native::StdVideoEncodeH265PictureInfoFlags {
+        _bitfield_align_1: [],
+        _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+    };
+    flags.set_is_reference(1);
+    flags.set_IrapPicFlag(u32::from(idr));
+    flags.set_short_term_ref_pic_set_sps_flag(u32::from(idr));
+    flags.set_pic_output_flag(1);
+    ash::vk::native::StdVideoEncodeH265PictureInfo {
+        flags,
+        pic_type,
+        sps_video_parameter_set_id: 0,
+        pps_seq_parameter_set_id: 0,
+        pps_pic_parameter_set_id: 0,
+        short_term_ref_pic_set_idx: 0,
+        PicOrderCntVal: poc,
+        TemporalId: 0,
+        reserved1: [0; 7],
+        pRefLists: ref_lists.map_or(std::ptr::null(), std::ptr::from_ref),
+        pShortTermRefPicSet: rps.map_or(std::ptr::null(), std::ptr::from_ref),
+        pLongTermRefPics: std::ptr::null(),
+    }
+}
+
+/// H.265 encode slice header, P type when `p` holds.
+fn h265_encode_slice(p: bool) -> ash::vk::native::StdVideoEncodeH265SliceSegmentHeader {
+    let mut flags = ash::vk::native::StdVideoEncodeH265SliceSegmentHeaderFlags {
+        _bitfield_align_1: [],
+        _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+    };
+    flags.set_first_slice_segment_in_pic_flag(1);
+    ash::vk::native::StdVideoEncodeH265SliceSegmentHeader {
+        flags,
+        slice_type: if p {
+            StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P
+        } else {
+            StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I
+        },
+        slice_segment_address: 0,
+        collocated_ref_idx: 0,
+        MaxNumMergeCand: 5,
+        slice_cb_qp_offset: 0,
+        slice_cr_qp_offset: 0,
+        slice_beta_offset_div2: 0,
+        slice_tc_offset_div2: 0,
+        slice_act_y_qp_offset: 0,
+        slice_act_cb_qp_offset: 0,
+        slice_act_cr_qp_offset: 0,
+        slice_qp_delta: 0,
+        reserved1: 0,
+        pWeightTable: std::ptr::null(),
+    }
+}
+
+/// Checked narrowing of an index to `i32`.
+fn narrow_i32(value: usize, syntax: &'static str) -> Result<i32, VulkanError> {
+    i32::try_from(value).map_err(|_| crate::error::ParseError::OutOfRange { syntax }.into())
+}
+
+/// Narrowed reference slot of `plan`, if the picture predicts.
+fn plan_ref_slot(plan: &EncodePlan) -> Result<Option<u8>, VulkanError> {
+    plan.ref_slot
+        .map(|slot| {
+            u8::try_from(slot)
+                .map_err(|_| crate::error::ParseError::OutOfRange { syntax: "ref slot" })
+        })
+        .transpose()
+        .map_err(VulkanError::from)
+}
+
+/// Encode info over `src` into `buffer`, reconstructing into `slot`.
+fn encode_info<'a>(
+    buffer: vk::Buffer,
+    src: vk::VideoPictureResourceInfoKHR<'a>,
+    slot: &'a vk::VideoReferenceSlotInfoKHR<'a>,
+    refs: &'a [vk::VideoReferenceSlotInfoKHR<'a>],
+) -> Result<vk::VideoEncodeInfoKHR<'a>, VulkanError> {
+    Ok(vk::VideoEncodeInfoKHR {
+        dst_buffer: buffer,
+        dst_buffer_offset: 0,
+        dst_buffer_range: BITSTREAM_BYTES,
+        src_picture_resource: src,
+        p_setup_reference_slot: std::ptr::from_ref(slot),
+        reference_slot_count: narrow_u32(refs.len(), "encode refs")?,
+        p_reference_slots: if refs.is_empty() {
+            std::ptr::null()
+        } else {
+            refs.as_ptr()
+        },
+        ..Default::default()
+    })
+}
+
 /// H.264 wire level for `macroblocks`, if any level covers it.
 pub(crate) fn h264_level_for(macroblocks: u32) -> Option<u8> {
     const TABLE: [(u32, u8); 10] = [
@@ -522,15 +845,15 @@ pub(crate) fn h265_level_for(samples: u64) -> Option<u8> {
         .map(|(_, level)| *level)
 }
 
-/// Images, buffers, pool, and fence of one encode session.
+/// Images, buffers, and feedback queries of one encode session.
 struct SessionResources {
     /// Source image view; drops before `input` below.
     input_view: GpuView,
     /// Source image for uploaded pictures.
     input: GpuImage,
-    /// Reconstructed layer view; drops before `dpb` below.
-    dpb_view: GpuView,
-    /// Single-layer reconstructed image.
+    /// One view per DPB layer; drops before `dpb` below.
+    dpb_views: Vec<GpuView>,
+    /// DPB array image, one layer per slot.
     dpb: GpuImage,
     /// NV12 upload staging buffer.
     staging: GpuBuffer,
@@ -538,27 +861,20 @@ struct SessionResources {
     bitstream: GpuBuffer,
     /// Coded-size feedback pool.
     feedback: EncodeFeedback,
-    /// Command pool behind the submit slot.
-    pool: CommandPool,
-    /// Command buffer, allocated once and reset per submit.
-    cmd: vk::CommandBuffer,
-    /// Submission fence, reset per submit.
-    fence: VkFence,
     /// Encode queue functions.
     encode: EncodeQueue,
 }
 
 /// Owned encode session over a negotiated device.
 ///
-/// Field order is the drop order: parameters free before the session they
-/// belong to, and GPU objects free before the pool and device clones.
+/// Field order is the drop order: the submit ring idles the device
+/// before dependents free, parameters free before the session they
+/// belong to, and GPU objects free before the device clone.
 pub(crate) struct EncodeSession {
+    /// Submit-slot ring; drops first, idling the device.
+    submit: SubmitSlots,
     /// Logical device.
     device: ash::Device,
-    /// Video queue.
-    queue: vk::Queue,
-    /// Queue submission mutex, shared with the device.
-    queue_lock: std::sync::Arc<std::sync::Mutex<()>>,
     /// Encode queue functions.
     encode: EncodeQueue,
     /// Session parameters; drops before `video` below.
@@ -583,33 +899,46 @@ pub(crate) struct EncodeSession {
     input: GpuImage,
     /// Tracked source layout.
     input_layout: vk::ImageLayout,
-    /// Reconstructed layer view; drops before `dpb` below.
-    dpb_view: GpuView,
-    /// Single-layer reconstructed image.
+    /// One view per DPB layer; drops before `dpb` below.
+    dpb_views: Vec<GpuView>,
+    /// DPB array image, one layer per slot.
     dpb: GpuImage,
-    /// Tracked reconstructed layout.
-    dpb_layout: vk::ImageLayout,
+    /// Tracked layout per DPB layer.
+    dpb_layouts: Vec<vk::ImageLayout>,
+    /// Reference-id to slot map.
+    slots: SlotBook,
+    /// Reconstructed picture per slot.
+    meta: Vec<Option<EncodeMeta>>,
+    /// Next reference identity.
+    next_id: ReferenceId,
+    /// Two DPB slots back P pictures; one slot stays IDR-only.
+    p_capable: bool,
     /// NV12 upload staging buffer.
     staging: GpuBuffer,
     /// Coded bitstream buffer.
     bitstream: GpuBuffer,
     /// Coded-size feedback pool.
     feedback: EncodeFeedback,
-    /// Command pool behind the submit slot.
-    pool: CommandPool,
-    /// Command buffer, allocated once and reset per submit.
-    cmd: vk::CommandBuffer,
-    /// Submission fence, reset per submit.
-    fence: VkFence,
-    /// True after a submit failure; the fence state is unknown.
-    wedged: bool,
     /// CBR rate control.
     rate: RateControl,
-    /// Coding scope opened at least once; the slot holds the last IDR.
-    /// Stamp of the picture in the slot, if any.
-    prev: Option<IdrStamp>,
-    /// Driver-encoded parameter sets prepended to every packet.
+    /// Driver-encoded parameter sets prepended to keyframe packets.
     headers: Vec<u8>,
+}
+
+/// Claimed slots and reference of one picture.
+struct EncodePlan {
+    /// Slot receiving the reconstructed picture.
+    setup_slot: usize,
+    /// Slot holding the live reference, if the picture predicts.
+    ref_slot: Option<usize>,
+    /// Live reference behind `ref_slot`.
+    ref_meta: Option<EncodeMeta>,
+    /// H.265 POC gap minus 1 behind the explicit short-term set.
+    rps_delta_minus1: u16,
+    /// Picture codes as IDR.
+    coded_idr: bool,
+    /// Identity leaving the DPB with this picture.
+    old_id: Option<ReferenceId>,
 }
 
 impl EncodeSession {
@@ -629,22 +958,7 @@ impl EncodeSession {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
         check_extent(&facts, width, height)?;
-        if !facts
-            .feedback
-            .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN)
-        {
-            return Err(VulkanError::OverCaps {
-                what: "encode feedback",
-            });
-        }
-        if !facts
-            .rate_control_modes
-            .contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-        {
-            return Err(VulkanError::OverCaps {
-                what: "rate control",
-            });
-        }
+        check_caps(&facts)?;
         let raw = device.raw().device();
         let properties =
             crate::raw::RawDevice::memory_properties(device.backend(), device.adapter());
@@ -670,13 +984,16 @@ impl EncodeSession {
             .backend()
             .video_formats(device.adapter(), &profile, usage)?;
         let format = crate::raw::pick_video_format(&formats).ok_or(VulkanError::NoVideoFormat)?;
-        let resources = Self::open_resources(device, &properties, format, extent, &profile)?;
+        let p_capable = facts.dpb_slots >= ENCODE_DPB_SLOTS && facts.active_refs >= 1;
+        let dpb_count = if p_capable { ENCODE_DPB_SLOTS } else { 1 };
+        let resources =
+            Self::open_resources(device, &properties, format, extent, &profile, dpb_count)?;
         let desc = crate::raw::VideoSessionDesc {
             profile: &profile,
             queue_family: device.queue_family(),
             format,
             extent,
-            dpb_slots: 1,
+            dpb_slots: dpb_count,
             active_refs: 1,
             std_version: &std_version,
         };
@@ -695,10 +1012,15 @@ impl EncodeSession {
             EncodeCodec::H264 => resources.encode.encoded_parameters_h264(params.params())?,
             EncodeCodec::H265 => resources.encode.encoded_parameters_h265(params.params())?,
         };
+        let submit = SubmitSlots::open(
+            raw,
+            device.queue_family(),
+            device.queue(),
+            device.queue_lock().clone(),
+        )?;
         Ok(Self {
+            submit,
             device: raw.clone(),
-            queue: device.queue(),
-            queue_lock: device.queue_lock().clone(),
             encode: resources.encode,
             params,
             video: session,
@@ -711,29 +1033,29 @@ impl EncodeSession {
             input_view: resources.input_view,
             input: resources.input,
             input_layout: vk::ImageLayout::UNDEFINED,
-            dpb_view: resources.dpb_view,
+            dpb_views: resources.dpb_views,
             dpb: resources.dpb,
-            dpb_layout: vk::ImageLayout::UNDEFINED,
+            dpb_layouts: vec![vk::ImageLayout::UNDEFINED; dpb_count as usize],
+            slots: SlotBook::with_slots(dpb_count as usize),
+            meta: vec![None; dpb_count as usize],
+            next_id: ReferenceId::default(),
+            p_capable,
             staging: resources.staging,
             bitstream: resources.bitstream,
             feedback: resources.feedback,
-            pool: resources.pool,
-            cmd: resources.cmd,
-            fence: resources.fence,
-            wedged: false,
             rate: RateControl::cbr_for(extent),
-            prev: None,
             headers,
         })
     }
 
-    /// Images, buffers, pool, and fence for `profile` at `extent`.
+    /// Images, buffers, and feedback queries for `profile` at `extent`.
     fn open_resources(
         device: &VulkanDevice,
         properties: &vk::PhysicalDeviceMemoryProperties,
         format: vk::Format,
         extent: vk::Extent2D,
         profile: &vk::VideoProfileInfoKHR<'_>,
+        dpb_layers: u32,
     ) -> Result<SessionResources, VulkanError> {
         let raw = device.raw().device();
         let profiles = std::slice::from_ref(profile);
@@ -742,6 +1064,7 @@ impl EncodeSession {
             properties,
             format,
             extent,
+            1,
             vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR | vk::ImageUsageFlags::TRANSFER_DST,
             profiles,
         )?;
@@ -751,10 +1074,14 @@ impl EncodeSession {
             properties,
             format,
             extent,
+            dpb_layers,
             vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR,
             profiles,
         )?;
-        let dpb_view = dpb.layer_view(0)?;
+        let mut dpb_views = Vec::with_capacity(dpb_layers as usize);
+        for layer in 0..dpb_layers {
+            dpb_views.push(dpb.layer_view(layer)?);
+        }
         let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let staging = GpuBuffer::create(
             raw,
@@ -772,37 +1099,36 @@ impl EncodeSession {
             host,
             profiles,
         )?;
+        let slots =
+            u32::try_from(SUBMIT_SLOTS).map_err(|_| crate::error::ParseError::OutOfRange {
+                syntax: "submit slots",
+            })?;
         let feedback = EncodeFeedback::create(
             raw,
-            1,
+            slots,
             vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
             profile,
         )?;
-        let pool = CommandPool::create(raw, device.queue_family())?;
-        let cmd = pool.allocate()?;
-        let fence = VkFence::new(raw, false)?;
         let encode = EncodeQueue::new(device.backend().instance(), raw);
         Ok(SessionResources {
             input_view,
             input,
-            dpb_view,
+            dpb_views,
             dpb,
             staging,
             bitstream,
             feedback,
-            pool,
-            cmd,
-            fence,
             encode,
         })
     }
 
-    /// Image of `format` at `extent` with `usage` over `profiles`, memory bound.
+    /// Image of `format` at `extent` with `layers` and `usage` over `profiles`.
     fn create_image(
         raw: &ash::Device,
         properties: &vk::PhysicalDeviceMemoryProperties,
         format: vk::Format,
         extent: vk::Extent2D,
+        layers: u32,
         usage: vk::ImageUsageFlags,
         profiles: &[vk::VideoProfileInfoKHR<'_>],
     ) -> Result<GpuImage, VulkanError> {
@@ -812,7 +1138,7 @@ impl EncodeSession {
             &crate::raw::GpuImageDesc {
                 format,
                 extent,
-                layers: 1,
+                layers,
                 tiling: vk::ImageTiling::OPTIMAL,
                 usage,
                 flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
@@ -885,17 +1211,114 @@ impl EncodeSession {
         &self.headers
     }
 
-    /// Encode tight NV12 `picture` stamped `idr` into `out`.
+    /// Submit-core gauges snapshot.
+    #[must_use]
+    pub(crate) fn submit_stats(&self) -> SubmitStats {
+        self.submit.stats()
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    pub(crate) fn inject_fault(&mut self) {
+        self.submit.inject_fault();
+    }
+
+    /// True when two DPB slots back P pictures.
+    pub(crate) fn supports_p_frames(&self) -> bool {
+        self.p_capable
+    }
+
+    /// Forget layouts and references after a submit-core reset.
+    fn reset_state(&mut self) {
+        self.input_layout = vk::ImageLayout::UNDEFINED;
+        self.dpb_layouts.fill(vk::ImageLayout::UNDEFINED);
+        self.slots.release_all();
+        self.meta.fill(None);
+    }
+
+    /// Claimed setup slot and live reference for `stamp`.
+    ///
+    /// An IDR flushes the DPB; a P without a live reference codes as
+    /// IDR instead, so a reset never emits a dangling prediction.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when recording, submission, or the fence wait fails.
+    /// Returns `Err` when no slot is free or the POC gap escapes `u16`.
+    fn plan_picture(&mut self, stamp: PictureStamp) -> Result<EncodePlan, VulkanError> {
+        if stamp.is_idr {
+            self.slots.release_all();
+            self.meta.fill(None);
+        }
+        let live = if stamp.is_idr || !self.p_capable {
+            None
+        } else {
+            self.live_reference(stamp.poc)
+        };
+        let coded_idr = stamp.is_idr || live.is_none();
+        let (ref_slot, ref_meta, rps_delta_minus1, old_id) = match live {
+            Some((slot, meta, id)) => {
+                let delta = u16::try_from(stamp.poc - meta.poc - 1).map_err(|_| {
+                    crate::error::ParseError::OutOfRange {
+                        syntax: "poc delta",
+                    }
+                })?;
+                (Some(slot), Some(meta), delta, Some(id))
+            }
+            None => (None, None, 0, None),
+        };
+        let setup_slot = self.slots.claim(self.next_id.next())?;
+        Ok(EncodePlan {
+            setup_slot,
+            ref_slot,
+            ref_meta,
+            rps_delta_minus1,
+            coded_idr,
+            old_id,
+        })
+    }
+
+    /// Slot, picture, and identity of the live reference behind `poc`.
+    fn live_reference(&self, poc: i32) -> Option<(usize, EncodeMeta, ReferenceId)> {
+        let (slot, meta) = self
+            .meta
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, meta)| meta.map(|meta| (slot, meta)))
+            .max_by_key(|(_, meta)| meta.poc)?;
+        if meta.poc >= poc {
+            return None;
+        }
+        Some((slot, meta, self.slots.identity_of(slot)?))
+    }
+
+    /// Retire the replaced reference and store the new reconstructed picture.
+    fn commit_plan(&mut self, plan: &EncodePlan, stamp: PictureStamp) {
+        if let Some(old) = plan.old_id {
+            if let Some(slot) = self.slots.slot_of(old) {
+                self.meta[slot] = None;
+            }
+            self.slots.release(old);
+        }
+        self.meta[plan.setup_slot] = Some(EncodeMeta {
+            poc: stamp.poc,
+            frame_num: stamp.frame_num,
+            idr: plan.coded_idr,
+        });
+    }
+
+    /// Encode tight NV12 `picture` stamped `stamp` into `out`.
+    ///
+    /// Returns whether the picture coded as a keyframe.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when staging, recording, submission, or the fence
+    /// wait fails.
     pub(crate) fn encode_into(
         &mut self,
         picture: &[u8],
-        idr: IdrStamp,
+        stamp: PictureStamp,
         out: &mut Vec<u8>,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<bool, VulkanError> {
         let want =
             usize::try_from(crate::session::decode::nv12_bytes(self.extent)).map_err(|_| {
                 crate::error::ParseError::OutOfRange {
@@ -908,13 +1331,35 @@ impl EncodeSession {
                 found: picture.len(),
             });
         }
-        self.staging.memory().fill(picture)?;
-        self.pool.reset_buffer(self.cmd)?;
-        self.record(idr)?;
-        self.dispatch(out)
+        let index = self.submit.acquire().inspect_err(|_| self.reset_state())?;
+        if let Err(error) = self.staging.memory().fill(picture) {
+            self.submit.release(index);
+            return Err(error);
+        }
+        let plan = match self.plan_picture(stamp) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.submit.release(index);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.record(index, stamp, &plan) {
+            self.submit.release(index);
+            self.reset_state();
+            return Err(error);
+        }
+        if let Err(error) = self.submit.submit(index) {
+            self.reset_state();
+            return Err(error);
+        }
+        self.commit_plan(&plan, stamp);
+        self.collect(index, out)?;
+        Ok(plan.coded_idr)
     }
 
-    /// Encode the device `export` stamped `idr` into `out`.
+    /// Encode the device `export` stamped `stamp` into `out`.
+    ///
+    /// Returns whether the picture coded as a keyframe.
     ///
     /// # Errors
     ///
@@ -923,9 +1368,9 @@ impl EncodeSession {
     pub(crate) fn encode_import(
         &mut self,
         export: &DeviceExport,
-        idr: IdrStamp,
+        stamp: PictureStamp,
         out: &mut Vec<u8>,
-    ) -> Result<(), VulkanError> {
+    ) -> Result<bool, VulkanError> {
         if export.source() != self.format {
             return Err(VulkanError::Unsupported {
                 what: "encode import format".to_owned(),
@@ -955,37 +1400,63 @@ impl EncodeSession {
             });
         };
         let (y, uv) = (import.y_image(), import.uv_image());
-        self.pool.reset_buffer(self.cmd)?;
-        self.record_import(idr, y, uv)?;
-        self.dispatch(out)
+        let index = self.submit.acquire().inspect_err(|_| self.reset_state())?;
+        let plan = match self.plan_picture(stamp) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.submit.release(index);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.record_import(index, stamp, &plan, y, uv) {
+            self.submit.release(index);
+            self.reset_state();
+            return Err(error);
+        }
+        if let Err(error) = self.submit.submit(index) {
+            self.reset_state();
+            return Err(error);
+        }
+        self.commit_plan(&plan, stamp);
+        self.collect(index, out)?;
+        Ok(plan.coded_idr)
     }
 
     /// Record upload, encode, and feedback commands.
-    fn record(&mut self, idr: IdrStamp) -> Result<(), VulkanError> {
-        self.pool.begin_buffer(self.cmd)?;
-        self.record_upload_head();
-        self.record_tail(idr);
-        self.pool.end_buffer(self.cmd)?;
+    fn record(
+        &mut self,
+        index: usize,
+        stamp: PictureStamp,
+        plan: &EncodePlan,
+    ) -> Result<(), VulkanError> {
+        let cmd = self.submit.cmd(index);
+        self.submit.pool().begin_buffer(cmd)?;
+        self.record_upload_head(cmd);
+        self.record_tail(index, cmd, stamp, plan)?;
+        self.submit.pool().end_buffer(cmd)?;
         Ok(())
     }
 
     /// Record import, encode, and feedback commands.
     fn record_import(
         &mut self,
-        idr: IdrStamp,
+        index: usize,
+        stamp: PictureStamp,
+        plan: &EncodePlan,
         y: vk::Image,
         uv: vk::Image,
     ) -> Result<(), VulkanError> {
-        self.pool.begin_buffer(self.cmd)?;
-        self.record_import_head(y, uv);
-        self.record_tail(idr);
-        self.pool.end_buffer(self.cmd)?;
+        let cmd = self.submit.cmd(index);
+        self.submit.pool().begin_buffer(cmd)?;
+        self.record_import_head(cmd, y, uv);
+        self.record_tail(index, cmd, stamp, plan)?;
+        self.submit.pool().end_buffer(cmd)?;
         Ok(())
     }
 
     /// Record the staging upload into the source image.
-    fn record_upload_head(&mut self) {
-        let recorder = self.pool.recorder(self.cmd);
+    fn record_upload_head(&mut self, cmd: vk::CommandBuffer) {
+        let recorder = self.submit.pool().recorder(cmd);
         let mut barriers = Vec::new();
         if self.input_layout != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
             barriers.push(layout_barrier(
@@ -1020,8 +1491,8 @@ impl EncodeSession {
     }
 
     /// Record the imported planes into the source image.
-    fn record_import_head(&mut self, y: vk::Image, uv: vk::Image) {
-        let recorder = self.pool.recorder(self.cmd);
+    fn record_import_head(&mut self, cmd: vk::CommandBuffer, y: vk::Image, uv: vk::Image) {
+        let recorder = self.submit.pool().recorder(cmd);
         for image in [y, uv] {
             let barrier = layout_barrier(
                 image,
@@ -1092,97 +1563,119 @@ impl EncodeSession {
     }
 
     /// Record reconstructed setup, encode, and feedback commands.
-    fn record_tail(&mut self, idr: IdrStamp) {
-        let recorder = self.pool.recorder(self.cmd);
-        if self.dpb_layout != vk::ImageLayout::VIDEO_ENCODE_DPB_KHR {
+    fn record_tail(
+        &mut self,
+        index: usize,
+        cmd: vk::CommandBuffer,
+        stamp: PictureStamp,
+        plan: &EncodePlan,
+    ) -> Result<(), VulkanError> {
+        let query = u32::try_from(index).map_err(|_| crate::error::ParseError::OutOfRange {
+            syntax: "submit slot",
+        })?;
+        let setup_layer =
+            u32::try_from(plan.setup_slot).map_err(|_| crate::error::ParseError::OutOfRange {
+                syntax: "setup slot",
+            })?;
+        let recorder = self.submit.pool().recorder(cmd);
+        if self.dpb_layouts[plan.setup_slot] != vk::ImageLayout::VIDEO_ENCODE_DPB_KHR {
             let to_dpb = layout_barrier(
                 self.dpb.image(),
-                self.dpb_layout,
+                self.dpb_layouts[plan.setup_slot],
                 vk::ImageLayout::VIDEO_ENCODE_DPB_KHR,
                 vk::ImageAspectFlags::COLOR,
-                0,
+                setup_layer,
                 1,
             );
             recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[to_dpb]));
         }
-        self.dpb_layout = vk::ImageLayout::VIDEO_ENCODE_DPB_KHR;
-        recorder.reset_queries(self.feedback.pool(), 0, 1);
+        self.dpb_layouts[plan.setup_slot] = vk::ImageLayout::VIDEO_ENCODE_DPB_KHR;
+        recorder.reset_queries(self.feedback.pool(), query, 1);
         let layer = rc_layer(&self.rate);
         let mut control = rc_control(&layer);
         match self.codec {
-            EncodeCodec::H264 => self.record_h264(idr, &mut control),
-            EncodeCodec::H265 => self.record_h265(idr, &mut control),
+            EncodeCodec::H264 => self.record_h264(cmd, query, stamp, plan, &mut control)?,
+            EncodeCodec::H265 => self.record_h265(cmd, query, stamp, plan, &mut control)?,
         }
-        self.prev = Some(idr);
+        Ok(())
     }
 
-    /// Record one H.264 IDR encode.
-    fn record_h264(&self, idr: IdrStamp, control: &mut vk::VideoEncodeRateControlInfoKHR<'_>) {
-        use ash::vk::native::{StdVideoEncodeH264PictureInfo, StdVideoEncodeH264ReferenceInfo};
-        let recorder = self.pool.recorder(self.cmd);
-        let held = self.prev.map_or(idr.poc, |stamp| stamp.poc);
-        let recon = StdVideoEncodeH264ReferenceInfo {
-            flags: ash::vk::native::StdVideoEncodeH264ReferenceInfoFlags {
-                _bitfield_align_1: [],
-                _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
-            },
-            primary_pic_type: StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_I,
-            FrameNum: 0,
-            PicOrderCnt: held,
-            long_term_pic_num: 0,
-            long_term_frame_idx: 0,
-            temporal_id: 0,
+    /// Record one H.264 IDR or P encode.
+    fn record_h264(
+        &self,
+        cmd: vk::CommandBuffer,
+        query: u32,
+        stamp: PictureStamp,
+        plan: &EncodePlan,
+        control: &mut vk::VideoEncodeRateControlInfoKHR<'_>,
+    ) -> Result<(), VulkanError> {
+        let recorder = self.submit.pool().recorder(cmd);
+        let idr = plan.coded_idr;
+        let pic_type = if idr {
+            StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
+        } else {
+            StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
         };
+        let frame_num = if idr { 0 } else { u32::from(stamp.frame_num) };
+        let recon = h264_encode_ref_info(pic_type, frame_num, stamp.poc);
         let recon_dpb = vk::VideoEncodeH264DpbSlotInfoKHR {
             p_std_reference_info: std::ptr::from_ref(&recon),
             ..Default::default()
         };
-        let dst = picture_resource(self.dpb_view.view(), self.extent, 0);
-        let mut slot = reference_slot(0, &dst);
+        // Per-layer views carry the layer; the resource addresses the view's only layer.
+        let dst = picture_resource(self.dpb_views[plan.setup_slot].view(), self.extent, 0);
+        let setup_index = narrow_i32(plan.setup_slot, "setup slot")?;
+        let mut slot = reference_slot(setup_index, &dst);
         slot.p_next = std::ptr::from_ref(&recon_dpb).cast();
         let bind = reference_slot(-1, &dst);
-        let (ref_count, ref_slots) = (1, std::ptr::from_ref(&bind));
+        let ref_meta = plan.ref_meta.unwrap_or(EncodeMeta {
+            poc: 0,
+            frame_num: 0,
+            idr: true,
+        });
+        let ref_pic_type = if ref_meta.idr {
+            StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR
+        } else {
+            StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
+        };
+        let ref_std =
+            h264_encode_ref_info(ref_pic_type, u32::from(ref_meta.frame_num), ref_meta.poc);
+        let ref_dpb = vk::VideoEncodeH264DpbSlotInfoKHR {
+            p_std_reference_info: std::ptr::from_ref(&ref_std),
+            ..Default::default()
+        };
+        let ref_slot = plan.ref_slot.unwrap_or(0);
+        let ref_resource = picture_resource(self.dpb_views[ref_slot].view(), self.extent, 0);
+        let ref_index = narrow_i32(ref_slot, "ref slot")?;
+        let mut reference = reference_slot(ref_index, &ref_resource);
+        reference.p_next = std::ptr::from_ref(&ref_dpb).cast();
+        let mut begin_slots = Vec::with_capacity(2);
+        let mut encode_refs = Vec::with_capacity(1);
+        if plan.ref_slot.is_some() {
+            begin_slots.push(reference);
+            encode_refs.push(reference);
+        }
+        begin_slots.push(bind);
         let begin = vk::VideoBeginCodingInfoKHR {
             video_session: self.video.session(),
             video_session_parameters: self.params.params(),
-            reference_slot_count: ref_count,
-            p_reference_slots: ref_slots,
+            reference_slot_count: narrow_u32(begin_slots.len(), "begin slots")?,
+            p_reference_slots: begin_slots.as_ptr(),
             ..Default::default()
         };
         let begin = begin.push_next(control);
-        self.video.begin_coding(self.cmd, &begin);
-        recorder.begin_query(self.feedback.pool(), 0);
-        let std_picture = StdVideoEncodeH264PictureInfo {
-            flags: ash::vk::native::StdVideoEncodeH264PictureInfoFlags {
-                _bitfield_align_1: [],
-                _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
-            },
-            seq_parameter_set_id: 0,
-            pic_parameter_set_id: 0,
-            idr_pic_id: idr.idr_id,
-            primary_pic_type: StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_IDR,
-            frame_num: 0,
-            PicOrderCnt: idr.poc,
-            temporal_id: 0,
-            reserved1: [0; 3],
-            pRefLists: std::ptr::null(),
-        };
-        let slice_header = ash::vk::native::StdVideoEncodeH264SliceHeader {
-            flags: ash::vk::native::StdVideoEncodeH264SliceHeaderFlags {
-                _bitfield_align_1: [],
-                _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
-            },
-            first_mb_in_slice: 0,
-            slice_type: StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I,
-            slice_alpha_c0_offset_div2: 0,
-            slice_beta_offset_div2: 0,
-            slice_qp_delta: 0,
-            reserved1: 0,
-            cabac_init_idc: StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
-            disable_deblocking_filter_idc:
-                StdVideoH264DisableDeblockingFilterIdc_STD_VIDEO_H264_DISABLE_DEBLOCKING_FILTER_IDC_ENABLED,
-            pWeightTable: std::ptr::null(),
-        };
+        self.video.begin_coding(cmd, &begin);
+        recorder.begin_query(self.feedback.pool(), query);
+        let ref_lists = plan_ref_slot(plan)?.map(h264_ref_lists);
+        let std_picture = h264_encode_picture(
+            idr,
+            stamp.idr_id,
+            pic_type,
+            frame_num,
+            stamp.poc,
+            ref_lists.as_ref(),
+        );
+        let slice_header = h264_encode_slice(!idr);
         let slice = vk::VideoEncodeH264NaluSliceInfoKHR {
             constant_qp: 0,
             p_std_slice_header: std::ptr::from_ref(&slice_header),
@@ -1195,96 +1688,85 @@ impl EncodeSession {
             ..Default::default()
         };
         let src = picture_resource(self.input_view.view(), self.extent, 0);
-        let info = vk::VideoEncodeInfoKHR {
-            dst_buffer: self.bitstream.buffer(),
-            dst_buffer_offset: 0,
-            dst_buffer_range: BITSTREAM_BYTES,
-            src_picture_resource: src,
-            p_setup_reference_slot: std::ptr::from_ref(&slot),
-            ..Default::default()
-        };
+        let info = encode_info(self.bitstream.buffer(), src, &slot, &encode_refs)?;
         let info = info.push_next(&mut codec);
-        self.encode.encode_video(self.cmd, &info);
-        recorder.end_query(self.feedback.pool(), 0);
+        self.encode.encode_video(cmd, &info);
+        recorder.end_query(self.feedback.pool(), query);
         self.video
-            .end_coding(self.cmd, &vk::VideoEndCodingInfoKHR::default());
+            .end_coding(cmd, &vk::VideoEndCodingInfoKHR::default());
+        Ok(())
     }
 
-    /// Record one H.265 IDR encode.
-    fn record_h265(&self, idr: IdrStamp, control: &mut vk::VideoEncodeRateControlInfoKHR<'_>) {
-        use ash::vk::native::{StdVideoEncodeH265PictureInfo, StdVideoEncodeH265ReferenceInfo};
-        let recorder = self.pool.recorder(self.cmd);
-        let mut picture_flags = ash::vk::native::StdVideoEncodeH265PictureInfoFlags {
-            _bitfield_align_1: [],
-            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+    /// Record one H.265 IDR or P encode.
+    fn record_h265(
+        &self,
+        cmd: vk::CommandBuffer,
+        query: u32,
+        stamp: PictureStamp,
+        plan: &EncodePlan,
+        control: &mut vk::VideoEncodeRateControlInfoKHR<'_>,
+    ) -> Result<(), VulkanError> {
+        let recorder = self.submit.pool().recorder(cmd);
+        let idr = plan.coded_idr;
+        let pic_type = if idr {
+            StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else {
+            StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
         };
-        picture_flags.set_short_term_ref_pic_set_sps_flag(1);
-        picture_flags.set_pic_output_flag(1);
-        let held = self.prev.map_or(idr.poc, |stamp| stamp.poc);
-        let recon = StdVideoEncodeH265ReferenceInfo {
-            flags: ash::vk::native::StdVideoEncodeH265ReferenceInfoFlags {
-                _bitfield_align_1: [],
-                _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
-            },
-            pic_type: StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR,
-            PicOrderCntVal: held,
-            TemporalId: 0,
-        };
+        let recon = h265_encode_ref_info(pic_type, stamp.poc);
         let recon_dpb = vk::VideoEncodeH265DpbSlotInfoKHR {
             p_std_reference_info: std::ptr::from_ref(&recon),
             ..Default::default()
         };
-        let dst = picture_resource(self.dpb_view.view(), self.extent, 0);
-        let mut slot = reference_slot(0, &dst);
+        // Per-layer views carry the layer; the resource addresses the view's only layer.
+        let dst = picture_resource(self.dpb_views[plan.setup_slot].view(), self.extent, 0);
+        let setup_index = narrow_i32(plan.setup_slot, "setup slot")?;
+        let mut slot = reference_slot(setup_index, &dst);
         slot.p_next = std::ptr::from_ref(&recon_dpb).cast();
         let bind = reference_slot(-1, &dst);
-        let (ref_count, ref_slots) = (1, std::ptr::from_ref(&bind));
+        let ref_meta = plan.ref_meta.unwrap_or(EncodeMeta {
+            poc: 0,
+            frame_num: 0,
+            idr: true,
+        });
+        let ref_pic_type = if ref_meta.idr {
+            StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR
+        } else {
+            StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P
+        };
+        let ref_std = h265_encode_ref_info(ref_pic_type, ref_meta.poc);
+        let ref_dpb = vk::VideoEncodeH265DpbSlotInfoKHR {
+            p_std_reference_info: std::ptr::from_ref(&ref_std),
+            ..Default::default()
+        };
+        let ref_slot = plan.ref_slot.unwrap_or(0);
+        let ref_resource = picture_resource(self.dpb_views[ref_slot].view(), self.extent, 0);
+        let ref_index = narrow_i32(ref_slot, "ref slot")?;
+        let mut reference = reference_slot(ref_index, &ref_resource);
+        reference.p_next = std::ptr::from_ref(&ref_dpb).cast();
+        let mut begin_slots = Vec::with_capacity(2);
+        let mut encode_refs = Vec::with_capacity(1);
+        if plan.ref_slot.is_some() {
+            begin_slots.push(reference);
+            encode_refs.push(reference);
+        }
+        begin_slots.push(bind);
         let begin = vk::VideoBeginCodingInfoKHR {
             video_session: self.video.session(),
             video_session_parameters: self.params.params(),
-            reference_slot_count: ref_count,
-            p_reference_slots: ref_slots,
+            reference_slot_count: narrow_u32(begin_slots.len(), "begin slots")?,
+            p_reference_slots: begin_slots.as_ptr(),
             ..Default::default()
         };
         let begin = begin.push_next(control);
-        self.video.begin_coding(self.cmd, &begin);
-        recorder.begin_query(self.feedback.pool(), 0);
-        let std_picture = StdVideoEncodeH265PictureInfo {
-            flags: picture_flags,
-            pic_type: StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR,
-            sps_video_parameter_set_id: 0,
-            pps_seq_parameter_set_id: 0,
-            pps_pic_parameter_set_id: 0,
-            short_term_ref_pic_set_idx: 0,
-            PicOrderCntVal: idr.poc,
-            TemporalId: 0,
-            reserved1: [0; 7],
-            pRefLists: std::ptr::null(),
-            pShortTermRefPicSet: std::ptr::null(),
-            pLongTermRefPics: std::ptr::null(),
-        };
-        let mut slice_flags = ash::vk::native::StdVideoEncodeH265SliceSegmentHeaderFlags {
-            _bitfield_align_1: [],
-            _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
-        };
-        slice_flags.set_first_slice_segment_in_pic_flag(1);
-        let slice_header = ash::vk::native::StdVideoEncodeH265SliceSegmentHeader {
-            flags: slice_flags,
-            slice_type: StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
-            slice_segment_address: 0,
-            collocated_ref_idx: 0,
-            MaxNumMergeCand: 5,
-            slice_cb_qp_offset: 0,
-            slice_cr_qp_offset: 0,
-            slice_beta_offset_div2: 0,
-            slice_tc_offset_div2: 0,
-            slice_act_y_qp_offset: 0,
-            slice_act_cb_qp_offset: 0,
-            slice_act_cr_qp_offset: 0,
-            slice_qp_delta: 0,
-            reserved1: 0,
-            pWeightTable: std::ptr::null(),
-        };
+        self.video.begin_coding(cmd, &begin);
+        recorder.begin_query(self.feedback.pool(), query);
+        let ref_lists = plan_ref_slot(plan)?.map(h265_ref_lists);
+        let rps = h265_rps(plan.rps_delta_minus1);
+        let rps_ref = if idr { None } else { Some(&rps) };
+        let std_picture =
+            h265_encode_picture(idr, pic_type, stamp.poc, ref_lists.as_ref(), rps_ref);
+        let slice_header = h265_encode_slice(!idr);
         let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR {
             constant_qp: 0,
             p_std_slice_segment_header: std::ptr::from_ref(&slice_header),
@@ -1297,42 +1779,25 @@ impl EncodeSession {
             ..Default::default()
         };
         let src = picture_resource(self.input_view.view(), self.extent, 0);
-        let info = vk::VideoEncodeInfoKHR {
-            dst_buffer: self.bitstream.buffer(),
-            dst_buffer_offset: 0,
-            dst_buffer_range: BITSTREAM_BYTES,
-            src_picture_resource: src,
-            p_setup_reference_slot: std::ptr::from_ref(&slot),
-            ..Default::default()
-        };
+        let info = encode_info(self.bitstream.buffer(), src, &slot, &encode_refs)?;
         let info = info.push_next(&mut codec);
-        self.encode.encode_video(self.cmd, &info);
-        recorder.end_query(self.feedback.pool(), 0);
+        self.encode.encode_video(cmd, &info);
+        recorder.end_query(self.feedback.pool(), query);
         self.video
-            .end_coding(self.cmd, &vk::VideoEndCodingInfoKHR::default());
+            .end_coding(cmd, &vk::VideoEndCodingInfoKHR::default());
+        Ok(())
     }
 
-    /// Submit recorded commands, wait, and map the coded prefix.
-    ///
-    /// A failure wedges the session: the fence may still be submitted,
-    /// so later submits fail without touching the queue.
-    fn dispatch(&mut self, out: &mut Vec<u8>) -> Result<(), VulkanError> {
-        if self.wedged {
-            return Err(VulkanError::Timeout);
-        }
-        if let Err(error) = crate::raw::submit_and_wait(
-            &self.device,
-            &self.queue_lock,
-            self.queue,
-            self.cmd,
-            &self.fence,
-            crate::raw::SUBMIT_TIMEOUT_NS,
-        ) {
-            self.wedged = true;
-            return Err(error);
-        }
+    /// Wait `index` out, then map the coded prefix into `out`.
+    fn collect(&mut self, index: usize, out: &mut Vec<u8>) -> Result<(), VulkanError> {
+        self.submit
+            .poll(index)
+            .inspect_err(|_| self.reset_state())?;
+        let query = u32::try_from(index).map_err(|_| crate::error::ParseError::OutOfRange {
+            syntax: "submit slot",
+        })?;
         let mut written = [0_u64; 1];
-        self.feedback.results(0, &mut written)?;
+        self.feedback.results(query, &mut written)?;
         let len =
             usize::try_from(written[0]).map_err(|_| crate::error::ParseError::OutOfRange {
                 syntax: "coded size",
@@ -1415,6 +1880,32 @@ mod tests {
         assert_eq!(sps.pic_height_in_luma_samples, 248);
         assert_eq!(sps.conf_win_right_offset, 3);
         assert_eq!(sps.conf_win_bottom_offset, 3);
+    }
+
+    #[test]
+    fn ref_lists_point_l0_at_slot() {
+        let h264 = super::h264_ref_lists(1);
+        assert_eq!(h264.num_ref_idx_l0_active_minus1, 0);
+        assert_eq!(h264.num_ref_idx_l1_active_minus1, 0);
+        assert_eq!(h264.RefPicList0[0], 1);
+        assert!(h264.RefPicList0[1..].iter().all(|entry| *entry == 0xFF));
+        assert!(h264.RefPicList1.iter().all(|entry| *entry == 0xFF));
+        assert_eq!(h264.refPicMarkingOpCount, 0);
+        let h265 = super::h265_ref_lists(1);
+        assert_eq!(h265.num_ref_idx_l0_active_minus1, 0);
+        assert_eq!(h265.RefPicList0[0], 1);
+        assert!(h265.RefPicList0[1..].iter().all(|entry| *entry == 0xFF));
+        assert!(h265.RefPicList1.iter().all(|entry| *entry == 0xFF));
+    }
+
+    #[test]
+    fn rps_holds_one_negative_picture() {
+        let rps = super::h265_rps(0);
+        assert_eq!(rps.num_negative_pics, 1);
+        assert_eq!(rps.num_positive_pics, 0);
+        assert_eq!(rps.delta_poc_s0_minus1[0], 0);
+        assert_eq!(rps.used_by_curr_pic_s0_flag, 1);
+        assert_eq!(rps.use_delta_flag, 0);
     }
 
     #[test]

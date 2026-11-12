@@ -66,6 +66,12 @@ impl SlotBook {
         self.slots.iter().position(|slot| *slot == Some(id))
     }
 
+    /// Identity behind `slot`, if the slot is claimed.
+    #[must_use]
+    pub fn identity_of(&self, slot: usize) -> Option<ReferenceId> {
+        self.slots.get(slot).copied().flatten()
+    }
+
     /// Free the slot `id` holds, if any.
     pub fn release(&mut self, id: ReferenceId) {
         if let Some(index) = self.slot_of(id) {

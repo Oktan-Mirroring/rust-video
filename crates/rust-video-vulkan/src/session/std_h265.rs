@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(std.flags.IrapPicFlag(), 0);
         assert_eq!(std.flags.IdrPicFlag(), 0);
         assert_eq!(std.PicOrderCntVal, 1);
-        assert_eq!(std.NumBitsForSTRefPicSetInSlice, 22);
+        assert_eq!(std.NumBitsForSTRefPicSetInSlice, 6);
         assert_eq!(std.RefPicSetStCurrBefore[0], 0);
         assert_eq!(&std.RefPicSetStCurrBefore[1..3], &[0xFF, 0xFF]);
         assert_eq!(std.RefPicSetStCurrAfter, [0xFF; 8]);
