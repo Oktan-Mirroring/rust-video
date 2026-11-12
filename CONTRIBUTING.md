@@ -12,7 +12,7 @@ commit, body only when the why is not obvious from the diff.
 
 ## Scope
 
-Read `.claude/skills/realtime-scope/SKILL.md` before adding behaviour.
+Read `.agents/skills/realtime-scope/SKILL.md` before adding behaviour.
 Realtime encode/decode and its tiers are in; demuxing, subtitles, filters, and
 audio are out.
 

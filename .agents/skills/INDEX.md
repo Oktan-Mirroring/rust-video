@@ -11,4 +11,3 @@
 | [rust-file-layout](rust-file-layout/SKILL.md) | Creating a `.rs` file or adding a top-level item |
 
 New skills land as `.agents/skills/<name>/SKILL.md` with a row here.
-`.claude/skills` symlinks to this directory so both paths resolve.

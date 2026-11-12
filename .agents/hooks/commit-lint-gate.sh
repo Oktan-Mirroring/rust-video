@@ -38,7 +38,7 @@ tell_re="let's dive in|in the landscape of|in today's fast-paced|it is worth not
 leak_hits=""; tell_hits=""; dash_hits=""; blob_hits=""
 while IFS= read -r f; do
   [ -n "$f" ] && [ -f "$f" ] || continue
-  case "$f" in .claude/*|*/.claude/*) continue ;; esac
+  case "$f" in .agents/hooks/*|*/.agents/hooks/*) continue ;; esac
   case "$f" in
     *.rs)   prose="$(grep -nE '^[[:space:]]*(//|/\*|\*)' -- "$f" 2>/dev/null)" ;;
     *.md|*.toml) prose="$(grep -n '' -- "$f" 2>/dev/null)" ;;
@@ -101,7 +101,7 @@ scan=""
 
 session="$(printf '%s' "$raw" | jq -r '.session_id // empty' 2>/dev/null || true)"
 [ -n "$session" ] || session="nosession"
-state_dir="$HOME/.claude/state/commit-lint-gate"
+state_dir="$HOME/.agents/state/commit-lint-gate"
 mkdir -p "$state_dir" 2>/dev/null || true
 
 rust_touched=false

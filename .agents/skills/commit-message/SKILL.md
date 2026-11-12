@@ -1,6 +1,6 @@
 ---
 name: commit-message
-description: Use when drafting ANY git commit message. MANDATORY, load before writing the message. Conventional format, developer voice (no AI trailers, no mention of Claude / LLMs / sessions), commit-between-things cadence.
+description: Use when drafting ANY git commit message. MANDATORY, load before writing the message. Conventional format, developer voice (no AI trailers, no mention of AI assistants / LLMs / sessions), commit-between-things cadence.
 ---
 
 # Commit message style
@@ -20,7 +20,7 @@ Optional. When present: one short paragraph or a few bullets carrying the one re
 
 ## Developer voice
 
-Never `Co-Authored-By` for Claude or any AI. Never mention the assistant, the conversation, the prompt, this session. Log reads as one hand.
+Never `Co-Authored-By` for any AI assistant. Never mention the assistant, the conversation, the prompt, this session. Log reads as one hand.
 
 ## Claims
 

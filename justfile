@@ -43,9 +43,9 @@ e2e:
 goldens *args:
     cargo run -j24 -p rust-video-harness --bin golden_gen -- {{args}}
 
-# Commit gate hook entry point.
+# Commit gate hook entry point; wiring lives in .agents/hooks/README.md.
 commit-lint-gate:
-    bash .claude/hooks/commit-lint-gate.sh
+    bash .agents/hooks/commit-lint-gate.sh
 
 # MSRV gate: check and test on the pinned 1.87.0 toolchain.
 msrv:
