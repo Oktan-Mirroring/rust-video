@@ -6,7 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 #[cfg(target_os = "android")]
-use crate::bridge::{CodecEvent, EventQueue};
+use crate::bridge::{CodecEvent, EventQueue, PendingInputs};
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
 #[cfg(target_os = "android")]
@@ -110,7 +110,7 @@ enum DrainMode {
     /// Synchronous dequeue with timeouts.
     Sync,
     /// Async callbacks feeding a polled queue.
-    Async(EventQueue),
+    Async(AsyncDrain),
 }
 
 /// Byte-buffer plane arrangement.
@@ -129,6 +129,120 @@ impl Layout {
             Self::Nv12 => PixelFormat::Nv12,
             Self::Planar => PixelFormat::Yuv420P,
         }
+    }
+}
+
+/// Async callback state.
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+struct AsyncDrain {
+    /// Callback-side event intake.
+    queue: EventQueue,
+    /// Input indices awaiting a packet.
+    pending: PendingInputs,
+}
+
+#[cfg(target_os = "android")]
+impl AsyncDrain {
+    /// Drain over `queue` with an empty stash.
+    fn new(queue: EventQueue) -> Self {
+        Self {
+            queue,
+            pending: PendingInputs::new(),
+        }
+    }
+
+    /// Packet queued; frames freed along the way.
+    fn push(
+        &mut self,
+        codec: &MediaCodec,
+        packet: &Packet,
+        output: &mut OutputLayout,
+    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
+        let mut frames = Vec::new();
+        for _ in 0..Inner::INPUT_ATTEMPTS {
+            if let Some(index) = self.pending.pop() {
+                Inner::write_input(codec, index, packet)?;
+                return Ok(frames);
+            }
+            let batch = self.queue.drain_blocking(Inner::INPUT_TIMEOUT);
+            for event in self.pending.stash_inputs(batch) {
+                match event {
+                    CodecEvent::InputAvailable { index } => self.pending.push(index),
+                    CodecEvent::OutputAvailable {
+                        index,
+                        offset,
+                        size,
+                        flags,
+                        ..
+                    } => {
+                        if let Some(frame) =
+                            Inner::pull_output(codec, index, offset, size, flags, output)?
+                        {
+                            frames.push(frame);
+                        }
+                    }
+                    CodecEvent::FormatChanged => {
+                        Inner::refresh_output(codec, output)?;
+                    }
+                    CodecEvent::Error {
+                        recoverable,
+                        transient,
+                        kind,
+                    } => {
+                        return Err(MediaCodecError::CodecFault {
+                            recoverable,
+                            transient,
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
+        Err(MediaCodecError::InputStarved)
+    }
+
+    /// Outputs collected from queued async events.
+    fn drain(
+        &mut self,
+        codec: &MediaCodec,
+        output: &mut OutputLayout,
+    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
+        let mut frames = Vec::new();
+        let batch = self.queue.drain();
+        for event in self.pending.stash_inputs(batch) {
+            match event {
+                CodecEvent::InputAvailable { index } => self.pending.push(index),
+                CodecEvent::OutputAvailable {
+                    index,
+                    offset,
+                    size,
+                    flags,
+                    ..
+                } => {
+                    if let Some(frame) =
+                        Inner::pull_output(codec, index, offset, size, flags, output)?
+                    {
+                        frames.push(frame);
+                    }
+                }
+                CodecEvent::FormatChanged => {
+                    Inner::refresh_output(codec, output)?;
+                }
+                CodecEvent::Error {
+                    recoverable,
+                    transient,
+                    kind,
+                } => {
+                    return Err(MediaCodecError::CodecFault {
+                        recoverable,
+                        transient,
+                        kind,
+                    });
+                }
+            }
+        }
+        Ok(frames)
     }
 }
 
@@ -153,28 +267,28 @@ impl Inner {
 
     /// Packet queued; frames freed along the way.
     fn push_packet(
-        &self,
+        &mut self,
         packet: &Packet,
         output: &mut OutputLayout,
     ) -> Result<Vec<CpuFrame>, MediaCodecError> {
-        match &self.mode {
-            DrainMode::Sync => self.push_sync(packet, output),
-            DrainMode::Async(queue) => self.push_async(packet, queue, output),
+        match &mut self.mode {
+            DrainMode::Sync => Self::push_sync(&self.codec, packet, output),
+            DrainMode::Async(drain) => drain.push(&self.codec, packet, output),
         }
     }
 
     /// Packet queued through sync dequeue.
     fn push_sync(
-        &self,
+        codec: &MediaCodec,
         packet: &Packet,
         output: &mut OutputLayout,
     ) -> Result<Vec<CpuFrame>, MediaCodecError> {
         let mut frames = Vec::new();
         for _ in 0..Self::INPUT_ATTEMPTS {
-            match self.codec.dequeue_input_buffer(Self::INPUT_TIMEOUT)? {
+            match codec.dequeue_input_buffer(Self::INPUT_TIMEOUT)? {
                 DequeuedInputBufferResult::Buffer(mut buffer) => {
                     Self::fill_buffer(&mut buffer, packet.data())?;
-                    self.codec.queue_input_buffer(
+                    codec.queue_input_buffer(
                         buffer,
                         0,
                         packet.data().len(),
@@ -184,7 +298,7 @@ impl Inner {
                     return Ok(frames);
                 }
                 DequeuedInputBufferResult::TryAgainLater => {
-                    frames.extend(self.drain_outputs(output)?);
+                    frames.extend(Self::drain_sync(codec, output)?);
                 }
             }
         }
@@ -212,62 +326,13 @@ impl Inner {
         }
     }
 
-    /// Packet queued through async input events.
-    fn push_async(
-        &self,
-        packet: &Packet,
-        queue: &EventQueue,
-        output: &mut OutputLayout,
-    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
-        let mut frames = Vec::new();
-        let mut queued = false;
-        for _ in 0..Self::INPUT_ATTEMPTS {
-            for event in queue.drain_blocking(Self::INPUT_TIMEOUT) {
-                match event {
-                    CodecEvent::InputAvailable { index } if !queued => {
-                        self.write_input(index, packet)?;
-                        queued = true;
-                    }
-                    CodecEvent::InputAvailable { index } => {
-                        let _sent = queue.sender().send(CodecEvent::InputAvailable { index });
-                    }
-                    CodecEvent::OutputAvailable {
-                        index,
-                        offset,
-                        size,
-                        flags,
-                        ..
-                    } => {
-                        if let Some(frame) = self.pull_output(index, offset, size, flags, output)? {
-                            frames.push(frame);
-                        }
-                    }
-                    CodecEvent::FormatChanged => {
-                        self.refresh_output(output)?;
-                    }
-                    CodecEvent::Error {
-                        recoverable,
-                        transient,
-                        kind,
-                    } => {
-                        return Err(MediaCodecError::CodecFault {
-                            recoverable,
-                            transient,
-                            kind,
-                        });
-                    }
-                }
-            }
-            if queued {
-                return Ok(frames);
-            }
-        }
-        Err(MediaCodecError::InputStarved)
-    }
-
     /// Packet bytes queued into input buffer `index`.
-    fn write_input(&self, index: usize, packet: &Packet) -> Result<(), MediaCodecError> {
-        let Some(dst) = self.codec.input_buffer(index) else {
+    fn write_input(
+        codec: &MediaCodec,
+        index: usize,
+        packet: &Packet,
+    ) -> Result<(), MediaCodecError> {
+        let Some(dst) = codec.input_buffer(index) else {
             return Err(MediaCodecError::BufferLost);
         };
         if packet.data().len() > dst.len() {
@@ -279,7 +344,7 @@ impl Inner {
         for (slot, byte) in dst.iter_mut().zip(packet.data().iter()) {
             slot.write(*byte);
         }
-        self.codec.queue_input_buffer_by_index(
+        codec.queue_input_buffer_by_index(
             index,
             0,
             packet.data().len(),
@@ -290,44 +355,50 @@ impl Inner {
     }
 
     /// Available outputs as frames.
-    fn drain_outputs(&self, output: &mut OutputLayout) -> Result<Vec<CpuFrame>, MediaCodecError> {
-        match &self.mode {
-            DrainMode::Sync => self.drain_sync(output),
-            DrainMode::Async(queue) => self.drain_async(queue, output),
+    fn drain_outputs(
+        &mut self,
+        output: &mut OutputLayout,
+    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
+        match &mut self.mode {
+            DrainMode::Sync => Self::drain_sync(&self.codec, output),
+            DrainMode::Async(drain) => drain.drain(&self.codec, output),
         }
     }
 
     /// Outputs collected through sync dequeue.
-    fn drain_sync(&self, output: &mut OutputLayout) -> Result<Vec<CpuFrame>, MediaCodecError> {
+    fn drain_sync(
+        codec: &MediaCodec,
+        output: &mut OutputLayout,
+    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
         let mut frames = Vec::new();
         loop {
-            match self.codec.dequeue_output_buffer(Duration::ZERO)? {
+            match codec.dequeue_output_buffer(Duration::ZERO)? {
                 DequeuedOutputBufferInfoResult::Buffer(buffer) => {
                     let info = *buffer.info();
                     if info.flags() & Self::BUFFER_FLAG_DECODE_ONLY != 0 {
-                        self.codec.release_output_buffer(buffer, false)?;
+                        codec.release_output_buffer(buffer, false)?;
                         continue;
                     }
                     if !output.negotiated() {
-                        self.refresh_output(output)?;
+                        Self::refresh_output(codec, output)?;
                     }
                     let caught = catch_unwind(AssertUnwindSafe(|| buffer.buffer()));
                     let Ok(slice) = caught else {
-                        let _released = self.codec.release_output_buffer(buffer, false);
+                        let _released = codec.release_output_buffer(buffer, false);
                         return Err(MediaCodecError::BufferLost);
                     };
                     let bytes = match ranged_bytes(slice, info.offset(), info.size()) {
                         Ok(bytes) => bytes,
                         Err(error) => {
-                            let _released = self.codec.release_output_buffer(buffer, false);
+                            let _released = codec.release_output_buffer(buffer, false);
                             return Err(error);
                         }
                     };
-                    self.codec.release_output_buffer(buffer, false)?;
+                    codec.release_output_buffer(buffer, false)?;
                     frames.push(output.split(bytes)?);
                 }
                 DequeuedOutputBufferInfoResult::OutputFormatChanged => {
-                    self.refresh_output(output)?;
+                    Self::refresh_output(codec, output)?;
                 }
                 DequeuedOutputBufferInfoResult::OutputBuffersChanged => {}
                 DequeuedOutputBufferInfoResult::TryAgainLater => return Ok(frames),
@@ -335,51 +406,9 @@ impl Inner {
         }
     }
 
-    /// Outputs collected from queued async events.
-    fn drain_async(
-        &self,
-        queue: &EventQueue,
-        output: &mut OutputLayout,
-    ) -> Result<Vec<CpuFrame>, MediaCodecError> {
-        let mut frames = Vec::new();
-        for event in queue.drain() {
-            match event {
-                CodecEvent::InputAvailable { index } => {
-                    let _sent = queue.sender().send(CodecEvent::InputAvailable { index });
-                }
-                CodecEvent::OutputAvailable {
-                    index,
-                    offset,
-                    size,
-                    flags,
-                    ..
-                } => {
-                    if let Some(frame) = self.pull_output(index, offset, size, flags, output)? {
-                        frames.push(frame);
-                    }
-                }
-                CodecEvent::FormatChanged => {
-                    self.refresh_output(output)?;
-                }
-                CodecEvent::Error {
-                    recoverable,
-                    transient,
-                    kind,
-                } => {
-                    return Err(MediaCodecError::CodecFault {
-                        recoverable,
-                        transient,
-                        kind,
-                    });
-                }
-            }
-        }
-        Ok(frames)
-    }
-
     /// Frame pulled from output buffer `index`, unless decode-only.
     fn pull_output(
-        &self,
+        codec: &MediaCodec,
         index: usize,
         offset: i32,
         size: i32,
@@ -387,23 +416,26 @@ impl Inner {
         output: &mut OutputLayout,
     ) -> Result<Option<CpuFrame>, MediaCodecError> {
         if flags & Self::BUFFER_FLAG_DECODE_ONLY != 0 {
-            self.codec.release_output_buffer_by_index(index, false)?;
+            codec.release_output_buffer_by_index(index, false)?;
             return Ok(None);
         }
         if !output.negotiated() {
-            self.refresh_output(output)?;
+            Self::refresh_output(codec, output)?;
         }
-        let Some(buffer) = self.codec.output_buffer(index) else {
+        let Some(buffer) = codec.output_buffer(index) else {
             return Err(MediaCodecError::BufferLost);
         };
         let bytes = ranged_bytes(buffer, offset, size);
-        let _released = self.codec.release_output_buffer_by_index(index, false);
+        let _released = codec.release_output_buffer_by_index(index, false);
         Ok(Some(output.split(bytes?)?))
     }
 
     /// Layout refreshed from the current output format.
-    fn refresh_output(&self, output: &mut OutputLayout) -> Result<(), MediaCodecError> {
-        let format = self.codec.output_format();
+    fn refresh_output(
+        codec: &MediaCodec,
+        output: &mut OutputLayout,
+    ) -> Result<(), MediaCodecError> {
+        let format = codec.output_format();
         output.apply_format(
             format.i32(FormatSpec::KEY_WIDTH),
             format.i32(FormatSpec::KEY_HEIGHT),
@@ -467,7 +499,7 @@ impl MediaCodecDecoder {
         let mode = if level.supports_async_notify() {
             let queue = EventQueue::new();
             codec.set_async_notify_callback(Some(queue.async_callbacks()))?;
-            DrainMode::Async(queue)
+            DrainMode::Async(AsyncDrain::new(queue))
         } else {
             DrainMode::Sync
         };
@@ -525,6 +557,9 @@ impl MediaCodecDecoder {
     pub fn reset(&mut self) -> Result<Vec<CpuFrame>, MediaCodecError> {
         self.state.ensure_started("reset")?;
         let frames = self.inner.drain_outputs(&mut self.output)?;
+        if let DrainMode::Async(drain) = &mut self.inner.mode {
+            drain.pending.clear();
+        }
         self.inner.codec.flush()?;
         if matches!(self.inner.mode, DrainMode::Async(_)) {
             self.inner.codec.start()?;

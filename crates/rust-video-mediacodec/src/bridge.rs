@@ -1,5 +1,6 @@
 //! Async callback events drained through polling.
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -131,11 +132,73 @@ impl Default for EventQueue {
     }
 }
 
+/// Input indices awaiting a packet, oldest first.
+#[derive(Debug, Default)]
+pub struct PendingInputs {
+    /// Queued indices in arrival order.
+    indices: VecDeque<usize>,
+}
+
+impl PendingInputs {
+    /// Empty stash.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            indices: VecDeque::new(),
+        }
+    }
+
+    /// Index held for the next packet.
+    pub fn push(&mut self, index: usize) {
+        self.indices.push_back(index);
+    }
+
+    /// Oldest held index, if any.
+    #[must_use]
+    pub fn pop(&mut self) -> Option<usize> {
+        self.indices.pop_front()
+    }
+
+    /// `events` minus inputs; inputs join the stash in order.
+    ///
+    /// # Arguments
+    ///
+    /// * `events` - drained queue batch.
+    #[must_use]
+    pub fn stash_inputs(&mut self, events: Vec<CodecEvent>) -> Vec<CodecEvent> {
+        let mut rest = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                CodecEvent::InputAvailable { index } => self.push(index),
+                other => rest.push(other),
+            }
+        }
+        rest
+    }
+
+    /// Stash emptied; held indices no longer valid.
+    pub fn clear(&mut self) {
+        self.indices.clear();
+    }
+
+    /// Held index count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// True when no index waits.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{CodecEvent, EventQueue};
+    use super::{CodecEvent, EventQueue, PendingInputs};
 
     #[test]
     fn drain_returns_arrival_order() {
@@ -173,6 +236,58 @@ mod tests {
     fn drain_blocking_times_out_empty() {
         let queue = EventQueue::default();
         assert!(queue.drain_blocking(Duration::from_millis(1)).is_empty());
+    }
+
+    #[test]
+    fn pending_pops_fifo_then_none() {
+        let mut pending = PendingInputs::new();
+        assert!(pending.is_empty());
+        assert_eq!(pending.len(), 0);
+        assert_eq!(pending.pop(), None);
+        pending.push(4);
+        pending.push(1);
+        pending.push(7);
+        assert!(!pending.is_empty());
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.pop(), Some(4));
+        assert_eq!(pending.pop(), Some(1));
+        assert_eq!(pending.pop(), Some(7));
+        assert_eq!(pending.pop(), None);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stash_inputs_splits_batch_in_order() {
+        let mut pending = PendingInputs::default();
+        let output = || CodecEvent::OutputAvailable {
+            index: 0,
+            offset: 0,
+            size: 8,
+            pts_us: 0,
+            flags: 0,
+        };
+        let rest = pending.stash_inputs(vec![
+            CodecEvent::InputAvailable { index: 3 },
+            output(),
+            CodecEvent::FormatChanged,
+            CodecEvent::InputAvailable { index: 5 },
+        ]);
+        assert_eq!(rest, vec![output(), CodecEvent::FormatChanged]);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.pop(), Some(3));
+        assert_eq!(pending.pop(), Some(5));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn clear_empties_stash() {
+        let mut pending = PendingInputs::new();
+        pending.push(2);
+        pending.push(9);
+        pending.clear();
+        assert!(pending.is_empty());
+        assert_eq!(pending.len(), 0);
+        assert_eq!(pending.pop(), None);
     }
 
     #[test]

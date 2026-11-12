@@ -8,7 +8,7 @@ mod format;
 mod quirks;
 mod sdk;
 
-pub use bridge::{CodecEvent, EventQueue};
+pub use bridge::{CodecEvent, EventQueue, PendingInputs};
 pub use decoder::{ranged_bytes, DecodeState, MediaCodecDecoder, OutputLayout};
 pub use device::MediaCodecDevice;
 pub use error::MediaCodecError;
