@@ -85,6 +85,8 @@ pub struct VaApiEncoder {
     level: u8,
     /// Pictures encoded so far.
     count: u64,
+    /// Driver buffers created by this session.
+    creates: u64,
     /// Next reconstruction surface.
     next_recon: usize,
     /// Coded-bitstream buffer, rewritten every picture.
@@ -228,8 +230,10 @@ impl VaApiEncoder {
         let words = Words::new(codec);
         let level = Self::level(codec, coded_size);
         let visible_pair = (visible.width(), visible.height());
-        let (vps, sps) =
+        let (vps, sps, mut creates) =
             Self::pack_session_headers(codec, coded_size, visible_pair, level, display, context)?;
+        // coded, sequence, picture, slice singles plus pps and slice packed pairs below.
+        creates += 8;
         Ok(Self {
             codec,
             visible,
@@ -239,6 +243,7 @@ impl VaApiEncoder {
             words,
             level,
             count: 0,
+            creates,
             next_recon: 0,
             coded_buf: VaBuffer::empty(
                 display,
@@ -286,14 +291,15 @@ impl VaApiEncoder {
         level: u8,
         display: ffi::VaDisplay,
         context: ffi::VaContextId,
-    ) -> Result<(Option<PackedPair>, PackedPair), VaApiError> {
+    ) -> Result<(Option<PackedPair>, PackedPair, u64), VaApiError> {
         let mut writer = BitWriter::default();
+        let mut creates = 0;
         let mut vps = None;
         if codec == EncodeCodec::H265 {
             Self::hevc_vps(level, &mut writer);
             let (bytes, bits) = writer.take();
             let mut pair = PackedPair::empty(display, context)?;
-            pair.pack(ffi::VA_ENC_PACKED_HEADER_TYPE_RAW_DATA, &bytes, bits)?;
+            creates += 2 + pair.pack(ffi::VA_ENC_PACKED_HEADER_TYPE_RAW_DATA, &bytes, bits)?;
             vps = Some(pair);
         }
         match codec {
@@ -302,14 +308,20 @@ impl VaApiEncoder {
         }
         let (bytes, bits) = writer.take();
         let mut sps = PackedPair::empty(display, context)?;
-        sps.pack(ffi::VA_ENC_PACKED_HEADER_TYPE_SEQUENCE, &bytes, bits)?;
-        Ok((vps, sps))
+        creates += 2 + sps.pack(ffi::VA_ENC_PACKED_HEADER_TYPE_SEQUENCE, &bytes, bits)?;
+        Ok((vps, sps, creates))
     }
 
     /// Codec the session writes.
     #[must_use]
     pub const fn codec(&self) -> EncodeCodec {
         self.codec
+    }
+
+    /// Driver buffers created by this session since open.
+    #[must_use]
+    pub const fn buffer_creates(&self) -> u64 {
+        self.creates
     }
 
     /// Visible size in luma samples.
@@ -337,6 +349,9 @@ impl VaApiEncoder {
 
     /// Packets coded from `scaled`, possibly none.
     ///
+    /// Syncs the scale output first: the scaler returns before the
+    /// scale finishes.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the surface lives on another display, misses
@@ -346,6 +361,8 @@ impl VaApiEncoder {
         scaled: &ScaledSurface,
     ) -> Result<Vec<Packet>, VaApiError> {
         self.check_surface(scaled.display(), scaled.size())?;
+        // Sound: the source surface is live behind the scaler.
+        VaApiError::status(unsafe { ffi::vaSyncSurface(self.session.display, scaled.surface()) })?;
         self.encode_inner(scaled.surface())
     }
 
@@ -559,11 +576,12 @@ impl VaApiEncoder {
             EncodeCodec::H265 => Self::hevc_pps(qp, &mut self.writer),
         }
         let bits = self.writer.bit_len();
-        self.pps.pack(
+        let recreated = self.pps.pack(
             ffi::VA_ENC_PACKED_HEADER_TYPE_PICTURE,
             self.writer.bytes(),
             bits,
         )?;
+        self.creates += recreated;
         self.writer.clear();
         self.packed_qp = Some(qp);
         Ok(())
@@ -581,11 +599,12 @@ impl VaApiEncoder {
         self.pack_pps(qp)?;
         Self::h264_slice(frame_num, idr_pic_id, poc, &mut self.writer);
         let slice_bits = self.writer.bit_len();
-        self.slice_packed.pack(
+        let recreated = self.slice_packed.pack(
             ffi::VA_ENC_PACKED_HEADER_TYPE_SLICE,
             self.writer.bytes(),
             slice_bits,
         )?;
+        self.creates += recreated;
         self.writer.clear();
         let crop = self.coded != (self.visible.width(), self.visible.height());
         let seq = ffi::VaEncSequenceParameterBufferH264 {
@@ -619,7 +638,7 @@ impl VaApiEncoder {
             time_scale: 0,
             va_reserved: [0; 4],
         };
-        self.seq.rewrite(bytes_of(&seq))?;
+        self.creates += u64::from(self.seq.rewrite(bytes_of(&seq))?);
         let pic = ffi::VaEncPictureParameterBufferH264 {
             curr_pic: ffi::VaPictureH264 {
                 picture_id: recon,
@@ -636,7 +655,7 @@ impl VaApiEncoder {
             pic_fields: self.words.pic,
             ..Default::default()
         };
-        self.slice_pic.rewrite(bytes_of(&pic))?;
+        self.creates += u64::from(self.slice_pic.rewrite(bytes_of(&pic))?);
         let mbs = u64::from(mbw) * u64::from(mbh);
         let slice = ffi::VaEncSliceParameterBufferH264 {
             num_macroblocks: u32::try_from(mbs).map_err(|_| Self::range())?,
@@ -648,7 +667,7 @@ impl VaApiEncoder {
             ref_pic_list1: [Self::h264_invalid(); 32],
             ..Default::default()
         };
-        self.slice.rewrite(bytes_of(&slice))?;
+        self.creates += u64::from(self.slice.rewrite(bytes_of(&slice))?);
         self.render.clear();
         self.render.extend([
             self.seq.id(),
@@ -674,11 +693,12 @@ impl VaApiEncoder {
         self.pack_pps(qp)?;
         Self::hevc_slice(&mut self.writer);
         let slice_bits = self.writer.bit_len();
-        self.slice_packed.pack(
+        let recreated = self.slice_packed.pack(
             ffi::VA_ENC_PACKED_HEADER_TYPE_SLICE,
             self.writer.bytes(),
             slice_bits,
         )?;
+        self.creates += recreated;
         self.writer.clear();
         let seq = ffi::VaEncSequenceParameterBufferHevc {
             general_profile_idc: 1,
@@ -695,7 +715,7 @@ impl VaApiEncoder {
             max_transform_hierarchy_depth_intra: 2,
             ..Default::default()
         };
-        self.seq.rewrite(bytes_of(&seq))?;
+        self.creates += u64::from(self.seq.rewrite(bytes_of(&seq))?);
         let pic = ffi::VaEncPictureParameterBufferHevc {
             decoded_curr_pic: ffi::VaPictureHevc {
                 picture_id: recon,
@@ -709,7 +729,7 @@ impl VaApiEncoder {
             pic_fields: self.words.pic,
             ..Default::default()
         };
-        self.slice_pic.rewrite(bytes_of(&pic))?;
+        self.creates += u64::from(self.slice_pic.rewrite(bytes_of(&pic))?);
         let slice = ffi::VaEncSliceParameterBufferHevc {
             num_ctu_in_slice: ctus,
             slice_type: 2,
@@ -719,7 +739,7 @@ impl VaApiEncoder {
             slice_fields: self.words.slice,
             ..Default::default()
         };
-        self.slice.rewrite(bytes_of(&slice))?;
+        self.creates += u64::from(self.slice.rewrite(bytes_of(&slice))?);
         self.render.clear();
         if let Some(vps) = &self.vps {
             self.render.push(vps.param.id());
@@ -1253,15 +1273,18 @@ impl PackedPair {
     }
 
     /// Pack `bytes` of `bit_len` bits as `header_type`.
-    fn pack(&mut self, header_type: u32, bytes: &[u8], bit_len: u32) -> Result<(), VaApiError> {
+    ///
+    /// The return counts recreated buffers.
+    fn pack(&mut self, header_type: u32, bytes: &[u8], bit_len: u32) -> Result<u64, VaApiError> {
         let param = ffi::VaEncPackedHeaderParameterBuffer {
             header_type,
             bit_length: bit_len,
             has_emulation_bytes: 0,
             va_reserved: [0; 4],
         };
-        self.param.rewrite(bytes_of(&param))?;
-        self.data.rewrite(bytes)
+        let mut recreated = u64::from(self.param.rewrite(bytes_of(&param))?);
+        recreated += u64::from(self.data.rewrite(bytes)?);
+        Ok(recreated)
     }
 }
 

@@ -447,6 +447,184 @@ fn vaapi_encodes_h265_keyframes() {
 }
 
 #[test]
+fn vaapi_pipelines_submit_depth() {
+    let Some(device) = device() else {
+        return;
+    };
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut decoder = H264Decoder::open(&device);
+    let mut frames = Vec::new();
+    for sample in stream.samples.iter().take(9) {
+        frames.extend(
+            decoder
+                .decode_surface(&Packet::new(Bytes::copy_from_slice(sample)))
+                .expect("va-api decode"),
+        );
+    }
+    let stats = decoder.submit_stats().expect("backend open");
+    eprintln!(
+        "submit stats: submitted={} peak={} resets={} creates={}",
+        stats.submitted(),
+        stats.peak(),
+        stats.resets(),
+        stats.buffer_creates(),
+    );
+    assert_eq!(stats.submitted(), 8);
+    assert!(stats.peak() > 1, "pipelined peak {}", stats.peak());
+    assert_eq!(stats.resets(), 0);
+    for (index, frame) in frames.iter().enumerate() {
+        assert!(
+            matches!(frame.export(), GpuExport::DmaBuf { .. }),
+            "frame {index} exports dmabuf"
+        );
+    }
+    let shown = frames.len();
+    drop(frames);
+    let tail = decoder.flush_surface().expect("flush");
+    for (index, frame) in tail.iter().enumerate() {
+        assert!(
+            matches!(frame.export(), GpuExport::DmaBuf { .. }),
+            "flushed frame {index} exports dmabuf"
+        );
+    }
+    assert_eq!(shown + tail.len(), 9);
+}
+
+#[test]
+fn vaapi_reuses_decode_buffers() {
+    let Some(device) = device() else {
+        return;
+    };
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut decoder = H264Decoder::open(&device);
+    let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
+    assert_eq!(frames.len(), stream.samples.len());
+    let stats = decoder.submit_stats().expect("backend open");
+    eprintln!(
+        "decode reuse: submitted={} creates={}",
+        stats.submitted(),
+        stats.buffer_creates(),
+    );
+    assert_eq!(stats.submitted(), stream.samples.len() as u64);
+    assert!(
+        stats.buffer_creates() < stats.submitted(),
+        "reused buffers, not per-picture: {} creates for {} pictures",
+        stats.buffer_creates(),
+        stats.submitted(),
+    );
+}
+
+#[test]
+fn vaapi_reuses_encode_buffers() {
+    let Some(device) = device() else {
+        return;
+    };
+    let size = PictureSize::new(320, 240).expect("synth size");
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+        Ok(encoder) => encoder,
+        Err(VaApiError::Unsupported(message)) => {
+            skip(&format!("h264 encode entrypoint ({message})"));
+            return;
+        }
+        Err(error) => panic!("unexpected encode failure: {error}"),
+    };
+    for index in 0..8 {
+        let frame = synth::frame(size, index);
+        assert_eq!(encoder.encode(&frame).expect("encode").len(), 1);
+    }
+    for packet in encoder.flush().expect("flush") {
+        let _ = packet;
+    }
+    eprintln!("encode reuse: creates={}", encoder.buffer_creates());
+    assert!(
+        encoder.buffer_creates() < 8 * 4,
+        "reused buffers, not per-picture: {} creates for 8 pictures",
+        encoder.buffer_creates(),
+    );
+}
+
+#[test]
+fn vaapi_recovers_after_bad_packet() {
+    let Some(device) = device() else {
+        return;
+    };
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut decoder = H264Decoder::open(&device);
+    let mut frames = Vec::new();
+    for sample in stream.samples.iter().take(2) {
+        frames.extend(
+            decoder
+                .decode(&Packet::new(Bytes::copy_from_slice(sample)))
+                .expect("va-api decode"),
+        );
+    }
+    let bad = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x67, 0x42, 0x00]));
+    assert!(
+        decoder.decode(&bad).is_err(),
+        "truncated sequence set fails"
+    );
+    for sample in &stream.samples[2..] {
+        frames.extend(
+            decoder
+                .decode(&Packet::new(Bytes::copy_from_slice(sample)))
+                .expect("va-api decode after bad packet"),
+        );
+    }
+    frames.extend(decoder.flush().expect("flush after bad packet"));
+    assert_eq!(frames.len(), stream.samples.len());
+}
+
+#[test]
+fn vaapi_transcodes_scaled_on_device() {
+    let Some(device) = device() else {
+        return;
+    };
+    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264)
+        .with_target(PictureSize::new(640, 360).expect("scale target"));
+    if !transcoder.caps().ready() {
+        skip("transcode export+encode caps");
+        return;
+    }
+    let path = corpus().join("synth/h264/h264-high.mp4");
+    let stream = mp4::demux(&path).expect("demux synth high");
+    let mut coded = 0;
+    let mut annex_b = Vec::new();
+    for sample in &stream.samples {
+        let outcome = transcoder
+            .transcode(&Packet::new(Bytes::copy_from_slice(sample)))
+            .expect("transcode");
+        assert_eq!(outcome.plan().route(), Route::Gpu);
+        for packet in outcome.packets() {
+            assert!(packet.is_keyframe(), "all-intra keyframe");
+            annex_b.extend_from_slice(packet.data());
+            coded += 1;
+        }
+    }
+    let outcome = transcoder.flush().expect("flush");
+    for packet in outcome.packets() {
+        annex_b.extend_from_slice(packet.data());
+        coded += 1;
+    }
+    assert_eq!(coded, stream.samples.len());
+    let mut decoder = H264Decoder::open(&device);
+    let mut frames = decoder
+        .decode(&Packet::new(Bytes::from(annex_b)))
+        .expect("self decode");
+    frames.extend(decoder.flush().expect("self flush"));
+    assert_eq!(frames.len(), coded);
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.identity().size(),
+            PictureSize::new(640, 360).expect("scale target"),
+            "frame {index}"
+        );
+    }
+}
+
+#[test]
 fn vaapi_transcodes_on_device() {
     let Some(device) = device() else {
         return;

@@ -25,6 +25,8 @@ pub struct Scaler {
     pipeline: VaBuffer,
     /// Output surface index.
     next: usize,
+    /// True per output without unwaited work.
+    settled: [bool; Self::OUTPUTS],
     /// Owned session, dropped after the pipeline buffer above.
     session: Session,
     /// Source size in luma samples.
@@ -68,6 +70,7 @@ impl Scaler {
         Ok(Self {
             pipeline,
             next: 0,
+            settled: [true; Self::OUTPUTS],
             session,
             from,
             to,
@@ -88,6 +91,10 @@ impl Scaler {
     }
 
     /// Device surface behind `frame`, scaled to the target size.
+    ///
+    /// Returns before the scale finishes; the consumer syncs the
+    /// output at use. The reused output waits its own previous work
+    /// first, so two outputs overlap one scale with one consume.
     ///
     /// # Errors
     ///
@@ -115,7 +122,13 @@ impl Scaler {
                 self.from.height(),
             )));
         }
-        let target = self.session.surfaces[self.next];
+        let slot = self.next;
+        let target = self.session.surfaces[slot];
+        if !self.settled[slot] {
+            // Sound: the surface was just submitted.
+            VaApiError::status(unsafe { ffi::vaSyncSurface(self.session.display, target) })?;
+            self.settled[slot] = true;
+        }
         self.next = (self.next + 1) % Self::OUTPUTS;
         let params = ffi::VaProcPipelineParameterBuffer {
             surface,
@@ -155,8 +168,7 @@ impl Scaler {
         let end = unsafe { ffi::vaEndPicture(display, context) };
         VaApiError::status(rendered)?;
         VaApiError::status(end)?;
-        // Sound: the surface was just submitted.
-        VaApiError::status(unsafe { ffi::vaSyncSurface(display, target) })?;
+        self.settled[slot] = false;
         Ok(ScaledSurface {
             display,
             surface: target,

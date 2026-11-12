@@ -5,7 +5,7 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, StatsInner};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::{self, VaSliceParameterBufferH264};
@@ -79,6 +79,12 @@ impl<'a> H264Decoder<'a> {
     /// Returns `Err` when the backend cannot release its held frames.
     pub fn flush_surface(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.flush_inner(false)
+    }
+
+    /// Submit gauges of the live context, absent before the first sequence set.
+    #[must_use]
+    pub fn submit_stats(&self) -> Option<crate::backend::SubmitStats> {
+        self.backend.as_ref().map(Backend::stats)
     }
 
     /// Decode `packet`, reading back pixels when `readback` holds.
@@ -253,17 +259,13 @@ impl<'a> H264Decoder<'a> {
             .backend
             .as_mut()
             .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
-        let outcome = backend.submit(
+        backend.submit(
             surface,
             &picture_params,
             &matrix,
             &self.slice_params,
             |index| picture.slices()[index].data(),
-        );
-        if outcome.is_err() {
-            backend.sync_quiet(surface);
-        }
-        outcome
+        )
     }
 
     /// Reference lists for one slice header, rebuilt in `list0`/`list1`.
@@ -359,9 +361,9 @@ impl<'a> H264Decoder<'a> {
             let device = if readback {
                 None
             } else {
-                backend
-                    .surface_guard(slot.index())
-                    .map(|guard| DeviceSurface::new(self.device.display(), surface, guard))
+                backend.surface_guard(slot.index()).map(|guard| {
+                    DeviceSurface::new(self.device.display(), surface, guard, backend.gauges())
+                })
             };
             frames.push(VaApiFrame {
                 identity: GpuFrame::new(frame_size, PixelFormat::Nv12, generation),
@@ -494,15 +496,23 @@ struct DeviceSurface {
     surface: ffi::VaSurfaceId,
     /// Pool-slot lease; the slot stays out of the free set while live.
     _guard: Arc<()>,
+    /// Submit gauges of the owning context.
+    gauges: Arc<StatsInner>,
 }
 
 impl DeviceSurface {
     /// Surface on `display` leased by `guard`.
-    fn new(display: ffi::VaDisplay, surface: ffi::VaSurfaceId, guard: Arc<()>) -> Self {
+    fn new(
+        display: ffi::VaDisplay,
+        surface: ffi::VaSurfaceId,
+        guard: Arc<()>,
+        gauges: Arc<StatsInner>,
+    ) -> Self {
         Self {
             display,
             surface,
             _guard: guard,
+            gauges,
         }
     }
 
@@ -513,6 +523,7 @@ impl DeviceSurface {
         if synced != ffi::VA_STATUS_SUCCESS {
             return None;
         }
+        self.gauges.note_synced();
         let mut descriptor = std::mem::MaybeUninit::<ffi::VaDrmPrimeDescriptor>::uninit();
         // Sound: the descriptor outlives the call.
         let status = unsafe {

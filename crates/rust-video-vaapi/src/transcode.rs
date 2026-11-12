@@ -146,22 +146,45 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Packets coded from device `surfaces`.
+    ///
+    /// Scaled pictures pipeline one deep: the next scale submits
+    /// before the previous scaled picture encodes, so the scaler and
+    /// the encoder overlap across pictures.
     fn encode_surfaces(&mut self, surfaces: &[VaApiFrame]) -> Result<Vec<Packet>, VaApiError> {
         let mut packets = Vec::new();
+        let mut pending: Option<ScaledSurface> = None;
         for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
                 return Err(VaApiError::Unsupported(cause.to_string()));
             }
             if let Some(cause) = self.scale.miss(surface.identity().size()) {
                 let scaled = self.scaled_or_miss(surface, cause)?;
-                let size = scaled.size();
-                packets.append(&mut self.encoder_for(size)?.encode_scaled(&scaled)?);
+                if let Some(previous) = pending.replace(scaled) {
+                    self.encode_pending(&previous, &mut packets)?;
+                }
             } else {
+                if let Some(previous) = pending.take() {
+                    self.encode_pending(&previous, &mut packets)?;
+                }
                 let size = surface.identity().size();
                 packets.append(&mut self.encoder_for(size)?.encode_surface(surface)?);
             }
         }
+        if let Some(previous) = pending.take() {
+            self.encode_pending(&previous, &mut packets)?;
+        }
         Ok(packets)
+    }
+
+    /// Packets coded from a held-back scaled picture.
+    fn encode_pending(
+        &mut self,
+        scaled: &ScaledSurface,
+        packets: &mut Vec<Packet>,
+    ) -> Result<(), VaApiError> {
+        let size = scaled.size();
+        packets.append(&mut self.encoder_for(size)?.encode_scaled(scaled)?);
+        Ok(())
     }
 
     /// Scaled `surface` for a `cause` miss, or the loud miss itself.

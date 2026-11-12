@@ -101,15 +101,16 @@ impl VaBuffer {
     /// Rewrite the buffer with `data`, recreating it only when `data` overflows.
     ///
     /// Shorter payloads map over the leading bytes; the driver reads
-    /// the length the parameter buffer names, never the tail.
+    /// the length the parameter buffer names, never the tail. The
+    /// return reports a recreation.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the driver refuses the map or the recreation.
-    pub(crate) fn rewrite(&mut self, data: &[u8]) -> Result<(), VaApiError> {
+    pub(crate) fn rewrite(&mut self, data: &[u8]) -> Result<bool, VaApiError> {
         if data.len() > self.len {
             *self = Self::create(self.display, self.context, self.buffer_type, data)?;
-            return Ok(());
+            return Ok(true);
         }
         // Sound: the buffer is live until the context drops.
         let mut mapped: *mut c_void = std::ptr::null_mut();
@@ -121,7 +122,8 @@ impl VaBuffer {
             }
         }
         // Sound: the buffer was mapped above.
-        VaApiError::status(unsafe { ffi::vaUnmapBuffer(self.display, self.id) })
+        VaApiError::status(unsafe { ffi::vaUnmapBuffer(self.display, self.id) })?;
+        Ok(false)
     }
 }
 

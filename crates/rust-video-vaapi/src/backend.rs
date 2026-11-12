@@ -9,6 +9,7 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::buffer::{bytes_of, VaBuffer};
@@ -41,6 +42,8 @@ pub struct Backend {
     next: usize,
     /// Surface last submitted per set, synced before the set is reused.
     last: Vec<Option<VaSurfaceId>>,
+    /// Submit gauges, shared with exported frames syncing outside.
+    gauges: Arc<StatsInner>,
     /// Scratch render list, reused across submits.
     render: Vec<VaBufferId>,
     /// Pool size as the driver takes it.
@@ -137,9 +140,10 @@ impl Backend {
             }
             return Err(error);
         }
+        let gauges = Arc::new(StatsInner::default());
         let mut sets = Vec::with_capacity(Self::ASYNC_DEPTH);
         for _ in 0..Self::ASYNC_DEPTH {
-            match BufferSet::open(display, context) {
+            match BufferSet::open(display, context, &gauges) {
                 Ok(set) => sets.push(set),
                 Err(error) => {
                     drop(sets);
@@ -163,6 +167,7 @@ impl Backend {
             sets,
             next: 0,
             last: vec![None; Self::ASYNC_DEPTH],
+            gauges,
             render: Vec::new(),
             count_c,
             width,
@@ -196,6 +201,18 @@ impl Backend {
         self.profile
     }
 
+    /// Submit gauges since open.
+    #[must_use]
+    pub fn stats(&self) -> SubmitStats {
+        self.gauges.snapshot()
+    }
+
+    /// Shared gauges for frames syncing outside the backend.
+    #[must_use]
+    pub(crate) fn gauges(&self) -> Arc<StatsInner> {
+        Arc::clone(&self.gauges)
+    }
+
     /// Lease for pool slot `index`, keeping it out of the free set.
     #[must_use]
     pub fn surface_guard(&self, index: u32) -> Option<Arc<()>> {
@@ -220,7 +237,9 @@ impl Backend {
     /// the buffers are safe to rewrite. Callers sync at consumption:
     /// `read_nv12` and the DMA-BUF export both sync first. Slice
     /// payloads arrive through `data` so the caller keeps no pairing
-    /// allocation; `data` must answer every index below `slices`.
+    /// allocation; `data` must answer every index below `slices`. A
+    /// failed submit quiets the target and leaves the context
+    /// reusable; the next submit runs without a rebuild.
     ///
     /// # Errors
     ///
@@ -244,6 +263,18 @@ impl Backend {
         self.fill(set, picture, matrix, slices, data)?;
         // Sound: the context and target are live; the buffers were created above.
         VaApiError::status(unsafe { ffi::vaBeginPicture(self.display, self.context, target) })?;
+        let outcome = self.render();
+        if outcome.is_err() {
+            self.gauges.note_reset();
+            self.sync_quiet(target);
+        } else {
+            self.gauges.note_submitted();
+        }
+        outcome
+    }
+
+    /// Render list of the begun picture; the end runs on every path.
+    fn render(&mut self) -> Result<(), VaApiError> {
         let buffer_count = c_int::try_from(self.render.len()).map_err(|_| Self::range())?;
         let rendered = unsafe {
             ffi::vaRenderPicture(
@@ -265,7 +296,9 @@ impl Backend {
     /// Returns `Err` when the driver reports the surface failed.
     pub fn sync(&self, surface: VaSurfaceId) -> Result<(), VaApiError> {
         // Sound: the surface belongs to the pool.
-        VaApiError::status(unsafe { ffi::vaSyncSurface(self.display, surface) })
+        let outcome = VaApiError::status(unsafe { ffi::vaSyncSurface(self.display, surface) });
+        self.gauges.note_synced();
+        outcome
     }
 
     /// Block until `surface` finishes, dropping any failure.
@@ -320,26 +353,29 @@ impl Backend {
     {
         let display = self.display;
         let context = self.context;
+        let gauges = Arc::clone(&self.gauges);
         let Some(entry) = self.sets.get_mut(set) else {
             return Err(Self::range());
         };
-        entry.grow(display, context, slices.len())?;
-        entry.picture.rewrite(bytes_of(picture))?;
-        entry.matrix.rewrite(bytes_of(matrix))?;
+        entry.grow(display, context, slices.len(), &gauges)?;
+        let mut recreated = 0;
+        recreated += u64::from(entry.picture.rewrite(bytes_of(picture))?);
+        recreated += u64::from(entry.matrix.rewrite(bytes_of(matrix))?);
         self.render.clear();
         self.render.reserve(2 + 2 * slices.len());
         self.render.push(entry.picture.id());
         self.render.push(entry.matrix.id());
         for (index, params) in slices.iter().enumerate() {
             let param = &mut entry.slice_params[index];
-            param.rewrite(bytes_of(params))?;
+            recreated += u64::from(param.rewrite(bytes_of(params))?);
             let param_id = param.id();
             let slot = &mut entry.slice_data[index];
-            slot.rewrite(data(index))?;
+            recreated += u64::from(slot.rewrite(data(index))?);
             let slot_id = slot.id();
             self.render.push(param_id);
             self.render.push(slot_id);
         }
+        gauges.note_buffer_creates(recreated);
         Ok(())
     }
 
@@ -490,7 +526,11 @@ struct BufferSet {
 
 impl BufferSet {
     /// Set with fresh picture and matrix buffers, no slice buffers yet.
-    fn open(display: ffi::VaDisplay, context: VaContextId) -> Result<Self, VaApiError> {
+    fn open(
+        display: ffi::VaDisplay,
+        context: VaContextId,
+        gauges: &StatsInner,
+    ) -> Result<Self, VaApiError> {
         let picture = VaBuffer::create(
             display,
             context,
@@ -503,6 +543,7 @@ impl BufferSet {
             ffi::VA_IQ_MATRIX_BUFFER_TYPE,
             &[0; size_of::<ffi::VaIqMatrixBufferH264>()],
         )?;
+        gauges.note_buffer_creates(2);
         Ok(Self {
             picture,
             matrix,
@@ -517,7 +558,9 @@ impl BufferSet {
         display: ffi::VaDisplay,
         context: VaContextId,
         count: usize,
+        gauges: &StatsInner,
     ) -> Result<(), VaApiError> {
+        let mut created = 0;
         while self.slice_params.len() < count {
             self.slice_params.push(VaBuffer::create(
                 display,
@@ -525,6 +568,7 @@ impl BufferSet {
                 ffi::VA_SLICE_PARAMETER_BUFFER_TYPE,
                 &[0; size_of::<ffi::VaSliceParameterBufferH264>()],
             )?);
+            created += 1;
         }
         while self.slice_data.len() < count {
             self.slice_data.push(VaBuffer::create(
@@ -533,8 +577,99 @@ impl BufferSet {
                 ffi::VA_SLICE_DATA_BUFFER_TYPE,
                 &[0],
             )?);
+            created += 1;
         }
+        gauges.note_buffer_creates(created);
         Ok(())
+    }
+}
+
+/// Shared submit gauges behind one decode context.
+#[derive(Debug, Default)]
+pub(crate) struct StatsInner {
+    /// Pictures submitted.
+    submitted: AtomicU64,
+    /// Surfaces synced, backend or export path.
+    synced: AtomicU64,
+    /// Peak submitted-minus-synced.
+    peak: AtomicUsize,
+    /// Failed submits quieted.
+    resets: AtomicU64,
+    /// Driver buffers created.
+    buffer_creates: AtomicU64,
+}
+
+impl StatsInner {
+    /// One submitted picture; the peak follows submitted-minus-synced.
+    fn note_submitted(&self) {
+        let submitted = self.submitted.fetch_add(1, Ordering::Relaxed) + 1;
+        let synced = self.synced.load(Ordering::Relaxed);
+        let inflight = usize::try_from(submitted.saturating_sub(synced)).unwrap_or(usize::MAX);
+        self.peak.fetch_max(inflight, Ordering::Relaxed);
+    }
+
+    /// One synced surface.
+    pub(crate) fn note_synced(&self) {
+        self.synced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One failed submit quieted.
+    fn note_reset(&self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` driver buffers created.
+    fn note_buffer_creates(&self, count: u64) {
+        self.buffer_creates.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Gauge snapshot.
+    fn snapshot(&self) -> SubmitStats {
+        SubmitStats {
+            submitted: self.submitted.load(Ordering::Relaxed),
+            peak: self.peak.load(Ordering::Relaxed),
+            resets: self.resets.load(Ordering::Relaxed),
+            buffer_creates: self.buffer_creates.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Submit gauges since backend open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmitStats {
+    /// Pictures submitted.
+    submitted: u64,
+    /// Peak pictures submitted ahead of sync.
+    peak: usize,
+    /// Failed submits quieted.
+    resets: u64,
+    /// Driver buffers created by this backend since open.
+    buffer_creates: u64,
+}
+
+impl SubmitStats {
+    /// Pictures submitted.
+    #[must_use]
+    pub const fn submitted(&self) -> u64 {
+        self.submitted
+    }
+
+    /// Peak pictures submitted ahead of sync.
+    #[must_use]
+    pub const fn peak(&self) -> usize {
+        self.peak
+    }
+
+    /// Failed submits quieted.
+    #[must_use]
+    pub const fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// Driver buffers created by this backend since open.
+    #[must_use]
+    pub const fn buffer_creates(&self) -> u64 {
+        self.buffer_creates
     }
 }
 
