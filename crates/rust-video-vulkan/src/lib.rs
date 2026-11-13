@@ -1,4 +1,4 @@
-//! Vulkan video tier: negotiation ladder plus H.264/H.265 codecs.
+//! Vulkan video tier: negotiation ladder plus H.264/H.265/AV1 codecs.
 
 mod decoder;
 mod device;
@@ -11,7 +11,7 @@ mod raw;
 mod session;
 mod transcode;
 
-pub use decoder::{H264Decoder, H265Decoder, VulkanFrame};
+pub use decoder::{Av1Decoder, H264Decoder, H265Decoder, VulkanFrame};
 pub use device::VulkanDevice;
 pub use encoder::{Gop, H264Encoder, H265Encoder};
 pub use error::{ParseError, SkipReason, VulkanError};

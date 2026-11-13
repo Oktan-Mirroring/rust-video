@@ -30,6 +30,9 @@ pub enum SkipReason {
     /// No H.265 profile reports decode capabilities.
     #[error("no H.265 decode capabilities")]
     NoH265Caps,
+    /// No AV1 profile reports decode capabilities.
+    #[error("no AV1 decode capabilities")]
+    NoAv1Caps,
     /// No queue family with video-encode capability.
     #[error("no video-encode queue family")]
     NoEncodeQueue,
@@ -206,6 +209,10 @@ mod tests {
         assert_eq!(
             SkipReason::NoH265Caps.to_string(),
             "no H.265 decode capabilities"
+        );
+        assert_eq!(
+            SkipReason::NoAv1Caps.to_string(),
+            "no AV1 decode capabilities"
         );
         assert_eq!(
             SkipReason::NoEncodeQueue.to_string(),

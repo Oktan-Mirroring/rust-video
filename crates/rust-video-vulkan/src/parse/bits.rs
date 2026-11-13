@@ -118,6 +118,106 @@ impl<'a> BitReader<'a> {
         }
         self.bits(syntax, left).map(|_| ())
     }
+
+    /// Unsigned variable-length code: zeros, a one, then the value bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on truncation, or when the code exceeds 32 bits.
+    pub fn uvlc(&mut self, syntax: &'static str) -> Result<u32, ParseError> {
+        let mut zeros = 0_u32;
+        while !self.bit(syntax)? {
+            zeros += 1;
+            if zeros > 31 {
+                return Err(ParseError::Overflow { syntax });
+            }
+        }
+        if zeros == 0 {
+            return Ok(0);
+        }
+        let rest = self.bits(syntax, zeros)?;
+        Ok(rest + (1_u32 << zeros) - 1)
+    }
+
+    /// Signed `n`-bit two's-complement value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on truncation or a zero width.
+    pub fn su(&mut self, syntax: &'static str, n: u32) -> Result<i32, ParseError> {
+        if n == 0 || n > 32 {
+            return Err(ParseError::OutOfRange { syntax });
+        }
+        let raw = self.bits(syntax, n)?;
+        Ok((raw << (32 - n)).cast_signed() >> (32 - n))
+    }
+
+    /// Non-symmetric value over `n` symbols.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on truncation or an empty symbol count.
+    pub fn ns(&mut self, syntax: &'static str, n: u32) -> Result<u32, ParseError> {
+        if n == 0 || n >= (1 << 31) {
+            return Err(ParseError::OutOfRange { syntax });
+        }
+        let w = 32 - n.leading_zeros();
+        let m = (1_u32 << w) - n;
+        let v = if w > 1 { self.bits(syntax, w - 1)? } else { 0 };
+        if v < m {
+            return Ok(v);
+        }
+        let extra = self.bits(syntax, 1)?;
+        Ok((v << 1) - m + extra)
+    }
+
+    /// Increment code between `min` and `max`: one bits up, zero stops.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on truncation or an inverted range.
+    pub fn increment(
+        &mut self,
+        syntax: &'static str,
+        min: u32,
+        max: u32,
+    ) -> Result<u32, ParseError> {
+        if min > max {
+            return Err(ParseError::OutOfRange { syntax });
+        }
+        let mut value = min;
+        while value < max {
+            if !self.bit(syntax)? {
+                break;
+            }
+            value += 1;
+        }
+        Ok(value)
+    }
+
+    /// Sub-exponential code under `range_max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on truncation or a degenerate range.
+    pub fn subexp(&mut self, syntax: &'static str, range_max: u32) -> Result<u32, ParseError> {
+        if range_max < 9 {
+            return Err(ParseError::OutOfRange { syntax });
+        }
+        let max_len = 32 - (range_max - 1).leading_zeros() - 1 - 3;
+        let len = self.increment(syntax, 0, max_len)?;
+        let (range_bits, range_offset) = if len == 0 {
+            (3, 0)
+        } else {
+            (2 + len, 1 << (2 + len))
+        };
+        let value = if len < max_len {
+            self.bits(syntax, range_bits)?
+        } else {
+            self.ns(syntax, range_max - range_offset)?
+        };
+        Ok(value + range_offset)
+    }
 }
 
 /// Raw byte sequence payload with emulation prevention removed.
@@ -215,5 +315,44 @@ mod tests {
     fn rbsp_collapses_prevention_bytes() {
         let stripped = Rbsp::strip(&[0, 0, 3, 0, 0, 3, 1, 0, 0, 3, 3]);
         assert_eq!(stripped.bytes(), &[0, 0, 0, 0, 1, 0, 0, 3]);
+    }
+
+    #[test]
+    fn uvlc_decodes_values() {
+        let mut reader = BitReader::new(&[0b1010_0110, 0b0011_1000]);
+        assert_eq!(reader.uvlc("t").expect("0"), 0);
+        assert_eq!(reader.uvlc("t").expect("1"), 1);
+        assert_eq!(reader.uvlc("t").expect("2"), 2);
+        assert_eq!(reader.uvlc("t").expect("13"), 13);
+    }
+
+    #[test]
+    fn su_decodes_twos_complement() {
+        let mut reader = BitReader::new(&[0b1010_0101]);
+        assert_eq!(reader.su("t", 4).expect("neg"), -6);
+        assert_eq!(reader.su("t", 4).expect("pos"), 5);
+        let mut reader = BitReader::new(&[0b1110_0010]);
+        assert_eq!(reader.su("t", 7).expect("q"), -15);
+    }
+
+    #[test]
+    fn ns_covers_short_and_long_forms() {
+        let mut reader = BitReader::new(&[0b0111_1000]);
+        assert_eq!(reader.ns("t", 5).expect("short"), 1);
+        assert_eq!(reader.ns("t", 5).expect("long"), 4);
+    }
+
+    #[test]
+    fn increment_counts_ones() {
+        let mut reader = BitReader::new(&[0b1100_0000]);
+        assert_eq!(reader.increment("t", 1, 4).expect("mid"), 3);
+        let mut reader = BitReader::new(&[0b1110_0000]);
+        assert_eq!(reader.increment("t", 1, 4).expect("max"), 4);
+    }
+
+    #[test]
+    fn subexp_decodes_bands() {
+        let mut reader = BitReader::new(&[0b0101_0000]);
+        assert_eq!(reader.subexp("t", 513).expect("low"), 5);
     }
 }

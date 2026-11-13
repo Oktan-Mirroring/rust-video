@@ -4,12 +4,14 @@ use bytes::Bytes;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_vulkan::{CodecOp, H264Decoder, H265Decoder, VulkanDevice, VulkanFrame};
+use rust_video_vulkan::{Av1Decoder, CodecOp, H264Decoder, H265Decoder, VulkanDevice, VulkanFrame};
 
 fn main() {
     let codec = std::env::var("VKPROBE_CODEC").unwrap_or_else(|_| "h264".to_owned());
     let default_vector = if codec == "h265" {
         "h265-main.h265"
+    } else if codec == "av1" {
+        "av1-test.obu"
     } else {
         "h264-high.h264"
     };
@@ -38,6 +40,8 @@ fn main() {
     };
     let op = if codec == "h265" {
         CodecOp::H265Decode
+    } else if codec == "av1" {
+        CodecOp::Av1Decode
     } else {
         CodecOp::H264Decode
     };
@@ -54,6 +58,9 @@ fn main() {
     };
     if codec == "h265" {
         let decoder = H265Decoder::open(&device).expect("decoder");
+        run(decoder, bytes, &out_path);
+    } else if codec == "av1" {
+        let decoder = Av1Decoder::open(&device).expect("decoder");
         run(decoder, bytes, &out_path);
     } else {
         let decoder = H264Decoder::open(&device).expect("decoder");

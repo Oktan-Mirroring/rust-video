@@ -26,6 +26,8 @@ pub(crate) enum DpbMeta {
     H264(vk::native::StdVideoDecodeH264ReferenceInfo),
     /// H.265 reference info of the slot's picture.
     H265(vk::native::StdVideoDecodeH265ReferenceInfo),
+    /// AV1 reference info of the slot's picture.
+    Av1(vk::native::StdVideoDecodeAV1ReferenceInfo),
 }
 
 /// Exportable planes behind one GPU submit.
@@ -93,7 +95,7 @@ impl Session {
         geometry: &SessionGeometry,
         profile: &vk::VideoProfileInfoKHR<'_>,
         std_version: &vk::ExtensionProperties,
-        template: &mut crate::session::params::ParamsTemplate,
+        template: &mut crate::session::params::ParamsTemplate<'_>,
     ) -> Result<Self, VulkanError> {
         let raw = device.raw().device();
         let properties =
@@ -118,6 +120,9 @@ impl Session {
                 SessionParameters::create(&session, &create.push_next(codec))?
             }
             crate::session::params::ParamsTemplate::H265(codec) => {
+                SessionParameters::create(&session, &create.push_next(codec))?
+            }
+            crate::session::params::ParamsTemplate::Av1(codec) => {
                 SessionParameters::create(&session, &create.push_next(codec))?
             }
             crate::session::params::ParamsTemplate::H264Encode(_)

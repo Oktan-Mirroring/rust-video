@@ -1,6 +1,6 @@
 //! GPU transcode: decode export to encoder import without readback.
 
-use crate::decoder::{H264Decoder, H265Decoder, VulkanFrame};
+use crate::decoder::{Av1Decoder, H264Decoder, H265Decoder, VulkanFrame};
 use crate::device::VulkanDevice;
 use crate::encoder::{H264Encoder, H265Encoder};
 use crate::error::VulkanError;
@@ -60,6 +60,8 @@ enum DecodeRouted<'a> {
     H264(H264Decoder<'a>),
     /// H.265 decoder.
     H265(H265Decoder<'a>),
+    /// AV1 decoder.
+    Av1(Av1Decoder<'a>),
 }
 
 impl<'a> Transcoder<'a> {
@@ -83,6 +85,7 @@ impl<'a> Transcoder<'a> {
         let decoder = match decode_op {
             CodecOp::H264Decode => DecodeRouted::H264(H264Decoder::open(decode_device)?),
             CodecOp::H265Decode => DecodeRouted::H265(H265Decoder::open(decode_device)?),
+            CodecOp::Av1Decode => DecodeRouted::Av1(Av1Decoder::open(decode_device)?),
             CodecOp::H264Encode | CodecOp::H265Encode => {
                 return Err(VulkanError::Unsupported {
                     what: "transcode direction".to_owned(),
@@ -176,6 +179,7 @@ impl<'a> Transcoder<'a> {
             let frames = match &mut self.decoder {
                 DecodeRouted::H264(decoder) => decoder.flush()?,
                 DecodeRouted::H265(decoder) => decoder.flush()?,
+                DecodeRouted::Av1(decoder) => decoder.flush()?,
             };
             let mut packets = self.encode_cpu(&frames)?;
             if let Some(encoder) = self.encoder.as_mut() {
@@ -193,6 +197,7 @@ impl<'a> Transcoder<'a> {
         match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.decode(packet),
             DecodeRouted::H265(decoder) => decoder.decode(packet),
+            DecodeRouted::Av1(decoder) => decoder.decode(packet),
         }
     }
 
@@ -202,6 +207,7 @@ impl<'a> Transcoder<'a> {
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.decode_surface(packet)?,
             DecodeRouted::H265(decoder) => decoder.decode_surface(packet)?,
+            DecodeRouted::Av1(decoder) => decoder.decode_surface(packet)?,
         };
         let packets = self.encode_surfaces(&frames)?;
         Ok(Outcome::new(packets, self.plan))
@@ -213,6 +219,7 @@ impl<'a> Transcoder<'a> {
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.flush_surface()?,
             DecodeRouted::H265(decoder) => decoder.flush_surface()?,
+            DecodeRouted::Av1(decoder) => decoder.flush_surface()?,
         };
         let mut packets = self.encode_surfaces(&frames)?;
         if let Some(encoder) = self.encoder.as_mut() {
@@ -305,7 +312,7 @@ impl<'a> Transcoder<'a> {
                 CodecOp::H265Encode => {
                     Encode::H265(H265Encoder::open(self.encode_device, width, height)?)
                 }
-                CodecOp::H264Decode | CodecOp::H265Decode => {
+                CodecOp::H264Decode | CodecOp::H265Decode | CodecOp::Av1Decode => {
                     return Err(VulkanError::OverCaps { what: "codec op" });
                 }
             };
@@ -339,6 +346,12 @@ fn decode_two_plane(device: &VulkanDevice, op: CodecOp) -> bool {
                 return false;
             };
             let chain = H265ProfileChain::new(profile);
+            device
+                .backend()
+                .video_formats(device.adapter(), &chain.base(), usage)
+        }
+        CodecOp::Av1Decode => {
+            let chain = crate::session::params::Av1ProfileChain::new(0);
             device
                 .backend()
                 .video_formats(device.adapter(), &chain.base(), usage)

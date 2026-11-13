@@ -532,11 +532,9 @@ const INITIAL_BUFFER_MS: u32 = 500;
 
 /// CBR control over `layer`.
 ///
-/// Every begin carries the control: drivers set rate control state
-/// from the begin chain, the FFmpeg-compatible shape. Newer
-/// validation wants the state preconfigured through a control
-/// command instead and flags each begin; the control path fails on
-/// drivers, so the begin chain stays.
+/// Every begin carries the control: drivers read rate control state
+/// from the begin chain, and the preconfigured control path fails
+/// on them.
 fn rc_control<'a>(
     layer: &'a vk::VideoEncodeRateControlLayerInfoKHR<'_>,
 ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
@@ -1150,7 +1148,7 @@ impl EncodeSession {
     /// Empty session parameters over `template`.
     fn create_params(
         session: &VideoSession,
-        template: &mut crate::session::params::ParamsTemplate,
+        template: &mut crate::session::params::ParamsTemplate<'_>,
     ) -> Result<SessionParameters, VulkanError> {
         let create = vk::VideoSessionParametersCreateInfoKHR {
             video_session: session.session(),
@@ -1164,7 +1162,8 @@ impl EncodeSession {
                 SessionParameters::create(session, &create.push_next(codec))
             }
             crate::session::params::ParamsTemplate::H264(_)
-            | crate::session::params::ParamsTemplate::H265(_) => {
+            | crate::session::params::ParamsTemplate::H265(_)
+            | crate::session::params::ParamsTemplate::Av1(_) => {
                 Err(VulkanError::OverCaps { what: "codec op" })
             }
         }

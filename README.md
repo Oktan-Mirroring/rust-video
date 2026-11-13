@@ -28,7 +28,7 @@ Out: archival demuxing, subtitles, filters, audio.
 | Backend | H.264 | H.265 | AV1 | VP9 | VP8 |
 |---|---|---|---|---|---|
 | Software | ● | ● | ● | ● | ● |
-| Vulkan | ● | ● | – | – | – |
+| Vulkan | ● | ● | ● | – | – |
 | VA-API | ● | ◐ | ◐ | ◐ | ◐ |
 | D3D11 | ● | ◐ | ◐ | ◐ | – |
 | D3D12 | ● | ●⁵ | ◐ | ◐ | – |

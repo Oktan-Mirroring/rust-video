@@ -15,6 +15,8 @@ pub enum CodecOp {
     H264Decode,
     /// H.265 decode.
     H265Decode,
+    /// AV1 decode.
+    Av1Decode,
     /// H.264 encode.
     H264Encode,
     /// H.265 encode.
@@ -38,6 +40,11 @@ impl CodecOp {
                 ash::vk::KHR_VIDEO_QUEUE_NAME,
                 ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME,
                 ash::vk::KHR_VIDEO_DECODE_H265_NAME,
+            ],
+            Self::Av1Decode => [
+                ash::vk::KHR_VIDEO_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME,
+                ash::vk::KHR_VIDEO_DECODE_AV1_NAME,
             ],
             Self::H264Encode => [
                 ash::vk::KHR_VIDEO_QUEUE_NAME,
@@ -197,6 +204,8 @@ pub(crate) struct AdapterFacts<A> {
     pub h264: Option<DecodeFacts>,
     /// H.265 caps, when a profile reports them.
     pub h265: Option<DecodeFacts>,
+    /// AV1 caps, when a profile reports them.
+    pub av1: Option<DecodeFacts>,
     /// H.264 encode caps, when a profile reports them.
     pub h264_encode: Option<EncodeFacts>,
     /// H.265 encode caps, when a profile reports them.
@@ -290,6 +299,10 @@ impl<A> AdapterFacts<A> {
                 .h265
                 .map(OpCaps::Decode)
                 .ok_or(LadderError::Skip(SkipReason::NoH265Caps)),
+            CodecOp::Av1Decode => self
+                .av1
+                .map(OpCaps::Decode)
+                .ok_or(LadderError::Skip(SkipReason::NoAv1Caps)),
             CodecOp::H264Encode => self
                 .h264_encode
                 .map(OpCaps::Encode)
@@ -599,6 +612,7 @@ mod tests {
             encode_queue_families: vec![4],
             h264: Some(caps()),
             h265: Some(caps()),
+            av1: Some(caps()),
             h264_encode: Some(encode_caps()),
             h265_encode: Some(encode_caps()),
         }
@@ -725,6 +739,7 @@ mod tests {
     fn ops_split_encode_from_decode() {
         assert!(!CodecOp::H264Decode.is_encode());
         assert!(!CodecOp::H265Decode.is_encode());
+        assert!(!CodecOp::Av1Decode.is_encode());
         assert!(CodecOp::H264Encode.is_encode());
         assert!(CodecOp::H265Encode.is_encode());
     }
@@ -755,6 +770,19 @@ mod tests {
                 "VK_KHR_video_queue",
                 "VK_KHR_video_encode_queue",
                 "VK_KHR_video_encode_h264",
+            ]
+        );
+        let av1: Vec<String> = CodecOp::Av1Decode
+            .extensions()
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            av1.as_slice(),
+            [
+                "VK_KHR_video_queue",
+                "VK_KHR_video_decode_queue",
+                "VK_KHR_video_decode_av1",
             ]
         );
         let hevc: Vec<String> = CodecOp::H265Encode
@@ -820,6 +848,22 @@ mod tests {
         assert_eq!(
             skip(facts.check_video_caps(CodecOp::H265Decode)),
             SkipReason::NoH265Caps
+        );
+    }
+
+    #[test]
+    fn av1_caps_cover_both_rungs() {
+        assert_eq!(
+            green_for(CodecOp::Av1Decode)
+                .check_video_caps(CodecOp::Av1Decode)
+                .expect("caps"),
+            OpCaps::Decode(caps())
+        );
+        let mut facts = green_for(CodecOp::Av1Decode);
+        facts.av1 = None;
+        assert_eq!(
+            skip(facts.check_video_caps(CodecOp::Av1Decode)),
+            SkipReason::NoAv1Caps
         );
     }
 

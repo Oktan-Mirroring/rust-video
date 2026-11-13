@@ -143,6 +143,37 @@ pub(crate) fn h265_profile_to_std(profile_idc: u8) -> Option<u32> {
     }
 }
 
+/// AV1 level index to its comparison value, identity over 0-23 and 31.
+///
+/// Index 31 carries no level constraints; 24-30 are reserved.
+pub(crate) fn av1_level_to_std(level_idx: u8) -> Option<u32> {
+    if level_idx <= 23 || level_idx == 31 {
+        Some(u32::from(level_idx))
+    } else {
+        None
+    }
+}
+
+/// `StdVideo` AV1 level to its index, clamped to the defined range.
+pub(crate) fn av1_std_to_wire(level: u32) -> u8 {
+    level.min(23) as u8
+}
+
+/// AV1 sequence profile to its `StdVideo` value.
+pub(crate) fn av1_profile_to_std(profile: u8) -> Option<u32> {
+    use vk::native::{
+        StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
+        StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+        StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_PROFESSIONAL,
+    };
+    match profile {
+        0 => Some(StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN),
+        1 => Some(StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH),
+        2 => Some(StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_PROFESSIONAL),
+        _ => None,
+    }
+}
+
 /// Codec profile pinned to one session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionProfile {
@@ -158,6 +189,13 @@ pub(crate) enum SessionProfile {
         /// `StdVideo` profile `idc`.
         profile: u32,
         /// `StdVideo` level `idc`.
+        level: u32,
+    },
+    /// AV1 profile and level index.
+    Av1 {
+        /// `StdVideo` profile.
+        profile: u32,
+        /// Level index, the `StdVideo` value over 0-23.
         level: u32,
     },
 }
@@ -330,6 +368,72 @@ impl SessionGeometry {
         )
     }
 
+    /// Geometry from an AV1 sequence header and the frame display size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on unsupported sampling, unknown profile or level,
+    /// level or size above the caps, or no 4:2:0 format.
+    pub fn av1(
+        seq: &crate::parse::av1::SequenceHeader,
+        display: (u32, u32),
+        caps: &DecodeFacts,
+        formats: &[vk::VideoFormatPropertiesKHR<'_>],
+    ) -> Result<Self, VulkanError> {
+        if seq.mono_chrome()
+            || seq.subsampling_x() != 1
+            || seq.subsampling_y() != 1
+            || seq.bit_depth() != 8
+        {
+            return Err(ParseError::Unsupported {
+                what: "av1 sampling",
+            }
+            .into());
+        }
+        let Some(profile) = av1_profile_to_std(seq.profile()) else {
+            return Err(ParseError::Unsupported {
+                what: "av1 profile",
+            }
+            .into());
+        };
+        if profile != vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN {
+            return Err(ParseError::Unsupported {
+                what: "av1 profile",
+            }
+            .into());
+        }
+        let Some(level) = av1_level_to_std(seq.level_idx()) else {
+            return Err(ParseError::Unsupported { what: "av1 level" }.into());
+        };
+        if seq.level_idx() != 31 && seq.level_idx() > caps.max_level {
+            return Err(VulkanError::UnsupportedLevel {
+                stream: seq.level_idx(),
+                max: caps.max_level,
+            });
+        }
+        let coded = seq.coded_size();
+        if display.0 > coded.0 || display.1 > coded.1 {
+            return Err(VulkanError::OverCaps {
+                what: "coded extent",
+            });
+        }
+        if coded.0 % 2 == 1 || coded.1 % 2 == 1 || display.0 % 2 == 1 || display.1 % 2 == 1 {
+            return Err(ParseError::Unsupported {
+                what: "av1 sampling",
+            }
+            .into());
+        }
+        Self::sized(
+            CodecOp::Av1Decode,
+            SessionProfile::Av1 { profile, level },
+            coded,
+            display,
+            crate::parse::av1::DPB_SLOTS,
+            caps,
+            formats,
+        )
+    }
+
     /// Geometry from validated sizes against the caps.
     fn sized(
         op: CodecOp,
@@ -441,6 +545,44 @@ mod tests {
         assert_eq!(geometry.coded(), (320, 240));
         assert_eq!(geometry.dpb_slots(), 4);
         assert!(geometry.format() == vk::Format::G8_B8R8_2PLANE_420_UNORM);
+    }
+
+    #[test]
+    fn av1_level_profile_maps_cover_defined_values() {
+        for level in 0..=23 {
+            assert_eq!(super::av1_level_to_std(level), Some(u32::from(level)));
+            assert_eq!(super::av1_std_to_wire(u32::from(level)), level);
+        }
+        assert_eq!(super::av1_level_to_std(24), None);
+        assert_eq!(super::av1_level_to_std(30), None);
+        assert_eq!(super::av1_level_to_std(31), Some(31));
+        assert_eq!(super::av1_std_to_wire(31), 23);
+        assert_eq!(super::av1_profile_to_std(0), Some(0));
+        assert_eq!(super::av1_profile_to_std(1), Some(1));
+        assert_eq!(super::av1_profile_to_std(2), Some(2));
+        assert_eq!(super::av1_profile_to_std(3), None);
+    }
+
+    #[test]
+    fn av1_sequence_sizes_session() {
+        let seq = crate::parse::av1::SequenceHeader::test_main_420();
+        let mut capped = caps();
+        capped.max_level = 4;
+        let geometry =
+            super::SessionGeometry::av1(&seq, (320, 240), &capped, &formats()).expect("geometry");
+        assert_eq!(geometry.coded(), (320, 240));
+        assert_eq!(geometry.display(), (320, 240));
+        assert_eq!(geometry.dpb_slots(), 9);
+        assert!(matches!(
+            super::SessionGeometry::av1(&seq, (321, 240), &capped, &formats()).unwrap_err(),
+            crate::error::VulkanError::OverCaps { .. }
+        ));
+        let mut low = capped;
+        low.max_level = 3;
+        assert!(matches!(
+            super::SessionGeometry::av1(&seq, (320, 240), &low, &formats()).unwrap_err(),
+            crate::error::VulkanError::UnsupportedLevel { stream: 4, max: 3 }
+        ));
     }
 
     #[test]

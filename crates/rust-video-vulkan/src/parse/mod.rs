@@ -1,6 +1,7 @@
 //! Annex-B parsers feeding the video sessions.
 
 pub(crate) mod au;
+pub(crate) mod av1;
 pub(crate) mod bits;
 pub(crate) mod h264;
 pub(crate) mod h265;

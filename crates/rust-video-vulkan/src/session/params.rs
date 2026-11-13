@@ -25,17 +25,21 @@ pub(crate) const H265_MAX_PPS: u32 = 64;
 pub(crate) const H264_DECODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h264_decode";
 /// H.265 decode Std header extension name.
 pub(crate) const H265_DECODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h265_decode";
+/// AV1 decode Std header extension name.
+pub(crate) const AV1_DECODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_av1_decode";
 /// H.264 encode Std header extension name.
 pub(crate) const H264_ENCODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h264_encode";
 /// H.265 encode Std header extension name.
 pub(crate) const H265_ENCODE_STD_NAME: &[u8] = b"VK_STD_vulkan_video_codec_h265_encode";
 
 /// Session-parameters template per codec.
-pub(crate) enum ParamsTemplate {
+pub(crate) enum ParamsTemplate<'a> {
     /// H.264 template.
     H264(vk::VideoDecodeH264SessionParametersCreateInfoKHR<'static>),
     /// H.265 template.
     H265(vk::VideoDecodeH265SessionParametersCreateInfoKHR<'static>),
+    /// AV1 template over the active sequence header.
+    Av1(vk::VideoDecodeAV1SessionParametersCreateInfoKHR<'a>),
     /// H.264 encode template.
     H264Encode(vk::VideoEncodeH264SessionParametersCreateInfoKHR<'static>),
     /// H.265 encode template.
@@ -94,6 +98,36 @@ impl H265ProfileChain {
     pub(crate) fn base(&self) -> vk::VideoProfileInfoKHR<'_> {
         vk::VideoProfileInfoKHR {
             video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+            chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
+            luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
+            p_next: std::ptr::from_ref(self.codec.as_ref()).cast(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Owned AV1 decode profile chain.
+pub(crate) struct Av1ProfileChain {
+    /// Codec tail, box-stable; every `base` borrows it.
+    codec: Box<vk::VideoDecodeAV1ProfileInfoKHR<'static>>,
+}
+
+impl Av1ProfileChain {
+    /// 8-bit 4:2:0 AV1 decode profile for `std_profile`.
+    pub(crate) fn new(std_profile: u32) -> Self {
+        Self {
+            codec: Box::new(vk::VideoDecodeAV1ProfileInfoKHR {
+                std_profile,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Base profile for session creation and format queries.
+    pub(crate) fn base(&self) -> vk::VideoProfileInfoKHR<'_> {
+        vk::VideoProfileInfoKHR {
+            video_codec_operation: vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
             chroma_subsampling: vk::VideoChromaSubsamplingFlagsKHR::TYPE_420,
             luma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
             chroma_bit_depth: vk::VideoComponentBitDepthFlagsKHR::TYPE_8,
@@ -221,6 +255,16 @@ pub(crate) fn h265_params_add<'a>(
     })
 }
 
+/// AV1 session-parameters template over `header`.
+pub(crate) fn av1_params_create(
+    header: &vk::native::StdVideoAV1SequenceHeader,
+) -> vk::VideoDecodeAV1SessionParametersCreateInfoKHR<'_> {
+    vk::VideoDecodeAV1SessionParametersCreateInfoKHR {
+        p_std_sequence_header: std::ptr::from_ref(header),
+        ..Default::default()
+    }
+}
+
 /// H.264 encode template over one sequence and one picture set.
 pub(crate) fn h264_encode_params_create(
 ) -> vk::VideoEncodeH264SessionParametersCreateInfoKHR<'static> {
@@ -315,6 +359,46 @@ mod tests {
         let codec = std::ptr::from_ref(chain.codec.as_ref()).cast();
         assert_eq!(base.p_next, codec);
         assert_eq!(chain.codec.std_profile_idc, 1);
+    }
+
+    #[test]
+    fn av1_chain_carries_decode_profile() {
+        let chain = super::Av1ProfileChain::new(0);
+        let base = chain.base();
+        assert!(base.video_codec_operation == ash::vk::VideoCodecOperationFlagsKHR::DECODE_AV1);
+        assert!(base.chroma_subsampling == ash::vk::VideoChromaSubsamplingFlagsKHR::TYPE_420);
+        assert!(!base.p_next.is_null());
+        let codec = std::ptr::from_ref(chain.codec.as_ref()).cast();
+        assert_eq!(base.p_next, codec);
+        assert_eq!(chain.codec.std_profile, 0);
+    }
+
+    #[test]
+    fn av1_template_pins_sequence_header() {
+        use ash::vk::native::{
+            __BindgenBitfieldUnit, StdVideoAV1SequenceHeader, StdVideoAV1SequenceHeaderFlags,
+        };
+        let header = StdVideoAV1SequenceHeader {
+            flags: StdVideoAV1SequenceHeaderFlags {
+                _bitfield_align_1: [],
+                _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
+            },
+            seq_profile: 0,
+            frame_width_bits_minus_1: 0,
+            frame_height_bits_minus_1: 0,
+            max_frame_width_minus_1: 0,
+            max_frame_height_minus_1: 0,
+            delta_frame_id_length_minus_2: 0,
+            additional_frame_id_length_minus_1: 0,
+            order_hint_bits_minus_1: 0,
+            seq_force_integer_mv: 0,
+            seq_force_screen_content_tools: 0,
+            reserved1: [0; 5],
+            pColorConfig: std::ptr::null(),
+            pTimingInfo: std::ptr::null(),
+        };
+        let template = super::av1_params_create(&header);
+        assert_eq!(template.p_std_sequence_header, std::ptr::from_ref(&header));
     }
 
     #[test]

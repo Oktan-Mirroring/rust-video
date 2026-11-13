@@ -58,6 +58,12 @@ impl VulkanFrame {
         &self.data
     }
 
+    /// Shared NV12 frame bytes.
+    #[must_use]
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.data
+    }
+
     /// Planar `yuv420p` bytes: Y then U then V.
     ///
     /// The golden oracle hashes planar bytes, so tests compare through this.
@@ -307,6 +313,34 @@ impl FrameSink {
         let frame = self.stage(session, lease)?;
         self.generation += 1;
         Ok(self.reorder.push(poc, frame))
+    }
+
+    /// Display frame from retained bytes, queued in display order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on an exhausted VRAM budget.
+    pub(crate) fn emit_stored(
+        &mut self,
+        size: PictureSize,
+        cpu: Option<&Bytes>,
+        gpu: Option<&Arc<ExportPair>>,
+        poc: i32,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let identity = GpuFrame::new(size, PixelFormat::Nv12, self.generation);
+        let data = cpu.cloned().unwrap_or_default();
+        let lease = self.shared.try_acquire(data.len() as u64)?;
+        let device = gpu.map(|pair| DeviceExport::new((*pair).clone()));
+        self.generation += 1;
+        Ok(self.reorder.push(
+            poc,
+            VulkanFrame {
+                identity,
+                data,
+                lease,
+                device,
+            },
+        ))
     }
 
     /// Cropped leased frame from staged coded bytes.
@@ -585,6 +619,7 @@ impl<'a> H264Decoder<'a> {
                 picture_next: std::ptr::from_ref(&codec).cast(),
                 meta: DpbMeta::H264(setup_std),
                 flush_on_reset: true,
+                emit: true,
             },
             gpu,
         )?;
@@ -652,6 +687,14 @@ impl<'a> H264Decoder<'a> {
                 }
                 H264Instruction::Picture(picture) => {
                     self.submit_picture(&picture, gpu)?;
+                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                        out.extend(drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?);
+                    }
                 }
             }
         }
@@ -951,6 +994,8 @@ struct SubmitPlan<'a, 'b, 'c> {
     meta: DpbMeta,
     /// Flush the reorder buffer on a DPB reset.
     flush_on_reset: bool,
+    /// Picture displays once collected.
+    emit: bool,
 }
 
 /// Submitted but uncollected picture.
@@ -963,6 +1008,10 @@ struct PendingPicture {
     resets: bool,
     /// Flush the reorder buffer on a DPB reset.
     flush_on_reset: bool,
+    /// Picture displays once collected.
+    emit: bool,
+    /// Stable identity when a reference.
+    show_id: Option<ReferenceId>,
     /// Export lease behind a GPU submit, absent on the CPU path.
     lease: Option<ExportLease>,
 }
@@ -1013,11 +1062,16 @@ fn plan_submit(
         poc: body.poc(),
         resets: body.resets_dpb(),
         flush_on_reset: plan.flush_on_reset,
+        emit: plan.emit,
+        show_id: body.is_reference().then_some(plan.setup_id),
         lease,
     })
 }
 
 /// Collect one submitted picture into display frames.
+///
+/// Always reads the picture back: callers drop unshown frames after
+/// retaining their bytes, never before.
 fn collect_pending(
     session: &mut Session,
     sink: &mut FrameSink,
@@ -1379,6 +1433,7 @@ impl<'a> H265Decoder<'a> {
                 picture_next: std::ptr::from_ref(&codec).cast(),
                 meta: DpbMeta::H265(setup_std),
                 flush_on_reset: false,
+                emit: true,
             },
             gpu,
         )?;
@@ -1477,6 +1532,14 @@ impl<'a> H265Decoder<'a> {
                 }
                 H265Instruction::Picture(picture) => {
                     self.submit_picture(&picture, gpu)?;
+                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                        out.extend(drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?);
+                    }
                 }
             }
         }
@@ -1562,11 +1625,640 @@ impl Decoder for H265Decoder<'_> {
     }
 }
 
+/// Retained display frame behind one reference identity.
+struct StoredFrame {
+    /// Display size in luma samples.
+    size: PictureSize,
+    /// NV12 bytes on the CPU path, absent on the GPU path.
+    cpu: Option<Bytes>,
+    /// Exportable planes on the GPU path, absent on the CPU path.
+    gpu: Option<Arc<ExportPair>>,
+}
+
+/// Display frames retained for show-existing displays.
+struct ShowStore {
+    /// Retained frames by reference identity.
+    entries: Vec<(ReferenceId, StoredFrame)>,
+}
+
+impl ShowStore {
+    /// Empty store.
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Retain `frame` under `id`, replacing any prior entry.
+    fn insert(
+        &mut self,
+        id: ReferenceId,
+        size: PictureSize,
+        cpu: Option<Bytes>,
+        gpu: Option<Arc<ExportPair>>,
+    ) {
+        self.entries.retain(|entry| entry.0 != id);
+        self.entries.push((id, StoredFrame { size, cpu, gpu }));
+    }
+
+    /// Retained frame of `id`, if any.
+    fn get(&self, id: ReferenceId) -> Option<&StoredFrame> {
+        self.entries
+            .iter()
+            .find(|entry| entry.0 == id)
+            .map(|entry| &entry.1)
+    }
+
+    /// Drop every entry named in `releases`.
+    fn evict(&mut self, releases: &[ReferenceId]) {
+        self.entries.retain(|entry| !releases.contains(&entry.0));
+    }
+
+    /// Drop every entry.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// AV1 decoder over a negotiated Vulkan device.
+///
+/// Thread-local: parser state holds `Rc` tables, so the decoder stays on
+/// its creating thread while queue submission takes the device lock.
+pub struct Av1Decoder<'a> {
+    /// Negotiated device, borrowed for the decoder's life.
+    device: &'a VulkanDevice,
+    /// Reference context.
+    context: crate::parse::refs::Av1Context,
+    /// Standard-structure tables.
+    tables: crate::session::std_av1::Av1Tables,
+    /// Active sequence header.
+    seq: Option<Rc<crate::parse::av1::SequenceHeader>>,
+    /// Live session, built from the first sequence header.
+    session: Option<Session>,
+    /// Display sink.
+    sink: FrameSink,
+    /// Scratch reference ids for non-reference pictures.
+    scratch: ReferenceId,
+    /// Reused begin-chain buffers.
+    begin_bufs: ChainBufs<
+        ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+        vk::VideoDecodeAV1DpbSlotInfoKHR<'static>,
+    >,
+    /// Reused decode-chain buffers.
+    ref_bufs: ChainBufs<
+        ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+        vk::VideoDecodeAV1DpbSlotInfoKHR<'static>,
+    >,
+    /// Submitted but uncollected pictures.
+    pending: Vec<PendingPicture>,
+    /// Retained display frames by reference identity.
+    shown: ShowStore,
+    /// Display order counter for show-existing frames.
+    show_seq: i32,
+    /// Accumulated submit-core gauges.
+    stats: SubmitStats,
+    /// Armed fault for the next submit, applied once a session runs.
+    fault: bool,
+}
+
+/// Resolved reference state of one AV1 picture submit.
+struct Av1RefState {
+    /// Stored order hint per reference name.
+    order_hints: [u8; 8],
+    /// Sign bias mask over reference names.
+    bias: u8,
+    /// Expected frame id per reference name.
+    expected: [u32; 8],
+}
+
+impl<'a> Av1Decoder<'a> {
+    /// Decoder over `device`, negotiated for AV1 decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `device` negotiated a different operation.
+    pub fn open(device: &'a VulkanDevice) -> Result<Self, VulkanError> {
+        if device.op() != CodecOp::Av1Decode {
+            return Err(VulkanError::OverCaps { what: "codec op" });
+        }
+        Ok(Self {
+            device,
+            context: crate::parse::refs::Av1Context::new(),
+            tables: crate::session::std_av1::Av1Tables::new(),
+            seq: None,
+            session: None,
+            sink: FrameSink::new(device.shared().clone(), device.owned()),
+            scratch: ReferenceId(1 << 30),
+            begin_bufs: ChainBufs::new(),
+            ref_bufs: ChainBufs::new(),
+            pending: Vec::new(),
+            shown: ShowStore::new(),
+            show_seq: 0,
+            stats: SubmitStats::new(),
+            fault: false,
+        })
+    }
+
+    /// Submit-core gauges of the decoder.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        self.stats
+    }
+
+    /// Fail the next submit once, exercising the reset path.
+    ///
+    /// Armed before any session, the fault fires on the first submit.
+    pub fn inject_submit_fault(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.inject_fault();
+        } else {
+            self.fault = true;
+        }
+    }
+
+    /// Session for `seq` at `display`, recreated on geometry change.
+    fn ensure_session(
+        &mut self,
+        seq: &Rc<crate::parse::av1::SequenceHeader>,
+        display: (u32, u32),
+    ) -> Result<(), VulkanError> {
+        let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
+            return Err(VulkanError::OverCaps { what: "codec op" });
+        };
+        let Some(profile) = crate::session::geometry::av1_profile_to_std(seq.profile()) else {
+            return Err(ParseError::Unsupported {
+                what: "av1 profile",
+            }
+            .into());
+        };
+        let chain = crate::session::params::Av1ProfileChain::new(profile);
+        let usage =
+            vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
+        let formats =
+            self.device
+                .backend()
+                .video_formats(self.device.adapter(), &chain.base(), usage)?;
+        let geometry = SessionGeometry::av1(seq, display, &facts, &formats)?;
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.geometry() == &geometry)
+        {
+            return Ok(());
+        }
+        let std_version = crate::raw::std_header_version(
+            crate::session::params::AV1_DECODE_STD_NAME,
+            facts.std_version,
+        );
+        let Some(std_seq) = self.tables.sequence() else {
+            return Err(VulkanError::NoSession);
+        };
+        let mut template = ParamsTemplate::Av1(crate::session::params::av1_params_create(std_seq));
+        let session = Session::open(
+            self.device,
+            &geometry,
+            &chain.base(),
+            &std_version,
+            &mut template,
+        )?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// Order hints, sign bias, and expected ids of `picture` references.
+    fn resolve_ref_state(
+        &self,
+        picture: &crate::parse::refs::Av1Picture,
+    ) -> Result<Av1RefState, VulkanError> {
+        let (Some(session), Some(seq)) = (self.session.as_ref(), self.seq.as_ref()) else {
+            return Err(VulkanError::NoSession);
+        };
+        let header = picture.header();
+        let mut order_hints = [0_u8; 8];
+        if !header.is_intra() {
+            for (name, id) in picture.name_slots().iter().enumerate() {
+                let Some(slot) = id.and_then(|id| session.slots().slot_of(id)) else {
+                    continue;
+                };
+                if let Some(DpbMeta::Av1(std)) = session.meta(slot) {
+                    order_hints[name + 1] = std.OrderHint;
+                }
+            }
+        }
+        let mut bias = 0;
+        if seq.enable_order_hint() && !header.is_intra() {
+            for name in 0..crate::parse::av1::REFS_PER_FRAME {
+                if crate::parse::av1::relative_dist(seq, order_hints[name + 1], header.order_hint())
+                    > 0
+                {
+                    bias |= 1_u8 << (name + 1);
+                }
+            }
+        }
+        let mut expected = [0_u32; 8];
+        if !header.is_intra() {
+            for name in 0..crate::parse::av1::REFS_PER_FRAME {
+                expected[name + 1] = crate::session::std_av1::expected_frame_id(seq, header, name);
+            }
+        }
+        Ok(Av1RefState {
+            order_hints,
+            bias,
+            expected,
+        })
+    }
+
+    /// Queue-submit one decoded picture without waiting.
+    fn submit_picture(
+        &mut self,
+        picture: &crate::parse::refs::Av1Picture,
+        gpu: bool,
+    ) -> Result<(), VulkanError> {
+        use crate::session::std_av1::{fill_reference, Av1PictureStd};
+        if picture.header().grain().apply_grain {
+            return Err(VulkanError::Unsupported {
+                what: "av1 film grain output".to_owned(),
+            });
+        }
+        apply_armed_fault(&mut self.session, &mut self.fault);
+        let state = self.resolve_ref_state(picture)?;
+        let super128 = self
+            .seq
+            .as_ref()
+            .is_some_and(|seq| seq.use_128x128_superblock());
+        let Self {
+            session,
+            sink,
+            scratch,
+            begin_bufs,
+            ref_bufs,
+            pending,
+            ..
+        } = self;
+        let Some(session) = session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
+        let body = picture.picture();
+        let header = picture.header();
+        release_ids(session, picture.pre());
+        let setup_id = body.id().unwrap_or_else(|| scratch.next());
+        let setup_slot = session.slots_mut().claim(setup_id)?;
+        let extent = {
+            let (width, height) = session.geometry().coded();
+            vk::Extent2D { width, height }
+        };
+        let refs = collect_av1_refs(session, picture)?;
+        let ref_entries = fill_av1_refs(session, &refs);
+        let begin_entries = begin_av1_entries(session);
+        let dpb_of = |std| vk::VideoDecodeAV1DpbSlotInfoKHR {
+            p_std_reference_info: std,
+            ..Default::default()
+        };
+        ref_bufs.fill(&ref_entries, extent, "decode slot", dpb_of)?;
+        begin_bufs.fill(&begin_entries, extent, "begin slot", dpb_of)?;
+        let ref_slots = ref_bufs.slots(&ref_entries, "decode slot")?;
+        let begin_slots = begin_bufs.slots(&begin_entries, "begin slot")?;
+        let setup_std = fill_reference(
+            header.order_hint(),
+            header.frame_type(),
+            state.bias,
+            state.order_hints,
+            header.disable_frame_end_update_cdf(),
+            header.segmentation().enabled,
+        );
+        let (setup_resource, setup_index) = setup_target(session, extent, setup_slot)?;
+        let std_sets = Av1PictureStd::fill(header, super128, state.order_hints, state.expected);
+        let name_indices = av1_name_indices(session, picture)?;
+        let codec = av1_codec_info(picture, &std_sets, name_indices)?;
+        let setup_dpb = vk::VideoDecodeAV1DpbSlotInfoKHR {
+            p_std_reference_info: std::ptr::from_ref(&setup_std),
+            ..Default::default()
+        };
+        let mut setup = reference_slot(setup_index, &setup_resource);
+        setup.p_next = std::ptr::from_ref(&setup_dpb).cast();
+        let setup_bind = reference_slot(-1, &setup_resource);
+        let mut begin_all = begin_slots;
+        if session.meta(setup_slot).is_none() {
+            begin_all.push(setup_bind);
+        }
+        let submitted = match plan_submit(
+            session,
+            sink,
+            body,
+            &SubmitPlan {
+                setup_id,
+                setup_slot,
+                begin: &begin_all,
+                refs: &ref_slots,
+                setup: &setup,
+                dst: setup_resource,
+                picture_next: std::ptr::from_ref(&codec).cast(),
+                meta: DpbMeta::Av1(setup_std),
+                flush_on_reset: true,
+                emit: header.show_frame(),
+            },
+            gpu,
+        ) {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                release_ids(session, picture.post());
+                return Err(error);
+            }
+        };
+        release_ids(session, picture.post());
+        pending.push(submitted);
+        Ok(())
+    }
+
+    /// Run one temporal unit through the context, submitting its pictures.
+    fn run_unit(
+        &mut self,
+        unit: &crate::parse::av1::TemporalUnit<'_>,
+        gpu: bool,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        use crate::parse::refs::Av1Instruction;
+        let mut out = Vec::new();
+        for instruction in self.context.compile(unit)? {
+            match instruction {
+                Av1Instruction::Sequence(seq) => {
+                    let drained = self.drain()?;
+                    out.extend(drained);
+                    self.tables.insert(&seq);
+                    if self.seq.as_ref().is_some_and(|cur| cur != &seq) {
+                        self.session = None;
+                        self.shown.clear();
+                    }
+                    self.seq = Some(seq);
+                }
+                Av1Instruction::Picture(picture) => {
+                    let Some(seq) = self.seq.clone() else {
+                        return Err(VulkanError::NoSession);
+                    };
+                    self.ensure_session(&seq, picture.header().display_size())?;
+                    self.submit_picture(picture.as_ref(), gpu)?;
+                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                        out.extend(self.drain()?);
+                    }
+                }
+                Av1Instruction::ShowExisting { id, releases } => {
+                    let drained = self.drain()?;
+                    out.extend(drained);
+                    if let Some(session) = self.session.as_mut() {
+                        for release in &releases {
+                            if let Some(slot) = session.slots().slot_of(*release) {
+                                session.set_meta(slot, None);
+                            }
+                            session.slots_mut().release(*release);
+                        }
+                    }
+                    self.shown.evict(&releases);
+                    let Some(stored) = self.shown.get(id) else {
+                        return Err(ParseError::MissingSet {
+                            id: u32::try_from(id.0).unwrap_or(0),
+                        }
+                        .into());
+                    };
+                    let poc = self.show_seq;
+                    self.show_seq = self.show_seq.wrapping_add(1);
+                    out.extend(self.sink.emit_stored(
+                        stored.size,
+                        stored.cpu.as_ref(),
+                        stored.gpu.as_ref(),
+                        poc,
+                    )?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collect every submitted picture, retaining reference frames.
+    fn drain(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
+        let mut out = Vec::new();
+        for picture in self.pending.drain(..) {
+            let emit = picture.emit;
+            let show_id = picture.show_id;
+            let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
+            let frames = collect_pending(session, &mut self.sink, picture)?;
+            if let Some(id) = show_id {
+                for frame in &frames {
+                    let cpu = frame
+                        .device_export()
+                        .is_none()
+                        .then(|| frame.bytes().clone());
+                    self.shown
+                        .insert(id, frame.identity().size(), cpu, pair.clone());
+                }
+            }
+            if emit {
+                out.extend(frames);
+            }
+        }
+        let snapshot = session.submit_stats();
+        self.stats.peak_inflight = self.stats.peak_inflight.max(snapshot.peak_inflight);
+        self.stats.resets += session.take_resets();
+        Ok(out)
+    }
+
+    /// Decode raw OBU bytes, returning display-ready frames.
+    fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        let obus = crate::parse::av1::split_obus(bytes)?;
+        for unit in crate::parse::av1::temporal_units(obus) {
+            out.extend(self.run_unit(&unit, gpu)?);
+        }
+        out.extend(self.drain()?);
+        Ok(out)
+    }
+
+    /// Frames decoded from `packet` with device exports attached.
+    ///
+    /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
+    /// is absent. Each frame pins its export planes until dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot decode `packet` or export it.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), true)
+    }
+
+    /// Surface frames held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    pub fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner()
+    }
+
+    /// Held frames.
+    fn flush_inner(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = self.drain()?;
+        out.extend(self.sink.reorder().flush());
+        Ok(out)
+    }
+}
+
+impl Decoder for Av1Decoder<'_> {
+    type Frame = VulkanFrame;
+    type Error = VulkanError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.run_bytes(packet.data(), false)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.flush_inner()
+    }
+}
+
+/// Release `ids` from the session DPB, clearing their metadata.
+fn release_ids(session: &mut Session, ids: &[ReferenceId]) {
+    for id in ids {
+        if let Some(slot) = session.slots().slot_of(*id) {
+            session.set_meta(slot, None);
+        }
+        session.slots_mut().release(*id);
+    }
+}
+
+/// Reference name slot indices of `picture`, negative when unclaimed.
+///
+/// # Errors
+///
+/// Returns `Err` when a slot id exceeds its field width.
+fn av1_name_indices(
+    session: &Session,
+    picture: &crate::parse::refs::Av1Picture,
+) -> Result<[i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR], VulkanError> {
+    let mut name_indices = [-1_i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR];
+    for (name, id) in picture.name_slots().iter().enumerate() {
+        let Some(id) = id else { continue };
+        let Some(slot) = session.slots().slot_of(*id) else {
+            continue;
+        };
+        name_indices[name] = i32::try_from(slot).map_err(|_| ParseError::OutOfRange {
+            syntax: "decode slot",
+        })?;
+    }
+    Ok(name_indices)
+}
+
+/// AV1 picture info chain of `picture` over `std_sets`.
+///
+/// # Errors
+///
+/// Returns `Err` when the tile count exceeds its field width.
+fn av1_codec_info<'a>(
+    picture: &'a crate::parse::refs::Av1Picture,
+    std_sets: &'a crate::session::std_av1::Av1PictureStd,
+    name_indices: [i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR],
+) -> Result<vk::VideoDecodeAV1PictureInfoKHR<'a>, VulkanError> {
+    Ok(vk::VideoDecodeAV1PictureInfoKHR {
+        p_std_picture_info: std::ptr::from_ref(std_sets.info()),
+        reference_name_slot_indices: name_indices,
+        frame_header_offset: 0,
+        tile_count: u32::try_from(picture.tile_offsets().len()).map_err(|_| {
+            ParseError::OutOfRange {
+                syntax: "tile count",
+            }
+        })?,
+        p_tile_offsets: picture.tile_offsets().as_ptr(),
+        p_tile_sizes: picture.tile_sizes().as_ptr(),
+        ..Default::default()
+    })
+}
+
+/// Deduplicated reference slots of one AV1 picture in DPB order.
+///
+/// # Errors
+///
+/// Returns `Err` when a cited reference left the session; the caller
+/// resyncs instead of submitting a dangling `-1`.
+fn collect_av1_refs(
+    session: &Session,
+    picture: &crate::parse::refs::Av1Picture,
+) -> Result<Vec<(usize, ReferenceId)>, VulkanError> {
+    let mut refs = Vec::new();
+    let mut seen = HashSet::new();
+    for id in picture.name_slots().iter().flatten() {
+        let Some(slot) = session.slots().slot_of(*id) else {
+            return Err(ParseError::MissingSet {
+                id: u32::try_from(id.0).map_err(|_| ParseError::OutOfRange {
+                    syntax: "reference id",
+                })?,
+            }
+            .into());
+        };
+        if !seen.insert(slot) {
+            continue;
+        }
+        refs.push((slot, *id));
+    }
+    if refs.len() > session.geometry().active_refs() as usize {
+        return Err(VulkanError::OverCaps {
+            what: "active references",
+        });
+    }
+    Ok(refs)
+}
+
+/// Standard reference entries of `refs` from the session metas.
+fn fill_av1_refs(
+    session: &Session,
+    refs: &[(usize, ReferenceId)],
+) -> Vec<(
+    usize,
+    ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+    vk::ImageView,
+)> {
+    let mut entries = Vec::with_capacity(refs.len());
+    for (slot, _) in refs {
+        let Some(view) = session.dpb_view(*slot) else {
+            continue;
+        };
+        let Some(DpbMeta::Av1(std)) = session.meta(*slot) else {
+            continue;
+        };
+        entries.push((*slot, std, view));
+    }
+    entries
+}
+
+/// Standard reference entries held at begin time.
+fn begin_av1_entries(
+    session: &Session,
+) -> Vec<(
+    usize,
+    ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+    vk::ImageView,
+)> {
+    let mut entries = Vec::new();
+    for slot in 0..session.geometry().dpb_slots() as usize {
+        let Some(DpbMeta::Av1(std)) = session.meta(slot) else {
+            continue;
+        };
+        let Some(view) = session.dpb_view(slot) else {
+            continue;
+        };
+        entries.push((slot, std, view));
+    }
+    entries
+}
+
 /// POC of the picture in `slot`, from its stored reference info.
 fn ref_poc(session: &Session, slot: usize) -> i32 {
     match session.meta(slot) {
         Some(DpbMeta::H265(std)) => std.PicOrderCntVal,
         Some(DpbMeta::H264(std)) => std.PicOrderCnt[0],
+        Some(DpbMeta::Av1(std)) => i32::from(std.OrderHint),
         None => 0,
     }
 }
@@ -1580,6 +2272,112 @@ mod tests {
     use rust_video_caps::traits::SharedDevice;
 
     use super::VulkanFrame;
+
+    /// AV1 hardware decode against software decode, or a loud decline.
+    ///
+    /// Without AV1 caps, ffmpeg, or VRAM the test prints its reason and
+    /// passes; with all three the GPU bytes must match software exactly.
+    #[test]
+    fn av1_matches_software_decode_or_declines() {
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+
+        use crate::device::VulkanDevice;
+        use crate::error::VulkanError;
+        use crate::ladder::CodecOp;
+
+        let device = match VulkanDevice::open_or_skip(CodecOp::Av1Decode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: av1 on this box: {reason}");
+                return;
+            }
+            Err(error) => panic!("negotiation failed: {error}"),
+        };
+        let workdir = std::env::temp_dir().join("vulkan-av1-test");
+        if std::fs::create_dir_all(&workdir).is_err() {
+            println!("declined: av1 without a workdir");
+            return;
+        }
+        let vector = workdir.join("probe.obu");
+        let synth = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=0.2",
+                "-c:v",
+                "libaom-av1",
+                "-b:v",
+                "200k",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&vector)
+            .output();
+        if !synth.is_ok_and(|synth| synth.status.success()) {
+            println!("declined: av1 without ffmpeg libaom-av1");
+            return;
+        }
+        let bytes = std::fs::read(&vector).expect("vector reads");
+        let mut decoder = match super::Av1Decoder::open(&device) {
+            Ok(decoder) => decoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                let (free_mb, total_mb) = device.memory_budget_mb();
+                println!("declined:OOM av1 open: {error} (free {free_mb}MB of {total_mb}MB)");
+                return;
+            }
+            Err(error) => panic!("engine starts: {error}"),
+        };
+        let mut actual = Vec::new();
+        let mut scratch = Vec::new();
+        let mut frames = match decoder.decode(&Packet::new(Bytes::from(bytes))) {
+            Ok(frames) => frames,
+            Err(error) if error.is_out_of_device_memory() => {
+                let (free_mb, total_mb) = device.memory_budget_mb();
+                println!("declined:OOM av1 decode: {error} (free {free_mb}MB of {total_mb}MB)");
+                return;
+            }
+            Err(error) => panic!("decode runs: {error}"),
+        };
+        frames.extend(match decoder.flush() {
+            Ok(frames) => frames,
+            Err(error) if error.is_out_of_device_memory() => {
+                let (free_mb, total_mb) = device.memory_budget_mb();
+                println!("declined:OOM av1 flush: {error} (free {free_mb}MB of {total_mb}MB)");
+                return;
+            }
+            Err(error) => panic!("flush runs: {error}"),
+        });
+        assert!(!frames.is_empty(), "no frames decoded");
+        for frame in &frames {
+            frame.yuv420p_into(&mut scratch);
+            actual.extend_from_slice(&scratch);
+        }
+        let expected = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&vector)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("software decode runs");
+        assert!(expected.status.success(), "software decode fails");
+        assert_eq!(
+            actual.len(),
+            expected.stdout.len(),
+            "byte count differs from software decode"
+        );
+        let first = actual
+            .iter()
+            .zip(expected.stdout.iter())
+            .position(|(a, b)| a != b);
+        assert!(
+            first.is_none(),
+            "bytes differ from software decode at {first:?}"
+        );
+    }
 
     /// Frame over `data` leased against `shared`.
     fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> VulkanFrame {

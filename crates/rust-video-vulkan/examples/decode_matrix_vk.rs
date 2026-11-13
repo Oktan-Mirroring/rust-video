@@ -5,7 +5,8 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_vulkan::{
-    CodecOp, H264Decoder, H265Decoder, Transcoder, VulkanDevice, VulkanError, VulkanFrame,
+    Av1Decoder, CodecOp, H264Decoder, H265Decoder, Transcoder, VulkanDevice, VulkanError,
+    VulkanFrame,
 };
 
 fn main() {
@@ -14,6 +15,9 @@ fn main() {
     }
     if let Some(device) = probe_device(CodecOp::H265Decode, "h265-decode") {
         run_decode("h265", H265Decoder::open(&device));
+    }
+    if let Some(device) = probe_device(CodecOp::Av1Decode, "av1-decode") {
+        run_decode("av1", Av1Decoder::open(&device));
     }
     if probe_device(CodecOp::H264Encode, "h264-encode").is_some() {
         println!("h264-encode: session negotiates");

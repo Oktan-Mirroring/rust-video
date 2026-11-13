@@ -47,6 +47,13 @@ const H265_PROFILES: [vk::native::StdVideoH265ProfileIdc; 2] = [
     vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN,
 ];
 
+/// AV1 profiles the caps rung probes, most capable first.
+const AV1_PROFILES: [vk::native::StdVideoAV1Profile; 3] = [
+    vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_PROFESSIONAL,
+    vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH,
+    vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN,
+];
+
 impl AshBackend {
     /// Entry plus 1.3 instance over the system loader.
     ///
@@ -174,6 +181,7 @@ impl AshBackend {
         }
         let h264 = self.h264_caps(adapter, &names);
         let h265 = self.h265_caps(adapter, &names);
+        let av1 = self.av1_caps(adapter, &names);
         let h264_encode = self.h264_encode_caps(adapter, &names);
         let h265_encode = self.h265_encode_caps(adapter, &names);
         Ok(AdapterFacts {
@@ -189,6 +197,7 @@ impl AshBackend {
             encode_queue_families: encode,
             h264,
             h265,
+            av1,
             h264_encode,
             h265_encode,
         })
@@ -387,6 +396,61 @@ impl AshBackend {
                     dpb_slots: facts.2,
                     active_refs: facts.3,
                     max_level: crate::session::geometry::h265_std_to_wire(codec_caps.max_level_idc),
+                    std_version: facts.4,
+                    min_bitstream_align: facts.5,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// AV1 caps from the first supported profile, if any.
+    ///
+    /// Skips the query unless every video extension string is present:
+    /// ash loads a panicking stub for missing extension entry points.
+    fn av1_caps(&self, adapter: vk::PhysicalDevice, extensions: &[CString]) -> Option<DecodeFacts> {
+        if !Self::gated(CodecOp::Av1Decode, extensions) {
+            return None;
+        }
+        AV1_PROFILES.iter().find_map(|profile| {
+            let mut av1 = vk::VideoDecodeAV1ProfileInfoKHR::default().std_profile(*profile);
+            let query = vk::VideoProfileInfoKHR::default()
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
+                .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+                .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+                .push_next(&mut av1);
+            let mut codec_caps = vk::VideoDecodeAV1CapabilitiesKHR::default();
+            let mut decode_caps = vk::VideoDecodeCapabilitiesKHR::default();
+            let (status, facts) = {
+                let mut caps = vk::VideoCapabilitiesKHR::default()
+                    .push_next(&mut codec_caps)
+                    .push_next(&mut decode_caps);
+                // SAFETY: gated on extension strings; structs outlive the call.
+                let status = unsafe {
+                    (self.video.fp().get_physical_device_video_capabilities_khr)(
+                        adapter,
+                        &raw const query,
+                        &raw mut caps,
+                    )
+                };
+                let facts = (
+                    caps.max_coded_extent.width,
+                    caps.max_coded_extent.height,
+                    caps.max_dpb_slots,
+                    caps.max_active_reference_pictures,
+                    caps.std_header_version.spec_version,
+                    caps.min_bitstream_buffer_size_alignment,
+                );
+                (status, facts)
+            };
+            if status == vk::Result::SUCCESS {
+                Some(DecodeFacts {
+                    coded_extent: (facts.0, facts.1),
+                    dpb_slots: facts.2,
+                    active_refs: facts.3,
+                    max_level: crate::session::geometry::av1_std_to_wire(codec_caps.max_level),
                     std_version: facts.4,
                     min_bitstream_align: facts.5,
                 })
