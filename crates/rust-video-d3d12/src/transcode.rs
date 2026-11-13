@@ -10,7 +10,7 @@ mod h264;
 use crate::decoder::{D3d12Frame, H264Decoder, HevcDecoder};
 use crate::device::D3d12Device;
 use crate::encoder::D3d12Encoder;
-use crate::error::D3d12Error;
+use crate::error::{D3d12Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::scale::Scaler;
 use crate::texture::GpuTexture;
@@ -96,7 +96,9 @@ impl<'a> Transcoder<'a> {
             Codec::H264 => Source::H264(Box::new(H264Decoder::open(device))),
             Codec::Hevc => Source::Hevc(Box::new(HevcDecoder::open(device))),
             codec => {
-                return Err(D3d12Error::Unsupported(format!("{codec} decode pending")));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::DecodePending {
+                    codec,
+                }));
             }
         };
         let encoder = D3d12Encoder::open(device, encode)?;
@@ -199,7 +201,9 @@ impl<'a> Transcoder<'a> {
         let mut packets = Vec::new();
         for texture in textures {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
-                return Err(D3d12Error::Unsupported(cause.to_string()));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             let scaled;
             let input = if let Some(cause) = self.scale.miss(texture.size()) {
@@ -220,7 +224,9 @@ impl<'a> Transcoder<'a> {
         cause: FallbackCause,
     ) -> Result<GpuTexture, D3d12Error> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
-            return Err(D3d12Error::Unsupported(cause.to_string()));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
+                cause,
+            }));
         };
         if self
             .scaler
@@ -230,7 +236,9 @@ impl<'a> Transcoder<'a> {
             match Scaler::open(self.device, from, to) {
                 Ok(scaler) => self.scaler = Some(scaler),
                 Err(D3d12Error::Unsupported(_)) => {
-                    return Err(D3d12Error::Unsupported(cause.to_string()));
+                    return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
+                        cause,
+                    }));
                 }
                 Err(error) => return Err(error),
             }
@@ -245,14 +253,18 @@ impl<'a> Transcoder<'a> {
     fn encode_cpu(&mut self, frames: &[D3d12Frame]) -> Result<Vec<Packet>, D3d12Error> {
         let mut packets = Vec::new();
         for frame in frames {
-            let cpu = frame
-                .to_cpu()
-                .ok_or_else(|| D3d12Error::Unsupported("readback short of extent".to_owned()))?;
+            let cpu = frame.to_cpu().ok_or(D3d12Error::Unsupported(
+                UnsupportedReason::ReadbackShortOfExtent,
+            ))?;
             if let Some(cause) = self.convert.miss(cpu.format()) {
-                return Err(D3d12Error::Unsupported(cause.to_string()));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             if let Some(cause) = self.scale.miss(cpu.size()) {
-                return Err(D3d12Error::Unsupported(cause.to_string()));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             packets.append(&mut self.encoder.encode(&cpu)?);
         }
@@ -426,7 +438,10 @@ mod tests {
             .and_then(|_| transcoder.flush());
         match drained {
             Err(crate::error::D3d12Error::Unsupported(error)) => {
-                assert!(error.contains("scale"), "names the hop: {error}");
+                assert!(
+                    error.to_string().contains("scale"),
+                    "names the hop: {error}"
+                );
             }
             outcome => panic!("expected scale miss, got {outcome:?}"),
         }

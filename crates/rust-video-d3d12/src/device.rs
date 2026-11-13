@@ -1,14 +1,13 @@
 //! D3D12 device with enumerated decoder profiles behind the caps `Device` trait.
 
+// FFI boundary: D3D12 device enumeration COM calls live here.
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 
 #[cfg(target_os = "windows")]
-use crate::error::D3d12Error;
-#[cfg(target_os = "windows")]
-use crate::error::SkipReason;
+use crate::error::{D3d12Error, SkipReason, UnsupportedReason};
 use crate::guid::{Codec, Profile};
 
 use rust_video_caps::traits::Device;
@@ -586,7 +585,7 @@ pub(crate) fn check_decode_support(
         });
     }
     if support.DecodeTier.0 < D3D12_VIDEO_DECODE_TIER_2.0 {
-        return Err(D3d12Error::Unsupported("decode tier 1".to_owned()));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::DecodeTier1));
     }
     Ok(())
 }

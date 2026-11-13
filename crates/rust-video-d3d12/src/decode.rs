@@ -5,6 +5,7 @@
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
 
+// FFI boundary: video-decode COM calls live here.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -22,7 +23,7 @@ use crate::dxva::{
     HEVC_TOOL_OUTPUT_FLAG, HEVC_TOOL_SAO, HEVC_TOOL_SIGN_HIDING, HEVC_TOOL_STRONG_INTRA,
     HEVC_TOOL_TEMPORAL_MVP,
 };
-use crate::error::D3d12Error;
+use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::Crop;
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 
@@ -96,7 +97,9 @@ pub(crate) fn start_coded_bitstream(nals: &[&[u8]]) -> Result<CodedBitstream, D3
         spans.push((location, bytes));
     }
     if spans.is_empty() {
-        return Err(D3d12Error::Unsupported("picture without slices".to_owned()));
+        return Err(D3d12Error::Unsupported(
+            UnsupportedReason::PictureWithoutSlices,
+        ));
     }
     let padding = 128 - (bitstream.len() % 128);
     bitstream.resize(bitstream.len() + padding, 0);
@@ -139,22 +142,24 @@ impl HevcSubmission {
     ) -> Result<Self, D3d12Error> {
         if !picture.intra() {
             return Err(D3d12Error::Unsupported(
-                "inter picture needs references".to_owned(),
+                UnsupportedReason::InterPictureNeedsReferences,
             ));
         }
         if !picture.idr {
             return Err(D3d12Error::Unsupported(
-                "non-IDR intra needs POC tracking".to_owned(),
+                UnsupportedReason::NonIdrIntraNeedsPocTracking,
             ));
         }
         if picture.slices.is_empty() {
-            return Err(D3d12Error::Unsupported("picture without slices".to_owned()));
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::PictureWithoutSlices,
+            ));
         }
         let min_cb = sps.min_cb();
         let width_in_min_cbs = u16::try_from(sps.width().div_ceil(min_cb))
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let height_in_min_cbs = u16::try_from(sps.height().div_ceil(min_cb))
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let mut params = PicParamsHevc::empty();
         params.pic_width_in_min_cbs_y = width_in_min_cbs;
         params.pic_height_in_min_cbs_y = height_in_min_cbs;
@@ -532,12 +537,13 @@ impl DecodeSession {
         crop: Option<Crop>,
     ) -> Result<Self, D3d12Error> {
         if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
-            return Err(D3d12Error::Unsupported(format!(
-                "{codec} picture args pending"
-            )));
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::PictureArgsPending { codec },
+            ));
         }
-        let profile = crate::device::decode_profile(codec)
-            .ok_or_else(|| D3d12Error::Unsupported(format!("no {codec} decode profile")))?;
+        let profile = crate::device::decode_profile(codec).ok_or(D3d12Error::Unsupported(
+            UnsupportedReason::NoDecodeProfile { codec },
+        ))?;
         crate::device::check_decode_support(device.video(), profile, width, height)?;
         let resources = DeviceResources::new(device.device());
         let heap = crate::device::create_decoder_heap(device.video(), profile, width, height)?;
@@ -668,13 +674,17 @@ impl DecodeSession {
         let source = self
             .outputs
             .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?
             .clone();
         self.wait_copy_slot(index)?;
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         pair.reset()?;
         let list = pair.list();
         // Sound: the barriers name a live texture; the list is open.
@@ -688,7 +698,9 @@ impl DecodeSession {
         let staging = self
             .staging
             .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?
             .clone();
         // Sound: the copy locations name live resources; the list is open.
         unsafe {
@@ -713,7 +725,9 @@ impl DecodeSession {
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
         self.copy_busy[index] = Some(ticket);
         Ok(ticket)
@@ -727,10 +741,9 @@ impl DecodeSession {
     /// the wait budget, or when staging falls short of the layout.
     pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Vec<u8>, D3d12Error> {
         let index = usize::from(slot);
-        let staging = self
-            .staging
-            .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+        let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
+            BrokenReferenceReason::SlotOutsidePool,
+        ))?;
         self.copy_fence.wait(ticket)?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
@@ -777,7 +790,9 @@ impl DecodeSession {
         self.outputs
             .get(usize::from(slot))
             .cloned()
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))
     }
 
     /// Pool `slot` cropped to the visible rectangle on the GPU.
@@ -809,20 +824,27 @@ impl DecodeSession {
         let source = self
             .outputs
             .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?
             .clone();
         let target = self
             .crops
             .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?
             .clone();
-        let plan = crop_plan(self.width, self.height, self.crop)
-            .ok_or_else(|| D3d12Error::BrokenReference("crop target without crop".to_owned()))?;
+        let plan = crop_plan(self.width, self.height, self.crop).ok_or(
+            D3d12Error::BrokenReference(BrokenReferenceReason::CropTargetWithoutCrop),
+        )?;
         self.wait_copy_slot(index)?;
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         pair.reset()?;
         let list = pair.list();
         // Sound: the barriers name live textures; the list is open.
@@ -878,7 +900,9 @@ impl DecodeSession {
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
         self.copy_busy[index] = Some(ticket);
         Ok(ticket)
@@ -899,7 +923,9 @@ impl DecodeSession {
         self.crops
             .get(usize::from(slot))
             .cloned()
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
@@ -985,12 +1011,16 @@ impl DecodeSession {
         let target = self
             .outputs
             .get(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?
             .clone();
         let pair = self
             .video_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         pair.reset()?;
         let list = pair.list();
         let output = D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS {
@@ -1029,7 +1059,9 @@ impl DecodeSession {
         let pair = self
             .video_slots
             .get_mut(index)
-            .ok_or_else(|| D3d12Error::BrokenReference("slot outside pool".to_owned()))?;
+            .ok_or(D3d12Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsidePool,
+            ))?;
         let ticket = pair.close_execute(&self.video_queue, &mut self.video_fence)?;
         self.video_busy = Some(ticket);
         Ok(ticket)
@@ -1042,15 +1074,15 @@ impl DecodeSession {
         refs: Option<&mut RefTables>,
     ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
         let params_len = u32::try_from(std::mem::size_of::<S::Params>())
-            .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
         let matrix_len = u32::try_from(std::mem::size_of::<S::Matrix>())
-            .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
         let slices_len = u32::try_from(
             std::mem::size_of::<S::Slice>().saturating_mul(submission.slices().len()),
         )
-        .map_err(|_| D3d12Error::Unsupported("picture args too large".to_owned()))?;
+        .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
         let bitstream_len = u64::try_from(submission.bitstream_len())
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let mut args = [D3D12_VIDEO_DECODE_FRAME_ARGUMENT::default(); 10];
         args[0] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
             Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS,

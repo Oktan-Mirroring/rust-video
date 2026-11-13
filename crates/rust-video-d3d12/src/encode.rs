@@ -2,11 +2,12 @@
 //!
 //! Intra-only H.264 and HEVC; reference pictures stay pending.
 
+// FFI boundary: video-encode COM calls live here.
 #![allow(unsafe_code)]
 
 use std::mem::ManuallyDrop;
 
-use crate::error::D3d12Error;
+use crate::error::{D3d12Error, UnsupportedReason};
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 
 use windows::Win32::Graphics::Direct3D12::{
@@ -126,7 +127,7 @@ fn pad_grid(visible: u32) -> Result<u32, D3d12Error> {
     visible
         .div_ceil(MB)
         .checked_mul(MB)
-        .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))
+        .ok_or(D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))
 }
 
 /// Right and bottom pad in luma samples under `visible` in `coded`.
@@ -140,7 +141,7 @@ fn pad_crop(
         return Ok(None);
     }
     if !right.is_multiple_of(2) || !bottom.is_multiple_of(2) {
-        return Err(D3d12Error::Unsupported("odd visible extent".to_owned()));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::OddVisibleExtent));
     }
     Ok(Some(crate::h264::Crop {
         left: 0,
@@ -176,9 +177,13 @@ impl H264Headers {
             .0
             .checked_div(MB)
             .and_then(|w| coded.1.checked_div(MB).and_then(|h| w.checked_mul(h)))
-            .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .ok_or(D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let level_idc = LEVELS.iter().find(|entry| mbs <= entry.0).map_or_else(
-            || Err(D3d12Error::Unsupported("extent above level 5.2".to_owned())),
+            || {
+                Err(D3d12Error::Unsupported(
+                    UnsupportedReason::ExtentAboveLevel52,
+                ))
+            },
             |entry| Ok(entry.1),
         )?;
         let mut bytes = Vec::new();
@@ -280,12 +285,16 @@ impl HevcHeaders {
         let samples = coded
             .0
             .checked_mul(coded.1)
-            .ok_or_else(|| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .ok_or(D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let level_idc = LEVELS_HEVC
             .iter()
             .find(|entry| samples <= entry.0)
             .map_or_else(
-                || Err(D3d12Error::Unsupported("extent above level 6.2".to_owned())),
+                || {
+                    Err(D3d12Error::Unsupported(
+                        UnsupportedReason::ExtentAboveLevel62,
+                    ))
+                },
                 |entry| Ok(entry.1),
             )?;
         let mut bytes = Vec::new();
@@ -483,7 +492,7 @@ fn pad_nv12(
     let y_len = vis_w.saturating_mul(vis_h);
     if visible.len() < y_len + y_len / 2 {
         return Err(D3d12Error::Unsupported(
-            "nv12 short of its extent".to_owned(),
+            UnsupportedReason::Nv12ShortOfExtent,
         ));
     }
     let mut out = Vec::with_capacity(coded_w * coded_h * 3 / 2);
@@ -749,9 +758,9 @@ impl EncodeSession {
         height: u32,
     ) -> Result<Self, D3d12Error> {
         if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
-            return Err(D3d12Error::Unsupported(format!(
-                "{codec} encode args pending"
-            )));
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::EncodeArgsPending { codec },
+            ));
         }
         let (mut descriptors, header_bytes) = Self::descriptors(codec, width, height)?;
         let (coded_width, coded_height) = match descriptors.as_ref() {
@@ -842,9 +851,9 @@ impl EncodeSession {
                 });
                 Ok((Box::new(descriptors), headers.into_bytes()))
             }
-            _ => Err(D3d12Error::Unsupported(format!(
-                "{codec} encode args pending"
-            ))),
+            _ => Err(D3d12Error::Unsupported(
+                UnsupportedReason::EncodeArgsPending { codec },
+            )),
         }
     }
 
@@ -867,7 +876,7 @@ impl EncodeSession {
             50 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_5),
             51 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_51),
             52 => Ok(D3D12_VIDEO_ENCODER_LEVELS_H264_52),
-            _ => Err(D3d12Error::Unsupported("level outside 5.2".to_owned())),
+            _ => Err(D3d12Error::Unsupported(UnsupportedReason::LevelOutside52)),
         }
     }
 
@@ -890,7 +899,7 @@ impl EncodeSession {
             183 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_61,
             186 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_62,
             _ => {
-                return Err(D3d12Error::Unsupported("level outside 6.2".to_owned()));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::LevelOutside62));
             }
         };
         Ok(D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC {
@@ -1256,7 +1265,7 @@ impl EncodeSession {
     ) -> Result<Vec<u8>, D3d12Error> {
         if (width, height) != (self.visible_width, self.visible_height) {
             return Err(D3d12Error::Unsupported(
-                "texture extent outside session".to_owned(),
+                UnsupportedReason::TextureExtentOutsideSession,
             ));
         }
         let ticket = self.submit_copy_from(src, width, height)?;
@@ -1272,16 +1281,17 @@ impl EncodeSession {
         self.copy_fence.wait(ticket)?;
         let meta = self.read_metadata()?;
         if meta.EncodeErrorFlags != 0 {
-            return Err(D3d12Error::Unsupported(format!(
-                "encoder error flags {:#x}",
-                meta.EncodeErrorFlags
-            )));
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::EncoderErrorFlags {
+                    flags: meta.EncodeErrorFlags,
+                },
+            ));
         }
         let driver_len = usize::try_from(meta.EncodedBitstreamWrittenBytesCount)
-            .map_err(|_| D3d12Error::Unsupported("bitstream too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::BitstreamTooLarge))?;
         if u64::try_from(driver_len).unwrap_or(u64::MAX) > self.bitstream_cap || driver_len == 0 {
             return Err(D3d12Error::Unsupported(
-                "driver bitstream outside buffer".to_owned(),
+                UnsupportedReason::DriverBitstreamOutsideBuffer,
             ));
         }
         let buffer = DeviceResources::read_readback(&self.staging, driver_len)?;
@@ -1745,7 +1755,7 @@ impl EncodeSession {
         let bytes = DeviceResources::read_readback(&self.resolved_staging, len)?;
         if bytes.len() < len {
             return Err(D3d12Error::Unsupported(
-                "resolved metadata short".to_owned(),
+                UnsupportedReason::ResolvedMetadataShort,
             ));
         }
         // Sound: the length is verified; the metadata is plain data.

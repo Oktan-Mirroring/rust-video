@@ -4,12 +4,13 @@
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12fence-seteventoncompletion>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
 
+// FFI boundary: queue, fence, and resource COM calls live here.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 
-use crate::error::D3d12Error;
+use crate::error::{D3d12Error, UnsupportedReason};
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::{
@@ -154,7 +155,7 @@ impl Nv12Layout {
     ) -> Result<Vec<u8>, D3d12Error> {
         let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
         let y_len = usize::try_from(u64::from(visible_width) * u64::from(visible_height))
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let mut out = Vec::with_capacity(y_len + y_len / 2);
         for (plane, index) in self.planes.iter().zip([0, 1]) {
             let (plane_left, plane_top, plane_width, plane_rows) = if index == 0 {
@@ -183,14 +184,14 @@ impl Nv12Layout {
         height: u32,
     ) -> Result<Vec<u8>, D3d12Error> {
         let y_len = usize::try_from(u64::from(width) * u64::from(height))
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         if nv12.len() < y_len + y_len / 2 {
             return Err(D3d12Error::Unsupported(
-                "nv12 short of its extent".to_owned(),
+                UnsupportedReason::Nv12ShortOfExtent,
             ));
         }
         let total = usize::try_from(self.total)
-            .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let mut staged = vec![0u8; total];
         let mut src = 0usize;
         for (plane, rows) in self.planes.iter().zip([height, height / 2]) {
@@ -203,7 +204,7 @@ impl Nv12Layout {
                 let end = dst.saturating_add(width);
                 if end > staged.len() || src.saturating_add(width) > nv12.len() {
                     return Err(D3d12Error::Unsupported(
-                        "staging short of its layout".to_owned(),
+                        UnsupportedReason::StagingShortOfLayout,
                     ));
                 }
                 staged[dst..end].copy_from_slice(&nv12[src..src + width]);
@@ -249,7 +250,7 @@ fn copy_plane(
         let end = src.saturating_add(width);
         if end > staged.len() {
             return Err(D3d12Error::Unsupported(
-                "staging short of its layout".to_owned(),
+                UnsupportedReason::StagingShortOfLayout,
             ));
         }
         out.extend_from_slice(&staged[src..end]);
@@ -373,7 +374,9 @@ impl DeviceResources {
             call,
             hresult: error.code().0,
         })?;
-        out.ok_or_else(|| D3d12Error::Unsupported(format!("{call} returned null")))
+        out.ok_or(D3d12Error::Unsupported(
+            UnsupportedReason::CallReturnedNull { call },
+        ))
     }
 
     /// Pitch layout plus driver footprints for a `width` by `height` NV12 texture.
@@ -401,7 +404,7 @@ impl DeviceResources {
             );
         }
         if total == 0 {
-            return Err(D3d12Error::Unsupported("empty NV12 layout".to_owned()));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::EmptyNv12Layout));
         }
         let planes = [
             Nv12Plane {
@@ -537,7 +540,7 @@ impl DeviceResources {
         })?;
         if mapped.is_null() {
             return Err(D3d12Error::Unsupported(
-                "upload map returned null".to_owned(),
+                UnsupportedReason::UploadMapReturnedNull,
             ));
         }
         // Sound: `mapped` spans `bytes.len()` upload bytes; `bytes` outlives the copy.
@@ -578,7 +581,7 @@ impl DeviceResources {
         })?;
         if read.is_null() {
             return Err(D3d12Error::Unsupported(
-                "readback map returned null".to_owned(),
+                UnsupportedReason::ReadbackMapReturnedNull,
             ));
         }
         // Sound: `read` spans `len` readback bytes; the mapping outlives `f`.

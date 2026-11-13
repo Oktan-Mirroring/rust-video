@@ -156,7 +156,7 @@ fn probe_scale(device: &D3d12Device) {
                 packets += outcome.packets().len();
                 bytes += bytes_of(&outcome);
             }
-            Err(D3d12Error::Unsupported(error)) if error.contains("scale") => {
+            Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
                 println!("MISS: {error}");
                 return;
             }
@@ -171,7 +171,7 @@ fn probe_scale(device: &D3d12Device) {
             packets += outcome.packets().len();
             bytes += bytes_of(&outcome);
         }
-        Err(D3d12Error::Unsupported(error)) if error.contains("scale") => {
+        Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
             println!("MISS: {error}");
             return;
         }

@@ -36,7 +36,7 @@ pub use decoder::{H264Decoder, HevcDecoder};
 pub use device::D3d12Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d12Encoder;
-pub use error::{D3d12Error, SkipReason};
+pub use error::{BrokenReferenceReason, D3d12Error, ParseReason, SkipReason, UnsupportedReason};
 pub use guid::{Codec, Profile};
 #[cfg(target_os = "windows")]
 pub use transcode::Transcoder;

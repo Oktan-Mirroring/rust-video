@@ -5,7 +5,7 @@ use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission, SharedExpo
 use crate::device::D3d12Device;
 #[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb};
-use crate::error::{D3d12Error, SkipReason};
+use crate::error::{D3d12Error, ParseReason, SkipReason, UnsupportedReason};
 use crate::guid::Codec;
 #[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
@@ -168,10 +168,10 @@ macro_rules! real_decoder {
                 let nv12 = submission.submit(session)?;
                 let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
                 let y_len = usize::try_from(luma)
-                    .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+                    .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
                 if nv12.len() != y_len + y_len / 2 {
                     return Err(D3d12Error::Unsupported(
-                        "readback short of extent".to_owned(),
+                        UnsupportedReason::ReadbackShortOfExtent,
                     ));
                 }
                 let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, self.generation);
@@ -202,7 +202,7 @@ macro_rules! real_decoder {
                         .sps(pps.seq_parameter_set_id)
                         .ok_or(D3d12Error::NoSession)?;
                     let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
-                        .ok_or_else(|| D3d12Error::Parse("crop empties picture".to_owned()))?;
+                        .ok_or(D3d12Error::Parse(ParseReason::CropEmptiesPicture))?;
                     Active {
                         sps_id: sps.seq_parameter_set_id,
                         width: sps.width(),
@@ -278,6 +278,10 @@ macro_rules! real_decoder {
             ///
             /// Returns `Err` without a `codec` profile or when the backend
             /// cannot decode `packet`.
+            ///
+            /// # Arguments
+            ///
+            /// * `packet` - compressed picture data.
             pub(crate) fn decode_texture(
                 &mut self,
                 packet: &Packet,
@@ -291,7 +295,7 @@ macro_rules! real_decoder {
                 let pictures = self.ingest.ingest_packet(packet.data())?;
                 if pictures.len() > 1 {
                     return Err(D3d12Error::Unsupported(
-                        "multi-picture packet needs per-picture encode".to_owned(),
+                        UnsupportedReason::MultiPicturePacketNeedsPerPictureEncode,
                     ));
                 }
                 let mut textures = Vec::new();
@@ -536,7 +540,7 @@ impl<'a> H264Decoder<'a> {
             .sps(pps.seq_parameter_set_id)
             .ok_or(D3d12Error::NoSession)?;
         let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
-            .ok_or_else(|| D3d12Error::Parse("crop empties picture".to_owned()))?;
+            .ok_or(D3d12Error::Parse(ParseReason::CropEmptiesPicture))?;
         Ok(Active {
             sps_id: sps.seq_parameter_set_id,
             width: sps.width(),
@@ -705,6 +709,10 @@ impl<'a> H264Decoder<'a> {
     ///
     /// Returns `Err` without an H.264 profile or when the backend
     /// cannot decode `packet`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - compressed picture data.
     pub(crate) fn decode_texture(
         &mut self,
         packet: &Packet,
@@ -795,10 +803,10 @@ fn emit_frame(
 ) -> Result<D3d12Frame, D3d12Error> {
     let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
     let y_len = usize::try_from(luma)
-        .map_err(|_| D3d12Error::Unsupported("picture too large".to_owned()))?;
+        .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
     if nv12.len() != y_len + y_len / 2 {
         return Err(D3d12Error::Unsupported(
-            "readback short of extent".to_owned(),
+            UnsupportedReason::ReadbackShortOfExtent,
         ));
     }
     let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, generation);
@@ -841,7 +849,9 @@ macro_rules! shell {
                     .into());
                 }
                 Err(D3d12Error::Unsupported(
-                    concat!(stringify!($codec), " picture builder pending").to_lowercase(),
+                    UnsupportedReason::PictureBuilderPending {
+                        codec: Codec::$codec,
+                    },
                 ))
             }
 

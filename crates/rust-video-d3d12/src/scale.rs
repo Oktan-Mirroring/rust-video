@@ -3,12 +3,13 @@
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12video/nf-d3d12video-id3d12videoprocesscommandlist-processframes>
 
+// FFI boundary: video-process COM calls live here.
 #![allow(unsafe_code)]
 
 use std::mem::ManuallyDrop;
 
 use crate::device::D3d12Device;
-use crate::error::D3d12Error;
+use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
 use crate::submit::{CommandSlot, DeviceResources, Fence};
 use crate::texture::GpuTexture;
 
@@ -110,7 +111,7 @@ impl Scaler {
     pub(crate) fn scale(&mut self, texture: &GpuTexture) -> Result<GpuTexture, D3d12Error> {
         if texture.size() != self.from {
             return Err(D3d12Error::Unsupported(
-                "scale source outside scaler".to_owned(),
+                UnsupportedReason::ScaleSourceOutsideScaler,
             ));
         }
         self.slot.reset()?;
@@ -205,7 +206,7 @@ fn check_support(
         .contains(D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED)
     {
         return Err(D3d12Error::Unsupported(
-            "video process unsupported".to_owned(),
+            UnsupportedReason::VideoProcessUnsupported,
         ));
     }
     let range = support.ScaleSupport.OutputSizeRange;
@@ -216,21 +217,21 @@ fn check_support(
         || to.height() > range.MaxHeight
     {
         return Err(D3d12Error::Unsupported(
-            "scale target outside process range".to_owned(),
+            UnsupportedReason::ScaleTargetOutsideProcessRange,
         ));
     }
     if flags.contains(D3D12_VIDEO_SCALE_SUPPORT_FLAG_POW2_ONLY)
         && (!to.width().is_power_of_two() || !to.height().is_power_of_two())
     {
         return Err(D3d12Error::Unsupported(
-            "scale target outside power-of-two".to_owned(),
+            UnsupportedReason::ScaleTargetOutsidePowerOfTwo,
         ));
     }
     if flags.contains(D3D12_VIDEO_SCALE_SUPPORT_FLAG_EVEN_DIMENSIONS_ONLY)
         && (!to.width().is_multiple_of(2) || !to.height().is_multiple_of(2))
     {
         return Err(D3d12Error::Unsupported(
-            "scale target outside even extents".to_owned(),
+            UnsupportedReason::ScaleTargetOutsideEvenExtents,
         ));
     }
     Ok(())
@@ -287,10 +288,10 @@ fn create_processor(
 
 /// Full-frame rectangle for `size`.
 fn full_rect(size: PictureSize) -> Result<RECT, D3d12Error> {
-    let right =
-        i32::try_from(size.width()).map_err(|_| D3d12Error::Parse("extent range".to_owned()))?;
-    let bottom =
-        i32::try_from(size.height()).map_err(|_| D3d12Error::Parse("extent range".to_owned()))?;
+    let right = i32::try_from(size.width())
+        .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "extent" }))?;
+    let bottom = i32::try_from(size.height())
+        .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "extent" }))?;
     Ok(RECT {
         left: 0,
         top: 0,
