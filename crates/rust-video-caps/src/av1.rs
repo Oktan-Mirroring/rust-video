@@ -362,9 +362,6 @@ impl Validate for Params {
                 max: 10,
             });
         }
-        if self.chroma == ChromaSampling::Yuv422 && self.depth.bits() != 12 {
-            return Err(Violation::ChromaNotAllowed);
-        }
         if self.mono && !matches!(self.profile, Profile::Main | Profile::Professional) {
             return Err(Violation::ChromaNotAllowed);
         }
@@ -500,6 +497,21 @@ mod tests {
             params.validate(),
             Err(Violation::BitDepthNotAllowed { .. })
         ));
+    }
+
+    #[test]
+    fn professional_422_below_12_bit_passes() {
+        let mut params = params_1080p();
+        params.profile = Profile::Professional;
+        params.chroma = ChromaSampling::Yuv422;
+        params.validate().expect("pro 8-bit 422");
+    }
+
+    #[test]
+    fn main_422_fails() {
+        let mut params = params_1080p();
+        params.chroma = ChromaSampling::Yuv422;
+        assert_eq!(params.validate(), Err(Violation::ChromaNotAllowed));
     }
 
     #[test]

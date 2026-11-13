@@ -351,13 +351,14 @@ impl Plane {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     #[cfg(unix)]
     use std::{
         fs::File,
         os::fd::{AsRawFd, OwnedFd},
     };
 
-    use super::{CpuFrame, CpuReadback, FramePool, GpuFrame, PixelFormat, Plane};
+    use super::{CpuFrame, CpuReadback, FramePool, GpuExport, GpuFrame, PixelFormat, Plane};
     use crate::common::PictureSize;
 
     use bytes::{Bytes, BytesMut};
@@ -369,6 +370,8 @@ mod tests {
     fn size() -> PictureSize {
         PictureSize::new(16, 16).expect("valid size")
     }
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn plane_rejects_zero_stride() {
@@ -464,6 +467,36 @@ mod tests {
         let _shared = bytes.clone();
         pool.recycle(bytes);
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn vocabulary_is_send_sync() {
+        assert_send_sync::<CpuFrame>();
+        assert_send_sync::<FramePool>();
+        assert_send_sync::<GpuExport>();
+        assert_send_sync::<GpuFrame>();
+        assert_send_sync::<PixelFormat>();
+        assert_send_sync::<Plane>();
+    }
+
+    #[test]
+    fn shared_pool_recycles_under_threads() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 25;
+        let pool = Mutex::new(FramePool::new(size(), PixelFormat::Rgba8));
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        let mut buffer = pool.lock().expect("pool lock").acquire();
+                        buffer.extend_from_slice(&[1, 2, 3]);
+                        pool.lock().expect("pool lock").recycle(buffer.freeze());
+                    }
+                });
+            }
+        });
+        let len = pool.lock().expect("pool lock").len();
+        assert!((1..=THREADS).contains(&len));
     }
 
     #[test]

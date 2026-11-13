@@ -209,7 +209,27 @@ struct SharedInner {
 
 #[cfg(test)]
 mod tests {
-    use super::{Device, OverBudget, SharedDevice};
+    use super::{Decoder, Device, Lease, OverBudget, SharedDevice};
+    use crate::packet::Packet;
+
+    use bytes::Bytes;
+
+    struct EchoDecoder;
+
+    impl Decoder for EchoDecoder {
+        type Frame = u64;
+        type Error = OverBudget;
+
+        fn decode(&mut self, packet: &Packet) -> Result<Vec<u64>, OverBudget> {
+            Ok(vec![packet.data().len() as u64])
+        }
+
+        fn flush(&mut self) -> Result<Vec<u64>, OverBudget> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn acquire_within_budget_leases() {
@@ -253,5 +273,32 @@ mod tests {
     fn over_budget_display_names_amounts() {
         let err = OverBudget::new(50, 40);
         assert_eq!(err.to_string(), "requested 50 bytes with 40 available");
+    }
+
+    #[test]
+    fn shared_device_is_send_sync() {
+        assert_send_sync::<Lease>();
+        assert_send_sync::<SharedDevice>();
+    }
+
+    #[test]
+    fn independent_decoders_run_concurrently() {
+        const STREAMS: u8 = 4;
+        assert_send_sync::<EchoDecoder>();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(usize::from(STREAMS));
+            for stream in 0..STREAMS {
+                handles.push(scope.spawn(move || {
+                    let mut decoder = EchoDecoder;
+                    let packet = Packet::new(Bytes::from(vec![stream; usize::from(stream) + 1]));
+                    let frames = decoder.decode(&packet).expect("decode");
+                    assert_eq!(decoder.flush().expect("flush"), []);
+                    frames
+                }));
+            }
+            for (stream, handle) in handles.into_iter().enumerate() {
+                assert_eq!(handle.join().expect("thread"), vec![stream as u64 + 1]);
+            }
+        });
     }
 }

@@ -1,3 +1,5 @@
+//! Shared caps vocabulary: sampling, depth, size, violations.
+
 use std::fmt;
 
 /// Conformance check against codec caps.

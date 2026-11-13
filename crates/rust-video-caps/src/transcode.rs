@@ -1,4 +1,4 @@
-//! Transcode route vocabulary: GPU plan versus loud CPU fallback.
+//! Transcode route vocabulary: GPU plan, caller-built CPU plan.
 
 use std::fmt;
 
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn outcome_reports_packets_and_plan() {
         let outcome = Outcome::new(Vec::new(), Plan::gpu());
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
         assert_eq!(outcome.plan(), Plan::gpu());
         assert_eq!(outcome.plan().route(), Route::Gpu);
     }
@@ -475,7 +475,7 @@ mod tests {
     fn outcome_reports_cpu_plan() {
         let plan = Plan::cpu(FallbackCause::DeviceMismatch);
         let outcome = Outcome::new(Vec::new(), plan);
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
         assert_eq!(outcome.plan().route(), Route::Cpu);
         assert_eq!(outcome.plan().cause(), Some(FallbackCause::DeviceMismatch));
     }

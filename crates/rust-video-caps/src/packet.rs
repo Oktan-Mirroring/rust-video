@@ -85,6 +85,13 @@ mod tests {
 
     use super::Packet;
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn packet_is_send_sync() {
+        assert_send_sync::<Packet>();
+    }
+
     #[test]
     fn new_packet_has_no_stamps_or_flag() {
         let packet = Packet::new(Bytes::from_static(&[0x65, 0x88]));
