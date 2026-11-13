@@ -2424,10 +2424,8 @@ mod tests {
     #[test]
     fn frame_past_budget_fails() {
         let shared = SharedDevice::new("vulkan", 10);
-        let size = PictureSize::new(4, 2).expect("nonzero extent");
-        let over = shared.try_acquire(11);
-        assert!(over.is_err());
-        assert_eq!(size.width(), 4);
+        let over = shared.try_acquire(11).unwrap_err();
+        assert_eq!(over.to_string(), "requested 11 bytes with 10 available");
     }
 
     #[test]

@@ -785,7 +785,8 @@ mod tests {
         let whole = Backend::copy_planes(image.as_ptr(), 9, [3, 3, 0], [0, 6, 0], (0, 0, 3, 2))
             .expect("whole planes");
         assert_eq!(whole, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        let offset = Backend::copy_planes(image.as_ptr(), 9, [3, 3, 0], [0, 6, 0], (0, 1, 3, 1));
-        assert!(offset.is_ok());
+        let offset = Backend::copy_planes(image.as_ptr(), 9, [3, 3, 0], [0, 6, 0], (0, 1, 3, 1))
+            .expect("offset crop");
+        assert_eq!(offset, vec![4, 5, 6]);
     }
 }

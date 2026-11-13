@@ -1552,6 +1552,8 @@ mod tests {
     fn frame_num_wraps_without_gap() {
         let mut dpb = Dpb::new(&sps());
         let frames = [(14, 0), (15, 2), (0, 4), (1, 6)];
+        let pocs = [0, 2, 4, 6];
+        let emitted: [Vec<u8>; 4] = [vec![], vec![0], vec![1], vec![2]];
         for (index, (frame_num, lsb)) in frames.iter().enumerate() {
             let picture = if index == 0 {
                 picture(
@@ -1568,7 +1570,10 @@ mod tests {
             } else {
                 p(*frame_num, *lsb)
             };
-            dpb.decode(&picture, &sps(), &pps()).expect("wraps");
+            let decoded = dpb.decode(&picture, &sps(), &pps()).expect("wraps");
+            let poc = pocs[index];
+            assert_eq!(decoded.submission.params.curr_field_order_cnt, [poc, poc]);
+            assert_eq!(slots(&decoded.outputs), emitted[index]);
         }
     }
 

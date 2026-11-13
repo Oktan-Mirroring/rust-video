@@ -1483,6 +1483,15 @@ mod tests {
 
         use super::Session;
 
+        let queue = std::sync::Arc::new(EventQueue::new());
+        let waiter = queue.clone();
+        let worker = std::thread::spawn(move || waiter.pop());
+        queue.push(Err(windows::Win32::Foundation::E_ABORT.0));
+        assert_eq!(
+            worker.join().expect("waiter joins"),
+            Err(windows::Win32::Foundation::E_ABORT.0)
+        );
+
         let device = match D3d11Device::open() {
             Ok(device) => device,
             Err(error) => {
