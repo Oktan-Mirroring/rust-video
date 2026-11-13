@@ -4,10 +4,7 @@ use std::fmt;
 
 use crate::error::MediaCodecError;
 
-/// Embedded quirk source.
-const SOURCE: &str = include_str!("../quirks.toml");
-
-/// Section header opening one quirk.
+/// Section header opening one quirk (`QuirkTable` shape, `QuirkSyntax` wording).
 const SECTION: &str = "[[quirk]]";
 
 /// Codec scope of a quirk.
@@ -76,7 +73,10 @@ pub enum QuirkSyntax {
     /// Line without an assignment.
     ExpectedAssignment,
     /// Key outside the known seven.
-    UnknownKey(String),
+    UnknownKey {
+        /// Rejected key spelling.
+        key: String,
+    },
     /// Key repeated in one section.
     DuplicateKey(&'static str),
     /// Value of the wrong shape.
@@ -95,7 +95,7 @@ impl fmt::Display for QuirkSyntax {
         match self {
             Self::ExpectedSection => write!(f, "expected {SECTION}"),
             Self::ExpectedAssignment => write!(f, "expected key = value"),
-            Self::UnknownKey(key) => write!(f, "unknown key {key}"),
+            Self::UnknownKey { key } => write!(f, "unknown key {key}"),
             Self::DuplicateKey(key) => write!(f, "duplicate key {key}"),
             Self::BadValue { key, value } => write!(f, "bad value for {key}: {value}"),
             Self::MissingField(key) => write!(f, "missing field {key}"),
@@ -209,13 +209,16 @@ pub struct QuirkTable {
 }
 
 impl QuirkTable {
+    /// Embedded quirk source.
+    const SOURCE: &str = include_str!("../quirks.toml");
+
     /// Table parsed from the embedded `quirks.toml`.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the embedded table breaks the strict shape.
     pub fn load() -> Result<Self, MediaCodecError> {
-        Self::parse(SOURCE)
+        Self::parse(Self::SOURCE)
     }
 
     /// Table parsed from `text`.
@@ -410,7 +413,9 @@ fn assign(
         _ => {
             return Err(MediaCodecError::Quirk {
                 line,
-                reason: QuirkSyntax::UnknownKey(key.to_owned()),
+                reason: QuirkSyntax::UnknownKey {
+                    key: key.to_owned(),
+                },
             });
         }
     }
@@ -550,7 +555,9 @@ mod tests {
             error,
             MediaCodecError::Quirk {
                 line: 2,
-                reason: QuirkSyntax::UnknownKey("nope".to_owned()),
+                reason: QuirkSyntax::UnknownKey {
+                    key: "nope".to_owned(),
+                },
             }
         );
         let error = QuirkTable::parse("[[quirk]]\nid = \"a\"\nid = \"b\"\n")
