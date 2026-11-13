@@ -426,7 +426,7 @@ impl Inner {
             return Err(MediaCodecError::BufferLost);
         };
         let bytes = ranged_bytes(buffer, offset, size);
-        let _released = codec.release_output_buffer_by_index(index, false);
+        codec.release_output_buffer_by_index(index, false)?;
         Ok(Some(output.split(bytes?)?))
     }
 
@@ -471,7 +471,8 @@ impl MediaCodecDecoder {
     ///
     /// # Errors
     ///
-    /// Returns `Err` below the device floor, or when no decoder answers the mime.
+    /// Returns `Err` below the device floor, without both `csd` blobs on
+    /// H.264/H.265, or when no decoder answers the mime.
     #[cfg(target_os = "android")]
     pub fn open(
         spec: &FormatSpec,
@@ -488,6 +489,7 @@ impl MediaCodecDecoder {
         soc: &str,
         quirks: &QuirkTable,
     ) -> Result<Self, MediaCodecError> {
+        spec.check_csd()?;
         let level = ApiLevel::current();
         if !level.meets_min() || !level.at_least(spec.min_sdk()) {
             return Err(MediaCodecError::BelowMinSdk { found: level.get() });

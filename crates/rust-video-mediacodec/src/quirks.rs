@@ -419,7 +419,7 @@ fn assign(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_list, parse_string, QuirkStatus, QuirkSyntax, QuirkTable};
+    use super::{parse_list, parse_string, Quirk, QuirkStatus, QuirkSyntax, QuirkTable};
 
     use crate::error::MediaCodecError;
 
@@ -473,7 +473,10 @@ mod tests {
             .map(|quirk| quirk.id())
             .collect();
         assert!(exynos.contains(&"exynos-drain-before-flush"));
-        assert!(table.matching("SM8850", "video/unknown").is_empty());
+        assert_eq!(
+            table.matching("SM8850", "video/unknown"),
+            Vec::<&Quirk>::new()
+        );
     }
 
     #[test]
@@ -481,8 +484,11 @@ mod tests {
         let h264_only = ENTRY.replace("[\"h264\", \"*\"]", "[\"h264\"]");
         let table = QuirkTable::parse(&h264_only).expect("entry parses");
         assert_eq!(table.matching("snapdragon", "video/avc").len(), 1);
-        assert!(table.matching("snapdragon", "video/av01").is_empty());
-        assert!(table.matching("exynos", "video/avc").is_empty());
+        assert_eq!(
+            table.matching("snapdragon", "video/av01"),
+            Vec::<&Quirk>::new()
+        );
+        assert_eq!(table.matching("exynos", "video/avc"), Vec::<&Quirk>::new());
     }
 
     #[test]

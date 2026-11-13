@@ -215,7 +215,7 @@ mod tests {
                 CodecEvent::FormatChanged
             ]
         );
-        assert!(queue.drain().is_empty());
+        assert_eq!(queue.drain(), Vec::<CodecEvent>::new());
     }
 
     #[test]
@@ -235,7 +235,10 @@ mod tests {
     #[test]
     fn drain_blocking_times_out_empty() {
         let queue = EventQueue::default();
-        assert!(queue.drain_blocking(Duration::from_millis(1)).is_empty());
+        assert_eq!(
+            queue.drain_blocking(Duration::from_millis(1)),
+            Vec::<CodecEvent>::new()
+        );
     }
 
     #[test]

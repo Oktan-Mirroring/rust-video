@@ -4,6 +4,7 @@ use crate::decoder::DecodeState;
 use crate::quirks::QuirkSyntax;
 
 /// `MediaCodec` tier failure.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MediaCodecError {
     /// Device below the 21 floor.
@@ -17,6 +18,14 @@ pub enum MediaCodecError {
     NoDecoder {
         /// Mime the lookup used.
         mime: &'static str,
+    },
+    /// H.264/H.265 format without its codec-specific blob.
+    #[error("missing {key} for {mime}")]
+    MissingCsd {
+        /// Codec mime demanding the blob.
+        mime: &'static str,
+        /// Missing `csd` key.
+        key: &'static str,
     },
     /// Output color without a plane layout.
     #[error("color format {value} has no plane layout")]
@@ -99,6 +108,14 @@ mod tests {
         assert_eq!(
             MediaCodecError::NoDecoder { mime: "video/avc" }.to_string(),
             "no MediaCodec decoder for video/avc"
+        );
+        assert_eq!(
+            MediaCodecError::MissingCsd {
+                mime: "video/avc",
+                key: "csd-0",
+            }
+            .to_string(),
+            "missing csd-0 for video/avc"
         );
         assert_eq!(
             MediaCodecError::BufferLost.to_string(),

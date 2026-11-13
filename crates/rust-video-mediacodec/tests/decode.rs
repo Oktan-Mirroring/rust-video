@@ -43,15 +43,20 @@ fn run_case(name: &str, spec: &FormatSpec) {
     decoder.reset().expect("reset drains and flushes");
 }
 
+/// `open` demands both blobs on H.264/H.265; the empty packet never decodes them.
+fn with_csd(spec: FormatSpec) -> FormatSpec {
+    spec.with_csd_0(vec![0, 0, 1]).with_csd_1(vec![0, 0, 1])
+}
+
 #[test]
 fn h264_decodes_empty_packet() {
-    let spec = FormatSpec::h264(64, 64).expect("valid dims");
+    let spec = with_csd(FormatSpec::h264(64, 64).expect("valid dims"));
     run_case("h264", &spec);
 }
 
 #[test]
 fn h265_decodes_empty_packet() {
-    let spec = FormatSpec::h265(64, 64).expect("valid dims");
+    let spec = with_csd(FormatSpec::h265(64, 64).expect("valid dims"));
     run_case("h265", &spec);
 }
 

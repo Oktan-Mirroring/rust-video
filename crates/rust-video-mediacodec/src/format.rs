@@ -2,6 +2,8 @@
 
 use rust_video_caps::frame::PixelFormat;
 
+use crate::error::MediaCodecError;
+
 #[cfg(target_os = "android")]
 use ndk::media::media_format::MediaFormat;
 
@@ -197,6 +199,37 @@ impl FormatSpec {
         self.csd_1.as_deref()
     }
 
+    /// Rejection unless H.264/H.265 carries both codec-specific blobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MissingCsd` naming the first absent blob.
+    pub fn check_csd(&self) -> Result<(), MediaCodecError> {
+        match self.codec {
+            Codec::H264 | Codec::H265 => {
+                if Self::absent(self.csd_0.as_ref()) {
+                    return Err(MediaCodecError::MissingCsd {
+                        mime: self.mime(),
+                        key: Self::KEY_CSD_0,
+                    });
+                }
+                if Self::absent(self.csd_1.as_ref()) {
+                    return Err(MediaCodecError::MissingCsd {
+                        mime: self.mime(),
+                        key: Self::KEY_CSD_1,
+                    });
+                }
+                Ok(())
+            }
+            Codec::Av1 | Codec::Vp9 | Codec::Vp8 => Ok(()),
+        }
+    }
+
+    /// True when the blob is unset or empty.
+    fn absent(blob: Option<&Vec<u8>>) -> bool {
+        blob.is_none_or(Vec::is_empty)
+    }
+
     /// Native format for `configure`.
     ///
     /// <https://docs.rs/ndk/0.9.0/ndk/media/media_format/struct.MediaFormat.html>
@@ -249,6 +282,7 @@ pub fn pixel_format_for(color_format: i32) -> Option<PixelFormat> {
 mod tests {
     use super::{pixel_format_for, FormatSpec};
 
+    use crate::error::MediaCodecError;
     use rust_video_caps::frame::PixelFormat;
 
     #[test]
@@ -311,6 +345,51 @@ mod tests {
         assert_eq!(FormatSpec::KEY_COLOR_FORMAT, "color-format");
         assert_eq!(FormatSpec::KEY_STRIDE, "stride");
         assert_eq!(FormatSpec::KEY_SLICE_HEIGHT, "slice-height");
+    }
+
+    #[test]
+    fn check_csd_demands_blobs_for_avc_and_hevc() {
+        let bare = FormatSpec::h264(16, 16).expect("valid dims");
+        assert_eq!(
+            bare.check_csd(),
+            Err(MediaCodecError::MissingCsd {
+                mime: "video/avc",
+                key: "csd-0",
+            })
+        );
+        let half = FormatSpec::h264(16, 16)
+            .expect("valid dims")
+            .with_csd_0(vec![1]);
+        assert_eq!(
+            half.check_csd(),
+            Err(MediaCodecError::MissingCsd {
+                mime: "video/avc",
+                key: "csd-1",
+            })
+        );
+        let empty = FormatSpec::h265(16, 16)
+            .expect("valid dims")
+            .with_csd_0(Vec::new())
+            .with_csd_1(vec![1]);
+        assert_eq!(
+            empty.check_csd(),
+            Err(MediaCodecError::MissingCsd {
+                mime: "video/hevc",
+                key: "csd-0",
+            })
+        );
+        let full = FormatSpec::h265(16, 16)
+            .expect("valid dims")
+            .with_csd_0(vec![1])
+            .with_csd_1(vec![2]);
+        assert!(full.check_csd().is_ok());
+        for spec in [
+            FormatSpec::av1(16, 16).expect("valid dims"),
+            FormatSpec::vp9(16, 16).expect("valid dims"),
+            FormatSpec::vp8(16, 16).expect("valid dims"),
+        ] {
+            assert!(spec.check_csd().is_ok());
+        }
     }
 
     #[test]
