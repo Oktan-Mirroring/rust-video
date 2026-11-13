@@ -1,6 +1,8 @@
 # Recipes run under PowerShell on Windows; sh is not on PATH there.
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
+export RUSTDOCFLAGS := "-D warnings"
+
 python := if os() == "windows" { "python" } else { "python3" }
 
 # Format the workspace.
@@ -28,7 +30,8 @@ build:
 
 # API docs for the workspace, no dependency docs.
 doc:
-    {{python}} scripts/doc.py
+    cargo doc --workspace --exclude rust-video-sw --no-deps --all-features
+    cargo doc -p rust-video-sw --no-deps --features h264-openh264
 
 # Formatting gate for CI.
 fmt-check:
