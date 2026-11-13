@@ -38,9 +38,10 @@ instance at API 1.0 for maximum driver inclusion, then negotiate up
 per device: instance version, device properties, extension strings,
 then video capabilities and format properties per codec op [T1,
 docs.vulkan.org]. Query before every use. Missing loader, pre-1.3
-drivers, or absent video extensions mean graceful tier skip, never
-degraded video: video cannot exist below 1.3, so fallback is
-tier-off. Hand-write the two missing ash extension modules against
+drivers, or absent video extensions mean the tier declines with its
+cause named, never degraded video: video cannot exist below 1.3, so
+a miss is decline-only and `tier::resolve` selects another tier.
+Hand-write the two missing ash extension modules against
 registry vk.xml inside `rust-video-vulkan`, each behind its
 extension-string check; no ash fork, no git pin. Lavapipe CI
 coverage is [?].

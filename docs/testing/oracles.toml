@@ -28,5 +28,5 @@ status = "unmeasured"
 [[oracle]]
 id = "RV5"
 behaviour = "Every decoder output matches its golden frame hashes"
-test = "crates/rust-video-harness goldens, generation pending first backend"
+test = "crates/rust-video-sw/tests/e2e.rs golden tests (vp8, vp9, h264, av1); h265 unwired"
 status = "unmeasured"

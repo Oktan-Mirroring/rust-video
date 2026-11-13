@@ -3,8 +3,8 @@
 # Runtime data plane
 
 Ownership and flow rules for live frames. Code homes: packet and frame
-types in `crates/rust-video/src/`, slots and queues in
-`crates/rust-video-livepack/src/lib.rs`, allocation proof in
+types in `crates/rust-video-caps/src/`, slots and queues in
+`crates/rust-video-livepack/src/queue.rs`, allocation proof in
 `crates/rust-video-harness/src/alloc_tracker.rs`.
 
 ## Ownership
@@ -49,6 +49,11 @@ Variants are `cfg`-gated per target; behavior arrives with the tiers.
 
 Until a backend attaches, `export` and `try_to_cpu` return
 `BackendAbsent`.
+
+An unavailable export declines with the missing capability named;
+no tier reroutes past a miss on its own. Tier choice stays with the
+caller through `tier::resolve`: selection up front, never fallback
+afterward.
 
 ## VRAM budget
 

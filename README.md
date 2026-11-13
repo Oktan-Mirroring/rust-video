@@ -17,7 +17,7 @@ Out: archival demuxing, subtitles, filters, audio.
 
 - One `Decoder`/`Encoder` API over every backend; `tier::resolve` picks the tier for the platform.
 - Per-tier transcoders stay on device surfaces where ready; Vulkan and VA-API transcode on the GPU over DMA-BUF, VA-API proven live on hardware.
-- Loud CPU fallback: `FallbackCause` names the failed hop, `Plan` records the route taken.
+- No fallback: `FallbackCause` names the missing capability in a typed decline, and the caller decides the route.
 - Livepack packs coded video into TS and fMP4/CMAF with bounded memory, no full-file buffering.
 - 427 golden vectors pin pixel output against ffmpeg; rules in `docs/testing/goldens.md`.
 
@@ -38,7 +38,7 @@ Out: archival demuxing, subtitles, filters, audio.
 
 | Backend | H.264 | H.265 | AV1 | VP9 | VP8 | Xcode |
 |---|---|---|---|---|---|---|
-| Software | ● | ●¹ | ● | ● | – | – |
+| Software | ● | ●¹ | ● | ● | ● | – |
 | Vulkan | ● | ● | – | – | – | ●² |
 | VA-API | ● | ● | – | – | – | ●³ |
 | D3D11 | ●⁴ | ●⁴ | ●⁴ | ●⁴ | – | ●³⁴ |
@@ -63,7 +63,7 @@ Backend policy and platform detail: `docs/matrix.md`, `docs/compat.md`.
 
 ## Requirements
 
-Rust 1.87 or later. `rust-video-sw` features select the software backends: `ffmpeg` decodes all five codecs and encodes VP9 and AV1 through the system libavcodec and libavutil (install the matching development headers); `h264-openh264` encodes H.264 through a vendored openh264; `gpl` encodes H.265 through libx265 and implies `ffmpeg`. On Windows, `FFMPEG_LIB_DIR` must point at `avcodec.lib` and `avutil.lib`.
+Rust 1.87 or later. `rust-video-sw` features select the software backends: `ffmpeg` decodes all five codecs and encodes VP8, VP9, and AV1 through the system libavcodec and libavutil (install the matching development headers); `h264-openh264` encodes H.264 through a vendored openh264; `gpl` encodes H.265 through libx265 and implies `ffmpeg`. On Windows, `FFMPEG_LIB_DIR` must point at `avcodec.lib` and `avutil.lib`.
 
 ## Quick start
 
@@ -97,7 +97,7 @@ Each crate carries unit tests beside the modules they cover, run with `just test
 |---|---|
 | `crates/rust-video` | Facade: codec and tier enums, packet and frame types |
 | `docs/runtime.md` | Runtime data-plane ownership and flow rules |
-| `crates/rust-video-h264` … `-av2` | Codec backends, one crate each |
+| `crates/rust-video-h264` … `-vp9`, `-av1`, `-av2` | Codec backend crates (VP8 ships in `rust-video-sw`) |
 | `crates/rust-video-vulkan` … `-mediacodec` | Platform tiers, one crate each |
 | `crates/rust-video-livepack` | Livepack frame packing |
 | `crates/rust-video-harness` | Vector suites and golden oracles |

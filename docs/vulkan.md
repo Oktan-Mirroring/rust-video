@@ -1,6 +1,6 @@
 # Vulkan tier
 
-Negotiation ladder plus H.264/H.265 decode, IDR encode, and transcode
+Negotiation ladder plus H.264/H.265 decode, GOP encode, and transcode
 behind the caps vocabulary.
 
 ## Operations
@@ -8,17 +8,18 @@ behind the caps vocabulary.
 | Op | Negotiates | Runs |
 |---|---|---|
 | `H264Decode` / `H265Decode` | decode queue, codec ext, caps rung | Annex-B in, NV12 frames out |
-| `H264Encode` / `H265Encode` | encode queue, codec ext, caps rung | NV12 in, IDR Annex-B out |
+| `H264Encode` / `H265Encode` | encode queue, codec ext, caps rung | NV12 in, GOP Annex-B out |
 
 `VulkanDevice::open` returns `Ok(None)` on a declined machine, never an
 error; `open_or_skip` names the rung through `SkipReason`.
 
 ## Encode
 
-IDR-only: every picture codes without references, so one DPB slot and
-no reference lists. The driver emits parameter sets from the session
-sets, and the feedback query reports the coded size. CBR rate control
-scales with the extent. Inter coding stays out until measured demand.
+GOP coding: an IDR every 30 pictures by default (`Gop`, all-intra
+available), P pictures predicting from the single live reference, no
+B-frames. The driver emits parameter sets from the session sets, and
+the feedback query reports the coded size. CBR rate control scales
+with the extent.
 
 Every begin carries the CBR control; drivers set rate control state
 from the begin chain. Newer validation wants the state preconfigured

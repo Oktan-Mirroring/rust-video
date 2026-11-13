@@ -4,7 +4,7 @@ One negotiated device, one video queue, one three-slot submit ring per codec obj
 
 ## Template
 
-This file defines the per-tier skeleton. Headings stay fixed across tier docs. Each section opens with its tier rule, then the Vulkan binding. A vaapi, d3d11, d3d12, or mediacodec doc keeps the headings and tier rules and swaps the binding.
+This file defines the per-tier skeleton. Headings stay fixed across tier docs. Each section opens with its tier rule, then the Vulkan binding. A vaapi or mediacodec doc keeps the headings and tier rules and swaps the binding; the d3d11 and d3d12 docs use the ops-focused format instead.
 
 ## Components
 
