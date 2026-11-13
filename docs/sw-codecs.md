@@ -7,7 +7,7 @@ AMD Ryzen 9 9950X3D, 32 threads, 60 GB RAM, release profile, ffmpeg 7.1.5
 (Debian 7.1.5-0+deb13u1). Rung 3 throughout: the real code on this machine.
 System libs: dav1d 1.5.1, libvpx 1.15.0 (`libdav1d-dev`, `libvpx-dev`
 installed for headers). Pinned versions live in the workspace root
-`Cargo.lock`: openh264 0.9.8, openh264-sys2 0.9.8. Decode and VP9
+`Cargo.lock`: openh264 0.9.8, openh264-sys2 0.9.8. Decode and VP8/VP9
 encode reach the system libraries through one hand-written sys layer;
 no crate in the tree binds dav1d or libvpx directly.
 
@@ -15,10 +15,11 @@ no crate in the tree binds dav1d or libvpx directly.
 
 One backend shape: every software decoder rides a single hand-written
 libavcodec/libavutil sys layer (`ffmpeg_sys.rs`), with one thin decoder
-type per codec over it. VP9 encode rides the same layer through ffmpeg's
-`libvpx-vp9` wrapper, over the same system libvpx (`-encoders` shows no
-native LGPL software encoder for the codec: only `libx264`/`libx265`
-GPL, `libvpx*` external, and hardware wrappers).
+type per codec over it. VP8 and VP9 encode ride the same layer through
+ffmpeg's `libvpx`/`libvpx-vp9` wrappers, over the same system libvpx
+(`-encoders` shows no native LGPL software encoder for either codec:
+only `libx264`/`libx265` GPL, `libvpx*` external, and hardware
+wrappers).
 
 | Candidate | Role | Verdict | Throughput, 1080p | Exactness |
 |---|---|---|---|---|
@@ -29,6 +30,7 @@ GPL, `libvpx*` external, and hardware wrappers).
 | ffmpeg libdav1d wrapper, hand sys | AV1 decode | **wins** (`Av1Decoder`) | 604 fps, 4 threads; ~347 fps, 1 thread | 60/60 + 60/60 + 60/60 `cmp`-clean vs ffmpeg |
 | openh264 0.9.8 | H.264 encode | **wins** (`H264Encoder`) | 272 fps, 4 threads | 120/120 frames ffmpeg-valid |
 | libvpx 1.15.0 via ffmpeg `libvpx-vp9` wrapper, hand sys | VP9 encode | **wins** (`Vp9Encoder`) | 368 fps, 4 threads | 120/120 frames ffmpeg-valid |
+| libvpx 1.15.0 via ffmpeg `libvpx` wrapper, hand sys | VP8 encode | **live** (`Vp8Encoder`) | unmeasured | roundtrip through `Vp8Decoder`, keyframe-marked |
 | ffmpeg `libaom-av1` wrapper, hand sys | AV1 encode | **live** (`Av1Encoder`) | unmeasured | roundtrip through `Av1Decoder`, keyframe-marked |
 | ffmpeg `libx265` wrapper, hand sys, `gpl` | H.265 encode | **live** (`H265Encoder`) | unmeasured | roundtrip through `H265Decoder`, keyframe-marked |
 | openh264 0.9.8 | H.264 decode | **loses** | 127 fps single-thread | 27/60 vs ffmpeg; B-frame trigger isolated |
@@ -176,9 +178,9 @@ bound major; there is no silent fallback to a drifted ABI:
 
 | Linked lib | Guard | Bound | Binds it protects |
 |---|---|---|---|
-| libavcodec | `avcodec_version() >> 16` | 61 | all five decoders, all three ffmpeg encodes |
-| libavutil | `avutil_version() >> 16` | 59 | frame layout, all three ffmpeg encodes |
-| libvpx | none direct; `libvpx-vp9` by-name lookup + avcodec guard | n/a | VP9 encode via wrapper |
+| libavcodec | `avcodec_version() >> 16` | 61 | all five decoders, all four ffmpeg encodes |
+| libavutil | `avutil_version() >> 16` | 59 | frame layout, all four ffmpeg encodes |
+| libvpx | none direct; `libvpx*` by-name lookup + avcodec guard | n/a | VP8/VP9 encode via wrapper |
 | libdav1d | none direct; by-name lookup + avcodec guard | n/a | AV1 decode via wrapper |
 | openh264 | none needed; vendored static, pinned in `Cargo.lock` | 0.9.8 | H.264 encode |
 
@@ -282,5 +284,7 @@ decode the 4:2:2/4:4:4 goldens at all (I420 output only). Throughput
 3. Re-read the sys layer against libavcodec 62/63 headers when the
    Windows vcpkg build lands (same surface, offsets re-probed,
    guard extended).
-4. Throughput numbers for `Av1Encoder` and `H265Encoder`: probe
-   modes plus 1080p fps before any realtime claim.
+4. Throughput numbers for `Vp8Encoder`, `Av1Encoder`, and
+   `H265Encoder`: 1080p fps before any realtime claim. Probe modes
+   exist for AV1 (`av1enc`) and H.265 (`x265enc`); VP8 still needs
+   its own mode (`vpxenc` is VP9-hardcoded).

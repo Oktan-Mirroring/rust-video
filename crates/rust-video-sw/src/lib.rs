@@ -1,7 +1,7 @@
 //! Software CPU codec backends behind the facade.
 //!
-//! Decode rides one ffmpeg sys layer; VP9 and AV1 encode ride their ffmpeg
-//! wrappers. H.265 encode hides behind the `gpl` gate.
+//! Decode rides one ffmpeg sys layer; VP8, VP9, and AV1 encode ride their
+//! ffmpeg wrappers. H.265 encode hides behind the `gpl` gate.
 
 #[cfg(feature = "ffmpeg")]
 pub mod av1;
@@ -33,4 +33,4 @@ pub use h264::H264Encoder;
 #[cfg(feature = "gpl")]
 pub use h265::{H265Encoder, H265Preset};
 #[cfg(feature = "ffmpeg")]
-pub use vpx::Vp9Encoder;
+pub use vpx::{Vp8Encoder, Vp9Encoder};

@@ -3,6 +3,9 @@
 #[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]
 mod common;
 
+#[cfg(feature = "ffmpeg")]
+mod av1;
+
 #[cfg(feature = "h264-openh264")]
 mod h264;
 
@@ -14,6 +17,9 @@ mod ivf;
 
 #[cfg(feature = "ffmpeg")]
 mod vpx;
+
+#[cfg(feature = "gpl")]
+mod x265;
 
 #[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]
 use std::path::Path;
@@ -63,6 +69,20 @@ fn main() {
             let frames = args[5].parse().expect("frames");
             vpx::run_encode(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }
-        _ => panic!("usage: probe h264dec|h264enc|ffdec|vpxenc ..."),
+        #[cfg(feature = "ffmpeg")]
+        "av1enc" => {
+            let w = args[3].parse().expect("width");
+            let h = args[4].parse().expect("height");
+            let frames = args[5].parse().expect("frames");
+            av1::run_encode(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
+        }
+        #[cfg(feature = "gpl")]
+        "x265enc" => {
+            let w = args[3].parse().expect("width");
+            let h = args[4].parse().expect("height");
+            let frames = args[5].parse().expect("frames");
+            x265::run_encode(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
+        }
+        _ => panic!("usage: probe h264dec|h264enc|ffdec|vpxenc|av1enc|x265enc ..."),
     }
 }

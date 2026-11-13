@@ -45,8 +45,9 @@ where marked.
 
 ## VP8
 
-- Decode only, native ffmpeg over the hand sys layer (`Vp8Decoder`).
-  No encoder ships.
+- Decode: native ffmpeg over the hand sys layer (`Vp8Decoder`).
+- Encode: ffmpeg `libvpx` wrapper (`Vp8Encoder`), throughput
+  unmeasured until Linux CI runs it.
 
 ## Hardware tiers
 
