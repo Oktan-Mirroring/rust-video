@@ -2,6 +2,7 @@
 //! AV1 encode over ffmpeg's libaom-av1 wrapper.
 //!
 //! Encode only: decode rides the libdav1d wrapper behind the same sys layer.
+// Unsafe is the option-setting FFI below: live context, valid C strings.
 
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
@@ -11,7 +12,7 @@ use crate::error::SwError;
 use crate::ffmpeg_enc::FfmpegEncoder;
 use crate::ffmpeg_sys as sys;
 
-/// Realtime AV1 encoder.
+/// AV1 encoder over `libaom-av1`; throughput unmeasured.
 pub struct Av1Encoder {
     inner: FfmpegEncoder,
 }
@@ -41,7 +42,7 @@ impl Av1Encoder {
         .map(|inner| Self { inner })
     }
 
-    /// Context options matching the realtime preset; false on first refusal.
+    /// Context options matching the `usage=realtime` preset; false on first refusal.
     fn configure(
         ctx: *mut sys::AVCodecContext,
         width: u32,
@@ -154,7 +155,7 @@ mod tests {
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
         packets.extend(encoder.flush().expect("flush"));
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
     }
 
@@ -169,7 +170,7 @@ mod tests {
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
         packets.extend(encoder.flush().expect("flush"));
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
         let mut frames = Vec::new();
         for packet in &packets {

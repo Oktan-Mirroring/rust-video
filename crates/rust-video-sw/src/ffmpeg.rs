@@ -1,3 +1,4 @@
+// FFI boundary: every unsafe block states its contract.
 #![allow(unsafe_code)]
 //! Software decode over ffmpeg's native decoders.
 //!
@@ -63,6 +64,9 @@ impl Codec {
 }
 
 /// Threaded decoder over one libavcodec decoder.
+///
+/// `Send`, never `Sync`: hand the decoder to another thread when idle,
+/// but run every call on one thread.
 pub struct FfmpegDecoder {
     ctx: *mut sys::AVCodecContext,
     parser: *mut sys::AVCodecParserContext,
@@ -70,6 +74,10 @@ pub struct FfmpegDecoder {
     packet: *mut sys::AVPacket,
     framed: bool,
 }
+
+// SAFETY: sole owner of its context, parser, frame, and packet; every
+// FFI call takes `&mut self` and `Drop` frees each allocation once.
+unsafe impl Send for FfmpegDecoder {}
 
 impl FfmpegDecoder {
     /// Decoder for `codec` with `threads` worker threads; zero selects the library default.
@@ -192,6 +200,10 @@ impl FfmpegDecoder {
     }
 
     /// One complete frame queued from `bytes`, drained pictures into `out`.
+    ///
+    /// # Performance
+    ///
+    /// One copy per packet.
     ///
     /// # Errors
     ///
@@ -537,6 +549,10 @@ impl Decoder for Av1Decoder {
 
 /// CPU frame copied from a decoded frame.
 ///
+/// # Performance
+///
+/// One copy per plane.
+///
 /// # Errors
 ///
 /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
@@ -563,20 +579,37 @@ fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
     {
         return Err(SwError::BadFrame);
     }
-    let rows = |plane: usize, stride: usize, count: usize, cols: usize| {
-        let mut out = Vec::with_capacity(count * cols);
-        for row in 0..count {
-            // SAFETY: rows are stride bytes apart inside the live frame.
-            let src = unsafe { frame.data[plane].add(row * stride) };
-            // SAFETY: each row spans live decoder memory, copied now.
-            let bytes = unsafe { std::slice::from_raw_parts(src.cast_const(), cols) };
-            out.extend_from_slice(bytes);
-        }
-        out
+    // SAFETY: luma rows span live decoder memory, gathered below.
+    let y_source = unsafe {
+        std::slice::from_raw_parts(frame.data[0].cast_const(), height as usize * y_stride)
     };
-    let y = rows(0, y_stride, height as usize, width as usize);
-    let u = rows(1, u_stride, chroma_height as usize, chroma_width as usize);
-    let v = rows(2, v_stride, chroma_height as usize, chroma_width as usize);
+    // SAFETY: chroma rows span live decoder memory, gathered below.
+    let u_source = unsafe {
+        std::slice::from_raw_parts(
+            frame.data[1].cast_const(),
+            chroma_height as usize * u_stride,
+        )
+    };
+    // SAFETY: chroma rows span live decoder memory, gathered below.
+    let v_source = unsafe {
+        std::slice::from_raw_parts(
+            frame.data[2].cast_const(),
+            chroma_height as usize * v_stride,
+        )
+    };
+    let y = gather_plane(y_source, y_stride, height as usize, width as usize);
+    let u = gather_plane(
+        u_source,
+        u_stride,
+        chroma_height as usize,
+        chroma_width as usize,
+    );
+    let v = gather_plane(
+        v_source,
+        v_stride,
+        chroma_height as usize,
+        chroma_width as usize,
+    );
     let planes = [
         Plane::new(Bytes::from(y), width),
         Plane::new(Bytes::from(u), chroma_width),
@@ -588,6 +621,30 @@ fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
     CpuFrame::new(size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
 }
 
+/// Plane bytes gathered from stride-separated source rows.
+///
+/// # Performance
+///
+/// One copy per plane.
+///
+/// # Arguments
+///
+/// * `source` - source bytes; holds `rows` times `stride`.
+/// * `stride` - source bytes per row.
+/// * `rows` - row count.
+/// * `cols` - bytes gathered per row; at most `stride`.
+fn gather_plane(source: &[u8], stride: usize, rows: usize, cols: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows * cols);
+    if stride == cols {
+        out.extend_from_slice(&source[..rows * cols]);
+    } else {
+        for chunk in source.chunks_exact(stride).take(rows) {
+            out.extend_from_slice(&chunk[..cols]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -595,7 +652,56 @@ mod tests {
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
 
-    use super::{Codec, FfmpegDecoder, H264Decoder};
+    use super::{
+        gather_plane, Av1Decoder, Codec, FfmpegDecoder, H264Decoder, H265Decoder, Vp8Decoder,
+        Vp9Decoder,
+    };
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn decoders_move_between_threads() {
+        assert_send::<Av1Decoder>();
+        assert_send::<FfmpegDecoder>();
+        assert_send::<H264Decoder>();
+        assert_send::<H265Decoder>();
+        assert_send::<Vp8Decoder>();
+        assert_send::<Vp9Decoder>();
+    }
+
+    #[test]
+    fn gather_plane_matches_row_by_row() {
+        let tight: Vec<u8> = (0..64).collect();
+        let mut strided = vec![0xFFu8; 2 * 40];
+        strided[..32].copy_from_slice(&tight[..32]);
+        strided[40..72].copy_from_slice(&tight[32..]);
+        assert_eq!(gather_plane(&tight, 32, 2, 32), tight);
+        assert_eq!(gather_plane(&strided, 40, 2, 32), tight);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn independent_decoders_run_concurrently() {
+        const STREAMS: usize = 4;
+        let mut decoders = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            decoders.push(FfmpegDecoder::open(Codec::Vp9, 1).expect("decoder"));
+        }
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(STREAMS);
+            for mut decoder in decoders {
+                handles.push(scope.spawn(move || {
+                    let packet = Packet::new(Bytes::new());
+                    let frames = decoder.decode(&packet).expect("decode");
+                    let tail = decoder.flush().expect("flush");
+                    assert!(frames.is_empty() && tail.is_empty());
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("thread");
+            }
+        });
+    }
 
     #[test]
     fn open_accepts_thread_counts() {
@@ -613,7 +719,7 @@ mod tests {
     #[test]
     fn flush_without_input_is_empty() {
         let mut decoder = H264Decoder::open(1).expect("decoder");
-        assert!(decoder.flush().expect("flush").is_empty());
+        assert_eq!(decoder.flush().expect("flush"), []);
     }
 
     #[test]
@@ -628,7 +734,7 @@ mod tests {
     fn empty_input_fails_without_panic() {
         let mut decoder = H264Decoder::open(1).expect("decoder");
         let packet = Packet::new(Bytes::new());
-        assert!(decoder.decode(&packet).expect("decode").is_empty());
+        assert_eq!(decoder.decode(&packet).expect("decode"), []);
     }
 
     #[test]
@@ -643,7 +749,7 @@ mod tests {
     fn framed_empty_input_is_empty() {
         let mut decoder = FfmpegDecoder::open(Codec::Vp9, 1).expect("decoder");
         let packet = Packet::new(Bytes::new());
-        assert!(decoder.decode(&packet).expect("decode").is_empty());
+        assert_eq!(decoder.decode(&packet).expect("decode"), []);
     }
 
     #[cfg(feature = "h264-openh264")]

@@ -2,6 +2,7 @@
 //! HEVC encode over ffmpeg's libx265 wrapper (GPL).
 //!
 //! Enabling links the GPL path (x265 GPL-2+ flips the ffmpeg build GPL); see <https://ffmpeg.org/legal.html>.
+// Unsafe is the option-setting FFI below: live context, valid C strings.
 
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
@@ -14,11 +15,11 @@ use crate::ffmpeg_sys as sys;
 /// Speed preset for the x265 wrapper.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum H265Preset {
-    /// Fastest realtime tune.
+    /// Fastest tune.
     Ultrafast,
-    /// Slower tune, still realtime on desktop.
+    /// Slower tune.
     Superfast,
-    /// Slowest shipped tune, still realtime on desktop.
+    /// Slowest shipped tune.
     Veryfast,
 }
 
@@ -33,7 +34,7 @@ impl H265Preset {
     }
 }
 
-/// Realtime HEVC encoder.
+/// HEVC encoder over `libx265`; throughput unmeasured.
 pub struct H265Encoder {
     inner: FfmpegEncoder,
 }
@@ -79,7 +80,7 @@ impl H265Encoder {
         .map(|inner| Self { inner })
     }
 
-    /// Context options matching the realtime preset; false on first refusal.
+    /// Context options matching the `zerolatency` tune; false on first refusal.
     fn configure(
         ctx: *mut sys::AVCodecContext,
         width: u32,
@@ -212,7 +213,7 @@ mod tests {
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
         packets.extend(encoder.flush().expect("flush"));
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
     }
 
@@ -243,7 +244,7 @@ mod tests {
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
         packets.extend(encoder.flush().expect("flush"));
-        assert!(!packets.is_empty());
+        assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
         let mut frames = Vec::new();
         for packet in &packets {

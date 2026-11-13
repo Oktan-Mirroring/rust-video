@@ -162,11 +162,11 @@ fn vp9_decode_matches_golden() {
 #[test]
 fn h264_decode_matches_golden() {
     let mut decoder = H264Decoder::open(4).expect("h264 decoder opens");
-    check_codec(VideoCodec::H264, "h264", &mut decoder, mp4_payloads, false);
+    check_codec(VideoCodec::H264, "h264", &mut decoder, mp4_payloads, true);
 }
 
 #[test]
 fn av1_decode_matches_golden() {
     let mut decoder = Av1Decoder::open(4).expect("av1 decoder opens");
-    check_codec(VideoCodec::Av1, "av1", &mut decoder, ivf_payloads, false);
+    check_codec(VideoCodec::Av1, "av1", &mut decoder, ivf_payloads, true);
 }

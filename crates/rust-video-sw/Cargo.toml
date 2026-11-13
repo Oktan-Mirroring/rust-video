@@ -11,15 +11,15 @@ workspace = true
 
 [features]
 default = []
-ffmpeg = []
+ffmpeg = ["dep:bytes", "dep:rust-video-caps"]
 # Enabling `gpl` links the GPL path (libx265 is GPL-2+, which flips the ffmpeg
 # build GPL): the closed product ships the default LGPL-clean set, opt in only.
 gpl = ["ffmpeg"]
-h264-openh264 = ["dep:openh264"]
+h264-openh264 = ["dep:bytes", "dep:openh264", "dep:rust-video-caps"]
 
 [dependencies]
-bytes = "1"
-rust-video-caps = { path = "../rust-video-caps" }
+bytes = { version = "1", optional = true }
+rust-video-caps = { path = "../rust-video-caps", optional = true }
 openh264 = { version = "0.9", optional = true }
 
 [dev-dependencies]

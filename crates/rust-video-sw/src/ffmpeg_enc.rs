@@ -1,3 +1,4 @@
+// FFI boundary: every unsafe block states its contract.
 #![allow(unsafe_code)]
 //! Shared ffmpeg encode session behind the software encoders.
 //!
@@ -17,6 +18,9 @@ use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
 
 /// Live ffmpeg encode session: context plus reusable frame and packet.
+///
+/// `Send`, never `Sync`: hand the session to another thread when idle,
+/// but run every call on one thread.
 pub(crate) struct FfmpegEncoder {
     ctx: *mut sys::AVCodecContext,
     frame: *mut sys::AVFrame,
@@ -25,6 +29,10 @@ pub(crate) struct FfmpegEncoder {
     height: u32,
     next_pts: i64,
 }
+
+// SAFETY: sole owner of its context, frame, and packet; every FFI call
+// takes `&mut self` and `Drop` frees each allocation once.
+unsafe impl Send for FfmpegEncoder {}
 
 impl FfmpegEncoder {
     /// CBR encoder for `name` at `width`x`height` and `bitrate_kbps`.
@@ -171,6 +179,10 @@ impl FfmpegEncoder {
 
     /// Input frame queued from `frame`, packets drained into `out`.
     ///
+    /// # Performance
+    ///
+    /// One copy per plane.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the frame is rejected or a ready packet is unusable.
@@ -195,20 +207,17 @@ impl FfmpegEncoder {
             for (slot, plane) in frame.planes().iter().enumerate() {
                 let stride =
                     usize::try_from((*self.frame).linesize[slot]).map_err(|_| SwError::Rejected)?;
-                let cols = plane.stride() as usize;
+                let src_stride = plane.stride() as usize;
                 let rows = if slot == 0 {
                     self.height as usize
                 } else {
                     self.height as usize / 2
                 };
-                if stride < cols {
+                if stride < src_stride {
                     return Err(SwError::Rejected);
                 }
-                for row in 0..rows {
-                    let dst = (*self.frame).data[slot].add(row * stride);
-                    let src = &plane.data()[row * cols..row * cols + cols];
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, cols);
-                }
+                let dst = std::slice::from_raw_parts_mut((*self.frame).data[slot], rows * stride);
+                copy_plane(dst, stride, plane.data(), src_stride, rows, src_stride);
             }
             (*self.frame).pts = self.next_pts;
         }
@@ -233,6 +242,10 @@ impl FfmpegEncoder {
     }
 
     /// Packets ready now, copied out of the reusable slot.
+    ///
+    /// # Performance
+    ///
+    /// One copy per packet.
     ///
     /// # Errors
     ///
@@ -269,5 +282,63 @@ impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
         // SAFETY: every slot came from its allocator and is dropped once.
         unsafe { Self::release(self.ctx, self.frame, self.packet) };
+    }
+}
+
+/// Destination rows filled from source rows.
+///
+/// # Performance
+///
+/// One copy per plane.
+///
+/// # Arguments
+///
+/// * `dst` - destination bytes; holds `rows` times `dst_stride`.
+/// * `dst_stride` - destination bytes per row.
+/// * `src` - source bytes; holds `rows` times `src_stride`.
+/// * `src_stride` - source bytes per row.
+/// * `rows` - row count.
+/// * `cols` - bytes copied per row; at most both strides.
+fn copy_plane(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    rows: usize,
+    cols: usize,
+) {
+    if dst_stride == src_stride {
+        let len = rows * src_stride;
+        dst[..len].copy_from_slice(&src[..len]);
+    } else {
+        for (row, chunk) in src.chunks_exact(src_stride).take(rows).enumerate() {
+            dst[row * dst_stride..row * dst_stride + cols].copy_from_slice(&chunk[..cols]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_plane, FfmpegEncoder};
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn encoder_moves_between_threads() {
+        assert_send::<FfmpegEncoder>();
+    }
+
+    #[test]
+    fn copy_plane_matches_row_by_row() {
+        let tight: Vec<u8> = (0..64).collect();
+        let mut strided = vec![0xFFu8; 2 * 40];
+        strided[..32].copy_from_slice(&tight[..32]);
+        strided[40..72].copy_from_slice(&tight[32..]);
+        let mut fast = vec![0u8; 64];
+        copy_plane(&mut fast, 32, &tight, 32, 2, 32);
+        assert_eq!(fast, tight);
+        let mut slow = vec![0u8; 64];
+        copy_plane(&mut slow, 32, &strided, 40, 2, 32);
+        assert_eq!(slow, tight);
     }
 }
