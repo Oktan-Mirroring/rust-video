@@ -17,7 +17,7 @@ mod h264;
 #[path = "../../rust-video-vaapi/tests/support/mp4.rs"]
 mod mp4;
 
-use rust_video::{resolve, Capabilities, Platform, Tier, TierPreference, VideoCodec};
+use rust_video::{Capabilities, Platform, Tier, TierPreference, VideoCodec};
 
 /// Resolution failure carries `codec` under `preference`.
 fn failed(codec: VideoCodec, preference: TierPreference, error: rust_video::TierError) {
@@ -37,27 +37,18 @@ fn software_caps_resolve_all_but_h265() {
         VideoCodec::Av2,
     ] {
         assert_eq!(
-            resolve(codec, TierPreference::Auto, &caps, Platform::Linux),
+            TierPreference::Auto.resolve(codec, &caps, Platform::Linux),
             Ok(Tier::Software),
             "{codec:?}"
         );
     }
-    let error = resolve(
-        VideoCodec::H265,
-        TierPreference::Auto,
-        &caps,
-        Platform::Linux,
-    )
-    .expect_err("h265 without a realtime backend");
+    let error = TierPreference::Auto
+        .resolve(VideoCodec::H265, &caps, Platform::Linux)
+        .expect_err("h265 without a realtime backend");
     failed(VideoCodec::H265, TierPreference::Auto, error);
     let caps = caps.with_h265_software();
     assert_eq!(
-        resolve(
-            VideoCodec::H265,
-            TierPreference::Auto,
-            &caps,
-            Platform::Linux
-        ),
+        TierPreference::Auto.resolve(VideoCodec::H265, &caps, Platform::Linux),
         Ok(Tier::Software)
     );
 }
@@ -73,23 +64,14 @@ fn forced_hardware_binds_native_platform() {
         (Tier::MediaCodec, Platform::Android),
     ] {
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(tier),
-                &caps,
-                platform
-            ),
+            TierPreference::Force(tier).resolve(VideoCodec::H264, &caps, platform),
             Ok(tier),
             "{tier:?}"
         );
     }
-    let error = resolve(
-        VideoCodec::H264,
-        TierPreference::Force(Tier::VaApi),
-        &caps,
-        Platform::Windows,
-    )
-    .expect_err("foreign hardware tier");
+    let error = TierPreference::Force(Tier::VaApi)
+        .resolve(VideoCodec::H264, &caps, Platform::Windows)
+        .expect_err("foreign hardware tier");
     failed(VideoCodec::H264, TierPreference::Force(Tier::VaApi), error);
 }
 
@@ -97,13 +79,9 @@ fn forced_hardware_binds_native_platform() {
 #[test]
 fn failure_names_codec_and_preference() {
     let caps = Capabilities::none();
-    let error = resolve(
-        VideoCodec::Av1,
-        TierPreference::Auto,
-        &caps,
-        Platform::Other,
-    )
-    .expect_err("no tier resolves");
+    let error = TierPreference::Auto
+        .resolve(VideoCodec::Av1, &caps, Platform::Other)
+        .expect_err("no tier resolves");
     failed(VideoCodec::Av1, TierPreference::Auto, error);
     assert_eq!(error.to_string(), "no tier available for codec Av1");
 }
@@ -128,17 +106,13 @@ fn synth_h264() -> std::path::PathBuf {
 #[cfg(all(target_os = "linux", vaapi_available, have_corpus))]
 #[test]
 fn resolved_tier_transcodes_vaapi_hop() {
-    use rust_video::vaapi::{EncodeCodec, Transcoder, VaApiDevice, VaApiError};
-    use rust_video::{Bytes, Packet, Route};
+    use bytes::Bytes;
+    use rust_video::{Packet, Route};
+    use rust_video_vaapi::{EncodeCodec, Transcoder, VaApiDevice, VaApiError};
 
     let caps = Capabilities::none().with_platform_hw().with_software();
     assert_eq!(
-        resolve(
-            VideoCodec::H264,
-            TierPreference::Force(Tier::VaApi),
-            &caps,
-            Platform::Linux
-        ),
+        TierPreference::Force(Tier::VaApi).resolve(VideoCodec::H264, &caps, Platform::Linux),
         Ok(Tier::VaApi)
     );
     let device = match VaApiDevice::open() {
@@ -177,17 +151,13 @@ fn resolved_tier_transcodes_vaapi_hop() {
     have_corpus
 ))]
 fn vulkan_hop(platform: Platform) {
-    use rust_video::vulkan::{CodecOp, Transcoder, VulkanDevice};
-    use rust_video::{Bytes, FallbackCause, Packet};
+    use bytes::Bytes;
+    use rust_video::{FallbackCause, Packet};
+    use rust_video_vulkan::{CodecOp, Transcoder, VulkanDevice};
 
     let caps = Capabilities::none().with_vulkan().with_software();
     assert_eq!(
-        resolve(
-            VideoCodec::H264,
-            TierPreference::Force(Tier::Vulkan),
-            &caps,
-            platform
-        ),
+        TierPreference::Force(Tier::Vulkan).resolve(VideoCodec::H264, &caps, platform),
         Ok(Tier::Vulkan)
     );
     let decode_device = match VulkanDevice::open(CodecOp::H264Decode) {
@@ -255,17 +225,13 @@ fn resolved_tier_transcodes_vulkan_hop_windows() {
 #[cfg(d3d12_available)]
 #[test]
 fn resolved_tier_transcodes_one_hop() {
-    use rust_video::d3d12::{Codec, D3d12Device, Transcoder};
-    use rust_video::{Bytes, Packet, Route};
+    use bytes::Bytes;
+    use rust_video::{Packet, Route};
+    use rust_video_d3d12::{Codec, D3d12Device, Transcoder};
 
     let caps = Capabilities::none().with_platform_hw().with_software();
     assert_eq!(
-        resolve(
-            VideoCodec::H264,
-            TierPreference::Force(Tier::D3d12),
-            &caps,
-            Platform::Windows
-        ),
+        TierPreference::Force(Tier::D3d12).resolve(VideoCodec::H264, &caps, Platform::Windows),
         Ok(Tier::D3d12)
     );
     let device = match D3d12Device::open() {
@@ -312,17 +278,13 @@ fn resolved_tier_transcodes_one_hop() {
 #[cfg(d3d11_available)]
 #[test]
 fn resolved_tier_transcodes_d3d11_hop() {
-    use rust_video::d3d11::{Codec, D3d11Device, Transcoder};
-    use rust_video::{Bytes, Packet, Route};
+    use bytes::Bytes;
+    use rust_video::{Packet, Route};
+    use rust_video_d3d11::{Codec, D3d11Device, Transcoder};
 
     let caps = Capabilities::none().with_platform_hw().with_software();
     assert_eq!(
-        resolve(
-            VideoCodec::H264,
-            TierPreference::Force(Tier::D3d11),
-            &caps,
-            Platform::Windows
-        ),
+        TierPreference::Force(Tier::D3d11).resolve(VideoCodec::H264, &caps, Platform::Windows),
         Ok(Tier::D3d11)
     );
     let device = match D3d11Device::open() {

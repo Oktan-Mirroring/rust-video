@@ -4,7 +4,7 @@
 [[oracle]]
 id = "RV1"
 behaviour = "Auto tier order resolves Vulkan, platform hardware, then software"
-test = "crates/rust-video/src/tier.rs auto_order and resolve auto-selection tests"
+test = "crates/rust-video/src/tier.rs Platform::auto_order and TierPreference::resolve auto-selection tests"
 status = "proven"
 
 [[oracle]]

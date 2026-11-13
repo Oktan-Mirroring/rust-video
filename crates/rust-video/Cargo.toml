@@ -24,6 +24,7 @@ vaapi = ["dep:rust-video-vaapi"]
 vulkan = ["dep:rust-video-vulkan"]
 
 [dev-dependencies]
+bytes = "1"
 rust-video-harness = { path = "../rust-video-harness" }
 
 [lints]
@@ -31,6 +32,7 @@ workspace = true
 
 [dependencies]
 bytes = "1"
+# Backend crates serve the integration tests; the facade re-exports vocabulary only.
 rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1", optional = true }
 rust-video-av2 = { version = "0.1.0", path = "../rust-video-av2", optional = true }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }

@@ -1,8 +1,6 @@
 //! Facade tier resolution across platforms and codecs.
 
-use rust_video::{
-    auto_order, host_platform, resolve, Capabilities, Platform, TierPreference, VideoCodec,
-};
+use rust_video::{Capabilities, Platform, TierPreference, VideoCodec};
 
 fn main() {
     let caps = Capabilities::none()
@@ -24,7 +22,7 @@ fn main() {
             VideoCodec::Vp8,
             VideoCodec::Av2,
         ] {
-            match resolve(codec, TierPreference::Auto, &caps, platform) {
+            match TierPreference::Auto.resolve(codec, &caps, platform) {
                 Ok(tier) => println!("{platform:?}/{codec:?} -> {tier:?}"),
                 Err(error) => println!("{platform:?}/{codec:?} -> {error}"),
             }
@@ -32,7 +30,7 @@ fn main() {
     }
     println!(
         "host: {:?} order: {:?}",
-        host_platform(),
-        auto_order(host_platform())
+        Platform::host(),
+        Platform::host().auto_order()
     );
 }

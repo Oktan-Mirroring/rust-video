@@ -17,6 +17,35 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// Host OS family.
+    #[must_use]
+    pub fn host() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Tier order for automatic selection: Vulkan, platform hardware, software.
+    ///
+    /// # Returns
+    ///
+    /// Tiers in probe order. Platforms without a hardware tier skip the middle slots.
+    #[must_use]
+    pub fn auto_order(self) -> &'static [Tier] {
+        match self {
+            Self::Windows => &[Tier::Vulkan, Tier::D3d11, Tier::D3d12, Tier::Software],
+            Self::Linux => &[Tier::Vulkan, Tier::VaApi, Tier::Software],
+            Self::Android => &[Tier::Vulkan, Tier::MediaCodec, Tier::Software],
+            Self::Other => &[Tier::Vulkan, Tier::Software],
+        }
+    }
+
     /// True when `tier` is native hardware on the platform.
     #[must_use]
     fn supports_hardware(self, tier: Tier) -> bool {
@@ -72,6 +101,48 @@ pub enum TierPreference {
     Force(Tier),
 }
 
+impl TierPreference {
+    /// Tier for `codec` under this preference given `caps` on `platform`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the forced tier is missing or H.265 software lacks a realtime backend, or when automatic selection finds no usable tier.
+    ///
+    /// # Arguments
+    ///
+    /// * `codec` - codec to encode or decode.
+    /// * `caps` - tier availability on this machine.
+    /// * `platform` - host OS; selects the hardware tiers.
+    ///
+    /// # Returns
+    ///
+    /// Selected tier.
+    pub fn resolve(
+        self,
+        codec: VideoCodec,
+        caps: &Capabilities,
+        platform: Platform,
+    ) -> Result<Tier, TierError> {
+        match self {
+            Self::Force(tier) => {
+                if caps.supports(codec, tier, platform) {
+                    Ok(tier)
+                } else {
+                    Err(TierError::new(codec, self))
+                }
+            }
+            Self::Auto => {
+                for tier in platform.auto_order().iter().copied() {
+                    if caps.supports(codec, tier, platform) {
+                        return Ok(tier);
+                    }
+                }
+                Err(TierError::new(codec, self))
+            }
+        }
+    }
+}
+
 /// Video codec.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -93,9 +164,13 @@ pub enum VideoCodec {
 /// Tier availability on one machine.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Capabilities {
+    /// Vulkan video available.
     vulkan: bool,
+    /// Platform hardware tier available.
     platform_hw: bool,
+    /// Software backend available.
     software: bool,
+    /// H.265 software backend maturity.
     h265_sw: SoftwareH265,
 }
 
@@ -157,7 +232,9 @@ impl Capabilities {
 /// Tier resolution failure.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TierError {
+    /// Codec the failed resolution targeted.
     codec: VideoCodec,
+    /// Preference the failed resolution used.
     preference: TierPreference,
 }
 
@@ -194,91 +271,14 @@ impl fmt::Display for TierError {
 
 impl std::error::Error for TierError {}
 
-/// Tier order for automatic selection: Vulkan, platform hardware, software.
-///
-/// # Arguments
-///
-/// * `platform` - host OS; its hardware tiers fill the middle slots.
-///
-/// # Returns
-///
-/// Tiers in probe order. Platforms without a hardware tier skip the middle slots.
-#[must_use]
-pub fn auto_order(platform: Platform) -> &'static [Tier] {
-    match platform {
-        Platform::Windows => &[Tier::Vulkan, Tier::D3d11, Tier::D3d12, Tier::Software],
-        Platform::Linux => &[Tier::Vulkan, Tier::VaApi, Tier::Software],
-        Platform::Android => &[Tier::Vulkan, Tier::MediaCodec, Tier::Software],
-        Platform::Other => &[Tier::Vulkan, Tier::Software],
-    }
-}
-
-/// Host OS family.
-#[must_use]
-pub fn host_platform() -> Platform {
-    if cfg!(target_os = "windows") {
-        Platform::Windows
-    } else if cfg!(target_os = "linux") {
-        Platform::Linux
-    } else if cfg!(target_os = "android") {
-        Platform::Android
-    } else {
-        Platform::Other
-    }
-}
-
-/// Tier for `codec` under `pref` given `caps` on `platform`.
-///
-/// # Arguments
-///
-/// * `codec` - codec to encode or decode.
-/// * `pref` - automatic order or one forced tier.
-/// * `caps` - tier availability on this machine.
-/// * `platform` - host OS; selects the hardware tiers.
-///
-/// # Errors
-///
-/// Returns `Err` when the forced tier is missing or H.265 software lacks a realtime backend, or when automatic selection finds no usable tier.
-///
-/// # Returns
-///
-/// Selected tier.
-pub fn resolve(
-    codec: VideoCodec,
-    pref: TierPreference,
-    caps: &Capabilities,
-    platform: Platform,
-) -> Result<Tier, TierError> {
-    match pref {
-        TierPreference::Force(tier) => {
-            if caps.supports(codec, tier, platform) {
-                Ok(tier)
-            } else {
-                Err(TierError::new(codec, pref))
-            }
-        }
-        TierPreference::Auto => {
-            for tier in auto_order(platform).iter().copied() {
-                if caps.supports(codec, tier, platform) {
-                    return Ok(tier);
-                }
-            }
-            Err(TierError::new(codec, pref))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        auto_order, host_platform, resolve, Capabilities, Platform, Tier, TierError,
-        TierPreference, VideoCodec,
-    };
+    use super::{Capabilities, Platform, Tier, TierError, TierPreference, VideoCodec};
 
     #[test]
     fn auto_order_windows() {
         assert_eq!(
-            auto_order(Platform::Windows),
+            Platform::Windows.auto_order(),
             [Tier::Vulkan, Tier::D3d11, Tier::D3d12, Tier::Software]
         );
     }
@@ -291,7 +291,7 @@ mod tests {
             Platform::Android,
             Platform::Other,
         ] {
-            let order = auto_order(platform);
+            let order = platform.auto_order();
             assert_eq!(order.first(), Some(&Tier::Vulkan), "{platform:?}");
             assert_eq!(order.last(), Some(&Tier::Software), "{platform:?}");
         }
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn auto_order_linux() {
         assert_eq!(
-            auto_order(Platform::Linux),
+            Platform::Linux.auto_order(),
             [Tier::Vulkan, Tier::VaApi, Tier::Software]
         );
     }
@@ -308,14 +308,14 @@ mod tests {
     #[test]
     fn auto_order_android() {
         assert_eq!(
-            auto_order(Platform::Android),
+            Platform::Android.auto_order(),
             [Tier::Vulkan, Tier::MediaCodec, Tier::Software]
         );
     }
 
     #[test]
     fn auto_order_other_skips_middle_slots() {
-        assert_eq!(auto_order(Platform::Other), [Tier::Vulkan, Tier::Software]);
+        assert_eq!(Platform::Other.auto_order(), [Tier::Vulkan, Tier::Software]);
     }
 
     #[test]
@@ -329,7 +329,7 @@ mod tests {
         } else {
             Platform::Other
         };
-        assert_eq!(host_platform(), expected);
+        assert_eq!(Platform::host(), expected);
     }
 
     #[test]
@@ -339,12 +339,7 @@ mod tests {
             .with_platform_hw()
             .with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Linux),
             Ok(Tier::Vulkan)
         );
     }
@@ -353,12 +348,7 @@ mod tests {
     fn auto_falls_back_to_platform_hardware() {
         let caps = Capabilities::none().with_platform_hw().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Linux),
             Ok(Tier::VaApi)
         );
     }
@@ -367,12 +357,7 @@ mod tests {
     fn auto_falls_back_to_software() {
         let caps = Capabilities::none().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Linux),
             Ok(Tier::Software)
         );
     }
@@ -381,12 +366,7 @@ mod tests {
     fn auto_without_tiers_fails() {
         let caps = Capabilities::none();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Linux),
             Err(TierError::new(VideoCodec::H264, TierPreference::Auto))
         );
     }
@@ -395,12 +375,7 @@ mod tests {
     fn force_present_tier_succeeds() {
         let caps = Capabilities::none().with_platform_hw();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(Tier::VaApi),
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Force(Tier::VaApi).resolve(VideoCodec::H264, &caps, Platform::Linux),
             Ok(Tier::VaApi)
         );
     }
@@ -409,12 +384,7 @@ mod tests {
     fn force_missing_vulkan_fails() {
         let caps = Capabilities::none().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(Tier::Vulkan),
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Force(Tier::Vulkan).resolve(VideoCodec::H264, &caps, Platform::Linux),
             Err(TierError::new(
                 VideoCodec::H264,
                 TierPreference::Force(Tier::Vulkan)
@@ -426,12 +396,7 @@ mod tests {
     fn force_foreign_hardware_tier_fails() {
         let caps = Capabilities::none().with_platform_hw();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(Tier::VaApi),
-                &caps,
-                Platform::Windows
-            ),
+            TierPreference::Force(Tier::VaApi).resolve(VideoCodec::H264, &caps, Platform::Windows),
             Err(TierError::new(
                 VideoCodec::H264,
                 TierPreference::Force(Tier::VaApi)
@@ -443,12 +408,7 @@ mod tests {
     fn force_d3d12_on_windows_succeeds() {
         let caps = Capabilities::none().with_platform_hw();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(Tier::D3d12),
-                &caps,
-                Platform::Windows
-            ),
+            TierPreference::Force(Tier::D3d12).resolve(VideoCodec::H264, &caps, Platform::Windows),
             Ok(Tier::D3d12)
         );
     }
@@ -457,12 +417,7 @@ mod tests {
     fn force_d3d12_off_windows_fails() {
         let caps = Capabilities::none().with_platform_hw();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Force(Tier::D3d12),
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Force(Tier::D3d12).resolve(VideoCodec::H264, &caps, Platform::Linux),
             Err(TierError::new(
                 VideoCodec::H264,
                 TierPreference::Force(Tier::D3d12)
@@ -474,12 +429,7 @@ mod tests {
     fn auto_keeps_d3d11_middle_slot() {
         let caps = Capabilities::none().with_platform_hw().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Windows
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Windows),
             Ok(Tier::D3d11)
         );
     }
@@ -488,22 +438,12 @@ mod tests {
     fn h265_software_needs_realtime_backend_auto() {
         let caps = Capabilities::none().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H265,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H265, &caps, Platform::Linux),
             Err(TierError::new(VideoCodec::H265, TierPreference::Auto))
         );
         let caps = Capabilities::none().with_software().with_h265_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H265,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H265, &caps, Platform::Linux),
             Ok(Tier::Software)
         );
     }
@@ -513,12 +453,12 @@ mod tests {
         let pref = TierPreference::Force(Tier::Software);
         let caps = Capabilities::none().with_software();
         assert_eq!(
-            resolve(VideoCodec::H265, pref, &caps, Platform::Linux),
+            pref.resolve(VideoCodec::H265, &caps, Platform::Linux),
             Err(TierError::new(VideoCodec::H265, pref))
         );
         let caps = Capabilities::none().with_software().with_h265_software();
         assert_eq!(
-            resolve(VideoCodec::H265, pref, &caps, Platform::Linux),
+            pref.resolve(VideoCodec::H265, &caps, Platform::Linux),
             Ok(Tier::Software)
         );
     }
@@ -527,12 +467,7 @@ mod tests {
     fn h265_gate_leaves_hardware_tiers_open() {
         let caps = Capabilities::none().with_vulkan().with_platform_hw();
         assert_eq!(
-            resolve(
-                VideoCodec::H265,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H265, &caps, Platform::Linux),
             Ok(Tier::Vulkan)
         );
     }
@@ -541,12 +476,7 @@ mod tests {
     fn h265_gate_ignores_other_codecs() {
         let caps = Capabilities::none().with_software();
         assert_eq!(
-            resolve(
-                VideoCodec::H264,
-                TierPreference::Auto,
-                &caps,
-                Platform::Linux
-            ),
+            TierPreference::Auto.resolve(VideoCodec::H264, &caps, Platform::Linux),
             Ok(Tier::Software)
         );
     }
