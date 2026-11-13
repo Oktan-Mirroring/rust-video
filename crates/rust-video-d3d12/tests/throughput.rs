@@ -2,8 +2,7 @@
 
 //! GPU transcode throughput: 1080p hops against the 60 fps bar.
 //!
-//! Skips without hardware. Prints measured fps; fails below the bar only
-//! with `RUST_VIDEO_BENCH_STRICT=1`.
+//! Skips without hardware; a hardware run fails below the bar.
 
 #[path = "../examples/common/bits.rs"]
 mod bits;
@@ -85,10 +84,8 @@ fn xcode_1080p_measures_realtime() {
     let raws = annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
     let measured = fps(&mut transcoder, &warmup, &raws);
     println!("xcode 1080p: {measured:.1}fps over {HOPS} hops, bar {BAR:.0}fps");
-    if std::env::var("RUST_VIDEO_BENCH_STRICT").is_ok_and(|value| value == "1") {
-        assert!(
-            measured >= BAR,
-            "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
-        );
-    }
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
 }

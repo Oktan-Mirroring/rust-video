@@ -1,31 +1,41 @@
+# Recipes run under PowerShell on Windows; sh is not on PATH there.
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+
+python := if os() == "windows" { "python" } else { "python3" }
+
 # Format the workspace.
 fmt:
     cargo fmt --all
 
-# Clippy over the workspace, warnings denied.
+# Clippy over the workspace, every cargo-only feature, warnings denied.
+# rust-video-sw leaves the --all-features line: its ffmpeg feature links
+# system libavcodec, so sw lints with h264-openh264 and e2e covers ffmpeg.
 check:
-    cargo clippy --workspace --all-targets -j24 -- -D warnings
+    cargo clippy --workspace --exclude rust-video-sw --all-targets --all-features -- -D warnings
+    cargo clippy -p rust-video-sw --all-targets --features h264-openh264 -- -D warnings
 
-# Unit tests across the workspace.
+# Unit tests across the workspace: default, no-default, sw codec.
+# The livepack ffmpeg oracle stays out: it needs --features
+# rust-video-livepack/oracle, which only the e2e path passes.
 test:
-    cargo test --workspace -j24
+    cargo test --workspace
+    cargo test --workspace --no-default-features
+    cargo test -p rust-video-sw --features h264-openh264
 
 # Debug build of the workspace.
 build:
-    cargo build --workspace -j24
+    cargo build --workspace
 
 # API docs for the workspace, no dependency docs.
 doc:
-    cargo doc --workspace --no-deps
+    {{python}} scripts/doc.py
 
 # Formatting gate for CI.
 fmt-check:
     cargo fmt --all --check
 
-# Full gate: format, lints, tests, docs, spec tables.
-ci: fmt-check check test doc spec-check
-
-python := if os() == "windows" { "python" } else { "python3" }
+# Full gate: format, lints, build, tests, docs, spec tables.
+ci: fmt-check check build test doc spec-check
 
 # Diff spec doc tables against caps const tables.
 spec-check:
@@ -41,13 +51,16 @@ e2e:
 
 # Generate goldens with the ffmpeg oracle; fails on uncovered options.
 goldens *args:
-    cargo run -j24 -p rust-video-harness --bin golden_gen -- {{args}}
+    cargo run -p rust-video-harness --bin golden_gen -- {{args}}
 
 # Commit gate hook entry point; wiring lives in .agents/hooks/README.md.
 commit-lint-gate:
-    bash .agents/hooks/commit-lint-gate.sh
+    {{python}} .agents/hooks/commit-lint-gate.py
 
-# MSRV gate: check and test on the pinned 1.87.0 toolchain.
+# MSRV gate: check and test on the pinned 1.87.0 toolchain. sw/openh264
+# stays out: its transitive safe_arch/wide need rustc 1.89.
 msrv:
-    cargo +1.87.0 clippy --workspace --all-targets -j24 -- -D warnings
-    cargo +1.87.0 test --workspace -j24
+    cargo +1.87.0 clippy --workspace --exclude rust-video-sw --all-targets --all-features -- -D warnings
+    cargo +1.87.0 clippy -p rust-video-sw --all-targets -- -D warnings
+    cargo +1.87.0 test --workspace
+    cargo +1.87.0 test --workspace --no-default-features

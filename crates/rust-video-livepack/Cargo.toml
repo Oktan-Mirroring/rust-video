@@ -8,3 +8,10 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+oracle = []
+
+[[test]]
+name = "fmp4_ffmpeg"
+required-features = ["oracle"]

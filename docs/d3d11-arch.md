@@ -141,8 +141,12 @@ zero-reset steady run; `H264Decoder::resets` counts stream
 resets (`decoder.rs`, `tests/e2e.rs`).
 
 `tests/throughput.rs` measures 30 1080p GPU hops against
-the 60 fps bar (305.5 fps); `RUST_VIDEO_BENCH_STRICT=1`
-fails below the bar.
+the 60 fps bar; a hardware run fails below it. One 1080p
+NV12 frame is 1920*1080*1.5 = 3,110,400 bytes, so the bar
+moves 186,624,000 bytes/s. Measured 519.8 fps on
+2026-11-13: Windows 11 Pro N build 26200, Ryzen 9 9950X3D,
+RTX 5080 on driver 32.0.16.2114, debug build, via `cargo
+test -p rust-video-d3d11 --test throughput`.
 
 ## Examples
 

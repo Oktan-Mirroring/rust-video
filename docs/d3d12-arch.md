@@ -152,8 +152,12 @@ Rext label is relabeled Main across 30 parameter-set
 sites, and an unpatched regen fails loud with profile
 outside main (`tests/e2e.rs`, `device.rs`).
 `tests/throughput.rs` measures 30 1080p GPU hops against
-the 60 fps bar (64.2 fps); `RUST_VIDEO_BENCH_STRICT=1`
-fails below the bar.
+the 60 fps bar; a hardware run fails below it. One 1080p
+NV12 frame is 1920*1080*1.5 = 3,110,400 bytes, so the bar
+moves 186,624,000 bytes/s. Measured 112.7 fps on
+2026-11-13: Windows 11 Pro N build 26200, Ryzen 9 9950X3D,
+RTX 5080 on driver 32.0.16.2114, debug build, via `cargo
+test -p rust-video-d3d12 --test throughput`.
 
 ## Examples
 

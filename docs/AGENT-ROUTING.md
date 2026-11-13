@@ -17,5 +17,6 @@ that proves it.
 | register a capability | `docs/testing/manifest.toml` | `just ci` |
 | touch a codec cap or level | `docs/specs/<codec>.md`, `docs/sourcing.md` | `just spec-check` |
 | add a sourced value | `docs/sourcing.md` tier table | `just ci` |
-| touch versions, tiers, or CI matrix | `docs/compat.md` | `just ci` |
+| touch versions or tiers | `docs/compat.md` | `just ci` |
+| touch the CI matrix | `.github/workflows/ci.yml` | `just ci` + `just msrv`; the matrix itself greens on push |
 | touch frames, pools, queues, or exports | `docs/runtime.md` | `just ci` |
