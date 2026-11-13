@@ -160,7 +160,11 @@ impl<T> Default for FrameSlot<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{BoundedQueue, FrameSlot, Policy, PushError};
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn queue_rejects_zero_capacity() {
@@ -218,5 +222,57 @@ mod tests {
     fn slot_default_is_empty() {
         let slot = FrameSlot::<u8>::default();
         assert_eq!(slot.take(), None);
+    }
+
+    #[test]
+    fn queue_and_slot_are_send_sync() {
+        assert_send_sync::<BoundedQueue<u64>>();
+        assert_send_sync::<FrameSlot<u64>>();
+    }
+
+    #[test]
+    fn concurrent_push_pop_preserves_entries() {
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 250;
+        const TOTAL: usize = PRODUCERS * PER_PRODUCER;
+        let queue = BoundedQueue::new(TOTAL, Policy::Block).expect("cap");
+        let collected = Mutex::new(Vec::with_capacity(TOTAL));
+        let queue = &queue;
+        let collected = &collected;
+        std::thread::scope(|scope| {
+            for producer in 0..PRODUCERS {
+                scope.spawn(move || {
+                    for item in 0..PER_PRODUCER {
+                        let value = producer * PER_PRODUCER + item;
+                        loop {
+                            match queue.push(value) {
+                                Ok(None) => break,
+                                Ok(Some(_)) => unreachable!("blocking push evicts nothing"),
+                                Err(PushError::WouldBlock) => std::thread::yield_now(),
+                            }
+                        }
+                    }
+                });
+            }
+            for _ in 0..2 {
+                scope.spawn(move || loop {
+                    if let Some(value) = queue.pop() {
+                        let mut collected = collected.lock().expect("collected");
+                        collected.push(value);
+                        if collected.len() == TOTAL {
+                            break;
+                        }
+                    } else if collected.lock().expect("collected").len() == TOTAL {
+                        break;
+                    } else {
+                        std::thread::yield_now();
+                    }
+                });
+            }
+        });
+        let mut collected = collected.lock().expect("collected").clone();
+        collected.sort_unstable();
+        let expected: Vec<usize> = (0..TOTAL).collect();
+        assert_eq!(collected, expected);
     }
 }

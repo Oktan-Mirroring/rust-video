@@ -883,7 +883,7 @@ mod tests {
             mux.push(&empty, None, &mut out).unwrap_err(),
             TsMuxError::EmptyPayload
         );
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]
@@ -898,7 +898,7 @@ mod tests {
                 TsMuxError::CodecNotMappable(codec)
             );
         }
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
     }
 
     #[test]
@@ -917,7 +917,8 @@ mod tests {
     #[test]
     fn demux_holds_partial_packet() {
         let mut demux = TsDemux::new(1 << 20);
-        assert!(demux.push(&[0x47; 100]).expect("buffered").is_empty());
+        let units = demux.push(&[0x47; 100]).expect("buffered");
+        assert_eq!(units, []);
     }
 
     #[test]

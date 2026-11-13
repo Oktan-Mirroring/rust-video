@@ -95,5 +95,8 @@ fn duplicate_packet_is_ignored() {
 #[test]
 fn empty_push_is_silent() {
     let mut demux = TsDemux::new(1 << 20);
-    assert!(demux.push(&[]).expect("parsed").is_empty());
+    assert_eq!(
+        demux.push(&[]).expect("parsed"),
+        [] as [rust_video_livepack::AccessUnit; 0]
+    );
 }

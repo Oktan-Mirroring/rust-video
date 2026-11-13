@@ -115,7 +115,10 @@ fn finish_flushes_trailing_unbounded_pes() {
     let mut stream = Vec::new();
     mux.push(&big, None, &mut stream).expect("packetized");
     let mut demux = TsDemux::new(1 << 20);
-    assert!(demux.push(&stream).expect("parsed").is_empty());
+    assert_eq!(
+        demux.push(&stream).expect("parsed"),
+        [] as [rust_video_livepack::AccessUnit; 0]
+    );
     let unit = demux.finish().expect("flushed");
     assert_eq!(unit.payload(), big.payload());
     assert!(demux.finish().is_none());

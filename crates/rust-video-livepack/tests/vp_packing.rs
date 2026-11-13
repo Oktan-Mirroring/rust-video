@@ -1,8 +1,27 @@
 //! VP8/VP9 fMP4 packing: muxed sample bytes match the inputs.
 //!
-//! `FFmpeg` oracle at the bottom runs only when `libvpx-vp9` exists.
+//! `FFmpeg` oracle at the bottom fails without `ffmpeg`/`ffprobe` plus
+//! `libvpx-vp9`; set `RUST_VIDEO_ALLOW_SKIP=1` to skip instead.
 
 use rust_video_livepack::{AccessUnit, Codec, FragmentMux, TrackConfig, Vp8Config, Vp9Config};
+
+/// True when `RUST_VIDEO_ALLOW_SKIP=1` permits skipping.
+fn allow_skip() -> bool {
+    std::env::var("RUST_VIDEO_ALLOW_SKIP").is_ok_and(|value| value == "1")
+}
+
+/// Skip over missing `what`.
+///
+/// # Panics
+///
+/// Panics unless `RUST_VIDEO_ALLOW_SKIP=1` is set.
+fn skip(what: &str) {
+    if allow_skip() {
+        eprintln!("skipped: missing {what}");
+    } else {
+        panic!("missing {what}; rerun with RUST_VIDEO_ALLOW_SKIP=1 to skip");
+    }
+}
 
 /// `vpcC` box: version 1, zero flags, 8-bit 4:2:0, no init data.
 fn vpcc() -> [u8; 12] {
@@ -178,7 +197,7 @@ fn find_tagged(buf: &[u8], tag: [u8; 4]) -> Vec<&[u8]> {
 #[test]
 fn vp9_ffmpeg_oracle() {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") || !have_encoder("libvpx-vp9") {
-        eprintln!("skip: ffmpeg/ffprobe/libvpx-vp9 missing");
+        skip("ffmpeg/ffprobe/libvpx-vp9 (install an ffmpeg build with libvpx-vp9)");
         return;
     }
     let dir = workdir();

@@ -1112,7 +1112,7 @@ mod tests {
                 mux.push_sample(&unit, 3000, None, &mut out).unwrap_err(),
                 Fmp4Error::CodecMismatch
             );
-            assert!(out.is_empty());
+            assert_eq!(out, [] as [u8; 0]);
         }
     }
 
@@ -1190,7 +1190,7 @@ mod tests {
                 .unwrap_err(),
             Fmp4Error::NoNalus
         );
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         assert_eq!(mux.sequence(), 1);
     }
 
@@ -1208,7 +1208,7 @@ mod tests {
                 .expect("polled"),
             PacketAction::HeldForKeyframe
         );
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         assert_eq!(mux.sequence(), 1);
     }
 
