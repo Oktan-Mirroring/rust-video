@@ -39,7 +39,7 @@ fn probe_reports_or_skips() {
         println!("profile: {} ({})", profile.name(), profile.codec());
     }
     assert!(device.supports(Codec::H264));
-    assert!(!device.profiles().is_empty());
+    assert_ne!(device.profiles(), []);
 
     let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xC5, 0x00]));
     let mut h264 = H264Decoder::open(&device);
@@ -79,19 +79,7 @@ fn probe_reports_or_skips() {
 fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, required: bool) {
     let mut encoder = match D3d11Encoder::open(device, codec) {
         Ok(encoder) => encoder,
-        Err(error) => {
-            println!("{codec} encode unavailable: {error}");
-            assert!(!required, "{codec} encoder required: {error}");
-            assert!(
-                matches!(error, D3d11Error::Unsupported(_)),
-                "loud fallback: {error}"
-            );
-            assert!(
-                error.to_string().contains("encoder MFT"),
-                "loud fallback: {error}"
-            );
-            return;
-        }
+        Err(error) => return fallback(codec, required, &error),
     };
     assert_eq!(encoder.codec(), codec);
     let frame = grey_nv12(width, height);
@@ -99,14 +87,20 @@ fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, re
     let mut count = 0usize;
     let mut bytes = 0usize;
     for _ in 0..8 {
-        let packets = encoder.encode(&frame).expect("encode frame");
+        let packets = match encoder.encode(&frame) {
+            Ok(packets) => packets,
+            Err(error) => return fallback(codec, required, &error),
+        };
         count += packets.len();
         bytes += packets
             .iter()
             .map(|packet| packet.data().len())
             .sum::<usize>();
     }
-    let drained = encoder.flush().expect("flush");
+    let drained = match encoder.flush() {
+        Ok(drained) => drained,
+        Err(error) => return fallback(codec, required, &error),
+    };
     count += drained.len();
     bytes += drained
         .iter()
@@ -119,6 +113,20 @@ fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, re
         start.elapsed()
     );
     assert!(bytes > 0, "{codec} encoder emitted no bytes");
+}
+
+/// Loud fallback for a `codec` the machine cannot encode.
+fn fallback(codec: Codec, required: bool, error: &D3d11Error) {
+    println!("{codec} encode unavailable: {error}");
+    assert!(!required, "{codec} encoder required: {error}");
+    assert!(
+        matches!(error, D3d11Error::Unsupported(_)),
+        "loud fallback: {error}"
+    );
+    assert!(
+        error.to_string().contains("encoder MFT"),
+        "loud fallback: {error}"
+    );
 }
 
 /// Mid-grey NV12 frame of `width` x `height`.

@@ -1,4 +1,8 @@
 //! GPU transcode: decode surface to encoder texture without readback.
+//!
+//! Export probe over COM/D3D11: live descriptors, checked handles.
+
+#![allow(unsafe_code)]
 
 use crate::decoder::GpuSurface;
 use crate::decoder::{D3d11Frame, H264Decoder};
@@ -7,6 +11,7 @@ use crate::encoder::D3d11Encoder;
 use crate::error::D3d11Error;
 use crate::guid::Codec;
 use crate::scale::{ScaledSurface, Scaler};
+use crate::submit::flag_word;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
@@ -14,6 +19,16 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::IDXGIResource;
+
+/// Probe texture extent in luma samples.
+const PROBE_EXTENT: u32 = 64;
 
 /// GPU transcode from decode surface to encoder texture.
 pub struct Transcoder<'a> {
@@ -40,18 +55,16 @@ impl<'a> Transcoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` without a `decode` picture builder or without an
-    /// `encode` encoder MFT on the machine.
+    /// Returns `Err` without a `decode` picture builder, without
+    /// shared-texture export on the device, or without an `encode`
+    /// encoder MFT on the machine.
     pub fn open(device: &'a D3d11Device, decode: Codec, encode: Codec) -> Result<Self, D3d11Error> {
         if decode != Codec::H264 {
             return Err(D3d11Error::Unsupported(format!("{decode} decode pending")));
         }
+        let share = shared_export(device).ok_or_else(declined_export)?;
         let encoder = D3d11Encoder::open(device, encode)?;
-        let caps = GpuCaps::new(
-            Some(ShareMechanism::NtHandle),
-            device.supports(decode),
-            encoder.gpu_ready(),
-        );
+        let caps = GpuCaps::new(Some(share), device.supports(decode), encoder.gpu_ready());
         let plan = Plan::for_caps(&caps);
         let decoder = Box::new(H264Decoder::open(device));
         Ok(Self {
@@ -204,6 +217,49 @@ impl<'a> Transcoder<'a> {
     }
 }
 
+/// NT-handle share behind `device`, absent without shared-texture export.
+fn shared_export(device: &D3d11Device) -> Option<ShareMechanism> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: PROBE_EXTENT,
+        Height: PROBE_EXTENT,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: flag_word(D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0),
+        CPUAccessFlags: 0,
+        MiscFlags: flag_word(D3D11_RESOURCE_MISC_SHARED.0),
+    };
+    let mut texture = None;
+    // Sound: the descriptor stays live for the call.
+    let created = unsafe {
+        device.device().CreateTexture2D(
+            std::ptr::addr_of!(desc),
+            None,
+            Some(std::ptr::addr_of_mut!(texture)),
+        )
+    };
+    let (Ok(()), Some(texture)) = (created, texture) else {
+        return None;
+    };
+    let resource: IDXGIResource = texture.cast().ok()?;
+    // Sound: the resource is live.
+    let handle = unsafe { resource.GetSharedHandle() }.ok()?;
+    (!handle.0.is_null()).then_some(ShareMechanism::NtHandle)
+}
+
+/// Typed decline for a device without shared-texture export.
+fn declined_export() -> D3d11Error {
+    D3d11Error::Unsupported(format!(
+        "export declined: {}",
+        FallbackCause::NoSharedExport
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -212,6 +268,16 @@ mod tests {
     /// Live H.264 transcoder, absent without hardware.
     fn transcoder(device: &crate::device::D3d11Device) -> Option<super::Transcoder<'_>> {
         super::Transcoder::open(device, crate::guid::Codec::H264, crate::guid::Codec::H264).ok()
+    }
+
+    #[test]
+    fn declined_export_names_export() {
+        let error = super::declined_export();
+        assert!(matches!(error, crate::error::D3d11Error::Unsupported(_)));
+        assert_eq!(
+            error.to_string(),
+            "unsupported stream: export declined: decode texture without share handle"
+        );
     }
 
     #[test]
@@ -236,7 +302,7 @@ mod tests {
             return;
         };
         let outcome = transcoder.flush().expect("flush drains");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -247,16 +313,8 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
-        assert!(transcoder
-            .flush()
-            .expect("first flush")
-            .packets()
-            .is_empty());
-        assert!(transcoder
-            .flush()
-            .expect("second flush")
-            .packets()
-            .is_empty());
+        assert_eq!(transcoder.flush().expect("first flush").packets(), []);
+        assert_eq!(transcoder.flush().expect("second flush").packets(), []);
     }
 
     #[test]
@@ -269,7 +327,7 @@ mod tests {
         };
         let packet = Packet::new(Bytes::new());
         let outcome = transcoder.transcode(&packet).expect("empty packet");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -282,7 +340,7 @@ mod tests {
         };
         let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1]));
         let outcome = transcoder.transcode(&packet).expect("truncated packet");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]

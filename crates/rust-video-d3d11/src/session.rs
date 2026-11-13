@@ -440,6 +440,7 @@ fn create_texture(
         ..desc
     };
     let mut texture = None;
+    // Sound: the fallback descriptor stays live for the call.
     unsafe {
         device.device().CreateTexture2D(
             std::ptr::addr_of!(desc),

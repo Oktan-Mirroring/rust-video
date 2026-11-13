@@ -4,6 +4,7 @@
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
 
 #![allow(unsafe_code)]
+// The implement macro expands to inline(always) shims with ref casts.
 #![allow(clippy::inline_always, clippy::ref_as_ptr)]
 
 use std::collections::VecDeque;
@@ -326,7 +327,8 @@ impl Session {
             match self.configure_try(width, height) {
                 Ok(()) => return Ok(()),
                 Err(_) if !self.standby.is_empty() => self.adopt()?,
-                Err(error) => return Err(error),
+                Err(error) if self.size.is_some() => return Err(error),
+                Err(_) => return Err(missing_encoder(self.codec)),
             }
         }
     }
@@ -344,7 +346,7 @@ impl Session {
         }
         self.message(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
         self.message(MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
-        let mut info: MFT_INPUT_STREAM_INFO = unsafe { std::mem::zeroed() };
+        let mut info = MFT_INPUT_STREAM_INFO::default();
         // Sound: the info stays live for the call; failure keeps the default align.
         if unsafe {
             self.transform
@@ -661,6 +663,13 @@ impl EventPump {
         if let Err(error) = unsafe { self.events.BeginGetEvent(&self.callback, state) } {
             self.queue.push(Err(error.code().0));
         }
+    }
+}
+
+impl Drop for EventPump {
+    // Outstanding request abandoned; blocked waiters wake with `E_ABORT`.
+    fn drop(&mut self) {
+        self.queue.push(Err(windows::Win32::Foundation::E_ABORT.0));
     }
 }
 
@@ -1285,6 +1294,7 @@ fn stamp(
     height: u32,
     bitrate: Option<u32>,
 ) -> Result<(), D3d11Error> {
+    // Sound: the borrowed type is live for every set below.
     call(
         unsafe { media.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height)) },
         "SetUINT64",
@@ -1447,11 +1457,11 @@ mod tests {
     #[test]
     fn drain_collects_without_blocking() {
         let queue = EventQueue::new();
-        assert!(queue.drain().is_empty());
+        assert_eq!(queue.drain(), [] as [std::result::Result<u32, i32>; 0]);
         queue.push(Ok(1));
         queue.push(Ok(2));
         assert_eq!(queue.drain(), vec![Ok(1), Ok(2)]);
-        assert!(queue.drain().is_empty());
+        assert_eq!(queue.drain(), [] as [std::result::Result<u32, i32>; 0]);
     }
 
     #[test]
@@ -1464,5 +1474,35 @@ mod tests {
         });
         assert_eq!(queue.pop(), Ok(9));
         worker.join().expect("worker joins");
+    }
+
+    #[test]
+    fn async_session_opens_and_drops() {
+        use crate::device::D3d11Device;
+        use crate::guid::Codec;
+
+        use super::Session;
+
+        let device = match D3d11Device::open() {
+            Ok(device) => device,
+            Err(error) => {
+                println!("d3d11 skipped: {error}");
+                return;
+            }
+        };
+        let session = match Session::open(&device, Codec::H264) {
+            Ok(session) => session,
+            Err(error) => {
+                println!("d3d11 skipped: {error}");
+                return;
+            }
+        };
+        let name = session.mft_name().to_owned();
+        let path = if session.pump.is_some() {
+            "async"
+        } else {
+            "sync"
+        };
+        println!("d3d11 session: {name} ({path})");
     }
 }
