@@ -51,6 +51,9 @@ pub(crate) enum BitstreamError {
         /// Parsed value.
         value: i32,
     },
+    /// Byte-granularity read off a byte boundary.
+    #[error("attempted unaligned read")]
+    Unaligned,
 }
 
 impl From<BitstreamError> for String {
@@ -76,6 +79,8 @@ pub(crate) struct BitReader<'a> {
     num_epb: usize,
     /// Whether or not we need emulation prevention logic.
     needs_epb: bool,
+    /// Bits read so far.
+    position: u64,
 }
 
 impl<'a> BitReader<'a> {
@@ -87,12 +92,39 @@ impl<'a> BitReader<'a> {
             prev_two_bytes: 0xffff,
             num_epb: Default::default(),
             needs_epb,
+            position: 0,
         }
     }
 
     /// Read a single bit from the stream.
     pub fn read_bit(&mut self) -> Result<bool, BitstreamError> {
         Ok(self.read_bits::<u32>(1)? == 1)
+    }
+
+    /// Bits read so far.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Read `num_bits` bits, requiring a byte boundary first.
+    pub fn read_bits_aligned<U: TryFrom<u32>>(
+        &mut self,
+        num_bits: usize,
+    ) -> Result<U, BitstreamError> {
+        if !self.num_remaining_bits_in_curr_byte.is_multiple_of(8) {
+            return Err(BitstreamError::Unaligned);
+        }
+        self.read_bits(num_bits)
+    }
+
+    /// Read a `num_bytes`-byte little-endian integer.
+    pub fn read_le<U: TryFrom<u32>>(&mut self, num_bytes: u8) -> Result<U, BitstreamError> {
+        let mut value = 0u32;
+        for index in 0..num_bytes {
+            let byte = self.read_bits_aligned::<u32>(8)?;
+            value += byte << (u32::from(index) * 8);
+        }
+        U::try_from(value).map_err(|_| BitstreamError::BoundedConversion)
     }
 
     /// Read up to 31 bits from the stream. Note that we don't want to read 32
@@ -116,6 +148,7 @@ impl<'a> BitReader<'a> {
         out |= u32::from(self.curr_byte >> (self.num_remaining_bits_in_curr_byte - bits_left));
         out &= (1 << num_bits) - 1;
         self.num_remaining_bits_in_curr_byte -= bits_left;
+        self.position += num_bits as u64;
 
         U::try_from(out).map_err(|_| BitstreamError::BitsConversion)
     }
@@ -410,5 +443,39 @@ mod tests {
             String::from(BitstreamError::OutOfBits),
             "reader ran out of bits"
         );
+    }
+
+    #[test]
+    fn position_counts_read_bits() {
+        let mut reader = BitReader::new(&[0xFF, 0x00], false);
+        assert_eq!(reader.position(), 0);
+        assert_eq!(reader.read_bits::<u32>(3), Ok(0b111));
+        assert_eq!(reader.position(), 3);
+        assert_eq!(reader.skip_bits(5), Ok(()));
+        assert_eq!(reader.position(), 8);
+    }
+
+    #[test]
+    fn aligned_read_rejects_mid_byte() {
+        let mut reader = BitReader::new(&[0xA5, 0x3C], false);
+        assert_eq!(reader.read_bits_aligned::<u32>(8), Ok(0xA5));
+        assert_eq!(reader.read_bits::<u32>(4), Ok(0x3));
+        assert_eq!(
+            reader.read_bits_aligned::<u32>(4),
+            Err(BitstreamError::Unaligned)
+        );
+        assert_eq!(
+            BitstreamError::Unaligned.to_string(),
+            "attempted unaligned read"
+        );
+    }
+
+    #[test]
+    fn little_endian_reads_bytes_low_first() {
+        let mut reader = BitReader::new(&[0x34, 0x12, 0x00], false);
+        assert_eq!(reader.read_le::<u32>(2), Ok(0x1234));
+        assert_eq!(reader.position(), 16);
+        let mut reader = BitReader::new(&[0x01], false);
+        assert_eq!(reader.read_le::<u8>(2), Err(BitstreamError::OutOfBits));
     }
 }

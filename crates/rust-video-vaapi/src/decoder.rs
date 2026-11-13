@@ -339,40 +339,14 @@ impl<'a> H264Decoder<'a> {
         readback: bool,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        let frame_size = PictureSize::new(size.0, size.1).ok_or(VaApiError::BadExtent {
-            width: size.0,
-            height: size.1,
-        })?;
-        let mut generation = self.generation;
-        for slot in slots {
-            let surface = backend
-                .surfaces()
-                .get(slot.index() as usize)
-                .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })?;
-            let data = if readback {
-                Bytes::from(backend.read_nv12(surface, crop)?)
-            } else {
-                Bytes::new()
-            };
-            let lease = shared.try_acquire(data.len() as u64)?;
-            let device = if readback {
-                None
-            } else {
-                backend.surface_guard(slot.index()).map(|guard| {
-                    DeviceSurface::new(self.device.display(), surface, guard, backend.gauges())
-                })
-            };
-            frames.push(VaApiFrame {
-                identity: GpuFrame::new(frame_size, PixelFormat::Nv12, generation),
-                data,
-                lease,
-                device,
-            });
-            generation = generation.wrapping_add(1);
-        }
+        let (mut emitted, generation) = VaApiFrame::emit(
+            self.device,
+            backend,
+            shared,
+            Emit::new(slots, size, crop, readback),
+            self.generation,
+        )?;
+        frames.append(&mut emitted);
         self.generation = generation;
         Ok(())
     }
@@ -406,6 +380,35 @@ impl Decoder for H264Decoder<'_> {
     }
 }
 
+/// Output-frame request: slots, geometry, and readback mode.
+pub(crate) struct Emit {
+    /// Pool slots to output, in order.
+    slots: Vec<SurfaceSlot>,
+    /// Frame size in luma samples.
+    size: (u32, u32),
+    /// Crop rectangle as `(x, y, width, height)`.
+    crop: (u32, u32, u32, u32),
+    /// True to read back pixels; false to attach device surfaces.
+    readback: bool,
+}
+
+impl Emit {
+    /// Request for `slots` at `size` cropped to `crop`.
+    pub(crate) fn new(
+        slots: Vec<SurfaceSlot>,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+        readback: bool,
+    ) -> Self {
+        Self {
+            slots,
+            size,
+            crop,
+            readback,
+        }
+    }
+}
+
 /// Decoded frame: NV12 bytes with identity, lease, and device surface.
 ///
 /// `Send`, never `Sync`: hand the frame to another thread when idle,
@@ -424,6 +427,58 @@ pub struct VaApiFrame {
 }
 
 impl VaApiFrame {
+    /// Output frames for `emit`, returning the frames and the next generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a slot left the pool, the size is empty, or
+    /// the budget refuses the bytes.
+    pub(crate) fn emit(
+        device: &VaApiDevice,
+        backend: &Backend,
+        shared: &SharedDevice,
+        emit: Emit,
+        generation: u64,
+    ) -> Result<(Vec<Self>, u64), VaApiError> {
+        let frame_size =
+            PictureSize::new(emit.size.0, emit.size.1).ok_or(VaApiError::BadExtent {
+                width: emit.size.0,
+                height: emit.size.1,
+            })?;
+        let mut frames = Vec::with_capacity(emit.slots.len());
+        let mut generation = generation;
+        for slot in emit.slots {
+            let surface = backend
+                .surfaces()
+                .get(slot.index() as usize)
+                .copied()
+                .ok_or_else(|| {
+                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
+                })?;
+            let data = if emit.readback {
+                Bytes::from(backend.read_nv12(surface, emit.crop)?)
+            } else {
+                Bytes::new()
+            };
+            let lease = shared.try_acquire(data.len() as u64)?;
+            let device = if emit.readback {
+                None
+            } else {
+                backend.surface_guard(slot.index()).map(|guard| {
+                    DeviceSurface::new(device.display(), surface, guard, backend.gauges())
+                })
+            };
+            frames.push(Self {
+                identity: GpuFrame::new(frame_size, PixelFormat::Nv12, generation),
+                data,
+                lease,
+                device,
+            });
+            generation = generation.wrapping_add(1);
+        }
+        Ok((frames, generation))
+    }
+
     /// Frame identity.
     #[must_use]
     pub fn identity(&self) -> GpuFrame {

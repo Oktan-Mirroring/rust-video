@@ -109,6 +109,17 @@ impl<'a> Reader<'a> {
         u32::try_from(self.0.position() / 8).unwrap_or(u32::MAX) - start_pos
     }
 
+    /// Remaining unit size after `consumed` bytes, resetting exhausted units.
+    fn check_consumed(consumed: u32, size: u32, what: &str) -> Result<u32, String> {
+        match consumed.cmp(&size) {
+            std::cmp::Ordering::Equal => Ok(0),
+            std::cmp::Ordering::Greater => Err(format!(
+                "{what}_unit_size is {size} but we consumed {consumed} bytes"
+            )),
+            std::cmp::Ordering::Less => Ok(size),
+        }
+    }
+
     /// Get the length of the current OBU in `AnnexB` format.
     pub fn current_annexb_obu_length(
         &mut self,
@@ -118,15 +129,11 @@ impl<'a> Reader<'a> {
             return Ok(None);
         }
 
-        #[allow(clippy::comparison_chain)]
-        if annexb_state.temporal_unit_consumed == annexb_state.temporal_unit_size {
-            annexb_state.temporal_unit_size = 0;
-        } else if annexb_state.temporal_unit_consumed > annexb_state.temporal_unit_size {
-            return Err(format!(
-                "temporal_unit_size is {} but we consumed {} bytes",
-                annexb_state.temporal_unit_size, annexb_state.temporal_unit_consumed,
-            ));
-        }
+        annexb_state.temporal_unit_size = Self::check_consumed(
+            annexb_state.temporal_unit_consumed,
+            annexb_state.temporal_unit_size,
+            "temporal",
+        )?;
 
         if annexb_state.temporal_unit_size == 0 {
             annexb_state.temporal_unit_size = self.read_leb128()?;
@@ -137,15 +144,11 @@ impl<'a> Reader<'a> {
 
         let start_pos = self.consumed(0);
 
-        #[allow(clippy::comparison_chain)]
-        if annexb_state.frame_unit_consumed == annexb_state.frame_unit_size {
-            annexb_state.frame_unit_size = 0;
-        } else if annexb_state.frame_unit_consumed > annexb_state.frame_unit_size {
-            return Err(format!(
-                "frame_unit_size is {} but we consumed {} bytes",
-                annexb_state.frame_unit_size, annexb_state.frame_unit_consumed,
-            ));
-        }
+        annexb_state.frame_unit_size = Self::check_consumed(
+            annexb_state.frame_unit_consumed,
+            annexb_state.frame_unit_size,
+            "frame",
+        )?;
 
         if annexb_state.frame_unit_size == 0 {
             annexb_state.frame_unit_size = self.read_leb128()?;

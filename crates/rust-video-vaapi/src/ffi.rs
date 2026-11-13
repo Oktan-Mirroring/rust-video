@@ -1,7 +1,8 @@
 //! Minimal libva rebind for decode, encode, and video processing over DRM.
 //!
-//! Layouts mirror `/usr/include/va/va.h` from libva 1.22.0; the byte
-//! sizes pinned below are that contract.
+//! Layouts mirror `/usr/include/va/va.h`, `va_dec_hevc.h`, and
+//! `va_dec_av1.h` from libva 1.22.0; the byte sizes pinned below are
+//! that contract.
 
 #![allow(unsafe_code)]
 
@@ -57,6 +58,8 @@ pub const VA_FOURCC_NV12: u32 = 0x3231_564e;
 pub const VA_PROGRESSIVE: c_int = 0x1;
 /// HEVC Main profile.
 pub const VA_PROFILE_HEVC_MAIN: c_int = 17;
+/// AV1 Profile 0.
+pub const VA_PROFILE_AV1_PROFILE0: c_int = 32;
 /// No profile, for video processing configs.
 pub const VA_PROFILE_NONE: c_int = -1;
 /// Slice-level encode entrypoint.
@@ -117,6 +120,14 @@ pub const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x0000_0010;
 
 /// HEVC invalid-picture flag.
 pub const VA_PICTURE_HEVC_INVALID: u32 = 0x0000_0001;
+/// HEVC long-term reference flag.
+pub const VA_PICTURE_HEVC_LONG_TERM_REFERENCE: u32 = 0x0000_0008;
+/// HEVC short-term current-before-RPS flag.
+pub const VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE: u32 = 0x0000_0010;
+/// HEVC short-term current-after-RPS flag.
+pub const VA_PICTURE_HEVC_RPS_ST_CURR_AFTER: u32 = 0x0000_0020;
+/// HEVC long-term current-RPS flag.
+pub const VA_PICTURE_HEVC_RPS_LT_CURR: u32 = 0x0000_0040;
 
 /// `seq_fields` bit shifts inside `VAPictureParameterBufferH264`.
 pub const SEQ_CHROMA_FORMAT_IDC: u32 = 0;
@@ -161,6 +172,240 @@ pub const PIC_DEBLOCKING_FILTER_CONTROL_PRESENT: u32 = 8;
 pub const PIC_REDUNDANT_PIC_CNT_PRESENT: u32 = 9;
 /// Reference-picture bit shift.
 pub const PIC_REFERENCE_PIC: u32 = 10;
+
+/// `pic_fields` bit shifts inside `VAPictureParameterBufferHEVC`.
+pub const HEVC_CHROMA_FORMAT_IDC: u32 = 0;
+/// Separate-colour-plane bit shift.
+pub const HEVC_SEPARATE_COLOUR_PLANE: u32 = 2;
+/// PCM-enabled bit shift.
+pub const HEVC_PCM_ENABLED: u32 = 3;
+/// Scaling-list-enabled bit shift.
+pub const HEVC_SCALING_LIST_ENABLED: u32 = 4;
+/// Transform-skip-enabled bit shift.
+pub const HEVC_TRANSFORM_SKIP_ENABLED: u32 = 5;
+/// Asymmetric-partition bit shift.
+pub const HEVC_AMP_ENABLED: u32 = 6;
+/// Strong-intra-smoothing bit shift.
+pub const HEVC_STRONG_INTRA_SMOOTHING_ENABLED: u32 = 7;
+/// Sign-data-hiding bit shift.
+pub const HEVC_SIGN_DATA_HIDING_ENABLED: u32 = 8;
+/// Constrained-intra-prediction bit shift.
+pub const HEVC_CONSTRAINED_INTRA_PRED: u32 = 9;
+/// CU-QP-delta-enabled bit shift.
+pub const HEVC_CU_QP_DELTA_ENABLED: u32 = 10;
+/// Weighted-prediction bit shift.
+pub const HEVC_WEIGHTED_PRED: u32 = 11;
+/// Weighted-biprediction bit shift.
+pub const HEVC_WEIGHTED_BIPRED: u32 = 12;
+/// Transquant-bypass-enabled bit shift.
+pub const HEVC_TRANSQUANT_BYPASS_ENABLED: u32 = 13;
+/// Tiles-enabled bit shift.
+pub const HEVC_TILES_ENABLED: u32 = 14;
+/// Entropy-coding-sync-enabled bit shift.
+pub const HEVC_ENTROPY_CODING_SYNC_ENABLED: u32 = 15;
+/// PPS loop-filter-across-slices bit shift.
+pub const HEVC_PPS_LOOP_FILTER_ACROSS_SLICES: u32 = 16;
+/// Loop-filter-across-tiles bit shift.
+pub const HEVC_LOOP_FILTER_ACROSS_TILES: u32 = 17;
+/// PCM-loop-filter-disabled bit shift.
+pub const HEVC_PCM_LOOP_FILTER_DISABLED: u32 = 18;
+
+/// `slice_parsing_fields` bit shifts inside `VAPictureParameterBufferHEVC`.
+pub const HEVC_LISTS_MODIFICATION_PRESENT: u32 = 0;
+/// Long-term-reference-pictures-present bit shift.
+pub const HEVC_LONG_TERM_REF_PICS_PRESENT: u32 = 1;
+/// SPS-temporal-MVP-enabled bit shift.
+pub const HEVC_SPS_TEMPORAL_MVP_ENABLED: u32 = 2;
+/// CABAC-init-present bit shift.
+pub const HEVC_CABAC_INIT_PRESENT: u32 = 3;
+/// Output-flag-present bit shift.
+pub const HEVC_OUTPUT_FLAG_PRESENT: u32 = 4;
+/// Dependent-slice-segments-enabled bit shift.
+pub const HEVC_DEPENDENT_SLICE_SEGMENTS_ENABLED: u32 = 5;
+/// PPS-slice-chroma-QP-offsets-present bit shift.
+pub const HEVC_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT: u32 = 6;
+/// Sample-adaptive-offset-enabled bit shift.
+pub const HEVC_SAMPLE_ADAPTIVE_OFFSET_ENABLED: u32 = 7;
+/// Deblocking-filter-override-enabled bit shift.
+pub const HEVC_DEBLOCKING_FILTER_OVERRIDE_ENABLED: u32 = 8;
+/// PPS-disable-deblocking-filter bit shift.
+pub const HEVC_PPS_DISABLE_DEBLOCKING_FILTER: u32 = 9;
+/// Slice-segment-header-extension-present bit shift.
+pub const HEVC_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT: u32 = 10;
+/// Random-access-picture bit shift.
+pub const HEVC_RAP_PIC: u32 = 11;
+/// IDR-picture bit shift.
+pub const HEVC_IDR_PIC: u32 = 12;
+/// Intra-picture bit shift.
+pub const HEVC_INTRA_PIC: u32 = 13;
+
+/// `LongSliceFlags` bit shifts inside `VASliceParameterBufferHEVC`.
+pub const HEVC_LAST_SLICE_OF_PIC: u32 = 0;
+/// Dependent-slice-segment bit shift.
+pub const HEVC_DEPENDENT_SLICE_SEGMENT: u32 = 1;
+/// Slice-type bit shift.
+pub const HEVC_SLICE_TYPE: u32 = 2;
+/// Colour-plane-id bit shift.
+pub const HEVC_COLOR_PLANE_ID: u32 = 4;
+/// Slice-SAO-luma bit shift.
+pub const HEVC_SLICE_SAO_LUMA: u32 = 6;
+/// Slice-SAO-chroma bit shift.
+pub const HEVC_SLICE_SAO_CHROMA: u32 = 7;
+/// MVD-L1-zero bit shift.
+pub const HEVC_MVD_L1_ZERO: u32 = 8;
+/// CABAC-init bit shift.
+pub const HEVC_CABAC_INIT: u32 = 9;
+/// Slice-temporal-MVP-enabled bit shift.
+pub const HEVC_SLICE_TEMPORAL_MVP_ENABLED: u32 = 10;
+/// Slice-deblocking-filter-disabled bit shift.
+pub const HEVC_SLICE_DEBLOCKING_FILTER_DISABLED: u32 = 11;
+/// Collocated-from-L0 bit shift.
+pub const HEVC_COLLOCATED_FROM_L0: u32 = 12;
+/// Slice-loop-filter-across-slices bit shift.
+pub const HEVC_SLICE_LOOP_FILTER_ACROSS_SLICES: u32 = 13;
+
+/// `seq_info_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_STILL_PICTURE: u32 = 0;
+/// 128x128-superblock bit shift.
+pub const AV1_USE_128X128_SUPERBLOCK: u32 = 1;
+/// Filter-intra-enabled bit shift.
+pub const AV1_ENABLE_FILTER_INTRA: u32 = 2;
+/// Intra-edge-filter-enabled bit shift.
+pub const AV1_ENABLE_INTRA_EDGE_FILTER: u32 = 3;
+/// Interintra-compound-enabled bit shift.
+pub const AV1_ENABLE_INTERINTRA_COMPOUND: u32 = 4;
+/// Masked-compound-enabled bit shift.
+pub const AV1_ENABLE_MASKED_COMPOUND: u32 = 5;
+/// Dual-filter-enabled bit shift.
+pub const AV1_ENABLE_DUAL_FILTER: u32 = 6;
+/// Order-hint-enabled bit shift.
+pub const AV1_ENABLE_ORDER_HINT: u32 = 7;
+/// Joint-compound-enabled bit shift.
+pub const AV1_ENABLE_JNT_COMP: u32 = 8;
+/// CDEF-enabled bit shift.
+pub const AV1_ENABLE_CDEF: u32 = 9;
+/// Monochrome bit shift.
+pub const AV1_MONO_CHROME: u32 = 10;
+/// Color-range bit shift.
+pub const AV1_COLOR_RANGE: u32 = 11;
+/// Horizontal-subsampling bit shift.
+pub const AV1_SUBSAMPLING_X: u32 = 12;
+/// Vertical-subsampling bit shift.
+pub const AV1_SUBSAMPLING_Y: u32 = 13;
+/// Film-grain-params-present bit shift.
+pub const AV1_FILM_GRAIN_PARAMS_PRESENT: u32 = 15;
+
+/// `pic_info_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_FRAME_TYPE: u32 = 0;
+/// Show-frame bit shift.
+pub const AV1_SHOW_FRAME: u32 = 2;
+/// Showable-frame bit shift.
+pub const AV1_SHOWABLE_FRAME: u32 = 3;
+/// Error-resilient-mode bit shift.
+pub const AV1_ERROR_RESILIENT_MODE: u32 = 4;
+/// Disable-CDF-update bit shift.
+pub const AV1_DISABLE_CDF_UPDATE: u32 = 5;
+/// Allow-screen-content-tools bit shift.
+pub const AV1_ALLOW_SCREEN_CONTENT_TOOLS: u32 = 6;
+/// Force-integer-motion-vector bit shift.
+pub const AV1_FORCE_INTEGER_MV: u32 = 7;
+/// Allow-intra-block-copy bit shift.
+pub const AV1_ALLOW_INTRABC: u32 = 8;
+/// Superres bit shift.
+pub const AV1_USE_SUPERRES: u32 = 9;
+/// High-precision-motion-vector bit shift.
+pub const AV1_ALLOW_HIGH_PRECISION_MV: u32 = 10;
+/// Switchable-motion-mode bit shift.
+pub const AV1_IS_MOTION_MODE_SWITCHABLE: u32 = 11;
+/// Reference-frame-motion-vectors bit shift.
+pub const AV1_USE_REF_FRAME_MVS: u32 = 12;
+/// Disable-frame-end-CDF-update bit shift.
+pub const AV1_DISABLE_FRAME_END_UPDATE_CDF: u32 = 13;
+/// Uniform-tile-spacing bit shift.
+pub const AV1_UNIFORM_TILE_SPACING: u32 = 14;
+/// Warped-motion bit shift.
+pub const AV1_ALLOW_WARPED_MOTION: u32 = 15;
+
+/// `loop_filter_info_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_SHARPNESS_LEVEL: u32 = 0;
+/// Mode-reference-delta-enabled bit shift.
+pub const AV1_MODE_REF_DELTA_ENABLED: u32 = 3;
+/// Mode-reference-delta-update bit shift.
+pub const AV1_MODE_REF_DELTA_UPDATE: u32 = 4;
+
+/// `qmatrix_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_USING_QMATRIX: u32 = 0;
+/// Luma-quantizer-matrix bit shift.
+pub const AV1_QM_Y: u32 = 1;
+/// Cb-quantizer-matrix bit shift.
+pub const AV1_QM_U: u32 = 5;
+/// Cr-quantizer-matrix bit shift.
+pub const AV1_QM_V: u32 = 9;
+
+/// `mode_control_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_DELTA_Q_PRESENT: u32 = 0;
+/// Delta-Q-resolution bit shift.
+pub const AV1_LOG2_DELTA_Q_RES: u32 = 1;
+/// Delta-loop-filter-present bit shift.
+pub const AV1_DELTA_LF_PRESENT: u32 = 3;
+/// Delta-loop-filter-resolution bit shift.
+pub const AV1_LOG2_DELTA_LF_RES: u32 = 4;
+/// Multi-delta-loop-filter bit shift.
+pub const AV1_DELTA_LF_MULTI: u32 = 6;
+/// Transform-mode bit shift.
+pub const AV1_TX_MODE: u32 = 7;
+/// Reference-select bit shift.
+pub const AV1_REFERENCE_SELECT: u32 = 9;
+/// Reduced-transform-set bit shift.
+pub const AV1_REDUCED_TX_SET_USED: u32 = 10;
+/// Skip-mode-present bit shift.
+pub const AV1_SKIP_MODE_PRESENT: u32 = 11;
+
+/// `loop_restoration_fields` bit shifts inside `VADecPictureParameterBufferAV1`.
+pub const AV1_YFRAME_RESTORATION_TYPE: u32 = 0;
+/// Cb-restoration-type bit shift.
+pub const AV1_CBFRAME_RESTORATION_TYPE: u32 = 2;
+/// Cr-restoration-type bit shift.
+pub const AV1_CRFRAME_RESTORATION_TYPE: u32 = 4;
+/// Restoration-unit-shift bit shift.
+pub const AV1_LR_UNIT_SHIFT: u32 = 6;
+/// Restoration-chroma-shift bit shift.
+pub const AV1_LR_UV_SHIFT: u32 = 8;
+
+/// `segment_info_fields` bit shifts inside `VASegmentationStructAV1`.
+pub const AV1_SEG_ENABLED: u32 = 0;
+/// Segmentation-map-update bit shift.
+pub const AV1_SEG_UPDATE_MAP: u32 = 1;
+/// Segmentation-temporal-update bit shift.
+pub const AV1_SEG_TEMPORAL_UPDATE: u32 = 2;
+/// Segmentation-data-update bit shift.
+pub const AV1_SEG_UPDATE_DATA: u32 = 3;
+
+/// `film_grain_info_fields` bit shifts inside `VAFilmGrainStructAV1`.
+pub const AV1_APPLY_GRAIN: u32 = 0;
+/// Chroma-scaling-from-luma bit shift.
+pub const AV1_CHROMA_SCALING_FROM_LUMA: u32 = 1;
+/// Grain-scaling-minus-8 bit shift.
+pub const AV1_GRAIN_SCALING_MINUS_8: u32 = 2;
+/// Autoregressive-lag bit shift.
+pub const AV1_AR_COEFF_LAG: u32 = 4;
+/// Autoregressive-shift bit shift.
+pub const AV1_AR_COEFF_SHIFT_MINUS_6: u32 = 6;
+/// Grain-scale-shift bit shift.
+pub const AV1_GRAIN_SCALE_SHIFT: u32 = 8;
+/// Overlap bit shift.
+pub const AV1_OVERLAP_FLAG: u32 = 10;
+/// Restricted-range-clip bit shift.
+pub const AV1_CLIP_TO_RESTRICTED_RANGE: u32 = 11;
+
+/// AV1 identity warp transform.
+pub const AV1_WARP_IDENTITY: c_int = 0;
+/// AV1 translational warp transform.
+pub const AV1_WARP_TRANSLATION: c_int = 1;
+/// AV1 rotation-zoom warp transform.
+pub const AV1_WARP_ROTZOOM: c_int = 2;
+/// AV1 affine warp transform.
+pub const AV1_WARP_AFFINE: c_int = 3;
 
 /// H.264 reference picture descriptor.
 #[derive(Clone, Copy, Debug, Default)]
@@ -380,6 +625,380 @@ pub struct VaPictureHevc {
     pub flags: u32,
     /// Reserved, zero.
     pub reserved: [u32; 4],
+}
+
+/// HEVC decode picture-parameter buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaPictureParameterBufferHevc {
+    /// Picture under decode.
+    pub curr_pic: VaPictureHevc,
+    /// Decoded-picture-buffer contents.
+    pub reference_frames: [VaPictureHevc; 15],
+    /// Coded width in luma samples.
+    pub pic_width_in_luma_samples: u16,
+    /// Coded height in luma samples.
+    pub pic_height_in_luma_samples: u16,
+    /// Packed picture flags; see `HEVC_*`.
+    pub pic_fields: u32,
+    /// DPB size of the current temporal layer, minus one.
+    pub sps_max_dec_pic_buffering_minus1: u8,
+    /// Luma bit depth, minus eight.
+    pub bit_depth_luma_minus8: u8,
+    /// Chroma bit depth, minus eight.
+    pub bit_depth_chroma_minus8: u8,
+    /// PCM luma sample depth, minus one.
+    pub pcm_sample_bit_depth_luma_minus1: u8,
+    /// PCM chroma sample depth, minus one.
+    pub pcm_sample_bit_depth_chroma_minus1: u8,
+    /// Minimum luma coding-block size, minus three.
+    pub log2_min_luma_coding_block_size_minus3: u8,
+    /// Coding-block size range.
+    pub log2_diff_max_min_luma_coding_block_size: u8,
+    /// Minimum transform-block size, minus two.
+    pub log2_min_transform_block_size_minus2: u8,
+    /// Transform-block size range.
+    pub log2_diff_max_min_transform_block_size: u8,
+    /// Minimum PCM coding-block size, minus three.
+    pub log2_min_pcm_luma_coding_block_size_minus3: u8,
+    /// PCM coding-block size range.
+    pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
+    /// Maximum intra transform depth.
+    pub max_transform_hierarchy_depth_intra: u8,
+    /// Maximum inter transform depth.
+    pub max_transform_hierarchy_depth_inter: u8,
+    /// Initial quantization, minus 26.
+    pub init_qp_minus26: i8,
+    /// CU QP delta depth.
+    pub diff_cu_qp_delta_depth: u8,
+    /// Cb quantization offset.
+    pub pps_cb_qp_offset: i8,
+    /// Cr quantization offset.
+    pub pps_cr_qp_offset: i8,
+    /// Parallel-merge level, minus two.
+    pub log2_parallel_merge_level_minus2: u8,
+    /// Tile columns, minus one.
+    pub num_tile_columns_minus1: u8,
+    /// Tile rows, minus one.
+    pub num_tile_rows_minus1: u8,
+    /// Tile column widths, minus one.
+    pub column_width_minus1: [u16; 19],
+    /// Tile row heights, minus one.
+    pub row_height_minus1: [u16; 21],
+    /// Packed slice-parsing flags; see `HEVC_*`.
+    pub slice_parsing_fields: u32,
+    /// Picture-order-count lsb range, minus four.
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    /// Short-term reference-picture-set count.
+    pub num_short_term_ref_pic_sets: u8,
+    /// Long-term reference pictures in the SPS.
+    pub num_long_term_ref_pic_sps: u8,
+    /// Default active list-0 references, minus one.
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    /// Default active list-1 references, minus one.
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    /// PPS beta offset, divided by two.
+    pub pps_beta_offset_div2: i8,
+    /// PPS Tc offset, divided by two.
+    pub pps_tc_offset_div2: i8,
+    /// Extra slice-header bits.
+    pub num_extra_slice_header_bits: u8,
+    /// Inline short-term reference-set bits, without emulation prevention.
+    pub st_rps_bits: u32,
+    /// Reserved, zero.
+    pub reserved: [u32; 8],
+}
+
+/// HEVC decode slice-parameter buffer, long format.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaSliceParameterBufferHevc {
+    /// Slice-data buffer bytes for this slice, NAL header included.
+    pub slice_data_size: u32,
+    /// Byte offset of the NAL header in the slice-data buffer.
+    pub slice_data_offset: u32,
+    /// `VA_SLICE_DATA_FLAG_*` flags.
+    pub slice_data_flag: u32,
+    /// Byte offset of `slice_data()` past the NAL header.
+    pub slice_data_byte_offset: u32,
+    /// First coding-tree-block address in the slice.
+    pub slice_segment_address: u32,
+    /// Reference lists as `ReferenceFrames` indices, `0xFF` invalid.
+    pub ref_pic_list: [[u8; 15]; 2],
+    /// Packed slice flags; see `HEVC_*`.
+    pub long_slice_flags: u32,
+    /// Collocated reference index, `0xFF` without temporal MVP.
+    pub collocated_ref_idx: u8,
+    /// Active list-0 references, minus one.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Active list-1 references, minus one.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// Slice quantization delta.
+    pub slice_qp_delta: i8,
+    /// Slice Cb quantization offset.
+    pub slice_cb_qp_offset: i8,
+    /// Slice Cr quantization offset.
+    pub slice_cr_qp_offset: i8,
+    /// Slice beta offset, divided by two.
+    pub slice_beta_offset_div2: i8,
+    /// Slice Tc offset, divided by two.
+    pub slice_tc_offset_div2: i8,
+    /// Luma weight denominator.
+    pub luma_log2_weight_denom: u8,
+    /// Chroma weight denominator delta.
+    pub delta_chroma_log2_weight_denom: i8,
+    /// List-0 luma weight deltas.
+    pub delta_luma_weight_l0: [i8; 15],
+    /// List-0 luma offsets.
+    pub luma_offset_l0: [i8; 15],
+    /// List-0 chroma weight deltas.
+    pub delta_chroma_weight_l0: [[i8; 2]; 15],
+    /// List-0 chroma offsets.
+    pub chroma_offset_l0: [[i8; 2]; 15],
+    /// List-1 luma weight deltas.
+    pub delta_luma_weight_l1: [i8; 15],
+    /// List-1 luma offsets.
+    pub luma_offset_l1: [i8; 15],
+    /// List-1 chroma weight deltas.
+    pub delta_chroma_weight_l1: [[i8; 2]; 15],
+    /// List-1 chroma offsets.
+    pub chroma_offset_l1: [[i8; 2]; 15],
+    /// Merge candidates below five.
+    pub five_minus_max_num_merge_cand: u8,
+    /// Entry-point offset count.
+    pub num_entry_point_offsets: u16,
+    /// Entry-point subset index.
+    pub entry_offset_to_subset_array: u16,
+    /// Emulation-prevention bytes in the slice header.
+    pub slice_data_num_emu_prevn_bytes: u16,
+    /// Reserved, zero.
+    pub reserved: [u32; 2],
+}
+
+/// HEVC decode inverse-quantization-matrix buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaIqMatrixBufferHevc {
+    /// 4x4 scaling lists in raster order.
+    pub scaling_list_4x4: [[u8; 16]; 6],
+    /// 8x8 scaling lists in raster order.
+    pub scaling_list_8x8: [[u8; 64]; 6],
+    /// 16x16 scaling lists in raster order.
+    pub scaling_list_16x16: [[u8; 64]; 6],
+    /// 32x32 scaling lists in raster order.
+    pub scaling_list_32x32: [[u8; 64]; 2],
+    /// 16x16 scaling-list DC coefficients.
+    pub scaling_list_dc_16x16: [u8; 6],
+    /// 32x32 scaling-list DC coefficients.
+    pub scaling_list_dc_32x32: [u8; 2],
+    /// Reserved, zero.
+    pub reserved: [u32; 4],
+}
+
+/// AV1 segmentation parameters.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaSegmentationAv1 {
+    /// Packed segmentation flags; see `AV1_SEG_*`.
+    pub segment_info_fields: u32,
+    /// Segment feature data, clipped per feature limits.
+    pub feature_data: [[i16; 8]; 8],
+    /// Enabled features per segment, one bit per feature.
+    pub feature_mask: [u8; 8],
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// AV1 film-grain parameters.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaFilmGrainAv1 {
+    /// Packed film-grain flags; see `AV1_*`.
+    pub film_grain_info_fields: u32,
+    /// Synthesis random seed.
+    pub grain_seed: u16,
+    /// Luma scaling points.
+    pub num_y_points: u8,
+    /// Luma scaling control values.
+    pub point_y_value: [u8; 14],
+    /// Luma scaling output values.
+    pub point_y_scaling: [u8; 14],
+    /// Cb scaling points.
+    pub num_cb_points: u8,
+    /// Cb scaling control values.
+    pub point_cb_value: [u8; 10],
+    /// Cb scaling output values.
+    pub point_cb_scaling: [u8; 10],
+    /// Cr scaling points.
+    pub num_cr_points: u8,
+    /// Cr scaling control values.
+    pub point_cr_value: [u8; 10],
+    /// Cr scaling output values.
+    pub point_cr_scaling: [u8; 10],
+    /// Luma autoregressive coefficients.
+    pub ar_coeffs_y: [i8; 24],
+    /// Cb autoregressive coefficients.
+    pub ar_coeffs_cb: [i8; 25],
+    /// Cr autoregressive coefficients.
+    pub ar_coeffs_cr: [i8; 25],
+    /// Cb component multiplier.
+    pub cb_mult: u8,
+    /// Cb luma multiplier.
+    pub cb_luma_mult: u8,
+    /// Cb index offset.
+    pub cb_offset: u16,
+    /// Cr component multiplier.
+    pub cr_mult: u8,
+    /// Cr luma multiplier.
+    pub cr_luma_mult: u8,
+    /// Cr index offset.
+    pub cr_offset: u16,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// AV1 warped-motion parameters for one reference.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaWarpedMotionAv1 {
+    /// Warp type; see `AV1_WARP_*`.
+    pub wmtype: c_int,
+    /// Warp matrix, `gm_params` rows packed.
+    pub wmmat: [i32; 8],
+    /// Nonzero when the affine set is invalid.
+    pub invalid: u8,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// AV1 decode picture-parameter buffer.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaDecPictureParameterBufferAv1 {
+    /// Bitstream profile.
+    pub profile: u8,
+    /// Order-hint bits, minus one.
+    pub order_hint_bits_minus_1: u8,
+    /// Bit-depth index: 0 for 8-bit, 1 for 10-bit, 2 for 12-bit.
+    pub bit_depth_idx: u8,
+    /// Matrix coefficients.
+    pub matrix_coefficients: u8,
+    /// Packed sequence flags; see `AV1_*`.
+    pub seq_info_fields: u32,
+    /// Surface under decode, grain-free with film grain.
+    pub current_frame: VaSurfaceId,
+    /// Grain-applied display surface, with film grain only.
+    pub current_display_picture: VaSurfaceId,
+    /// Large-scale-tile anchor count; zero without large tiles.
+    pub anchor_frames_num: u8,
+    /// Large-scale-tile anchors; null without large tiles.
+    pub anchor_frames_list: *const VaSurfaceId,
+    /// Frame width, minus one.
+    pub frame_width_minus1: u16,
+    /// Frame height, minus one.
+    pub frame_height_minus1: u16,
+    /// Output width in tiles, minus one; large tiles only.
+    pub output_frame_width_in_tiles_minus_1: u16,
+    /// Output height in tiles, minus one; large tiles only.
+    pub output_frame_height_in_tiles_minus_1: u16,
+    /// Reference surfaces by slot.
+    pub ref_frame_map: [VaSurfaceId; 8],
+    /// Reference slots by `LAST` to `ALTREF` order.
+    pub ref_frame_idx: [u8; 7],
+    /// Primary reference index, 7 for none.
+    pub primary_ref_frame: u8,
+    /// Frame order hint.
+    pub order_hint: u8,
+    /// Segmentation parameters.
+    pub seg_info: VaSegmentationAv1,
+    /// Film-grain parameters.
+    pub film_grain_info: VaFilmGrainAv1,
+    /// Tile columns.
+    pub tile_cols: u8,
+    /// Tile rows.
+    pub tile_rows: u8,
+    /// Tile widths in superblocks, minus one.
+    pub width_in_sbs_minus_1: [u16; 63],
+    /// Tile heights in superblocks, minus one.
+    pub height_in_sbs_minus_1: [u16; 63],
+    /// Large-scale-tile count, minus one; large tiles only.
+    pub tile_count_minus_1: u16,
+    /// Context-update tile id.
+    pub context_update_tile_id: u16,
+    /// Packed picture flags; see `AV1_*`.
+    pub pic_info_fields: u32,
+    /// Superres denominator: 8 without superres.
+    pub superres_scale_denominator: u8,
+    /// Interpolation filter.
+    pub interp_filter: u8,
+    /// Luma loop-filter levels.
+    pub filter_level: [u8; 2],
+    /// Cb loop-filter level.
+    pub filter_level_u: u8,
+    /// Cr loop-filter level.
+    pub filter_level_v: u8,
+    /// Packed loop-filter flags; see `AV1_*`.
+    pub loop_filter_info_fields: u8,
+    /// Reference loop-filter deltas.
+    pub ref_deltas: [i8; 8],
+    /// Mode loop-filter deltas.
+    pub mode_deltas: [i8; 2],
+    /// Base quantization index.
+    pub base_qindex: u8,
+    /// Luma-DC quantization delta.
+    pub y_dc_delta_q: i8,
+    /// Cb-DC quantization delta.
+    pub u_dc_delta_q: i8,
+    /// Cb-AC quantization delta.
+    pub u_ac_delta_q: i8,
+    /// Cr-DC quantization delta.
+    pub v_dc_delta_q: i8,
+    /// Cr-AC quantization delta.
+    pub v_ac_delta_q: i8,
+    /// Packed quantizer-matrix flags; see `AV1_*`.
+    pub qmatrix_fields: u16,
+    /// Packed mode-control flags; see `AV1_*`.
+    pub mode_control_fields: u32,
+    /// CDEF damping, minus three.
+    pub cdef_damping_minus_3: u8,
+    /// CDEF strength bits.
+    pub cdef_bits: u8,
+    /// Packed luma CDEF strengths.
+    pub cdef_y_strengths: [u8; 8],
+    /// Packed chroma CDEF strengths.
+    pub cdef_uv_strengths: [u8; 8],
+    /// Packed restoration flags; see `AV1_*`.
+    pub loop_restoration_fields: u16,
+    /// Warped-motion parameters by `LAST` to `ALTREF` order.
+    pub wm: [VaWarpedMotionAv1; 7],
+    /// Reserved, zero.
+    pub va_reserved: [u32; 8],
+}
+
+/// AV1 slice-parameter buffer, one per tile.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaSliceParameterBufferAv1 {
+    /// Tile bytes in the slice-data buffer.
+    pub slice_data_size: u32,
+    /// Byte offset of the tile in the slice-data buffer.
+    pub slice_data_offset: u32,
+    /// `VA_SLICE_DATA_FLAG_*` flags.
+    pub slice_data_flag: u32,
+    /// Tile row.
+    pub tile_row: u16,
+    /// Tile column.
+    pub tile_column: u16,
+    /// First tile-group tile; deprecated, zero.
+    pub tg_start: u16,
+    /// Last tile-group tile; deprecated, zero.
+    pub tg_end: u16,
+    /// Large-scale-tile anchor index; zero without large tiles.
+    pub anchor_frame_idx: u8,
+    /// Large-scale-tile list index; zero without large tiles.
+    pub tile_idx_in_tile_list: u16,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
 }
 
 /// H.264 encode sequence-parameter buffer.
@@ -1083,6 +1702,39 @@ mod tests {
     fn slice_param_layout_matches_libva() {
         assert_eq!(size_of::<VaSliceParameterBufferH264>(), 3128);
         assert_eq!(align_of::<VaSliceParameterBufferH264>(), 4);
+    }
+
+    #[test]
+    fn hevc_decode_layouts_match_libva() {
+        use super::{
+            VaIqMatrixBufferHevc, VaPictureParameterBufferHevc, VaSliceParameterBufferHevc,
+        };
+
+        assert_eq!(size_of::<VaPictureParameterBufferHevc>(), 604);
+        assert_eq!(align_of::<VaPictureParameterBufferHevc>(), 4);
+        assert_eq!(size_of::<VaSliceParameterBufferHevc>(), 264);
+        assert_eq!(align_of::<VaSliceParameterBufferHevc>(), 4);
+        assert_eq!(size_of::<VaIqMatrixBufferHevc>(), 1016);
+        assert_eq!(align_of::<VaIqMatrixBufferHevc>(), 4);
+    }
+
+    #[test]
+    fn av1_decode_layouts_match_libva() {
+        use super::{
+            VaDecPictureParameterBufferAv1, VaFilmGrainAv1, VaSegmentationAv1,
+            VaSliceParameterBufferAv1, VaWarpedMotionAv1,
+        };
+
+        assert_eq!(size_of::<VaSegmentationAv1>(), 156);
+        assert_eq!(align_of::<VaSegmentationAv1>(), 4);
+        assert_eq!(size_of::<VaFilmGrainAv1>(), 176);
+        assert_eq!(align_of::<VaFilmGrainAv1>(), 4);
+        assert_eq!(size_of::<VaWarpedMotionAv1>(), 56);
+        assert_eq!(align_of::<VaWarpedMotionAv1>(), 4);
+        assert_eq!(size_of::<VaDecPictureParameterBufferAv1>(), 1160);
+        assert_eq!(align_of::<VaDecPictureParameterBufferAv1>(), 8);
+        assert_eq!(size_of::<VaSliceParameterBufferAv1>(), 40);
+        assert_eq!(align_of::<VaSliceParameterBufferAv1>(), 4);
     }
 
     #[test]

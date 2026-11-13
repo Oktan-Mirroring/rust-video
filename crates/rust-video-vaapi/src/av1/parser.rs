@@ -13,10 +13,7 @@ pub const NUM_REF_FRAMES: usize = 8;
 pub const REFS_PER_FRAME: usize = 7;
 pub const MAX_SEGMENTS: usize = 8;
 pub const SEG_LVL_ALT_Q: usize = 0;
-pub const SEG_LVL_ALT_LF_Y_V: usize = 1;
 pub const SEG_LVL_REF_FRAME: usize = 5;
-pub const SEG_LVL_SKIP: usize = 6;
-pub const SEG_LVL_GLOBAL_MV: usize = 7;
 pub const SEG_LVL_MAX: usize = 8;
 pub const MAX_TILE_COLS: usize = 64;
 pub const MAX_TILE_ROWS: usize = 64;
@@ -141,18 +138,6 @@ pub struct ObuHeader {
     pub spatial_id: u32,
 }
 
-impl ObuHeader {
-    /// Length in bytes
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        if self.extension_flag {
-            2
-        } else {
-            1
-        }
-    }
-}
-
 /// Contains the OBU header and a reference to its data. The OBU itself hasn't been parsed yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Obu<'a> {
@@ -188,29 +173,6 @@ pub enum ParsedObu<'a> {
     Reserved6,
     Reserved7,
     Padding,
-}
-
-impl ParsedObu<'_> {
-    pub fn obu_type(&self) -> ObuType {
-        match self {
-            ParsedObu::Reserved => ObuType::Reserved,
-            ParsedObu::SequenceHeader(_) => ObuType::SequenceHeader,
-            ParsedObu::TemporalDelimiter => ObuType::TemporalDelimiter,
-            ParsedObu::FrameHeader(_) => ObuType::FrameHeader,
-            ParsedObu::TileGroup(_) => ObuType::TileGroup,
-            ParsedObu::Metadata => ObuType::Metadata,
-            ParsedObu::Frame(_) => ObuType::Frame,
-            ParsedObu::RedundantFrameHeader => ObuType::RedundantFrameHeader,
-            ParsedObu::TileList => ObuType::TileList,
-            ParsedObu::Reserved2 => ObuType::Reserved2,
-            ParsedObu::Reserved3 => ObuType::Reserved3,
-            ParsedObu::Reserved4 => ObuType::Reserved4,
-            ParsedObu::Reserved5 => ObuType::Reserved5,
-            ParsedObu::Reserved6 => ObuType::Reserved6,
-            ParsedObu::Reserved7 => ObuType::Reserved7,
-            ParsedObu::Padding => ObuType::Padding,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -515,21 +477,57 @@ impl TryFrom<u32> for ChromaSamplePosition {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ColorConfig {
+pub struct ColorDepth {
     /// Syntax elements which, together with `seq_profile`, determine the bit
     /// depth.
     pub high_bitdepth: bool,
     /// Syntax elements which, together with `seq_profile`, determine the bit
     /// depth.
     pub twelve_bit: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorFormat {
     /// If set, indicates that the video does not contain U and V color planes.
     /// If not set, indicates that the video contains Y, U, and V color planes.
     pub mono_chrome: bool,
+    /// Specify the chroma subsampling format
+    pub subsampling_x: bool,
+    /// Specify the chroma subsampling format
+    pub subsampling_y: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorDescription {
     /// If set, specifies that `color_primaries`, `transfer_characteristics`, and
     /// `matrix_coefficients` are present. If not set, specifies that
     /// `color_primaries`, `transfer_characteristics` and `matrix_coefficients` are
     /// not present.
     pub color_description_present_flag: bool,
+    /// Binary value that is associated with the `VideoFullRangeFlag` variable
+    /// specified in ISO/IEC 23091-4/ITU- T H.273. color range equal to 0 shall
+    /// be referred to as the studio swing representation and color range equal
+    /// to 1 shall be referred to as the full swing representation for all
+    /// intents relating to this specification.
+    pub color_range: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorQuant {
+    /// If set, indicates that the U and V planes may have separate delta
+    /// quantizer values. If not set, indicates that the U and V planes will
+    /// share the same delta quantizer value.
+    pub separate_uv_delta_q: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorConfig {
+    /// Bit depth.
+    pub depth: ColorDepth,
+    /// Planes and subsampling.
+    pub format: ColorFormat,
+    /// Color description presence.
+    pub description: ColorDescription,
     /// Defined by the “Color primaries” section of ISO/IEC 23091-4/ITU-T H.273.
     pub color_primaries: ColorPrimaries,
     /// Defined by the “Transfer characteristics” section of ISO/IEC
@@ -538,22 +536,130 @@ pub struct ColorConfig {
     /// Defined by the “Matrix coefficients” section of ISO/IEC 23091-4/ITU-T
     /// H.273.
     pub matrix_coefficients: MatrixCoefficients,
-    /// Binary value that is associated with the `VideoFullRangeFlag` variable
-    /// specified in ISO/IEC 23091-4/ITU- T H.273. color range equal to 0 shall
-    /// be referred to as the studio swing representation and color range equal
-    /// to 1 shall be referred to as the full swing representation for all
-    /// intents relating to this specification.
-    pub color_range: bool,
-    /// Specify the chroma subsampling format
-    pub subsampling_x: bool,
-    /// Specify the chroma subsampling format
-    pub subsampling_y: bool,
     /// Specifies the sample position for subsampled streams
     pub chroma_sample_position: ChromaSamplePosition,
-    /// If set, indicates that the U and V planes may have separate delta
-    /// quantizer values. If not set, indicates that the U and V planes will
-    /// share the same delta quantizer value.
-    pub separate_uv_delta_q: bool,
+    /// Chroma quantization.
+    pub quant: ColorQuant,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeqFlags {
+    /// If set, specifies that the coded video sequence contains only one coded
+    /// frame. If not set, specifies that the coded video sequence contains one
+    /// or more coded frames.
+    pub still_picture: bool,
+    /// Specifies that the syntax elements not needed by a still picture are
+    /// omitted.
+    pub reduced_still_picture_header: bool,
+    /// Specifies whether frame id numbers are present in the coded video
+    /// sequence.
+    pub frame_id_numbers_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuperblockSize {
+    /// When set, indicates that superblocks contain 128x128 luma samples. When
+    /// not set, it indicates that superblocks contain 64x64 luma samples. (The
+    /// number of contained chroma samples depends on `subsampling_x` and
+    /// `subsampling_y`.)
+    pub use_128x128_superblock: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IntraTools {
+    /// When set, specifies that the `use_filter_intra` syntax element may be
+    /// present. When not set, specifies that the `use_filter_intra` syntax
+    /// element will not be present.
+    pub enable_filter_intra: bool,
+    /// Specifies whether the intra edge filtering process should be enabled.
+    pub enable_intra_edge_filter: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompoundTools {
+    /// When set, specifies that the mode info for inter blocks may contain the
+    /// syntax element interintra. If not set, specifies that the syntax element
+    /// interintra will not be present.
+    pub enable_interintra_compound: bool,
+    /// When set, specifies that the mode info for inter blocks may contain the
+    /// syntax element `compound_type`. When not set, specifies that the syntax
+    /// element `compound_type` will not be present.
+    pub enable_masked_compound: bool,
+    /// If set, indicates that the distance weights process may be used for
+    /// inter prediction.
+    pub enable_jnt_comp: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterTools {
+    /// When set, indicates that tools based on the values of order hints may be
+    /// used. When not set, indicates that tools based on order hints are
+    /// disabled.
+    pub enable_order_hint: bool,
+    /// When set, indicates that the inter prediction filter type may be
+    /// specified independently in the horizontal and vertical directions. If
+    /// the flag is not set, only one filter type may be specified, which is
+    /// then used in both directions.
+    pub enable_dual_filter: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MotionTools {
+    /// When set, indicates that the `allow_warped_motion` syntax element may be
+    /// present. When not set, indicates that the `allow_warped_motion` syntax
+    /// element will not be present.
+    pub enable_warped_motion: bool,
+    /// If set, indicates that the `use_ref_frame_mvs` syntax element may be
+    /// present. If not set, indicates that the `use_ref_frame_mvs` syntax element
+    /// will not be present.
+    pub enable_ref_frame_mvs: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameTools {
+    /// If set, specifies that the `use_superres` syntax element will be present
+    /// in the uncompressed header. If not set, specifies that the `use_superres`
+    /// syntax element will not be present (instead `use_superres` will be set to
+    /// 0 in the uncompressed header without being read).
+    pub enable_superres: bool,
+    /// If set, specifies that cdef filtering may be enabled. If not set,
+    /// specifies that cdef filtering is disabled.
+    pub enable_cdef: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostTools {
+    /// If set, specifies that loop restoration filtering may be enabled. If
+    /// not set, specifies that loop restoration filtering is disabled.
+    pub enable_restoration: bool,
+    /// Specifies whether film grain parameters are present in the coded video
+    /// sequence.
+    pub film_grain_params_present: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeqTiming {
+    /// Specifies whether decoder model information is present in the coded
+    /// video sequence.
+    pub decoder_model_info_present_flag: bool,
+    /// Specifies whether initial display delay information is present in the
+    /// coded video sequence.
+    pub initial_display_delay_present_flag: bool,
+    /// Specifies whether timing info is present in the coded video sequence.
+    pub timing_info_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenTools {
+    /// If not set, indicates that the `seq_force_screen_content_tools` syntax
+    /// element will be present. If set, indicates that
+    /// `seq_force_screen_content_tools` should be set equal to
+    /// `SELECT_SCREEN_CONTENT_TOOLS`.
+    pub seq_choose_screen_content_tools: bool,
+    /// If not set, indicates that the `seq_force_integer_mv` syntax element will
+    /// be present. If set, indicates that `seq_force_integer_mv` should be set
+    /// equal to `SELECT_INTEGER_MV`.
+    pub seq_choose_integer_mv: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -562,13 +668,8 @@ pub struct SequenceHeaderObu {
     pub obu_header: ObuHeader,
     /// Specifies the features that can be used in the coded video sequence.
     pub seq_profile: Profile,
-    /// If set, specifies that the coded video sequence contains only one coded
-    /// frame. If not set, specifies that the coded video sequence contains one
-    /// or more coded frames.
-    pub still_picture: bool,
-    /// Specifies that the syntax elements not needed by a still picture are
-    /// omitted.
-    pub reduced_still_picture_header: bool,
+    /// Sequence structure.
+    pub sequence: SeqFlags,
     /// Specifies the number of bits minus 1 used for transmitting the frame
     /// width syntax elements.
     pub frame_width_bits_minus_1: u8,
@@ -581,68 +682,29 @@ pub struct SequenceHeaderObu {
     /// Specifies the maximum frame height minus 1 for the frames represented by
     /// this sequence header.
     pub max_frame_height_minus_1: u16,
-    /// Specifies whether frame id numbers are present in the coded video
-    /// sequence.
-    pub frame_id_numbers_present_flag: bool,
     /// Specifies the number of bits minus 2 used to encode `delta_frame_id`
     /// syntax elements.
     pub delta_frame_id_length_minus_2: u32,
     /// Used to calculate the number of bits used to encode the `frame_id` syntax
     /// element.
     pub additional_frame_id_length_minus_1: u32,
-    /// When set, indicates that superblocks contain 128x128 luma samples. When
-    /// not set, it indicates that superblocks contain 64x64 luma samples. (The
-    /// number of contained chroma samples depends on `subsampling_x` and
-    /// `subsampling_y`.)
-    pub use_128x128_superblock: bool,
-    /// When set, specifies that the `use_filter_intra` syntax element may be
-    /// present. When not set, specifies that the `use_filter_intra` syntax
-    /// element will not be present.
-    pub enable_filter_intra: bool,
-    /// Specifies whether the intra edge filtering process should be enabled.
-    pub enable_intra_edge_filter: bool,
-    /// When set, specifies that the mode info for inter blocks may contain the
-    /// syntax element interintra. If not set, specifies that the syntax element
-    /// interintra will not be present.
-    pub enable_interintra_compound: bool,
-    /// When set, specifies that the mode info for inter blocks may contain the
-    /// syntax element `compound_type`. When not set, specifies that the syntax
-    /// element `compound_type` will not be present.
-    pub enable_masked_compound: bool,
-    /// When set, indicates that the `allow_warped_motion` syntax element may be
-    /// present. When not set, indicates that the `allow_warped_motion` syntax
-    /// element will not be present.
-    pub enable_warped_motion: bool,
-    /// When set, indicates that tools based on the values of order hints may be
-    /// used. When not set, indicates that tools based on order hints are
-    /// disabled.
-    pub enable_order_hint: bool,
-    /// When set, indicates that the inter prediction filter type may be
-    /// specified independently in the horizontal and vertical directions. If
-    /// the flag is not set, only one filter type may be specified, which is
-    /// then used in both directions.
-    pub enable_dual_filter: bool,
-    /// If set, indicates that the distance weights process may be used for
-    /// inter prediction.
-    pub enable_jnt_comp: bool,
-    /// If set, indicates that the `use_ref_frame_mvs` syntax element may be
-    /// present. If not set, indicates that the `use_ref_frame_mvs` syntax element
-    /// will not be present.
-    pub enable_ref_frame_mvs: bool,
-    /// If not set, indicates that the `seq_force_screen_content_tools` syntax
-    /// element will be present. If set, indicates that
-    /// `seq_force_screen_content_tools` should be set equal to
-    /// `SELECT_SCREEN_CONTENT_TOOLS`.
-    pub seq_choose_screen_content_tools: bool,
+    /// Superblock size.
+    pub superblock: SuperblockSize,
+    /// Intra tools.
+    pub intra: IntraTools,
+    /// Compound prediction.
+    pub compound: CompoundTools,
+    /// Motion tools.
+    pub motion: MotionTools,
+    /// Inter tools.
+    pub inter: InterTools,
+    /// Screen content tools.
+    pub screen: ScreenTools,
     /// Equal to `SELECT_SCREEN_CONTENT_TOOLS` indicates that the
     /// `allow_screen_content_tools` syntax element will be present in the frame
     /// header. Otherwise, `seq_force_screen_content_tools` contains the value for
     /// `allow_screen_content_tools`.
     pub seq_force_screen_content_tools: u32,
-    /// If not set, indicates that the `seq_force_integer_mv` syntax element will
-    /// be present. If set, indicates that `seq_force_integer_mv` should be set
-    /// equal to `SELECT_INTEGER_MV`.
-    pub seq_choose_integer_mv: bool,
     /// Equal to `SELECT_INTEGER_MV` indicates that the `force_integer_mv` syntax
     /// element will be present in the frame header (providing
     /// `allow_screen_content_tools` is equal to 1). Otherwise,
@@ -652,36 +714,20 @@ pub struct SequenceHeaderObu {
     pub order_hint_bits_minus_1: i32,
     /// Specifies the number of bits used for the `order_hint` syntax element.
     pub order_hint_bits: i32,
-    /// If set, specifies that the `use_superres` syntax element will be present
-    /// in the uncompressed header. If not set, specifies that the `use_superres`
-    /// syntax element will not be present (instead `use_superres` will be set to
-    /// 0 in the uncompressed header without being read).
-    pub enable_superres: bool,
-    /// If set, specifies that cdef filtering may be enabled. If not set,
-    /// specifies that cdef filtering is disabled.
-    pub enable_cdef: bool,
-    /// If set, specifies that loop restoration filtering may be enabled. If
-    /// not set, specifies that loop restoration filtering is disabled.
-    pub enable_restoration: bool,
-    /// Specifies whether film grain parameters are present in the coded video
-    /// sequence.
-    pub film_grain_params_present: bool,
+    /// Frame tools.
+    pub tools: FrameTools,
+    /// Post-decode tools.
+    pub post: PostTools,
     /// Indicates the number of operating points minus 1 present in the coded
     /// video sequence. An operating point specifies which spatial and temporal
     /// layers should be decoded.
     pub operating_points_cnt_minus_1: u32,
     /// The set of operating points.
     pub operating_points: [OperatingPoint; MAX_NUM_OPERATING_POINTS],
-    /// Specifies whether decoder model information is present in the coded
-    /// video sequence.
-    pub decoder_model_info_present_flag: bool,
+    /// Timing presence.
+    pub timing: SeqTiming,
     /// The decoder model info.
     pub decoder_model_info: DecoderModelInfo,
-    /// Specifies whether initial display delay information is present in the
-    /// coded video sequence.
-    pub initial_display_delay_present_flag: bool,
-    /// Specifies whether timing info is present in the coded video sequence.
-    pub timing_info_present_flag: bool,
     /// The timing info.
     pub timing_info: TimingInfo,
     /// The color config.
@@ -690,19 +736,6 @@ pub struct SequenceHeaderObu {
     /* CamelCase variables in the specification */
     pub bit_depth: BitDepth,
     pub num_planes: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StreamInfo {
-    pub seq_header: Rc<SequenceHeaderObu>,
-    pub render_width: u32,
-    pub render_height: u32,
-}
-
-/// A `TemporalDelimiterOBU`
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TemporalDelimiterObu {
-    pub obu_header: ObuHeader,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -726,27 +759,6 @@ impl TryFrom<u32> for InterpolationFilter {
             3 => Ok(InterpolationFilter::Bilinear),
             4 => Ok(InterpolationFilter::Switchable),
             _ => Err(format!("Invalid InterpolationFilter {value}")),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TxModes {
-    #[default]
-    Only4x4 = 0,
-    Largest = 1,
-    Select = 2,
-}
-
-impl TryFrom<u32> for TxModes {
-    type Error = String;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(TxModes::Only4x4),
-            1 => Ok(TxModes::Largest),
-            2 => Ok(TxModes::Select),
-            _ => Err(format!("Invalid TxModes {value}")),
         }
     }
 }
@@ -880,13 +892,123 @@ pub struct FrameObu<'a> {
 
 /// A `FrameHeaderOBU`
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShowFlags {
+    /// If set, indicates the frame indexed by `frame_to_show_map_idx` is to be
+    /// output; If not set, indicates that further processing is required.
+    pub show_existing_frame: bool,
+    /// If set, specifies that this frame should be immediately output once
+    /// decoded. If not set specifies that this frame should not be
+    /// immediately output. (It may be output later if a later uncompressed
+    /// header uses `show_existing_frame` is set).
+    pub show_frame: bool,
+    /// When set, specifies that the frame may be output using the
+    /// `show_existing_frame` mechanism. When not set, specifies that this frame
+    /// will not be output using the `show_existing_frame` mechanism.
+    pub showable_frame: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResilienceFlags {
+    /// If set, indicates that error resilient mode is enabled;
+    /// `error_resilient_mode` equal to 0 indicates that error resilient mode is
+    /// disabled.
+    pub error_resilient_mode: bool,
+    /// Specifies whether the CDF update in the symbol decoding process should
+    /// be disabled.
+    pub disable_cdf_update: bool,
+    /// If set, indicates that the end of frame CDF update is disabled; If not
+    /// set, indicates that the end of frame CDF update is enabled.
+    pub disable_frame_end_update_cdf: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SizeFlags {
+    /// If not set, specifies that the frame size is equal to the size in the
+    /// sequence header. If set, specifies that the frame size will either be
+    /// specified as the size of one of the reference frames, or computed from
+    /// the `frame_width_minus_1` and `frame_height_minus_1` syntax elements.
+    pub frame_size_override_flag: bool,
+    /// If not set, means that the render width and height are inferred from the
+    /// frame width and height. If set, means that the render width and height
+    /// are explicitly coded.
+    pub render_and_frame_size_different: bool,
+    /// If not set, indicates that no upscaling is needed. If set, indicates
+    /// that upscaling is needed.
+    pub use_superres: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameMotion {
+    /// If not set, specifies that motion vectors are specified to quarter pel
+    /// precision; If set, specifies that motion vectors are specified to eighth
+    /// pel precision.
+    pub allow_high_precision_mv: bool,
+    /// If not set, specifies that only the SIMPLE motion mode will be used.
+    pub is_motion_mode_switchable: bool,
+    /// If set, specifies that motion vector information from a previous frame
+    /// can be used when decoding the current frame. If not set, specifies that
+    /// this information will not be used.
+    pub use_ref_frame_mvs: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PredictionTools {
+    /// If set, indicates that intra block copy may be used in this frame. If
+    /// not set indicates that intra block copy is not allowed in this frame.
+    pub allow_intrabc: bool,
+    /// If set, indicates that the syntax element `motion_mode` may be present.
+    /// If not set, indicates that the syntax element `motion_mode` will not be
+    /// present
+    pub allow_warped_motion: bool,
+    /// If set indicates that the filter selection is signaled at the block
+    /// level; If not set, indicates that the filter selection is signaled at
+    /// the frame level.
+    pub is_filter_switchable: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModeFlags {
+    /// If set specifies that the syntax element `skip_mode` will be present.  If
+    /// not set, specifies that `skip_mode` will not be used for this frame.
+    pub skip_mode_present: bool,
+    /// If set, specifies that the mode info for inter blocks contains the
+    /// syntax element `comp_mode` that indicates whether to use single or
+    /// compound reference prediction. If not set, specifies that all inter
+    /// blocks will use single prediction.
+    pub reference_select: bool,
+    /// If set, specifies that the frame is restricted to a reduced subset of
+    /// the full set of transform types.
+    pub reduced_tx_set: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignalingFlags {
+    /// If set, indicates that only two reference frames are explicitly
+    /// signaled. If not set, indicates that all reference frames are explicitly
+    /// signaled.
+    pub frame_refs_short_signaling: bool,
+    /// If set, specifies that `buffer_removal_time` is present.  If not set,
+    /// specifies that `buffer_removal_time` is not present.
+    pub buffer_removal_time_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LosslessFlags {
+    /// Whether the frame uses intra prediction only.
+    pub frame_is_intra: bool,
+    /// Whether the frame is coded losslessly.
+    pub coded_lossless: bool,
+    /// Whether all segments are lossless.
+    pub all_lossless: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameHeaderObu {
     /// The original OBU header. This may be from a `FrameOBU` or a `FrameHeaderOBU`
     /// directly.
     pub obu_header: ObuHeader,
-    /// If set, indicates the frame indexed by `frame_to_show_map_idx` is to be
-    /// output; If not set, indicates that further processing is required.
-    pub show_existing_frame: bool,
+    /// Frame output.
+    pub show: ShowFlags,
     /// Specifies the frame to be output. It is only available if
     /// `show_existing_frame` is set.
     pub frame_to_show_map_idx: u8,
@@ -897,22 +1019,8 @@ pub struct FrameHeaderObu {
     pub display_frame_id: u32,
     /// Specifies the type of the frame
     pub frame_type: FrameType,
-    /// If set, specifies that this frame should be immediately output once
-    /// decoded. If not set specifies that this frame should not be
-    /// immediately output. (It may be output later if a later uncompressed
-    /// header uses `show_existing_frame` is set).
-    pub show_frame: bool,
-    /// When set, specifies that the frame may be output using the
-    /// `show_existing_frame` mechanism. When not set, specifies that this frame
-    /// will not be output using the `show_existing_frame` mechanism.
-    pub showable_frame: bool,
-    /// If set, indicates that error resilient mode is enabled;
-    /// `error_resilient_mode` equal to 0 indicates that error resilient mode is
-    /// disabled.
-    pub error_resilient_mode: bool,
-    /// Specifies whether the CDF update in the symbol decoding process should
-    /// be disabled.
-    pub disable_cdf_update: bool,
+    /// Error resilience.
+    pub resilience: ResilienceFlags,
     /// When set, indicates that intra blocks may use palette encoding; When not
     /// set, indicates that palette encoding is never used.
     pub allow_screen_content_tools: u32,
@@ -924,20 +1032,16 @@ pub struct FrameHeaderObu {
     /// provide decoders with a way of detecting missing reference frames so
     /// that appropriate action can be taken.
     pub current_frame_id: u32,
-    /// If not set, specifies that the frame size is equal to the size in the
-    /// sequence header. If set, specifies that the frame size will either be
-    /// specified as the size of one of the reference frames, or computed from
-    /// the `frame_width_minus_1` and `frame_height_minus_1` syntax elements.
-    pub frame_size_override_flag: bool,
+    /// Frame size signaling.
+    pub size: SizeFlags,
     /// Specifies `OrderHintBits` least significant bits of the expected output
     /// order for this frame.
     pub order_hint: u32,
     /// Specifies which reference frame contains the CDF values and other state
     /// that should be loaded at the start of the frame.
     pub primary_ref_frame: u32,
-    /// If set, specifies that `buffer_removal_time` is present.  If not set,
-    /// specifies that `buffer_removal_time` is not present.
-    pub buffer_removal_time_present_flag: bool,
+    /// Reference and timing signaling.
+    pub signaling: SignalingFlags,
     /// Specifies the frame removal time in units of `DecCT` clock ticks counted
     /// from the removal time of the last random access point for operating
     /// point opNum. `buffer_removal_time` is signaled as a fixed length unsigned
@@ -949,50 +1053,18 @@ pub struct FrameHeaderObu {
     pub refresh_frame_flags: u32,
     /// Specifies the expected output order hint for each reference frame.
     pub ref_order_hint: [u32; NUM_REF_FRAMES],
-    /// If set, indicates that intra block copy may be used in this frame. If
-    /// not set indicates that intra block copy is not allowed in this frame.
-    pub allow_intrabc: bool,
-    /// If set, indicates that only two reference frames are explicitly
-    /// signaled. If not set, indicates that all reference frames are explicitly
-    /// signaled.
-    pub frame_refs_short_signaling: bool,
+    /// Prediction tools.
+    pub tools: PredictionTools,
     /// Specifies the reference frame to use for `LAST_FRAME`.
     pub last_frame_idx: u8,
     /// Specifies the reference frame to use for `GOLDEN_FRAME`.
     pub gold_frame_idx: u8,
     /// Specifies which reference frames are used by inter frames
     pub ref_frame_idx: [u8; REFS_PER_FRAME],
-    /// If not set, specifies that motion vectors are specified to quarter pel
-    /// precision; If set, specifies that motion vectors are specified to eighth
-    /// pel precision.
-    pub allow_high_precision_mv: bool,
-    /// If not set, specifies that only the SIMPLE motion mode will be used.
-    pub is_motion_mode_switchable: bool,
-    /// If set, specifies that motion vector information from a previous frame
-    /// can be used when decoding the current frame. If not set, specifies that
-    /// this information will not be used.
-    pub use_ref_frame_mvs: bool,
-    /// If set, indicates that the end of frame CDF update is disabled; If not
-    /// set, indicates that the end of frame CDF update is enabled.
-    pub disable_frame_end_update_cdf: bool,
-    /// If set, indicates that the syntax element `motion_mode` may be present.
-    /// If not set, indicates that the syntax element `motion_mode` will not be
-    /// present
-    pub allow_warped_motion: bool,
-    /// If set, specifies that the frame is restricted to a reduced subset of
-    /// the full set of transform types.
-    pub reduced_tx_set: bool,
-    /// If not set, means that the render width and height are inferred from the
-    /// frame width and height. If set, means that the render width and height
-    /// are explicitly coded.
-    pub render_and_frame_size_different: bool,
-    /// If not set, indicates that no upscaling is needed. If set, indicates
-    /// that upscaling is needed.
-    pub use_superres: bool,
-    /// If set indicates that the filter selection is signaled at the block
-    /// level; If not set, indicates that the filter selection is signaled at
-    /// the frame level.
-    pub is_filter_switchable: bool,
+    /// Motion prediction.
+    pub motion: FrameMotion,
+    /// Mode signaling.
+    pub mode: ModeFlags,
     /// The interpolation filter parameters.
     pub interpolation_filter: InterpolationFilter,
     /// The loop filter parameters.
@@ -1024,11 +1096,10 @@ pub struct FrameHeaderObu {
 
     /* CamelCase variables */
     pub superres_denom: u32,
-    pub frame_is_intra: bool,
+    /// Lossless state.
+    pub lossless: LosslessFlags,
     pub order_hints: [u32; NUM_REF_FRAMES],
     pub ref_frame_sign_bias: [bool; NUM_REF_FRAMES],
-    pub coded_lossless: bool,
-    pub all_lossless: bool,
     pub lossless_array: [bool; MAX_SEGMENTS],
     pub seg_qm_level: [[u32; MAX_SEGMENTS]; 3],
     pub upscaled_width: u32,
@@ -1044,6 +1115,30 @@ pub struct FrameHeaderObu {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoopFilterDelta {
+    /// If set, means that the filter level depends on the mode and reference
+    /// frame used to predict a block. If not set, means that the filter level
+    /// does not depend on the mode and reference frame.
+    pub loop_filter_delta_enabled: bool,
+    /// If set, means that additional syntax elements are present that specify
+    /// which mode and reference frame deltas are to be updated.
+    /// `loop_filter_delta_update` equal to 0 means that these syntax elements are
+    /// not present.
+    pub loop_filter_delta_update: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoopFilterMulti {
+    /// Specifies whether loop filter delta values are present.
+    pub delta_lf_present: bool,
+    /// If set, specifies that separate loop filter deltas are sent for
+    /// horizontal luma edges, vertical luma edges, the U edges, and the V
+    /// edges. If not set, specifies that the same loop filter delta is used for
+    /// all edges.
+    pub delta_lf_multi: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoopFilterParams {
     /// An array containing loop filter strength values. Different loop filter
     /// strength values from the array are used depending on the image plane
@@ -1054,15 +1149,8 @@ pub struct LoopFilterParams {
     /// `loop_filter_sharpness` together determine when a block edge is filtered,
     /// and by how much the filtering can change the sample values.
     pub loop_filter_sharpness: u8,
-    /// If set, means that the filter level depends on the mode and reference
-    /// frame used to predict a block. If not set, means that the filter level
-    /// does not depend on the mode and reference frame.
-    pub loop_filter_delta_enabled: bool,
-    /// If set, means that additional syntax elements are present that specify
-    /// which mode and reference frame deltas are to be updated.
-    /// `loop_filter_delta_update` equal to 0 means that these syntax elements are
-    /// not present.
-    pub loop_filter_delta_update: bool,
+    /// Mode and reference deltas.
+    pub delta: LoopFilterDelta,
     /// Contains the adjustment needed for the filter level based on the chosen
     /// reference frame. If this syntax element is not present, it maintains
     /// its previous value.
@@ -1071,16 +1159,11 @@ pub struct LoopFilterParams {
     /// mode. If this syntax element is not present in the, it maintains its
     /// previous value.
     pub loop_filter_mode_deltas: [i8; 2],
-    /// Specifies whether loop filter delta values are present.
-    pub delta_lf_present: bool,
+    /// Multi-delta presence.
+    pub multi: LoopFilterMulti,
     /// Specifies the left shift which should be applied to decoded loop filter
     /// delta values.
     pub delta_lf_res: u8,
-    /// If set, specifies that separate loop filter deltas are sent for
-    /// horizontal luma edges, vertical luma edges, the U edges, and the V
-    /// edges. If not set, specifies that the same loop filter delta is used for
-    /// all edges.
-    pub delta_lf_multi: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1120,7 +1203,7 @@ pub struct QuantizationParams {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SegmentationParams {
+pub struct SegmentationMap {
     /// If set, indicates that this frame makes use of the segmentation tool; If
     /// not set, indicates that the frame does not use segmentation.
     pub segmentation_enabled: bool,
@@ -1133,17 +1216,29 @@ pub struct SegmentationParams {
     /// the new segmentation map is coded without reference to the existing
     /// segmentation map.
     pub segmentation_temporal_update: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentationState {
     /// If set, indicates that new parameters are about to be specified for each
     /// segment. If not set, indicates that the segmentation parameters should
     /// keep their existing values.
     pub segmentation_update_data: bool,
+    /// Same as `SegIdPreSkip`
+    pub seg_id_pre_skip: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentationParams {
+    /// Segmentation map updates.
+    pub map: SegmentationMap,
+    /// Segmentation data state.
+    pub state: SegmentationState,
     /// If not set, indicates that the corresponding feature is unused and has
     /// value equal to 0. If set, indicates that the feature value is coded.
     pub feature_enabled: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
     /// Specifies the feature data for a segment feature.
     pub feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
-    /// Same as `SegIdPreSkip`
-    pub seg_id_pre_skip: bool,
     /// Same as `LastActiveSegId`
     pub last_active_seg_id: u8,
 }
@@ -1258,16 +1353,38 @@ pub struct GlobalMotionParams {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FilmGrainParams {
+pub struct GrainApply {
     /// If set, specifies that film grain should be added to this frame. If not
     /// set, specifies that film grain should not be added.
     pub apply_grain: bool,
-    /// Specifies the starting value for the pseudo-random numbers used during
-    /// film grain synthesis.
-    pub grain_seed: u16,
     /// If set means that a new set of parameters should be sent.  If not set,
     /// means that the previous set of parameters should be used.
     pub update_grain: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GrainSynthesis {
+    /// Specifies that the chroma scaling is inferred from the luma scaling.
+    pub chroma_scaling_from_luma: bool,
+    /// If set, indicates that the overlap between film grain blocks shall be
+    /// applied. If not set, indicates that the overlap between film grain
+    /// blocks shall not be applied.
+    pub overlap_flag: bool,
+    /// If set, indicates that clipping to the restricted (studio) range shall
+    /// be applied to the sample values after adding the film grain (see the
+    /// semantics for `color_range` for an explanation of studio swing).  If not
+    /// set, indicates that clipping to the full range shall be applied to the
+    /// sample values after adding the film grain.
+    pub clip_to_restricted_range: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilmGrainParams {
+    /// Grain application.
+    pub apply: GrainApply,
+    /// Specifies the starting value for the pseudo-random numbers used during
+    /// film grain synthesis.
+    pub grain_seed: u16,
     /// Indicates which reference frame contains the film grain parameters to be
     /// used for this frame.
     pub ref_idx: u8,
@@ -1283,8 +1400,6 @@ pub struct FilmGrainParams {
     /// Pepresents the scaling (output) value for the i-th point of the
     /// piecewise linear scaling function for luma component.
     pub point_y_scaling: [u8; MAX_NUM_Y_POINTS],
-    /// Specifies that the chroma scaling is inferred from the luma scaling.
-    pub chroma_scaling_from_luma: bool,
     /// Specifies the number of points for the piece-wise linear scaling
     /// function of the cb component.
     pub num_cb_points: u8,
@@ -1342,28 +1457,36 @@ pub struct FilmGrainParams {
     /// Represents an offset used in derivation of the input index to the cr
     /// component scaling function.
     pub cr_offset: u16,
-    /// If set, indicates that the overlap between film grain blocks shall be
-    /// applied. If not set, indicates that the overlap between film grain
-    /// blocks shall not be applied.
-    pub overlap_flag: bool,
-    /// If set, indicates that clipping to the restricted (studio) range shall
-    /// be applied to the sample values after adding the film grain (see the
-    /// semantics for `color_range` for an explanation of studio swing).  If not
-    /// set, indicates that clipping to the full range shall be applied to the
-    /// sample values after adding the film grain.
-    pub clip_to_restricted_range: bool,
+    /// Grain synthesis.
+    pub synthesis: GrainSynthesis,
 }
 
-/// Keeps track of the state of the reference frames in the parser. All
-/// variables are CamelCase.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ReferenceFrameInfo {
+struct RefFlags {
     /// An array which is indexed by a reference picture slot number. A value of
     /// true in the array signifies that the corresponding reference picture
     /// slot is valid for use as a reference picture, while a value of false
     /// signifies that the corresponding reference picture slot is not valid for
     /// use as a reference picture.
     ref_valid: bool,
+    /// Whether the reference frame can be output directly.
+    showable_frame: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RefSubsampling {
+    /// See 7.20 Reference Frame Update Process.
+    ref_subsampling_x: bool,
+    /// See 7.20 Reference Frame Update Process.
+    ref_subsampling_y: bool,
+}
+
+/// Keeps track of the state of the reference frames in the parser. All
+/// variables are CamelCase.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReferenceFrameInfo {
+    /// Reference validity.
+    flags: RefFlags,
     /// Specifies the frame id for each reference frame.
     ref_frame_id: u32,
     /// See 7.20 Reference Frame Update Process.
@@ -1382,10 +1505,8 @@ struct ReferenceFrameInfo {
     ref_mi_rows: u32,
     /// See 7.20 Reference Frame Update Process.
     ref_frame_type: FrameType,
-    /// See 7.20 Reference Frame Update Process.
-    ref_subsampling_x: bool,
-    /// See 7.20 Reference Frame Update Process.
-    ref_subsampling_y: bool,
+    /// Reference subsampling.
+    subsampling: RefSubsampling,
     /// See 7.20 Reference Frame Update Process.
     ref_bit_depth: BitDepth,
     /// See 7.20 Reference Frame Update Process.
@@ -1401,7 +1522,6 @@ struct ReferenceFrameInfo {
     /// The saved tile info parameters.
     tile_info: TileInfo,
     display_frame_id: u32,
-    showable_frame: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1443,7 +1563,7 @@ pub struct Parser {
     tile_size_bytes: u32,
 
     /// We keep this to implement `frame_header_copy()` in the specification, and to fill in
-    /// `StreamInfo` `render_width` and `render_height`.
+    /// Output `render_width` and `render_height`.
     pub last_frame_header: Option<FrameHeaderObu>,
     /// The last `SequenceHeaderObu` parsed.
     pub sequence_header: Option<Rc<SequenceHeaderObu>>,
@@ -1457,6 +1577,20 @@ struct Subsampling {
     /// Vertical chroma subsampling.
     y: bool,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct TileGeometry {
+    sb_cols: u32,
+    sb_rows: u32,
+    sb_shift: u32,
+    max_tile_width_sb: u32,
+    min_log2_tile_cols: u32,
+    max_log2_tile_cols: u32,
+    max_log2_tile_rows: u32,
+    min_log2_tiles: u32,
+}
+
+const ALL_FRAMES: u32 = (1 << NUM_REF_FRAMES) - 1;
 
 impl Parser {
     /// Probes the input data for the Annex B format. Anything other than
@@ -1537,13 +1671,13 @@ impl Parser {
         r: &mut Reader,
         seq: &SequenceHeaderObu,
     ) -> Result<(), String> {
-        if seq.enable_superres {
-            fh.use_superres = r.0.read_bit()?;
+        if seq.tools.enable_superres {
+            fh.size.use_superres = r.0.read_bit()?;
         } else {
-            fh.use_superres = false;
+            fh.size.use_superres = false;
         }
 
-        if fh.use_superres {
+        if fh.size.use_superres {
             fh.superres_denom = r.0.read_bits::<u32>(SUPERRES_DENOM_BITS)? + SUPERRES_DENOM_MIN;
         } else {
             fh.superres_denom = SUPERRES_NUM;
@@ -1552,6 +1686,56 @@ impl Parser {
         fh.upscaled_width = fh.frame_width;
         fh.frame_width =
             (fh.upscaled_width * SUPERRES_NUM + (fh.superres_denom / 2)) / fh.superres_denom;
+
+        Ok(())
+    }
+
+    fn find_backward_refs(
+        shifted_order_hints: &[i32; NUM_REF_FRAMES],
+        used_frame: &mut [bool; NUM_REF_FRAMES],
+        cur_frame_hint: i32,
+        latest_order_hint: &mut i32,
+        earliest_order_hint: &mut i32,
+        ref_frame_idx: &mut [i32; REFS_PER_FRAME],
+    ) -> Result<(), String> {
+        let ref_ = helpers::find_latest_backward(
+            shifted_order_hints,
+            *used_frame,
+            cur_frame_hint,
+            latest_order_hint,
+        );
+
+        if ref_ >= 0 {
+            ref_frame_idx
+                [ReferenceFrameType::AltRef as usize - ReferenceFrameType::Last as usize] = ref_;
+            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
+        }
+
+        let ref_ = helpers::find_earliest_backward(
+            shifted_order_hints,
+            *used_frame,
+            cur_frame_hint,
+            earliest_order_hint,
+        );
+
+        if ref_ >= 0 {
+            ref_frame_idx
+                [ReferenceFrameType::BwdRef as usize - ReferenceFrameType::Last as usize] = ref_;
+            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
+        }
+
+        let ref_ = helpers::find_earliest_backward(
+            shifted_order_hints,
+            *used_frame,
+            cur_frame_hint,
+            earliest_order_hint,
+        );
+
+        if ref_ >= 0 {
+            ref_frame_idx
+                [ReferenceFrameType::AltRef2 as usize - ReferenceFrameType::Last as usize] = ref_;
+            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
+        }
 
         Ok(())
     }
@@ -1585,7 +1769,7 @@ impl Parser {
         for i in 0..NUM_REF_FRAMES {
             shifted_order_hints[i] = cur_frame_hint
                 + helpers::get_relative_dist(
-                    seq.enable_order_hint,
+                    seq.inter.enable_order_hint,
                     seq.order_hint_bits,
                     ref_order_hint[i].try_into().unwrap(),
                     fh.order_hint.try_into().unwrap(),
@@ -1602,49 +1786,16 @@ impl Parser {
             return Err("It is a requirement of bitstream conformance that gold_order_hint < cur_frame_hint".into());
         }
 
-        let ref_ = helpers::find_latest_backward(
+        Self::find_backward_refs(
             &shifted_order_hints,
-            used_frame,
+            &mut used_frame,
             cur_frame_hint,
             &mut latest_order_hint,
-        );
-
-        if ref_ >= 0 {
-            ref_frame_idx
-                [ReferenceFrameType::AltRef as usize - ReferenceFrameType::Last as usize] = ref_;
-            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
-        }
-
-        let ref_ = helpers::find_earliest_backward(
-            &shifted_order_hints,
-            used_frame,
-            cur_frame_hint,
             &mut earliest_order_hint,
-        );
+            &mut ref_frame_idx,
+        )?;
 
-        if ref_ >= 0 {
-            ref_frame_idx
-                [ReferenceFrameType::BwdRef as usize - ReferenceFrameType::Last as usize] = ref_;
-            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
-        }
-
-        let ref_ = helpers::find_earliest_backward(
-            &shifted_order_hints,
-            used_frame,
-            cur_frame_hint,
-            &mut earliest_order_hint,
-        );
-
-        if ref_ >= 0 {
-            ref_frame_idx
-                [ReferenceFrameType::AltRef2 as usize - ReferenceFrameType::Last as usize] = ref_;
-            used_frame[usize::try_from(ref_).map_err(|_| "ref index range")?] = true;
-        }
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..REFS_PER_FRAME - 2 {
-            let ref_frame = REF_FRAME_LIST[i];
-
+        for ref_frame in REF_FRAME_LIST {
             if ref_frame_idx[ref_frame] < 0 {
                 let ref_ = helpers::find_latest_forward(
                     &shifted_order_hints,
@@ -1662,12 +1813,10 @@ impl Parser {
 
         let mut ref_ = 0;
         earliest_order_hint = shifted_order_hints[0];
-        #[allow(clippy::needless_range_loop)]
-        for i in 1..NUM_REF_FRAMES {
-            let hint = shifted_order_hints[i];
-            if hint < earliest_order_hint {
+        for (i, hint) in shifted_order_hints.iter().enumerate().skip(1) {
+            if *hint < earliest_order_hint {
                 ref_ = u8::try_from(i).map_err(|_| "ref index range")?;
-                earliest_order_hint = hint;
+                earliest_order_hint = *hint;
             }
         }
 
@@ -1689,7 +1838,7 @@ impl Parser {
     // 5.9.5.
     fn parse_frame_size(&mut self, fh: &mut FrameHeaderObu, r: &mut Reader) -> Result<(), String> {
         let seq = self.sequence()?;
-        if fh.frame_size_override_flag {
+        if fh.size.frame_size_override_flag {
             let n = seq.frame_width_bits_minus_1 + 1;
             fh.frame_width = r.0.read_bits::<u32>(n as usize)? + 1;
 
@@ -1707,8 +1856,8 @@ impl Parser {
     }
 
     fn parse_render_size(fh: &mut FrameHeaderObu, r: &mut Reader) -> Result<(), String> {
-        fh.render_and_frame_size_different = r.0.read_bit()?;
-        if fh.render_and_frame_size_different {
+        fh.size.render_and_frame_size_different = r.0.read_bit()?;
+        if fh.size.render_and_frame_size_different {
             fh.render_width = r.0.read_bits::<u32>(16)? + 1;
             fh.render_height = r.0.read_bits::<u32>(16)? + 1;
         } else {
@@ -1901,16 +2050,16 @@ impl Parser {
     fn parse_color_config(s: &mut SequenceHeaderObu, r: &mut Reader) -> Result<(), String> {
         let cc = &mut s.color_config;
 
-        cc.high_bitdepth = r.0.read_bit()?;
-        if s.seq_profile as u32 == 2 && cc.high_bitdepth {
-            cc.twelve_bit = r.0.read_bit()?;
-            if cc.twelve_bit {
+        cc.depth.high_bitdepth = r.0.read_bit()?;
+        if s.seq_profile as u32 == 2 && cc.depth.high_bitdepth {
+            cc.depth.twelve_bit = r.0.read_bit()?;
+            if cc.depth.twelve_bit {
                 s.bit_depth = BitDepth::Depth12;
             } else {
                 s.bit_depth = BitDepth::Depth10;
             }
         } else if s.seq_profile as u32 <= 2 {
-            s.bit_depth = if cc.high_bitdepth {
+            s.bit_depth = if cc.depth.high_bitdepth {
                 BitDepth::Depth10
             } else {
                 BitDepth::Depth8
@@ -1918,19 +2067,19 @@ impl Parser {
         }
 
         if s.seq_profile as u32 == 1 {
-            cc.mono_chrome = false;
+            cc.format.mono_chrome = false;
         } else {
-            cc.mono_chrome = r.0.read_bit()?;
+            cc.format.mono_chrome = r.0.read_bit()?;
         }
 
-        if cc.mono_chrome {
+        if cc.format.mono_chrome {
             s.num_planes = 1;
         } else {
             s.num_planes = 3;
         }
 
-        cc.color_description_present_flag = r.0.read_bit()?;
-        if cc.color_description_present_flag {
+        cc.description.color_description_present_flag = r.0.read_bit()?;
+        if cc.description.color_description_present_flag {
             cc.color_primaries = ColorPrimaries::try_from(r.0.read_bits::<u32>(8)?)?;
             cc.transfer_characteristics =
                 TransferCharacteristics::try_from(r.0.read_bits::<u32>(8)?)?;
@@ -1941,47 +2090,47 @@ impl Parser {
             cc.matrix_coefficients = MatrixCoefficients::Unspecified;
         }
 
-        if cc.mono_chrome {
-            cc.color_range = r.0.read_bit()?;
-            cc.subsampling_x = true;
-            cc.subsampling_y = true;
+        if cc.format.mono_chrome {
+            cc.description.color_range = r.0.read_bit()?;
+            cc.format.subsampling_x = true;
+            cc.format.subsampling_y = true;
             cc.chroma_sample_position = ChromaSamplePosition::Unknown;
-            cc.separate_uv_delta_q = false;
+            cc.quant.separate_uv_delta_q = false;
             return Ok(());
         } else if matches!(cc.color_primaries, ColorPrimaries::Bt709)
             && matches!(cc.transfer_characteristics, TransferCharacteristics::Srgb)
             && matches!(cc.matrix_coefficients, MatrixCoefficients::Identity)
         {
-            cc.color_range = true;
-            cc.subsampling_x = false;
-            cc.subsampling_y = false;
+            cc.description.color_range = true;
+            cc.format.subsampling_x = false;
+            cc.format.subsampling_y = false;
         } else {
-            cc.color_range = r.0.read_bit()?;
+            cc.description.color_range = r.0.read_bit()?;
             if s.seq_profile as u32 == 0 {
-                cc.subsampling_x = true;
-                cc.subsampling_y = true;
+                cc.format.subsampling_x = true;
+                cc.format.subsampling_y = true;
             } else if s.seq_profile as u32 == 1 {
-                cc.subsampling_x = false;
-                cc.subsampling_y = false;
+                cc.format.subsampling_x = false;
+                cc.format.subsampling_y = false;
             } else if matches!(s.bit_depth, BitDepth::Depth12) {
-                cc.subsampling_x = r.0.read_bit()?;
-                if cc.subsampling_x {
-                    cc.subsampling_y = r.0.read_bit()?;
+                cc.format.subsampling_x = r.0.read_bit()?;
+                if cc.format.subsampling_x {
+                    cc.format.subsampling_y = r.0.read_bit()?;
                 } else {
-                    cc.subsampling_y = false;
+                    cc.format.subsampling_y = false;
                 }
             } else {
-                cc.subsampling_x = true;
-                cc.subsampling_y = false;
+                cc.format.subsampling_x = true;
+                cc.format.subsampling_y = false;
             }
 
-            if cc.subsampling_x && cc.subsampling_y {
+            if cc.format.subsampling_x && cc.format.subsampling_y {
                 cc.chroma_sample_position =
                     ChromaSamplePosition::try_from(r.0.read_bits::<u32>(2)?)?;
             }
         }
 
-        cc.separate_uv_delta_q = r.0.read_bit()?;
+        cc.quant.separate_uv_delta_q = r.0.read_bit()?;
 
         Ok(())
     }
@@ -2035,24 +2184,12 @@ impl Parser {
         self.seen_frame_header = false;
     }
 
-    fn parse_sequence_header_obu(&mut self, obu: &Obu) -> Result<Rc<SequenceHeaderObu>, String> {
-        let mut s = SequenceHeaderObu {
-            obu_header: obu.header.clone(),
-            ..Default::default()
-        };
-
-        let mut r = Reader::new(obu.as_ref());
-        let profile = r.0.read_bits::<u32>(3)?;
-
-        s.seq_profile = Profile::try_from(profile)?;
-        s.still_picture = r.0.read_bit()?;
-        s.reduced_still_picture_header = r.0.read_bit()?;
-
-        if s.reduced_still_picture_header {
+    fn parse_operating_points(s: &mut SequenceHeaderObu, r: &mut Reader) -> Result<(), String> {
+        if s.sequence.reduced_still_picture_header {
             /* Default::default() already ensures a lot of this, but lets go verbatim */
-            s.timing_info_present_flag = false;
-            s.decoder_model_info_present_flag = false;
-            s.initial_display_delay_present_flag = false;
+            s.timing.timing_info_present_flag = false;
+            s.timing.decoder_model_info_present_flag = false;
+            s.timing.initial_display_delay_present_flag = false;
             s.operating_points_cnt_minus_1 = 0;
             s.operating_points[0].idc = 0;
             s.operating_points[0].seq_level_idx = r.0.read_bits::<u8>(5)?;
@@ -2060,18 +2197,18 @@ impl Parser {
             s.operating_points[0].decoder_model_present_for_this_op = false;
             s.operating_points[0].initial_display_delay_present_for_this_op = false;
         } else {
-            s.timing_info_present_flag = r.0.read_bit()?;
-            if s.timing_info_present_flag {
-                Self::parse_timing_info(&mut s.timing_info, &mut r)?;
-                s.decoder_model_info_present_flag = r.0.read_bit()?;
-                if s.decoder_model_info_present_flag {
-                    Self::parse_decoder_model_info(&mut s.decoder_model_info, &mut r)?;
+            s.timing.timing_info_present_flag = r.0.read_bit()?;
+            if s.timing.timing_info_present_flag {
+                Self::parse_timing_info(&mut s.timing_info, r)?;
+                s.timing.decoder_model_info_present_flag = r.0.read_bit()?;
+                if s.timing.decoder_model_info_present_flag {
+                    Self::parse_decoder_model_info(&mut s.decoder_model_info, r)?;
                 }
             } else {
-                s.decoder_model_info_present_flag = false;
+                s.timing.decoder_model_info_present_flag = false;
             }
 
-            s.initial_display_delay_present_flag = r.0.read_bit()?;
+            s.timing.initial_display_delay_present_flag = r.0.read_bit()?;
             s.operating_points_cnt_minus_1 = r.0.read_bits::<u32>(5)?;
             if s.operating_points_cnt_minus_1
                 > u32::try_from(MAX_NUM_OPERATING_POINTS).map_err(|_| "operating points range")?
@@ -2090,14 +2227,14 @@ impl Parser {
                 } else {
                     s.operating_points[i].seq_tier = 0;
                 }
-                if s.decoder_model_info_present_flag {
+                if s.timing.decoder_model_info_present_flag {
                     s.operating_points[i].decoder_model_present_for_this_op = r.0.read_bit()?;
                     if s.operating_points[i].decoder_model_present_for_this_op {
                         let buffer_delay_length_minus_1 =
                             s.decoder_model_info.buffer_delay_length_minus_1;
                         Self::parse_operating_parameters_info(
                             &mut s.operating_points[i],
-                            &mut r,
+                            r,
                             buffer_delay_length_minus_1,
                         )?;
                     }
@@ -2105,7 +2242,7 @@ impl Parser {
                     s.operating_points[i].decoder_model_present_for_this_op = false;
                 }
 
-                if s.initial_display_delay_present_flag {
+                if s.timing.initial_display_delay_present_flag {
                     s.operating_points[i].initial_display_delay_present_for_this_op =
                         r.0.read_bit()?;
                     if s.operating_points[i].initial_display_delay_present_for_this_op {
@@ -2115,6 +2252,77 @@ impl Parser {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn parse_seq_tools(s: &mut SequenceHeaderObu, r: &mut Reader) -> Result<(), String> {
+        if s.sequence.reduced_still_picture_header {
+            s.compound.enable_interintra_compound = false;
+            s.compound.enable_masked_compound = false;
+            s.motion.enable_warped_motion = false;
+            s.inter.enable_dual_filter = false;
+            s.inter.enable_order_hint = false;
+            s.compound.enable_jnt_comp = false;
+            s.motion.enable_ref_frame_mvs = false;
+            s.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
+            s.seq_force_integer_mv = SELECT_INTEGER_MV;
+            s.order_hint_bits = 0;
+            s.order_hint_bits_minus_1 = -1;
+        } else {
+            s.compound.enable_interintra_compound = r.0.read_bit()?;
+            s.compound.enable_masked_compound = r.0.read_bit()?;
+            s.motion.enable_warped_motion = r.0.read_bit()?;
+            s.inter.enable_dual_filter = r.0.read_bit()?;
+            s.inter.enable_order_hint = r.0.read_bit()?;
+            if s.inter.enable_order_hint {
+                s.compound.enable_jnt_comp = r.0.read_bit()?;
+                s.motion.enable_ref_frame_mvs = r.0.read_bit()?;
+            } else {
+                s.compound.enable_jnt_comp = false;
+                s.motion.enable_ref_frame_mvs = false;
+            }
+            s.screen.seq_choose_screen_content_tools = r.0.read_bit()?;
+            if s.screen.seq_choose_screen_content_tools {
+                s.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
+            } else {
+                s.seq_force_screen_content_tools = r.0.read_bit()?.into();
+            }
+            if s.seq_force_screen_content_tools > 0 {
+                s.screen.seq_choose_integer_mv = r.0.read_bit()?;
+                if s.screen.seq_choose_integer_mv {
+                    s.seq_force_integer_mv = SELECT_INTEGER_MV;
+                } else {
+                    s.seq_force_integer_mv = r.0.read_bit()?.into();
+                }
+            } else {
+                s.seq_force_integer_mv = SELECT_INTEGER_MV;
+            }
+
+            if s.inter.enable_order_hint {
+                s.order_hint_bits_minus_1 = r.0.read_bits::<u32>(3)?.try_into().unwrap();
+                s.order_hint_bits = s.order_hint_bits_minus_1 + 1;
+            } else {
+                s.order_hint_bits_minus_1 = -1;
+                s.order_hint_bits = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_sequence_header_obu(&mut self, obu: &Obu) -> Result<Rc<SequenceHeaderObu>, String> {
+        let mut s = SequenceHeaderObu {
+            obu_header: obu.header.clone(),
+            ..Default::default()
+        };
+
+        let mut r = Reader::new(obu.as_ref());
+        let profile = r.0.read_bits::<u32>(3)?;
+
+        s.seq_profile = Profile::try_from(profile)?;
+        s.sequence.still_picture = r.0.read_bit()?;
+        s.sequence.reduced_still_picture_header = r.0.read_bit()?;
+
+        Self::parse_operating_points(&mut s, &mut r)?;
 
         s.frame_width_bits_minus_1 = r.0.read_bits::<u8>(4)?;
         s.frame_height_bits_minus_1 = r.0.read_bits::<u8>(4)?;
@@ -2124,12 +2332,12 @@ impl Parser {
         // frame_height_bits_minus_1 has been read from 4 bits, meaning we can read 16 bits at most.
         s.max_frame_height_minus_1 =
             r.0.read_bits::<u16>(s.frame_height_bits_minus_1 as usize + 1)?;
-        if s.reduced_still_picture_header {
-            s.frame_id_numbers_present_flag = false;
+        if s.sequence.reduced_still_picture_header {
+            s.sequence.frame_id_numbers_present_flag = false;
         } else {
-            s.frame_id_numbers_present_flag = r.0.read_bit()?;
+            s.sequence.frame_id_numbers_present_flag = r.0.read_bit()?;
         }
-        if s.frame_id_numbers_present_flag {
+        if s.sequence.frame_id_numbers_present_flag {
             s.delta_frame_id_length_minus_2 = r.0.read_bits::<u32>(4)?;
             s.additional_frame_id_length_minus_1 = r.0.read_bits::<u32>(3)?;
             let frame_id_length =
@@ -2139,67 +2347,18 @@ impl Parser {
             }
         }
 
-        s.use_128x128_superblock = r.0.read_bit()?;
-        s.enable_filter_intra = r.0.read_bit()?;
-        s.enable_intra_edge_filter = r.0.read_bit()?;
-        if s.reduced_still_picture_header {
-            s.enable_interintra_compound = false;
-            s.enable_masked_compound = false;
-            s.enable_warped_motion = false;
-            s.enable_dual_filter = false;
-            s.enable_order_hint = false;
-            s.enable_jnt_comp = false;
-            s.enable_ref_frame_mvs = false;
-            s.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
-            s.seq_force_integer_mv = SELECT_INTEGER_MV;
-            s.order_hint_bits = 0;
-            s.order_hint_bits_minus_1 = -1;
-        } else {
-            s.enable_interintra_compound = r.0.read_bit()?;
-            s.enable_masked_compound = r.0.read_bit()?;
-            s.enable_warped_motion = r.0.read_bit()?;
-            s.enable_dual_filter = r.0.read_bit()?;
-            s.enable_order_hint = r.0.read_bit()?;
-            if s.enable_order_hint {
-                s.enable_jnt_comp = r.0.read_bit()?;
-                s.enable_ref_frame_mvs = r.0.read_bit()?;
-            } else {
-                s.enable_jnt_comp = false;
-                s.enable_ref_frame_mvs = false;
-            }
-            s.seq_choose_screen_content_tools = r.0.read_bit()?;
-            if s.seq_choose_screen_content_tools {
-                s.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
-            } else {
-                s.seq_force_screen_content_tools = r.0.read_bit()?.into();
-            }
-            if s.seq_force_screen_content_tools > 0 {
-                s.seq_choose_integer_mv = r.0.read_bit()?;
-                if s.seq_choose_integer_mv {
-                    s.seq_force_integer_mv = SELECT_INTEGER_MV;
-                } else {
-                    s.seq_force_integer_mv = r.0.read_bit()?.into();
-                }
-            } else {
-                s.seq_force_integer_mv = SELECT_INTEGER_MV;
-            }
+        s.superblock.use_128x128_superblock = r.0.read_bit()?;
+        s.intra.enable_filter_intra = r.0.read_bit()?;
+        s.intra.enable_intra_edge_filter = r.0.read_bit()?;
+        Self::parse_seq_tools(&mut s, &mut r)?;
 
-            if s.enable_order_hint {
-                s.order_hint_bits_minus_1 = r.0.read_bits::<u32>(3)?.try_into().unwrap();
-                s.order_hint_bits = s.order_hint_bits_minus_1 + 1;
-            } else {
-                s.order_hint_bits_minus_1 = -1;
-                s.order_hint_bits = 0;
-            }
-        }
-
-        s.enable_superres = r.0.read_bit()?;
-        s.enable_cdef = r.0.read_bit()?;
-        s.enable_restoration = r.0.read_bit()?;
+        s.tools.enable_superres = r.0.read_bit()?;
+        s.tools.enable_cdef = r.0.read_bit()?;
+        s.post.enable_restoration = r.0.read_bit()?;
 
         Self::parse_color_config(&mut s, &mut r)?;
 
-        s.film_grain_params_present = r.0.read_bit()?;
+        s.post.film_grain_params_present = r.0.read_bit()?;
 
         Self::skip_and_check_trailing_bits(&mut r, obu)?;
         let rc = Rc::new(s);
@@ -2240,7 +2399,7 @@ impl Parser {
             /* The accelerator is keeping track of CDF values, so that is skipped too */
             fh.global_motion_params = rf.global_motion_params.clone();
 
-            if seq.film_grain_params_present {
+            if seq.post.film_grain_params_present {
                 fh.film_grain_params = rf.film_grain_params.clone();
             }
             fh.loop_filter_params = rf.loop_filter_params.clone();
@@ -2254,35 +2413,41 @@ impl Parser {
         fh.segmentation_params.feature_enabled = Default::default();
         fh.segmentation_params.feature_data = Default::default();
 
-        for i in ReferenceFrameType::Last as usize..ReferenceFrameType::AltRef as usize {
-            fh.global_motion_params.gm_type[i] = WarpModelType::Identity;
+        for gm_type in &mut fh.global_motion_params.gm_type
+            [ReferenceFrameType::Last as usize..ReferenceFrameType::AltRef as usize]
+        {
+            *gm_type = WarpModelType::Identity;
         }
 
-        fh.loop_filter_params.loop_filter_delta_enabled = true;
+        fh.loop_filter_params.delta.loop_filter_delta_enabled = true;
         fh.loop_filter_params.loop_filter_ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
         fh.loop_filter_params.loop_filter_mode_deltas = Default::default();
     }
 
-    fn parse_tile_info(&mut self, r: &mut Reader, ti: &mut TileInfo) -> Result<(), String> {
+    fn tile_geometry(&self) -> Result<TileGeometry, String> {
         let seq = self.sequence()?;
 
-        let sb_cols = if seq.use_128x128_superblock {
+        let sb_cols = if seq.superblock.use_128x128_superblock {
             (self.mi_cols + 31) >> 5
         } else {
             (self.mi_cols + 15) >> 4
         };
 
-        let sb_rows = if seq.use_128x128_superblock {
+        let sb_rows = if seq.superblock.use_128x128_superblock {
             (self.mi_rows + 31) >> 5
         } else {
             (self.mi_rows + 15) >> 4
         };
 
-        let sb_shift = if seq.use_128x128_superblock { 5 } else { 4 };
+        let sb_shift = if seq.superblock.use_128x128_superblock {
+            5
+        } else {
+            4
+        };
         let sb_size = sb_shift + 2;
 
         let max_tile_width_sb = MAX_TILE_WIDTH >> sb_size;
-        let mut max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
+        let max_tile_area_sb = MAX_TILE_AREA >> (2 * sb_size);
 
         let min_log2_tile_cols = helpers::tile_log2(max_tile_width_sb, sb_cols);
 
@@ -2306,131 +2471,170 @@ impl Parser {
             min_log2_tile_cols,
             helpers::tile_log2(max_tile_area_sb, sb_rows * sb_cols),
         );
+        let geometry = TileGeometry {
+            sb_cols,
+            sb_rows,
+            sb_shift,
+            max_tile_width_sb,
+            min_log2_tile_cols,
+            max_log2_tile_cols,
+            max_log2_tile_rows,
+            min_log2_tiles,
+        };
+        Ok(geometry)
+    }
+
+    fn parse_uniform_tiles(
+        &mut self,
+        r: &mut Reader,
+        ti: &mut TileInfo,
+        geometry: TileGeometry,
+    ) -> Result<(), String> {
+        self.tile_cols_log2 = geometry.min_log2_tile_cols;
+        while self.tile_cols_log2 < geometry.max_log2_tile_cols {
+            let increment_tile_cols_log_2 = r.0.read_bit()?;
+            if increment_tile_cols_log_2 {
+                self.tile_cols_log2 += 1;
+            } else {
+                break;
+            }
+        }
+
+        let tile_width_sb =
+            (geometry.sb_cols + (1 << self.tile_cols_log2) - 1) >> self.tile_cols_log2;
+
+        let mut i = 0;
+        let mut start_sb = 0;
+
+        while start_sb < geometry.sb_cols {
+            self.mi_col_starts[i] = start_sb << geometry.sb_shift;
+            i += 1;
+            start_sb += tile_width_sb;
+        }
+
+        self.mi_col_starts[i] = self.mi_cols;
+        self.tile_cols = u32::try_from(i).map_err(|_| "tile index range")?;
+
+        if self.tile_cols > u32::try_from(MAX_TILE_COLS).map_err(|_| "tile cols range")? {
+            return Err(format!("Invalid tile_cols {}", self.tile_cols));
+        }
+
+        /* compute this anyways */
+        while i >= 1 {
+            ti.width_in_sbs_minus_1[i - 1] = ((self.mi_col_starts[i] - self.mi_col_starts[i - 1]
+                + ((1 << geometry.sb_shift) - 1))
+                >> geometry.sb_shift)
+                - 1;
+            i -= 1;
+        }
+
+        let min_log2_tile_rows = std::cmp::max(
+            geometry.min_log2_tiles.saturating_sub(self.tile_cols_log2),
+            0,
+        );
+        self.tile_rows_log2 = min_log2_tile_rows;
+
+        while self.tile_rows_log2 < geometry.max_log2_tile_rows {
+            let increment_tile_rows_log_2 = r.0.read_bit()?;
+
+            if increment_tile_rows_log_2 {
+                self.tile_rows_log2 += 1;
+            } else {
+                break;
+            }
+        }
+
+        let tile_height_sb =
+            (geometry.sb_rows + (1 << self.tile_rows_log2) - 1) >> self.tile_rows_log2;
+
+        let mut i = 0;
+        let mut start_sb = 0;
+
+        while start_sb < geometry.sb_rows {
+            self.mi_row_starts[i] = start_sb << geometry.sb_shift;
+            i += 1;
+            start_sb += tile_height_sb;
+        }
+
+        self.mi_row_starts[i] = self.mi_rows;
+        self.tile_rows = u32::try_from(i).map_err(|_| "tile index range")?;
+
+        if self.tile_rows > u32::try_from(MAX_TILE_ROWS).map_err(|_| "tile rows range")? {
+            return Err(format!("Invalid tile_rows {}", self.tile_rows));
+        }
+
+        /* compute this anyways */
+        while i >= 1 {
+            ti.height_in_sbs_minus_1[i - 1] = ((self.mi_row_starts[i] - self.mi_row_starts[i - 1]
+                + ((1 << geometry.sb_shift) - 1))
+                >> geometry.sb_shift)
+                - 1;
+            i -= 1;
+        }
+        Ok(())
+    }
+
+    fn parse_explicit_tiles(
+        &mut self,
+        r: &mut Reader,
+        ti: &mut TileInfo,
+        geometry: TileGeometry,
+    ) -> Result<(), String> {
+        let mut widest_tile_sb = 0;
+        let mut start_sb = 0;
+        let mut i = 0;
+
+        while start_sb < geometry.sb_cols {
+            self.mi_col_starts[i] = start_sb << geometry.sb_shift;
+
+            let max_width = std::cmp::min(geometry.sb_cols - start_sb, geometry.max_tile_width_sb);
+            ti.width_in_sbs_minus_1[i] = r.read_ns(max_width.try_into().unwrap())?;
+
+            let size_sb = ti.width_in_sbs_minus_1[i] + 1;
+            widest_tile_sb = std::cmp::max(size_sb, widest_tile_sb);
+
+            start_sb += size_sb;
+            i += 1;
+        }
+
+        self.mi_col_starts[i] = self.mi_cols;
+        self.tile_cols = u32::try_from(i).map_err(|_| "tile index range")?;
+        self.tile_cols_log2 = helpers::tile_log2(1, self.tile_cols);
+
+        let max_tile_area_sb = if geometry.min_log2_tiles > 0 {
+            (geometry.sb_rows * geometry.sb_cols) >> (geometry.min_log2_tiles + 1)
+        } else {
+            geometry.sb_rows * geometry.sb_cols
+        };
+
+        let max_tile_height_sb = std::cmp::max(max_tile_area_sb / widest_tile_sb, 1);
+        let mut start_sb = 0;
+        let mut i = 0;
+        while start_sb < geometry.sb_rows {
+            self.mi_row_starts[i] = start_sb << geometry.sb_shift;
+            let max_height = std::cmp::min(geometry.sb_rows - start_sb, max_tile_height_sb);
+            ti.height_in_sbs_minus_1[i] = r.read_ns(max_height.try_into().unwrap())?;
+
+            let size_sb = ti.height_in_sbs_minus_1[i] + 1;
+            start_sb += size_sb;
+            i += 1;
+        }
+
+        self.mi_row_starts[i] = self.mi_rows;
+        self.tile_rows = u32::try_from(i).map_err(|_| "tile index range")?;
+        self.tile_rows_log2 = helpers::tile_log2(1, self.tile_rows);
+        Ok(())
+    }
+
+    fn parse_tile_info(&mut self, r: &mut Reader, ti: &mut TileInfo) -> Result<(), String> {
+        let geometry = self.tile_geometry()?;
 
         ti.uniform_tile_spacing_flag = r.0.read_bit()?;
 
         if ti.uniform_tile_spacing_flag {
-            self.tile_cols_log2 = min_log2_tile_cols;
-            while self.tile_cols_log2 < max_log2_tile_cols {
-                let increment_tile_cols_log_2 = r.0.read_bit()?;
-                if increment_tile_cols_log_2 {
-                    self.tile_cols_log2 += 1;
-                } else {
-                    break;
-                }
-            }
-
-            let tile_width_sb = (sb_cols + (1 << self.tile_cols_log2) - 1) >> self.tile_cols_log2;
-
-            let mut i = 0;
-            let mut start_sb = 0;
-
-            while start_sb < sb_cols {
-                self.mi_col_starts[i] = start_sb << sb_shift;
-                i += 1;
-                start_sb += tile_width_sb;
-            }
-
-            self.mi_col_starts[i] = self.mi_cols;
-            self.tile_cols = u32::try_from(i).map_err(|_| "tile index range")?;
-
-            if self.tile_cols > u32::try_from(MAX_TILE_COLS).map_err(|_| "tile cols range")? {
-                return Err(format!("Invalid tile_cols {}", self.tile_cols));
-            }
-
-            /* compute this anyways */
-            while i >= 1 {
-                ti.width_in_sbs_minus_1[i - 1] =
-                    ((self.mi_col_starts[i] - self.mi_col_starts[i - 1] + ((1 << sb_shift) - 1))
-                        >> sb_shift)
-                        - 1;
-                i -= 1;
-            }
-
-            let min_log2_tile_rows =
-                std::cmp::max(min_log2_tiles.saturating_sub(self.tile_cols_log2), 0);
-            self.tile_rows_log2 = min_log2_tile_rows;
-
-            while self.tile_rows_log2 < max_log2_tile_rows {
-                let increment_tile_rows_log_2 = r.0.read_bit()?;
-
-                if increment_tile_rows_log_2 {
-                    self.tile_rows_log2 += 1;
-                } else {
-                    break;
-                }
-            }
-
-            let tile_height_sb = (sb_rows + (1 << self.tile_rows_log2) - 1) >> self.tile_rows_log2;
-
-            let mut i = 0;
-            let mut start_sb = 0;
-
-            while start_sb < sb_rows {
-                self.mi_row_starts[i] = start_sb << sb_shift;
-                i += 1;
-                start_sb += tile_height_sb;
-            }
-
-            self.mi_row_starts[i] = self.mi_rows;
-            self.tile_rows = u32::try_from(i).map_err(|_| "tile index range")?;
-
-            if self.tile_rows > u32::try_from(MAX_TILE_ROWS).map_err(|_| "tile rows range")? {
-                return Err(format!("Invalid tile_rows {}", self.tile_rows));
-            }
-
-            /* compute this anyways */
-            while i >= 1 {
-                ti.height_in_sbs_minus_1[i - 1] =
-                    ((self.mi_row_starts[i] - self.mi_row_starts[i - 1] + ((1 << sb_shift) - 1))
-                        >> sb_shift)
-                        - 1;
-                i -= 1;
-            }
+            Self::parse_uniform_tiles(self, r, ti, geometry)?;
         } else {
-            let mut widest_tile_sb = 0;
-            let mut start_sb = 0;
-            let mut i = 0;
-
-            while start_sb < sb_cols {
-                self.mi_col_starts[i] = start_sb << sb_shift;
-
-                let max_width = std::cmp::min(sb_cols - start_sb, max_tile_width_sb);
-                ti.width_in_sbs_minus_1[i] = r.read_ns(max_width.try_into().unwrap())?;
-
-                let size_sb = ti.width_in_sbs_minus_1[i] + 1;
-                widest_tile_sb = std::cmp::max(size_sb, widest_tile_sb);
-
-                start_sb += size_sb;
-                i += 1;
-            }
-
-            self.mi_col_starts[i] = self.mi_cols;
-            self.tile_cols = u32::try_from(i).map_err(|_| "tile index range")?;
-            self.tile_cols_log2 = helpers::tile_log2(1, self.tile_cols);
-
-            if min_log2_tiles > 0 {
-                max_tile_area_sb = (sb_rows * sb_cols) >> (min_log2_tiles + 1);
-            } else {
-                max_tile_area_sb = sb_rows * sb_cols;
-            }
-
-            let max_tile_height_sb = std::cmp::max(max_tile_area_sb / widest_tile_sb, 1);
-            let mut start_sb = 0;
-            let mut i = 0;
-            while start_sb < sb_rows {
-                self.mi_row_starts[i] = start_sb << sb_shift;
-                let max_height = std::cmp::min(sb_rows - start_sb, max_tile_height_sb);
-                ti.height_in_sbs_minus_1[i] = r.read_ns(max_height.try_into().unwrap())?;
-
-                let size_sb = ti.height_in_sbs_minus_1[i] + 1;
-                start_sb += size_sb;
-                i += 1;
-            }
-
-            self.mi_row_starts[i] = self.mi_rows;
-            self.tile_rows = u32::try_from(i).map_err(|_| "tile index range")?;
-            self.tile_rows_log2 = helpers::tile_log2(1, self.tile_rows);
+            Self::parse_explicit_tiles(self, r, ti, geometry)?;
         }
 
         if self.tile_cols_log2 > 0 || self.tile_rows_log2 > 0 {
@@ -2524,16 +2728,16 @@ impl Parser {
         delta_q_present: bool,
         allow_intrabc: bool,
     ) -> Result<(), String> {
-        lf.delta_lf_present = false;
+        lf.multi.delta_lf_present = false;
         lf.delta_lf_res = 0;
-        lf.delta_lf_multi = false;
+        lf.multi.delta_lf_multi = false;
         if delta_q_present {
             if !allow_intrabc {
-                lf.delta_lf_present = r.0.read_bit()?;
+                lf.multi.delta_lf_present = r.0.read_bit()?;
             }
-            if lf.delta_lf_present {
+            if lf.multi.delta_lf_present {
                 lf.delta_lf_res = r.0.read_bits::<u8>(2)?;
-                lf.delta_lf_multi = r.0.read_bit()?;
+                lf.multi.delta_lf_multi = r.0.read_bit()?;
             }
         }
         Ok(())
@@ -2545,20 +2749,20 @@ impl Parser {
         fh: &mut FrameHeaderObu,
     ) -> Result<(), String> {
         let s = &mut fh.segmentation_params;
-        s.segmentation_enabled = r.0.read_bit()?;
-        if s.segmentation_enabled {
+        s.map.segmentation_enabled = r.0.read_bit()?;
+        if s.map.segmentation_enabled {
             if fh.primary_ref_frame == PRIMARY_REF_NONE {
-                s.segmentation_update_map = true;
-                s.segmentation_temporal_update = false;
-                s.segmentation_update_data = true;
+                s.map.segmentation_update_map = true;
+                s.map.segmentation_temporal_update = false;
+                s.state.segmentation_update_data = true;
             } else {
-                s.segmentation_update_map = r.0.read_bit()?;
-                if s.segmentation_update_map {
-                    s.segmentation_temporal_update = r.0.read_bit()?;
+                s.map.segmentation_update_map = r.0.read_bit()?;
+                if s.map.segmentation_update_map {
+                    s.map.segmentation_temporal_update = r.0.read_bit()?;
                 }
-                s.segmentation_update_data = r.0.read_bit()?;
+                s.state.segmentation_update_data = r.0.read_bit()?;
             }
-            if s.segmentation_update_data {
+            if s.state.segmentation_update_data {
                 for i in 0..MAX_SEGMENTS {
                     for j in 0..SEG_LVL_MAX {
                         let feature_enabled = r.0.read_bit()?;
@@ -2593,7 +2797,7 @@ impl Parser {
                 let prev_frame =
                     &self.ref_info[fh.ref_frame_idx[fh.primary_ref_frame as usize] as usize];
 
-                if !prev_frame.ref_valid {
+                if !prev_frame.flags.ref_valid {
                     return Err("Reference is invalid".into());
                 }
 
@@ -2609,14 +2813,14 @@ impl Parser {
             }
         }
 
-        s.seg_id_pre_skip = false;
+        s.state.seg_id_pre_skip = false;
         s.last_active_seg_id = 0;
         for i in 0..MAX_SEGMENTS {
             for j in 0..SEG_LVL_MAX {
                 if s.feature_enabled[i][j] {
                     s.last_active_seg_id = u8::try_from(i).map_err(|_| "seg id range")?;
                     if j >= SEG_LVL_REF_FRAME {
-                        s.seg_id_pre_skip = true;
+                        s.state.seg_id_pre_skip = true;
                     }
                 }
             }
@@ -2631,7 +2835,7 @@ impl Parser {
         num_planes: u32,
     ) -> Result<(), String> {
         let lf = &mut fh.loop_filter_params;
-        if fh.coded_lossless || fh.allow_intrabc {
+        if fh.lossless.coded_lossless || fh.tools.allow_intrabc {
             lf.loop_filter_level[0] = 0;
             lf.loop_filter_level[1] = 0;
             lf.loop_filter_ref_deltas = [1, 0, 0, 0, -1, 0, -1, -1];
@@ -2649,21 +2853,21 @@ impl Parser {
         }
 
         lf.loop_filter_sharpness = r.0.read_bits::<u8>(3)?;
-        lf.loop_filter_delta_enabled = r.0.read_bit()?;
-        if lf.loop_filter_delta_enabled {
-            lf.loop_filter_delta_update = r.0.read_bit()?;
-            if lf.loop_filter_delta_update {
-                for i in 0..TOTAL_REFS_PER_FRAME {
+        lf.delta.loop_filter_delta_enabled = r.0.read_bit()?;
+        if lf.delta.loop_filter_delta_enabled {
+            lf.delta.loop_filter_delta_update = r.0.read_bit()?;
+            if lf.delta.loop_filter_delta_update {
+                for delta in &mut lf.loop_filter_ref_deltas {
                     let update_ref_delta = r.0.read_bit()?;
                     if update_ref_delta {
-                        lf.loop_filter_ref_deltas[i] = r.read_su::<i8>(7)?;
+                        *delta = r.read_su::<i8>(7)?;
                     }
                 }
 
-                for i in 0..2 {
+                for delta in &mut lf.loop_filter_mode_deltas {
                     let update_mode_delta = r.0.read_bit()?;
                     if update_mode_delta {
-                        lf.loop_filter_mode_deltas[i] = r.read_su::<i8>(7)?;
+                        *delta = r.read_su::<i8>(7)?;
                     }
                 }
             }
@@ -2680,7 +2884,7 @@ impl Parser {
     ) -> Result<(), String> {
         let cdef = &mut fh.cdef_params;
 
-        if fh.coded_lossless || fh.allow_intrabc || !enable_cdef {
+        if fh.lossless.coded_lossless || fh.tools.allow_intrabc || !enable_cdef {
             cdef.bits = 0;
             cdef.y_pri_strength[0] = 0;
             cdef.y_sec_strength[0] = 0;
@@ -2726,7 +2930,7 @@ impl Parser {
         ];
         let lr = &mut fh.loop_restoration_params;
 
-        if fh.all_lossless || fh.allow_intrabc || !enable_restoration {
+        if fh.lossless.all_lossless || fh.tools.allow_intrabc || !enable_restoration {
             lr.frame_restoration_type[0] = FrameRestorationType::None;
             lr.frame_restoration_type[1] = FrameRestorationType::None;
             lr.frame_restoration_type[2] = FrameRestorationType::None;
@@ -2773,7 +2977,7 @@ impl Parser {
     }
 
     fn read_tx_mode(r: &mut Reader, fh: &mut FrameHeaderObu) -> Result<(), String> {
-        if fh.coded_lossless {
+        if fh.lossless.coded_lossless {
             fh.tx_mode = TxMode::Only4x4;
         } else {
             let tx_mode_select = r.0.read_bit()?;
@@ -2797,7 +3001,7 @@ impl Parser {
     ) -> Result<(), String> {
         let skip_mode_allowed;
 
-        if fh.frame_is_intra || !fh.reference_select || !enable_order_hint {
+        if fh.lossless.frame_is_intra || !fh.mode.reference_select || !enable_order_hint {
             skip_mode_allowed = false;
         } else {
             let mut forward_idx = -1;
@@ -2887,25 +3091,25 @@ impl Parser {
         }
 
         if skip_mode_allowed {
-            fh.skip_mode_present = r.0.read_bit()?;
+            fh.mode.skip_mode_present = r.0.read_bit()?;
         } else {
-            fh.skip_mode_present = false;
+            fh.mode.skip_mode_present = false;
         }
 
         Ok(())
     }
 
     fn parse_frame_reference_mode(r: &mut Reader, fh: &mut FrameHeaderObu) -> Result<(), String> {
-        if fh.frame_is_intra {
-            fh.reference_select = false;
+        if fh.lossless.frame_is_intra {
+            fh.mode.reference_select = false;
         } else {
-            fh.reference_select = r.0.read_bit()?;
+            fh.mode.reference_select = r.0.read_bit()?;
         }
         Ok(())
     }
 
     fn seg_feature_active_idx(seg: &SegmentationParams, idx: u32, feature: u32) -> bool {
-        seg.segmentation_enabled && seg.feature_enabled[idx as usize][feature as usize]
+        seg.map.segmentation_enabled && seg.feature_enabled[idx as usize][feature as usize]
     }
 
     fn get_qindex(fh: &FrameHeaderObu, ignore_deltaq: bool, segment_id: u32) -> i32 {
@@ -2972,14 +3176,8 @@ impl Parser {
         let delta =
             helpers::round2signed(delta0, WARP_PARAM_REDUCE_BITS)? << WARP_PARAM_REDUCE_BITS;
 
-        #[allow(clippy::needless_bool)]
-        let warp_valid = if 4 * alpha.abs() + 7 * beta.abs() >= (1 << WARPEDMODEL_PREC_BITS)
-            || 4 * gamma.abs() + 4 * delta.abs() >= (1 << WARPEDMODEL_PREC_BITS)
-        {
-            false
-        } else {
-            true
-        };
+        let warp_valid = 4 * alpha.abs() + 7 * beta.abs() < (1 << WARPEDMODEL_PREC_BITS)
+            && 4 * gamma.abs() + 4 * delta.abs() < (1 << WARPEDMODEL_PREC_BITS);
 
         Ok(warp_valid)
     }
@@ -3021,19 +3219,117 @@ impl Parser {
         Ok(())
     }
 
+    fn parse_global_motion_ref(
+        r: &mut Reader,
+        gm: &mut GlobalMotionParams,
+        prev_gm_params: &[[i32; 6]; NUM_REF_FRAMES],
+        ref_frame: usize,
+        allow_high_precision_mv: bool,
+    ) -> Result<(), String> {
+        let type_;
+        gm.is_global[ref_frame] = r.0.read_bit()?;
+        if gm.is_global[ref_frame] {
+            gm.is_rot_zoom[ref_frame] = r.0.read_bit()?;
+            if gm.is_rot_zoom[ref_frame] {
+                type_ = WarpModelType::RotZoom;
+            } else {
+                gm.is_translation[ref_frame] = r.0.read_bit()?;
+                if gm.is_translation[ref_frame] {
+                    type_ = WarpModelType::Translation;
+                } else {
+                    type_ = WarpModelType::Affine;
+                }
+            }
+        } else {
+            type_ = WarpModelType::Identity;
+        }
+
+        gm.gm_type[ref_frame] = type_;
+        if gm.gm_type[ref_frame] as u32 >= WarpModelType::RotZoom as u32 {
+            Self::read_global_param(
+                r,
+                type_,
+                ref_frame,
+                2,
+                allow_high_precision_mv,
+                prev_gm_params,
+                &mut gm.gm_params,
+            )?;
+
+            Self::read_global_param(
+                r,
+                type_,
+                ref_frame,
+                3,
+                allow_high_precision_mv,
+                prev_gm_params,
+                &mut gm.gm_params,
+            )?;
+
+            if type_ == WarpModelType::Affine {
+                Self::read_global_param(
+                    r,
+                    type_,
+                    ref_frame,
+                    4,
+                    allow_high_precision_mv,
+                    prev_gm_params,
+                    &mut gm.gm_params,
+                )?;
+
+                Self::read_global_param(
+                    r,
+                    type_,
+                    ref_frame,
+                    5,
+                    allow_high_precision_mv,
+                    prev_gm_params,
+                    &mut gm.gm_params,
+                )?;
+            } else {
+                gm.gm_params[ref_frame][4] = -gm.gm_params[ref_frame][3];
+                gm.gm_params[ref_frame][5] = gm.gm_params[ref_frame][2];
+            }
+        }
+
+        if gm.gm_type[ref_frame] as u32 >= WarpModelType::Translation as u32 {
+            Self::read_global_param(
+                r,
+                type_,
+                ref_frame,
+                0,
+                allow_high_precision_mv,
+                prev_gm_params,
+                &mut gm.gm_params,
+            )?;
+
+            Self::read_global_param(
+                r,
+                type_,
+                ref_frame,
+                1,
+                allow_high_precision_mv,
+                prev_gm_params,
+                &mut gm.gm_params,
+            )?;
+        }
+
+        gm.warp_valid[ref_frame] = Self::setup_shear(&gm.gm_params[ref_frame])?;
+        Ok(())
+    }
+
     fn parse_global_motion_params(
         &mut self,
         r: &mut Reader,
         fh: &mut FrameHeaderObu,
     ) -> Result<(), String> {
         let gm = &mut fh.global_motion_params;
-        let mut type_;
         let mut prev_gm_params: [[i32; 6]; NUM_REF_FRAMES] = Default::default();
 
         for ref_frame in ReferenceFrameType::Last as usize..=ReferenceFrameType::AltRef as usize {
             gm.gm_type[ref_frame] = WarpModelType::Identity;
-            for i in 0..6 {
-                gm.gm_params[ref_frame][i] = if i % 3 == 2 {
+            for (i, param) in gm.gm_params[ref_frame].iter_mut().enumerate() {
+                *param = if i % 3 == 2 {
                     1 << WARPEDMODEL_PREC_BITS
                 } else {
                     0
@@ -3042,7 +3338,7 @@ impl Parser {
             gm.warp_valid[ref_frame] = true;
         }
 
-        if fh.frame_is_intra {
+        if fh.lossless.frame_is_intra {
             return Ok(());
         }
 
@@ -3051,15 +3347,15 @@ impl Parser {
         // parameters.
         if fh.primary_ref_frame == PRIMARY_REF_NONE {
             // setup_past_independence()
-            #[allow(clippy::needless_range_loop)]
-            for ref_frame in ReferenceFrameType::Last as usize..ReferenceFrameType::AltRef as usize
+            for params in &mut prev_gm_params
+                [ReferenceFrameType::Last as usize..ReferenceFrameType::AltRef as usize]
             {
-                for i in 0..5 {
-                    prev_gm_params[ref_frame][i] = if i % 3 == 2 {
+                for (i, param) in params.iter_mut().take(5).enumerate() {
+                    *param = if i % 3 == 2 {
                         1 << WARPEDMODEL_PREC_BITS
                     } else {
                         0
-                    }
+                    };
                 }
             }
         } else {
@@ -3073,162 +3369,26 @@ impl Parser {
         }
 
         for ref_frame in ReferenceFrameType::Last as usize..=ReferenceFrameType::AltRef as usize {
-            gm.is_global[ref_frame] = r.0.read_bit()?;
-            if gm.is_global[ref_frame] {
-                gm.is_rot_zoom[ref_frame] = r.0.read_bit()?;
-                if gm.is_rot_zoom[ref_frame] {
-                    type_ = WarpModelType::RotZoom;
-                } else {
-                    gm.is_translation[ref_frame] = r.0.read_bit()?;
-                    if gm.is_translation[ref_frame] {
-                        type_ = WarpModelType::Translation;
-                    } else {
-                        type_ = WarpModelType::Affine;
-                    }
-                }
-            } else {
-                type_ = WarpModelType::Identity;
-            }
-
-            gm.gm_type[ref_frame] = type_;
-            if gm.gm_type[ref_frame] as u32 >= WarpModelType::RotZoom as u32 {
-                Self::read_global_param(
-                    r,
-                    type_,
-                    ref_frame,
-                    2,
-                    fh.allow_high_precision_mv,
-                    &prev_gm_params,
-                    &mut gm.gm_params,
-                )?;
-
-                Self::read_global_param(
-                    r,
-                    type_,
-                    ref_frame,
-                    3,
-                    fh.allow_high_precision_mv,
-                    &prev_gm_params,
-                    &mut gm.gm_params,
-                )?;
-
-                if type_ == WarpModelType::Affine {
-                    Self::read_global_param(
-                        r,
-                        type_,
-                        ref_frame,
-                        4,
-                        fh.allow_high_precision_mv,
-                        &prev_gm_params,
-                        &mut gm.gm_params,
-                    )?;
-
-                    Self::read_global_param(
-                        r,
-                        type_,
-                        ref_frame,
-                        5,
-                        fh.allow_high_precision_mv,
-                        &prev_gm_params,
-                        &mut gm.gm_params,
-                    )?;
-                } else {
-                    gm.gm_params[ref_frame][4] = -gm.gm_params[ref_frame][3];
-                    gm.gm_params[ref_frame][5] = gm.gm_params[ref_frame][2];
-                }
-            }
-
-            if gm.gm_type[ref_frame] as u32 >= WarpModelType::Translation as u32 {
-                Self::read_global_param(
-                    r,
-                    type_,
-                    ref_frame,
-                    0,
-                    fh.allow_high_precision_mv,
-                    &prev_gm_params,
-                    &mut gm.gm_params,
-                )?;
-
-                Self::read_global_param(
-                    r,
-                    type_,
-                    ref_frame,
-                    1,
-                    fh.allow_high_precision_mv,
-                    &prev_gm_params,
-                    &mut gm.gm_params,
-                )?;
-            }
-
-            gm.warp_valid[ref_frame] = Self::setup_shear(&gm.gm_params[ref_frame])?;
+            Self::parse_global_motion_ref(
+                r,
+                gm,
+                &prev_gm_params,
+                ref_frame,
+                fh.motion.allow_high_precision_mv,
+            )?;
         }
 
         Ok(())
     }
 
-    fn parse_film_grain_parameters(
-        &self,
+    fn parse_film_grain_chroma_points(
         r: &mut Reader,
-        fh: &mut FrameHeaderObu,
-        film_grain_params_present: bool,
+        fg: &mut FilmGrainParams,
         mono_chrome: bool,
         subsampling: Subsampling,
     ) -> Result<(), String> {
-        let fg = &mut fh.film_grain_params;
-
-        if !film_grain_params_present || (!fh.show_frame && !fh.showable_frame) {
-            *fg = FilmGrainParams::default();
-            return Ok(());
-        }
-
-        fg.apply_grain = r.0.read_bit()?;
-        if !fg.apply_grain {
-            *fg = FilmGrainParams::default();
-            return Ok(());
-        }
-
-        fg.grain_seed = r.0.read_bits::<u16>(16)?;
-        if fh.frame_type == FrameType::Inter {
-            fg.update_grain = r.0.read_bit()?;
-        } else {
-            fg.update_grain = true;
-        }
-
-        if !fg.update_grain {
-            fg.ref_idx = r.0.read_bits::<u8>(3)?;
-            let temp_grain_seed = fg.grain_seed;
-
-            if !fh.ref_frame_idx.contains(&fg.ref_idx) {
-                return Err("Invalid ref_idx".into());
-            }
-
-            // load_grain_params()
-            *fg = self.ref_info[fg.ref_idx as usize].film_grain_params.clone();
-
-            fg.grain_seed = temp_grain_seed;
-
-            return Ok(());
-        }
-
-        fg.num_y_points = r.0.read_bits::<u8>(4)?;
-        fg.point_y_value
-            .iter_mut()
-            .zip(fg.point_y_scaling.iter_mut())
-            .take(fg.num_y_points as usize)
-            .try_for_each(|(point_y_value, point_y_scaling)| {
-                *point_y_value = r.0.read_bits::<u8>(8)?;
-                *point_y_scaling = r.0.read_bits::<u8>(8)?;
-                Ok::<_, String>(())
-            })?;
-
-        if mono_chrome {
-            fg.chroma_scaling_from_luma = false;
-        } else {
-            fg.chroma_scaling_from_luma = r.0.read_bit()?;
-        }
-
         if mono_chrome
-            || fg.chroma_scaling_from_luma
+            || fg.synthesis.chroma_scaling_from_luma
             || (subsampling.x && subsampling.y && fg.num_y_points == 0)
         {
             fg.num_cb_points = 0;
@@ -3262,31 +3422,113 @@ impl Parser {
                 fg.point_cr_scaling[i] = r.0.read_bits::<u8>(8)?;
             }
         }
+        Ok(())
+    }
 
+    fn parse_film_grain_ar_coeffs(r: &mut Reader, fg: &mut FilmGrainParams) -> Result<(), String> {
         fg.grain_scaling_minus_8 = r.0.read_bits::<u8>(2)?;
         fg.ar_coeff_lag = r.0.read_bits::<u32>(2)?;
 
         let num_pos_luma = 2 * fg.ar_coeff_lag * (fg.ar_coeff_lag + 1);
         let num_pos_chroma = if fg.num_y_points > 0 {
-            for i in 0..num_pos_luma as usize {
-                fg.ar_coeffs_y_plus_128[i] = r.0.read_bits::<u8>(8)?;
+            for coeff in fg
+                .ar_coeffs_y_plus_128
+                .iter_mut()
+                .take(num_pos_luma as usize)
+            {
+                *coeff = r.0.read_bits::<u8>(8)?;
             }
             num_pos_luma + 1
         } else {
             num_pos_luma
         };
 
-        if fg.chroma_scaling_from_luma || fg.num_cb_points > 0 {
-            for i in 0..num_pos_chroma as usize {
-                fg.ar_coeffs_cb_plus_128[i] = r.0.read_bits::<u8>(8)?;
+        if fg.synthesis.chroma_scaling_from_luma || fg.num_cb_points > 0 {
+            for coeff in fg
+                .ar_coeffs_cb_plus_128
+                .iter_mut()
+                .take(num_pos_chroma as usize)
+            {
+                *coeff = r.0.read_bits::<u8>(8)?;
             }
         }
 
-        if fg.chroma_scaling_from_luma || fg.num_cr_points > 0 {
-            for i in 0..num_pos_chroma as usize {
-                fg.ar_coeffs_cr_plus_128[i] = r.0.read_bits::<u8>(8)?;
+        if fg.synthesis.chroma_scaling_from_luma || fg.num_cr_points > 0 {
+            for coeff in fg
+                .ar_coeffs_cr_plus_128
+                .iter_mut()
+                .take(num_pos_chroma as usize)
+            {
+                *coeff = r.0.read_bits::<u8>(8)?;
             }
         }
+        Ok(())
+    }
+
+    fn parse_film_grain_parameters(
+        &self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        film_grain_params_present: bool,
+        mono_chrome: bool,
+        subsampling: Subsampling,
+    ) -> Result<(), String> {
+        let fg = &mut fh.film_grain_params;
+
+        if !film_grain_params_present || (!fh.show.show_frame && !fh.show.showable_frame) {
+            *fg = FilmGrainParams::default();
+            return Ok(());
+        }
+
+        fg.apply.apply_grain = r.0.read_bit()?;
+        if !fg.apply.apply_grain {
+            *fg = FilmGrainParams::default();
+            return Ok(());
+        }
+
+        fg.grain_seed = r.0.read_bits::<u16>(16)?;
+        if fh.frame_type == FrameType::Inter {
+            fg.apply.update_grain = r.0.read_bit()?;
+        } else {
+            fg.apply.update_grain = true;
+        }
+
+        if !fg.apply.update_grain {
+            fg.ref_idx = r.0.read_bits::<u8>(3)?;
+            let temp_grain_seed = fg.grain_seed;
+
+            if !fh.ref_frame_idx.contains(&fg.ref_idx) {
+                return Err("Invalid ref_idx".into());
+            }
+
+            // load_grain_params()
+            *fg = self.ref_info[fg.ref_idx as usize].film_grain_params.clone();
+
+            fg.grain_seed = temp_grain_seed;
+
+            return Ok(());
+        }
+
+        fg.num_y_points = r.0.read_bits::<u8>(4)?;
+        fg.point_y_value
+            .iter_mut()
+            .zip(fg.point_y_scaling.iter_mut())
+            .take(fg.num_y_points as usize)
+            .try_for_each(|(point_y_value, point_y_scaling)| {
+                *point_y_value = r.0.read_bits::<u8>(8)?;
+                *point_y_scaling = r.0.read_bits::<u8>(8)?;
+                Ok::<_, String>(())
+            })?;
+
+        if mono_chrome {
+            fg.synthesis.chroma_scaling_from_luma = false;
+        } else {
+            fg.synthesis.chroma_scaling_from_luma = r.0.read_bit()?;
+        }
+
+        Self::parse_film_grain_chroma_points(r, fg, mono_chrome, subsampling)?;
+
+        Self::parse_film_grain_ar_coeffs(r, fg)?;
 
         fg.ar_coeff_shift_minus_6 = r.0.read_bits::<u8>(2)?;
         fg.grain_scale_shift = r.0.read_bits::<u8>(2)?;
@@ -3303,8 +3545,8 @@ impl Parser {
             fg.cr_offset = r.0.read_bits::<u16>(9)?;
         }
 
-        fg.overlap_flag = r.0.read_bit()?;
-        fg.clip_to_restricted_range = r.0.read_bit()?;
+        fg.synthesis.overlap_flag = r.0.read_bit()?;
+        fg.synthesis.clip_to_restricted_range = r.0.read_bit()?;
 
         Ok(())
     }
@@ -3317,207 +3559,171 @@ impl Parser {
         Ok(seq)
     }
 
-    fn parse_uncompressed_frame_header(&mut self, obu: &Obu) -> Result<FrameHeaderObu, String> {
-        const ALL_FRAMES: u32 = (1 << NUM_REF_FRAMES) - 1;
-        let mut r = Reader::new(obu.as_ref());
-
-        let mut fh = FrameHeaderObu {
-            obu_header: obu.header.clone(),
-            ..Default::default()
-        };
-
-        // Section 6.8.1: It is a requirement of bitstream conformance that a
-        // sequence header OBU has been received before a frame header OBU.
-        let &SequenceHeaderObu {
-            operating_points_cnt_minus_1,
-            seq_force_integer_mv,
-            additional_frame_id_length_minus_1,
-            delta_frame_id_length_minus_2,
-            decoder_model_info_present_flag,
-            reduced_still_picture_header,
-            frame_id_numbers_present_flag,
-            use_128x128_superblock,
-            enable_order_hint,
-            seq_force_screen_content_tools,
-            order_hint_bits,
-            enable_cdef,
-            enable_restoration,
-            enable_warped_motion,
-            color_config:
-                ColorConfig {
-                    subsampling_x,
-                    subsampling_y,
-                    separate_uv_delta_q,
-                    mono_chrome,
-                    ..
-                },
-            timing_info:
-                TimingInfo {
-                    equal_picture_interval,
-                    ..
-                },
-            decoder_model_info:
-                DecoderModelInfo {
-                    frame_presentation_time_length_minus_1,
-                    buffer_removal_time_length_minus_1,
-                    ..
-                },
-            num_planes,
-            film_grain_params_present,
-            ..
-        } = self.sequence()?;
-
-        let mut id_len = 0;
-
-        if frame_id_numbers_present_flag {
-            id_len = additional_frame_id_length_minus_1 + delta_frame_id_length_minus_2 + 3;
-        }
-
-        if reduced_still_picture_header {
-            fh.show_existing_frame = false;
-            fh.frame_type = FrameType::Key;
-            fh.frame_is_intra = true;
-            fh.show_frame = true;
-            fh.showable_frame = false;
+    fn frame_id_len(seq: &SequenceHeaderObu) -> u32 {
+        if seq.sequence.frame_id_numbers_present_flag {
+            seq.additional_frame_id_length_minus_1 + seq.delta_frame_id_length_minus_2 + 3
         } else {
-            fh.show_existing_frame = r.0.read_bit()?;
-            if matches!(obu.header.obu_type, ObuType::Frame) && fh.show_existing_frame {
-                return Err("If obu_type is equal to OBU_FRAME, it is a requirement of bitstream conformance that show_existing_frame is equal to 0.".into());
+            0
+        }
+    }
+
+    fn parse_show_existing_frame(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+        obu_type: ObuType,
+    ) -> Result<bool, String> {
+        if !fh.show.show_existing_frame {
+            return Ok(false);
+        }
+        let id_len = Self::frame_id_len(seq);
+
+        fh.frame_to_show_map_idx = r.0.read_bits::<u8>(3)?;
+
+        if seq.timing.decoder_model_info_present_flag && !seq.timing_info.equal_picture_interval {
+            fh.frame_presentation_time = r.0.read_bits::<u32>(
+                seq.decoder_model_info
+                    .frame_presentation_time_length_minus_1 as usize
+                    + 1,
+            )?;
+        }
+
+        let ref_frame = &self.ref_info[fh.frame_to_show_map_idx as usize];
+
+        fh.refresh_frame_flags = 0;
+        if seq.sequence.frame_id_numbers_present_flag {
+            if id_len == 0 {
+                return Err(format!("Invalid id_len {id_len}"));
             }
-            if fh.show_existing_frame {
-                fh.frame_to_show_map_idx = r.0.read_bits::<u8>(3)?;
-
-                if decoder_model_info_present_flag && !equal_picture_interval {
-                    fh.frame_presentation_time =
-                        r.0.read_bits::<u32>(frame_presentation_time_length_minus_1 as usize + 1)?;
-                }
-
-                let ref_frame = &self.ref_info[fh.frame_to_show_map_idx as usize];
-
-                fh.refresh_frame_flags = 0;
-                if frame_id_numbers_present_flag {
-                    if id_len == 0 {
-                        return Err(format!("Invalid id_len {id_len}"));
-                    }
-                    fh.display_frame_id = r.0.read_bits::<u32>(id_len.try_into().unwrap())?;
-                    if ref_frame.display_frame_id != fh.display_frame_id || !ref_frame.ref_valid {
-                        return Err("Invalid display_frame_id".into());
-                    }
-                }
-
-                if !ref_frame.showable_frame {
-                    return Err("Invalid bitstream: can't show this past frame".into());
-                }
-
-                // In decode_frame_wrapup():
-                //
-                // Otherwise (show_existing_frame is equal to 1), if frame_type
-                // is equal to KEY_FRAME, the reference frame loading process as
-                // specified in section 7.21 is invoked (this process loads
-                // frame state from the reference frames into the current frame
-                // state variables)
-                //
-                // The following ordered steps now apply:
-                //
-                // 1. The reference frame update process as specified in section
-                // 7.20 is invoked (this process saves the current frame state
-                // into the reference frames).
-                //
-                // 2. If show_frame is equal to 1 or show_existing_frame is
-                // equal to 1, the output process as specified in section 7.18
-                // is invoked (this will output the current frame or a saved
-                // frame).
-                //
-                // We implement 1. here while 2. is left to the actual decoder
-                self.load_reference_frame(&mut fh)?;
-                if fh.frame_type == FrameType::Key {
-                    fh.refresh_frame_flags = ALL_FRAMES;
-                }
-
-                if film_grain_params_present {
-                    // load_grain_params()
-                    fh.film_grain_params = self.ref_info[fh.frame_to_show_map_idx as usize]
-                        .film_grain_params
-                        .clone();
-                }
-
-                // See 5.10.
-                if matches!(obu.header.obu_type, ObuType::Frame) {
-                    r.byte_alignment()?;
-                }
-
-                fh.header_bytes = usize::try_from(r.0.position() / 8).unwrap();
-                return Ok(fh);
-            }
-
-            fh.frame_type = FrameType::try_from(r.0.read_bits::<u32>(2)?)?;
-            fh.frame_is_intra = matches!(fh.frame_type, FrameType::IntraOnly | FrameType::Key);
-
-            fh.show_frame = r.0.read_bit()?;
-
-            if fh.show_frame && decoder_model_info_present_flag && equal_picture_interval {
-                fh.frame_presentation_time =
-                    r.0.read_bits::<u32>(frame_presentation_time_length_minus_1 as usize + 1)?;
-            }
-
-            if fh.show_frame {
-                fh.showable_frame = !matches!(fh.frame_type, FrameType::Key);
-            } else {
-                fh.showable_frame = r.0.read_bit()?;
-            }
-
-            if fh.frame_type == FrameType::Switch
-                || (fh.frame_type == FrameType::Key && fh.show_frame)
-            {
-                fh.error_resilient_mode = true;
-            } else {
-                fh.error_resilient_mode = r.0.read_bit()?;
+            fh.display_frame_id = r.0.read_bits::<u32>(id_len.try_into().unwrap())?;
+            if ref_frame.display_frame_id != fh.display_frame_id || !ref_frame.flags.ref_valid {
+                return Err("Invalid display_frame_id".into());
             }
         }
 
-        if fh.frame_type == FrameType::Key && fh.show_frame {
-            for i in 0..NUM_REF_FRAMES {
-                self.ref_info[i].ref_valid = false;
-                self.ref_info[i].ref_order_hint = 0;
-            }
-            for i in 0..REFS_PER_FRAME {
-                fh.order_hints[ReferenceFrameType::Last as usize + i] = 0;
-            }
+        if !ref_frame.flags.showable_frame {
+            return Err("Invalid bitstream: can't show this past frame".into());
         }
 
-        fh.disable_cdf_update = r.0.read_bit()?;
-        if seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
+        // In decode_frame_wrapup():
+        //
+        // Otherwise (show_existing_frame is equal to 1), if frame_type
+        // is equal to KEY_FRAME, the reference frame loading process as
+        // specified in section 7.21 is invoked (this process loads
+        // frame state from the reference frames into the current frame
+        // state variables)
+        //
+        // The following ordered steps now apply:
+        //
+        // 1. The reference frame update process as specified in section
+        // 7.20 is invoked (this process saves the current frame state
+        // into the reference frames).
+        //
+        // 2. If show_frame is equal to 1 or show_existing_frame is
+        // equal to 1, the output process as specified in section 7.18
+        // is invoked (this will output the current frame or a saved
+        // frame).
+        //
+        // We implement 1. here while 2. is left to the actual decoder
+        self.load_reference_frame(fh)?;
+        if fh.frame_type == FrameType::Key {
+            fh.refresh_frame_flags = ALL_FRAMES;
+        }
+
+        if seq.post.film_grain_params_present {
+            // load_grain_params()
+            fh.film_grain_params = self.ref_info[fh.frame_to_show_map_idx as usize]
+                .film_grain_params
+                .clone();
+        }
+
+        // See 5.10.
+        if matches!(obu_type, ObuType::Frame) {
+            r.byte_alignment()?;
+        }
+
+        fh.header_bytes = usize::try_from(r.0.position() / 8).unwrap();
+        Ok(true)
+    }
+
+    fn parse_frame_type_signaling(
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        fh.frame_type = FrameType::try_from(r.0.read_bits::<u32>(2)?)?;
+        fh.lossless.frame_is_intra = matches!(fh.frame_type, FrameType::IntraOnly | FrameType::Key);
+
+        fh.show.show_frame = r.0.read_bit()?;
+
+        if fh.show.show_frame
+            && seq.timing.decoder_model_info_present_flag
+            && seq.timing_info.equal_picture_interval
+        {
+            fh.frame_presentation_time = r.0.read_bits::<u32>(
+                seq.decoder_model_info
+                    .frame_presentation_time_length_minus_1 as usize
+                    + 1,
+            )?;
+        }
+
+        if fh.show.show_frame {
+            fh.show.showable_frame = !matches!(fh.frame_type, FrameType::Key);
+        } else {
+            fh.show.showable_frame = r.0.read_bit()?;
+        }
+
+        if fh.frame_type == FrameType::Switch
+            || (fh.frame_type == FrameType::Key && fh.show.show_frame)
+        {
+            fh.resilience.error_resilient_mode = true;
+        } else {
+            fh.resilience.error_resilient_mode = r.0.read_bit()?;
+        }
+        Ok(())
+    }
+
+    fn parse_cdf_and_frame_ids(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        let id_len = Self::frame_id_len(seq);
+        fh.resilience.disable_cdf_update = r.0.read_bit()?;
+        if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
             fh.allow_screen_content_tools = u32::from(r.0.read_bit()?);
         } else {
-            fh.allow_screen_content_tools = seq_force_screen_content_tools;
+            fh.allow_screen_content_tools = seq.seq_force_screen_content_tools;
         }
 
         if fh.allow_screen_content_tools > 0 {
-            if seq_force_integer_mv == SELECT_INTEGER_MV {
+            if seq.seq_force_integer_mv == SELECT_INTEGER_MV {
                 fh.force_integer_mv = u32::from(r.0.read_bit()?);
             } else {
-                fh.force_integer_mv = seq_force_integer_mv;
+                fh.force_integer_mv = seq.seq_force_integer_mv;
             }
         } else {
             fh.force_integer_mv = 0;
         }
 
-        if fh.frame_is_intra {
+        if fh.lossless.frame_is_intra {
             fh.force_integer_mv = 1;
         }
 
-        if frame_id_numbers_present_flag {
+        if seq.sequence.frame_id_numbers_present_flag {
             self.prev_frame_id = self.current_frame_id;
             self.current_frame_id = r.0.read_bits::<u32>(id_len.try_into().unwrap())?;
             fh.current_frame_id = self.current_frame_id;
 
             /* conformance checking, as per aom */
             let have_prev_frame_id =
-                !(self.is_first_frame || fh.frame_type == FrameType::Key && fh.show_frame);
+                !(self.is_first_frame || fh.frame_type == FrameType::Key && fh.show.show_frame);
 
             if have_prev_frame_id {
                 let frame_id_length =
-                    additional_frame_id_length_minus_1 + delta_frame_id_length_minus_2 + 3;
+                    seq.additional_frame_id_length_minus_1 + seq.delta_frame_id_length_minus_2 + 3;
 
                 let diff_frame_id = if self.current_frame_id > self.prev_frame_id {
                     self.current_frame_id - self.prev_frame_id
@@ -3539,7 +3745,7 @@ impl Parser {
             }
 
             /* mark_ref_frames (idLen) */
-            let diff_len = delta_frame_id_length_minus_2 + 2;
+            let diff_len = seq.delta_frame_id_length_minus_2 + 2;
             let shifted_diff_len = 1 << diff_len;
             let shifted_id_len = 1 << id_len;
 
@@ -3549,13 +3755,13 @@ impl Parser {
                         || self.ref_info[i].ref_frame_id
                             < (self.current_frame_id - shifted_diff_len)
                     {
-                        self.ref_info[i].ref_valid = false;
+                        self.ref_info[i].flags.ref_valid = false;
                     }
                 } else if self.ref_info[i].ref_frame_id > self.current_frame_id
                     && self.ref_info[i].ref_frame_id
                         < shifted_id_len + self.current_frame_id - shifted_diff_len
                 {
-                    self.ref_info[i].ref_valid = false;
+                    self.ref_info[i].flags.ref_valid = false;
                 }
             }
         } else {
@@ -3563,48 +3769,63 @@ impl Parser {
             self.prev_frame_id = self.current_frame_id;
             fh.current_frame_id = self.current_frame_id;
         }
+        Ok(())
+    }
 
+    fn parse_order_hints_and_refresh(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
         if fh.frame_type == FrameType::Switch {
-            fh.frame_size_override_flag = true;
-        } else if reduced_still_picture_header {
-            fh.frame_size_override_flag = false;
+            fh.size.frame_size_override_flag = true;
+        } else if seq.sequence.reduced_still_picture_header {
+            fh.size.frame_size_override_flag = false;
         } else {
-            fh.frame_size_override_flag = r.0.read_bit()?;
+            fh.size.frame_size_override_flag = r.0.read_bit()?;
         }
 
-        fh.order_hint = r.0.read_bits::<u32>(order_hint_bits.try_into().unwrap())?;
+        fh.order_hint =
+            r.0.read_bits::<u32>(seq.order_hint_bits.try_into().unwrap())?;
 
-        if fh.frame_is_intra || fh.error_resilient_mode {
+        if fh.lossless.frame_is_intra || fh.resilience.error_resilient_mode {
             fh.primary_ref_frame = PRIMARY_REF_NONE;
         } else {
             fh.primary_ref_frame = r.0.read_bits::<u32>(3)?;
         }
 
         let operating_points = &self.sequence()?.operating_points;
-        if decoder_model_info_present_flag {
-            fh.buffer_removal_time_present_flag = r.0.read_bit()?;
-            if fh.buffer_removal_time_present_flag {
-                #[allow(clippy::needless_range_loop)]
-                for op_num in 0..=operating_points_cnt_minus_1 as usize {
-                    if operating_points[op_num].decoder_model_present_for_this_op {
-                        let op_pt_idc = operating_points[op_num].idc;
-                        let in_temporal_layer = (op_pt_idc >> fh.obu_header.temporal_id) & 1 != 0;
-                        let in_spatial_layer =
-                            (op_pt_idc >> (fh.obu_header.spatial_id + 8)) & 1 != 0;
+        if seq.timing.decoder_model_info_present_flag {
+            fh.signaling.buffer_removal_time_present_flag = r.0.read_bit()?;
+            if fh.signaling.buffer_removal_time_present_flag {
+                fh.buffer_removal_time
+                    .resize(seq.operating_points_cnt_minus_1 as usize + 1, 0);
+                let (temporal_id, spatial_id) =
+                    (fh.obu_header.temporal_id, fh.obu_header.spatial_id);
+                for (point, removal) in operating_points
+                    .iter()
+                    .zip(fh.buffer_removal_time.iter_mut())
+                {
+                    if point.decoder_model_present_for_this_op {
+                        let op_pt_idc = point.idc;
+                        let in_temporal_layer = (op_pt_idc >> temporal_id) & 1 != 0;
+                        let in_spatial_layer = (op_pt_idc >> (spatial_id + 8)) & 1 != 0;
 
                         if op_pt_idc == 0 || (in_temporal_layer && in_spatial_layer) {
-                            let n = buffer_removal_time_length_minus_1 + 1;
-                            fh.buffer_removal_time[op_num] = r.0.read_bits::<u32>(n as usize)?;
+                            let n = seq.decoder_model_info.buffer_removal_time_length_minus_1 + 1;
+                            *removal = r.0.read_bits::<u32>(n as usize)?;
                         }
                     }
                 }
             }
         }
 
-        fh.allow_high_precision_mv = false;
-        fh.use_ref_frame_mvs = false;
-        fh.allow_intrabc = false;
-        if fh.frame_type == FrameType::Switch || (fh.frame_type == FrameType::Key && fh.show_frame)
+        fh.motion.allow_high_precision_mv = false;
+        fh.motion.use_ref_frame_mvs = false;
+        fh.tools.allow_intrabc = false;
+        if fh.frame_type == FrameType::Switch
+            || (fh.frame_type == FrameType::Key && fh.show.show_frame)
         {
             fh.refresh_frame_flags = ALL_FRAMES;
         } else {
@@ -3612,131 +3833,152 @@ impl Parser {
         }
 
         /* equivalent boolean expression */
-        if (!fh.frame_is_intra || fh.refresh_frame_flags != ALL_FRAMES)
-            && fh.error_resilient_mode
-            && enable_order_hint
+        if (!fh.lossless.frame_is_intra || fh.refresh_frame_flags != ALL_FRAMES)
+            && fh.resilience.error_resilient_mode
+            && seq.inter.enable_order_hint
         {
             for i in 0..NUM_REF_FRAMES {
-                fh.ref_order_hint[i] = r.0.read_bits::<u32>(order_hint_bits.try_into().unwrap())?;
+                fh.ref_order_hint[i] =
+                    r.0.read_bits::<u32>(seq.order_hint_bits.try_into().unwrap())?;
                 if fh.ref_order_hint[i] != self.ref_info[i].ref_order_hint {
-                    self.ref_info[i].ref_valid = false;
+                    self.ref_info[i].flags.ref_valid = false;
                 }
             }
         }
+        Ok(())
+    }
 
-        if fh.frame_is_intra {
-            self.parse_frame_size(&mut fh, &mut r)?;
-            Self::parse_render_size(&mut fh, &mut r)?;
-            if fh.allow_screen_content_tools > 0 && fh.upscaled_width == fh.frame_width {
-                fh.allow_intrabc = r.0.read_bit()?;
+    fn parse_inter_refs(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        let id_len = Self::frame_id_len(seq);
+        if seq.inter.enable_order_hint {
+            fh.signaling.frame_refs_short_signaling = r.0.read_bit()?;
+            if fh.signaling.frame_refs_short_signaling {
+                fh.last_frame_idx = r.0.read_bits::<u8>(3)?;
+                fh.gold_frame_idx = r.0.read_bits::<u8>(3)?;
+                let ref_order_hints: [u32; NUM_REF_FRAMES] =
+                    std::array::from_fn(|i| self.ref_info[i].ref_order_hint);
+                self.set_frame_refs(fh, &ref_order_hints)?;
             }
         } else {
-            if enable_order_hint {
-                fh.frame_refs_short_signaling = r.0.read_bit()?;
-                if fh.frame_refs_short_signaling {
-                    fh.last_frame_idx = r.0.read_bits::<u8>(3)?;
-                    fh.gold_frame_idx = r.0.read_bits::<u8>(3)?;
-                    let ref_order_hints: [u32; NUM_REF_FRAMES] =
-                        std::array::from_fn(|i| self.ref_info[i].ref_order_hint);
-                    self.set_frame_refs(&mut fh, &ref_order_hints)?;
+            fh.signaling.frame_refs_short_signaling = false;
+        }
+
+        let mut expected_frame_id = [0; REFS_PER_FRAME];
+        let short_signaling = fh.signaling.frame_refs_short_signaling;
+        for (ref_idx, expected) in fh
+            .ref_frame_idx
+            .iter_mut()
+            .zip(expected_frame_id.iter_mut())
+        {
+            if !short_signaling {
+                *ref_idx = r.0.read_bits::<u32>(3)?.try_into().unwrap();
+            }
+
+            if seq.sequence.frame_id_numbers_present_flag {
+                /* DeltaFrameId */
+                let delta_frame_id =
+                    r.0.read_bits::<u32>(seq.delta_frame_id_length_minus_2 as usize + 2)? + 1;
+
+                if id_len == 0 {
+                    return Err(format!("Invalid id_len {id_len}"));
                 }
-            } else {
-                fh.frame_refs_short_signaling = false;
-            }
 
-            let mut expected_frame_id = [0; REFS_PER_FRAME];
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..REFS_PER_FRAME {
-                if !fh.frame_refs_short_signaling {
-                    fh.ref_frame_idx[i] = r.0.read_bits::<u32>(3)?.try_into().unwrap();
-                }
+                let shifted_id_len = 1 << id_len;
 
-                if frame_id_numbers_present_flag {
-                    /* DeltaFrameId */
-                    let delta_frame_id =
-                        r.0.read_bits::<u32>(delta_frame_id_length_minus_2 as usize + 2)? + 1;
+                *expected =
+                    (self.current_frame_id + shifted_id_len - delta_frame_id) % shifted_id_len;
 
-                    if id_len == 0 {
-                        return Err(format!("Invalid id_len {id_len}"));
-                    }
+                let actual_frame_id = self.ref_info[*ref_idx as usize].ref_frame_id;
 
-                    let shifted_id_len = 1 << id_len;
-
-                    expected_frame_id[i] =
-                        (self.current_frame_id + shifted_id_len - delta_frame_id) % shifted_id_len;
-
-                    let actual_frame_id = self.ref_info[fh.ref_frame_idx[i] as usize].ref_frame_id;
-
-                    if expected_frame_id[i] != actual_frame_id {
-                        return Err(format!(
-                            "Invalid frame id, expected {} got {}",
-                            expected_frame_id[i], actual_frame_id
-                        ));
-                    }
-                }
-            }
-
-            if fh.frame_size_override_flag && !fh.error_resilient_mode {
-                self.frame_size_with_refs(&mut fh, &mut r)?;
-            } else {
-                self.parse_frame_size(&mut fh, &mut r)?;
-                Self::parse_render_size(&mut fh, &mut r)?;
-            }
-
-            if fh.force_integer_mv > 0 {
-                fh.allow_high_precision_mv = false;
-            } else {
-                fh.allow_high_precision_mv = r.0.read_bit()?;
-            }
-
-            /* read_interpolation_filter */
-            fh.is_filter_switchable = r.0.read_bit()?;
-            if fh.is_filter_switchable {
-                fh.interpolation_filter = InterpolationFilter::Switchable;
-            } else {
-                fh.interpolation_filter = InterpolationFilter::try_from(r.0.read_bits::<u32>(2)?)?;
-            }
-
-            fh.is_motion_mode_switchable = r.0.read_bit()?;
-
-            if fh.error_resilient_mode || !self.sequence()?.enable_ref_frame_mvs {
-                fh.use_ref_frame_mvs = false;
-            } else {
-                fh.use_ref_frame_mvs = r.0.read_bit()?;
-            }
-
-            for i in 0..REFS_PER_FRAME {
-                let ref_frame = ReferenceFrameType::Last as usize + i;
-                let hint = self.ref_info[fh.ref_frame_idx[i] as usize].ref_order_hint;
-                fh.order_hints[ref_frame] = hint;
-
-                if enable_order_hint {
-                    fh.ref_frame_sign_bias[i] = helpers::get_relative_dist(
-                        enable_order_hint,
-                        order_hint_bits,
-                        hint.try_into().unwrap(),
-                        fh.order_hint.try_into().unwrap(),
-                    ) > 0;
-                } else {
-                    fh.ref_frame_sign_bias[i] = false;
+                if *expected != actual_frame_id {
+                    return Err(format!(
+                        "Invalid frame id, expected {expected} got {actual_frame_id}"
+                    ));
                 }
             }
         }
+        Ok(())
+    }
 
-        if reduced_still_picture_header || fh.disable_cdf_update {
-            fh.disable_frame_end_update_cdf = true;
+    fn parse_inter_tail(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        if fh.size.frame_size_override_flag && !fh.resilience.error_resilient_mode {
+            self.frame_size_with_refs(fh, r)?;
         } else {
-            fh.disable_frame_end_update_cdf = r.0.read_bit()?;
+            self.parse_frame_size(fh, r)?;
+            Self::parse_render_size(fh, r)?;
+        }
+
+        if fh.force_integer_mv > 0 {
+            fh.motion.allow_high_precision_mv = false;
+        } else {
+            fh.motion.allow_high_precision_mv = r.0.read_bit()?;
+        }
+
+        /* read_interpolation_filter */
+        fh.tools.is_filter_switchable = r.0.read_bit()?;
+        if fh.tools.is_filter_switchable {
+            fh.interpolation_filter = InterpolationFilter::Switchable;
+        } else {
+            fh.interpolation_filter = InterpolationFilter::try_from(r.0.read_bits::<u32>(2)?)?;
+        }
+
+        fh.motion.is_motion_mode_switchable = r.0.read_bit()?;
+
+        if fh.resilience.error_resilient_mode || !self.sequence()?.motion.enable_ref_frame_mvs {
+            fh.motion.use_ref_frame_mvs = false;
+        } else {
+            fh.motion.use_ref_frame_mvs = r.0.read_bit()?;
+        }
+
+        for i in 0..REFS_PER_FRAME {
+            let ref_frame = ReferenceFrameType::Last as usize + i;
+            let hint = self.ref_info[fh.ref_frame_idx[i] as usize].ref_order_hint;
+            fh.order_hints[ref_frame] = hint;
+
+            if seq.inter.enable_order_hint {
+                fh.ref_frame_sign_bias[i] = helpers::get_relative_dist(
+                    seq.inter.enable_order_hint,
+                    seq.order_hint_bits,
+                    hint.try_into().unwrap(),
+                    fh.order_hint.try_into().unwrap(),
+                ) > 0;
+            } else {
+                fh.ref_frame_sign_bias[i] = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_cdf_end_and_tiles(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        if seq.sequence.reduced_still_picture_header || fh.resilience.disable_cdf_update {
+            fh.resilience.disable_frame_end_update_cdf = true;
+        } else {
+            fh.resilience.disable_frame_end_update_cdf = r.0.read_bit()?;
         }
 
         if fh.primary_ref_frame == PRIMARY_REF_NONE {
-            Self::setup_past_independence(&mut fh);
+            Self::setup_past_independence(fh);
         } else {
             /* load from the past reference */
             let prev_frame =
                 &self.ref_info[fh.ref_frame_idx[fh.primary_ref_frame as usize] as usize];
 
-            if !prev_frame.ref_valid {
+            if !prev_frame.flags.ref_valid {
                 return Err("Reference is invalid".into());
             }
 
@@ -3752,30 +3994,39 @@ impl Parser {
         }
 
         // TODO: we can live without this for now.
-        // if fh.use_ref_frame_mvs {
+        // if fh.motion.use_ref_frame_mvs {
         //     // motion_field_estimators()
         // }
 
-        self.parse_tile_info(&mut r, &mut fh.tile_info)?;
+        self.parse_tile_info(r, &mut fh.tile_info)?;
+        Ok(())
+    }
+
+    fn parse_frame_quant(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
         Self::parse_quantization_params(
-            &mut r,
+            r,
             &mut fh.quantization_params,
-            num_planes,
-            separate_uv_delta_q,
+            seq.num_planes,
+            seq.color_config.quant.separate_uv_delta_q,
         )?;
-        self.parse_segmentation_params(&mut r, &mut fh)?;
-        Self::parse_delta_q_params(&mut r, &mut fh.quantization_params)?;
+        self.parse_segmentation_params(r, fh)?;
+        Self::parse_delta_q_params(r, &mut fh.quantization_params)?;
         Self::parse_delta_lf_params(
-            &mut r,
+            r,
             &mut fh.loop_filter_params,
             fh.quantization_params.delta_q_present,
-            fh.allow_intrabc,
+            fh.tools.allow_intrabc,
         )?;
 
-        fh.coded_lossless = true;
+        fh.lossless.coded_lossless = true;
         for segment_id in 0..MAX_SEGMENTS {
             let q_index = Self::get_qindex(
-                &fh,
+                fh,
                 true,
                 u32::try_from(segment_id).map_err(|_| "segment id range")?,
             );
@@ -3787,7 +4038,7 @@ impl Parser {
                 && q.delta_q_v_ac == 0
                 && q.delta_q_v_dc == 0;
             if !fh.lossless_array[segment_id] {
-                fh.coded_lossless = false;
+                fh.lossless.coded_lossless = false;
             }
             if q.using_qmatrix {
                 if fh.lossless_array[segment_id] {
@@ -3802,42 +4053,122 @@ impl Parser {
             }
         }
 
-        fh.all_lossless = fh.coded_lossless && fh.frame_width == fh.upscaled_width;
-        Self::parse_loop_filter_parameters(&mut r, &mut fh, num_planes)?;
-        Self::parse_cdef_params(&mut r, &mut fh, enable_cdef, num_planes)?;
+        fh.lossless.all_lossless =
+            fh.lossless.coded_lossless && fh.frame_width == fh.upscaled_width;
+        Ok(())
+    }
+
+    fn parse_frame_tools(
+        &mut self,
+        r: &mut Reader,
+        fh: &mut FrameHeaderObu,
+        seq: &SequenceHeaderObu,
+    ) -> Result<(), String> {
+        Self::parse_loop_filter_parameters(r, fh, seq.num_planes)?;
+        Self::parse_cdef_params(r, fh, seq.tools.enable_cdef, seq.num_planes)?;
         Self::parse_loop_restoration_params(
-            &mut r,
-            &mut fh,
-            enable_restoration,
-            num_planes,
-            use_128x128_superblock,
+            r,
+            fh,
+            seq.post.enable_restoration,
+            seq.num_planes,
+            seq.superblock.use_128x128_superblock,
             Subsampling {
-                x: subsampling_x,
-                y: subsampling_y,
+                x: seq.color_config.format.subsampling_x,
+                y: seq.color_config.format.subsampling_y,
             },
         )?;
-        Self::read_tx_mode(&mut r, &mut fh)?;
-        Self::parse_frame_reference_mode(&mut r, &mut fh)?;
-        self.parse_skip_mode_params(&mut r, &mut fh, enable_order_hint, order_hint_bits)?;
+        Self::read_tx_mode(r, fh)?;
+        Self::parse_frame_reference_mode(r, fh)?;
+        self.parse_skip_mode_params(r, fh, seq.inter.enable_order_hint, seq.order_hint_bits)?;
 
-        if fh.frame_is_intra || fh.error_resilient_mode || !enable_warped_motion {
-            fh.allow_warped_motion = false;
+        if fh.lossless.frame_is_intra
+            || fh.resilience.error_resilient_mode
+            || !seq.motion.enable_warped_motion
+        {
+            fh.tools.allow_warped_motion = false;
         } else {
-            fh.allow_warped_motion = r.0.read_bit()?;
+            fh.tools.allow_warped_motion = r.0.read_bit()?;
         }
 
-        fh.reduced_tx_set = r.0.read_bit()?;
-        self.parse_global_motion_params(&mut r, &mut fh)?;
+        fh.mode.reduced_tx_set = r.0.read_bit()?;
+        self.parse_global_motion_params(r, fh)?;
         self.parse_film_grain_parameters(
-            &mut r,
-            &mut fh,
-            film_grain_params_present,
-            mono_chrome,
+            r,
+            fh,
+            seq.post.film_grain_params_present,
+            seq.color_config.format.mono_chrome,
             Subsampling {
-                x: subsampling_x,
-                y: subsampling_y,
+                x: seq.color_config.format.subsampling_x,
+                y: seq.color_config.format.subsampling_y,
             },
         )?;
+        Ok(())
+    }
+
+    fn parse_uncompressed_frame_header(&mut self, obu: &Obu) -> Result<FrameHeaderObu, String> {
+        let mut r = Reader::new(obu.as_ref());
+
+        let mut fh = FrameHeaderObu {
+            obu_header: obu.header.clone(),
+            ..Default::default()
+        };
+
+        // Section 6.8.1: It is a requirement of bitstream conformance that a
+        // sequence header OBU has been received before a frame header OBU.
+        let seq = self
+            .sequence_header
+            .clone()
+            .ok_or_else(|| "No sequence header parsed yet".to_owned())?;
+
+        if seq.sequence.reduced_still_picture_header {
+            fh.show.show_existing_frame = false;
+            fh.frame_type = FrameType::Key;
+            fh.lossless.frame_is_intra = true;
+            fh.show.show_frame = true;
+            fh.show.showable_frame = false;
+        } else {
+            fh.show.show_existing_frame = r.0.read_bit()?;
+            if matches!(obu.header.obu_type, ObuType::Frame) && fh.show.show_existing_frame {
+                return Err("If obu_type is equal to OBU_FRAME, it is a requirement of bitstream conformance that show_existing_frame is equal to 0.".into());
+            }
+            if self.parse_show_existing_frame(&mut r, &mut fh, &seq, obu.header.obu_type)? {
+                return Ok(fh);
+            }
+
+            Self::parse_frame_type_signaling(&mut r, &mut fh, &seq)?;
+        }
+
+        if fh.frame_type == FrameType::Key && fh.show.show_frame {
+            for info in &mut self.ref_info {
+                info.flags.ref_valid = false;
+                info.ref_order_hint = 0;
+            }
+            for i in 0..REFS_PER_FRAME {
+                fh.order_hints[ReferenceFrameType::Last as usize + i] = 0;
+            }
+        }
+
+        self.parse_cdf_and_frame_ids(&mut r, &mut fh, &seq)?;
+
+        self.parse_order_hints_and_refresh(&mut r, &mut fh, &seq)?;
+
+        if fh.lossless.frame_is_intra {
+            self.parse_frame_size(&mut fh, &mut r)?;
+            Self::parse_render_size(&mut fh, &mut r)?;
+            if fh.allow_screen_content_tools > 0 && fh.upscaled_width == fh.frame_width {
+                fh.tools.allow_intrabc = r.0.read_bit()?;
+            }
+        } else {
+            self.parse_inter_refs(&mut r, &mut fh, &seq)?;
+
+            self.parse_inter_tail(&mut r, &mut fh, &seq)?;
+        }
+
+        self.parse_cdf_end_and_tiles(&mut r, &mut fh, &seq)?;
+
+        self.parse_frame_quant(&mut r, &mut fh, &seq)?;
+
+        self.parse_frame_tools(&mut r, &mut fh, &seq)?;
 
         Self::skip_and_check_trailing_bits(&mut r, obu)?;
 
@@ -3865,6 +4196,9 @@ impl Parser {
         let mut sz: u64 = r.0.num_bits_left() as u64 / 8;
 
         let num_tiles = self.tile_rows * self.tile_cols;
+        if num_tiles == 0 {
+            return Err("tile group before frame header".into());
+        }
         let start_bit_pos = r.0.position();
 
         if num_tiles > 1 {
@@ -3983,7 +4317,7 @@ impl Parser {
         } else {
             self.seen_frame_header = true;
             let header = self.parse_uncompressed_frame_header(obu)?;
-            if header.show_existing_frame {
+            if header.show.show_existing_frame {
                 self.last_frame_header = None;
                 self.seen_frame_header = false;
             } else {
@@ -4001,7 +4335,7 @@ impl Parser {
     pub fn ref_frame_update(&mut self, fh: &FrameHeaderObu) -> Result<(), String> {
         // This was found as a bug otherwise by Nicolas Dufresne in GStreamer's
         // av1parse.
-        if fh.show_existing_frame && !matches!(fh.frame_type, FrameType::Key) {
+        if fh.show.show_existing_frame && !matches!(fh.frame_type, FrameType::Key) {
             return Ok(());
         }
 
@@ -4012,18 +4346,26 @@ impl Parser {
         let &SequenceHeaderObu {
             color_config:
                 ColorConfig {
-                    subsampling_x,
-                    subsampling_y,
+                    format:
+                        ColorFormat {
+                            subsampling_x,
+                            subsampling_y,
+                            ..
+                        },
                     ..
                 },
-            film_grain_params_present,
+            post:
+                PostTools {
+                    film_grain_params_present,
+                    ..
+                },
             bit_depth,
             ..
         } = self.sequence()?;
 
         for (i, ref_info) in self.ref_info.iter_mut().enumerate() {
             if ((fh.refresh_frame_flags >> i) & 1) != 0 {
-                ref_info.ref_valid = true;
+                ref_info.flags.ref_valid = true;
 
                 ref_info.ref_frame_id = fh.current_frame_id;
                 ref_info.ref_frame_type = fh.frame_type;
@@ -4035,15 +4377,15 @@ impl Parser {
                 ref_info.ref_order_hint = fh.order_hint;
                 ref_info.ref_mi_cols = self.mi_cols;
                 ref_info.ref_mi_rows = self.mi_rows;
-                ref_info.ref_subsampling_x = subsampling_x;
-                ref_info.ref_subsampling_y = subsampling_y;
+                ref_info.subsampling.ref_subsampling_x = subsampling_x;
+                ref_info.subsampling.ref_subsampling_y = subsampling_y;
                 ref_info.ref_bit_depth = bit_depth;
                 ref_info.segmentation_params = fh.segmentation_params.clone();
                 ref_info.global_motion_params = fh.global_motion_params.clone();
                 ref_info.loop_filter_params = fh.loop_filter_params.clone();
                 ref_info.tile_info = fh.tile_info.clone();
                 ref_info.display_frame_id = fh.display_frame_id;
-                ref_info.showable_frame = fh.showable_frame;
+                ref_info.flags.showable_frame = fh.show.showable_frame;
 
                 if film_grain_params_present {
                     ref_info.film_grain_params = fh.film_grain_params.clone();
@@ -4052,15 +4394,6 @@ impl Parser {
         }
 
         Ok(())
-    }
-
-    pub fn highest_operating_point(&self) -> Option<u32> {
-        if self.operating_point_idc == 0 {
-            /* No scalability information, all OBUs must be decoded */
-            None
-        } else {
-            helpers::floor_log2(u32::from(self.operating_point_idc >> 8)).ok()
-        }
     }
 
     /// Fully parse an OBU.

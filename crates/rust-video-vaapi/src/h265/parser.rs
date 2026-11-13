@@ -43,17 +43,17 @@ const MAX_SHORT_TERM_REF_PIC_SETS: usize = 65;
 const MAX_LONG_TERM_REF_PIC_SETS: usize = 32;
 
 // From table 7-5.
-const DEFAULT_SCALING_LIST_0: [u8; 16] = [16; 16];
+pub(crate) const DEFAULT_SCALING_LIST_0: [u8; 16] = [16; 16];
 
 // From Table 7-6.
-const DEFAULT_SCALING_LIST_1: [u8; 64] = [
+pub(crate) const DEFAULT_SCALING_LIST_1: [u8; 64] = [
     16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20,
     21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31,
     29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
 ];
 
 // From Table 7-6.
-const DEFAULT_SCALING_LIST_2: [u8; 64] = [
+pub(crate) const DEFAULT_SCALING_LIST_2: [u8; 64] = [
     16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20,
     20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28,
     28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
@@ -359,28 +359,22 @@ impl TryFrom<u8> for Profile {
 }
 
 /// A H.265 Video Parameter Set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Vps {
-    /// Identifies the VPS for reference by other syntax elements.
-    pub video_parameter_set_id: u8,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VpsLayers {
     /// If `vps_base_layer_internal_flag` is equal to 1 and
     /// `vps_base_layer_available_flag` is equal to 1, the base layer is present
     /// in the bitstream.
     pub base_layer_internal_flag: bool,
     /// See `base_layer_internal_flag`.
     pub base_layer_available_flag: bool,
-    /// Plus 1 specifies the maximum allowed number of layers in each CVS
-    /// referring to the VPS.
-    pub max_layers_minus1: u8,
-    /// Plus 1 specifies the maximum number of temporal sub-layers that may be
-    /// present in each CVS referring to the VPS.
-    pub max_sub_layers_minus1: u8,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VpsSubLayers {
     /// When `vps_max_sub_layers_minus1` is greater than 0, specifies whether
     /// inter prediction is additionally restricted for CVSs referring to the
     /// VPS.
     pub temporal_id_nesting_flag: bool,
-    /// `ProfileTierLevel()` data.
-    pub profile_tier_level: ProfileTierLevel,
     /// When true, specifies that `vps_max_dec_pic_buffering_minus1[ i ]`,
     /// `vps_max_num_reorder_pics[ i ]` and `vps_max_latency_increase_plus1[ i ]`
     /// are present for `vps_max_sub_layers`_ minus1 + 1 sub-layers.
@@ -390,6 +384,50 @@ pub struct Vps {
     /// `vps_max_latency_increase_plus1[ vps_max_sub_layers_minus1 ]` apply to all
     /// sub-layers
     pub sub_layer_ordering_info_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VpsTiming {
+    /// When true, specifies that `num_units_in_tick`, `time_scale`,
+    /// `poc_proportional_to_timing_flag` and `num_hrd_parameters` are present in
+    /// the VPS.
+    pub timing_info_present_flag: bool,
+    /// When true, indicates that the picture order count value for each picture
+    /// in the CVS that is not the first picture in the CVS, in decoding order,
+    /// is proportional to the output time of the picture relative to the output
+    /// time of the first picture in the CVS.  When false, indicates that the
+    /// picture order count value for each picture in the CVS that is not the
+    /// first picture in the CVS, in decoding order, may or may not be
+    /// proportional to the output time of the picture relative to the output
+    /// time of the first picture in the CVS.
+    pub poc_proportional_to_timing_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VpsExtension {
+    /// When false, specifies that no `vps_extension_data_flag` syntax elements
+    /// are present in the VPS RBSP syntax structure. When true, specifies that
+    /// there are `vps_extension_data_flag` syntax elements present in the VPS
+    /// RBSP syntax structure.
+    pub extension_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vps {
+    /// Identifies the VPS for reference by other syntax elements.
+    pub video_parameter_set_id: u8,
+    /// Base layer presence.
+    pub layers: VpsLayers,
+    /// Plus 1 specifies the maximum allowed number of layers in each CVS
+    /// referring to the VPS.
+    pub max_layers_minus1: u8,
+    /// Plus 1 specifies the maximum number of temporal sub-layers that may be
+    /// present in each CVS referring to the VPS.
+    pub max_sub_layers_minus1: u8,
+    /// Sub-layer nesting and ordering.
+    pub sub_layers: VpsSubLayers,
+    /// `ProfileTierLevel()` data.
+    pub profile_tier_level: ProfileTierLevel,
     /// `max_dec_pic_buffering_minus1[i]` plus 1 specifies the maximum required
     /// size of the decoded picture buffer for the CVS in units of picture
     /// storage buffers when `HighestTid` is equal to i.
@@ -412,10 +450,8 @@ pub struct Vps {
     /// `num_layer_sets_minus1` plus 1 specifies the number of layer sets that are
     /// specified by the VPS.
     pub num_layer_sets_minus1: u32,
-    /// When true, specifies that `num_units_in_tick`, `time_scale`,
-    /// `poc_proportional_to_timing_flag` and `num_hrd_parameters` are present in
-    /// the VPS.
-    pub timing_info_present_flag: bool,
+    /// Timing information presence.
+    pub timing: VpsTiming,
     /// The number of time units of a clock operating at the frequency
     /// `vps_time_scale` Hz that corresponds to one increment (called a clock
     /// tick) of a clock tick counter. The value of `vps_num_units_in_tick` shall
@@ -430,15 +466,6 @@ pub struct Vps {
     /// coordinate system that measures time using a 27 MHz clock has a
     /// `vps_time_scale` of 27 000 000.
     pub time_scale: u32,
-    /// When true, indicates that the picture order count value for each picture
-    /// in the CVS that is not the first picture in the CVS, in decoding order,
-    /// is proportional to the output time of the picture relative to the output
-    /// time of the first picture in the CVS.  When false, indicates that the
-    /// picture order count value for each picture in the CVS that is not the
-    /// first picture in the CVS, in decoding order, may or may not be
-    /// proportional to the output time of the picture relative to the output
-    /// time of the first picture in the CVS.
-    pub poc_proportional_to_timing_flag: bool,
     /// `num_ticks_poc_diff_one_minus1` plus 1 specifies the number of clock ticks
     /// corresponding to a difference of picture order count values equal to 1.
     pub num_ticks_poc_diff_one_minus1: u32,
@@ -460,66 +487,46 @@ pub struct Vps {
     pub cprms_present_flag: Vec<bool>,
     /// The `hrd_parameters()` data.
     pub hrd_parameters: Vec<HrdParams>,
-    /// When false, specifies that no `vps_extension_data_flag` syntax elements
-    /// are present in the VPS RBSP syntax structure. When true, specifies that
-    /// there are `vps_extension_data_flag` syntax elements present in the VPS
-    /// RBSP syntax structure. Decoders conforming to a profile specified in
-    /// Annex A but not supporting the INBLD capability specified in Annex F
-    /// shall ignore all data that follow the value 1 for `vps_extension_flag` in
-    /// a VPS NAL unit.
-    pub extension_flag: bool,
+    /// Extension data presence.
+    pub extension: VpsExtension,
 }
 
 impl Default for Vps {
     fn default() -> Self {
         Self {
             video_parameter_set_id: Default::default(),
-            base_layer_internal_flag: Default::default(),
-            base_layer_available_flag: Default::default(),
+            layers: VpsLayers::default(),
             max_layers_minus1: Default::default(),
             max_sub_layers_minus1: Default::default(),
-            temporal_id_nesting_flag: Default::default(),
+            sub_layers: VpsSubLayers::default(),
             profile_tier_level: ProfileTierLevel::default(),
-            sub_layer_ordering_info_present_flag: Default::default(),
             max_dec_pic_buffering_minus1: Default::default(),
             max_num_reorder_pics: Default::default(),
             max_latency_increase_plus1: Default::default(),
             max_layer_id: Default::default(),
             num_layer_sets_minus1: Default::default(),
-            timing_info_present_flag: Default::default(),
+            timing: VpsTiming::default(),
             num_units_in_tick: Default::default(),
             time_scale: Default::default(),
-            poc_proportional_to_timing_flag: Default::default(),
             num_ticks_poc_diff_one_minus1: Default::default(),
             num_hrd_parameters: Default::default(),
             hrd_layer_set_idx: Vec::default(),
             cprms_present_flag: vec![true],
             hrd_parameters: Vec::default(),
-            extension_flag: Default::default(),
+            extension: VpsExtension::default(),
         }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProfileTierLevel {
-    /// Specifies the context for the interpretation of `general_profile_idc` and
-    /// `general_profile_compatibility_flag[ j ]` for all values of j in the range
-    /// of 0 to 31, inclusive.
-    pub general_profile_space: u8,
+pub struct Tier {
     /// Specifies the tier context for the interpretation of `general_level_idc`
     /// as specified in Annex A.
     pub general_tier_flag: bool,
-    /// When `general_profile_space` is equal to 0, indicates a profile to which
-    /// the CVS conforms as specified in Annex A. Bitstreams shall not contain
-    /// values of `general_profile_idc` other than those specified in Annex A.
-    /// Other values of `general_profile_idc` are reserved for future use by ITU-T
-    /// | ISO/IEC.
-    pub general_profile_idc: u8,
-    /// `general_profile_compatibility_flag[ j ]` equal to true, when
-    /// `general_profile_space` is false, indicates that the CVS conforms to the
-    /// profile indicated by `general_profile_idc` equal to j as specified in
-    /// Annex A.
-    pub general_profile_compatibility_flag: [bool; 32],
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceFlags {
     /// `general_progressive_source_flag` and `general_interlaced_source_flag` are
     /// interpreted as follows:
     ///
@@ -551,27 +558,13 @@ pub struct ProfileTierLevel {
     /// projection SEI messages, or cubemap projection SEI messages present in
     /// the CVS.
     pub general_non_packed_constraint_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameFlags {
     /// When true, specifies that `field_seq_flag` is false. When false, indicates
     /// that `field_seq_flag` may or may not be false.
     pub general_frame_only_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_12bit_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_10bit_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_8bit_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_422chroma_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_420chroma_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_monochrome_constraint_flag: bool,
-    /// See Annex A.
-    pub general_intra_constraint_flag: bool,
-    /// See Annex A.
-    pub general_lower_bit_rate_constraint_flag: bool,
-    /// See Annex A.
-    pub general_max_14bit_constraint_flag: bool,
     /// See Annex A.
     pub general_one_picture_only_constraint_flag: bool,
     /// When true, specifies that the INBLD capability as specified in Annex F
@@ -580,6 +573,67 @@ pub struct ProfileTierLevel {
     /// capability as specified in Annex F is not required for decoding of the
     /// layer to which the `profile_tier_level`( ) syntax structure applies.
     pub general_inbld_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BitDepthFlags {
+    /// See Annex A.
+    pub general_max_12bit_constraint_flag: bool,
+    /// See Annex A.
+    pub general_max_10bit_constraint_flag: bool,
+    /// See Annex A.
+    pub general_max_8bit_constraint_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChromaFlags {
+    /// See Annex A.
+    pub general_max_422chroma_constraint_flag: bool,
+    /// See Annex A.
+    pub general_max_420chroma_constraint_flag: bool,
+    /// See Annex A.
+    pub general_max_monochrome_constraint_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodingFlags {
+    /// See Annex A.
+    pub general_intra_constraint_flag: bool,
+    /// See Annex A.
+    pub general_lower_bit_rate_constraint_flag: bool,
+    /// See Annex A.
+    pub general_max_14bit_constraint_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProfileTierLevel {
+    /// Specifies the context for the interpretation of `general_profile_idc` and
+    /// `general_profile_compatibility_flag[ j ]` for all values of j in the range
+    /// of 0 to 31, inclusive.
+    pub general_profile_space: u8,
+    /// Tier context.
+    pub tier: Tier,
+    /// When `general_profile_space` is equal to 0, indicates a profile to which
+    /// the CVS conforms as specified in Annex A. Bitstreams shall not contain
+    /// values of `general_profile_idc` other than those specified in Annex A.
+    /// Other values of `general_profile_idc` are reserved for future use by ITU-T
+    /// | ISO/IEC.
+    pub general_profile_idc: u8,
+    /// `general_profile_compatibility_flag[ j ]` equal to true, when
+    /// `general_profile_space` is false, indicates that the CVS conforms to the
+    /// profile indicated by `general_profile_idc` equal to j as specified in
+    /// Annex A.
+    pub general_profile_compatibility_flag: [bool; 32],
+    /// Source scan constraints.
+    pub source: SourceFlags,
+    /// Frame constraints.
+    pub frame: FrameFlags,
+    /// Bit depth constraints.
+    pub bit_depth: BitDepthFlags,
+    /// Chroma constraints.
+    pub chroma: ChromaFlags,
+    /// Coding constraints.
+    pub coding: CodingFlags,
     /// Indicates a level to which the CVS conforms as specified in Annex A.
     pub general_level_idc: Level,
     /// Sub-layer syntax element.
@@ -653,38 +707,74 @@ impl ProfileTierLevel {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SpsRangeExtension {
+pub struct SpsRangeTransform {
     pub transform_skip_rotation_enabled_flag: bool,
     pub transform_skip_context_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeRdpcm {
     pub implicit_rdpcm_enabled_flag: bool,
     pub explicit_rdpcm_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangePrecision {
     pub extended_precision_processing_flag: bool,
-    pub intra_smoothing_disabled_flag: bool,
     pub high_precision_offsets_enabled_flag: bool,
     pub persistent_rice_adaptation_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeFilter {
+    pub intra_smoothing_disabled_flag: bool,
     pub cabac_bypass_alignment_enabled_flag: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpsSccExtension {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsRangeExtension {
+    pub transform: SpsRangeTransform,
+    pub rdpcm: SpsRangeRdpcm,
+    pub precision: SpsRangePrecision,
+    pub filter: SpsRangeFilter,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsSccPalette {
+    /// When set, specifies that the decoding process for palette mode may be
+    /// used for intra blocks. When not set, specifies that the decoding process
+    /// for palette mode is not applied.
+    pub palette_mode_enabled_flag: bool,
+    /// When set, specifies that the sequence palette predictors are initialized
+    /// using the `sps_palette_predictor_initializers`. When not set, specifies
+    /// that the entries in the sequence palette predictor are initialized to 0.
+    pub palette_predictor_initializers_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsSccPrediction {
     /// When set, specifies that a picture in the CVS may be included in a
     /// reference picture list of a slice of the picture itself.  When not set,
     /// specifies that a picture in the CVS is never included in a reference
     /// picture list of a slice of the picture itself.
     pub curr_pic_ref_enabled_flag: bool,
-    /// When set, specifies that the decoding process for palette mode may be
-    /// used for intra blocks. When not set, specifies that the decoding process
-    /// for palette mode is not applied.
-    pub palette_mode_enabled_flag: bool,
+    /// When set, specifies that the intra boundary filtering process is
+    /// unconditionally disabled for intra prediction.  If not set, specifies
+    /// that the intra boundary filtering process may be used.
+    pub intra_boundary_filtering_disabled_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpsSccExtension {
+    /// Palette prediction.
+    pub palette: SpsSccPalette,
+    /// Intra prediction tools.
+    pub prediction: SpsSccPrediction,
     /// Specifies the maximum allowed palette size.
     pub palette_max_size: u8,
     /// Specifies the difference between the maximum allowed palette predictor
     /// size and the maximum allowed palette size.
     pub delta_palette_max_predictor_size: u8,
-    /// When set, specifies that the sequence palette predictors are initialized
-    /// using the `sps_palette_predictor_initializers`. When not set, specifies
-    /// that the entries in the sequence palette predictor are initialized to 0.
-    pub palette_predictor_initializers_present_flag: bool,
     /// `num_palette_predictor_initializers_minus1` plus 1 specifies the number of
     /// entries in the sequence palette predictor initializer.
     pub num_palette_predictor_initializer_minus1: u8,
@@ -695,26 +785,136 @@ pub struct SpsSccExtension {
     /// Controls the presence and inference of the `use_integer_mv_flag` that
     /// specifies the resolution of motion vectors for inter prediction.
     pub motion_vector_resolution_control_idc: u8,
-    /// When set, specifies that the intra boundary filtering process is
-    /// unconditionally disabled for intra prediction.  If not set, specifies
-    /// that the intra boundary filtering process may be used.
-    pub intra_boundary_filtering_disabled_flag: bool,
 }
 
 impl Default for SpsSccExtension {
     fn default() -> Self {
         Self {
-            curr_pic_ref_enabled_flag: Default::default(),
-            palette_mode_enabled_flag: Default::default(),
+            palette: SpsSccPalette::default(),
+            prediction: SpsSccPrediction::default(),
             palette_max_size: Default::default(),
             delta_palette_max_predictor_size: Default::default(),
-            palette_predictor_initializers_present_flag: Default::default(),
             num_palette_predictor_initializer_minus1: Default::default(),
             palette_predictor_initializer: [[0; 128]; 3],
             motion_vector_resolution_control_idc: Default::default(),
-            intra_boundary_filtering_disabled_flag: Default::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsSubLayers {
+    /// When `sps_max_sub_layers_minus1` is greater than 0, specifies whether
+    /// inter prediction is additionally restricted for CVSs referring to the
+    /// SPS.
+    pub temporal_id_nesting_flag: bool,
+    /// When true, specifies that `max_dec_pic_buffering_minus1[ i ]`,
+    /// `max_num_reorder_pics[ i ]` and `max_latency_increase_plus1[ i ]` are
+    /// present for `max_sub_layers_minus1` + 1 sub- layers. When false, specifies
+    /// that the values of `max_dec_pic_ buffering_minus1[ max_sub_layers_minus1
+    /// ]`, `max_num_reorder_pics[ max_sub_layers_minus1 ]` and max_
+    /// `latency_increase_plus1[ max_sub_layers_minus1 ]` apply to all sub-layers.
+    pub sub_layer_ordering_info_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PictureFormat {
+    /// When true, specifies that the three colour components of the 4:4:4
+    /// chroma format are coded separately. When false, specifies that the
+    /// colour components are not coded separately.
+    pub separate_colour_plane_flag: bool,
+    /// When true, indicates that the conformance cropping window offset
+    /// parameters follow next in the SPS. When false, indicates that the
+    /// conformance cropping window offset parameters are not present.
+    pub conformance_window_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsScaling {
+    /// When true, specifies that a scaling list is used for the scaling process
+    /// for transform coefficients. When false, specifies that scaling list is
+    /// not used for the scaling process for transform coefficients.
+    pub scaling_list_enabled_flag: bool,
+    /// When true, specifies that the `scaling_list_data`( ) syntax structure is
+    /// present in the SPS. When false, specifies that the `scaling_list_data`( )
+    /// syntax structure is not present in the SPS.
+    pub scaling_list_data_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsTools {
+    /// When true, specifies that asymmetric motion partitions, i.e., `PartMode`
+    /// equal to `PART_2NxnU`, `PART_2NxnD`, `PART_nLx2N` or `PART_nRx2N`, may be used
+    /// in CTBs. When false, specifies that asymmetric motion partitions cannot
+    /// be used in CTBs.
+    pub amp_enabled_flag: bool,
+    /// When set, specifies that `slice_temporal_mvp_enabled_flag` is present in
+    /// the slice headers of non-IDR pictures in the CVS. When not set,
+    /// specifies that `slice_temporal_mvp_enabled_flag` is not present in slice
+    /// headers and that temporal motion vector predictors are not used in the
+    /// CVS.
+    pub temporal_mvp_enabled_flag: bool,
+    /// When set, specifies that bi-linear interpolation is conditionally used
+    /// in the intraprediction filtering process in the CVS as specified in
+    /// clause 8.4.4.2.3.
+    pub strong_intra_smoothing_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pcm {
+    /// When false, specifies that PCM-related syntax
+    /// (`pcm_sample_bit_depth_luma_minus1`, `pcm_sample`_ `bit_depth_chroma_minus1`,
+    /// `log2_min_pcm_luma_coding_block_size_minus3`, `log2_diff_max_min_pcm_luma`_
+    /// `coding_block_size`, `pcm_loop_filter_disabled_flag`, `pcm_flag`,
+    /// `pcm_alignment_zero_bit` syntax elements and `pcm_sample`( ) syntax
+    /// structure) is not present in the CVS.
+    pub pcm_enabled_flag: bool,
+    /// Specifies whether the loop filter process is disabled on reconstructed
+    /// samples in a coding unit with `pcm_flag` equal to true as follows:
+    ///
+    /// – If `pcm_loop_filter_disabled_flag` is set, the deblocking filter and
+    /// sample adaptive offset filter processes on the reconstructed samples in
+    /// a coding unit with `pcm_flag` set are disabled.
+    ///
+    /// – Otherwise (`pcm_loop_filter_disabled_flag` value is not set), the
+    /// deblocking filter and sample adaptive offset filter processes on the
+    /// reconstructed samples in a coding unit with `pcm_flag` set are not
+    /// disabled.
+    pub pcm_loop_filter_disabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsFeatures {
+    /// When true, specifies that the sample adaptive offset process is applied
+    /// to the reconstructed picture after the deblocking filter process.  When
+    /// false, specifies that the sample adaptive offset process is not applied
+    /// to the reconstructed picture after the deblocking filter process.
+    pub sample_adaptive_offset_enabled_flag: bool,
+    /// If unset, specifies that no long-term reference picture is used for
+    /// inter prediction of any coded picture in the CVS.
+    /// If set, specifies that long-term reference pictures may be used for
+    /// inter prediction of one or more coded pictures in the CVS.
+    pub long_term_ref_pics_present_flag: bool,
+    /// When set, specifies that the `vui_parameters`( ) syntax structure as
+    /// specified in Annex E is present. When not set, specifies that the
+    /// `vui_parameters`( ) syntax structure as specified in Annex E is not
+    /// present.
+    pub vui_parameters_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsExtensions {
+    /// When set, specifies that the syntax elements `sps_range_extension_flag`,
+    /// `sps_multilayer_extension_flag`, `sps_3d_extension_flag`,
+    /// `sps_scc_extension_flag`, and `sps_extension_4bits` are present in the SPS
+    /// RBSP syntax structure. When not set, specifies that these syntax
+    /// elements are not present.
+    pub extension_present_flag: bool,
+    /// Range extension presence.
+    pub range_extension_flag: bool,
+    /// When set, specifies that the `sps_scc_extension`( ) syntax structure is
+    /// present in the SPS RBSP syntax structure. When not set, specifies that
+    /// this syntax structure is not present
+    pub scc_extension_flag: bool,
 }
 
 /// A H.265 Sequence Parameter Set.
@@ -725,10 +925,8 @@ pub struct Sps {
     /// `max_sub_layers_minus1` plus 1 specifies the maximum number of temporal
     /// sub-layers that may be present in each CVS referring to the SPS.
     pub max_sub_layers_minus1: u8,
-    /// When `sps_max_sub_layers_minus1` is greater than 0, specifies whether
-    /// inter prediction is additionally restricted for CVSs referring to the
-    /// SPS.
-    pub temporal_id_nesting_flag: bool,
+    /// Sub-layer nesting and ordering.
+    pub sub_layers: SpsSubLayers,
     /// `profile_tier_level()` data.
     pub profile_tier_level: ProfileTierLevel,
     /// Provides an identifier for the SPS for reference by other syntax
@@ -737,18 +935,12 @@ pub struct Sps {
     /// Specifies the chroma sampling relative to the luma sampling as specified
     /// in clause 6.2.
     pub chroma_format_idc: u8,
-    /// When true, specifies that the three colour components of the 4:4:4
-    /// chroma format are coded separately. When false, specifies that the
-    /// colour components are not coded separately.
-    pub separate_colour_plane_flag: bool,
+    /// Picture format.
+    pub format: PictureFormat,
     /// Specifies the width of each decoded picture in units of luma samples.
     pub pic_width_in_luma_samples: u16,
     /// Specifies the height of each decoded picture in units of luma samples.
     pub pic_height_in_luma_samples: u16,
-    /// When true, indicates that the conformance cropping window offset
-    /// parameters follow next in the SPS. When false, indicates that the
-    /// conformance cropping window offset parameters are not present.
-    pub conformance_window_flag: bool,
     /* if conformance_window_flag */
     /// Specify the samples of the pictures in the CVS that are output from the
     /// decoding process, in terms of a rectangular region specified in picture
@@ -768,13 +960,6 @@ pub struct Sps {
     /// Specifies the value of the variable `MaxPicOrderCntLsb` that is used in
     /// the decoding process for picture order count.
     pub log2_max_pic_order_cnt_lsb_minus4: u8,
-    /// When true, specifies that `max_dec_pic_buffering_minus1[ i ]`,
-    /// `max_num_reorder_pics[ i ]` and `max_latency_increase_plus1[ i ]` are
-    /// present for `max_sub_layers_minus1` + 1 sub- layers. When false, specifies
-    /// that the values of `max_dec_pic_ buffering_minus1[ max_sub_layers_minus1
-    /// ]`, `max_num_reorder_pics[ max_sub_layers_minus1 ]` and max_
-    /// `latency_increase_plus1[ max_sub_layers_minus1 ]` apply to all sub-layers.
-    pub sub_layer_ordering_info_present_flag: bool,
     /// `max_dec_pic_buffering_minus1[ i ]` plus 1 specifies the maximum required
     /// size of the decoded picture buffer for the CVS in units of picture
     /// storage buffers when `HighestTid` is equal to i.
@@ -810,34 +995,17 @@ pub struct Sps {
     /// Specifies the maximum hierarchy depth for transform units of coding
     /// units coded in intra prediction mode.
     pub max_transform_hierarchy_depth_intra: u8,
-    /// When true, specifies that a scaling list is used for the scaling process
-    /// for transform coefficients. When false, specifies that scaling list is
-    /// not used for the scaling process for transform coefficients.
-    pub scaling_list_enabled_flag: bool,
+    /// Scaling list presence.
+    pub scaling: SpsScaling,
     /* if scaling_list_enabled_flag */
-    /// When true, specifies that the `scaling_list_data`( ) syntax structure is
-    /// present in the SPS. When false, specifies that the `scaling_list_data`( )
-    /// syntax structure is not present in the SPS.
-    pub scaling_list_data_present_flag: bool,
     /// The `scaling_list_data()` syntax data.
     pub scaling_list: ScalingLists,
-    /// When true, specifies that asymmetric motion partitions, i.e., `PartMode`
-    /// equal to `PART_2NxnU`, `PART_2NxnD`, `PART_nLx2N` or `PART_nRx2N`, may be used
-    /// in CTBs. When false, specifies that asymmetric motion partitions cannot
-    /// be used in CTBs.
-    pub amp_enabled_flag: bool,
-    /// When true, specifies that the sample adaptive offset process is applied
-    /// to the reconstructed picture after the deblocking filter process.  When
-    /// false, specifies that the sample adaptive offset process is not applied
-    /// to the reconstructed picture after the deblocking filter process.
-    pub sample_adaptive_offset_enabled_flag: bool,
-    /// When false, specifies that PCM-related syntax
-    /// (`pcm_sample_bit_depth_luma_minus1`, `pcm_sample`_ `bit_depth_chroma_minus1`,
-    /// `log2_min_pcm_luma_coding_block_size_minus3`, `log2_diff_max_min_pcm_luma`_
-    /// `coding_block_size`, `pcm_loop_filter_disabled_flag`, `pcm_flag`,
-    /// `pcm_alignment_zero_bit` syntax elements and `pcm_sample`( ) syntax
-    /// structure) is not present in the CVS.
-    pub pcm_enabled_flag: bool,
+    /// Prediction tools.
+    pub tools: SpsTools,
+    /// Optional features.
+    pub features: SpsFeatures,
+    /// PCM presence.
+    pub pcm: Pcm,
 
     /* if pcm_enabled_flag */
     pub pcm_sample_bit_depth_luma_minus1: u8,
@@ -850,28 +1018,11 @@ pub struct Sps {
     /// Specifies the difference between the maximum and minimum size of coding
     /// blocks with `pcm_flag` equal to true.
     pub log2_diff_max_min_pcm_luma_coding_block_size: u8,
-    /// Specifies whether the loop filter process is disabled on reconstructed
-    /// samples in a coding unit with `pcm_flag` equal to true as follows:
-    ///
-    /// – If `pcm_loop_filter_disabled_flag` is set, the deblocking filter and
-    /// sample adaptive offset filter processes on the reconstructed samples in
-    /// a coding unit with `pcm_flag` set are disabled.
-    ///
-    /// – Otherwise (`pcm_loop_filter_disabled_flag` value is not set), the
-    /// deblocking filter and sample adaptive offset filter processes on the
-    /// reconstructed samples in a coding unit with `pcm_flag` set are not
-    /// disabled.
-    pub pcm_loop_filter_disabled_flag: bool,
     /// Specifies the number of `st_ref_pic_set`( ) syntax structures included in
     /// the SPS.
     pub num_short_term_ref_pic_sets: u8,
     /// the `st_ref_pic_set()` data.
     pub short_term_ref_pic_set: Vec<ShortTermRefPicSet>,
-    /// If unset, specifies that no long-term reference picture is used for
-    /// inter prediction of any coded picture in the CVS.
-    /// If set, specifies that long-term reference pictures may be used for
-    /// inter prediction of one or more coded pictures in the CVS.
-    pub long_term_ref_pics_present_flag: bool,
 
     /* if long_term_ref_pics_present_flag */
     /// Specifies the number of candidate long-term reference pictures that are
@@ -887,37 +1038,12 @@ pub struct Sps {
     /// picture set (RPS) the i-th candidate long-term reference picture
     /// specified in the SPS.
     pub used_by_curr_pic_lt_flag: [bool; MAX_LONG_TERM_REF_PIC_SETS],
-    /// When set, specifies that `slice_temporal_mvp_enabled_flag` is present in
-    /// the slice headers of non-IDR pictures in the CVS. When not set,
-    /// specifies that `slice_temporal_mvp_enabled_flag` is not present in slice
-    /// headers and that temporal motion vector predictors are not used in the
-    /// CVS.
-    pub temporal_mvp_enabled_flag: bool,
-    /// When set, specifies that bi-linear interpolation is conditionally used
-    /// in the intraprediction filtering process in the CVS as specified in
-    /// clause 8.4.4.2.3.
-    pub strong_intra_smoothing_enabled_flag: bool,
-    /// When set, specifies that the `vui_parameters`( ) syntax structure as
-    /// specified in Annex E is present. When not set, specifies that the
-    /// `vui_parameters`( ) syntax structure as specified in Annex E is not
-    /// present.
-    pub vui_parameters_present_flag: bool,
     /// The `vui_parameters()` data.
     pub vui_parameters: VuiParams,
-    /// When set, specifies that the syntax elements `sps_range_extension_flag`,
-    /// `sps_multilayer_extension_flag`, `sps_3d_extension_flag`,
-    /// `sps_scc_extension_flag`, and `sps_extension_4bits` are present in the SPS
-    /// RBSP syntax structure. When not set, specifies that these syntax
-    /// elements are not present.
-    pub extension_present_flag: bool,
-
-    pub range_extension_flag: bool,
+    /// Extension presence.
+    pub extensions: SpsExtensions,
     /// The `sps_range_extension()` data.
     pub range_extension: SpsRangeExtension,
-    /// When set, specifies that the `sps_scc_extension`( ) syntax structure is
-    /// present in the SPS RBSP syntax structure. When not set, specifies that
-    /// this syntax structure is not present
-    pub scc_extension_flag: bool,
     /// The `sps_scc_extension()` data.
     pub scc_extension: SpsSccExtension,
 
@@ -983,7 +1109,7 @@ impl Sps {
         // NOTE 3 – The conformance cropping window offset parameters are
         // only applied at the output. All internal decoding processes are
         // applied to the uncropped picture size.
-        if !self.conformance_window_flag {
+        if !self.format.conformance_window_flag {
             return Rect {
                 min: Point { x: 0, y: 0 },
                 max: Point {
@@ -1013,8 +1139,22 @@ impl Sps {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PpsSccExtension {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsSccPalette {
+    /// When set, specifies that the palette predictor initializers used for the
+    /// pictures referring to the PPS are derived based on the palette predictor
+    /// initializers specified by the PPS. If not set, specifies that the
+    /// palette predictor initializers used for the pictures referring to the
+    /// PPS are inferred to be equal to those specified by the active SPS.
+    pub palette_predictor_initializers_present_flag: bool,
+    /// When set, specifies that the pictures that refer to this PPS are
+    /// monochrome. If not set, specifies that the pictures that refer to this
+    /// PPS have multiple components.
+    pub monochrome_palette_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsSccCoding {
     /// When set, specifies that a picture referring to the PPS may be included
     /// in a reference picture list of a slice of the picture itself.  If not
     /// set, specifies that a picture referring to the PPS is never included in
@@ -1029,25 +1169,23 @@ pub struct PpsSccExtension {
     /// specifies that `slice_act_y_qp_offset`, `slice_act_cb_qp_offset`,
     /// `slice_act_cr_qp_offset` are not present in the slice header.
     pub slice_act_qp_offsets_present_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PpsSccExtension {
+    /// Palette prediction.
+    pub palette: PpsSccPalette,
+    /// Residual coding tools.
+    pub coding: PpsSccCoding,
     /// See the specificartion for more details.
     pub act_y_qp_offset_plus5: i8,
     /// See the specificartion for more details.
     pub act_cb_qp_offset_plus5: i8,
     /// See the specificartion for more details.
     pub act_cr_qp_offset_plus3: i8,
-    /// When set, specifies that the palette predictor initializers used for the
-    /// pictures referring to the PPS are derived based on the palette predictor
-    /// initializers specified by the PPS. If not set, specifies that the
-    /// palette predictor initializers used for the pictures referring to the
-    /// PPS are inferred to be equal to those specified by the active SPS.
-    pub palette_predictor_initializers_present_flag: bool,
     /// Specifies the number of entries in the picture palette predictor
     /// initializer.
     pub num_palette_predictor_initializers: u8,
-    /// When set, specifies that the pictures that refer to this PPS are
-    /// monochrome. If not set, specifies that the pictures that refer to this
-    /// PPS have multiple components.
-    pub monochrome_palette_flag: bool,
     /// `luma_bit_depth_entry_minus8` plus 8 specifies the bit depth of the luma
     /// component of the entries of the palette predictor initializer.
     pub luma_bit_depth_entry_minus8: u8,
@@ -1063,15 +1201,12 @@ pub struct PpsSccExtension {
 impl Default for PpsSccExtension {
     fn default() -> Self {
         Self {
-            curr_pic_ref_enabled_flag: Default::default(),
-            residual_adaptive_colour_transform_enabled_flag: Default::default(),
-            slice_act_qp_offsets_present_flag: Default::default(),
+            palette: PpsSccPalette::default(),
+            coding: PpsSccCoding::default(),
             act_y_qp_offset_plus5: Default::default(),
             act_cb_qp_offset_plus5: Default::default(),
             act_cr_qp_offset_plus3: Default::default(),
-            palette_predictor_initializers_present_flag: Default::default(),
             num_palette_predictor_initializers: Default::default(),
-            monochrome_palette_flag: Default::default(),
             luma_bit_depth_entry_minus8: Default::default(),
             chroma_bit_depth_entry_minus8: Default::default(),
             palette_predictor_initializer: [[0; 128]; 3],
@@ -1117,27 +1252,8 @@ pub struct PpsRangeExtension {
     pub log2_sao_offset_scale_chroma: u32,
 }
 
-/// A H.265 Picture Parameter Set.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Pps {
-    /// Identifies the PPS for reference by other syntax elements.
-    pub pic_parameter_set_id: u8,
-    /// Specifies the value of `sps_seq_parameter_set_id` for the active SPS.
-    pub seq_parameter_set_id: u8,
-    /// When set, specifies the presence of the syntax element
-    /// `dependent_slice_segment_flag` in the slice segment headers for coded
-    /// pictures referring to the PPS. When not set, specifies the absence of
-    /// the syntax element `dependent_slice_segment_flag` in the slice segment
-    /// headers for coded pictures referring to the PPS.
-    pub dependent_slice_segments_enabled_flag: bool,
-    /// When set, indicates that the `pic_output_flag` syntax element is present
-    /// in the associated slice headers. When not set, indicates that the
-    /// `pic_output_flag` syntax element is not present in the associated slice
-    /// headers.
-    pub output_flag_present_flag: bool,
-    /// Specifies the number of extra slice header bits that are present in the
-    /// slice header RBSP for coded pictures referring to the PPS.
-    pub num_extra_slice_header_bits: u8,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsCoding {
     /// When not set, specifies that sign bit hiding is disabled. Whens set,
     /// specifies that sign bit hiding is enabled.
     pub sign_data_hiding_enabled_flag: bool,
@@ -1145,17 +1261,6 @@ pub struct Pps {
     /// referring to the PPS. When not set, specifies that `cabac_init_flag` is
     /// not present in slice headers referring to the PPS.
     pub cabac_init_present_flag: bool,
-    /// Specifies the inferred value of `num_ref_idx_l0_active_minus1` for P and B
-    /// slices with `num_ref_idx_active_override_flag` not set.
-    pub num_ref_idx_l0_default_active_minus1: u8,
-    /// Specifies the inferred value of `num_ref_idx_l1_active_minus1` for B
-    /// slices with `num_ref_idx_active_override_flag` not set.
-    pub num_ref_idx_l1_default_active_minus1: u8,
-    /// `init_qp_minus26` plus 26 specifies the initial value of `SliceQpY` for each
-    /// slice referring to the PPS. The initial value of `SliceQpY` is modified at
-    /// the slice segment layer when a non-zero value of `slice_qp_delta` is
-    /// decoded.
-    pub init_qp_minus26: i8,
     /// When not set, specifies that intra prediction allows usage of residual
     /// data and decoded samples of neighbouring coding blocks coded using
     /// either intra or inter prediction modes. When set, specifies constrained
@@ -1163,6 +1268,27 @@ pub struct Pps {
     /// and decoded samples from neighbouring coding blocks coded using intra
     /// prediction modes.
     pub constrained_intra_pred_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsPrediction {
+    /// When not set, specifies that weighted prediction is not applied to P
+    /// slices. When set, specifies that weighted prediction is applied to P
+    /// slices.
+    pub weighted_pred_flag: bool,
+    /// When not set, specifies that the default weighted prediction is applied
+    /// to B slices. When set, specifies that weighted prediction is applied to
+    /// B slices.
+    pub weighted_bipred_flag: bool,
+    /// When set, specifies that the syntax structure
+    /// `ref_pic_lists_modification`( ) is present in the slice segment header.
+    /// When not set, specifies that the syntax structure
+    /// `ref_pic_lists_modification`( ) is not present in the slice segment header
+    pub lists_modification_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsTransform {
     /// When set, specifies that `transform_skip_flag` may be present in the
     /// residual coding syntax. When not set, specifies that `transform_skip_flag`
     /// is not present in the residual coding syntax.
@@ -1174,35 +1300,13 @@ pub struct Pps {
     /// and that `cu_qp_delta_abs` is not present in the transform unit syntax and
     /// the palette syntax.
     pub cu_qp_delta_enabled_flag: bool,
-
-    /*if cu_qp_delta_enabled_flag */
-    /// Specifies the difference between the luma CTB size and the minimum luma
-    /// coding block size of coding units that convey `cu_qp_delta_abs` and
-    /// `cu_qp_delta_sign_flag`.
-    pub diff_cu_qp_delta_depth: u8,
-    /// Specifies the offsets to the luma quantization parameter Qp′Y used for
-    /// deriving Qp′Cb and Qp′Cr, respectively.
-    pub cb_qp_offset: i8,
-    /// Specifies the offsets to the luma quantization parameter Qp′Y used for
-    /// deriving Qp′Cb and Qp′Cr, respectively.
-    pub cr_qp_offset: i8,
-    /// When set, indicates that the `slice_cb_qp_offset` and `slice_cr_qp_offset`
-    /// syntax elements are present in the associated slice headers.  When not
-    /// set, indicates that these syntax elements are not present in the
-    /// associated slice headers. When `ChromaArrayType` is equal to 0,
-    /// `pps_slice_chroma_qp_offsets_present_flag` shall be equal to 0
-    pub slice_chroma_qp_offsets_present_flag: bool,
-    /// When not set, specifies that weighted prediction is not applied to P
-    /// slices. When set, specifies that weighted prediction is applied to P
-    /// slices.
-    pub weighted_pred_flag: bool,
-    /// When not set, specifies that the default weighted prediction is applied
-    /// to B slices. When set, specifies that weighted prediction is applied to
-    /// B slices.
-    pub weighted_bipred_flag: bool,
     /// When set, specifies that `cu_transquant_bypass_flag` is present, When
     /// not set, specifies that `cu_transquant_bypass_flag` is not present.
     pub transquant_bypass_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsTiles {
     /// When set, specifies that there is more than one tile in each picture
     /// referring to the PPS. When not set, specifies that there is only one
     /// tile in each picture referring to the PPS.
@@ -1226,12 +1330,6 @@ pub struct Pps {
     /// includes the second CTB of a row of CTBs in each tile in each picture
     /// referring to the PPS.
     pub entropy_coding_sync_enabled_flag: bool,
-    /// `num_tile_columns_minus1` plus 1 specifies the number of tile columns
-    /// partitioning the picture.
-    pub num_tile_columns_minus1: u8,
-    /// `num_tile_rows_minus1` plus 1 specifies the number of tile rows
-    /// partitioning the picture.
-    pub num_tile_rows_minus1: u8,
     /// When set, specifies that tile column boundaries and likewise tile row
     /// boundaries are distributed uniformly across the picture.  When not set,
     /// specifies that tile column boundaries and likewise tile row boundaries
@@ -1239,12 +1337,10 @@ pub struct Pps {
     /// explicitly using the syntax elements `column_width_minus1[ i ]` and
     /// `row_height_minus1[ i ]`.
     pub uniform_spacing_flag: bool,
-    /// `column_width_minus1[ i ]` plus 1 specifies the width of the i-th tile
-    /// column in units of CTBs.
-    pub column_width_minus1: [u32; 19],
-    /// `row_height_minus1[ i ]` plus 1 specifies the height of the i-th tile row
-    /// in units of CTBs.
-    pub row_height_minus1: [u32; 21],
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsLoopFilter {
     /// When set, specifies that in-loop filtering operations may be performed
     /// across tile boundaries in pictures referring to the PPS.  When not set,
     /// specifies that in-loop filtering operations are not performed across
@@ -1259,6 +1355,10 @@ pub struct Pps {
     /// loop filtering operations include the deblocking filter and sample
     /// adaptive offset filter operations.
     pub loop_filter_across_slices_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsDeblocking {
     /// When set, specifies the presence of deblocking filter control syntax
     /// elements in the PPS. When not set, specifies the absence of deblocking
     /// filter control syntax elements in the PPS.
@@ -1275,6 +1375,119 @@ pub struct Pps {
     /// slices referring to the PPS in which
     /// `slice_deblocking_filter_disabled_flag` is not present.
     pub deblocking_filter_disabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsPresence {
+    /// When set, specifies the presence of the syntax element
+    /// `dependent_slice_segment_flag` in the slice segment headers for coded
+    /// pictures referring to the PPS. When not set, specifies the absence of
+    /// the syntax element `dependent_slice_segment_flag` in the slice segment
+    /// headers for coded pictures referring to the PPS.
+    pub dependent_slice_segments_enabled_flag: bool,
+    /// When set, indicates that the `pic_output_flag` syntax element is present
+    /// in the associated slice headers. When not set, indicates that the
+    /// `pic_output_flag` syntax element is not present in the associated slice
+    /// headers.
+    pub output_flag_present_flag: bool,
+    /// When set, indicates that the `slice_cb_qp_offset` and `slice_cr_qp_offset`
+    /// syntax elements are present in the associated slice headers.  When not
+    /// set, indicates that these syntax elements are not present in the
+    /// associated slice headers. When `ChromaArrayType` is equal to 0,
+    /// `pps_slice_chroma_qp_offsets_present_flag` shall be equal to 0
+    pub slice_chroma_qp_offsets_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsHeaders {
+    /// When set, specifies that the scaling list data used for the pictures
+    /// referring to the PPS are derived based on the scaling lists specified by
+    /// the active SPS and the scaling lists specified by the PPS.
+    /// `pps_scaling_list_data_present_flag` equal to 0 specifies that the scaling
+    /// list data used for the pictures referring to the PPS are inferred to be
+    /// equal to those specified by the active SPS.
+    pub scaling_list_data_present_flag: bool,
+    /// When not set, specifies that no slice segment header extension syntax
+    /// elements are present in the slice segment headers for coded pictures
+    /// referring to the PPS. When set, specifies that slice segment header
+    /// extension syntax elements are present in the slice segment headers for
+    /// coded pictures referring to the PPS.
+    pub slice_segment_header_extension_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsExtensions {
+    /// When set, specifies that the syntax elements `pps_range_extension_flag`,
+    /// `pps_multilayer_extension_flag`, `pps_3d_extension_flag`,
+    /// `pps_scc_extension_flag`, and `pps_extension_4bits` are present in the
+    /// picture parameter set RBSP syntax structure. When not set, specifies
+    /// that these syntax elements are not present.
+    pub extension_present_flag: bool,
+    /// Range extension presence.
+    pub range_extension_flag: bool,
+    /// Screen content coding extension presence.
+    pub scc_extension_flag: bool,
+}
+
+/// A H.265 Picture Parameter Set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pps {
+    /// Identifies the PPS for reference by other syntax elements.
+    pub pic_parameter_set_id: u8,
+    /// Specifies the value of `sps_seq_parameter_set_id` for the active SPS.
+    pub seq_parameter_set_id: u8,
+    /// Slice header presence.
+    pub presence: PpsPresence,
+    /// Specifies the number of extra slice header bits that are present in the
+    /// slice header RBSP for coded pictures referring to the PPS.
+    pub num_extra_slice_header_bits: u8,
+    /// Residual coding.
+    pub coding: PpsCoding,
+    /// Specifies the inferred value of `num_ref_idx_l0_active_minus1` for P and B
+    /// slices with `num_ref_idx_active_override_flag` not set.
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    /// Specifies the inferred value of `num_ref_idx_l1_active_minus1` for B
+    /// slices with `num_ref_idx_active_override_flag` not set.
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    /// `init_qp_minus26` plus 26 specifies the initial value of `SliceQpY` for each
+    /// slice referring to the PPS. The initial value of `SliceQpY` is modified at
+    /// the slice segment layer when a non-zero value of `slice_qp_delta` is
+    /// decoded.
+    pub init_qp_minus26: i8,
+    /// Transform coding.
+    pub transform: PpsTransform,
+
+    /*if cu_qp_delta_enabled_flag */
+    /// Specifies the difference between the luma CTB size and the minimum luma
+    /// coding block size of coding units that convey `cu_qp_delta_abs` and
+    /// `cu_qp_delta_sign_flag`.
+    pub diff_cu_qp_delta_depth: u8,
+    /// Specifies the offsets to the luma quantization parameter Qp′Y used for
+    /// deriving Qp′Cb and Qp′Cr, respectively.
+    pub cb_qp_offset: i8,
+    /// Specifies the offsets to the luma quantization parameter Qp′Y used for
+    /// deriving Qp′Cb and Qp′Cr, respectively.
+    pub cr_qp_offset: i8,
+    /// Weighted prediction.
+    pub prediction: PpsPrediction,
+    /// Tiles and parallelism.
+    pub tiles: PpsTiles,
+    /// `num_tile_columns_minus1` plus 1 specifies the number of tile columns
+    /// partitioning the picture.
+    pub num_tile_columns_minus1: u8,
+    /// `num_tile_rows_minus1` plus 1 specifies the number of tile rows
+    /// partitioning the picture.
+    pub num_tile_rows_minus1: u8,
+    /// `column_width_minus1[ i ]` plus 1 specifies the width of the i-th tile
+    /// column in units of CTBs.
+    pub column_width_minus1: [u32; 19],
+    /// `row_height_minus1[ i ]` plus 1 specifies the height of the i-th tile row
+    /// in units of CTBs.
+    pub row_height_minus1: [u32; 21],
+    /// In-loop filtering across boundaries.
+    pub loop_filter: PpsLoopFilter,
+    /// Deblocking filter control.
+    pub deblocking: PpsDeblocking,
     /// Specify the default deblocking parameter offsets for β and tC (divided
     /// by 2) that are applied for slices referring to the PPS, unless the
     /// default deblocking parameter offsets are overridden by the deblocking
@@ -1287,46 +1500,20 @@ pub struct Pps {
     /// parameter offsets present in the slice headers of the slices referring
     /// to the PPS.
     pub tc_offset_div2: i8,
-    /// When set, specifies that the scaling list data used for the pictures
-    /// referring to the PPS are derived based on the scaling lists specified by
-    /// the active SPS and the scaling lists specified by the PPS.
-    /// `pps_scaling_list_data_present_flag` equal to 0 specifies that the scaling
-    /// list data used for the pictures referring to the PPS are inferred to be
-    /// equal to those specified by the active SPS.
-    pub scaling_list_data_present_flag: bool,
+    /// Header data presence.
+    pub headers: PpsHeaders,
     /// The scaling list data.
     pub scaling_list: ScalingLists,
-    /// When set, specifies that the syntax structure
-    /// `ref_pic_lists_modification`( ) is present in the slice segment header.
-    /// When not set, specifies that the syntax structure
-    /// `ref_pic_lists_modification`( ) is not present in the slice segment header
-    pub lists_modification_present_flag: bool,
     /// `log2_parallel_merge_level_minus2` plus 2 specifies the value of the
     /// variable `Log2ParMrgLevel`, which is used in the derivation process for
     /// luma motion vectors for merge mode as specified in clause 8.5.3.2.2 and
     /// the derivation process for spatial merging candidates as specified in
     /// clause 8.5.3.2.3.
     pub log2_parallel_merge_level_minus2: u8,
-    /// When not set, specifies that no slice segment header extension syntax
-    /// elements are present in the slice segment headers for coded pictures
-    /// referring to the PPS. When set, specifies that slice segment header
-    /// extension syntax elements are present in the slice segment headers for
-    /// coded pictures referring to the PPS.
-    pub slice_segment_header_extension_present_flag: bool,
-    /// When set, specifies that the syntax elements `pps_range_extension_flag`,
-    /// `pps_multilayer_extension_flag`, `pps_3d_extension_flag`,
-    /// `pps_scc_extension_flag`, and `pps_extension_4bits` are present in the
-    /// picture parameter set RBSP syntax structure. When not set, specifies
-    /// that these syntax elements are not present.
-    pub extension_present_flag: bool,
-    /// When setspecifies that the `pps_range_extension`( ) syntax structure is
-    /// present in the PPS RBSP syntax structure. When not set, specifies that
-    /// this syntax structure is not present.
-    pub range_extension_flag: bool,
+    /// Extension presence.
+    pub extensions: PpsExtensions,
     /// The range extension data.
     pub range_extension: PpsRangeExtension,
-
-    pub scc_extension_flag: bool,
     /// The SCC extension data.
     pub scc_extension: PpsSccExtension,
 
@@ -1536,30 +1723,128 @@ impl SliceType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SliceHeader {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlicePosition {
     /// When set, specifies that the slice segment is the first slice segment of
     /// the picture in decoding order. When not set, specifies that the slice
     /// segment is not the first slice segment of the picture in decoding order.
     pub first_slice_segment_in_pic_flag: bool,
-    /// Affects the output of previously-decoded pictures in the decoded picture
-    /// buffer after the decoding of an IDR or a BLA picture that is not the
-    /// first picture in the bitstream as specified in Annex C.
-    pub no_output_of_prior_pics_flag: bool,
-    /// Specifies the value of `pps_pic_parameter_set_id` for the PPS in use.
-    pub pic_parameter_set_id: u8,
     /// When set, specifies that the value of each slice segment header syntax
     /// element that is not present is inferred to be equal to the value of the
     /// corresponding slice segment header syntax element in the slice header.
     pub dependent_slice_segment_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceOutput {
+    /// Affects the output of previously-decoded pictures in the decoded picture
+    /// buffer after the decoding of an IDR or a BLA picture that is not the
+    /// first picture in the bitstream as specified in Annex C.
+    pub no_output_of_prior_pics_flag: bool,
+    /// Affects the decoded picture output and removal processes as specified in
+    /// Annex C.
+    pub pic_output_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceRefs {
+    /// When set, specifies that the short-term RPS of the current picture is
+    /// derived based on one of the `st_ref_pic_set`( ) syntax structures in the
+    /// active SPS that is identified by the syntax element
+    /// `short_term_ref_pic_set_idx` in the slice header.  When not set, specifies
+    /// that the short-term RPS of the current picture is derived based on the
+    /// `st_ref_pic_set`( ) syntax structure that is directly included in the
+    /// slice headers of the current picture.
+    pub short_term_ref_pic_set_sps_flag: bool,
+    /// When set, specifies that the syntax element `num_ref_idx_l0_active_minus1`
+    /// is present for P and B slices and that the syntax element
+    /// `num_ref_idx_l1_active_minus1` is present for B slices. When not set,
+    /// specifies that the syntax elements `num_ref_idx_l0_active_minus1` and
+    /// `num_ref_idx_l1_active_minus1` are not present.
+    pub num_ref_idx_active_override_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceMotion {
+    /// Specifies whether temporal motion vector predictors can be used for
+    /// inter prediction. If `slice_temporal_mvp_enabled_flag` is not set, the
+    /// syntax elements of the current picture shall be constrained such that no
+    /// temporal motion vector predictor is used in decoding of the current
+    /// picture. Otherwise (`slice_temporal_mvp_enabled_flag` is set), temporal
+    /// motion vector predictors may be used in decoding of the current picture.
+    pub temporal_mvp_enabled_flag: bool,
+    /// When set, specifies that the collocated picture used for temporal motion
+    /// vector prediction is derived from reference picture list 0.  When not
+    /// set, specifies that the collocated picture used for temporal motion
+    /// vector prediction is derived from reference picture list 1.
+    pub collocated_from_l0_flag: bool,
+    /// When set, indicates that the `mvd_coding`( x0, y0, 1 ) syntax structure is
+    /// not parsed and `MvdL1[ x0 ]`[ y0 `][ compIdx ]` is set equal to 0 for
+    /// compIdx = 0..1. When not set, indicates that the `mvd_coding`( x0, y0, 1 )
+    /// syntax structure is parsed.
+    pub mvd_l1_zero_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceSao {
+    /// When set, specifies that SAO is enabled for the luma component in the
+    /// current slice; `slice_sao_luma_flag` not set specifies that SAO is
+    /// disabled for the luma component in the current slice.
+    pub sao_luma_flag: bool,
+    /// When set, specifies that SAO is enabled for the chroma component in the
+    /// current slice; When not set, specifies that SAO is disabled for the
+    /// chroma component in the current slice.
+    pub sao_chroma_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceCoding {
+    /// Specifies the method for determining the initialization table used in
+    /// the initialization process for context variables.
+    pub cabac_init_flag: bool,
+    /// Specifies that the resolution of motion vectors for inter prediction in
+    /// the current slice is integer. When not set, specifies
+    /// that the resolution of motion vectors for inter prediction in the
+    /// current slice that refer to pictures other than the current picture is
+    /// fractional with quarter-sample precision in units of luma samples.
+    pub use_integer_mv_flag: bool,
+    /// When set, specifies that the `cu_chroma_qp_offset_flag` may be present in
+    /// the transform unit syntax. When not set, specifies that the
+    /// `cu_chroma_qp_offset_flag` is not present in the transform unit syntax.
+    pub cu_chroma_qp_offset_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SliceDeblocking {
+    /// When set, specifies that deblocking parameters are present in the slice
+    /// header. When not set, specifies that deblocking parameters are not
+    /// present in the slice header.
+    pub deblocking_filter_override_flag: bool,
+    /// When set, specifies that the operation of the deblocking filter is not
+    /// applied for the current slice. When not set, specifies that the
+    /// operation of the deblocking filter is applied for the current slice.
+    pub deblocking_filter_disabled_flag: bool,
+    /// When set, specifies that in-loop filtering operations may be performed
+    /// across the left and upper boundaries of the current slice.  When not
+    /// set, specifies that in-loop operations are not performed across left and
+    /// upper boundaries of the current slice. The in-loop filtering operations
+    /// include the deblocking filter and sample adaptive offset filter.
+    pub loop_filter_across_slices_enabled_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SliceHeader {
+    /// Slice position within the picture.
+    pub position: SlicePosition,
+    /// Decoded picture output.
+    pub output: SliceOutput,
+    /// Specifies the value of `pps_pic_parameter_set_id` for the PPS in use.
+    pub pic_parameter_set_id: u8,
     /// Specifies the address of the first CTB in the slice segment, in CTB
     /// raster scan of a picture.
     pub segment_address: u32,
     /// Specifies the coding type of the slice according to Table 7-7.
     pub type_: SliceType,
-    /// Affects the decoded picture output and removal processes as specified in
-    /// Annex C.
-    pub pic_output_flag: bool,
     /// Specifies the colour plane associated with the current slice RBSP when
     /// `separate_colour_plane_flag` is set. The value of `colour_plane_id` shall be
     /// in the range of 0 to 2, inclusive. `colour_plane_id` values 0, 1 and 2
@@ -1569,14 +1854,8 @@ pub struct SliceHeader {
     /// current picture. The length of the `slice_pic_order_cnt_lsb` syntax
     /// element is `log2_max_pic_order_cnt_lsb_minus4` + 4 bits.
     pub pic_order_cnt_lsb: u16,
-    /// When set, specifies that the short-term RPS of the current picture is
-    /// derived based on one of the `st_ref_pic_set`( ) syntax structures in the
-    /// active SPS that is identified by the syntax element
-    /// `short_term_ref_pic_set_idx` in the slice header.  When not set, specifies
-    /// that the short-term RPS of the current picture is derived based on the
-    /// `st_ref_pic_set`( ) syntax structure that is directly included in the
-    /// slice headers of the current picture.
-    pub short_term_ref_pic_set_sps_flag: bool,
+    /// Reference set selection.
+    pub refs: SliceRefs,
     /// The `st_ref_pic_set()` data.
     pub short_term_ref_pic_set: ShortTermRefPicSet,
     /// Specifies the index, into the list of the `st_ref_pic_set`( ) syntax
@@ -1603,27 +1882,10 @@ pub struct SliceHeader {
     pub delta_poc_msb_present_flag: [bool; 16],
     /// Same as `DeltaPocMsbCycleLt` in the specification.
     pub delta_poc_msb_cycle_lt: [u32; 16],
-    /// Specifies whether temporal motion vector predictors can be used for
-    /// inter prediction. If `slice_temporal_mvp_enabled_flag` is not set, the
-    /// syntax elements of the current picture shall be constrained such that no
-    /// temporal motion vector predictor is used in decoding of the current
-    /// picture. Otherwise (`slice_temporal_mvp_enabled_flag` is set), temporal
-    /// motion vector predictors may be used in decoding of the current picture.
-    pub temporal_mvp_enabled_flag: bool,
-    /// When set, specifies that SAO is enabled for the luma component in the
-    /// current slice; `slice_sao_luma_flag` not set specifies that SAO is
-    /// disabled for the luma component in the current slice.
-    pub sao_luma_flag: bool,
-    /// When set, specifies that SAO is enabled for the chroma component in the
-    /// current slice; When not set, specifies that SAO is disabled for the
-    /// chroma component in the current slice.
-    pub sao_chroma_flag: bool,
-    /// When set, specifies that the syntax element `num_ref_idx_l0_active_minus1`
-    /// is present for P and B slices and that the syntax element
-    /// `num_ref_idx_l1_active_minus1` is present for B slices. When not set,
-    /// specifies that the syntax elements `num_ref_idx_l0_active_minus1` and
-    /// `num_ref_idx_l1_active_minus1` are not present.
-    pub num_ref_idx_active_override_flag: bool,
+    /// Motion prediction.
+    pub motion: SliceMotion,
+    /// Sample adaptive offsets.
+    pub sao: SliceSao,
     /// Specifies the maximum reference index for
     /// reference picture list 0 that may be used to decode the slice.
     pub num_ref_idx_l0_active_minus1: u8,
@@ -1632,19 +1894,8 @@ pub struct SliceHeader {
     pub num_ref_idx_l1_active_minus1: u8,
     /// The `RefPicListModification` data.
     pub ref_pic_list_modification: RefPicListModification,
-    /// When set, indicates that the `mvd_coding`( x0, y0, 1 ) syntax structure is
-    /// not parsed and `MvdL1[ x0 ]`[ y0 `][ compIdx ]` is set equal to 0 for
-    /// compIdx = 0..1. When not set, indicates that the `mvd_coding`( x0, y0, 1 )
-    /// syntax structure is parsed.
-    pub mvd_l1_zero_flag: bool,
-    /// Specifies the method for determining the initialization table used in
-    /// the initialization process for context variables.
-    pub cabac_init_flag: bool,
-    /// When set, specifies that the collocated picture used for temporal motion
-    /// vector prediction is derived from reference picture list 0.  When not
-    /// set, specifies that the collocated picture used for temporal motion
-    /// vector prediction is derived from reference picture list 1.
-    pub collocated_from_l0_flag: bool,
+    /// Residual coding.
+    pub coding: SliceCoding,
     /// Specifies the reference index of the collocated picture used for
     /// temporal motion vector prediction.
     pub collocated_ref_idx: u8,
@@ -1653,12 +1904,6 @@ pub struct SliceHeader {
     /// Specifies the maximum number of merging motion vector prediction (MVP)
     /// candidates supported in the slice subtracted from 5.
     pub five_minus_max_num_merge_cand: u8,
-    /// Specifies that the resolution of motion vectors for inter prediction in
-    /// the current slice is integer. When not set, specifies
-    /// that the resolution of motion vectors for inter prediction in the
-    /// current slice that refer to pictures other than the current picture is
-    /// fractional with quarter-sample precision in units of luma samples.
-    pub use_integer_mv_flag: bool,
     /// Specifies the initial value of `QpY` to be used for the coding blocks in
     /// the slice until modified by the value of `CuQpDeltaVal` in the coding unit
     /// layer.
@@ -1678,30 +1923,14 @@ pub struct SliceHeader {
     /// Specifies offsets to the quantization parameter values qP derived in
     /// clause 8.6.2 for luma, Cb, and Cr components, respectively.
     pub slice_act_cr_qp_offset: i8,
-    /// When set, specifies that the `cu_chroma_qp_offset_flag` may be present in
-    /// the transform unit syntax. When not set, specifies that the
-    /// `cu_chroma_qp_offset_flag` is not present in the transform unit syntax.
-    pub cu_chroma_qp_offset_enabled_flag: bool,
-    /// When set, specifies that deblocking parameters are present in the slice
-    /// header. When not set, specifies that deblocking parameters are not
-    /// present in the slice header.
-    pub deblocking_filter_override_flag: bool,
-    /// When set, specifies that the operation of the deblocking filter is not
-    /// applied for the current slice. When not set, specifies that the
-    /// operation of the deblocking filter is applied for the current slice.
-    pub deblocking_filter_disabled_flag: bool,
+    /// Deblocking filter control.
+    pub deblocking: SliceDeblocking,
     /// Specifies the deblocking parameter offsets for β and tC (divided by 2)
     /// for the current slice.
     pub beta_offset_div2: i8,
     /// Specifies the deblocking parameter offsets for β and tC (divided by 2)
     /// for the current slice.
     pub tc_offset_div2: i8,
-    /// When set, specifies that in-loop filtering operations may be performed
-    /// across the left and upper boundaries of the current slice.  When not
-    /// set, specifies that in-loop operations are not performed across left and
-    /// upper boundaries of the current slice. The in-loop filtering operations
-    /// include the deblocking filter and sample adaptive offset filter.
-    pub loop_filter_across_slices_enabled_flag: bool,
     /// Specifies the number of `entry_point_offset_minus1[ i ]` syntax elements
     /// in the slice header.
     pub num_entry_point_offsets: u32,
@@ -1730,16 +1959,17 @@ pub struct SliceHeader {
 impl Default for SliceHeader {
     fn default() -> Self {
         Self {
-            first_slice_segment_in_pic_flag: Default::default(),
-            no_output_of_prior_pics_flag: Default::default(),
+            position: SlicePosition::default(),
+            output: SliceOutput {
+                pic_output_flag: true,
+                ..SliceOutput::default()
+            },
             pic_parameter_set_id: Default::default(),
-            dependent_slice_segment_flag: Default::default(),
             segment_address: Default::default(),
             type_: SliceType::default(),
-            pic_output_flag: true,
             colour_plane_id: Default::default(),
             pic_order_cnt_lsb: Default::default(),
-            short_term_ref_pic_set_sps_flag: Default::default(),
+            refs: SliceRefs::default(),
             short_term_ref_pic_set: ShortTermRefPicSet::default(),
             short_term_ref_pic_set_idx: Default::default(),
             num_long_term_sps: Default::default(),
@@ -1749,32 +1979,27 @@ impl Default for SliceHeader {
             used_by_curr_pic_lt: Default::default(),
             delta_poc_msb_present_flag: Default::default(),
             delta_poc_msb_cycle_lt: Default::default(),
-            temporal_mvp_enabled_flag: Default::default(),
-            sao_luma_flag: Default::default(),
-            sao_chroma_flag: Default::default(),
-            num_ref_idx_active_override_flag: Default::default(),
+            motion: SliceMotion {
+                collocated_from_l0_flag: true,
+                ..SliceMotion::default()
+            },
+            sao: SliceSao::default(),
             num_ref_idx_l0_active_minus1: Default::default(),
             num_ref_idx_l1_active_minus1: Default::default(),
             ref_pic_list_modification: RefPicListModification::default(),
-            mvd_l1_zero_flag: Default::default(),
-            cabac_init_flag: Default::default(),
-            collocated_from_l0_flag: true,
+            coding: SliceCoding::default(),
             collocated_ref_idx: Default::default(),
             pred_weight_table: PredWeightTable::default(),
             five_minus_max_num_merge_cand: Default::default(),
-            use_integer_mv_flag: Default::default(),
             qp_delta: Default::default(),
             cb_qp_offset: Default::default(),
             cr_qp_offset: Default::default(),
             slice_act_y_qp_offset: Default::default(),
             slice_act_cb_qp_offset: Default::default(),
             slice_act_cr_qp_offset: Default::default(),
-            cu_chroma_qp_offset_enabled_flag: Default::default(),
-            deblocking_filter_override_flag: Default::default(),
-            deblocking_filter_disabled_flag: Default::default(),
+            deblocking: SliceDeblocking::default(),
             beta_offset_div2: Default::default(),
             tc_offset_div2: Default::default(),
-            loop_filter_across_slices_enabled_flag: Default::default(),
             num_entry_point_offsets: Default::default(),
             offset_len_minus1: Default::default(),
             entry_point_offset_minus1: Default::default(),
@@ -1800,11 +2025,12 @@ impl Slice<'_> {
     /// Sets the header for dependent slices by copying from an independent
     /// slice.
     pub fn replace_header(&mut self, header: SliceHeader) -> Result<(), String> {
-        if self.header.dependent_slice_segment_flag {
-            let first_slice_segment_in_pic_flag = self.header.first_slice_segment_in_pic_flag;
-            let no_output_of_prior_pics_flag = self.header.no_output_of_prior_pics_flag;
+        if self.header.position.dependent_slice_segment_flag {
+            let first_slice_segment_in_pic_flag =
+                self.header.position.first_slice_segment_in_pic_flag;
+            let no_output_of_prior_pics_flag = self.header.output.no_output_of_prior_pics_flag;
             let pic_parameter_set_id = self.header.pic_parameter_set_id;
-            let dependent_slice_segment_flag = self.header.dependent_slice_segment_flag;
+            let dependent_slice_segment_flag = self.header.position.dependent_slice_segment_flag;
             let segment_address = self.header.segment_address;
 
             let offset_len_minus1 = self.header.offset_len_minus1;
@@ -1817,10 +2043,10 @@ impl Slice<'_> {
 
             self.header = header;
 
-            self.header.first_slice_segment_in_pic_flag = first_slice_segment_in_pic_flag;
-            self.header.no_output_of_prior_pics_flag = no_output_of_prior_pics_flag;
+            self.header.position.first_slice_segment_in_pic_flag = first_slice_segment_in_pic_flag;
+            self.header.output.no_output_of_prior_pics_flag = no_output_of_prior_pics_flag;
             self.header.pic_parameter_set_id = pic_parameter_set_id;
-            self.header.dependent_slice_segment_flag = dependent_slice_segment_flag;
+            self.header.position.dependent_slice_segment_flag = dependent_slice_segment_flag;
             self.header.segment_address = segment_address;
             self.header.offset_len_minus1 = offset_len_minus1;
             self.header.entry_point_offset_minus1 = entry_point_offset_minus1;
@@ -1861,8 +2087,8 @@ pub struct SublayerHrdParameters {
     pub cbr_flag: [bool; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HrdParams {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HrdPresent {
     /// When set, specifies that NAL HRD parameters (pertaining to the Type II
     /// bitstream conformance point) are present in the `hrd_parameters`( ) syntax
     /// structure. When not set, specifies that NAL HRD parameters are not
@@ -1873,11 +2099,31 @@ pub struct HrdParams {
     /// structure. When not set, specifies that VCL HRD parameters are not
     /// present in the `hrd_parameters`( ) syntax structure.
     pub vcl_hrd_parameters_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubPicHrd {
     /// When set, specifies that sub-picture level HRD parameters are present
     /// and the HRD may operate at access unit level or sub-picture level. When
     /// not set, specifies that sub-picture level HRD parameters are not present
     /// and the HRD operates at access unit level.
     pub sub_pic_hrd_params_present_flag: bool,
+    /// When set, specifies that sub-picture level CPB removal delay parameters
+    /// are present in picture timing SEI messages and no decoding unit
+    /// information SEI message is available (in the CVS or provided through
+    /// external means not specified in this Specification).  When not set,
+    /// specifies that sub-picture level CPB removal delay parameters are
+    /// present in decoding unit information SEI messages and picture timing SEI
+    /// messages do not include sub-picture level CPB removal delay parameters.
+    pub sub_pic_cpb_params_in_pic_timing_sei_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HrdParams {
+    /// NAL and VCL HRD presence.
+    pub present: HrdPresent,
+    /// Sub-picture HRD presence.
+    pub sub_pic: SubPicHrd,
     /// Used to specify the clock sub-tick. A clock sub-tick is the minimum
     /// interval of time that can be represented in the coded data when
     /// `sub_pic_hrd_params_present_flag` is set.
@@ -1888,14 +2134,6 @@ pub struct HrdParams {
     /// picture timing SEI message and the `du_spt_cpb_removal_delay_increment`
     /// syntax element in the decoding unit information SEI message.
     pub du_cpb_removal_delay_increment_length_minus1: u8,
-    /// When set, specifies that sub-picture level CPB removal delay parameters
-    /// are present in picture timing SEI messages and no decoding unit
-    /// information SEI message is available (in the CVS or provided through
-    /// external means not specified in this Specification).  When not set,
-    /// specifies that sub-picture level CPB removal delay parameters are
-    /// present in decoding unit information SEI messages and picture timing SEI
-    /// messages do not include sub-picture level CPB removal delay parameters.
-    pub sub_pic_cpb_params_in_pic_timing_sei_flag: bool,
     /// `dpb_output_delay_du_length_minus1` plus 1 specifies the length, in bits,
     /// of the `pic_dpb_output_du_delay` syntax element in the picture timing SEI
     /// message and the `pic_spt_dpb_output_du_delay` syntax element in the
@@ -1962,12 +2200,10 @@ impl Default for HrdParams {
             initial_cpb_removal_delay_length_minus1: 23,
             au_cpb_removal_delay_length_minus1: 23,
             dpb_output_delay_du_length_minus1: 23,
-            nal_hrd_parameters_present_flag: Default::default(),
-            vcl_hrd_parameters_present_flag: Default::default(),
-            sub_pic_hrd_params_present_flag: Default::default(),
+            present: HrdPresent::default(),
+            sub_pic: SubPicHrd::default(),
             tick_divisor_minus2: Default::default(),
             du_cpb_removal_delay_increment_length_minus1: Default::default(),
-            sub_pic_cpb_params_in_pic_timing_sei_flag: Default::default(),
             bit_rate_scale: Default::default(),
             cpb_size_scale: Default::default(),
             cpb_size_du_scale: Default::default(),
@@ -1983,19 +2219,11 @@ impl Default for HrdParams {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VuiParams {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiDisplay {
     /// When set, specifies that `aspect_ratio_idc` is present.  When not set,
     /// specifies that `aspect_ratio_idc` is not present.
     pub aspect_ratio_info_present_flag: bool,
-    /// Specifies the value of the sample aspect ratio of the luma samples.
-    pub aspect_ratio_idc: u32,
-    /// Indicates the horizontal size of the sample aspect ratio (in arbitrary
-    /// units).
-    pub sar_width: u32,
-    /// Indicates the vertical size of the sample aspect ratio (in arbitrary
-    /// units).
-    pub sar_height: u32,
     /// When set, specifies that the `overscan_appropriate_flag` is present. When
     /// not set, the preferred display method for the video signal is
     /// unspecified.
@@ -2007,14 +2235,15 @@ pub struct VuiParams {
     /// picture, such that the cropped decoded pictures output should not be
     /// displayed using overscan.
     pub overscan_appropriate_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiSignal {
     /// When set, specifies that `video_format`, `video_full_range_flag` and
     /// `colour_description_present_flag` are present.  When not set, specify that
     /// `video_format`, `video_full_range_flag` and `colour_description_present_flag`
     /// are not present.
     pub video_signal_type_present_flag: bool,
-    /// Indicates the representation of the pictures as specified in Table E.2,
-    /// before being coded in accordance with this Specification.
-    pub video_format: u8,
     /// Indicates the black level and range of the luma and chroma signals as
     /// derived from E′Y, E′PB, and E′PR or E′R, E′G, and E′B real-valued
     /// component signals.
@@ -2024,29 +2253,23 @@ pub struct VuiParams {
     /// `colour_primaries`, `transfer_characteristics`, and `matrix_coeffs` are not
     /// present.
     pub colour_description_present_flag: bool,
-    /// Indicates the chromaticity coordinates of the source primaries as
-    /// specified in Table E.3 in terms of the CIE 1931 definition of x and y as
-    /// specified in ISO 11664-1.
-    pub colour_primaries: u32,
-    /// See table E.4 in the specification.
-    pub transfer_characteristics: u32,
-    /// Describes the matrix coefficients used in deriving luma and chroma
-    /// signals from the green, blue, and red, or Y, Z, and X primaries, as
-    /// specified in Table E.5.
-    pub matrix_coeffs: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiChroma {
     /// When true, specifies that `chroma_sample_loc_type_top_field` and
     /// `chroma_sample_loc_type_bottom_field` are present. When false, specifies
     /// that `chroma_sample_loc_type_top_field` and
     /// `chroma_sample_loc_type_bottom_field` are not present.
     pub chroma_loc_info_present_flag: bool,
-    /// See the specification for more details.
-    pub chroma_sample_loc_type_top_field: u32,
-    /// See the specification for more details.
-    pub chroma_sample_loc_type_bottom_field: u32,
     /// When true, indicates that the value of all decoded chroma samples is
     /// equal to 1 << ( `BitDepthC` − 1 ). When false, provides no indication of
     /// decoded chroma sample values.
     pub neutral_chroma_indication_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiStructure {
     /// When true, indicates that the CVS conveys pictures that represent
     /// fields, and specifies that a picture timing SEI message shall be present
     /// in every access unit of the current CVS. When false, indicates that the
@@ -2062,6 +2285,99 @@ pub struct VuiParams {
     /// next in the VUI. When false, indicates that the default display window
     /// parameters are not present.
     pub default_display_window_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiTiming {
+    /// When set, specifies that `vui_num_units_in_tick`, `vui_time_scale`,
+    /// `vui_poc_proportional_to_timing_flag` and `vui_hrd_parameters_present_flag`
+    /// are present in the `vui_parameters`( ) syntax structure.  When not set,
+    /// specifies that `vui_num_units_in_tick`, `vui_time_scale`,
+    /// `vui_poc_proportional_to_timing_flag` and `vui_hrd_parameters_present_flag`
+    /// are not present in the `vui_parameters`( ) syntax structure
+    pub timing_info_present_flag: bool,
+    /// When set, indicates that the picture order count value for each picture
+    /// in the CVS that is not the first picture in the CVS, in decoding order,
+    /// is proportional to the output time of the picture relative to the output
+    /// time of the first picture in the CVS.  When not set, indicates that the
+    /// picture order count value for each picture in the CVS that is not the
+    /// first picture in the CVS, in decoding order, may or may not be
+    /// proportional to the output time of the picture relative to the output
+    /// time of the first picture in the CVS.
+    pub poc_proportional_to_timing_flag: bool,
+    /// When set, specifies that the syntax structure `hrd_parameters`( ) is
+    /// present in the `vui_parameters`( ) syntax structure.  When not set,
+    /// specifies that the syntax structure `hrd_parameters`( ) is not present in
+    /// the `vui_parameters`( ) syntax structure.
+    pub hrd_parameters_present_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiRestriction {
+    /// When set, specifies that the bitstream restriction parameters for the
+    /// CVS are present. When not set, specifies that the bitstream restriction
+    /// parameters for the CVS are not present.
+    pub bitstream_restriction_flag: bool,
+    /// When set, indicates that all P and B slices (when present) that belong
+    /// to the same picture have an identical reference picture list 0 and that
+    /// all B slices (when present) that belong to the same picture have an
+    /// identical reference picture list 1.
+    pub restricted_ref_pic_lists_flag: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VuiMotion {
+    /// When set, indicates that each PPS that is active in the CVS has the same
+    /// value of the syntax elements `num_tile_columns_minus1`,
+    /// `num_tile_rows_minus1`, `uniform_spacing_flag`, `column_width_minus1[ i ]`,
+    /// `row_height_minus1[ i ]` and `loop_filter_across_tiles_enabled_flag`, when
+    /// present. When not set, indicates that tiles syntax elements in different
+    /// PPSs may or may not have the same value
+    pub tiles_fixed_structure_flag: bool,
+    /// When not set, indicates that no sample outside the picture boundaries
+    /// and no sample at a fractional sample position for which the sample value
+    /// is derived using one or more samples outside the picture boundaries is
+    /// used for inter prediction of any sample.  When set, indicates that one
+    /// or more samples outside the picture boundaries may be used in inter
+    /// prediction.
+    pub motion_vectors_over_pic_boundaries_flag: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VuiParams {
+    /// Display information presence.
+    pub display: VuiDisplay,
+    /// Specifies the value of the sample aspect ratio of the luma samples.
+    pub aspect_ratio_idc: u32,
+    /// Indicates the horizontal size of the sample aspect ratio (in arbitrary
+    /// units).
+    pub sar_width: u32,
+    /// Indicates the vertical size of the sample aspect ratio (in arbitrary
+    /// units).
+    pub sar_height: u32,
+    /// Video signal presence.
+    pub signal: VuiSignal,
+    /// Indicates the representation of the pictures as specified in Table E.2,
+    /// before being coded in accordance with this Specification.
+    pub video_format: u8,
+    /// Indicates the chromaticity coordinates of the source primaries as
+    /// specified in Table E.3 in terms of the CIE 1931 definition of x and y as
+    /// specified in ISO 11664-1.
+    pub colour_primaries: u32,
+    /// See table E.4 in the specification.
+    pub transfer_characteristics: u32,
+    /// Describes the matrix coefficients used in deriving luma and chroma
+    /// signals from the green, blue, and red, or Y, Z, and X primaries, as
+    /// specified in Table E.5.
+    pub matrix_coeffs: u32,
+    /// Chroma location presence.
+    pub chroma: VuiChroma,
+    /// See the specification for more details.
+    pub chroma_sample_loc_type_top_field: u32,
+    /// See the specification for more details.
+    pub chroma_sample_loc_type_bottom_field: u32,
+    /// Picture structure presence.
+    pub structure: VuiStructure,
     /// Specifies the samples of the pictures in the CVS that are within the
     /// default display window, in terms of a rectangular region specified in
     /// picture coordinates for display.
@@ -2078,13 +2394,8 @@ pub struct VuiParams {
     /// default display window, in terms of a rectangular region specified in
     /// picture coordinates for display.
     pub def_disp_win_bottom_offset: u32,
-    /// When set, specifies that `vui_num_units_in_tick`, `vui_time_scale`,
-    /// `vui_poc_proportional_to_timing_flag` and `vui_hrd_parameters_present_flag`
-    /// are present in the `vui_parameters`( ) syntax structure.  When not set,
-    /// specifies that `vui_num_units_in_tick`, `vui_time_scale`,
-    /// `vui_poc_proportional_to_timing_flag` and `vui_hrd_parameters_present_flag`
-    /// are not present in the `vui_parameters`( ) syntax structure
-    pub timing_info_present_flag: bool,
+    /// Timing information presence.
+    pub timing: VuiTiming,
     /// The number of time units of a clock operating at the frequency
     /// `vui_time_scale` Hz that corresponds to one increment (called a clock
     /// tick) of a clock tick counter.
@@ -2093,49 +2404,16 @@ pub struct VuiParams {
     /// coordinate system that measures time using a 27 MHz clock has a
     /// `vui_time_scale` of 27 000 000.
     pub time_scale: u32,
-    /// When set, indicates that the picture order count value for each picture
-    /// in the CVS that is not the first picture in the CVS, in decoding order,
-    /// is proportional to the output time of the picture relative to the output
-    /// time of the first picture in the CVS.  When not set, indicates that the
-    /// picture order count value for each picture in the CVS that is not the
-    /// first picture in the CVS, in decoding order, may or may not be
-    /// proportional to the output time of the picture relative to the output
-    /// time of the first picture in the CVS.
-    pub poc_proportional_to_timing_flag: bool,
     /// `vui_num_ticks_poc_diff_one_minus1` plus 1 specifies the number of clock
     /// ticks corresponding to a difference of picture order count values equal
     /// to 1.
     pub num_ticks_poc_diff_one_minus1: u32,
-    /// When set, specifies that the syntax structure `hrd_parameters`( ) is
-    /// present in the `vui_parameters`( ) syntax structure.  When not set,
-    /// specifies that the syntax structure `hrd_parameters`( ) is not present in
-    /// the `vui_parameters`( ) syntax structure.
-    pub hrd_parameters_present_flag: bool,
     /// The `hrd_parameters()` data.
     pub hrd: HrdParams,
-    /// When set, specifies that the bitstream restriction parameters for the
-    /// CVS are present. When not set, specifies that the bitstream restriction
-    /// parameters for the CVS are not present.
-    pub bitstream_restriction_flag: bool,
-    /// When set, indicates that each PPS that is active in the CVS has the same
-    /// value of the syntax elements `num_tile_columns_minus1`,
-    /// `num_tile_rows_minus1`, `uniform_spacing_flag`, `column_width_minus1[ i ]`,
-    /// `row_height_minus1[ i ]` and `loop_filter_across_tiles_enabled_flag`, when
-    /// present. When not set, indicates that tiles syntax elements in different
-    /// PPSs may or may not have the same value
-    pub tiles_fixed_structure_flag: bool,
-    /// When not set, indicates that no sample outside the picture boundaries
-    /// and no sample at a fractional sample position for which the sample value
-    /// is derived using one or more samples outside the picture boundaries is
-    /// used for inter prediction of any sample.  When set, indicates that one
-    /// or more samples outside the picture boundaries may be used in inter
-    /// prediction.
-    pub motion_vectors_over_pic_boundaries_flag: bool,
-    /// When set, indicates that all P and B slices (when present) that belong
-    /// to the same picture have an identical reference picture list 0 and that
-    /// all B slices (when present) that belong to the same picture have an
-    /// identical reference picture list 1.
-    pub restricted_ref_pic_lists_flag: bool,
+    /// Bitstream restriction presence.
+    pub restriction: VuiRestriction,
+    /// Motion constraints.
+    pub motion: VuiMotion,
     /// When not equal to 0, establishes a bound on the maximum possible size of
     /// distinct coded spatial segmentation regions in the pictures of the CVS.
     pub min_spatial_segmentation_idc: u32,
@@ -2158,41 +2436,33 @@ pub struct VuiParams {
 impl Default for VuiParams {
     fn default() -> Self {
         Self {
-            aspect_ratio_info_present_flag: Default::default(),
+            display: VuiDisplay::default(),
             aspect_ratio_idc: Default::default(),
             sar_width: Default::default(),
             sar_height: Default::default(),
-            overscan_info_present_flag: Default::default(),
-            overscan_appropriate_flag: Default::default(),
-            video_signal_type_present_flag: Default::default(),
+            signal: VuiSignal::default(),
             video_format: 5,
-            video_full_range_flag: Default::default(),
-            colour_description_present_flag: Default::default(),
             colour_primaries: 2,
             transfer_characteristics: 2,
             matrix_coeffs: 2,
-            chroma_loc_info_present_flag: Default::default(),
+            chroma: VuiChroma::default(),
             chroma_sample_loc_type_top_field: Default::default(),
             chroma_sample_loc_type_bottom_field: Default::default(),
-            neutral_chroma_indication_flag: Default::default(),
-            field_seq_flag: Default::default(),
-            frame_field_info_present_flag: Default::default(),
-            default_display_window_flag: Default::default(),
+            structure: VuiStructure::default(),
             def_disp_win_left_offset: Default::default(),
             def_disp_win_right_offset: Default::default(),
             def_disp_win_top_offset: Default::default(),
             def_disp_win_bottom_offset: Default::default(),
-            timing_info_present_flag: Default::default(),
+            timing: VuiTiming::default(),
             num_units_in_tick: Default::default(),
             time_scale: Default::default(),
-            poc_proportional_to_timing_flag: Default::default(),
             num_ticks_poc_diff_one_minus1: Default::default(),
-            hrd_parameters_present_flag: Default::default(),
             hrd: HrdParams::default(),
-            bitstream_restriction_flag: Default::default(),
-            tiles_fixed_structure_flag: Default::default(),
-            motion_vectors_over_pic_boundaries_flag: true,
-            restricted_ref_pic_lists_flag: Default::default(),
+            restriction: VuiRestriction::default(),
+            motion: VuiMotion {
+                tiles_fixed_structure_flag: false,
+                motion_vectors_over_pic_boundaries_flag: true,
+            },
             min_spatial_segmentation_idc: Default::default(),
             max_bytes_per_pic_denom: 2,
             max_bits_per_min_cu_denom: 1,
@@ -2210,6 +2480,44 @@ pub struct Parser {
 }
 
 impl Parser {
+    fn parse_vps_timing(vps: &mut Vps, r: &mut BitReader) -> Result<(), String> {
+        vps.timing.timing_info_present_flag = r.read_bit()?;
+
+        if vps.timing.timing_info_present_flag {
+            vps.num_units_in_tick = r.read_bits::<u32>(31)? << 1;
+            vps.num_units_in_tick |= r.read_bits::<u32>(1)?;
+
+            vps.time_scale = r.read_bits::<u32>(31)? << 1;
+            vps.time_scale |= r.read_bits::<u32>(1)?;
+
+            vps.timing.poc_proportional_to_timing_flag = r.read_bit()?;
+            if vps.timing.poc_proportional_to_timing_flag {
+                vps.num_ticks_poc_diff_one_minus1 = r.read_ue()?;
+            }
+
+            vps.num_hrd_parameters = r.read_ue()?;
+
+            for i in 0..vps.num_hrd_parameters as usize {
+                vps.hrd_layer_set_idx.push(r.read_ue()?);
+                if i > 0 {
+                    vps.cprms_present_flag.push(r.read_bit()?);
+                }
+
+                let mut hrd = HrdParams::default();
+                Self::parse_hrd_parameters(
+                    vps.cprms_present_flag[i],
+                    vps.max_sub_layers_minus1,
+                    &mut hrd,
+                    r,
+                )?;
+
+                vps.hrd_parameters.push(hrd);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Parse a VPS NALU.
     pub fn parse_vps(&mut self, nalu: &Nalu) -> Result<&Vps, String> {
         if !matches!(nalu.header.type_, NaluType::VpsNut) {
@@ -2226,24 +2534,42 @@ impl Parser {
         // Skip the header
         let mut r = BitReader::new(&data[hdr_len..], true);
 
+        let video_parameter_set_id = r.read_bits(4)?;
+        let base_layer_internal_flag = r.read_bit()?;
+        let base_layer_available_flag = r.read_bit()?;
+        let max_layers_minus1 = r.read_bits(6)?;
+        let max_sub_layers_minus1 = r.read_bits(3)?;
+        let temporal_id_nesting_flag = r.read_bit()?;
         let mut vps = Vps {
-            video_parameter_set_id: r.read_bits(4)?,
-            base_layer_internal_flag: r.read_bit()?,
-            base_layer_available_flag: r.read_bit()?,
-            max_layers_minus1: r.read_bits(6)?,
-            max_sub_layers_minus1: r.read_bits(3)?,
-            temporal_id_nesting_flag: r.read_bit()?,
+            video_parameter_set_id,
+            layers: VpsLayers {
+                base_layer_internal_flag,
+                base_layer_available_flag,
+            },
+            max_layers_minus1,
+            max_sub_layers_minus1,
+            sub_layers: VpsSubLayers {
+                temporal_id_nesting_flag,
+                sub_layer_ordering_info_present_flag: false,
+            },
             ..Default::default()
         };
+
+        if vps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid max_sub_layers_minus1 {}",
+                vps.max_sub_layers_minus1
+            ));
+        }
 
         r.skip_bits(16)?; // vps_reserved_0xffff_16bits
 
         let ptl = &mut vps.profile_tier_level;
         Self::parse_profile_tier_level(ptl, &mut r, true, vps.max_sub_layers_minus1)?;
 
-        vps.sub_layer_ordering_info_present_flag = r.read_bit()?;
+        vps.sub_layers.sub_layer_ordering_info_present_flag = r.read_bit()?;
 
-        let start = if vps.sub_layer_ordering_info_present_flag {
+        let start = if vps.sub_layers.sub_layer_ordering_info_present_flag {
             0
         } else {
             vps.max_sub_layers_minus1
@@ -2276,7 +2602,7 @@ impl Parser {
         // vps_max_sub_layers_minus1 ], vps_max_num_reorder_pics[ vps_max_sub_
         // layers_minus1 ] and vps_max_latency_increase_plus1[
         // vps_max_sub_layers_minus1 ] apply to all sub-layers
-        if !vps.sub_layer_ordering_info_present_flag {
+        if !vps.sub_layers.sub_layer_ordering_info_present_flag {
             let max_num_sublayers = usize::from(vps.max_sub_layers_minus1);
             for i in 0..max_num_sublayers {
                 vps.max_dec_pic_buffering_minus1[i] =
@@ -2303,41 +2629,9 @@ impl Parser {
             }
         }
 
-        vps.timing_info_present_flag = r.read_bit()?;
+        Self::parse_vps_timing(&mut vps, &mut r)?;
 
-        if vps.timing_info_present_flag {
-            vps.num_units_in_tick = r.read_bits::<u32>(31)? << 1;
-            vps.num_units_in_tick |= r.read_bits::<u32>(1)?;
-
-            vps.time_scale = r.read_bits::<u32>(31)? << 1;
-            vps.time_scale |= r.read_bits::<u32>(1)?;
-
-            vps.poc_proportional_to_timing_flag = r.read_bit()?;
-            if vps.poc_proportional_to_timing_flag {
-                vps.num_ticks_poc_diff_one_minus1 = r.read_ue()?;
-            }
-
-            vps.num_hrd_parameters = r.read_ue()?;
-
-            for i in 0..vps.num_hrd_parameters as usize {
-                vps.hrd_layer_set_idx.push(r.read_ue()?);
-                if i > 0 {
-                    vps.cprms_present_flag.push(r.read_bit()?);
-                }
-
-                let mut hrd = HrdParams::default();
-                Self::parse_hrd_parameters(
-                    vps.cprms_present_flag[i],
-                    vps.max_sub_layers_minus1,
-                    &mut hrd,
-                    &mut r,
-                )?;
-
-                vps.hrd_parameters.push(hrd);
-            }
-        }
-
-        vps.extension_flag = r.read_bit()?;
+        vps.extension.extension_flag = r.read_bit()?;
 
         if self.vpses.keys().len() >= MAX_VPS_COUNT {
             return Err("Broken data: Number of active VPSs > MAX_VPS_COUNT".into());
@@ -2349,25 +2643,120 @@ impl Parser {
         Ok(self.vpses.entry(key).or_insert(vps))
     }
 
-    fn parse_profile_tier_level(
+    fn parse_sub_layer_profile_tier(
+        ptl: &mut ProfileTierLevel,
+        r: &mut BitReader,
+        i: usize,
+    ) -> Result<(), String> {
+        if ptl.sub_layer_level_present_flag[i] {
+            ptl.sub_layer_profile_space[i] = r.read_bits(2)?;
+            ptl.sub_layer_tier_flag[i] = r.read_bit()?;
+            ptl.sub_layer_profile_idc[i] = r.read_bits(5)?;
+            for flag in &mut ptl.sub_layer_profile_compatibility_flag[i] {
+                *flag = r.read_bit()?;
+            }
+            ptl.sub_layer_progressive_source_flag[i] = r.read_bit()?;
+            ptl.sub_layer_interlaced_source_flag[i] = r.read_bit()?;
+            ptl.sub_layer_non_packed_constraint_flag[i] = r.read_bit()?;
+            ptl.sub_layer_frame_only_constraint_flag[i] = r.read_bit()?;
+
+            if ptl.sub_layer_profile_idc[i] == 4
+                || ptl.sub_layer_profile_compatibility_flag[i][4]
+                || ptl.sub_layer_profile_idc[i] == 5
+                || ptl.sub_layer_profile_compatibility_flag[i][5]
+                || ptl.sub_layer_profile_idc[i] == 6
+                || ptl.sub_layer_profile_compatibility_flag[i][6]
+                || ptl.sub_layer_profile_idc[i] == 7
+                || ptl.sub_layer_profile_compatibility_flag[i][7]
+                || ptl.sub_layer_profile_idc[i] == 8
+                || ptl.sub_layer_profile_compatibility_flag[i][8]
+                || ptl.sub_layer_profile_idc[i] == 9
+                || ptl.sub_layer_profile_compatibility_flag[i][9]
+                || ptl.sub_layer_profile_idc[i] == 10
+                || ptl.sub_layer_profile_compatibility_flag[i][10]
+                || ptl.sub_layer_profile_idc[i] == 11
+                || ptl.sub_layer_profile_compatibility_flag[i][11]
+            {
+                ptl.sub_layer_max_12bit_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_max_10bit_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_max_8bit_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_max_422chroma_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_max_420chroma_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_max_monochrome_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_intra_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_one_picture_only_constraint_flag[i] = r.read_bit()?;
+                ptl.sub_layer_lower_bit_rate_constraint_flag[i] = r.read_bit()?;
+
+                if ptl.sub_layer_profile_idc[i] == 5
+                    || ptl.sub_layer_profile_compatibility_flag[i][5]
+                    || ptl.sub_layer_profile_idc[i] == 9
+                    || ptl.sub_layer_profile_compatibility_flag[i][9]
+                    || ptl.sub_layer_profile_idc[i] == 10
+                    || ptl.sub_layer_profile_compatibility_flag[i][10]
+                    || ptl.sub_layer_profile_idc[i] == 11
+                    || ptl.sub_layer_profile_compatibility_flag[i][11]
+                {
+                    ptl.sub_layer_max_14bit_constraint_flag[i] = r.read_bit()?;
+                    r.skip_bits(33)?;
+                } else {
+                    r.skip_bits(34)?;
+                }
+            } else if ptl.sub_layer_profile_idc[i] == 2
+                || ptl.sub_layer_profile_compatibility_flag[i][2]
+            {
+                r.skip_bits(7)?;
+                ptl.sub_layer_one_picture_only_constraint_flag[i] = r.read_bit()?;
+                r.skip_bits(35)?;
+            } else {
+                r.skip_bits(43)?;
+            }
+
+            if ptl.sub_layer_profile_idc[i] == 1
+                || ptl.sub_layer_profile_compatibility_flag[i][1]
+                || ptl.sub_layer_profile_idc[i] == 2
+                || ptl.sub_layer_profile_compatibility_flag[i][2]
+                || ptl.sub_layer_profile_idc[i] == 3
+                || ptl.sub_layer_profile_compatibility_flag[i][3]
+                || ptl.sub_layer_profile_idc[i] == 4
+                || ptl.sub_layer_profile_compatibility_flag[i][4]
+                || ptl.sub_layer_profile_idc[i] == 5
+                || ptl.sub_layer_profile_compatibility_flag[i][5]
+                || ptl.sub_layer_profile_idc[i] == 9
+                || ptl.sub_layer_profile_compatibility_flag[i][9]
+                || ptl.sub_layer_profile_idc[i] == 11
+                || ptl.sub_layer_profile_compatibility_flag[i][11]
+            {
+                ptl.sub_layer_inbld_flag[i] = r.read_bit()?;
+            } else {
+                r.skip_bits(1)?;
+            }
+
+            if ptl.sub_layer_level_present_flag[i] {
+                let level: u8 = r.read_bits(8)?;
+                ptl.sub_layer_level_idc[i] = Level::try_from(level)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_general_profile_tier(
         ptl: &mut ProfileTierLevel,
         r: &mut BitReader,
         profile_present_flag: bool,
-        sps_max_sub_layers_minus_1: u8,
     ) -> Result<(), String> {
         if profile_present_flag {
             ptl.general_profile_space = r.read_bits(2)?;
-            ptl.general_tier_flag = r.read_bit()?;
+            ptl.tier.general_tier_flag = r.read_bit()?;
             ptl.general_profile_idc = r.read_bits(5)?;
 
-            for i in 0..32 {
-                ptl.general_profile_compatibility_flag[i] = r.read_bit()?;
+            for flag in &mut ptl.general_profile_compatibility_flag {
+                *flag = r.read_bit()?;
             }
 
-            ptl.general_progressive_source_flag = r.read_bit()?;
-            ptl.general_interlaced_source_flag = r.read_bit()?;
-            ptl.general_non_packed_constraint_flag = r.read_bit()?;
-            ptl.general_frame_only_constraint_flag = r.read_bit()?;
+            ptl.source.general_progressive_source_flag = r.read_bit()?;
+            ptl.source.general_interlaced_source_flag = r.read_bit()?;
+            ptl.source.general_non_packed_constraint_flag = r.read_bit()?;
+            ptl.frame.general_frame_only_constraint_flag = r.read_bit()?;
 
             if ptl.general_profile_idc == 4
                 || ptl.general_profile_compatibility_flag[4]
@@ -2386,15 +2775,15 @@ impl Parser {
                 || ptl.general_profile_idc == 11
                 || ptl.general_profile_compatibility_flag[11]
             {
-                ptl.general_max_12bit_constraint_flag = r.read_bit()?;
-                ptl.general_max_10bit_constraint_flag = r.read_bit()?;
-                ptl.general_max_8bit_constraint_flag = r.read_bit()?;
-                ptl.general_max_422chroma_constraint_flag = r.read_bit()?;
-                ptl.general_max_420chroma_constraint_flag = r.read_bit()?;
-                ptl.general_max_monochrome_constraint_flag = r.read_bit()?;
-                ptl.general_intra_constraint_flag = r.read_bit()?;
-                ptl.general_one_picture_only_constraint_flag = r.read_bit()?;
-                ptl.general_lower_bit_rate_constraint_flag = r.read_bit()?;
+                ptl.bit_depth.general_max_12bit_constraint_flag = r.read_bit()?;
+                ptl.bit_depth.general_max_10bit_constraint_flag = r.read_bit()?;
+                ptl.bit_depth.general_max_8bit_constraint_flag = r.read_bit()?;
+                ptl.chroma.general_max_422chroma_constraint_flag = r.read_bit()?;
+                ptl.chroma.general_max_420chroma_constraint_flag = r.read_bit()?;
+                ptl.chroma.general_max_monochrome_constraint_flag = r.read_bit()?;
+                ptl.coding.general_intra_constraint_flag = r.read_bit()?;
+                ptl.frame.general_one_picture_only_constraint_flag = r.read_bit()?;
+                ptl.coding.general_lower_bit_rate_constraint_flag = r.read_bit()?;
                 if ptl.general_profile_idc == 5
                     || ptl.general_profile_compatibility_flag[5]
                     || ptl.general_profile_idc == 9
@@ -2404,7 +2793,7 @@ impl Parser {
                     || ptl.general_profile_idc == 11
                     || ptl.general_profile_compatibility_flag[11]
                 {
-                    ptl.general_max_14bit_constraint_flag = r.read_bit()?;
+                    ptl.coding.general_max_14bit_constraint_flag = r.read_bit()?;
                     // Skip general_reserved_zero_33bits
                     r.skip_bits(31)?;
                     r.skip_bits(2)?;
@@ -2416,7 +2805,7 @@ impl Parser {
             } else if ptl.general_profile_idc == 2 || ptl.general_profile_compatibility_flag[2] {
                 // Skip general_reserved_zero_7bits
                 r.skip_bits(7)?;
-                ptl.general_one_picture_only_constraint_flag = r.read_bit()?;
+                ptl.frame.general_one_picture_only_constraint_flag = r.read_bit()?;
                 // Skip general_reserved_zero_35bits
                 r.skip_bits(31)?;
                 r.skip_bits(4)?;
@@ -2440,11 +2829,21 @@ impl Parser {
                 || ptl.general_profile_idc == 11
                 || ptl.general_profile_compatibility_flag[11]
             {
-                ptl.general_inbld_flag = r.read_bit()?;
+                ptl.frame.general_inbld_flag = r.read_bit()?;
             } else {
                 r.skip_bits(1)?;
             }
         }
+        Ok(())
+    }
+
+    fn parse_profile_tier_level(
+        ptl: &mut ProfileTierLevel,
+        r: &mut BitReader,
+        profile_present_flag: bool,
+        sps_max_sub_layers_minus_1: u8,
+    ) -> Result<(), String> {
+        Self::parse_general_profile_tier(ptl, r, profile_present_flag)?;
 
         let level: u8 = r.read_bits(8)?;
         ptl.general_level_idc = Level::try_from(level)?;
@@ -2461,94 +2860,7 @@ impl Parser {
         }
 
         for i in 0..sps_max_sub_layers_minus_1 as usize {
-            if ptl.sub_layer_level_present_flag[i] {
-                ptl.sub_layer_profile_space[i] = r.read_bits(2)?;
-                ptl.sub_layer_tier_flag[i] = r.read_bit()?;
-                ptl.sub_layer_profile_idc[i] = r.read_bits(5)?;
-                for j in 0..32 {
-                    ptl.sub_layer_profile_compatibility_flag[i][j] = r.read_bit()?;
-                }
-                ptl.sub_layer_progressive_source_flag[i] = r.read_bit()?;
-                ptl.sub_layer_interlaced_source_flag[i] = r.read_bit()?;
-                ptl.sub_layer_non_packed_constraint_flag[i] = r.read_bit()?;
-                ptl.sub_layer_frame_only_constraint_flag[i] = r.read_bit()?;
-
-                if ptl.sub_layer_profile_idc[i] == 4
-                    || ptl.sub_layer_profile_compatibility_flag[i][4]
-                    || ptl.sub_layer_profile_idc[i] == 5
-                    || ptl.sub_layer_profile_compatibility_flag[i][5]
-                    || ptl.sub_layer_profile_idc[i] == 6
-                    || ptl.sub_layer_profile_compatibility_flag[i][6]
-                    || ptl.sub_layer_profile_idc[i] == 7
-                    || ptl.sub_layer_profile_compatibility_flag[i][7]
-                    || ptl.sub_layer_profile_idc[i] == 8
-                    || ptl.sub_layer_profile_compatibility_flag[i][8]
-                    || ptl.sub_layer_profile_idc[i] == 9
-                    || ptl.sub_layer_profile_compatibility_flag[i][9]
-                    || ptl.sub_layer_profile_idc[i] == 10
-                    || ptl.sub_layer_profile_compatibility_flag[i][10]
-                    || ptl.sub_layer_profile_idc[i] == 11
-                    || ptl.sub_layer_profile_compatibility_flag[i][11]
-                {
-                    ptl.sub_layer_max_12bit_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_max_10bit_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_max_8bit_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_max_422chroma_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_max_420chroma_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_max_monochrome_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_intra_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_one_picture_only_constraint_flag[i] = r.read_bit()?;
-                    ptl.sub_layer_lower_bit_rate_constraint_flag[i] = r.read_bit()?;
-
-                    if ptl.sub_layer_profile_idc[i] == 5
-                        || ptl.sub_layer_profile_compatibility_flag[i][5]
-                        || ptl.sub_layer_profile_idc[i] == 9
-                        || ptl.sub_layer_profile_compatibility_flag[i][9]
-                        || ptl.sub_layer_profile_idc[i] == 10
-                        || ptl.sub_layer_profile_compatibility_flag[i][10]
-                        || ptl.sub_layer_profile_idc[i] == 11
-                        || ptl.sub_layer_profile_compatibility_flag[i][11]
-                    {
-                        ptl.sub_layer_max_14bit_constraint_flag[i] = r.read_bit()?;
-                        r.skip_bits(33)?;
-                    } else {
-                        r.skip_bits(34)?;
-                    }
-                } else if ptl.sub_layer_profile_idc[i] == 2
-                    || ptl.sub_layer_profile_compatibility_flag[i][2]
-                {
-                    r.skip_bits(7)?;
-                    ptl.sub_layer_one_picture_only_constraint_flag[i] = r.read_bit()?;
-                    r.skip_bits(35)?;
-                } else {
-                    r.skip_bits(43)?;
-                }
-
-                if ptl.sub_layer_profile_idc[i] == 1
-                    || ptl.sub_layer_profile_compatibility_flag[i][1]
-                    || ptl.sub_layer_profile_idc[i] == 2
-                    || ptl.sub_layer_profile_compatibility_flag[i][2]
-                    || ptl.sub_layer_profile_idc[i] == 3
-                    || ptl.sub_layer_profile_compatibility_flag[i][3]
-                    || ptl.sub_layer_profile_idc[i] == 4
-                    || ptl.sub_layer_profile_compatibility_flag[i][4]
-                    || ptl.sub_layer_profile_idc[i] == 5
-                    || ptl.sub_layer_profile_compatibility_flag[i][5]
-                    || ptl.sub_layer_profile_idc[i] == 9
-                    || ptl.sub_layer_profile_compatibility_flag[i][9]
-                    || ptl.sub_layer_profile_idc[i] == 11
-                    || ptl.sub_layer_profile_compatibility_flag[i][11]
-                {
-                    ptl.sub_layer_inbld_flag[i] = r.read_bit()?;
-                } else {
-                    r.skip_bits(1)?;
-                }
-
-                if ptl.sub_layer_level_present_flag[i] {
-                    let level: u8 = r.read_bits(8)?;
-                    ptl.sub_layer_level_idc[i] = Level::try_from(level)?;
-                }
-            }
+            Self::parse_sub_layer_profile_tier(ptl, r, i)?;
         }
         Ok(())
     }
@@ -2687,6 +2999,104 @@ impl Parser {
         Ok(())
     }
 
+    fn derive_predicted_negative_pics(
+        st: &mut ShortTermRefPicSet,
+        ref_st: &ShortTermRefPicSet,
+        delta_rps: i32,
+        used_by_curr_pic_flag: &[bool; 64],
+        use_delta_flag: &[bool; 64],
+    ) -> Result<(), String> {
+        // (7-61)
+        let mut i = 0;
+        // Ranges are [a,b[, but the real loop is [b, a], i.e.
+        // [num_positive_pics - 1, 0]. Use ..= so that b is included when
+        // rev() is called.
+        for j in (0..isize::from(ref_st.num_positive_pics))
+            .rev()
+            .take_while(|j| *j >= 0)
+            .map(|j| usize::try_from(j).unwrap_or(0))
+        {
+            let d_poc = ref_st.delta_poc_s1[j] + delta_rps;
+            if d_poc < 0 && use_delta_flag[usize::from(ref_st.num_negative_pics) + j] {
+                st.delta_poc_s0[i] = d_poc;
+                st.used_by_curr_pic_s0[i] =
+                    used_by_curr_pic_flag[usize::from(ref_st.num_negative_pics) + j];
+
+                i += 1;
+            }
+        }
+
+        if delta_rps < 0 && use_delta_flag[ref_st.num_delta_pocs as usize] {
+            st.delta_poc_s0[i] = delta_rps;
+            st.used_by_curr_pic_s0[i] = used_by_curr_pic_flag[ref_st.num_delta_pocs as usize];
+
+            i += 1;
+        }
+
+        // Let's *not* change the original algorithm in any way.
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..ref_st.num_negative_pics as usize {
+            let d_poc = ref_st.delta_poc_s0[j] + delta_rps;
+            if d_poc < 0 && use_delta_flag[j] {
+                st.delta_poc_s0[i] = d_poc;
+                st.used_by_curr_pic_s0[i] = used_by_curr_pic_flag[j];
+
+                i += 1;
+            }
+        }
+
+        st.num_negative_pics = u8::try_from(i).map_err(|_| "pic count range")?;
+        Ok(())
+    }
+
+    fn derive_predicted_positive_pics(
+        st: &mut ShortTermRefPicSet,
+        ref_st: &ShortTermRefPicSet,
+        delta_rps: i32,
+        used_by_curr_pic_flag: &[bool; 64],
+        use_delta_flag: &[bool; 64],
+    ) -> Result<(), String> {
+        // (7-62)
+        let mut i = 0;
+        // Ranges are [a,b[, but the real loop is [b, a], i.e.
+        // [num_negative_pics - 1, 0]. Use ..= so that b is included when
+        // rev() is called.
+        for j in (0..isize::from(ref_st.num_negative_pics))
+            .rev()
+            .take_while(|j| *j >= 0)
+            .map(|j| usize::try_from(j).unwrap_or(0))
+        {
+            let d_poc = ref_st.delta_poc_s0[j] + delta_rps;
+            if d_poc > 0 && use_delta_flag[j] {
+                st.delta_poc_s1[i] = d_poc;
+                st.used_by_curr_pic_s1[i] = used_by_curr_pic_flag[j];
+
+                i += 1;
+            }
+        }
+
+        if delta_rps > 0 && use_delta_flag[ref_st.num_delta_pocs as usize] {
+            st.delta_poc_s1[i] = delta_rps;
+            st.used_by_curr_pic_s1[i] = used_by_curr_pic_flag[ref_st.num_delta_pocs as usize];
+
+            i += 1;
+        }
+
+        for j in 0..usize::from(ref_st.num_positive_pics) {
+            let d_poc = ref_st.delta_poc_s1[j] + delta_rps;
+            if d_poc > 0 && use_delta_flag[ref_st.num_negative_pics as usize + j] {
+                st.delta_poc_s1[i] = d_poc;
+                st.used_by_curr_pic_s1[i] =
+                    used_by_curr_pic_flag[ref_st.num_negative_pics as usize + j];
+
+                i += 1;
+            }
+        }
+
+        st.num_positive_pics = u8::try_from(i).map_err(|_| "pic count range")?;
+        Ok(())
+    }
+
     fn parse_short_term_ref_pic_set(
         sps: &Sps,
         st: &mut ShortTermRefPicSet,
@@ -2729,85 +3139,21 @@ impl Parser {
                 }
             }
 
-            // (7-61)
-            let mut i = 0;
-            // Ranges are [a,b[, but the real loop is [b, a], i.e.
-            // [num_positive_pics - 1, 0]. Use ..= so that b is included when
-            // rev() is called.
-            for j in (0..isize::from(ref_st.num_positive_pics))
-                .rev()
-                .take_while(|j| *j >= 0)
-                .map(|j| usize::try_from(j).unwrap_or(0))
-            {
-                let d_poc = ref_st.delta_poc_s1[j] + delta_rps;
-                if d_poc < 0 && use_delta_flag[usize::from(ref_st.num_negative_pics) + j] {
-                    st.delta_poc_s0[i] = d_poc;
-                    st.used_by_curr_pic_s0[i] =
-                        used_by_curr_pic_flag[usize::from(ref_st.num_negative_pics) + j];
+            Self::derive_predicted_negative_pics(
+                st,
+                ref_st,
+                delta_rps,
+                &used_by_curr_pic_flag,
+                &use_delta_flag,
+            )?;
 
-                    i += 1;
-                }
-            }
-
-            if delta_rps < 0 && use_delta_flag[ref_st.num_delta_pocs as usize] {
-                st.delta_poc_s0[i] = delta_rps;
-                st.used_by_curr_pic_s0[i] = used_by_curr_pic_flag[ref_st.num_delta_pocs as usize];
-
-                i += 1;
-            }
-
-            // Let's *not* change the original algorithm in any way.
-            #[allow(clippy::needless_range_loop)]
-            for j in 0..ref_st.num_negative_pics as usize {
-                let d_poc = ref_st.delta_poc_s0[j] + delta_rps;
-                if d_poc < 0 && use_delta_flag[j] {
-                    st.delta_poc_s0[i] = d_poc;
-                    st.used_by_curr_pic_s0[i] = used_by_curr_pic_flag[j];
-
-                    i += 1;
-                }
-            }
-
-            st.num_negative_pics = u8::try_from(i).map_err(|_| "pic count range")?;
-
-            // (7-62)
-            let mut i = 0;
-            // Ranges are [a,b[, but the real loop is [b, a], i.e.
-            // [num_negative_pics - 1, 0]. Use ..= so that b is included when
-            // rev() is called.
-            for j in (0..isize::from(ref_st.num_negative_pics))
-                .rev()
-                .take_while(|j| *j >= 0)
-                .map(|j| usize::try_from(j).unwrap_or(0))
-            {
-                let d_poc = ref_st.delta_poc_s0[j] + delta_rps;
-                if d_poc > 0 && use_delta_flag[j] {
-                    st.delta_poc_s1[i] = d_poc;
-                    st.used_by_curr_pic_s1[i] = used_by_curr_pic_flag[j];
-
-                    i += 1;
-                }
-            }
-
-            if delta_rps > 0 && use_delta_flag[ref_st.num_delta_pocs as usize] {
-                st.delta_poc_s1[i] = delta_rps;
-                st.used_by_curr_pic_s1[i] = used_by_curr_pic_flag[ref_st.num_delta_pocs as usize];
-
-                i += 1;
-            }
-
-            for j in 0..usize::from(ref_st.num_positive_pics) {
-                let d_poc = ref_st.delta_poc_s1[j] + delta_rps;
-                if d_poc > 0 && use_delta_flag[ref_st.num_negative_pics as usize + j] {
-                    st.delta_poc_s1[i] = d_poc;
-                    st.used_by_curr_pic_s1[i] =
-                        used_by_curr_pic_flag[ref_st.num_negative_pics as usize + j];
-
-                    i += 1;
-                }
-            }
-
-            st.num_positive_pics = u8::try_from(i).map_err(|_| "pic count range")?;
+            Self::derive_predicted_positive_pics(
+                st,
+                ref_st,
+                delta_rps,
+                &used_by_curr_pic_flag,
+                &use_delta_flag,
+            )?;
         } else {
             st.num_negative_pics = r.read_ue_max(u32::from(
                 sps.max_dec_pic_buffering_minus1[usize::from(sps.max_sub_layers_minus1)],
@@ -2877,19 +3223,21 @@ impl Parser {
         r: &mut BitReader,
     ) -> Result<(), String> {
         if common_inf_present_flag {
-            hrd.nal_hrd_parameters_present_flag = r.read_bit()?;
-            hrd.vcl_hrd_parameters_present_flag = r.read_bit()?;
-            if hrd.nal_hrd_parameters_present_flag || hrd.vcl_hrd_parameters_present_flag {
-                hrd.sub_pic_hrd_params_present_flag = r.read_bit()?;
-                if hrd.sub_pic_hrd_params_present_flag {
+            hrd.present.nal_hrd_parameters_present_flag = r.read_bit()?;
+            hrd.present.vcl_hrd_parameters_present_flag = r.read_bit()?;
+            if hrd.present.nal_hrd_parameters_present_flag
+                || hrd.present.vcl_hrd_parameters_present_flag
+            {
+                hrd.sub_pic.sub_pic_hrd_params_present_flag = r.read_bit()?;
+                if hrd.sub_pic.sub_pic_hrd_params_present_flag {
                     hrd.tick_divisor_minus2 = r.read_bits(8)?;
                     hrd.du_cpb_removal_delay_increment_length_minus1 = r.read_bits(5)?;
-                    hrd.sub_pic_cpb_params_in_pic_timing_sei_flag = r.read_bit()?;
+                    hrd.sub_pic.sub_pic_cpb_params_in_pic_timing_sei_flag = r.read_bit()?;
                     hrd.dpb_output_delay_du_length_minus1 = r.read_bits(5)?;
                 }
                 hrd.bit_rate_scale = r.read_bits(4)?;
                 hrd.cpb_size_scale = r.read_bits(4)?;
-                if hrd.sub_pic_hrd_params_present_flag {
+                if hrd.sub_pic.sub_pic_hrd_params_present_flag {
                     hrd.cpb_size_du_scale = r.read_bits(4)?;
                 }
                 hrd.initial_cpb_removal_delay_length_minus1 = r.read_bits(5)?;
@@ -2913,20 +3261,20 @@ impl Parser {
                 hrd.cpb_cnt_minus1[i] = r.read_ue_max(31)?;
             }
 
-            if hrd.nal_hrd_parameters_present_flag {
+            if hrd.present.nal_hrd_parameters_present_flag {
                 Self::parse_sublayer_hrd_parameters(
                     &mut hrd.nal_hrd[i],
                     hrd.cpb_cnt_minus1[i] + 1,
-                    hrd.sub_pic_hrd_params_present_flag,
+                    hrd.sub_pic.sub_pic_hrd_params_present_flag,
                     r,
                 )?;
             }
 
-            if hrd.vcl_hrd_parameters_present_flag {
+            if hrd.present.vcl_hrd_parameters_present_flag {
                 Self::parse_sublayer_hrd_parameters(
                     &mut hrd.vcl_hrd[i],
                     hrd.cpb_cnt_minus1[i] + 1,
-                    hrd.sub_pic_hrd_params_present_flag,
+                    hrd.sub_pic.sub_pic_hrd_params_present_flag,
                     r,
                 )?;
             }
@@ -2939,8 +3287,8 @@ impl Parser {
         const EXTENDED_SAR: u32 = 255;
         let vui = &mut sps.vui_parameters;
 
-        vui.aspect_ratio_info_present_flag = r.read_bit()?;
-        if vui.aspect_ratio_info_present_flag {
+        vui.display.aspect_ratio_info_present_flag = r.read_bit()?;
+        if vui.display.aspect_ratio_info_present_flag {
             vui.aspect_ratio_idc = r.read_bits(8)?;
             if vui.aspect_ratio_idc == EXTENDED_SAR {
                 vui.sar_width = r.read_bits(16)?;
@@ -2948,43 +3296,43 @@ impl Parser {
             }
         }
 
-        vui.overscan_info_present_flag = r.read_bit()?;
-        if vui.overscan_info_present_flag {
-            vui.overscan_appropriate_flag = r.read_bit()?;
+        vui.display.overscan_info_present_flag = r.read_bit()?;
+        if vui.display.overscan_info_present_flag {
+            vui.display.overscan_appropriate_flag = r.read_bit()?;
         }
 
-        vui.video_signal_type_present_flag = r.read_bit()?;
-        if vui.video_signal_type_present_flag {
+        vui.signal.video_signal_type_present_flag = r.read_bit()?;
+        if vui.signal.video_signal_type_present_flag {
             vui.video_format = r.read_bits(3)?;
-            vui.video_full_range_flag = r.read_bit()?;
-            vui.colour_description_present_flag = r.read_bit()?;
-            if vui.colour_description_present_flag {
+            vui.signal.video_full_range_flag = r.read_bit()?;
+            vui.signal.colour_description_present_flag = r.read_bit()?;
+            if vui.signal.colour_description_present_flag {
                 vui.colour_primaries = r.read_bits(8)?;
                 vui.transfer_characteristics = r.read_bits(8)?;
                 vui.matrix_coeffs = r.read_bits(8)?;
             }
         }
 
-        vui.chroma_loc_info_present_flag = r.read_bit()?;
-        if vui.chroma_loc_info_present_flag {
+        vui.chroma.chroma_loc_info_present_flag = r.read_bit()?;
+        if vui.chroma.chroma_loc_info_present_flag {
             vui.chroma_sample_loc_type_top_field = r.read_ue_max(5)?;
             vui.chroma_sample_loc_type_bottom_field = r.read_ue_max(5)?;
         }
 
-        vui.neutral_chroma_indication_flag = r.read_bit()?;
-        vui.field_seq_flag = r.read_bit()?;
-        vui.frame_field_info_present_flag = r.read_bit()?;
-        vui.default_display_window_flag = r.read_bit()?;
+        vui.chroma.neutral_chroma_indication_flag = r.read_bit()?;
+        vui.structure.field_seq_flag = r.read_bit()?;
+        vui.structure.frame_field_info_present_flag = r.read_bit()?;
+        vui.structure.default_display_window_flag = r.read_bit()?;
 
-        if vui.default_display_window_flag {
+        if vui.structure.default_display_window_flag {
             vui.def_disp_win_left_offset = r.read_ue()?;
             vui.def_disp_win_right_offset = r.read_ue()?;
             vui.def_disp_win_top_offset = r.read_ue()?;
             vui.def_disp_win_bottom_offset = r.read_ue()?;
         }
 
-        vui.timing_info_present_flag = r.read_bit()?;
-        if vui.timing_info_present_flag {
+        vui.timing.timing_info_present_flag = r.read_bit()?;
+        if vui.timing.timing_info_present_flag {
             vui.num_units_in_tick = r.read_bits::<u32>(31)? << 1;
             vui.num_units_in_tick |= r.read_bits::<u32>(1)?;
 
@@ -3002,23 +3350,23 @@ impl Parser {
                 log::warn!("Incompliant value for time_scale {}", vui.time_scale);
             }
 
-            vui.poc_proportional_to_timing_flag = r.read_bit()?;
-            if vui.poc_proportional_to_timing_flag {
+            vui.timing.poc_proportional_to_timing_flag = r.read_bit()?;
+            if vui.timing.poc_proportional_to_timing_flag {
                 vui.num_ticks_poc_diff_one_minus1 = r.read_ue_max(u32::MAX - 1)?;
             }
 
-            vui.hrd_parameters_present_flag = r.read_bit()?;
-            if vui.hrd_parameters_present_flag {
+            vui.timing.hrd_parameters_present_flag = r.read_bit()?;
+            if vui.timing.hrd_parameters_present_flag {
                 let sps_max_sub_layers_minus1 = sps.max_sub_layers_minus1;
                 Self::parse_hrd_parameters(true, sps_max_sub_layers_minus1, &mut vui.hrd, r)?;
             }
         }
 
-        vui.bitstream_restriction_flag = r.read_bit()?;
-        if vui.bitstream_restriction_flag {
-            vui.tiles_fixed_structure_flag = r.read_bit()?;
-            vui.motion_vectors_over_pic_boundaries_flag = r.read_bit()?;
-            vui.restricted_ref_pic_lists_flag = r.read_bit()?;
+        vui.restriction.bitstream_restriction_flag = r.read_bit()?;
+        if vui.restriction.bitstream_restriction_flag {
+            vui.motion.tiles_fixed_structure_flag = r.read_bit()?;
+            vui.motion.motion_vectors_over_pic_boundaries_flag = r.read_bit()?;
+            vui.restriction.restricted_ref_pic_lists_flag = r.read_bit()?;
 
             vui.min_spatial_segmentation_idc = r.read_ue_max(4095)?;
             vui.max_bytes_per_pic_denom = r.read_ue()?;
@@ -3033,14 +3381,14 @@ impl Parser {
     fn parse_sps_scc_extension(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
         let scc = &mut sps.scc_extension;
 
-        scc.curr_pic_ref_enabled_flag = r.read_bit()?;
-        scc.palette_mode_enabled_flag = r.read_bit()?;
-        if scc.palette_mode_enabled_flag {
+        scc.prediction.curr_pic_ref_enabled_flag = r.read_bit()?;
+        scc.palette.palette_mode_enabled_flag = r.read_bit()?;
+        if scc.palette.palette_mode_enabled_flag {
             scc.palette_max_size = r.read_ue_max(64)?;
             scc.delta_palette_max_predictor_size =
                 r.read_ue_max(128 - u32::from(scc.palette_max_size))?;
-            scc.palette_predictor_initializers_present_flag = r.read_bit()?;
-            if scc.palette_predictor_initializers_present_flag {
+            scc.palette.palette_predictor_initializers_present_flag = r.read_bit()?;
+            if scc.palette.palette_predictor_initializers_present_flag {
                 let max =
                     u32::from(scc.palette_max_size + scc.delta_palette_max_predictor_size - 1);
                 scc.num_palette_predictor_initializer_minus1 = r.read_ue_max(max)?;
@@ -3061,7 +3409,7 @@ impl Parser {
         }
 
         scc.motion_vector_resolution_control_idc = r.read_bits(2)?;
-        scc.intra_boundary_filtering_disabled_flag = r.read_bit()?;
+        scc.prediction.intra_boundary_filtering_disabled_flag = r.read_bit()?;
 
         Ok(())
     }
@@ -3069,64 +3417,30 @@ impl Parser {
     fn parse_sps_range_extension(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
         let ext = &mut sps.range_extension;
 
-        ext.transform_skip_rotation_enabled_flag = r.read_bit()?;
-        ext.transform_skip_context_enabled_flag = r.read_bit()?;
-        ext.implicit_rdpcm_enabled_flag = r.read_bit()?;
-        ext.explicit_rdpcm_enabled_flag = r.read_bit()?;
-        ext.extended_precision_processing_flag = r.read_bit()?;
-        ext.intra_smoothing_disabled_flag = r.read_bit()?;
-        ext.high_precision_offsets_enabled_flag = r.read_bit()?;
-        ext.persistent_rice_adaptation_enabled_flag = r.read_bit()?;
-        ext.cabac_bypass_alignment_enabled_flag = r.read_bit()?;
+        ext.transform.transform_skip_rotation_enabled_flag = r.read_bit()?;
+        ext.transform.transform_skip_context_enabled_flag = r.read_bit()?;
+        ext.rdpcm.implicit_rdpcm_enabled_flag = r.read_bit()?;
+        ext.rdpcm.explicit_rdpcm_enabled_flag = r.read_bit()?;
+        ext.precision.extended_precision_processing_flag = r.read_bit()?;
+        ext.filter.intra_smoothing_disabled_flag = r.read_bit()?;
+        ext.precision.high_precision_offsets_enabled_flag = r.read_bit()?;
+        ext.precision.persistent_rice_adaptation_enabled_flag = r.read_bit()?;
+        ext.filter.cabac_bypass_alignment_enabled_flag = r.read_bit()?;
 
         Ok(())
     }
 
     /// Parse a SPS NALU.
-    pub fn parse_sps(&mut self, nalu: &Nalu) -> Result<&Sps, String> {
-        if !matches!(nalu.header.type_, NaluType::SpsNut) {
-            return Err(format!(
-                "Invalid NALU type, expected {:?}, got {:?}",
-                NaluType::SpsNut,
-                nalu.header.type_
-            ));
-        }
-
-        let data = nalu.as_ref();
-        let header = &nalu.header;
-        let hdr_len = header.len();
-        // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
-
-        let video_parameter_set_id = r.read_bits(4)?;
-
-        // A non-existing VPS means the SPS is not using any VPS.
-        let vps = self.get_vps(video_parameter_set_id).cloned();
-
-        let mut sps = Sps {
-            video_parameter_set_id,
-            max_sub_layers_minus1: r.read_bits(3)?,
-            temporal_id_nesting_flag: r.read_bit()?,
-            vps,
-            ..Default::default()
-        };
-
-        Self::parse_profile_tier_level(
-            &mut sps.profile_tier_level,
-            &mut r,
-            true,
-            sps.max_sub_layers_minus1,
-        )?;
-
+    fn parse_sps_dimensions(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
         sps.seq_parameter_set_id =
             r.read_ue_max(u32::try_from(MAX_SPS_COUNT).map_err(|_| "sps count range")? - 1)?;
         sps.chroma_format_idc = r.read_ue_max(3)?;
 
         if sps.chroma_format_idc == 3 {
-            sps.separate_colour_plane_flag = r.read_bit()?;
+            sps.format.separate_colour_plane_flag = r.read_bit()?;
         }
 
-        sps.chroma_array_type = if sps.separate_colour_plane_flag {
+        sps.chroma_array_type = if sps.format.separate_colour_plane_flag {
             0
         } else {
             sps.chroma_format_idc
@@ -3135,8 +3449,8 @@ impl Parser {
         sps.pic_width_in_luma_samples = r.read_ue_bounded(1, 16888)?;
         sps.pic_height_in_luma_samples = r.read_ue_bounded(1, 16888)?;
 
-        sps.conformance_window_flag = r.read_bit()?;
-        if sps.conformance_window_flag {
+        sps.format.conformance_window_flag = r.read_bit()?;
+        if sps.format.conformance_window_flag {
             sps.conf_win_left_offset = r.read_ue()?;
             sps.conf_win_right_offset = r.read_ue()?;
             sps.conf_win_top_offset = r.read_ue()?;
@@ -3146,10 +3460,10 @@ impl Parser {
         sps.bit_depth_luma_minus8 = r.read_ue_max(6)?;
         sps.bit_depth_chroma_minus8 = r.read_ue_max(6)?;
         sps.log2_max_pic_order_cnt_lsb_minus4 = r.read_ue_max(12)?;
-        sps.sub_layer_ordering_info_present_flag = r.read_bit()?;
+        sps.sub_layers.sub_layer_ordering_info_present_flag = r.read_bit()?;
 
         {
-            let i = if sps.sub_layer_ordering_info_present_flag {
+            let i = if sps.sub_layers.sub_layer_ordering_info_present_flag {
                 0
             } else {
                 sps.max_sub_layers_minus1
@@ -3162,7 +3476,10 @@ impl Parser {
                 sps.max_latency_increase_plus1[j as usize] = r.read_ue_max(u32::MAX - 1)?;
             }
         }
+        Ok(())
+    }
 
+    fn parse_sps_block_geometry(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
         sps.log2_min_luma_coding_block_size_minus3 = r.read_ue_max(3)?;
         sps.log2_diff_max_min_luma_coding_block_size = r.read_ue_max(6)?;
         sps.log2_min_luma_transform_block_size_minus2 = r.read_ue_max(3)?;
@@ -3202,36 +3519,39 @@ impl Parser {
         sps.max_transform_hierarchy_depth_inter = r.read_ue_max(4)?;
         sps.max_transform_hierarchy_depth_intra = r.read_ue_max(4)?;
 
-        sps.scaling_list_enabled_flag = r.read_bit()?;
-        if sps.scaling_list_enabled_flag {
-            sps.scaling_list_data_present_flag = r.read_bit()?;
-            if sps.scaling_list_data_present_flag {
-                Self::parse_scaling_list_data(&mut sps.scaling_list, &mut r)?;
+        sps.scaling.scaling_list_enabled_flag = r.read_bit()?;
+        if sps.scaling.scaling_list_enabled_flag {
+            sps.scaling.scaling_list_data_present_flag = r.read_bit()?;
+            if sps.scaling.scaling_list_data_present_flag {
+                Self::parse_scaling_list_data(&mut sps.scaling_list, r)?;
             }
         }
 
-        sps.amp_enabled_flag = r.read_bit()?;
-        sps.sample_adaptive_offset_enabled_flag = r.read_bit()?;
+        sps.tools.amp_enabled_flag = r.read_bit()?;
+        sps.features.sample_adaptive_offset_enabled_flag = r.read_bit()?;
+        Ok(())
+    }
 
-        sps.pcm_enabled_flag = r.read_bit()?;
-        if sps.pcm_enabled_flag {
+    fn parse_sps_rps(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
+        sps.pcm.pcm_enabled_flag = r.read_bit()?;
+        if sps.pcm.pcm_enabled_flag {
             sps.pcm_sample_bit_depth_luma_minus1 = r.read_bits(4)?;
             sps.pcm_sample_bit_depth_chroma_minus1 = r.read_bits(4)?;
             sps.log2_min_pcm_luma_coding_block_size_minus3 = r.read_ue_max(2)?;
             sps.log2_diff_max_min_pcm_luma_coding_block_size = r.read_ue_max(2)?;
-            sps.pcm_loop_filter_disabled_flag = r.read_bit()?;
+            sps.pcm.pcm_loop_filter_disabled_flag = r.read_bit()?;
         }
 
         sps.num_short_term_ref_pic_sets = r.read_ue_max(64)?;
 
         for i in 0..sps.num_short_term_ref_pic_sets {
             let mut st = ShortTermRefPicSet::default();
-            Self::parse_short_term_ref_pic_set(&sps, &mut st, &mut r, i)?;
+            Self::parse_short_term_ref_pic_set(sps, &mut st, r, i)?;
             sps.short_term_ref_pic_set.push(st);
         }
 
-        sps.long_term_ref_pics_present_flag = r.read_bit()?;
-        if sps.long_term_ref_pics_present_flag {
+        sps.features.long_term_ref_pics_present_flag = r.read_bit()?;
+        if sps.features.long_term_ref_pics_present_flag {
             sps.num_long_term_ref_pics = r.read_ue_max(32)?;
             for i in 0..usize::from(sps.num_long_term_ref_pics) {
                 sps.lt_ref_pic_poc_lsb[i] =
@@ -3239,20 +3559,23 @@ impl Parser {
                 sps.used_by_curr_pic_lt_flag[i] = r.read_bit()?;
             }
         }
+        Ok(())
+    }
 
-        sps.temporal_mvp_enabled_flag = r.read_bit()?;
-        sps.strong_intra_smoothing_enabled_flag = r.read_bit()?;
+    fn parse_sps_tail(sps: &mut Sps, r: &mut BitReader) -> Result<(), String> {
+        sps.tools.temporal_mvp_enabled_flag = r.read_bit()?;
+        sps.tools.strong_intra_smoothing_enabled_flag = r.read_bit()?;
 
-        sps.vui_parameters_present_flag = r.read_bit()?;
-        if sps.vui_parameters_present_flag {
-            Self::parse_vui_parameters(&mut sps, &mut r)?;
+        sps.features.vui_parameters_present_flag = r.read_bit()?;
+        if sps.features.vui_parameters_present_flag {
+            Self::parse_vui_parameters(sps, r)?;
         }
 
-        sps.extension_present_flag = r.read_bit()?;
-        if sps.extension_present_flag {
-            sps.range_extension_flag = r.read_bit()?;
-            if sps.range_extension_flag {
-                Self::parse_sps_range_extension(&mut sps, &mut r)?;
+        sps.extensions.extension_present_flag = r.read_bit()?;
+        if sps.extensions.extension_present_flag {
+            sps.extensions.range_extension_flag = r.read_bit()?;
+            if sps.extensions.range_extension_flag {
+                Self::parse_sps_range_extension(sps, r)?;
             }
 
             let multilayer_extension_flag = r.read_bit()?;
@@ -3265,13 +3588,17 @@ impl Parser {
                 return Err("3D extension not supported.".into());
             }
 
-            sps.scc_extension_flag = r.read_bit()?;
-            if sps.scc_extension_flag {
-                Self::parse_sps_scc_extension(&mut sps, &mut r)?;
+            sps.extensions.scc_extension_flag = r.read_bit()?;
+            if sps.extensions.scc_extension_flag {
+                Self::parse_sps_scc_extension(sps, r)?;
             }
         }
 
-        let shift = if sps.range_extension.high_precision_offsets_enabled_flag {
+        let shift = if sps
+            .range_extension
+            .precision
+            .high_precision_offsets_enabled_flag
+        {
             sps.bit_depth_luma_minus8 + 7
         } else {
             7
@@ -3279,13 +3606,73 @@ impl Parser {
 
         sps.wp_offset_half_range_y = 1 << shift;
 
-        let shift = if sps.range_extension.high_precision_offsets_enabled_flag {
+        let shift = if sps
+            .range_extension
+            .precision
+            .high_precision_offsets_enabled_flag
+        {
             sps.bit_depth_chroma_minus8 + 7
         } else {
             7
         };
 
         sps.wp_offset_half_range_c = 1 << shift;
+        Ok(())
+    }
+
+    pub fn parse_sps(&mut self, nalu: &Nalu) -> Result<&Sps, String> {
+        if !matches!(nalu.header.type_, NaluType::SpsNut) {
+            return Err(format!(
+                "Invalid NALU type, expected {:?}, got {:?}",
+                NaluType::SpsNut,
+                nalu.header.type_
+            ));
+        }
+
+        let data = nalu.as_ref();
+        let header = &nalu.header;
+        let hdr_len = header.len();
+        // Skip the header
+        let mut r = BitReader::new(&data[hdr_len..], true);
+
+        let video_parameter_set_id = r.read_bits(4)?;
+
+        // A non-existing VPS means the SPS is not using any VPS.
+        let vps = self.get_vps(video_parameter_set_id).cloned();
+
+        let max_sub_layers_minus1 = r.read_bits(3)?;
+        let temporal_id_nesting_flag = r.read_bit()?;
+        let mut sps = Sps {
+            video_parameter_set_id,
+            max_sub_layers_minus1,
+            sub_layers: SpsSubLayers {
+                temporal_id_nesting_flag,
+                sub_layer_ordering_info_present_flag: false,
+            },
+            vps,
+            ..Default::default()
+        };
+        if sps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid max_sub_layers_minus1 {}",
+                sps.max_sub_layers_minus1
+            ));
+        }
+
+        Self::parse_profile_tier_level(
+            &mut sps.profile_tier_level,
+            &mut r,
+            true,
+            sps.max_sub_layers_minus1,
+        )?;
+
+        Self::parse_sps_dimensions(&mut sps, &mut r)?;
+
+        Self::parse_sps_block_geometry(&mut sps, &mut r)?;
+
+        Self::parse_sps_rps(&mut sps, &mut r)?;
+
+        Self::parse_sps_tail(&mut sps, &mut r)?;
 
         log::debug!(
             "Parsed SPS({}), resolution: ({}, {}): NAL size was {}",
@@ -3307,34 +3694,38 @@ impl Parser {
 
     fn parse_pps_scc_extension(pps: &mut Pps, sps: &Sps, r: &mut BitReader) -> Result<(), String> {
         let scc = &mut pps.scc_extension;
-        scc.curr_pic_ref_enabled_flag = r.read_bit()?;
-        scc.residual_adaptive_colour_transform_enabled_flag = r.read_bit()?;
-        if scc.residual_adaptive_colour_transform_enabled_flag {
-            scc.slice_act_qp_offsets_present_flag = r.read_bit()?;
+        scc.coding.curr_pic_ref_enabled_flag = r.read_bit()?;
+        scc.coding.residual_adaptive_colour_transform_enabled_flag = r.read_bit()?;
+        if scc.coding.residual_adaptive_colour_transform_enabled_flag {
+            scc.coding.slice_act_qp_offsets_present_flag = r.read_bit()?;
             scc.act_y_qp_offset_plus5 = r.read_se_bounded(-7, 17)?;
             scc.act_cb_qp_offset_plus5 = r.read_se_bounded(-7, 17)?;
             scc.act_cr_qp_offset_plus3 = r.read_se_bounded(-9, 15)?;
         }
 
-        scc.palette_predictor_initializers_present_flag = r.read_bit()?;
-        if scc.palette_predictor_initializers_present_flag {
+        scc.palette.palette_predictor_initializers_present_flag = r.read_bit()?;
+        if scc.palette.palette_predictor_initializers_present_flag {
             let max = sps.scc_extension.palette_max_size
                 + sps.scc_extension.delta_palette_max_predictor_size;
             scc.num_palette_predictor_initializers = r.read_ue_max(max.into())?;
             if scc.num_palette_predictor_initializers > 0 {
-                scc.monochrome_palette_flag = r.read_bit()?;
+                scc.palette.monochrome_palette_flag = r.read_bit()?;
                 scc.luma_bit_depth_entry_minus8 = r.read_ue_bounded(
                     sps.bit_depth_luma_minus8.into(),
                     sps.bit_depth_luma_minus8.into(),
                 )?;
-                if !scc.monochrome_palette_flag {
+                if !scc.palette.monochrome_palette_flag {
                     scc.chroma_bit_depth_entry_minus8 = r.read_ue_bounded(
                         sps.bit_depth_chroma_minus8.into(),
                         sps.bit_depth_chroma_minus8.into(),
                     )?;
                 }
 
-                let num_comps = if scc.monochrome_palette_flag { 1 } else { 3 };
+                let num_comps = if scc.palette.monochrome_palette_flag {
+                    1
+                } else {
+                    3
+                };
                 for comp in 0..num_comps {
                     let num_bits = if comp == 0 {
                         scc.luma_bit_depth_entry_minus8 + 8
@@ -3358,7 +3749,7 @@ impl Parser {
     ) -> Result<(), String> {
         let rext = &mut pps.range_extension;
 
-        if pps.transform_skip_enabled_flag {
+        if pps.transform.transform_skip_enabled_flag {
             rext.log2_max_transform_skip_block_size_minus2 =
                 r.read_ue_max(sps.max_tb_log2_size_y - 2)?;
         }
@@ -3384,84 +3775,12 @@ impl Parser {
     }
 
     /// Parse a PPS NALU.
-    pub fn parse_pps(&mut self, nalu: &Nalu) -> Result<&Pps, String> {
-        if !matches!(nalu.header.type_, NaluType::PpsNut) {
-            return Err(format!(
-                "Invalid NALU type, expected {:?}, got {:?}",
-                NaluType::PpsNut,
-                nalu.header.type_
-            ));
-        }
-
-        let data = nalu.as_ref();
-        let header = &nalu.header;
-        let hdr_len = header.len();
-        // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
-
-        let pic_parameter_set_id =
-            r.read_ue_max(u32::try_from(MAX_PPS_COUNT).map_err(|_| "pps count range")? - 1)?;
-        let seq_parameter_set_id =
-            r.read_ue_max(u32::try_from(MAX_SPS_COUNT).map_err(|_| "sps count range")? - 1)?;
-
-        let sps = self.get_sps(seq_parameter_set_id).ok_or::<String>(format!(
-            "Could not get SPS for seq_parameter_set_id {seq_parameter_set_id}"
-        ))?;
-
-        let mut pps = Pps {
-            pic_parameter_set_id,
-            seq_parameter_set_id,
-            dependent_slice_segments_enabled_flag: Default::default(),
-            output_flag_present_flag: Default::default(),
-            num_extra_slice_header_bits: Default::default(),
-            sign_data_hiding_enabled_flag: Default::default(),
-            cabac_init_present_flag: Default::default(),
-            num_ref_idx_l0_default_active_minus1: Default::default(),
-            num_ref_idx_l1_default_active_minus1: Default::default(),
-            init_qp_minus26: Default::default(),
-            constrained_intra_pred_flag: Default::default(),
-            transform_skip_enabled_flag: Default::default(),
-            cu_qp_delta_enabled_flag: Default::default(),
-            diff_cu_qp_delta_depth: Default::default(),
-            cb_qp_offset: Default::default(),
-            cr_qp_offset: Default::default(),
-            slice_chroma_qp_offsets_present_flag: Default::default(),
-            weighted_pred_flag: Default::default(),
-            weighted_bipred_flag: Default::default(),
-            transquant_bypass_enabled_flag: Default::default(),
-            tiles_enabled_flag: Default::default(),
-            entropy_coding_sync_enabled_flag: Default::default(),
-            num_tile_columns_minus1: Default::default(),
-            num_tile_rows_minus1: Default::default(),
-            uniform_spacing_flag: true,
-            column_width_minus1: Default::default(),
-            row_height_minus1: Default::default(),
-            loop_filter_across_tiles_enabled_flag: true,
-            loop_filter_across_slices_enabled_flag: Default::default(),
-            deblocking_filter_control_present_flag: Default::default(),
-            deblocking_filter_override_enabled_flag: Default::default(),
-            deblocking_filter_disabled_flag: Default::default(),
-            beta_offset_div2: Default::default(),
-            tc_offset_div2: Default::default(),
-            scaling_list_data_present_flag: Default::default(),
-            scaling_list: ScalingLists::default(),
-            lists_modification_present_flag: Default::default(),
-            log2_parallel_merge_level_minus2: Default::default(),
-            slice_segment_header_extension_present_flag: Default::default(),
-            extension_present_flag: Default::default(),
-            range_extension_flag: Default::default(),
-            range_extension: PpsRangeExtension::default(),
-            qp_bd_offset_y: Default::default(),
-            scc_extension: PpsSccExtension::default(),
-            scc_extension_flag: Default::default(),
-            sps: Rc::clone(sps),
-        };
-
-        pps.dependent_slice_segments_enabled_flag = r.read_bit()?;
-        pps.output_flag_present_flag = r.read_bit()?;
+    fn parse_pps_qp(pps: &mut Pps, sps: &Sps, r: &mut BitReader) -> Result<(), String> {
+        pps.presence.dependent_slice_segments_enabled_flag = r.read_bit()?;
+        pps.presence.output_flag_present_flag = r.read_bit()?;
         pps.num_extra_slice_header_bits = r.read_bits(3)?;
-        pps.sign_data_hiding_enabled_flag = r.read_bit()?;
-        pps.cabac_init_present_flag = r.read_bit()?;
+        pps.coding.sign_data_hiding_enabled_flag = r.read_bit()?;
+        pps.coding.cabac_init_present_flag = r.read_bit()?;
 
         // 7.4.7.1
         pps.num_ref_idx_l0_default_active_minus1 = r.read_ue_max(14)?;
@@ -3472,11 +3791,11 @@ impl Parser {
 
         pps.init_qp_minus26 = r.read_se_bounded(-(26 + qp_bd_offset_y), 25)?;
         pps.qp_bd_offset_y = u32::try_from(qp_bd_offset_y).map_err(|_| "qp offset range")?;
-        pps.constrained_intra_pred_flag = r.read_bit()?;
-        pps.transform_skip_enabled_flag = r.read_bit()?;
-        pps.cu_qp_delta_enabled_flag = r.read_bit()?;
+        pps.coding.constrained_intra_pred_flag = r.read_bit()?;
+        pps.transform.transform_skip_enabled_flag = r.read_bit()?;
+        pps.transform.cu_qp_delta_enabled_flag = r.read_bit()?;
 
-        if pps.cu_qp_delta_enabled_flag {
+        if pps.transform.cu_qp_delta_enabled_flag {
             pps.diff_cu_qp_delta_depth =
                 r.read_ue_max(u32::from(sps.log2_diff_max_min_luma_coding_block_size))?;
         }
@@ -3484,19 +3803,22 @@ impl Parser {
         pps.cb_qp_offset = r.read_se_bounded(-12, 12)?;
         pps.cr_qp_offset = r.read_se_bounded(-12, 12)?;
 
-        pps.slice_chroma_qp_offsets_present_flag = r.read_bit()?;
-        pps.weighted_pred_flag = r.read_bit()?;
-        pps.weighted_bipred_flag = r.read_bit()?;
-        pps.transquant_bypass_enabled_flag = r.read_bit()?;
-        pps.tiles_enabled_flag = r.read_bit()?;
-        pps.entropy_coding_sync_enabled_flag = r.read_bit()?;
+        pps.presence.slice_chroma_qp_offsets_present_flag = r.read_bit()?;
+        pps.prediction.weighted_pred_flag = r.read_bit()?;
+        pps.prediction.weighted_bipred_flag = r.read_bit()?;
+        pps.transform.transquant_bypass_enabled_flag = r.read_bit()?;
+        pps.tiles.tiles_enabled_flag = r.read_bit()?;
+        pps.tiles.entropy_coding_sync_enabled_flag = r.read_bit()?;
+        Ok(())
+    }
 
+    fn parse_pps_tiles(pps: &mut Pps, sps: &Sps, r: &mut BitReader) -> Result<(), String> {
         // A mix of the rbsp data and the algorithm in 6.5.1
-        if pps.tiles_enabled_flag {
+        if pps.tiles.tiles_enabled_flag {
             pps.num_tile_columns_minus1 = r.read_ue_max(sps.pic_width_in_ctbs_y - 1)?;
             pps.num_tile_rows_minus1 = r.read_ue_max(sps.pic_height_in_ctbs_y - 1)?;
-            pps.uniform_spacing_flag = r.read_bit()?;
-            if pps.uniform_spacing_flag {
+            pps.tiles.uniform_spacing_flag = r.read_bit()?;
+            if pps.tiles.uniform_spacing_flag {
                 let nrows = u32::from(pps.num_tile_rows_minus1) + 1;
                 let ncols = u32::from(pps.num_tile_columns_minus1) + 1;
 
@@ -3537,25 +3859,28 @@ impl Parser {
                 }
             }
 
-            pps.loop_filter_across_tiles_enabled_flag = r.read_bit()?;
+            pps.loop_filter.loop_filter_across_tiles_enabled_flag = r.read_bit()?;
         }
+        Ok(())
+    }
 
-        pps.loop_filter_across_slices_enabled_flag = r.read_bit()?;
-        pps.deblocking_filter_control_present_flag = r.read_bit()?;
+    fn parse_pps_tail(pps: &mut Pps, sps: &Sps, r: &mut BitReader) -> Result<(), String> {
+        pps.loop_filter.loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        pps.deblocking.deblocking_filter_control_present_flag = r.read_bit()?;
 
-        if pps.deblocking_filter_control_present_flag {
-            pps.deblocking_filter_override_enabled_flag = r.read_bit()?;
-            pps.deblocking_filter_disabled_flag = r.read_bit()?;
-            if !pps.deblocking_filter_disabled_flag {
+        if pps.deblocking.deblocking_filter_control_present_flag {
+            pps.deblocking.deblocking_filter_override_enabled_flag = r.read_bit()?;
+            pps.deblocking.deblocking_filter_disabled_flag = r.read_bit()?;
+            if !pps.deblocking.deblocking_filter_disabled_flag {
                 pps.beta_offset_div2 = r.read_se_bounded(-6, 6)?;
                 pps.tc_offset_div2 = r.read_se_bounded(-6, 6)?;
             }
         }
 
-        pps.scaling_list_data_present_flag = r.read_bit()?;
+        pps.headers.scaling_list_data_present_flag = r.read_bit()?;
 
-        if pps.scaling_list_data_present_flag {
-            Self::parse_scaling_list_data(&mut pps.scaling_list, &mut r)?;
+        if pps.headers.scaling_list_data_present_flag {
+            Self::parse_scaling_list_data(&mut pps.scaling_list, r)?;
         } else {
             for size_id in 0..4 {
                 let mut matrix_id = 0;
@@ -3567,16 +3892,16 @@ impl Parser {
             }
         }
 
-        pps.lists_modification_present_flag = r.read_bit()?;
+        pps.prediction.lists_modification_present_flag = r.read_bit()?;
         pps.log2_parallel_merge_level_minus2 = r.read_ue_max(sps.ctb_log2_size_y - 2)?;
-        pps.slice_segment_header_extension_present_flag = r.read_bit()?;
+        pps.headers.slice_segment_header_extension_present_flag = r.read_bit()?;
 
-        pps.extension_present_flag = r.read_bit()?;
-        if pps.extension_present_flag {
-            pps.range_extension_flag = r.read_bit()?;
+        pps.extensions.extension_present_flag = r.read_bit()?;
+        if pps.extensions.extension_present_flag {
+            pps.extensions.range_extension_flag = r.read_bit()?;
 
-            if pps.range_extension_flag {
-                Self::parse_pps_range_extension(&mut pps, sps, &mut r)?;
+            if pps.extensions.range_extension_flag {
+                Self::parse_pps_range_extension(pps, sps, r)?;
             }
 
             let multilayer_extension_flag = r.read_bit()?;
@@ -3589,13 +3914,84 @@ impl Parser {
                 return Err("3D extension is not supported".into());
             }
 
-            pps.scc_extension_flag = r.read_bit()?;
-            if pps.scc_extension_flag {
-                Self::parse_pps_scc_extension(&mut pps, sps, &mut r)?;
+            pps.extensions.scc_extension_flag = r.read_bit()?;
+            if pps.extensions.scc_extension_flag {
+                Self::parse_pps_scc_extension(pps, sps, r)?;
             }
 
             r.skip_bits(4)?; // pps_extension_4bits
         }
+        Ok(())
+    }
+
+    pub fn parse_pps(&mut self, nalu: &Nalu) -> Result<&Pps, String> {
+        if !matches!(nalu.header.type_, NaluType::PpsNut) {
+            return Err(format!(
+                "Invalid NALU type, expected {:?}, got {:?}",
+                NaluType::PpsNut,
+                nalu.header.type_
+            ));
+        }
+
+        let data = nalu.as_ref();
+        let header = &nalu.header;
+        let hdr_len = header.len();
+        // Skip the header
+        let mut r = BitReader::new(&data[hdr_len..], true);
+
+        let pic_parameter_set_id =
+            r.read_ue_max(u32::try_from(MAX_PPS_COUNT).map_err(|_| "pps count range")? - 1)?;
+        let seq_parameter_set_id =
+            r.read_ue_max(u32::try_from(MAX_SPS_COUNT).map_err(|_| "sps count range")? - 1)?;
+
+        let sps = self.get_sps(seq_parameter_set_id).ok_or::<String>(format!(
+            "Could not get SPS for seq_parameter_set_id {seq_parameter_set_id}"
+        ))?;
+
+        let mut pps = Pps {
+            pic_parameter_set_id,
+            seq_parameter_set_id,
+            presence: PpsPresence::default(),
+            num_extra_slice_header_bits: Default::default(),
+            coding: PpsCoding::default(),
+            num_ref_idx_l0_default_active_minus1: Default::default(),
+            num_ref_idx_l1_default_active_minus1: Default::default(),
+            init_qp_minus26: Default::default(),
+            transform: PpsTransform::default(),
+            diff_cu_qp_delta_depth: Default::default(),
+            cb_qp_offset: Default::default(),
+            cr_qp_offset: Default::default(),
+            prediction: PpsPrediction::default(),
+            tiles: PpsTiles {
+                uniform_spacing_flag: true,
+                ..PpsTiles::default()
+            },
+            num_tile_columns_minus1: Default::default(),
+            num_tile_rows_minus1: Default::default(),
+            column_width_minus1: Default::default(),
+            row_height_minus1: Default::default(),
+            loop_filter: PpsLoopFilter {
+                loop_filter_across_tiles_enabled_flag: true,
+                ..PpsLoopFilter::default()
+            },
+            deblocking: PpsDeblocking::default(),
+            beta_offset_div2: Default::default(),
+            tc_offset_div2: Default::default(),
+            headers: PpsHeaders::default(),
+            scaling_list: ScalingLists::default(),
+            log2_parallel_merge_level_minus2: Default::default(),
+            extensions: PpsExtensions::default(),
+            range_extension: PpsRangeExtension::default(),
+            qp_bd_offset_y: Default::default(),
+            scc_extension: PpsSccExtension::default(),
+            sps: Rc::clone(sps),
+        };
+
+        Self::parse_pps_qp(&mut pps, sps, &mut r)?;
+
+        Self::parse_pps_tiles(&mut pps, sps, &mut r)?;
+
+        Self::parse_pps_tail(&mut pps, sps, &mut r)?;
 
         log::debug!(
             "Parsed PPS({}), NAL size was {}",
@@ -3631,13 +4027,21 @@ impl Parser {
             })?;
         }
 
-        for i in 0..=usize::from(hdr.num_ref_idx_l0_active_minus1) {
-            pwt.luma_weight_l0_flag[i] = r.read_bit()?;
+        for flag in pwt
+            .luma_weight_l0_flag
+            .iter_mut()
+            .take(usize::from(hdr.num_ref_idx_l0_active_minus1) + 1)
+        {
+            *flag = r.read_bit()?;
         }
 
         if sps.chroma_array_type != 0 {
-            for i in 0..=usize::from(hdr.num_ref_idx_l0_active_minus1) {
-                pwt.chroma_weight_l0_flag[i] = r.read_bit()?;
+            for flag in pwt
+                .chroma_weight_l0_flag
+                .iter_mut()
+                .take(usize::from(hdr.num_ref_idx_l0_active_minus1) + 1)
+            {
+                *flag = r.read_bit()?;
             }
         }
 
@@ -3659,13 +4063,21 @@ impl Parser {
         }
 
         if hdr.type_.is_b() {
-            for i in 0..=usize::from(hdr.num_ref_idx_l1_active_minus1) {
-                pwt.luma_weight_l1_flag[i] = r.read_bit()?;
+            for flag in pwt
+                .luma_weight_l1_flag
+                .iter_mut()
+                .take(usize::from(hdr.num_ref_idx_l1_active_minus1) + 1)
+            {
+                *flag = r.read_bit()?;
             }
 
             if sps.chroma_format_idc != 0 {
-                for i in 0..=usize::from(hdr.num_ref_idx_l1_active_minus1) {
-                    pwt.chroma_weight_l1_flag[i] = r.read_bit()?;
+                for flag in pwt
+                    .chroma_weight_l1_flag
+                    .iter_mut()
+                    .take(usize::from(hdr.num_ref_idx_l1_active_minus1) + 1)
+                {
+                    *flag = r.read_bit()?;
                 }
             }
 
@@ -3742,15 +4154,373 @@ impl Parser {
     /// Further sets default values given `sps` and `pps`.
     pub fn slice_header_set_defaults(hdr: &mut SliceHeader, sps: &Sps, pps: &Pps) {
         // Set some defaults that can't be defined in Default::default().
-        hdr.deblocking_filter_disabled_flag = pps.deblocking_filter_disabled_flag;
+        hdr.deblocking.deblocking_filter_disabled_flag =
+            pps.deblocking.deblocking_filter_disabled_flag;
         hdr.beta_offset_div2 = pps.beta_offset_div2;
         hdr.tc_offset_div2 = pps.tc_offset_div2;
-        hdr.loop_filter_across_slices_enabled_flag = pps.loop_filter_across_slices_enabled_flag;
+        hdr.deblocking.loop_filter_across_slices_enabled_flag =
+            pps.loop_filter.loop_filter_across_slices_enabled_flag;
         hdr.curr_rps_idx = sps.num_short_term_ref_pic_sets;
-        hdr.use_integer_mv_flag = sps.scc_extension.motion_vector_resolution_control_idc != 0;
+        hdr.coding.use_integer_mv_flag =
+            sps.scc_extension.motion_vector_resolution_control_idc != 0;
     }
 
     /// Parses a slice header from a slice NALU.
+    fn parse_slice_poc_and_st_rps(
+        hdr: &mut SliceHeader,
+        sps: &Sps,
+        r: &mut BitReader,
+    ) -> Result<(), String> {
+        let num_bits = usize::from(sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
+        hdr.pic_order_cnt_lsb = r.read_bits(num_bits)?;
+
+        if u32::from(hdr.pic_order_cnt_lsb)
+            > 2u32.pow(u32::from(sps.log2_max_pic_order_cnt_lsb_minus4 + 4))
+        {
+            return Err(format!(
+                "Invalid pic_order_cnt_lsb {}",
+                hdr.pic_order_cnt_lsb
+            ));
+        }
+
+        hdr.refs.short_term_ref_pic_set_sps_flag = r.read_bit()?;
+
+        if !hdr.refs.short_term_ref_pic_set_sps_flag {
+            let epb_before = r.num_epb();
+            let bits_left_before = r.num_bits_left();
+
+            let st_rps_idx = sps.num_short_term_ref_pic_sets;
+
+            Self::parse_short_term_ref_pic_set(
+                sps,
+                &mut hdr.short_term_ref_pic_set,
+                r,
+                st_rps_idx,
+            )?;
+
+            hdr.st_rps_bits = u32::try_from(
+                (bits_left_before - r.num_bits_left()) - 8 * (r.num_epb() - epb_before),
+            )
+            .map_err(|_| "rps bits range")?;
+        } else if sps.num_short_term_ref_pic_sets > 1 {
+            let num_bits = ceil_log2(u32::from(sps.num_short_term_ref_pic_sets));
+            hdr.short_term_ref_pic_set_idx = r.read_bits(num_bits)?;
+
+            if hdr.short_term_ref_pic_set_idx > sps.num_short_term_ref_pic_sets - 1 {
+                return Err(format!(
+                    "Invalid short_term_ref_pic_set_idx {}",
+                    hdr.short_term_ref_pic_set_idx
+                ));
+            }
+        }
+
+        if hdr.refs.short_term_ref_pic_set_sps_flag {
+            hdr.curr_rps_idx = hdr.short_term_ref_pic_set_idx;
+        }
+        Ok(())
+    }
+
+    fn parse_slice_lt_rps(
+        hdr: &mut SliceHeader,
+        sps: &Sps,
+        r: &mut BitReader,
+    ) -> Result<(), String> {
+        if sps.features.long_term_ref_pics_present_flag {
+            if sps.num_long_term_ref_pics > 0 {
+                hdr.num_long_term_sps = r.read_ue_max(u32::from(sps.num_long_term_ref_pics))?;
+            }
+
+            hdr.num_long_term_pics = r.read_ue_max(
+                u32::try_from(MAX_LONG_TERM_REF_PIC_SETS).map_err(|_| "lt pics range")?
+                    - u32::from(hdr.num_long_term_sps),
+            )?;
+
+            let num_lt = hdr.num_long_term_sps + hdr.num_long_term_pics;
+            for i in 0..usize::from(num_lt) {
+                // The variables `PocLsbLt[ i ]` and `UsedByCurrPicLt[ i ]` are derived as follows:
+                //
+                // – If i is less than num_long_term_sps, `PocLsbLt[ i ]` is set equal to
+                // lt_ref_pic_poc_lsb[ `lt_idx_sps[ i ]` ] and `UsedByCurrPicLt[ i ]` is set equal
+                // to used_by_curr_pic_lt_flag[ `lt_idx_sps[ i ]` ].
+                //
+                // – Otherwise, `PocLsbLt[ i ]`
+                // is set equal to `poc_lsb_lt[ i ]` and `UsedByCurrPicLt[ i ]` is set equal to
+                // `used_by_curr_pic_lt_flag[ i ]`.
+                if i < usize::from(hdr.num_long_term_sps) {
+                    if sps.num_long_term_ref_pics > 1 {
+                        let num_bits = ceil_log2(u32::from(sps.num_long_term_ref_pics));
+
+                        hdr.lt_idx_sps[i] = r.read_bits(num_bits)?;
+
+                        if hdr.lt_idx_sps[i] > sps.num_long_term_ref_pics - 1 {
+                            return Err(format!("Invalid lt_idx_sps[{}] {}", i, hdr.lt_idx_sps[i]));
+                        }
+                    }
+
+                    hdr.poc_lsb_lt[i] = sps.lt_ref_pic_poc_lsb[usize::from(hdr.lt_idx_sps[i])];
+                    hdr.used_by_curr_pic_lt[i] =
+                        sps.used_by_curr_pic_lt_flag[usize::from(hdr.lt_idx_sps[i])];
+                } else {
+                    let num_bits = usize::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4;
+                    hdr.poc_lsb_lt[i] = r.read_bits(num_bits)?;
+                    hdr.used_by_curr_pic_lt[i] = r.read_bit()?;
+                }
+
+                hdr.delta_poc_msb_present_flag[i] = r.read_bit()?;
+                if hdr.delta_poc_msb_present_flag[i] {
+                    // The value of `delta_poc_msb_cycle_lt[ i ]` shall be
+                    // in the range of 0 to 2(32 −
+                    // log2_max_pic_order_cnt_lsb_minus4 − 4 ),
+                    // inclusive. When `delta_poc_msb_cycle_lt[ i ]` is
+                    // not present, it is inferred to be equal to 0.
+                    let max = 2u32.pow(32 - u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) - 4);
+                    hdr.delta_poc_msb_cycle_lt[i] = r.read_ue_max(max)?;
+                }
+                // Equation 7-52 (simplified)
+                if i != 0 && i != usize::from(hdr.num_long_term_sps) {
+                    hdr.delta_poc_msb_cycle_lt[i] += hdr.delta_poc_msb_cycle_lt[i - 1];
+                }
+            }
+        }
+
+        if sps.tools.temporal_mvp_enabled_flag {
+            hdr.motion.temporal_mvp_enabled_flag = r.read_bit()?;
+        }
+        Ok(())
+    }
+
+    fn parse_slice_ref_counts(
+        hdr: &mut SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        r: &mut BitReader,
+    ) -> Result<(), String> {
+        hdr.refs.num_ref_idx_active_override_flag = r.read_bit()?;
+        if hdr.refs.num_ref_idx_active_override_flag {
+            hdr.num_ref_idx_l0_active_minus1 = r.read_ue_max(MAX_REF_IDX_ACTIVE - 1)?;
+            if hdr.type_.is_b() {
+                hdr.num_ref_idx_l1_active_minus1 = r.read_ue_max(MAX_REF_IDX_ACTIVE - 1)?;
+            }
+        } else {
+            hdr.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+            hdr.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+        }
+
+        // 7-57
+        let mut num_pic_total_curr = 0;
+        let rps = if hdr.refs.short_term_ref_pic_set_sps_flag {
+            sps.short_term_ref_pic_set
+                .get(usize::from(hdr.curr_rps_idx))
+                .ok_or::<String>("Invalid RPS".into())?
+        } else {
+            &hdr.short_term_ref_pic_set
+        };
+
+        for used in rps
+            .used_by_curr_pic_s0
+            .iter()
+            .take(usize::from(rps.num_negative_pics))
+        {
+            if *used {
+                num_pic_total_curr += 1;
+            }
+        }
+
+        for used in rps
+            .used_by_curr_pic_s1
+            .iter()
+            .take(usize::from(rps.num_positive_pics))
+        {
+            if *used {
+                num_pic_total_curr += 1;
+            }
+        }
+
+        for used in hdr.used_by_curr_pic_lt.iter().take(usize::from(
+            hdr.num_long_term_sps.saturating_add(hdr.num_long_term_pics),
+        )) {
+            if *used {
+                num_pic_total_curr += 1;
+            }
+        }
+
+        if pps.scc_extension.coding.curr_pic_ref_enabled_flag {
+            num_pic_total_curr += 1;
+        }
+
+        hdr.num_pic_total_curr = num_pic_total_curr;
+
+        if pps.prediction.lists_modification_present_flag && hdr.num_pic_total_curr > 1 {
+            Self::parse_ref_pic_lists_modification(hdr, r)?;
+        }
+        Ok(())
+    }
+
+    fn parse_slice_inter_tail(
+        hdr: &mut SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        r: &mut BitReader,
+    ) -> Result<(), String> {
+        if hdr.type_.is_b() {
+            hdr.motion.mvd_l1_zero_flag = r.read_bit()?;
+        }
+
+        if pps.coding.cabac_init_present_flag {
+            hdr.coding.cabac_init_flag = r.read_bit()?;
+        }
+
+        if hdr.motion.temporal_mvp_enabled_flag {
+            if hdr.type_.is_b() {
+                hdr.motion.collocated_from_l0_flag = r.read_bit()?;
+            }
+
+            if (hdr.motion.collocated_from_l0_flag && hdr.num_ref_idx_l0_active_minus1 > 0)
+                || (!hdr.motion.collocated_from_l0_flag && hdr.num_ref_idx_l1_active_minus1 > 0)
+            {
+                let max = if (hdr.type_.is_p() || hdr.type_.is_b())
+                    && hdr.motion.collocated_from_l0_flag
+                {
+                    hdr.num_ref_idx_l0_active_minus1
+                } else if hdr.type_.is_b() && !hdr.motion.collocated_from_l0_flag {
+                    hdr.num_ref_idx_l1_active_minus1
+                } else {
+                    return Err("Invalid value for collocated_ref_idx".into());
+                };
+
+                {
+                    hdr.collocated_ref_idx = r.read_ue_max(u32::from(max))?;
+                }
+            }
+        }
+
+        if (pps.prediction.weighted_pred_flag && hdr.type_.is_p())
+            || (pps.prediction.weighted_bipred_flag && hdr.type_.is_b())
+        {
+            Self::parse_pred_weight_table(hdr, r, sps)?;
+        }
+
+        hdr.five_minus_max_num_merge_cand = r.read_ue()?;
+
+        if sps.scc_extension.motion_vector_resolution_control_idc == 2 {
+            hdr.coding.use_integer_mv_flag = r.read_bit()?;
+        }
+        Ok(())
+    }
+
+    fn parse_slice_qp_tail(
+        hdr: &mut SliceHeader,
+        pps: &Pps,
+        r: &mut BitReader,
+    ) -> Result<(), String> {
+        hdr.qp_delta = r.read_se_bounded(-87, 77)?;
+
+        let slice_qp_y = i32::from(26 + pps.init_qp_minus26 + hdr.qp_delta);
+        if slice_qp_y < -pps.qp_bd_offset_y.cast_signed() || slice_qp_y > 51 {
+            return Err(format!("Invalid slice_qp_delta: {}", hdr.qp_delta));
+        }
+
+        if pps.presence.slice_chroma_qp_offsets_present_flag {
+            hdr.cb_qp_offset = r.read_se_bounded(-12, 12)?;
+
+            let qp_offset = pps.cb_qp_offset + hdr.cb_qp_offset;
+            if !(-12..=12).contains(&qp_offset) {
+                return Err(format!(
+                    "Invalid value for slice_cb_qp_offset: {}",
+                    hdr.cb_qp_offset
+                ));
+            }
+
+            hdr.cr_qp_offset = r.read_se_bounded(-12, 12)?;
+
+            let qp_offset = pps.cr_qp_offset + hdr.cr_qp_offset;
+            if !(-12..=12).contains(&qp_offset) {
+                return Err(format!(
+                    "Invalid value for slice_cr_qp_offset: {}",
+                    hdr.cr_qp_offset
+                ));
+            }
+        }
+
+        if pps.scc_extension.coding.slice_act_qp_offsets_present_flag {
+            hdr.slice_act_y_qp_offset = r.read_se_bounded(-12, 12)?;
+            hdr.slice_act_cb_qp_offset = r.read_se_bounded(-12, 12)?;
+            hdr.slice_act_cr_qp_offset = r.read_se_bounded(-12, 12)?;
+        }
+
+        if pps.range_extension.chroma_qp_offset_list_enabled_flag {
+            hdr.coding.cu_chroma_qp_offset_enabled_flag = r.read_bit()?;
+        }
+
+        if pps.deblocking.deblocking_filter_override_enabled_flag {
+            hdr.deblocking.deblocking_filter_override_flag = r.read_bit()?;
+        }
+
+        if hdr.deblocking.deblocking_filter_override_flag {
+            hdr.deblocking.deblocking_filter_disabled_flag = r.read_bit()?;
+            if !hdr.deblocking.deblocking_filter_disabled_flag {
+                hdr.beta_offset_div2 = r.read_se_bounded(-6, 6)?;
+                hdr.tc_offset_div2 = r.read_se_bounded(-6, 6)?;
+            }
+        }
+
+        if pps.loop_filter.loop_filter_across_slices_enabled_flag
+            && (hdr.sao.sao_luma_flag
+                || hdr.sao.sao_chroma_flag
+                || !hdr.deblocking.deblocking_filter_disabled_flag)
+        {
+            hdr.deblocking.loop_filter_across_slices_enabled_flag = r.read_bit()?;
+        }
+        Ok(())
+    }
+
+    fn parse_slice_entry_points(
+        hdr: &mut SliceHeader,
+        sps: &Sps,
+        pps: &Pps,
+        r: &mut BitReader,
+        nalu_size: usize,
+    ) -> Result<(), String> {
+        if pps.tiles.tiles_enabled_flag || pps.tiles.entropy_coding_sync_enabled_flag {
+            let max = if !pps.tiles.tiles_enabled_flag && pps.tiles.entropy_coding_sync_enabled_flag
+            {
+                sps.pic_height_in_ctbs_y - 1
+            } else if pps.tiles.tiles_enabled_flag && !pps.tiles.entropy_coding_sync_enabled_flag {
+                u32::from((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1) - 1)
+            } else {
+                (u32::from(pps.num_tile_columns_minus1) + 1) * sps.pic_height_in_ctbs_y - 1
+            };
+
+            hdr.num_entry_point_offsets = r.read_ue_max(max)?;
+            if hdr.num_entry_point_offsets > 0 {
+                hdr.offset_len_minus1 = r.read_ue_max(31)?;
+                for i in 0..hdr.num_entry_point_offsets as usize {
+                    let num_bits = usize::from(hdr.offset_len_minus1 + 1);
+                    hdr.entry_point_offset_minus1[i] = r.read_bits(num_bits)?;
+                }
+            }
+        }
+
+        if pps.headers.slice_segment_header_extension_present_flag {
+            let segment_header_extension_length = r.read_ue_max(256)?;
+            for _ in 0..segment_header_extension_length {
+                r.skip_bits(8)?; // slice_segment_header_extension_data_byte[i]
+            }
+        }
+
+        // byte_alignment()
+        r.skip_bits(1)?; // Alignment bit
+        let num_bits = r.num_bits_left() % 8;
+        r.skip_bits(num_bits)?;
+
+        let epb = r.num_epb();
+        hdr.header_bit_size = u32::try_from((nalu_size - epb) * 8 - r.num_bits_left())
+            .map_err(|_| "header bits range")?;
+
+        hdr.n_emulation_prevention_bytes = u32::try_from(epb).map_err(|_| "epb count range")?;
+        Ok(())
+    }
+
     pub fn parse_slice_header<'a>(&mut self, nalu: Nalu<'a>) -> Result<Slice<'a>, String> {
         if !matches!(
             nalu.header.type_,
@@ -3783,13 +4553,17 @@ impl Parser {
         // Skip the header
         let mut r = BitReader::new(&data[hdr_len..], true);
 
+        let first_slice_segment_in_pic_flag = r.read_bit()?;
         let mut hdr = SliceHeader {
-            first_slice_segment_in_pic_flag: r.read_bit()?,
+            position: SlicePosition {
+                first_slice_segment_in_pic_flag,
+                ..SlicePosition::default()
+            },
             ..Default::default()
         };
 
         if nalu.header.type_.is_irap() {
-            hdr.no_output_of_prior_pics_flag = r.read_bit()?;
+            hdr.output.no_output_of_prior_pics_flag = r.read_bit()?;
         }
 
         hdr.pic_parameter_set_id = r.read_ue_max(63)?;
@@ -3805,9 +4579,9 @@ impl Parser {
 
         Self::slice_header_set_defaults(&mut hdr, sps, pps);
 
-        if !hdr.first_slice_segment_in_pic_flag {
-            if pps.dependent_slice_segments_enabled_flag {
-                hdr.dependent_slice_segment_flag = r.read_bit()?;
+        if !hdr.position.first_slice_segment_in_pic_flag {
+            if pps.presence.dependent_slice_segments_enabled_flag {
+                hdr.position.dependent_slice_segment_flag = r.read_bit()?;
             }
 
             let num_bits = ceil_log2(sps.pic_size_in_ctbs_y);
@@ -3821,335 +4595,43 @@ impl Parser {
             }
         }
 
-        if !hdr.dependent_slice_segment_flag {
+        if !hdr.position.dependent_slice_segment_flag {
             r.skip_bits(usize::from(pps.num_extra_slice_header_bits))?;
 
             let slice_type: u32 = r.read_ue()?;
             hdr.type_ = SliceType::try_from(slice_type)?;
 
-            if pps.output_flag_present_flag {
-                hdr.pic_output_flag = r.read_bit()?;
+            if pps.presence.output_flag_present_flag {
+                hdr.output.pic_output_flag = r.read_bit()?;
             }
 
-            if sps.separate_colour_plane_flag {
+            if sps.format.separate_colour_plane_flag {
                 hdr.colour_plane_id = r.read_bits(2)?;
             }
 
             if !matches!(nalu_header.type_, NaluType::IdrWRadl | NaluType::IdrNLp) {
-                let num_bits = usize::from(sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
-                hdr.pic_order_cnt_lsb = r.read_bits(num_bits)?;
+                Self::parse_slice_poc_and_st_rps(&mut hdr, sps, &mut r)?;
 
-                if u32::from(hdr.pic_order_cnt_lsb)
-                    > 2u32.pow(u32::from(sps.log2_max_pic_order_cnt_lsb_minus4 + 4))
-                {
-                    return Err(format!(
-                        "Invalid pic_order_cnt_lsb {}",
-                        hdr.pic_order_cnt_lsb
-                    ));
-                }
-
-                hdr.short_term_ref_pic_set_sps_flag = r.read_bit()?;
-
-                if !hdr.short_term_ref_pic_set_sps_flag {
-                    let epb_before = r.num_epb();
-                    let bits_left_before = r.num_bits_left();
-
-                    let st_rps_idx = sps.num_short_term_ref_pic_sets;
-
-                    Self::parse_short_term_ref_pic_set(
-                        sps,
-                        &mut hdr.short_term_ref_pic_set,
-                        &mut r,
-                        st_rps_idx,
-                    )?;
-
-                    hdr.st_rps_bits = u32::try_from(
-                        (bits_left_before - r.num_bits_left()) - 8 * (r.num_epb() - epb_before),
-                    )
-                    .map_err(|_| "rps bits range")?;
-                } else if sps.num_short_term_ref_pic_sets > 1 {
-                    let num_bits = ceil_log2(u32::from(sps.num_short_term_ref_pic_sets));
-                    hdr.short_term_ref_pic_set_idx = r.read_bits(num_bits)?;
-
-                    if hdr.short_term_ref_pic_set_idx > sps.num_short_term_ref_pic_sets - 1 {
-                        return Err(format!(
-                            "Invalid short_term_ref_pic_set_idx {}",
-                            hdr.short_term_ref_pic_set_idx
-                        ));
-                    }
-                }
-
-                if hdr.short_term_ref_pic_set_sps_flag {
-                    hdr.curr_rps_idx = hdr.short_term_ref_pic_set_idx;
-                }
-
-                if sps.long_term_ref_pics_present_flag {
-                    if sps.num_long_term_ref_pics > 0 {
-                        hdr.num_long_term_sps =
-                            r.read_ue_max(u32::from(sps.num_long_term_ref_pics))?;
-                    }
-
-                    hdr.num_long_term_pics = r.read_ue_max(
-                        u32::try_from(MAX_LONG_TERM_REF_PIC_SETS).map_err(|_| "lt pics range")?
-                            - u32::from(hdr.num_long_term_sps),
-                    )?;
-
-                    let num_lt = hdr.num_long_term_sps + hdr.num_long_term_pics;
-                    for i in 0..usize::from(num_lt) {
-                        // The variables `PocLsbLt[ i ]` and `UsedByCurrPicLt[ i ]` are derived as follows:
-                        //
-                        // – If i is less than num_long_term_sps, `PocLsbLt[ i ]` is set equal to
-                        // lt_ref_pic_poc_lsb[ `lt_idx_sps[ i ]` ] and `UsedByCurrPicLt[ i ]` is set equal
-                        // to used_by_curr_pic_lt_flag[ `lt_idx_sps[ i ]` ].
-                        //
-                        // – Otherwise, `PocLsbLt[ i ]`
-                        // is set equal to `poc_lsb_lt[ i ]` and `UsedByCurrPicLt[ i ]` is set equal to
-                        // `used_by_curr_pic_lt_flag[ i ]`.
-                        if i < usize::from(hdr.num_long_term_sps) {
-                            if sps.num_long_term_ref_pics > 1 {
-                                let num_bits = ceil_log2(u32::from(sps.num_long_term_ref_pics));
-
-                                hdr.lt_idx_sps[i] = r.read_bits(num_bits)?;
-
-                                if hdr.lt_idx_sps[i] > sps.num_long_term_ref_pics - 1 {
-                                    return Err(format!(
-                                        "Invalid lt_idx_sps[{}] {}",
-                                        i, hdr.lt_idx_sps[i]
-                                    ));
-                                }
-                            }
-
-                            hdr.poc_lsb_lt[i] =
-                                sps.lt_ref_pic_poc_lsb[usize::from(hdr.lt_idx_sps[i])];
-                            hdr.used_by_curr_pic_lt[i] =
-                                sps.used_by_curr_pic_lt_flag[usize::from(hdr.lt_idx_sps[i])];
-                        } else {
-                            let num_bits = usize::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4;
-                            hdr.poc_lsb_lt[i] = r.read_bits(num_bits)?;
-                            hdr.used_by_curr_pic_lt[i] = r.read_bit()?;
-                        }
-
-                        hdr.delta_poc_msb_present_flag[i] = r.read_bit()?;
-                        if hdr.delta_poc_msb_present_flag[i] {
-                            // The value of `delta_poc_msb_cycle_lt[ i ]` shall be
-                            // in the range of 0 to 2(32 −
-                            // log2_max_pic_order_cnt_lsb_minus4 − 4 ),
-                            // inclusive. When `delta_poc_msb_cycle_lt[ i ]` is
-                            // not present, it is inferred to be equal to 0.
-                            let max =
-                                2u32.pow(32 - u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) - 4);
-                            hdr.delta_poc_msb_cycle_lt[i] = r.read_ue_max(max)?;
-                        }
-                        // Equation 7-52 (simplified)
-                        if i != 0 && i != usize::from(hdr.num_long_term_sps) {
-                            hdr.delta_poc_msb_cycle_lt[i] += hdr.delta_poc_msb_cycle_lt[i - 1];
-                        }
-                    }
-                }
-
-                if sps.temporal_mvp_enabled_flag {
-                    hdr.temporal_mvp_enabled_flag = r.read_bit()?;
-                }
+                Self::parse_slice_lt_rps(&mut hdr, sps, &mut r)?;
             }
 
-            if sps.sample_adaptive_offset_enabled_flag {
-                hdr.sao_luma_flag = r.read_bit()?;
+            if sps.features.sample_adaptive_offset_enabled_flag {
+                hdr.sao.sao_luma_flag = r.read_bit()?;
                 if sps.chroma_array_type != 0 {
-                    hdr.sao_chroma_flag = r.read_bit()?;
+                    hdr.sao.sao_chroma_flag = r.read_bit()?;
                 }
             }
 
             if hdr.type_.is_p() || hdr.type_.is_b() {
-                hdr.num_ref_idx_active_override_flag = r.read_bit()?;
-                if hdr.num_ref_idx_active_override_flag {
-                    hdr.num_ref_idx_l0_active_minus1 = r.read_ue_max(MAX_REF_IDX_ACTIVE - 1)?;
-                    if hdr.type_.is_b() {
-                        hdr.num_ref_idx_l1_active_minus1 = r.read_ue_max(MAX_REF_IDX_ACTIVE - 1)?;
-                    }
-                } else {
-                    hdr.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
-                    hdr.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
-                }
+                Self::parse_slice_ref_counts(&mut hdr, sps, pps, &mut r)?;
 
-                // 7-57
-                let mut num_pic_total_curr = 0;
-                let rps = if hdr.short_term_ref_pic_set_sps_flag {
-                    sps.short_term_ref_pic_set
-                        .get(usize::from(hdr.curr_rps_idx))
-                        .ok_or::<String>("Invalid RPS".into())?
-                } else {
-                    &hdr.short_term_ref_pic_set
-                };
-
-                for i in 0..usize::from(rps.num_negative_pics) {
-                    if rps.used_by_curr_pic_s0[i] {
-                        num_pic_total_curr += 1;
-                    }
-                }
-
-                for i in 0..usize::from(rps.num_positive_pics) {
-                    if rps.used_by_curr_pic_s1[i] {
-                        num_pic_total_curr += 1;
-                    }
-                }
-
-                for i in 0..usize::from(hdr.num_long_term_sps + hdr.num_long_term_pics) {
-                    if hdr.used_by_curr_pic_lt[i] {
-                        num_pic_total_curr += 1;
-                    }
-                }
-
-                if pps.scc_extension.curr_pic_ref_enabled_flag {
-                    num_pic_total_curr += 1;
-                }
-
-                hdr.num_pic_total_curr = num_pic_total_curr;
-
-                if pps.lists_modification_present_flag && hdr.num_pic_total_curr > 1 {
-                    Self::parse_ref_pic_lists_modification(&mut hdr, &mut r)?;
-                }
-
-                if hdr.type_.is_b() {
-                    hdr.mvd_l1_zero_flag = r.read_bit()?;
-                }
-
-                if pps.cabac_init_present_flag {
-                    hdr.cabac_init_flag = r.read_bit()?;
-                }
-
-                if hdr.temporal_mvp_enabled_flag {
-                    if hdr.type_.is_b() {
-                        hdr.collocated_from_l0_flag = r.read_bit()?;
-                    }
-
-                    if (hdr.collocated_from_l0_flag && hdr.num_ref_idx_l0_active_minus1 > 0)
-                        || (!hdr.collocated_from_l0_flag && hdr.num_ref_idx_l1_active_minus1 > 0)
-                    {
-                        let max = if (hdr.type_.is_p() || hdr.type_.is_b())
-                            && hdr.collocated_from_l0_flag
-                        {
-                            hdr.num_ref_idx_l0_active_minus1
-                        } else if hdr.type_.is_b() && !hdr.collocated_from_l0_flag {
-                            hdr.num_ref_idx_l1_active_minus1
-                        } else {
-                            return Err("Invalid value for collocated_ref_idx".into());
-                        };
-
-                        {
-                            hdr.collocated_ref_idx = r.read_ue_max(u32::from(max))?;
-                        }
-                    }
-                }
-
-                if (pps.weighted_pred_flag && hdr.type_.is_p())
-                    || (pps.weighted_bipred_flag && hdr.type_.is_b())
-                {
-                    Self::parse_pred_weight_table(&mut hdr, &mut r, sps)?;
-                }
-
-                hdr.five_minus_max_num_merge_cand = r.read_ue()?;
-
-                if sps.scc_extension.motion_vector_resolution_control_idc == 2 {
-                    hdr.use_integer_mv_flag = r.read_bit()?;
-                }
+                Self::parse_slice_inter_tail(&mut hdr, sps, pps, &mut r)?;
             }
 
-            hdr.qp_delta = r.read_se_bounded(-87, 77)?;
-
-            let slice_qp_y = i32::from(26 + pps.init_qp_minus26 + hdr.qp_delta);
-            if slice_qp_y < -pps.qp_bd_offset_y.cast_signed() || slice_qp_y > 51 {
-                return Err(format!("Invalid slice_qp_delta: {}", hdr.qp_delta));
-            }
-
-            if pps.slice_chroma_qp_offsets_present_flag {
-                hdr.cb_qp_offset = r.read_se_bounded(-12, 12)?;
-
-                let qp_offset = pps.cb_qp_offset + hdr.cb_qp_offset;
-                if !(-12..=12).contains(&qp_offset) {
-                    return Err(format!(
-                        "Invalid value for slice_cb_qp_offset: {}",
-                        hdr.cb_qp_offset
-                    ));
-                }
-
-                hdr.cr_qp_offset = r.read_se_bounded(-12, 12)?;
-
-                let qp_offset = pps.cr_qp_offset + hdr.cr_qp_offset;
-                if !(-12..=12).contains(&qp_offset) {
-                    return Err(format!(
-                        "Invalid value for slice_cr_qp_offset: {}",
-                        hdr.cr_qp_offset
-                    ));
-                }
-            }
-
-            if pps.scc_extension.slice_act_qp_offsets_present_flag {
-                hdr.slice_act_y_qp_offset = r.read_se_bounded(-12, 12)?;
-                hdr.slice_act_cb_qp_offset = r.read_se_bounded(-12, 12)?;
-                hdr.slice_act_cr_qp_offset = r.read_se_bounded(-12, 12)?;
-            }
-
-            if pps.range_extension.chroma_qp_offset_list_enabled_flag {
-                hdr.cu_chroma_qp_offset_enabled_flag = r.read_bit()?;
-            }
-
-            if pps.deblocking_filter_override_enabled_flag {
-                hdr.deblocking_filter_override_flag = r.read_bit()?;
-            }
-
-            if hdr.deblocking_filter_override_flag {
-                hdr.deblocking_filter_disabled_flag = r.read_bit()?;
-                if !hdr.deblocking_filter_disabled_flag {
-                    hdr.beta_offset_div2 = r.read_se_bounded(-6, 6)?;
-                    hdr.tc_offset_div2 = r.read_se_bounded(-6, 6)?;
-                }
-            }
-
-            if pps.loop_filter_across_slices_enabled_flag
-                && (hdr.sao_luma_flag
-                    || hdr.sao_chroma_flag
-                    || !hdr.deblocking_filter_disabled_flag)
-            {
-                hdr.loop_filter_across_slices_enabled_flag = r.read_bit()?;
-            }
+            Self::parse_slice_qp_tail(&mut hdr, pps, &mut r)?;
         }
 
-        if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
-            let max = if !pps.tiles_enabled_flag && pps.entropy_coding_sync_enabled_flag {
-                sps.pic_height_in_ctbs_y - 1
-            } else if pps.tiles_enabled_flag && !pps.entropy_coding_sync_enabled_flag {
-                u32::from((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1) - 1)
-            } else {
-                (u32::from(pps.num_tile_columns_minus1) + 1) * sps.pic_height_in_ctbs_y - 1
-            };
-
-            hdr.num_entry_point_offsets = r.read_ue_max(max)?;
-            if hdr.num_entry_point_offsets > 0 {
-                hdr.offset_len_minus1 = r.read_ue_max(31)?;
-                for i in 0..hdr.num_entry_point_offsets as usize {
-                    let num_bits = usize::from(hdr.offset_len_minus1 + 1);
-                    hdr.entry_point_offset_minus1[i] = r.read_bits(num_bits)?;
-                }
-            }
-        }
-
-        if pps.slice_segment_header_extension_present_flag {
-            let segment_header_extension_length = r.read_ue_max(256)?;
-            for _ in 0..segment_header_extension_length {
-                r.skip_bits(8)?; // slice_segment_header_extension_data_byte[i]
-            }
-        }
-
-        // byte_alignment()
-        r.skip_bits(1)?; // Alignment bit
-        let num_bits = r.num_bits_left() % 8;
-        r.skip_bits(num_bits)?;
-
-        let epb = r.num_epb();
-        hdr.header_bit_size = u32::try_from((nalu.size - epb) * 8 - r.num_bits_left())
-            .map_err(|_| "header bits range")?;
-
-        hdr.n_emulation_prevention_bytes = u32::try_from(epb).map_err(|_| "epb count range")?;
+        Self::parse_slice_entry_points(&mut hdr, sps, pps, &mut r, nalu.size)?;
 
         log::debug!(
             "Parsed slice {:?}, NAL size was {}",

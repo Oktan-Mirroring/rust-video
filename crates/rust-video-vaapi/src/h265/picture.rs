@@ -13,6 +13,22 @@ pub enum Reference {
     LongTerm,
 }
 
+/// Output flags of an h.265 picture.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct PictureOutput {
+    pub no_rasl_output_flag: bool,
+    pub pic_output_flag: bool,
+    pub no_output_of_prior_pics_flag: bool,
+}
+
+/// Decoder-kept state of an h.265 picture.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct PictureState {
+    pub valid_for_prev_tid0_pic: bool,
+    pub first_picture_after_eos: bool,
+    pub needed_for_output: bool,
+}
+
 /// Data associated with an h.265 picture. Most fields are extracted from the
 /// slice header and kept for future processing.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
@@ -20,19 +36,15 @@ pub struct PictureData {
     // Fields extracted from the slice header. These are the CamelCase
     // variables, unless noted otherwise.
     pub nalu_type: NaluType,
-    pub no_rasl_output_flag: bool,
-    pub pic_output_flag: bool,
-    pub valid_for_prev_tid0_pic: bool,
+    pub output: PictureOutput,
+    pub state: PictureState,
     pub slice_pic_order_cnt_lsb: i32,
     pub pic_order_cnt_msb: i32,
     pub pic_order_cnt_val: i32,
-    pub no_output_of_prior_pics_flag: bool,
 
     // Internal state.
-    pub first_picture_after_eos: bool,
     reference: Reference,
     pub pic_latency_cnt: i32,
-    pub needed_for_output: bool,
     pub short_term_ref_pic_set_size_bits: u32,
 }
 
@@ -74,7 +86,7 @@ impl PictureData {
         let pic_output_flag = if slice.nalu.header.type_.is_rasl() && no_rasl_output_flag {
             false
         } else {
-            hdr.pic_output_flag
+            hdr.output.pic_output_flag
         };
 
         // Compute the Picture Order Count. See 8.3.1 Decoding Process for
@@ -113,25 +125,29 @@ impl PictureData {
 
         let no_output_of_prior_pics_flag =
             if nalu_type.is_irap() && no_rasl_output_flag && !first_picture_in_bitstream {
-                nalu_type.is_cra() || hdr.no_output_of_prior_pics_flag
+                nalu_type.is_cra() || hdr.output.no_output_of_prior_pics_flag
             } else {
                 false
             };
 
         Self {
             nalu_type,
-            no_rasl_output_flag,
-            no_output_of_prior_pics_flag,
-            pic_output_flag,
-            valid_for_prev_tid0_pic,
+            output: PictureOutput {
+                no_rasl_output_flag,
+                pic_output_flag,
+                no_output_of_prior_pics_flag,
+            },
+            state: PictureState {
+                valid_for_prev_tid0_pic,
+                first_picture_after_eos,
+                needed_for_output: false,
+            },
             slice_pic_order_cnt_lsb,
             pic_order_cnt_msb,
             // Equation (8-2)
             pic_order_cnt_val: pic_order_cnt_msb + slice_pic_order_cnt_lsb,
-            first_picture_after_eos,
             reference: Reference::default(),
             pic_latency_cnt: 0,
-            needed_for_output: false,
             short_term_ref_pic_set_size_bits: hdr.st_rps_bits,
         }
     }

@@ -112,3 +112,18 @@ impl<U> AsRef<[u8]> for Nalu<'_, U> {
         &self.data[self.offset..self.offset + self.size]
     }
 }
+
+impl<U> Nalu<'_, U>
+where
+    U: Clone,
+{
+    /// Owned copy of this NAL unit.
+    pub fn into_owned(self) -> Nalu<'static, U> {
+        Nalu {
+            header: self.header,
+            data: Cow::Owned(self.data.into_owned()),
+            size: self.size,
+            offset: self.offset,
+        }
+    }
+}

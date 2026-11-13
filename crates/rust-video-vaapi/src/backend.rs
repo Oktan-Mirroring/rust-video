@@ -249,10 +249,67 @@ impl Backend {
         target: VaSurfaceId,
         picture: &ffi::VaPictureParameterBufferH264,
         matrix: &ffi::VaIqMatrixBufferH264,
-        slices: &[ffi::VaSliceParameterBufferH264],
+        slices: &'d [ffi::VaSliceParameterBufferH264],
         data: F,
     ) -> Result<(), VaApiError>
     where
+        F: Fn(usize) -> &'d [u8],
+    {
+        self.submit_inner(
+            target,
+            bytes_of(picture),
+            Some(bytes_of(matrix)),
+            slices.len(),
+            |index| bytes_of(&slices[index]),
+            data,
+        )
+    }
+
+    /// Decode one picture into `target` from raw parameter bytes.
+    ///
+    /// Same pipelining as [`Backend::submit`], over caller-packed
+    /// buffers: `picture` fills the picture-parameter buffer, `matrix`
+    /// the matrix buffer when present, and `slices` the slice-parameter
+    /// buffers in order. `data` must answer every index below
+    /// `slices`. A failed submit quiets the target and leaves the
+    /// context reusable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` off Linux, or when any VA-API call fails.
+    pub fn submit_raw<'d, F>(
+        &mut self,
+        target: VaSurfaceId,
+        picture: &[u8],
+        matrix: Option<&[u8]>,
+        slices: &[&'d [u8]],
+        data: F,
+    ) -> Result<(), VaApiError>
+    where
+        F: Fn(usize) -> &'d [u8],
+    {
+        self.submit_inner(
+            target,
+            picture,
+            matrix,
+            slices.len(),
+            |index| slices[index],
+            data,
+        )
+    }
+
+    /// Pipelined submit over byte-level parameter accessors.
+    fn submit_inner<'d, P, F>(
+        &mut self,
+        target: VaSurfaceId,
+        picture: &[u8],
+        matrix: Option<&[u8]>,
+        count: usize,
+        params: P,
+        data: F,
+    ) -> Result<(), VaApiError>
+    where
+        P: Fn(usize) -> &'d [u8],
         F: Fn(usize) -> &'d [u8],
     {
         let set = self.next;
@@ -260,7 +317,7 @@ impl Backend {
         if let Some(previous) = self.last[set].replace(target) {
             self.sync(previous)?;
         }
-        self.fill(set, picture, matrix, slices, data)?;
+        self.fill(set, picture, matrix, count, params, data)?;
         // Sound: the context and target are live; the buffers were created above.
         VaApiError::status(unsafe { ffi::vaBeginPicture(self.display, self.context, target) })?;
         let outcome = self.render();
@@ -340,15 +397,17 @@ impl Backend {
     }
 
     /// Rewrite set `set` for the next picture; the render list is rebuilt.
-    fn fill<'d, F>(
+    fn fill<'d, P, F>(
         &mut self,
         set: usize,
-        picture: &ffi::VaPictureParameterBufferH264,
-        matrix: &ffi::VaIqMatrixBufferH264,
-        slices: &[ffi::VaSliceParameterBufferH264],
+        picture: &[u8],
+        matrix: Option<&[u8]>,
+        count: usize,
+        params: P,
         data: F,
     ) -> Result<(), VaApiError>
     where
+        P: Fn(usize) -> &'d [u8],
         F: Fn(usize) -> &'d [u8],
     {
         let display = self.display;
@@ -357,17 +416,19 @@ impl Backend {
         let Some(entry) = self.sets.get_mut(set) else {
             return Err(Self::range());
         };
-        entry.grow(display, context, slices.len(), &gauges)?;
+        entry.grow(display, context, count, &gauges)?;
         let mut recreated = 0;
-        recreated += u64::from(entry.picture.rewrite(bytes_of(picture))?);
-        recreated += u64::from(entry.matrix.rewrite(bytes_of(matrix))?);
+        recreated += u64::from(entry.picture.rewrite(picture)?);
         self.render.clear();
-        self.render.reserve(2 + 2 * slices.len());
+        self.render.reserve(2 + 2 * count);
         self.render.push(entry.picture.id());
-        self.render.push(entry.matrix.id());
-        for (index, params) in slices.iter().enumerate() {
+        if let Some(matrix) = matrix {
+            recreated += u64::from(entry.matrix.rewrite(matrix)?);
+            self.render.push(entry.matrix.id());
+        }
+        for index in 0..count {
             let param = &mut entry.slice_params[index];
-            recreated += u64::from(param.rewrite(bytes_of(params))?);
+            recreated += u64::from(param.rewrite(params(index))?);
             let param_id = param.id();
             let slot = &mut entry.slice_data[index];
             recreated += u64::from(slot.rewrite(data(index))?);

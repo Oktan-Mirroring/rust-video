@@ -29,7 +29,7 @@ Out: archival demuxing, subtitles, filters, audio.
 |---|---|---|---|---|---|
 | Software | ● | ● | ● | ● | ● |
 | Vulkan | ● | ● | ● | – | – |
-| VA-API | ● | ◐ | ◐ | ◐ | ◐ |
+| VA-API | ● | ●⁸ | ●⁸ | ◐ | ◐ |
 | D3D11 | ● | ● | ● | ◐ | – |
 | D3D12 | ● | ●⁵ | ◐ | ◐ | – |
 | MediaCodec | ●⁷ | ●⁷ | ●⁷ | ●⁷ | ●⁷ |
@@ -58,6 +58,7 @@ Out: archival demuxing, subtitles, filters, audio.
 ⁵ IDR pictures only.
 ⁶ H.264/H.265 in and out.
 ⁷ Decoder per device mime; needs the device codec.
+⁸ Wired; hardware fps pending Linux runs.
 
 Backend policy and platform detail: `docs/matrix.md`, `docs/compat.md`.
 

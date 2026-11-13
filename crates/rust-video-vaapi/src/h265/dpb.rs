@@ -39,15 +39,6 @@ impl<T: Clone> Dpb<T> {
         self.entries.iter().map(|h| h.0.borrow_mut())
     }
 
-    /// Returns the length of the DPB.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Get a reference to the whole DPB entries.
     pub fn entries(&self) -> &Vec<DpbEntry<T>> {
         &self.entries
@@ -56,11 +47,6 @@ impl<T: Clone> Dpb<T> {
     /// Set the dpb's max num pics.
     pub fn set_max_num_pics(&mut self, max_num_pics: usize) {
         self.max_num_pics = max_num_pics;
-    }
-
-    /// Get a reference to the dpb's max num pics.
-    pub fn max_num_pics(&self) -> usize {
-        self.max_num_pics
     }
 
     /// Mark all pictures in the DPB as unused for reference.
@@ -121,13 +107,17 @@ impl<T: Clone> Dpb<T> {
 
     /// Whether the DPB needs bumping. See C.5.2.2.
     pub fn needs_bumping(&mut self, sps: &Sps) -> bool {
-        let num_needed_for_output = self.pictures().filter(|pic| pic.needed_for_output).count();
+        let num_needed_for_output = self
+            .pictures()
+            .filter(|pic| pic.state.needed_for_output)
+            .count();
 
         let highest_tid = sps.max_sub_layers_minus1;
         let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
         let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
         let pic_over_max_latency = self.pictures().find(|pic| {
-            pic.needed_for_output && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
+            pic.state.needed_for_output
+                && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
         });
         let max_dec_pic_buffering =
             usize::from(sps.max_dec_pic_buffering_minus1[usize::from(highest_tid)]) + 1;
@@ -141,7 +131,7 @@ impl<T: Clone> Dpb<T> {
     fn find_lowest_poc_for_bumping(&self) -> Option<DpbEntry<T>> {
         let lowest = self
             .pictures()
-            .filter(|pic| pic.needed_for_output)
+            .filter(|pic| pic.state.needed_for_output)
             .min_by_key(|pic| pic.pic_order_cnt_val)?;
 
         let position = self
@@ -158,7 +148,7 @@ impl<T: Clone> Dpb<T> {
         let handle = self.find_lowest_poc_for_bumping()?;
         let mut pic = handle.0.borrow_mut();
 
-        pic.needed_for_output = false;
+        pic.state.needed_for_output = false;
         log::debug!("Bumping POC {} from the dpb", pic.pic_order_cnt_val);
         log::trace!("{pic:#?}");
 
@@ -181,14 +171,18 @@ impl<T: Clone> Dpb<T> {
 
     /// See C.5.2.3. Happens when we are done decoding the picture.
     pub fn needs_additional_bumping(&mut self, sps: &Sps) -> bool {
-        let num_needed_for_output = self.pictures().filter(|pic| pic.needed_for_output).count();
+        let num_needed_for_output = self
+            .pictures()
+            .filter(|pic| pic.state.needed_for_output)
+            .count();
         let highest_tid = sps.max_sub_layers_minus1;
 
         let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
         let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
 
         let pic_over_max_latency = self.pictures().find(|pic| {
-            pic.needed_for_output && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
+            pic.state.needed_for_output
+                && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
         });
 
         num_needed_for_output > max_num_reorder_pics.into()
@@ -211,7 +205,7 @@ impl<T: Clone> Dpb<T> {
         log::debug!("Removing unused pictures from DPB.");
         self.entries.retain(|e| {
             let pic = e.0.borrow();
-            let retain = pic.needed_for_output || pic.is_ref();
+            let retain = pic.state.needed_for_output || pic.is_ref();
             log::debug!("Retaining pic POC: {}: {}", pic.pic_order_cnt_val, retain);
             retain
         });
@@ -234,11 +228,11 @@ impl<T: Clone> Dpb<T> {
             self.entries.len()
         );
 
-        if pic.pic_output_flag {
-            pic.needed_for_output = true;
+        if pic.output.pic_output_flag {
+            pic.state.needed_for_output = true;
             pic.pic_latency_cnt = 0;
         } else {
-            pic.needed_for_output = false;
+            pic.state.needed_for_output = false;
         }
 
         // C.3.4.
@@ -254,15 +248,6 @@ impl<T: Clone> Dpb<T> {
         self.entries.push(DpbEntry(picture, handle));
 
         Ok(())
-    }
-
-    /// Returns all the references in the DPB.
-    pub fn get_all_references(&self) -> Vec<DpbEntry<T>> {
-        self.entries
-            .iter()
-            .filter(|e| e.0.borrow().is_ref())
-            .cloned()
-            .collect()
     }
 }
 
