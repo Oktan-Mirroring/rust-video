@@ -3,14 +3,14 @@
 //! Resolution runs everywhere; each live hop runs on its own hardware
 //! and skips loud without it.
 
-#[cfg(d3d12_available)]
+#[cfg(any(d3d11_available, d3d12_available))]
 #[path = "../../rust-video-d3d12/examples/common/bits.rs"]
 mod bits;
-#[cfg(d3d12_available)]
+#[cfg(any(d3d11_available, d3d12_available))]
 #[path = "../../rust-video-d3d12/examples/common/h264.rs"]
 mod h264;
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "windows"),
     have_corpus,
     any(vaapi_available, feature = "vulkan")
 ))]
@@ -110,7 +110,7 @@ fn failure_names_codec_and_preference() {
 
 /// Synth H.264 vector under the workspace corpus.
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "windows"),
     have_corpus,
     any(vaapi_available, feature = "vulkan")
 ))]
@@ -170,10 +170,13 @@ fn resolved_tier_transcodes_vaapi_hop() {
     println!("facade xcode live: va-api gpu hop, {count} packets");
 }
 
-/// Resolved tier drives one live Vulkan transcode hop on Linux hardware.
-#[cfg(all(target_os = "linux", feature = "vulkan", have_corpus))]
-#[test]
-fn resolved_tier_transcodes_vulkan_hop() {
+/// One live Vulkan transcode hop on `platform` hardware.
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    feature = "vulkan",
+    have_corpus
+))]
+fn vulkan_hop(platform: Platform) {
     use rust_video::vulkan::{CodecOp, Transcoder, VulkanDevice};
     use rust_video::{Bytes, FallbackCause, Packet};
 
@@ -183,7 +186,7 @@ fn resolved_tier_transcodes_vulkan_hop() {
             VideoCodec::H264,
             TierPreference::Force(Tier::Vulkan),
             &caps,
-            Platform::Linux
+            platform
         ),
         Ok(Tier::Vulkan)
     );
@@ -232,6 +235,20 @@ fn resolved_tier_transcodes_vulkan_hop() {
         "facade xcode live: vulkan {:?} hop, {count} packets",
         plan.route()
     );
+}
+
+/// Resolved tier drives one live Vulkan transcode hop on Linux hardware.
+#[cfg(all(target_os = "linux", feature = "vulkan", have_corpus))]
+#[test]
+fn resolved_tier_transcodes_vulkan_hop() {
+    vulkan_hop(Platform::Linux);
+}
+
+/// Resolved tier drives one live Vulkan transcode hop on Windows hardware.
+#[cfg(all(target_os = "windows", feature = "vulkan", have_corpus))]
+#[test]
+fn resolved_tier_transcodes_vulkan_hop_windows() {
+    vulkan_hop(Platform::Windows);
 }
 
 /// Resolved tier drives one live transcode hop on Windows hardware.
@@ -289,4 +306,61 @@ fn resolved_tier_transcodes_one_hop() {
     count += drained.packets().len();
     assert!(count > 0, "no packets from the d3d12 hop");
     println!("facade xcode live: d3d12 gpu hop, {count} packets");
+}
+
+/// Resolved tier drives one live d3d11 transcode hop on Windows hardware.
+#[cfg(d3d11_available)]
+#[test]
+fn resolved_tier_transcodes_d3d11_hop() {
+    use rust_video::d3d11::{Codec, D3d11Device, Transcoder};
+    use rust_video::{Bytes, Packet, Route};
+
+    let caps = Capabilities::none().with_platform_hw().with_software();
+    assert_eq!(
+        resolve(
+            VideoCodec::H264,
+            TierPreference::Force(Tier::D3d11),
+            &caps,
+            Platform::Windows
+        ),
+        Ok(Tier::D3d11)
+    );
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("facade xcode skipped: {error}");
+            return;
+        }
+    };
+    let mut transcoder = match Transcoder::open(&device, Codec::H264, Codec::H264) {
+        Ok(transcoder) => transcoder,
+        Err(error) => {
+            println!("facade xcode skipped: {error}");
+            return;
+        }
+    };
+    if !transcoder.caps().ready() {
+        println!("facade xcode skipped: d3d11 without export plus encode caps");
+        return;
+    }
+    let raws: Vec<Vec<u8>> = crate::h264::annex_b_h264_packets()
+        .into_iter()
+        .chain(crate::h264::annex_b_h264_packets_cropped())
+        .chain(crate::h264::annex_b_h264_packets_cropped_sized(
+            39, 22, 4, 22,
+        ))
+        .collect();
+    let mut count = 0;
+    for raw in raws {
+        let outcome = transcoder
+            .transcode(&Packet::new(Bytes::from(raw)))
+            .expect("facade hop");
+        assert_eq!(outcome.plan().route(), Route::Gpu);
+        count += outcome.packets().len();
+    }
+    let drained = transcoder.flush().expect("facade drain");
+    assert_eq!(drained.plan().route(), Route::Gpu);
+    count += drained.packets().len();
+    assert!(count > 0, "no packets from the d3d11 hop");
+    println!("facade xcode live: d3d11 gpu hop, {count} packets");
 }
