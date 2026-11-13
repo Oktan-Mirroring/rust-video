@@ -11,9 +11,21 @@ pub enum BrokenReferenceReason {
     /// Marking sweep names an absent picture.
     #[error("marking target absent")]
     MarkingTargetAbsent,
+    /// Reference names an empty slot.
+    #[error("{reference} names empty slot")]
+    NamesEmptySlot {
+        /// Reference naming the empty slot.
+        reference: &'static str,
+    },
     /// Sliding window finds no short-term picture.
     #[error("no short-term to slide")]
     NoShortTermToSlide,
+    /// Reference POC absent from the buffer.
+    #[error("reference poc {poc} absent")]
+    ReferencePocAbsent {
+        /// Absent picture order count.
+        poc: i32,
+    },
     /// Move names an absent short-term picture.
     #[error("short-term target absent")]
     ShortTermTargetAbsent,
@@ -74,21 +86,54 @@ pub enum D3d11Error {
 /// Bitstream element the parser rejects.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum ParseReason {
+    /// Conformance window outside the coded size.
+    #[error("conformance_window outside coded size")]
+    ConformanceWindowOutsideCodedSize,
     /// Crop empties the picture.
     #[error("crop empties picture")]
     CropEmptiesPicture,
+    /// Frame before its sequence header.
+    #[error("frame before sequence header")]
+    FrameBeforeSequenceHeader,
     /// Crop extends past the coded size.
     #[error("frame_crop outside coded size")]
     FrameCropOutsideCodedSize,
     /// Gap with gaps forbidden by the sequence.
     #[error("frame_num gap with gaps forbidden")]
     FrameNumGapForbidden,
+    /// Frame size above the sequence maximum.
+    #[error("frame size above sequence maximum")]
+    FrameSizeAboveSequenceMaximum,
+    /// Frame without tile data.
+    #[error("frame without tile data")]
+    FrameWithoutTileData,
+    /// Frame without tiles.
+    #[error("frame without tiles")]
+    FrameWithoutTiles,
+    /// Tile group short of its tiles.
+    #[error("incomplete tile group")]
+    IncompleteTileGroup,
     /// NAL `forbidden_zero_bit` set.
     #[error("nal forbidden bit")]
     NalForbiddenBit,
+    /// NAL temporal id zero.
+    #[error("nal temporal id")]
+    NalTemporalId,
     /// Non-intra slice inside an IDR picture.
     #[error("non-intra slice in IDR")]
     NonIntraSliceInIdr,
+    /// OBU extension reserved bits set.
+    #[error("obu extension reserved bits")]
+    ObuExtensionReservedBits,
+    /// OBU `forbidden_zero_bit` set.
+    #[error("obu forbidden bit")]
+    ObuForbiddenBit,
+    /// OBU reserved bit set.
+    #[error("obu reserved bit")]
+    ObuReservedBit,
+    /// OBU size past its payload.
+    #[error("obu size exceeds payload")]
+    ObuSizeExceedsPayload,
     /// Signed Exp-Golomb code exceeds `i32`.
     #[error("{syntax} overflows i32")]
     OverflowI32 {
@@ -104,6 +149,12 @@ pub enum ParseReason {
     /// Slices of one picture disagree.
     #[error("picture slices disagree")]
     PictureSlicesDisagree,
+    /// Picture without an order count.
+    #[error("picture without poc")]
+    PictureWithoutPoc,
+    /// Picture without a reference set.
+    #[error("picture without reference set")]
+    PictureWithoutReferenceSet,
     /// Order-count syntax against the sequence method.
     #[error("poc syntax against sequence method")]
     PocSyntaxAgainstSequenceMethod,
@@ -119,12 +170,21 @@ pub enum ParseReason {
         /// Syntax element under parse.
         syntax: &'static str,
     },
+    /// Redundant header against the first.
+    #[error("redundant header mismatch")]
+    RedundantHeaderMismatch,
     /// Reference picture absent from the buffer.
     #[error("reference picture missing")]
     ReferencePictureMissing,
     /// Reference with zero reference frames.
     #[error("reference with zero ref frames")]
     ReferenceWithZeroRefFrames,
+    /// Reserved OBU type.
+    #[error("reserved obu type")]
+    ReservedObuType,
+    /// Short-term set past its size.
+    #[error("short_term_ref_pic_set size")]
+    ShortTermRefPicSetSize,
     /// Slice cites an unseen picture set.
     #[error("slice cites unknown pps")]
     SliceCitesUnknownPps,
@@ -137,9 +197,24 @@ pub enum ParseReason {
     /// Slice without a header.
     #[error("slice without header")]
     SliceWithoutHeader,
+    /// Sequence set cites an unseen video set.
+    #[error("sps cites unknown vps")]
+    SpsCitesUnknownVps,
     /// Sequence set without a body.
     #[error("sps without body")]
     SpsWithoutBody,
+    /// Tile grid short of the frame.
+    #[error("tile grid coverage")]
+    TileGridCoverage,
+    /// Tile groups out of order.
+    #[error("tile group order")]
+    TileGroupOrder,
+    /// Tile group without data.
+    #[error("tile group without data")]
+    TileGroupWithoutData,
+    /// Tile group without a frame header.
+    #[error("tile group without frame header")]
+    TileGroupWithoutFrameHeader,
     /// Element wider than 32 bits.
     #[error("{syntax} wider than 32 bits")]
     TooWide {
@@ -152,6 +227,9 @@ pub enum ParseReason {
         /// Syntax element under parse.
         syntax: &'static str,
     },
+    /// Video set without a body.
+    #[error("vps without body")]
+    VpsWithoutBody,
 }
 
 /// Machine declined by the D3D11 tier, with the cause.
@@ -192,6 +270,18 @@ pub enum UnsupportedReason {
     /// Async transform without an event pump.
     #[error("async MFT without an event pump")]
     AsyncMftWithoutEventPump,
+    /// AV1 bit depth above the 8-bit target.
+    #[error("av1 {depth}-bit needs a {depth}-bit target")]
+    Av1BitDepthNeedsTarget {
+        /// Sequence bit depth.
+        depth: u8,
+    },
+    /// AV1 chroma outside 4:2:0.
+    #[error("av1 chroma outside 4:2:0")]
+    Av1ChromaOutside420,
+    /// AV1 monochrome.
+    #[error("av1 monochrome")]
+    Av1Monochrome,
     /// Chroma depth above 8 bit.
     #[error("chroma depth above 8 bit")]
     ChromaDepthAbove8Bit,
@@ -207,6 +297,15 @@ pub enum UnsupportedReason {
         /// Codec the tier cannot decode yet.
         codec: Codec,
     },
+    /// Transcode without surface decode.
+    #[error("transcode from {codec} without surface decode")]
+    DecodeWithoutSurfaceDecode {
+        /// Codec without surface decode.
+        codec: Codec,
+    },
+    /// Dependent slice segments.
+    #[error("dependent slice segments")]
+    DependentSliceSegments,
     /// Encoder input outside NV12.
     #[error("encoder input {format:?}; nv12 only")]
     EncoderInputNotNv12 {
@@ -237,6 +336,9 @@ pub enum UnsupportedReason {
     /// Luma depth above 8 bit.
     #[error("luma depth above 8 bit")]
     LumaDepthAbove8Bit,
+    /// Multilayer stream.
+    #[error("multilayer")]
+    Multilayer,
     /// Multiview slices.
     #[error("multiview")]
     Multiview,
@@ -244,6 +346,12 @@ pub enum UnsupportedReason {
     #[error("no {codec} encoder MFT on this machine")]
     NoEncoderMft {
         /// Codec the machine cannot encode.
+        codec: Codec,
+    },
+    /// Codec without a decode session.
+    #[error("no d3d11 session for {codec}")]
+    NoSessionForCodec {
+        /// Codec the tier cannot open.
         codec: Codec,
     },
     /// NV12 bytes short of the extent.
@@ -258,6 +366,9 @@ pub enum UnsupportedReason {
     /// Packed NV12 length outside its extent.
     #[error("packed NV12 length outside its extent")]
     PackedNv12OutsideExtent,
+    /// PCM depth above 8 bit.
+    #[error("pcm depth above 8 bit")]
+    PcmDepthAbove8Bit,
     /// Decode without a picture builder.
     #[error("{codec} picture builder pending")]
     PictureBuilderPending {
@@ -270,18 +381,42 @@ pub enum UnsupportedReason {
     /// Plane stride below the width.
     #[error("plane stride below width")]
     PlaneStrideBelowWidth,
+    /// Picture-set extension.
+    #[error("pps extension")]
+    PpsExtension,
     /// Redundant pictures.
     #[error("redundant pictures")]
     RedundantPictures,
+    /// Render size against the frame size.
+    #[error("render size differs from frame size")]
+    RenderSizeDiffersFromFrameSize,
     /// Scale source outside the scaler.
     #[error("scale source outside scaler")]
     ScaleSourceOutsideScaler,
     /// SP/SI slices.
     #[error("sp/si slices")]
     SpSiSlices,
+    /// Spatial layers.
+    #[error("spatial layers")]
+    SpatialLayers,
+    /// Sequence-set extension.
+    #[error("sps extension")]
+    SpsExtension,
     /// Poisoned submit lock.
     #[error("submit lock poisoned")]
     SubmitLockPoisoned,
+    /// Superres upscale.
+    #[error("superres upscale")]
+    SuperresUpscale,
+    /// Tile count above 256.
+    #[error("tile count above 256")]
+    TileCountAbove256,
+    /// Tile grid above the driver grid.
+    #[error("tile grid above the driver grid")]
+    TileGridAboveDriverGrid,
+    /// Tile list.
+    #[error("tile list")]
+    TileList,
     /// Transform bypass.
     #[error("transform bypass")]
     TransformBypass,

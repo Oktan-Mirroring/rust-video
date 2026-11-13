@@ -55,14 +55,14 @@ impl<'a> Transcoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` without a `decode` picture builder, without
+    /// Returns `Err` without surface decode for `decode`, without
     /// shared-texture export on the device, or without an `encode`
     /// encoder MFT on the machine.
     pub fn open(device: &'a D3d11Device, decode: Codec, encode: Codec) -> Result<Self, D3d11Error> {
         if decode != Codec::H264 {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::DecodePending {
-                codec: decode,
-            }));
+            return Err(D3d11Error::Unsupported(
+                UnsupportedReason::DecodeWithoutSurfaceDecode { codec: decode },
+            ));
         }
         let share = shared_export(device).ok_or_else(declined_export)?;
         let encoder = D3d11Encoder::open(device, encode)?;
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_pending_decode_codec() {
+    fn open_rejects_decode_without_surface_decode() {
         let Ok(device) = crate::device::D3d11Device::open() else {
             return;
         };

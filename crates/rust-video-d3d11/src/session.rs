@@ -20,10 +20,13 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC}
 use windows::Win32::Graphics::Dxgi::IDXGIResource;
 use windows::Win32::Media::DirectShow::DXVA_NoEncrypt;
 
+use crate::av1_dpb::SubmittedAv1;
 use crate::device::D3d11Device;
 use crate::dpb::SubmittedPicture;
-use crate::error::{BrokenReferenceReason, D3d11Error};
+use crate::error::{BrokenReferenceReason, D3d11Error, SkipReason, UnsupportedReason};
+use crate::guid::Codec;
 use crate::h264::Crop;
+use crate::hevc_dpb::SubmittedHevc;
 use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock};
 
@@ -93,12 +96,46 @@ impl Session {
     /// Returns `Err` without a raw bitstream config, past
     /// the adapter surface floor, or when the driver refuses the decoder.
     pub fn open(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
-        Self::open_windows(device, width, height)
+        Self::open_windows(device, Codec::H264, width, height)
     }
 
-    /// Session over `device` for `width` x `height` H.264 pictures.
-    fn open_windows(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
-        let guid = crate::device::h264_guid();
+    /// Session over `device` for `width` x `height` `codec` pictures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without the codec profile, without an NV12
+    /// render target, without a raw bitstream config, past
+    /// the adapter surface floor, or when the driver refuses the decoder.
+    pub fn open_codec(
+        device: &D3d11Device,
+        codec: Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, D3d11Error> {
+        Self::open_windows(device, codec, width, height)
+    }
+
+    /// Session over `device` for `width` x `height` `codec` pictures.
+    fn open_windows(
+        device: &D3d11Device,
+        codec: Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, D3d11Error> {
+        let guid = match codec {
+            Codec::H264 => crate::device::h264_guid(),
+            Codec::Hevc => crate::device::hevc_guid(),
+            Codec::Av1 => crate::device::av1_guid(),
+            _ => {
+                return Err(D3d11Error::Unsupported(
+                    UnsupportedReason::NoSessionForCodec { codec },
+                ));
+            }
+        };
+        if !device.supports(codec) {
+            return Err(SkipReason::ProfileUnsupported { codec }.into());
+        }
+        check_format(device, &guid)?;
         let desc = D3D11_VIDEO_DECODER_DESC {
             Guid: guid,
             SampleWidth: width,
@@ -198,6 +235,58 @@ impl Session {
         self.submit_windows(submission)
     }
 
+    /// Decode HEVC `submission` onto its surface slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a buffer overruns the driver
+    /// allocation, or when the driver refuses the submission.
+    pub fn submit_hevc(&self, submission: &SubmittedHevc) -> Result<(), D3d11Error> {
+        let params = struct_slice(&submission.params);
+        let short = slice_slice(&submission.slices);
+        let mut parts = vec![
+            (D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, params, 0),
+            (
+                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                submission.bitstream.as_slice(),
+                0,
+            ),
+            (D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, short, 0),
+        ];
+        if let Some(matrix) = submission.qmatrix.as_ref() {
+            parts.insert(
+                1,
+                (
+                    D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
+                    struct_slice(matrix),
+                    0,
+                ),
+            );
+        }
+        self.submit_parts(submission.slot, &parts)
+    }
+
+    /// Decode AV1 `submission` onto its surface view.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a buffer overruns the driver
+    /// allocation, or when the driver refuses the submission.
+    pub fn submit_av1(&self, submission: &SubmittedAv1) -> Result<(), D3d11Error> {
+        let params = struct_slice(&submission.params);
+        let tiles = slice_slice(&submission.tiles);
+        let parts = [
+            (D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, params, 0),
+            (
+                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                submission.bitstream.as_slice(),
+                0,
+            ),
+            (D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, tiles, 0),
+        ];
+        self.submit_parts(submission.slot, &parts)
+    }
+
     /// Array `slot` copied to its lane staging through the immediate context.
     ///
     /// # Errors
@@ -236,37 +325,6 @@ impl Session {
 
     /// Decode `submission` onto its surface slot.
     fn submit_windows(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
-        let view =
-            self.views
-                .get(usize::from(submission.slot))
-                .ok_or(D3d11Error::BrokenReference(
-                    BrokenReferenceReason::SlotOutsideViews,
-                ))?;
-        let _submit = self.submit.enter()?;
-        // Sound: the decoder and view are live; no content key.
-        unsafe {
-            self.video_context
-                .DecoderBeginFrame(&self.decoder, view, 0, None)
-        }
-        .map_err(|error| D3d11Error::Call {
-            call: "DecoderBeginFrame",
-            hresult: error.code().0,
-        })?;
-        let result = self.submit_buffers(submission);
-        // Sound: the frame began above.
-        let end = unsafe { self.video_context.DecoderEndFrame(&self.decoder) };
-        match (result, end) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(D3d11Error::Call {
-                call: "DecoderEndFrame",
-                hresult: error.code().0,
-            }),
-        }
-    }
-
-    /// Picture, matrix, bitstream, and slice buffers in one submit.
-    fn submit_buffers(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);
         let matrix = struct_slice(&submission.qmatrix);
         let short;
@@ -295,8 +353,51 @@ impl Session {
                 macroblocks,
             ),
         ];
-        let mut descs = Vec::with_capacity(buffers.len());
-        for (buffer_type, bytes, macroblocks) in buffers.iter().copied() {
+        self.submit_parts(submission.slot, &buffers)
+    }
+
+    /// Buffer `parts` decoded onto `slot` in one submit.
+    fn submit_parts(
+        &self,
+        slot: u8,
+        parts: &[(D3D11_VIDEO_DECODER_BUFFER_TYPE, &[u8], u32)],
+    ) -> Result<(), D3d11Error> {
+        let view = self
+            .views
+            .get(usize::from(slot))
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
+        let _submit = self.submit.enter()?;
+        // Sound: the decoder and view are live; no content key.
+        unsafe {
+            self.video_context
+                .DecoderBeginFrame(&self.decoder, view, 0, None)
+        }
+        .map_err(|error| D3d11Error::Call {
+            call: "DecoderBeginFrame",
+            hresult: error.code().0,
+        })?;
+        let result = self.submit_buffers(parts);
+        // Sound: the frame began above.
+        let end = unsafe { self.video_context.DecoderEndFrame(&self.decoder) };
+        match (result, end) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(D3d11Error::Call {
+                call: "DecoderEndFrame",
+                hresult: error.code().0,
+            }),
+        }
+    }
+
+    /// Buffer `parts` through the driver in one submit.
+    fn submit_buffers(
+        &self,
+        parts: &[(D3D11_VIDEO_DECODER_BUFFER_TYPE, &[u8], u32)],
+    ) -> Result<(), D3d11Error> {
+        let mut descs = Vec::with_capacity(parts.len());
+        for (buffer_type, bytes, macroblocks) in parts.iter().copied() {
             descs.push(self.fill_buffer(buffer_type, bytes, macroblocks)?);
         }
         // Sound: the descriptors borrow released driver buffers.
@@ -368,6 +469,25 @@ impl Session {
             NumMBsInBuffer: macroblocks,
             ..Default::default()
         })
+    }
+}
+
+/// NV12 render target behind `guid`.
+fn check_format(device: &D3d11Device, guid: &windows::core::GUID) -> Result<(), D3d11Error> {
+    // Sound: the GUID and format are plain input values.
+    let supported = unsafe {
+        device
+            .video_device()
+            .CheckVideoDecoderFormat(guid, DXGI_FORMAT_NV12)
+    }
+    .map_err(|error| D3d11Error::Call {
+        call: "CheckVideoDecoderFormat",
+        hresult: error.code().0,
+    })?;
+    if supported.as_bool() {
+        Ok(())
+    } else {
+        Err(SkipReason::NoNv12Target.into())
     }
 }
 
@@ -512,6 +632,29 @@ fn short_bytes(slices: &[crate::dxva::SliceLongH264]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// HEVC and AV1 session negotiation on hardware, skipped without caps.
+    #[test]
+    fn negotiate_hevc_and_av1_on_hardware() {
+        use crate::device::D3d11Device;
+        use crate::guid::Codec;
+
+        use super::Session;
+
+        let Ok(device) = D3d11Device::open() else {
+            return;
+        };
+        for codec in [Codec::Hevc, Codec::Av1] {
+            if !device.supports(codec) {
+                println!("d3d11 skipped: no {codec} decoder profile");
+                continue;
+            }
+            let session = Session::open_codec(&device, codec, 320, 240).expect("codec session");
+            session.copy_slot(0).expect("copy");
+            let bytes = session.read_slot(0, None).expect("readback");
+            assert_eq!(bytes.len(), 320 * 240 * 3 / 2);
+        }
+    }
+
     /// Session negotiation plus staging roundtrip on hardware, skipped without.
     #[test]
     fn negotiate_and_copy_on_hardware() {

@@ -30,7 +30,7 @@ Out: archival demuxing, subtitles, filters, audio.
 | Software | ● | ● | ● | ● | ● |
 | Vulkan | ● | ● | ● | – | – |
 | VA-API | ● | ◐ | ◐ | ◐ | ◐ |
-| D3D11 | ● | ◐ | ◐ | ◐ | – |
+| D3D11 | ● | ● | ● | ◐ | – |
 | D3D12 | ● | ●⁵ | ◐ | ◐ | – |
 | MediaCodec | ●⁷ | ●⁷ | ●⁷ | ●⁷ | ●⁷ |
 

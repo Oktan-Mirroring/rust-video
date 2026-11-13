@@ -52,13 +52,15 @@ fn probe_reports_or_skips() {
     assert!(h264.flush().expect("flush").is_empty());
 
     let mut hevc = HevcDecoder::open(&device);
-    assert!(hevc.decode(&packet).is_err());
+    let hevc_bad = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x40, 0x01]));
+    assert!(hevc.decode(&hevc_bad).is_err());
     assert!(hevc.flush().expect("flush").is_empty());
     let mut vp9 = Vp9Decoder::open(&device);
     assert!(vp9.decode(&packet).is_err());
     assert!(vp9.flush().expect("flush").is_empty());
     let mut av1 = Av1Decoder::open(&device);
-    assert!(av1.decode(&packet).is_err());
+    let av1_bad = Packet::new(Bytes::from_static(&[0xFF]));
+    assert!(av1.decode(&av1_bad).is_err());
     assert!(av1.flush().expect("flush").is_empty());
     let mut mpeg2 = Mpeg2Decoder::open(&device);
     assert!(mpeg2.decode(&packet).is_err());

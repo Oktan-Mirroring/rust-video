@@ -379,6 +379,18 @@ pub(crate) fn h264_guid() -> GUID {
     windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_H264_VLD_NOFGT
 }
 
+/// HEVC Main profile GUID the tier decodes.
+#[cfg(target_os = "windows")]
+pub(crate) fn hevc_guid() -> GUID {
+    windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_HEVC_VLD_MAIN
+}
+
+/// AV1 profile 0 GUID the tier decodes.
+#[cfg(target_os = "windows")]
+pub(crate) fn av1_guid() -> GUID {
+    windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "windows")]
