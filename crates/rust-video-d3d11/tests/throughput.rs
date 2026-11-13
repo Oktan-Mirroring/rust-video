@@ -1,30 +1,38 @@
-#![cfg(target_os = "windows")]
-
 //! GPU transcode throughput: 1080p hops against the 60 fps bar.
 //!
 //! Skips without hardware; a hardware run fails below the bar.
 
+#[cfg(target_os = "windows")]
 #[path = "../examples/common/h264.rs"]
 mod h264;
 
+#[cfg(target_os = "windows")]
 use h264::{
     annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
     annex_b_packets,
 };
 
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, H264Decoder, Transcoder};
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Decoder;
+#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
 
+#[cfg(target_os = "windows")]
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
 
+#[cfg(target_os = "windows")]
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
+#[cfg(target_os = "windows")]
 /// Packets over `raws`, built once outside the timed loop.
 fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
     raws.iter()
@@ -32,6 +40,7 @@ fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
 /// Measured fps of `HOPS` 1080p hops through `transcoder`.
 fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64 {
     let warmup = packets(warmup);
@@ -60,6 +69,7 @@ fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64
     f64::from(HOPS) / elapsed
 }
 
+#[cfg(target_os = "windows")]
 /// 1080p GPU hops measured against the realtime bar.
 #[test]
 fn xcode_1080p_measures_realtime() {

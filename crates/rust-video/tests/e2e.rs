@@ -1,10 +1,14 @@
-#![cfg(have_corpus)]
+//! Corpus-backed facade checks; host builds without a corpus compile this file to nothing.
 
+#[cfg(have_corpus)]
 use std::path::PathBuf;
 
+#[cfg(have_corpus)]
 use rust_video::VideoCodec;
+#[cfg(have_corpus)]
 use rust_video_harness::Suite;
 
+#[cfg(have_corpus)]
 fn corpus() -> PathBuf {
     std::env::var_os("RUST_VIDEO_CORPUS").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus"),
@@ -12,6 +16,7 @@ fn corpus() -> PathBuf {
     )
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn corpus_cases_are_nonempty_files() {
     let suite = Suite::open_at(&corpus()).expect("corpus present by build gate");
@@ -22,6 +27,7 @@ fn corpus_cases_are_nonempty_files() {
     }
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn cases_for_yields_matching_codec_only() {
     let suite = Suite::open_at(&corpus()).expect("corpus present by build gate");

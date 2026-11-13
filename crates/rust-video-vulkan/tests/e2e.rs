@@ -1,27 +1,42 @@
-#![cfg(have_corpus)]
+//! Vulkan end-to-end: goldens, pipelined decode, encode.
 
+#[cfg(have_corpus)]
 use std::cell::{Cell, RefCell};
+#[cfg(have_corpus)]
 use std::path::{Path, PathBuf};
+#[cfg(have_corpus)]
 use std::process::Command;
+#[cfg(have_corpus)]
 use std::sync::{Mutex, MutexGuard};
+#[cfg(have_corpus)]
 use std::time::Instant;
 
+#[cfg(have_corpus)]
 use bytes::Bytes;
 
+#[cfg(have_corpus)]
 use rust_video::VideoCodec;
+#[cfg(have_corpus)]
 use rust_video_caps::frame::CpuFrame;
+#[cfg(have_corpus)]
 use rust_video_caps::packet::Packet;
+#[cfg(have_corpus)]
 use rust_video_caps::traits::{Decoder, Encoder};
+#[cfg(have_corpus)]
 use rust_video_caps::transcode::Route;
+#[cfg(have_corpus)]
 use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
+#[cfg(have_corpus)]
 use rust_video_vulkan::{
     CodecOp, Gop, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, SubmitStats,
     Transcoder, VulkanDevice, VulkanError, VulkanFrame,
 };
 
+#[cfg(have_corpus)]
 // Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+#[cfg(have_corpus)]
 /// Harness oracle over a Vulkan decoder.
 struct VulkanOracle<D> {
     /// Decoder under test, behind interior mutability for `Oracle`.
@@ -30,6 +45,7 @@ struct VulkanOracle<D> {
     oom: Cell<bool>,
 }
 
+#[cfg(have_corpus)]
 impl<D> VulkanOracle<D> {
     /// Oracle over `decoder`.
     fn new(decoder: D) -> Self {
@@ -53,6 +69,7 @@ impl<D> VulkanOracle<D> {
     }
 }
 
+#[cfg(have_corpus)]
 impl<D> Oracle for VulkanOracle<D>
 where
     D: Decoder<Frame = VulkanFrame, Error = VulkanError>,
@@ -78,6 +95,7 @@ where
     }
 }
 
+#[cfg(have_corpus)]
 /// Corpus root: `RUST_VIDEO_CORPUS`, else the workspace `corpus`.
 fn corpus() -> PathBuf {
     std::env::var_os("RUST_VIDEO_CORPUS").map_or_else(
@@ -86,6 +104,7 @@ fn corpus() -> PathBuf {
     )
 }
 
+#[cfg(have_corpus)]
 /// Device for `op`, declining loudly when the tier skips.
 fn device_or_decline(op: CodecOp) -> Option<VulkanDevice> {
     match VulkanDevice::open_or_skip(op) {
@@ -106,12 +125,14 @@ fn device_or_decline(op: CodecOp) -> Option<VulkanDevice> {
     }
 }
 
+#[cfg(have_corpus)]
 /// Loud VRAM-exhaustion decline with live budget numbers.
 fn decline_oom(context: &str, device: &VulkanDevice, detail: impl std::fmt::Display) {
     let (free_mb, total_mb) = device.memory_budget_mb();
     println!("declined:OOM {context}: {detail} (free {free_mb}MB of {total_mb}MB)");
 }
 
+#[cfg(have_corpus)]
 /// Unwrap `result`, declining loud with budget numbers on VRAM exhaustion.
 ///
 /// Panics on other errors.
@@ -130,6 +151,7 @@ fn unwrap_or_oom<T>(
     }
 }
 
+#[cfg(have_corpus)]
 /// Golden comparison of every `codec` case through `oracle`.
 fn check_goldens<D>(codec: VideoCodec, oracle: &VulkanOracle<D>, device: &VulkanDevice)
 where
@@ -165,6 +187,7 @@ where
     }
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn h264_matches_goldens() {
     let _guard = SERIAL.lock().unwrap();
@@ -178,6 +201,7 @@ fn h264_matches_goldens() {
     check_goldens(VideoCodec::H264, &oracle, &device);
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn h265_matches_goldens() {
     let _guard = SERIAL.lock().unwrap();
@@ -191,6 +215,7 @@ fn h265_matches_goldens() {
     check_goldens(VideoCodec::H265, &oracle, &device);
 }
 
+#[cfg(have_corpus)]
 /// Synthetic OOM through the decline helpers: decline, never panic.
 #[test]
 fn oom_helpers_decline_synthetic_oom() {
@@ -209,6 +234,7 @@ fn oom_helpers_decline_synthetic_oom() {
     assert!(oracle.oom());
 }
 
+#[cfg(have_corpus)]
 /// True when `tool -version` runs.
 fn have_tool(tool: &str) -> bool {
     Command::new(tool)
@@ -217,6 +243,7 @@ fn have_tool(tool: &str) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+#[cfg(have_corpus)]
 /// Run `tool` with `args`, returning stdout; panics on failure.
 fn run(tool: &str, args: &[String]) -> Vec<u8> {
     let out = Command::new(tool)
@@ -231,6 +258,7 @@ fn run(tool: &str, args: &[String]) -> Vec<u8> {
     out.stdout
 }
 
+#[cfg(have_corpus)]
 /// Working directory for extracted vectors.
 fn workdir() -> PathBuf {
     let dir = std::env::temp_dir().join("vulkan-annexb");
@@ -238,6 +266,7 @@ fn workdir() -> PathBuf {
     dir
 }
 
+#[cfg(have_corpus)]
 /// Pixel format of the first video stream.
 fn pix_fmt(path: &Path) -> String {
     let name = path.to_string_lossy().into_owned();
@@ -258,6 +287,7 @@ fn pix_fmt(path: &Path) -> String {
     String::from_utf8_lossy(&out).trim().to_owned()
 }
 
+#[cfg(have_corpus)]
 /// Annex-B extracts of 8-bit 4:2:0 synth mp4s, cached in the workdir.
 fn synth_vectors(codec: VideoCodec) -> Vec<PathBuf> {
     if !have_tool("ffmpeg") || !have_tool("ffprobe") {
@@ -315,6 +345,7 @@ fn synth_vectors(codec: VideoCodec) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(have_corpus)]
 /// Annex-B vectors for `codec`: corpus cases first, else synth extracts.
 ///
 /// Callers hold the serial guard across extraction and decode.
@@ -331,6 +362,7 @@ fn vectors(codec: VideoCodec, _serial: &MutexGuard<'_, ()>) -> Vec<PathBuf> {
     }
 }
 
+#[cfg(have_corpus)]
 /// Decoder plus submit-core gauges for the pipeline tests.
 trait GaugedDecoder: Decoder<Frame = VulkanFrame, Error = VulkanError> {
     /// Submit-core gauges snapshot.
@@ -340,6 +372,7 @@ trait GaugedDecoder: Decoder<Frame = VulkanFrame, Error = VulkanError> {
     fn inject(&mut self);
 }
 
+#[cfg(have_corpus)]
 impl GaugedDecoder for H264Decoder<'_> {
     fn stats(&self) -> SubmitStats {
         self.submit_stats()
@@ -350,6 +383,7 @@ impl GaugedDecoder for H264Decoder<'_> {
     }
 }
 
+#[cfg(have_corpus)]
 impl GaugedDecoder for H265Decoder<'_> {
     fn stats(&self) -> SubmitStats {
         self.submit_stats()
@@ -360,6 +394,7 @@ impl GaugedDecoder for H265Decoder<'_> {
     }
 }
 
+#[cfg(have_corpus)]
 /// Frames decoded from `bytes` plus the flush drain.
 fn decode_all(
     decoder: &mut impl GaugedDecoder,
@@ -370,6 +405,7 @@ fn decode_all(
     Ok(frames)
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn pipelined_decode_overlaps_frames() {
     let guard = SERIAL.lock().unwrap();
@@ -442,6 +478,7 @@ fn pipelined_decode_overlaps_frames() {
     }
 }
 
+#[cfg(have_corpus)]
 /// Second decode after an injected fault: same frames, one more reset.
 fn recovery_case(
     decoder: &mut impl GaugedDecoder,
@@ -480,6 +517,7 @@ fn recovery_case(
     Ok(())
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn reset_after_failure_recovers() {
     let guard = SERIAL.lock().unwrap();
@@ -524,6 +562,7 @@ fn reset_after_failure_recovers() {
     }
 }
 
+#[cfg(have_corpus)]
 /// Multi-frame transcode over the GPU route, declining the CPU split.
 fn transcode_case(
     codec: VideoCodec,
@@ -573,6 +612,7 @@ fn transcode_case(
     }
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn gpu_transcode_runs_multi_frame() {
     let guard = SERIAL.lock().unwrap();
@@ -590,6 +630,7 @@ fn gpu_transcode_runs_multi_frame() {
     );
 }
 
+#[cfg(have_corpus)]
 /// Decode plus encode steady state: every frame through, zero resets.
 fn steady_h264(guard: &MutexGuard<'_, ()>) {
     let paths = vectors(VideoCodec::H264, guard);
@@ -649,6 +690,7 @@ fn steady_h264(guard: &MutexGuard<'_, ()>) {
     assert_eq!(encoder.submit_stats().resets, 0, "encode recovered mid-run");
 }
 
+#[cfg(have_corpus)]
 /// Decode plus encode steady state: every frame through, zero resets.
 fn steady_h265(guard: &MutexGuard<'_, ()>) {
     let paths = vectors(VideoCodec::H265, guard);
@@ -708,6 +750,7 @@ fn steady_h265(guard: &MutexGuard<'_, ()>) {
     assert_eq!(encoder.submit_stats().resets, 0, "encode recovered mid-run");
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn steady_state_runs_without_timeout() {
     let guard = SERIAL.lock().unwrap();
@@ -715,6 +758,7 @@ fn steady_state_runs_without_timeout() {
     steady_h265(&guard);
 }
 
+#[cfg(have_corpus)]
 /// CPU frames decoded from the first vector yielding `want` frames.
 fn encode_source(
     codec: VideoCodec,
@@ -782,6 +826,7 @@ fn encode_source(
     None
 }
 
+#[cfg(have_corpus)]
 /// Packets coded from `frames` through `encoder`.
 fn encode_run(
     encoder: &mut impl Encoder<Error = VulkanError>,
@@ -795,6 +840,7 @@ fn encode_run(
     Ok(packets)
 }
 
+#[cfg(have_corpus)]
 /// Same frames through two fresh encoders: byte-identical packets.
 fn determinism_case(
     codec: VideoCodec,
@@ -889,6 +935,7 @@ fn determinism_case(
     println!("deterministic {codec:?}: {} identical packets", first.len());
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn encode_deterministic_packets() {
     let guard = SERIAL.lock().unwrap();
@@ -906,6 +953,7 @@ fn encode_deterministic_packets() {
     );
 }
 
+#[cfg(have_corpus)]
 /// P stream through a fresh decoder: every frame back, none lost.
 fn roundtrip_case(
     codec: VideoCodec,
@@ -1015,6 +1063,7 @@ fn roundtrip_case(
     assert_eq!(count, FRAMES, "P stream lost frames in {codec:?} roundtrip");
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn encode_p_stream_decodes_clean() {
     let guard = SERIAL.lock().unwrap();
@@ -1032,6 +1081,7 @@ fn encode_p_stream_decodes_clean() {
     );
 }
 
+#[cfg(have_corpus)]
 /// Keyframe flags land on the IDR cadence exactly, plus all-intra mode.
 fn gop_case(codec: VideoCodec, decode_op: CodecOp, encode_op: CodecOp, guard: &MutexGuard<'_, ()>) {
     const FRAMES: usize = 10;
@@ -1124,6 +1174,7 @@ fn gop_case(codec: VideoCodec, decode_op: CodecOp, encode_op: CodecOp, guard: &M
     );
 }
 
+#[cfg(have_corpus)]
 #[test]
 fn encode_gop_boundary_exact() {
     let guard = SERIAL.lock().unwrap();

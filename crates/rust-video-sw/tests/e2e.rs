@@ -1,22 +1,34 @@
-#![cfg(feature = "ffmpeg")]
+//! Software decode goldens over ffmpeg.
 
+#[cfg(feature = "ffmpeg")]
 #[path = "../../rust-video-vaapi/tests/support/mp4.rs"]
 mod mp4;
 
+#[cfg(feature = "ffmpeg")]
 #[path = "../examples/probe/ivf.rs"]
 mod ivf;
 
+#[cfg(feature = "ffmpeg")]
 use std::env;
+#[cfg(feature = "ffmpeg")]
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "ffmpeg")]
 use bytes::Bytes;
+#[cfg(feature = "ffmpeg")]
 use rust_video::VideoCodec;
+#[cfg(feature = "ffmpeg")]
 use rust_video_caps::frame::CpuFrame;
+#[cfg(feature = "ffmpeg")]
 use rust_video_caps::packet::Packet;
+#[cfg(feature = "ffmpeg")]
 use rust_video_caps::traits::Decoder;
+#[cfg(feature = "ffmpeg")]
 use rust_video_harness::{Case, FrameHash, Golden, Suite};
+#[cfg(feature = "ffmpeg")]
 use rust_video_sw::{Av1Decoder, H264Decoder, Vp8Decoder, Vp9Decoder};
 
+#[cfg(feature = "ffmpeg")]
 fn hash_frame(frame: &CpuFrame) -> FrameHash {
     let mut bytes = Vec::new();
     for plane in frame.planes() {
@@ -25,6 +37,7 @@ fn hash_frame(frame: &CpuFrame) -> FrameHash {
     FrameHash::of(&bytes)
 }
 
+#[cfg(feature = "ffmpeg")]
 fn corpus() -> PathBuf {
     env::var_os("RUST_VIDEO_CORPUS").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../corpus"),
@@ -32,6 +45,7 @@ fn corpus() -> PathBuf {
     )
 }
 
+#[cfg(feature = "ffmpeg")]
 fn goldens() -> PathBuf {
     env::var_os("RUST_VIDEO_GOLDENS").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rust-video-harness/goldens"),
@@ -39,6 +53,7 @@ fn goldens() -> PathBuf {
     )
 }
 
+#[cfg(feature = "ffmpeg")]
 /// Payloads of one IVF case, `None` for containers outside the IVF path.
 fn ivf_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     let ivf = Path::new(case.name())
@@ -47,6 +62,7 @@ fn ivf_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     ivf.then(|| ivf::read_ivf(case.path()).frames)
 }
 
+#[cfg(feature = "ffmpeg")]
 /// Payloads of one MP4 case, `None` for containers outside the MP4 path.
 fn mp4_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     let mp4 = Path::new(case.name())
@@ -62,6 +78,7 @@ fn mp4_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     )
 }
 
+#[cfg(feature = "ffmpeg")]
 /// Golden hashes decoded from `payloads` through `decoder`.
 fn decode_hashes<D>(decoder: &mut D, name: &str, payloads: &[Vec<u8>]) -> Vec<FrameHash>
 where
@@ -86,6 +103,7 @@ where
     actual
 }
 
+#[cfg(feature = "ffmpeg")]
 /// Cases of `codec` checked against `golden_dir`, skipping vectors the
 /// packetizer declines; skips the codec when `required` is false and the
 /// corpus holds none.
@@ -147,24 +165,28 @@ fn check_codec<D>(
     assert!(checked > 0, "no {golden_dir} case checked");
 }
 
+#[cfg(feature = "ffmpeg")]
 #[test]
 fn vp8_decode_matches_golden() {
     let mut decoder = Vp8Decoder::open(4).expect("vp8 decoder opens");
     check_codec(VideoCodec::Vp8, "vp8", &mut decoder, ivf_payloads, true);
 }
 
+#[cfg(feature = "ffmpeg")]
 #[test]
 fn vp9_decode_matches_golden() {
     let mut decoder = Vp9Decoder::open(4).expect("vp9 decoder opens");
     check_codec(VideoCodec::Vp9, "vp9", &mut decoder, ivf_payloads, true);
 }
 
+#[cfg(feature = "ffmpeg")]
 #[test]
 fn h264_decode_matches_golden() {
     let mut decoder = H264Decoder::open(4).expect("h264 decoder opens");
     check_codec(VideoCodec::H264, "h264", &mut decoder, mp4_payloads, true);
 }
 
+#[cfg(feature = "ffmpeg")]
 #[test]
 fn av1_decode_matches_golden() {
     let mut decoder = Av1Decoder::open(4).expect("av1 decoder opens");

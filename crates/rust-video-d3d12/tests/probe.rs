@@ -1,20 +1,25 @@
-#![cfg(target_os = "windows")]
-
 //! Device-tier probe: adapter, profiles, pictures, encoder.
 //!
 //! Prints the adapter matrix on hardware; passes without hardware.
 
+#[cfg(target_os = "windows")]
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
     Mpeg2Decoder, Vc1Decoder, Vp9Decoder,
 };
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
+#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
 
+#[cfg(target_os = "windows")]
 /// Adapter matrix plus picture and encoder contracts, skipped without hardware.
 #[test]
 fn probe_reports_or_skips() {
@@ -64,6 +69,7 @@ fn probe_reports_or_skips() {
     }
 }
 
+#[cfg(target_os = "windows")]
 /// Loud fallback for a pending `codec` builder.
 fn drive_shell<D>(decoder: &mut D, codec: Codec)
 where
@@ -77,6 +83,7 @@ where
     assert!(decoder.flush().expect("flush").is_empty());
 }
 
+#[cfg(target_os = "windows")]
 /// Bitstream or loud fallback for `codec` at `width` x `height`.
 fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
     let mut encoder = match D3d12Encoder::open(device, codec) {
@@ -118,6 +125,7 @@ fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
     );
 }
 
+#[cfg(target_os = "windows")]
 /// Mid-grey NV12 frame of `width` x `height`.
 fn grey_nv12(width: u32, height: u32) -> CpuFrame {
     let size = PictureSize::new(width, height).expect("nonzero extent");

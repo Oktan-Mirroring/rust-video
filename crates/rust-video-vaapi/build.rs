@@ -1,3 +1,5 @@
+//! Build flags: the corpus gate.
+
 use std::path::PathBuf;
 
 fn main() {

@@ -1,3 +1,5 @@
+//! Build flags: tier availability plus the corpus gate.
+
 use std::path::PathBuf;
 
 fn main() {

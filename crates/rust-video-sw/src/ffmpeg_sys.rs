@@ -1,3 +1,4 @@
+// FFI boundary: raw libavcodec and libavutil declarations live here.
 #![allow(unsafe_code)]
 //! Minimal libavcodec/libavutil bindings for software codecs.
 //!
@@ -29,28 +30,34 @@ pub const EOF: c_int = -541_478_725;
 pub const NOPTS: i64 = i64::MIN;
 /// Search flag reaching the encoder wrapper's private options.
 pub const OPT_SEARCH_CHILDREN: c_int = 1;
+/// Keyframe bit in `AVPacket::flags`.
+pub const FLAG_KEY: c_int = 1;
 
 /// Opaque codec descriptor.
 #[repr(C)]
 pub struct AVCodec {
+    /// Opaque body, never read.
     _opaque: [u8; 0],
 }
 
 /// Opaque codec instance; configured through options only.
 #[repr(C)]
 pub struct AVCodecContext {
+    /// Opaque body, never read.
     _opaque: [u8; 0],
 }
 
 /// Opaque stream splitter.
 #[repr(C)]
 pub struct AVCodecParserContext {
+    /// Opaque body, never read.
     _opaque: [u8; 0],
 }
 
 /// Coded packet; payload span, stream index, and flags are exposed.
 #[repr(C)]
 pub struct AVPacket {
+    /// Leading bytes ahead of the payload span.
     _head: [u8; 24],
     /// Payload bytes.
     pub data: *mut u8,
@@ -60,11 +67,9 @@ pub struct AVPacket {
     pub stream_index: c_int,
     /// Flag bits (`FLAG_KEY` marks a keyframe).
     pub flags: c_int,
+    /// Trailing bytes past the flags.
     _tail: [u8; 60],
 }
-
-/// Keyframe bit in `AVPacket::flags`.
-pub const FLAG_KEY: c_int = 1;
 
 /// Decoded frame; only geometry, format, planes, and pts are exposed.
 #[repr(C)]
@@ -83,9 +88,11 @@ pub struct AVFrame {
     pub nb_samples: c_int,
     /// Pixel format id.
     pub format: c_int,
+    /// Middle bytes between format and pts.
     _mid: [u8; 16],
     /// Presentation timestamp in time-base units.
     pub pts: i64,
+    /// Trailing bytes past the pts.
     _tail: [u8; 296],
 }
 

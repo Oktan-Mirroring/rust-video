@@ -1,3 +1,5 @@
+//! Vulkan decode probe over file vectors.
+
 use bytes::Bytes;
 
 use rust_video_caps::packet::Packet;

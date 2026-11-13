@@ -1,29 +1,78 @@
-#![cfg(have_corpus)]
-#![cfg(target_os = "linux")]
-
 //! VA-API end-to-end: synth vectors in, hashed frames out.
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[path = "support/mp4.rs"]
 mod mp4;
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[path = "../examples/common/synth.rs"]
 mod synth;
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use bytes::Bytes;
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_caps::common::PictureSize;
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_caps::frame::{GpuExport, PixelFormat};
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_caps::packet::Packet;
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_caps::transcode::Route;
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_harness::FrameHash;
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 use rust_video_vaapi::{
     EncodeCodec, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder, VaApiError,
     VaApiFrame,
 };
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Corpus root: `$RUST_VIDEO_CORPUS` or the checkout's `corpus/`.
 fn corpus() -> PathBuf {
     std::env::var_os("RUST_VIDEO_CORPUS").map_or_else(
@@ -37,6 +86,10 @@ fn corpus() -> PathBuf {
     )
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Scratch dir for one ffmpeg oracle run, removed after it.
 fn scratch(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -44,6 +97,10 @@ fn scratch(name: &str) -> PathBuf {
         .join(format!("vaapi-e2e-{}-{name}", std::process::id()))
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// NAL units of Annex B `bytes`, start codes stripped.
 fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
     let mut units = Vec::new();
@@ -68,6 +125,10 @@ fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
     units
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Demuxed samples as one Annex B blob.
 fn annex_b(stream: &mp4::Stream) -> Vec<u8> {
     let mut out = Vec::new();
@@ -77,6 +138,10 @@ fn annex_b(stream: &mp4::Stream) -> Vec<u8> {
     out
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// ffmpeg remux of `path` to Annex B `ext`, or `None` without ffmpeg.
 fn ffmpeg_remux(path: &Path, scratch: &Path, ext: &str) -> Option<Vec<u8>> {
     std::fs::create_dir_all(scratch).ok()?;
@@ -102,6 +167,10 @@ fn ffmpeg_remux(path: &Path, scratch: &Path, ext: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// ffmpeg software decode of `path` as planar hashes, or `None` without ffmpeg.
 fn ffmpeg_hashes(
     path: &Path,
@@ -149,6 +218,10 @@ fn ffmpeg_hashes(
     )
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// NV12 frame bytes as planar YUV420P.
 fn to_planar(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
     let y_len = width * height;
@@ -160,6 +233,10 @@ fn to_planar(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
     planar
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Decode one packet per sample.
 fn decode_stream(
     decoder: &mut H264Decoder<'_>,
@@ -173,11 +250,19 @@ fn decode_stream(
     Ok(frames)
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// True when `RUST_VIDEO_ALLOW_SKIP=1` permits skipping.
 fn allow_skip() -> bool {
     std::env::var("RUST_VIDEO_ALLOW_SKIP").is_ok_and(|value| value == "1")
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Skip over missing `what`.
 ///
 /// # Panics
@@ -191,6 +276,10 @@ fn skip(what: &str) {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// Device, or `None` when the tier declines the machine and skips are allowed.
 fn device() -> Option<VaApiDevice> {
     match VaApiDevice::open() {
@@ -206,6 +295,10 @@ fn device() -> Option<VaApiDevice> {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn demux_matches_ffmpeg_remux() {
     let path = corpus().join("synth/h264/h264-high.mp4");
@@ -226,6 +319,10 @@ fn demux_matches_ffmpeg_remux() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_decodes_synth_high() {
     let Some(device) = device() else {
@@ -255,6 +352,10 @@ fn vaapi_decodes_synth_high() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_declines_high_chroma() {
     let Some(device) = device() else {
@@ -272,6 +373,10 @@ fn vaapi_declines_high_chroma() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn demux_matches_ffmpeg_remux_h265() {
     let path = corpus().join("synth/h265/h265-main.mp4");
@@ -292,6 +397,10 @@ fn demux_matches_ffmpeg_remux_h265() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn h265_frontend_gap_is_loud() {
     let path = corpus().join("synth/h265/h265-main.mp4");
@@ -305,6 +414,10 @@ fn h265_frontend_gap_is_loud() {
     assert!(message.contains("h265"), "loud codec name: {message}");
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_exports_dmabuf() {
     let Some(device) = device() else {
@@ -337,6 +450,10 @@ fn vaapi_exports_dmabuf() {
     assert!(exported > 0);
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 /// First NAL header byte of Annex B `bytes`.
 fn first_nal_header(bytes: &[u8]) -> u8 {
     let units = nal_units(bytes);
@@ -347,6 +464,10 @@ fn first_nal_header(bytes: &[u8]) -> u8 {
         .expect("one nal")
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_encodes_h264_all_intra() {
     let Some(device) = device() else {
@@ -403,6 +524,10 @@ fn vaapi_encodes_h264_all_intra() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_encodes_h265_keyframes() {
     let Some(device) = device() else {
@@ -446,6 +571,10 @@ fn vaapi_encodes_h265_keyframes() {
     assert_eq!(expected.len(), coded, "ffmpeg frame count");
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_pipelines_submit_depth() {
     let Some(device) = device() else {
@@ -491,6 +620,10 @@ fn vaapi_pipelines_submit_depth() {
     assert_eq!(shown + tail.len(), 9);
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_reuses_decode_buffers() {
     let Some(device) = device() else {
@@ -516,6 +649,10 @@ fn vaapi_reuses_decode_buffers() {
     );
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_reuses_encode_buffers() {
     let Some(device) = device() else {
@@ -545,6 +682,10 @@ fn vaapi_reuses_encode_buffers() {
     );
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_recovers_after_bad_packet() {
     let Some(device) = device() else {
@@ -577,6 +718,10 @@ fn vaapi_recovers_after_bad_packet() {
     assert_eq!(frames.len(), stream.samples.len());
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_transcodes_scaled_on_device() {
     let Some(device) = device() else {
@@ -624,6 +769,10 @@ fn vaapi_transcodes_scaled_on_device() {
     }
 }
 
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
+#[cfg(have_corpus)]
+#[cfg(target_os = "linux")]
 #[test]
 fn vaapi_transcodes_on_device() {
     let Some(device) = device() else {

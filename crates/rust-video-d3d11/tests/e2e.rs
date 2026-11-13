@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 //! D3D11 end to end: file vectors through decode overlap, GPU
 //! transcode, and reset recovery.
 //!
@@ -7,20 +5,29 @@
 //! testsrc2 pictures (320x240 constrained baseline, IDR at 0 and
 //! 8); `examples/common/annexb.rs` loads and splits it.
 
+#[cfg(target_os = "windows")]
 #[path = "../examples/common/annexb.rs"]
 mod annexb;
 
+#[cfg(target_os = "windows")]
 use annexb::{picture_packets, vector};
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, H264Decoder, Transcoder};
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device};
+#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
 
+#[cfg(target_os = "windows")]
 /// Pictures in the committed vector.
 const PICTURES: usize = 15;
 
+#[cfg(target_os = "windows")]
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d11Device> {
     match D3d11Device::open() {
@@ -35,6 +42,7 @@ fn device() -> Option<D3d11Device> {
     }
 }
 
+#[cfg(target_os = "windows")]
 /// One packet per picture in order, failing loud off the steady path.
 fn decode_all(decoder: &mut H264Decoder<'_>, raws: &[Vec<u8>]) -> usize {
     let mut total = 0;
@@ -49,6 +57,7 @@ fn decode_all(decoder: &mut H264Decoder<'_>, raws: &[Vec<u8>]) -> usize {
     total
 }
 
+#[cfg(target_os = "windows")]
 /// Whole-file packet queues submits before the first wait.
 #[test]
 fn overlap_queues_before_first_wait() {
@@ -74,6 +83,7 @@ fn overlap_queues_before_first_wait() {
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }
 
+#[cfg(target_os = "windows")]
 /// Ordered pictures decode with no reset.
 #[test]
 fn steady_state_never_resets() {
@@ -93,6 +103,7 @@ fn steady_state_never_resets() {
     assert_eq!(decoder.resets(), 0, "steady vector never resets");
 }
 
+#[cfg(target_os = "windows")]
 /// Skipped picture fails once, then the stream recovers clean.
 #[test]
 fn reset_after_failure_recovers() {
@@ -121,6 +132,7 @@ fn reset_after_failure_recovers() {
     assert_eq!(decoder.resets(), 1, "recovery adds no reset");
 }
 
+#[cfg(target_os = "windows")]
 /// Hardware NV12 bytes match the ffmpeg software oracle byte-exact.
 #[test]
 fn hardware_matches_software_oracle() {
@@ -187,6 +199,7 @@ fn hardware_matches_software_oracle() {
     );
 }
 
+#[cfg(target_os = "windows")]
 /// GPU transcode output decodes clean under ffmpeg.
 #[test]
 fn gpu_transcode_stays_ffmpeg_clean() {
@@ -237,6 +250,7 @@ fn gpu_transcode_stays_ffmpeg_clean() {
     println!("transcode: {coded_packets} packets, {coded_bytes} bytes, route=gpu, ffmpeg-clean");
 }
 
+#[cfg(target_os = "windows")]
 /// ffmpeg decode over `path`, failing loud without the oracle.
 fn ffmpeg_clean(path: &std::path::Path) {
     let output = std::process::Command::new("ffmpeg")

@@ -1,20 +1,25 @@
-#![cfg(target_os = "windows")]
-
 //! Device-tier probe: adapter, profiles, shells, encoder.
 //!
 //! Prints the adapter matrix on hardware; passes without hardware.
 
+#[cfg(target_os = "windows")]
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, H264Decoder, HevcDecoder,
     Mpeg2Decoder, Vc1Decoder, Vp9Decoder,
 };
 
+#[cfg(target_os = "windows")]
 use bytes::Bytes;
+#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
+#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
 
+#[cfg(target_os = "windows")]
 /// Adapter matrix plus shell and encoder contracts, skipped without hardware.
 #[test]
 fn probe_reports_or_skips() {
@@ -75,6 +80,7 @@ fn probe_reports_or_skips() {
     }
 }
 
+#[cfg(target_os = "windows")]
 /// Eight frames plus a drain through `codec`, or its loud fallback.
 fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, required: bool) {
     let mut encoder = match D3d11Encoder::open(device, codec) {
@@ -115,6 +121,7 @@ fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, re
     assert!(bytes > 0, "{codec} encoder emitted no bytes");
 }
 
+#[cfg(target_os = "windows")]
 /// Loud fallback for a `codec` the machine cannot encode.
 fn fallback(codec: Codec, required: bool, error: &D3d11Error) {
     println!("{codec} encode unavailable: {error}");
@@ -129,6 +136,7 @@ fn fallback(codec: Codec, required: bool, error: &D3d11Error) {
     );
 }
 
+#[cfg(target_os = "windows")]
 /// Mid-grey NV12 frame of `width` x `height`.
 fn grey_nv12(width: u32, height: u32) -> CpuFrame {
     let size = PictureSize::new(width, height).expect("nonzero extent");

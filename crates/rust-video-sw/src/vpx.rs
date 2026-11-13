@@ -1,16 +1,17 @@
+// FFI boundary: libvpx option calls through the sys layer live here.
 #![allow(unsafe_code)]
 //! VP8/VP9 encode over ffmpeg's libvpx wrappers.
 //!
 //! Encode only: decode rides the same sys layer, and the wrappers drive the
 //! same libvpx underneath, so the coded output keeps its performance.
 
-use rust_video_caps::frame::CpuFrame;
-use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
-
 use crate::error::SwError;
 use crate::ffmpeg_enc::FfmpegEncoder;
 use crate::ffmpeg_sys as sys;
+
+use rust_video_caps::frame::CpuFrame;
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Encoder;
 
 /// VP8 encoder over ffmpeg's `libvpx` wrapper.
 ///
