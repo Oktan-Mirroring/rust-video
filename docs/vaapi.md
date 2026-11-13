@@ -57,7 +57,7 @@ happens once per wiring, not up front.
 ## Provenance
 
 Syntax sources: `cros-codecs` 0.0.6, BSD-3-Clause, Copyright
-2022–2024 The ChromiumOS Authors. License text kept at
+2022-2024 The ChromiumOS Authors. License text kept at
 `crates/rust-video-vaapi/LICENSE.cros-codecs`; every staged file
 keeps its upstream copyright header. No `cros-codecs` dependency.
 The H.264 tree is restructured from upstream (grouped parameter
@@ -99,8 +99,8 @@ backend-gated half of `cros-codecs` 0.0.6 (Tier 2, read-only reference).
 Staged code, verified clause by clause: frame/field picture numbers
 (8.2.4.1) match; P-frame (8.2.4.2.1) and B-frame (8.2.4.2.3) initial
 lists match, including the B1 identity swap, the poc-type-0
-non-existing exclusion, and POC — not FrameNumWrap — ordering for every
-poc type; sliding window (8.2.5.3) and MMCO 1–6 (8.2.5.4) match,
+non-existing exclusion, and POC, not FrameNumWrap, ordering for every
+poc type; sliding window (8.2.5.3) and MMCO 1-6 (8.2.5.4) match,
 including the MMCO 5 order-count reset arithmetic.
 
 Holes found and how each ships:
