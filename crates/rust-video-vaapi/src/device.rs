@@ -362,7 +362,7 @@ mod tests {
     fn open_selects_an_h264_node() {
         match VaApiDevice::open() {
             Ok(device) => {
-                assert!(!rust_video_caps::traits::Device::name(&device).is_empty());
+                assert_ne!(rust_video_caps::traits::Device::name(&device), "");
             }
             Err(crate::error::VaApiError::Skipped(reason)) => {
                 eprintln!("skipped: no va-api hardware ({reason})");

@@ -477,8 +477,8 @@ impl VaApiEncoder {
         let chroma_stride = usize::try_from(chroma.stride()).map_err(|_| Self::range())?;
         if luma_stride < width
             || chroma_stride < width
-            || luma.data().len() < luma_stride * height
-            || chroma.data().len() < chroma_stride * height / 2
+            || luma.data().len() < luma_stride.saturating_mul(height)
+            || chroma.data().len() < chroma_stride.saturating_mul(height) / 2
         {
             return Err(VaApiError::Unsupported(
                 "upload planes short of their strides".to_owned(),
@@ -496,6 +496,9 @@ impl VaApiEncoder {
         let y_pitch = usize::try_from(image.pitches[0]).map_err(|_| Self::range())?;
         let uv_base = usize::try_from(image.offsets[1]).map_err(|_| Self::range())?;
         let uv_pitch = usize::try_from(image.pitches[1]).map_err(|_| Self::range())?;
+        if width > y_pitch || width > uv_pitch {
+            return Err(VaApiError::Unsupported("upload image layout".to_owned()));
+        }
         let display = self.session.display;
         // Sound: the image buffer is live until `vaDestroyImage`.
         let mut data: *mut c_void = std::ptr::null_mut();

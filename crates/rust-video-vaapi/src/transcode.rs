@@ -158,6 +158,11 @@ impl<'a> Transcoder<'a> {
                 return Err(VaApiError::Unsupported(cause.to_string()));
             }
             if let Some(cause) = self.scale.miss(surface.identity().size()) {
+                if self.scaler_swap_needed(&cause) {
+                    if let Some(previous) = pending.take() {
+                        self.encode_pending(&previous, &mut packets)?;
+                    }
+                }
                 let scaled = self.scaled_or_miss(surface, cause)?;
                 if let Some(previous) = pending.replace(scaled) {
                     self.encode_pending(&previous, &mut packets)?;
@@ -185,6 +190,16 @@ impl<'a> Transcoder<'a> {
         let size = scaled.size();
         packets.append(&mut self.encoder_for(size)?.encode_scaled(scaled)?);
         Ok(())
+    }
+
+    /// True when `cause` needs a different scaler than the live one.
+    fn scaler_swap_needed(&self, cause: &FallbackCause) -> bool {
+        let FallbackCause::ScaleNeeded { from, to } = cause else {
+            return false;
+        };
+        self.scaler
+            .as_ref()
+            .is_none_or(|scaler| scaler.from() != *from || scaler.to() != *to)
     }
 
     /// Scaled `surface` for a `cause` miss, or the loud miss itself.

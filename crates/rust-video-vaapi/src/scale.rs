@@ -166,8 +166,12 @@ impl Scaler {
         VaApiError::status(unsafe { ffi::vaBeginPicture(display, context, target) })?;
         let rendered = unsafe { ffi::vaRenderPicture(display, context, &raw mut id, 1) };
         let end = unsafe { ffi::vaEndPicture(display, context) };
-        VaApiError::status(rendered)?;
-        VaApiError::status(end)?;
+        let outcome = VaApiError::status(rendered).and(VaApiError::status(end));
+        if outcome.is_err() {
+            // Sound: the target was just submitted.
+            let _ = unsafe { ffi::vaSyncSurface(display, target) };
+        }
+        outcome?;
         self.settled[slot] = false;
         Ok(ScaledSurface {
             display,

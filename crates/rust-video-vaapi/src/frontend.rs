@@ -1400,17 +1400,17 @@ mod tests {
         frontend.dpb.set_limits(sps.max_dpb_frames(), 16);
 
         let idr = committable(&sps, 0, true);
-        assert!(frontend
-            .commit(idr, SurfaceSlot::new(0))
-            .expect("idr")
-            .is_empty());
+        assert_eq!(
+            frontend.commit(idr, SurfaceSlot::new(0)).expect("idr"),
+            Vec::new()
+        );
         assert_eq!(frontend.dpb.len(), 1);
 
         let next = committable(&sps, 1, false);
-        assert!(frontend
-            .commit(next, SurfaceSlot::new(1))
-            .expect("p")
-            .is_empty());
+        assert_eq!(
+            frontend.commit(next, SurfaceSlot::new(1)).expect("p"),
+            Vec::new()
+        );
         let refs: Vec<_> = frontend
             .dpb
             .short_term_refs_iter()
@@ -1438,7 +1438,7 @@ mod tests {
             let bumped = frontend
                 .commit(committable, SurfaceSlot::new(slot))
                 .expect("room");
-            assert!(bumped.is_empty());
+            assert_eq!(bumped, Vec::new());
         }
 
         let mut delayed = committable(&sps, 3, false);

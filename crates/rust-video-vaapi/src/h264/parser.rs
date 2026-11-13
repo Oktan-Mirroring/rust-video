@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Can't reasonably expect client code to consume everything that has been parsed.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::io::Read;
@@ -391,66 +388,6 @@ pub struct SliceHeader {
 
     /// Number of emulation prevention bytes (EPB) in this `slice_header()`
     pub n_emulation_prevention_bytes: usize,
-}
-
-pub struct SliceHeaderBuilder(SliceHeader);
-
-impl SliceHeaderBuilder {
-    pub fn new(pps: &Pps) -> Self {
-        SliceHeaderBuilder(SliceHeader {
-            pic_parameter_set_id: pps.pic_parameter_set_id,
-            ..Default::default()
-        })
-    }
-
-    pub fn slice_type(mut self, type_: SliceType) -> Self {
-        self.0.slice_type = type_;
-        self
-    }
-
-    pub fn first_mb_in_slice(mut self, value: u32) -> Self {
-        self.0.first_mb_in_slice = value;
-        self
-    }
-
-    pub fn pic_order_cnt_lsb(mut self, value: u16) -> Self {
-        self.0.pic_order_cnt_lsb = value;
-        self
-    }
-
-    pub fn idr_pic_id(mut self, value: u16) -> Self {
-        self.0.idr_pic_id = value;
-        self
-    }
-
-    pub fn num_ref_idx_active_override_flag(mut self, value: bool) -> Self {
-        self.0.num_ref_idx_active_override_flag = value;
-        self
-    }
-
-    pub fn num_ref_idx_l0_active_minus1(mut self, value: u8) -> Self {
-        self = self.num_ref_idx_active_override_flag(true);
-        self.0.num_ref_idx_l0_active_minus1 = value;
-        self
-    }
-
-    pub fn num_ref_idx_l0_active(self, value: u8) -> Self {
-        self.num_ref_idx_l0_active_minus1(value - 1)
-    }
-
-    pub fn num_ref_idx_l1_active_minus1(mut self, value: u8) -> Self {
-        self = self.num_ref_idx_active_override_flag(true);
-        self.0.num_ref_idx_l1_active_minus1 = value;
-        self
-    }
-
-    pub fn num_ref_idx_l1_active(self, value: u8) -> Self {
-        self.num_ref_idx_l1_active_minus1(value - 1)
-    }
-
-    pub fn build(self) -> SliceHeader {
-        self.0
-    }
 }
 
 /// A H264 slice. An integer number of macroblocks or macroblock pairs ordered
@@ -977,228 +914,6 @@ impl Default for Sps {
     }
 }
 
-#[derive(Default)]
-pub struct SpsBuilder(Sps);
-
-impl SpsBuilder {
-    pub fn new() -> Self {
-        SpsBuilder::default()
-    }
-
-    pub fn seq_parameter_set_id(mut self, value: u8) -> Self {
-        self.0.seq_parameter_set_id = value;
-        self
-    }
-
-    pub fn profile_idc(mut self, value: Profile) -> Self {
-        self.0.profile_idc = value as u8;
-        self
-    }
-
-    pub fn level_idc(mut self, value: Level) -> Self {
-        self.0.level_idc = value;
-        self
-    }
-
-    pub fn frame_crop_offsets(mut self, top: u32, bottom: u32, left: u32, right: u32) -> Self {
-        self.0.crop = Some(FrameCrop {
-            left,
-            right,
-            top,
-            bottom,
-        });
-        self
-    }
-
-    pub fn frame_crop(self, top: u32, bottom: u32, left: u32, right: u32) -> Self {
-        let sub_width_c = if self.0.chroma.idc > 2 { 1 } else { 2 };
-        let sub_height_c = if self.0.chroma.idc > 1 { 1 } else { 2 };
-
-        let crop_unit_x = sub_width_c;
-        let crop_unit_y = sub_height_c
-            * (if self.0.frame_field.frame_mbs_only {
-                1
-            } else {
-                2
-            });
-
-        self.frame_crop_offsets(
-            top / crop_unit_y,
-            bottom / crop_unit_y,
-            left / crop_unit_x,
-            right / crop_unit_x,
-        )
-    }
-
-    pub fn resolution(mut self, width: u32, height: u32) -> Self {
-        const MB_SIZE: u32 = 16;
-
-        let mb_width = width.div_ceil(MB_SIZE);
-        let mb_height = height.div_ceil(MB_SIZE);
-
-        self.0.pic_width_in_mbs_minus1 = u16::try_from(mb_width - 1).unwrap_or(u16::MAX);
-        self.0.pic_height_in_map_units_minus1 = u16::try_from(mb_height - 1).unwrap_or(u16::MAX);
-
-        let compressed_width = mb_width * MB_SIZE;
-        let compressed_height = mb_height * MB_SIZE;
-
-        if compressed_width != width || compressed_height != height {
-            self = self.frame_crop(0, compressed_height - height, 0, compressed_width - width);
-        }
-
-        self
-    }
-
-    pub fn chroma_format_idc(mut self, value: u8) -> Self {
-        self.0.chroma.idc = value;
-        self
-    }
-
-    pub fn max_num_ref_frames(mut self, value: u8) -> Self {
-        self.0.max_num_ref_frames = value;
-        self
-    }
-
-    pub fn frame_mbs_only_flag(mut self, value: bool) -> Self {
-        self.0.frame_field.frame_mbs_only = value;
-        self
-    }
-
-    pub fn mb_adaptive_frame_field_flag(mut self, value: bool) -> Self {
-        self.0.frame_field.mb_adaptive = value;
-        self
-    }
-
-    pub fn seq_scaling_matrix_present_flag(mut self, value: bool) -> Self {
-        self.0.scaling.present = value;
-        self
-    }
-
-    pub fn direct_8x8_inference_flag(mut self, value: bool) -> Self {
-        self.0.direct_8x8_inference_flag = value;
-        self
-    }
-
-    pub fn vui_parameters_present(mut self) -> Self {
-        self.0.vui.get_or_insert_with(VuiParams::default);
-        self
-    }
-
-    pub fn aspect_ratio_idc(mut self, value: u8) -> Self {
-        self = self.vui_parameters_present();
-        let vui = self.0.vui.as_mut().expect("vui present");
-        vui.aspect_ratio = Some(AspectRatio {
-            idc: value,
-            ..vui.aspect_ratio.take().unwrap_or_default()
-        });
-        self
-    }
-
-    pub fn sar_resolution(mut self, width: u16, height: u16) -> Self {
-        self = self.aspect_ratio_idc(255);
-        let aspect_ratio = self
-            .0
-            .vui
-            .as_mut()
-            .expect("vui present")
-            .aspect_ratio
-            .as_mut()
-            .expect("aspect ratio present");
-        aspect_ratio.sar_width = width;
-        aspect_ratio.sar_height = height;
-        self
-    }
-
-    pub fn aspect_ratio(self, width_ratio: u16, height_ratio: u16) -> Self {
-        // H.264 Table E-1
-        match (width_ratio, height_ratio) {
-            (1, 1) => self.aspect_ratio_idc(1),
-            (12, 11) => self.aspect_ratio_idc(2),
-            (10, 11) => self.aspect_ratio_idc(3),
-            (16, 11) => self.aspect_ratio_idc(4),
-            (40, 33) => self.aspect_ratio_idc(5),
-            (24, 11) => self.aspect_ratio_idc(6),
-            (20, 11) => self.aspect_ratio_idc(7),
-            (32, 11) => self.aspect_ratio_idc(8),
-            (80, 33) => self.aspect_ratio_idc(9),
-            (18, 11) => self.aspect_ratio_idc(10),
-            (15, 11) => self.aspect_ratio_idc(11),
-            (64, 33) => self.aspect_ratio_idc(12),
-            (160, 99) => self.aspect_ratio_idc(13),
-            (4, 3) => self.aspect_ratio_idc(14),
-            (3, 2) => self.aspect_ratio_idc(15),
-            (2, 1) => self.aspect_ratio_idc(16),
-
-            _ => self.sar_resolution(width_ratio, height_ratio),
-        }
-    }
-
-    pub fn timing_info(
-        mut self,
-        num_units_in_tick: u32,
-        time_scale: u32,
-        fixed_frame_rate_flag: bool,
-    ) -> Self {
-        self = self.vui_parameters_present();
-        self.0.vui.as_mut().expect("vui present").timing = Some(TimingInfo {
-            num_units_in_tick,
-            time_scale,
-            fixed_frame_rate: fixed_frame_rate_flag,
-        });
-        self
-    }
-
-    pub fn log2_max_frame_num_minus4(mut self, value: u8) -> Self {
-        self.0.log2_max_frame_num_minus4 = value;
-        self
-    }
-
-    pub fn max_frame_num(self, value: u32) -> Self {
-        self.log2_max_frame_num_minus4(u8::try_from(value.ilog2()).unwrap_or(u8::MAX) - 4u8)
-    }
-
-    pub fn pic_order_cnt_type(mut self, value: u8) -> Self {
-        self.0.pic_order_cnt_type = value;
-        self
-    }
-
-    pub fn log2_max_pic_order_cnt_lsb_minus4(mut self, value: u8) -> Self {
-        self.0.log2_max_pic_order_cnt_lsb_minus4 = value;
-        self
-    }
-
-    pub fn max_pic_order_cnt_lsb(self, value: u32) -> Self {
-        self.log2_max_pic_order_cnt_lsb_minus4(u8::try_from(value.ilog2()).unwrap_or(u8::MAX) - 4u8)
-    }
-
-    pub fn delta_pic_order_always_zero_flag(mut self, value: bool) -> Self {
-        self.0.delta_pic_order_always_zero_flag = value;
-        self
-    }
-
-    pub fn bit_depth_chroma_minus8(mut self, value: u8) -> Self {
-        self.0.bit_depth.chroma_minus8 = value;
-        self
-    }
-
-    pub fn bit_depth_chroma(self, value: u8) -> Self {
-        self.bit_depth_luma_minus8(value - 8u8)
-    }
-
-    pub fn bit_depth_luma_minus8(mut self, value: u8) -> Self {
-        self.0.bit_depth.luma_minus8 = value;
-        self
-    }
-
-    pub fn bit_depth_luma(self, value: u8) -> Self {
-        self.bit_depth_luma_minus8(value - 8u8)
-    }
-
-    pub fn build(self) -> Rc<Sps> {
-        Rc::new(self.0)
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HrdParams {
     /// Plus 1 specifies the number of alternative CPB specifications in the
@@ -1441,8 +1156,10 @@ pub struct Pps {
     pub sps: Rc<Sps>,
 }
 
+#[cfg(test)]
 pub struct PpsBuilder(Pps);
 
+#[cfg(test)]
 impl PpsBuilder {
     pub fn new(sps: Rc<Sps>) -> Self {
         PpsBuilder(Pps {
@@ -1464,43 +1181,6 @@ impl PpsBuilder {
             second_chroma_qp_index_offset: 0,
             sps,
         })
-    }
-
-    pub fn pic_parameter_set_id(mut self, value: u8) -> Self {
-        self.0.pic_parameter_set_id = value;
-        self
-    }
-
-    pub fn pic_init_qp_minus26(mut self, value: i8) -> Self {
-        self.0.pic_init_qp_minus26 = value;
-        self
-    }
-
-    pub fn pic_init_qp(self, value: u8) -> Self {
-        self.pic_init_qp_minus26(value.cast_signed() - 26)
-    }
-
-    pub fn deblocking_filter_control_present_flag(mut self, value: bool) -> Self {
-        self.0.presence.deblocking_filter_control_present_flag = value;
-        self
-    }
-
-    pub fn num_ref_idx_l0_default_active_minus1(mut self, value: u8) -> Self {
-        self.0.num_ref_idx_l0_default_active_minus1 = value;
-        self
-    }
-
-    pub fn num_ref_idx_l0_default_active(self, value: u8) -> Self {
-        self.num_ref_idx_l0_default_active_minus1(value - 1)
-    }
-
-    pub fn num_ref_idx_l1_default_active_minus1(mut self, value: u8) -> Self {
-        self.0.num_ref_idx_l1_default_active_minus1 = value;
-        self
-    }
-
-    pub fn num_ref_idx_l1_default_active(self, value: u8) -> Self {
-        self.num_ref_idx_l1_default_active_minus1(value - 1)
     }
 
     pub fn build(self) -> Rc<Pps> {
@@ -1576,16 +1256,12 @@ impl Parser {
     ) {
         // (7-8) in the spec.
         for outer in scaling_list4x4 {
-            for inner in outer {
-                *inner = 16;
-            }
+            outer.fill(16);
         }
 
         // (7-9) in the spec.
         for outer in scaling_list8x8 {
-            for inner in outer {
-                *inner = 16;
-            }
+            outer.fill(16);
         }
     }
 
@@ -2365,9 +2041,9 @@ impl Parser {
 
         header.num_ref_idx_active_override_flag = r.read_bit()?;
         if header.num_ref_idx_active_override_flag {
-            header.num_ref_idx_l0_active_minus1 = r.read_ue()?;
+            header.num_ref_idx_l0_active_minus1 = r.read_ue_max(31)?;
             if header.slice_type.is_b() {
-                header.num_ref_idx_l1_active_minus1 = r.read_ue()?;
+                header.num_ref_idx_l1_active_minus1 = r.read_ue_max(31)?;
             }
         } else {
             header.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
@@ -2656,5 +2332,31 @@ mod tests {
         let nalu = first(&bytes);
         let parser = Parser::default();
         assert!(parser.parse_slice_header(nalu).is_err());
+    }
+
+    #[test]
+    fn slice_ref_override_over_list_cap_rejected() {
+        use std::rc::Rc;
+
+        use super::{FrameFieldCoding, PpsBuilder, Sps};
+
+        let sps = Rc::new(Sps {
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt_type: 2,
+            frame_field: FrameFieldCoding {
+                frame_mbs_only: true,
+                ..Default::default()
+            },
+            ..Sps::default()
+        });
+        let pps = PpsBuilder::new(sps).build();
+        let mut parser = Parser::default();
+        parser.active_ppses.insert(0, pps);
+        // P slice: first_mb 0, type P, pps 0, frame_num 0, override set, l0 count 32.
+        let bytes = annex_b(0x61, &[0xE1, 0x04, 0x20]);
+        assert_eq!(
+            parser.parse_slice_header(first(&bytes)).map(|_| ()),
+            Err("Value out of bounds: expected 0 - 31, got 32".to_owned())
+        );
     }
 }
