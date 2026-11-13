@@ -87,7 +87,7 @@ where
         Ok(_) => panic!("{codec} shell decoded without a builder"),
         Err(error) => {
             println!("{codec} decode pending: {error}");
-            assert!(!error.to_string().is_empty());
+            assert_ne!(error.to_string(), "");
         }
     }
 }
@@ -176,7 +176,7 @@ fn drive_encode_roundtrip<D>(
             return;
         }
     };
-    assert!(!packets.is_empty());
+    assert_ne!(packets, [] as [rust_video_caps::packet::Packet; 0]);
     let bytes: Vec<u8> = packets
         .iter()
         .flat_map(|packet| packet.data().to_vec())

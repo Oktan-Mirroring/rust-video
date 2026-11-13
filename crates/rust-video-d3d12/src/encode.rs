@@ -1049,6 +1049,7 @@ impl EncodeSession {
                 (encoder_desc, heap_desc)
             }
         };
+        // Sound: the descriptors and their nested records outlive both calls.
         let encoder: ID3D12VideoEncoder =
             unsafe { video3.CreateVideoEncoder(std::ptr::from_mut(&mut encoder_desc)) }.map_err(
                 |error| {

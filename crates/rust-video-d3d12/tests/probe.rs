@@ -43,7 +43,7 @@ fn probe_reports_or_skips() {
         println!("profile: {} ({})", profile.name(), profile.codec());
     }
     assert!(device.supports(Codec::H264));
-    assert!(!device.profiles().is_empty());
+    assert_ne!(device.profiles(), []);
 
     let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xC5, 0x00]));
     let mut h264 = H264Decoder::open(&device);
@@ -98,7 +98,7 @@ fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
     let frame = grey_nv12(width, height);
     match encoder.encode(&frame) {
         Ok(packets) => {
-            assert!(!packets.is_empty());
+            assert_ne!(packets, [] as [rust_video_caps::packet::Packet; 0]);
             assert!(packets.iter().any(|packet| !packet.data().is_empty()));
         }
         Err(error) => {
@@ -112,7 +112,10 @@ fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
             );
         }
     }
-    assert!(encoder.flush().expect("flush").is_empty());
+    assert_eq!(
+        encoder.flush().expect("flush"),
+        [] as [rust_video_caps::packet::Packet; 0]
+    );
 }
 
 /// Mid-grey NV12 frame of `width` x `height`.

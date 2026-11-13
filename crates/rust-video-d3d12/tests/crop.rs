@@ -147,7 +147,7 @@ fn cropped_stream_output_holds_pixels() {
         .chain(annex_b_h264_packets_cropped())
         .collect();
     let bytes = transcode_bytes(&mut transcoder, raws);
-    assert!(!bytes.is_empty());
+    assert_ne!(bytes, [] as [u8; 0]);
     let mut decoder = H264Decoder::open(&device);
     let packet = Packet::new(Bytes::from(bytes));
     let mut frames = decoder.decode(&packet).expect("oracle decode");

@@ -315,7 +315,7 @@ mod tests {
             return;
         };
         let outcome = transcoder.flush().expect("flush drains");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -326,16 +326,8 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
-        assert!(transcoder
-            .flush()
-            .expect("first flush")
-            .packets()
-            .is_empty());
-        assert!(transcoder
-            .flush()
-            .expect("second flush")
-            .packets()
-            .is_empty());
+        assert_eq!(transcoder.flush().expect("first flush").packets(), []);
+        assert_eq!(transcoder.flush().expect("second flush").packets(), []);
     }
 
     #[test]
@@ -348,7 +340,7 @@ mod tests {
         };
         let packet = Packet::new(Bytes::new());
         let outcome = transcoder.transcode(&packet).expect("empty packet");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -361,7 +353,7 @@ mod tests {
         };
         let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1]));
         let outcome = transcoder.transcode(&packet).expect("truncated packet");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
