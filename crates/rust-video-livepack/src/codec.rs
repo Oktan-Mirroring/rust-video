@@ -628,6 +628,9 @@ mod tests {
         ];
         let info = AvcSpsInfo::parse(&sps).expect("valid prefix");
         assert_eq!(info.profile, 100);
+        assert_eq!(info.chroma, 1);
+        assert_eq!(info.bit_depth_luma, 0);
+        assert_eq!(info.bit_depth_chroma, 0);
         assert!(info.needs_extensions());
     }
 

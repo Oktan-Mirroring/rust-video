@@ -449,7 +449,9 @@ mod tests {
     #[test]
     fn embedded_entries_carry_fallbacks() {
         let table = QuirkTable::load().expect("embedded quirks.toml parses");
-        for quirk in table.matching("", "video/avc") {
+        let matched = table.matching("", "video/avc");
+        assert_ne!(matched, [] as [&Quirk; 0]);
+        for quirk in matched {
             assert!(!quirk.fallback().is_empty(), "{}", quirk.id());
             assert!(!quirk.effect().is_empty(), "{}", quirk.id());
             assert!(!quirk.source().is_empty(), "{}", quirk.id());

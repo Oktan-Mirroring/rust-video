@@ -1216,7 +1216,11 @@ mod tests {
     fn frame_num_wraps_without_gap() {
         let mut dpb = Dpb::new(&sps());
         let frames = [(14, 0), (15, 2), (0, 4), (1, 6)];
-        for (index, (frame_num, lsb)) in frames.iter().enumerate() {
+        let expected_slots: [&[u8]; 4] = [&[], &[0], &[1], &[2]];
+        let expected_poc = [0, 2, 4, 6];
+        for (index, ((frame_num, lsb), expected)) in
+            frames.iter().zip(expected_slots.iter()).enumerate()
+        {
             let picture = if index == 0 {
                 picture(
                     true,
@@ -1232,7 +1236,12 @@ mod tests {
             } else {
                 p(*frame_num, *lsb)
             };
-            dpb.decode(&picture, &sps(), &pps()).expect("wraps");
+            let decoded = dpb.decode(&picture, &sps(), &pps()).expect("wraps");
+            let params = &decoded.submission.params;
+            assert_eq!(u32::from(params.frame_num), *frame_num);
+            let poc = expected_poc[index];
+            assert_eq!(params.curr_field_order_cnt, [poc, poc]);
+            assert_eq!(slots(&decoded.outputs), expected.to_vec());
         }
     }
 

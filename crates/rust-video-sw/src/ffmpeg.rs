@@ -726,7 +726,7 @@ mod tests {
     fn garbage_input_fails_without_panic() {
         let mut decoder = H264Decoder::open(1).expect("decoder");
         let packet = Packet::new(Bytes::from(vec![0xff; 64]));
-        let _ = decoder.decode(&packet);
+        assert_eq!(decoder.decode(&packet).unwrap_or_default(), []);
         let _ = decoder.flush();
     }
 
@@ -741,7 +741,7 @@ mod tests {
     fn framed_garbage_fails_without_panic() {
         let mut decoder = FfmpegDecoder::open(Codec::Vp9, 1).expect("decoder");
         let packet = Packet::new(Bytes::from(vec![0xff; 64]));
-        let _ = decoder.decode(&packet);
+        assert_eq!(decoder.decode(&packet).unwrap_or_default(), []);
         let _ = decoder.flush();
     }
 
