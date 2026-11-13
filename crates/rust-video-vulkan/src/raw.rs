@@ -895,34 +895,25 @@ impl GpuMemory {
     /// # Errors
     ///
     /// Returns `Err` when allocation fails or the platform exports nothing.
+    #[cfg(unix)]
     pub fn allocate_exportable(
         device: &ash::Device,
         size: vk::DeviceSize,
         type_index: u32,
     ) -> Result<Self, VulkanError> {
-        #[cfg(unix)]
-        {
-            let mut export = vk::ExportMemoryAllocateInfo::default()
-                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-            let info = vk::MemoryAllocateInfo::default()
-                .allocation_size(size)
-                .memory_type_index(type_index)
-                .push_next(&mut export);
-            // SAFETY: plain descriptor; the memory is owned on success.
-            let memory = unsafe { device.allocate_memory(&info, None) }?;
-            Ok(Self {
-                device: device.clone(),
-                memory,
-                size,
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (device, size, type_index);
-            Err(VulkanError::Unsupported {
-                what: "dma-buf export".to_owned(),
-            })
-        }
+        let mut export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(type_index)
+            .push_next(&mut export);
+        // SAFETY: plain descriptor; the memory is owned on success.
+        let memory = unsafe { device.allocate_memory(&info, None) }?;
+        Ok(Self {
+            device: device.clone(),
+            memory,
+            size,
+        })
     }
 
     /// Allocation of `size` bytes of `type_index` importing `fd` as DMA-BUF.
@@ -1605,6 +1596,7 @@ impl ExportPair {
         }
         #[cfg(not(unix))]
         {
+            let _ = self;
             GpuExport::Opaque { name: "vulkan" }
         }
     }
@@ -1820,6 +1812,7 @@ impl ImportPair {
         }
         #[cfg(not(unix))]
         {
+            let _ = self;
             vk::Image::null()
         }
     }
@@ -1833,6 +1826,7 @@ impl ImportPair {
         }
         #[cfg(not(unix))]
         {
+            let _ = self;
             vk::Image::null()
         }
     }

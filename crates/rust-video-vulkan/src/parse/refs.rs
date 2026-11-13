@@ -1475,8 +1475,8 @@ mod tests {
     #[test]
     fn reorder_holds_depth_then_releases_earliest() {
         let mut buffer = ReorderBuffer::with_capacity(2);
-        assert!(buffer.push(4, "a").is_empty());
-        assert!(buffer.push(2, "b").is_empty());
+        assert_eq!(buffer.push(4, "a"), [] as [&str; 0]);
+        assert_eq!(buffer.push(2, "b"), [] as [&str; 0]);
         assert_eq!(buffer.push(6, "c"), vec!["b"]);
         assert_eq!(buffer.push(0, "d"), vec!["d"]);
         assert_eq!(buffer.flush(), vec!["a", "c"]);
@@ -1487,7 +1487,7 @@ mod tests {
         let mut buffer = ReorderBuffer::with_capacity(4);
         buffer.push(2, "a");
         buffer.drop_held();
-        assert!(buffer.flush().is_empty());
+        assert_eq!(buffer.flush(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(l0.len(), 2);
         assert_eq!(l0[0].poc(), 2);
         assert_eq!(l0[1].poc(), 0);
-        assert!(p.releases().is_empty());
+        assert_eq!(p.releases(), []);
     }
 
     /// Single-slot 64x64 fixture SPS (`max_num_ref_frames` 1, type 2).
@@ -1660,10 +1660,13 @@ mod tests {
     #[test]
     fn reorder_reset_releases_held_before_new_sequence() {
         let mut buffer = ReorderBuffer::with_capacity(2);
-        assert!(buffer.push(56, "a").is_empty());
-        assert!(buffer.push(58, "b").is_empty());
+        assert_eq!(buffer.push(56, "a"), [] as [&str; 0]);
+        assert_eq!(buffer.push(58, "b"), [] as [&str; 0]);
         assert_eq!(buffer.push_flushing_on_reset(true, 0, "c"), vec!["a", "b"]);
-        assert!(buffer.push_flushing_on_reset(false, 2, "d").is_empty());
+        assert_eq!(
+            buffer.push_flushing_on_reset(false, 2, "d"),
+            [] as [&str; 0]
+        );
         assert_eq!(buffer.flush(), vec!["c", "d"]);
     }
 

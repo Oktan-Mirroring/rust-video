@@ -410,7 +410,7 @@ mod tests {
             return;
         };
         let outcome = transcoder.flush().expect("flush drains");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -421,16 +421,8 @@ mod tests {
         let Some(mut transcoder) = pair(&decode, &encode) else {
             return;
         };
-        assert!(transcoder
-            .flush()
-            .expect("first flush")
-            .packets()
-            .is_empty());
-        assert!(transcoder
-            .flush()
-            .expect("second flush")
-            .packets()
-            .is_empty());
+        assert_eq!(transcoder.flush().expect("first flush").packets(), []);
+        assert_eq!(transcoder.flush().expect("second flush").packets(), []);
     }
 
     #[test]
@@ -443,7 +435,7 @@ mod tests {
         };
         let packet = Packet::new(Bytes::new());
         let outcome = transcoder.transcode(&packet).expect("empty packet");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
     }
 
     #[test]
@@ -473,7 +465,7 @@ mod tests {
         };
         let plan = transcoder.plan();
         let outcome = transcoder.flush().expect("flush drains");
-        assert!(outcome.packets().is_empty());
+        assert_eq!(outcome.packets(), []);
         assert_eq!(outcome.plan(), plan);
     }
 }

@@ -836,7 +836,7 @@ mod tests {
         let resource = super::picture_resource(view, extent, 3);
         assert!(resource.coded_extent == extent);
         assert_eq!(resource.base_array_layer, 3);
-        assert!(resource.image_view_binding == view);
+        assert_eq!(resource.image_view_binding, view);
         assert!(resource.coded_offset == ash::vk::Offset2D { x: 0, y: 0 });
     }
 

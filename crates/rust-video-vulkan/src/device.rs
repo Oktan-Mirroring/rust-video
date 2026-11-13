@@ -253,10 +253,6 @@ fn share_of(extensions: &[std::ffi::CString]) -> Option<ShareMechanism> {
     if present(ash::vk::KHR_EXTERNAL_MEMORY_FD_NAME) {
         return Some(ShareMechanism::DmaBuf);
     }
-    #[cfg(windows)]
-    if present(ash::vk::KHR_EXTERNAL_MEMORY_WIN32_NAME) {
-        return Some(ShareMechanism::NtHandle);
-    }
     None
 }
 
@@ -283,26 +279,24 @@ mod tests {
 
     #[test]
     fn share_needs_external_memory_strings() {
-        use rust_video_caps::transcode::ShareMechanism;
         use std::ffi::CString;
         assert!(super::share_of(&[]).is_none());
         let base = CString::from(ash::vk::KHR_EXTERNAL_MEMORY_NAME);
         assert!(super::share_of(std::slice::from_ref(&base)).is_none());
         #[cfg(unix)]
         {
+            use rust_video_caps::transcode::ShareMechanism;
             let fd = CString::from(ash::vk::KHR_EXTERNAL_MEMORY_FD_NAME);
-            assert_eq!(
-                super::share_of(&[base.clone(), fd]),
-                Some(ShareMechanism::DmaBuf)
-            );
+            assert_eq!(super::share_of(&[base, fd]), Some(ShareMechanism::DmaBuf));
         }
         #[cfg(windows)]
         {
+            use rust_video_caps::transcode::{FallbackCause, GpuCaps, Plan};
             let win32 = CString::from(ash::vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
-            assert_eq!(
-                super::share_of(&[base.clone(), win32]),
-                Some(ShareMechanism::NtHandle)
-            );
+            let share = super::share_of(&[base, win32]);
+            assert!(share.is_none());
+            let plan = Plan::for_caps(&GpuCaps::new(share, true, true));
+            assert_eq!(plan.cause(), Some(FallbackCause::ShareUnsupported));
         }
     }
 
@@ -312,7 +306,7 @@ mod tests {
             Ok(device) => assert_eq!(device.name(), "vulkan"),
             Err(VulkanError::BackendAbsent(reason)) => {
                 println!("declined: {reason}");
-                assert!(!reason.to_string().is_empty());
+                assert_ne!(reason.to_string(), "");
             }
             Err(error) => panic!("unexpected hard failure: {error}"),
         }

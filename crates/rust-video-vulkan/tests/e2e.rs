@@ -136,8 +136,15 @@ where
     D: Decoder<Frame = VulkanFrame, Error = VulkanError>,
 {
     let context = format!("{codec:?} goldens");
-    let suite = Suite::open_at(&corpus()).expect("corpus present by build gate");
-    for case in suite.cases_for(codec) {
+    let root = corpus();
+    let suite = Suite::open_at(&root).expect("corpus present by build gate");
+    let cases: Vec<_> = suite.cases_for(codec).collect();
+    assert!(
+        !cases.is_empty(),
+        "no {codec:?} cases in {}",
+        root.display()
+    );
+    for case in cases {
         let actual = match oracle.decode(case) {
             Ok(hashes) => hashes,
             Err(error) if oracle.oom() => {
