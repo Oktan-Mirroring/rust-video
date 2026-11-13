@@ -208,7 +208,9 @@ impl Outcome {
 /// Transcode plan: route plus fallback cause on the CPU route.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Plan {
+    /// Execution route.
     route: Route,
+    /// Fallback cause, present on the CPU route only.
     cause: Option<FallbackCause>,
 }
 

@@ -5,6 +5,118 @@
 
 use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};
 
+/// `level_idc` for 1b under High profiles (A.3).
+pub const ONE_B_HIGH_IDC: u8 = 9;
+
+/// H.264 level (ITU-T H.264 Table A-1).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Level {
+    /// Level 1.
+    L1,
+    /// Level 1b.
+    L1b,
+    /// Level 1.1.
+    L11,
+    /// Level 1.2.
+    L12,
+    /// Level 1.3.
+    L13,
+    /// Level 2.
+    L2,
+    /// Level 2.1.
+    L21,
+    /// Level 2.2.
+    L22,
+    /// Level 3.
+    L3,
+    /// Level 3.1.
+    L31,
+    /// Level 3.2.
+    L32,
+    /// Level 4.
+    L4,
+    /// Level 4.1.
+    L41,
+    /// Level 4.2.
+    L42,
+    /// Level 5.
+    L5,
+    /// Level 5.1.
+    L51,
+    /// Level 5.2.
+    L52,
+}
+
+impl Level {
+    /// Table A-1 rows in level order.
+    #[rustfmt::skip]
+    const CAPS: [LevelCaps; 17] = [
+        LevelCaps { idc: 10, mbps: 1485, fs_mb: 99, dpb_mb: 396, br_kbps: 64, cpb_kbits: 175, min_cr: 2, mvs: None },
+        LevelCaps { idc: 11, mbps: 1485, fs_mb: 99, dpb_mb: 396, br_kbps: 128, cpb_kbits: 350, min_cr: 2, mvs: None },
+        LevelCaps { idc: 11, mbps: 3000, fs_mb: 396, dpb_mb: 900, br_kbps: 192, cpb_kbits: 500, min_cr: 2, mvs: None },
+        LevelCaps { idc: 12, mbps: 6000, fs_mb: 396, dpb_mb: 2376, br_kbps: 384, cpb_kbits: 1000, min_cr: 2, mvs: None },
+        LevelCaps { idc: 13, mbps: 11_880, fs_mb: 396, dpb_mb: 2376, br_kbps: 768, cpb_kbits: 2000, min_cr: 2, mvs: None },
+        LevelCaps { idc: 20, mbps: 11_880, fs_mb: 396, dpb_mb: 2376, br_kbps: 2000, cpb_kbits: 2000, min_cr: 2, mvs: None },
+        LevelCaps { idc: 21, mbps: 19_800, fs_mb: 792, dpb_mb: 4752, br_kbps: 4000, cpb_kbits: 4000, min_cr: 2, mvs: None },
+        LevelCaps { idc: 22, mbps: 20_250, fs_mb: 1620, dpb_mb: 8100, br_kbps: 4000, cpb_kbits: 4000, min_cr: 2, mvs: None },
+        LevelCaps { idc: 30, mbps: 40_500, fs_mb: 1620, dpb_mb: 8100, br_kbps: 10_000, cpb_kbits: 10_000, min_cr: 2, mvs: Some(32) },
+        LevelCaps { idc: 31, mbps: 108_000, fs_mb: 3600, dpb_mb: 18_000, br_kbps: 14_000, cpb_kbits: 14_000, min_cr: 4, mvs: Some(16) },
+        LevelCaps { idc: 32, mbps: 216_000, fs_mb: 5120, dpb_mb: 20_480, br_kbps: 20_000, cpb_kbits: 20_000, min_cr: 4, mvs: Some(16) },
+        LevelCaps { idc: 40, mbps: 245_760, fs_mb: 8192, dpb_mb: 32_768, br_kbps: 20_000, cpb_kbits: 25_000, min_cr: 4, mvs: Some(16) },
+        LevelCaps { idc: 41, mbps: 245_760, fs_mb: 8192, dpb_mb: 32_768, br_kbps: 50_000, cpb_kbits: 62_500, min_cr: 2, mvs: Some(16) },
+        LevelCaps { idc: 42, mbps: 522_240, fs_mb: 8704, dpb_mb: 34_816, br_kbps: 50_000, cpb_kbits: 62_500, min_cr: 2, mvs: Some(16) },
+        LevelCaps { idc: 50, mbps: 589_824, fs_mb: 22_080, dpb_mb: 110_400, br_kbps: 135_000, cpb_kbits: 135_000, min_cr: 2, mvs: Some(16) },
+        LevelCaps { idc: 51, mbps: 983_040, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
+        LevelCaps { idc: 52, mbps: 2_073_600, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
+    ];
+    /// `level_idc`; 1b reports 11, the base signalling (A.3).
+    #[must_use]
+    pub fn idc(self) -> u8 {
+        match self {
+            Self::L1 => 10,
+            Self::L1b | Self::L11 => 11,
+            Self::L12 => 12,
+            Self::L13 => 13,
+            Self::L2 => 20,
+            Self::L21 => 21,
+            Self::L22 => 22,
+            Self::L3 => 30,
+            Self::L31 => 31,
+            Self::L32 => 32,
+            Self::L4 => 40,
+            Self::L41 => 41,
+            Self::L42 => 42,
+            Self::L5 => 50,
+            Self::L51 => 51,
+            Self::L52 => 52,
+        }
+    }
+
+    /// Level caps row (Table A-1).
+    #[must_use]
+    pub fn caps(self) -> &'static LevelCaps {
+        match self {
+            Self::L1 => &Self::CAPS[0],
+            Self::L1b => &Self::CAPS[1],
+            Self::L11 => &Self::CAPS[2],
+            Self::L12 => &Self::CAPS[3],
+            Self::L13 => &Self::CAPS[4],
+            Self::L2 => &Self::CAPS[5],
+            Self::L21 => &Self::CAPS[6],
+            Self::L22 => &Self::CAPS[7],
+            Self::L3 => &Self::CAPS[8],
+            Self::L31 => &Self::CAPS[9],
+            Self::L32 => &Self::CAPS[10],
+            Self::L4 => &Self::CAPS[11],
+            Self::L41 => &Self::CAPS[12],
+            Self::L42 => &Self::CAPS[13],
+            Self::L5 => &Self::CAPS[14],
+            Self::L51 => &Self::CAPS[15],
+            Self::L52 => &Self::CAPS[16],
+        }
+    }
+}
+
 /// H.264 profile (ITU-T H.264 Annex A.2).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Profile {
@@ -162,6 +274,15 @@ impl Profile {
     }
 }
 
+/// Stream format selecting the rate scale.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum StreamFormat {
+    /// Video coding layer.
+    Vcl,
+    /// NAL byte stream, 1.2x VCL.
+    Nal,
+}
+
 /// constraint_set0-5 flags from the SPS.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ConstraintFlags(u8);
@@ -177,97 +298,6 @@ impl ConstraintFlags {
     #[must_use]
     pub fn set(&self, flag: u8) -> bool {
         flag < 6 && self.0 & (1 << (7 - flag)) != 0
-    }
-}
-
-/// H.264 level (ITU-T H.264 Table A-1).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Level {
-    /// Level 1.
-    L1,
-    /// Level 1b.
-    L1b,
-    /// Level 1.1.
-    L11,
-    /// Level 1.2.
-    L12,
-    /// Level 1.3.
-    L13,
-    /// Level 2.
-    L2,
-    /// Level 2.1.
-    L21,
-    /// Level 2.2.
-    L22,
-    /// Level 3.
-    L3,
-    /// Level 3.1.
-    L31,
-    /// Level 3.2.
-    L32,
-    /// Level 4.
-    L4,
-    /// Level 4.1.
-    L41,
-    /// Level 4.2.
-    L42,
-    /// Level 5.
-    L5,
-    /// Level 5.1.
-    L51,
-    /// Level 5.2.
-    L52,
-}
-
-/// `level_idc` for 1b under High profiles (A.3).
-pub const ONE_B_HIGH_IDC: u8 = 9;
-
-impl Level {
-    /// `level_idc`; 1b reports 11, the base signalling (A.3).
-    #[must_use]
-    pub fn idc(self) -> u8 {
-        match self {
-            Self::L1 => 10,
-            Self::L1b | Self::L11 => 11,
-            Self::L12 => 12,
-            Self::L13 => 13,
-            Self::L2 => 20,
-            Self::L21 => 21,
-            Self::L22 => 22,
-            Self::L3 => 30,
-            Self::L31 => 31,
-            Self::L32 => 32,
-            Self::L4 => 40,
-            Self::L41 => 41,
-            Self::L42 => 42,
-            Self::L5 => 50,
-            Self::L51 => 51,
-            Self::L52 => 52,
-        }
-    }
-
-    /// Level caps row (Table A-1).
-    #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
-        match self {
-            Self::L1 => &CAPS[0],
-            Self::L1b => &CAPS[1],
-            Self::L11 => &CAPS[2],
-            Self::L12 => &CAPS[3],
-            Self::L13 => &CAPS[4],
-            Self::L2 => &CAPS[5],
-            Self::L21 => &CAPS[6],
-            Self::L22 => &CAPS[7],
-            Self::L3 => &CAPS[8],
-            Self::L31 => &CAPS[9],
-            Self::L32 => &CAPS[10],
-            Self::L4 => &CAPS[11],
-            Self::L41 => &CAPS[12],
-            Self::L42 => &CAPS[13],
-            Self::L5 => &CAPS[14],
-            Self::L51 => &CAPS[15],
-            Self::L52 => &CAPS[16],
-        }
     }
 }
 
@@ -292,47 +322,49 @@ pub struct LevelCaps {
     pub mvs: Option<u8>,
 }
 
-#[rustfmt::skip]
-const CAPS: [LevelCaps; 17] = [
-    LevelCaps { idc: 10, mbps: 1485, fs_mb: 99, dpb_mb: 396, br_kbps: 64, cpb_kbits: 175, min_cr: 2, mvs: None },
-    LevelCaps { idc: 11, mbps: 1485, fs_mb: 99, dpb_mb: 396, br_kbps: 128, cpb_kbits: 350, min_cr: 2, mvs: None },
-    LevelCaps { idc: 11, mbps: 3000, fs_mb: 396, dpb_mb: 900, br_kbps: 192, cpb_kbits: 500, min_cr: 2, mvs: None },
-    LevelCaps { idc: 12, mbps: 6000, fs_mb: 396, dpb_mb: 2376, br_kbps: 384, cpb_kbits: 1000, min_cr: 2, mvs: None },
-    LevelCaps { idc: 13, mbps: 11_880, fs_mb: 396, dpb_mb: 2376, br_kbps: 768, cpb_kbits: 2000, min_cr: 2, mvs: None },
-    LevelCaps { idc: 20, mbps: 11_880, fs_mb: 396, dpb_mb: 2376, br_kbps: 2000, cpb_kbits: 2000, min_cr: 2, mvs: None },
-    LevelCaps { idc: 21, mbps: 19_800, fs_mb: 792, dpb_mb: 4752, br_kbps: 4000, cpb_kbits: 4000, min_cr: 2, mvs: None },
-    LevelCaps { idc: 22, mbps: 20_250, fs_mb: 1620, dpb_mb: 8100, br_kbps: 4000, cpb_kbits: 4000, min_cr: 2, mvs: None },
-    LevelCaps { idc: 30, mbps: 40_500, fs_mb: 1620, dpb_mb: 8100, br_kbps: 10_000, cpb_kbits: 10_000, min_cr: 2, mvs: Some(32) },
-    LevelCaps { idc: 31, mbps: 108_000, fs_mb: 3600, dpb_mb: 18_000, br_kbps: 14_000, cpb_kbits: 14_000, min_cr: 4, mvs: Some(16) },
-    LevelCaps { idc: 32, mbps: 216_000, fs_mb: 5120, dpb_mb: 20_480, br_kbps: 20_000, cpb_kbits: 20_000, min_cr: 4, mvs: Some(16) },
-    LevelCaps { idc: 40, mbps: 245_760, fs_mb: 8192, dpb_mb: 32_768, br_kbps: 20_000, cpb_kbits: 25_000, min_cr: 4, mvs: Some(16) },
-    LevelCaps { idc: 41, mbps: 245_760, fs_mb: 8192, dpb_mb: 32_768, br_kbps: 50_000, cpb_kbits: 62_500, min_cr: 2, mvs: Some(16) },
-    LevelCaps { idc: 42, mbps: 522_240, fs_mb: 8704, dpb_mb: 34_816, br_kbps: 50_000, cpb_kbits: 62_500, min_cr: 2, mvs: Some(16) },
-    LevelCaps { idc: 50, mbps: 589_824, fs_mb: 22_080, dpb_mb: 110_400, br_kbps: 135_000, cpb_kbits: 135_000, min_cr: 2, mvs: Some(16) },
-    LevelCaps { idc: 51, mbps: 983_040, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
-    LevelCaps { idc: 52, mbps: 2_073_600, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
-];
-
-/// Slice rate in slices/s, Table A-4 rows L3 and up.
-///
-/// Rows below L3 are unmapped.
-#[must_use]
-pub fn slice_rate(level: Level) -> Option<u16> {
-    match level {
-        Level::L3 => Some(22),
-        Level::L31 | Level::L32 | Level::L4 => Some(60),
-        Level::L41 | Level::L42 | Level::L5 | Level::L51 | Level::L52 => Some(24),
-        _ => None,
-    }
+/// Parsed NAL header (ITU-T H.264 Table 7-1, 7.4.1).
+pub struct NalInfo {
+    /// NAL unit type 0-31.
+    pub unit_type: u8,
+    /// `nal_ref_idc`.
+    pub ref_idc: u8,
 }
 
-/// Stream format selecting the rate scale.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum StreamFormat {
-    /// Video coding layer.
-    Vcl,
-    /// NAL byte stream, 1.2x VCL.
-    Nal,
+impl NalInfo {
+    /// Parse and check the first NAL byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a set forbidden bit, a reserved type, or a
+    /// `ref_idc` against the type rule.
+    ///
+    /// # Arguments
+    ///
+    /// * `byte` - first NAL byte.
+    pub fn validate(byte: u8) -> Result<Self, Violation> {
+        if byte & 0x80 != 0 {
+            return Err(Violation::NalForbiddenBit);
+        }
+        let unit_type = byte & 0x1f;
+        let ref_idc = (byte >> 5) & 0x03;
+        if matches!(unit_type, 16..=18 | 21..=23) {
+            return Err(Violation::ReservedNal(unit_type));
+        }
+        let zero_required = matches!(unit_type, 6 | 9..=12);
+        let nonzero_required = matches!(unit_type, 5 | 7 | 8);
+        if (zero_required && ref_idc != 0) || (nonzero_required && ref_idc == 0) {
+            return Err(Violation::RefIdc {
+                nal_type: unit_type,
+            });
+        }
+        Ok(Self { unit_type, ref_idc })
+    }
+
+    /// True for NAL types an IDR access unit may hold (no 1-4).
+    #[must_use]
+    pub fn allowed_after_idr(unit_type: u8) -> bool {
+        !matches!(unit_type, 1..=4)
+    }
 }
 
 /// H.264 coding parameters.
@@ -422,44 +454,22 @@ impl Validate for Params {
     }
 }
 
-/// Parsed NAL header (ITU-T H.264 Table 7-1, 7.4.1).
-pub struct NalInfo {
-    /// NAL unit type 0-31.
-    pub unit_type: u8,
-    /// `nal_ref_idc`.
-    pub ref_idc: u8,
-}
-
-impl NalInfo {
-    /// Parse and check the first NAL byte.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` on a set forbidden bit, a reserved type, or a
-    /// `ref_idc` against the type rule.
-    pub fn validate(byte: u8) -> Result<Self, Violation> {
-        if byte & 0x80 != 0 {
-            return Err(Violation::NalForbiddenBit);
-        }
-        let unit_type = byte & 0x1f;
-        let ref_idc = (byte >> 5) & 0x03;
-        if matches!(unit_type, 16..=18 | 21..=23) {
-            return Err(Violation::ReservedNal(unit_type));
-        }
-        let zero_required = matches!(unit_type, 6 | 9..=12);
-        let nonzero_required = matches!(unit_type, 5 | 7 | 8);
-        if (zero_required && ref_idc != 0) || (nonzero_required && ref_idc == 0) {
-            return Err(Violation::RefIdc {
-                nal_type: unit_type,
-            });
-        }
-        Ok(Self { unit_type, ref_idc })
-    }
-
-    /// True for NAL types an IDR access unit may hold (no 1-4).
-    #[must_use]
-    pub fn allowed_after_idr(unit_type: u8) -> bool {
-        !matches!(unit_type, 1..=4)
+/// Slice rate in slices/s, Table A-4 rows L3 and up.
+///
+/// # Arguments
+///
+/// * `level` - level to look up.
+///
+/// # Returns
+///
+/// Slice rate, absent below L3.
+#[must_use]
+pub fn slice_rate(level: Level) -> Option<u16> {
+    match level {
+        Level::L3 => Some(22),
+        Level::L31 | Level::L32 | Level::L4 => Some(60),
+        Level::L41 | Level::L42 | Level::L5 | Level::L51 | Level::L52 => Some(24),
+        _ => None,
     }
 }
 

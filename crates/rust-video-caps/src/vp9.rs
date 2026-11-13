@@ -5,6 +5,92 @@
 
 use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};
 
+/// Maximum tile width in samples, 64 superblocks (S3).
+pub const MAX_TILE_WIDTH: u32 = 4096;
+
+/// Superframe index maximum bytes (S5.26).
+pub const SUPERFRAME_INDEX_MAX: u8 = 34;
+
+/// Superframe marker 0b110 (S5.26).
+pub const SUPERFRAME_MARKER: u8 = 0b110;
+
+/// Maximum superframe frames (S5.26).
+pub const SUPERFRAME_MAX_FRAMES: u8 = 8;
+
+/// VP9 level (levels page).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Level {
+    /// Level 1.
+    L1,
+    /// Level 1.1.
+    L11,
+    /// Level 2.
+    L2,
+    /// Level 2.1.
+    L21,
+    /// Level 3.
+    L3,
+    /// Level 3.1.
+    L31,
+    /// Level 4.
+    L4,
+    /// Level 4.1.
+    L41,
+    /// Level 5.
+    L5,
+    /// Level 5.1.
+    L51,
+    /// Level 5.2.
+    L52,
+    /// Level 6.
+    L6,
+    /// Level 6.1.
+    L61,
+    /// Level 6.2.
+    L62,
+}
+
+impl Level {
+    /// Levels-page rows in level order.
+    #[rustfmt::skip]
+    const CAPS: [LevelCaps; 14] = [
+        LevelCaps { sr: 829_440, pic: 36_864, br: 200, cpb: Some(400), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 512 },
+        LevelCaps { sr: 2_764_800, pic: 73_728, br: 800, cpb: Some(1000), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 768 },
+        LevelCaps { sr: 4_608_000, pic: 122_880, br: 1800, cpb: Some(1500), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 960 },
+        LevelCaps { sr: 9_216_000, pic: 245_760, br: 3600, cpb: Some(2800), min_cr: 2, tiles: 2, alt_ref: 4, refs: 8, dim: 1344 },
+        LevelCaps { sr: 20_736_000, pic: 552_960, br: 7200, cpb: Some(6000), min_cr: 2, tiles: 4, alt_ref: 4, refs: 8, dim: 2048 },
+        LevelCaps { sr: 36_864_000, pic: 983_040, br: 12_000, cpb: Some(10_000), min_cr: 2, tiles: 4, alt_ref: 4, refs: 8, dim: 2752 },
+        LevelCaps { sr: 83_558_400, pic: 2_228_224, br: 18_000, cpb: Some(16_000), min_cr: 4, tiles: 4, alt_ref: 4, refs: 8, dim: 4160 },
+        LevelCaps { sr: 160_432_128, pic: 2_228_224, br: 30_000, cpb: Some(18_000), min_cr: 4, tiles: 4, alt_ref: 5, refs: 6, dim: 4160 },
+        LevelCaps { sr: 311_951_360, pic: 8_912_896, br: 60_000, cpb: Some(36_000), min_cr: 6, tiles: 8, alt_ref: 6, refs: 4, dim: 8384 },
+        LevelCaps { sr: 588_251_136, pic: 8_912_896, br: 120_000, cpb: Some(46_000), min_cr: 8, tiles: 8, alt_ref: 10, refs: 4, dim: 8384 },
+        LevelCaps { sr: 1_176_502_272, pic: 8_912_896, br: 180_000, cpb: None, min_cr: 8, tiles: 8, alt_ref: 10, refs: 4, dim: 8384 },
+        LevelCaps { sr: 1_176_502_272, pic: 35_651_584, br: 180_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
+        LevelCaps { sr: 2_353_004_544, pic: 35_651_584, br: 240_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
+        LevelCaps { sr: 4_706_009_088, pic: 35_651_584, br: 480_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
+    ];
+    /// Level caps row (levels page).
+    #[must_use]
+    pub fn caps(self) -> &'static LevelCaps {
+        match self {
+            Self::L1 => &Self::CAPS[0],
+            Self::L11 => &Self::CAPS[1],
+            Self::L2 => &Self::CAPS[2],
+            Self::L21 => &Self::CAPS[3],
+            Self::L3 => &Self::CAPS[4],
+            Self::L31 => &Self::CAPS[5],
+            Self::L4 => &Self::CAPS[6],
+            Self::L41 => &Self::CAPS[7],
+            Self::L5 => &Self::CAPS[8],
+            Self::L51 => &Self::CAPS[9],
+            Self::L52 => &Self::CAPS[10],
+            Self::L6 => &Self::CAPS[11],
+            Self::L61 => &Self::CAPS[12],
+            Self::L62 => &Self::CAPS[13],
+        }
+    }
+}
+
 /// VP9 profile (spec S7.2, S6.2).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Profile {
@@ -43,62 +129,6 @@ impl Profile {
     }
 }
 
-/// VP9 level (levels page).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Level {
-    /// Level 1.
-    L1,
-    /// Level 1.1.
-    L11,
-    /// Level 2.
-    L2,
-    /// Level 2.1.
-    L21,
-    /// Level 3.
-    L3,
-    /// Level 3.1.
-    L31,
-    /// Level 4.
-    L4,
-    /// Level 4.1.
-    L41,
-    /// Level 5.
-    L5,
-    /// Level 5.1.
-    L51,
-    /// Level 5.2.
-    L52,
-    /// Level 6.
-    L6,
-    /// Level 6.1.
-    L61,
-    /// Level 6.2.
-    L62,
-}
-
-impl Level {
-    /// Level caps row (levels page).
-    #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
-        match self {
-            Self::L1 => &CAPS[0],
-            Self::L11 => &CAPS[1],
-            Self::L2 => &CAPS[2],
-            Self::L21 => &CAPS[3],
-            Self::L3 => &CAPS[4],
-            Self::L31 => &CAPS[5],
-            Self::L4 => &CAPS[6],
-            Self::L41 => &CAPS[7],
-            Self::L5 => &CAPS[8],
-            Self::L51 => &CAPS[9],
-            Self::L52 => &CAPS[10],
-            Self::L6 => &CAPS[11],
-            Self::L61 => &CAPS[12],
-            Self::L62 => &CAPS[13],
-        }
-    }
-}
-
 /// One levels-page row: sample rate, picture, bitrate kbps, CPB kbits,
 /// `MinCR`, max tiles, min alt-ref distance, max refs, max dimension.
 pub struct LevelCaps {
@@ -120,54 +150,6 @@ pub struct LevelCaps {
     pub refs: u8,
     /// Max width/height samples.
     pub dim: u16,
-}
-
-#[rustfmt::skip]
-const CAPS: [LevelCaps; 14] = [
-    LevelCaps { sr: 829_440, pic: 36_864, br: 200, cpb: Some(400), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 512 },
-    LevelCaps { sr: 2_764_800, pic: 73_728, br: 800, cpb: Some(1000), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 768 },
-    LevelCaps { sr: 4_608_000, pic: 122_880, br: 1800, cpb: Some(1500), min_cr: 2, tiles: 1, alt_ref: 4, refs: 8, dim: 960 },
-    LevelCaps { sr: 9_216_000, pic: 245_760, br: 3600, cpb: Some(2800), min_cr: 2, tiles: 2, alt_ref: 4, refs: 8, dim: 1344 },
-    LevelCaps { sr: 20_736_000, pic: 552_960, br: 7200, cpb: Some(6000), min_cr: 2, tiles: 4, alt_ref: 4, refs: 8, dim: 2048 },
-    LevelCaps { sr: 36_864_000, pic: 983_040, br: 12_000, cpb: Some(10_000), min_cr: 2, tiles: 4, alt_ref: 4, refs: 8, dim: 2752 },
-    LevelCaps { sr: 83_558_400, pic: 2_228_224, br: 18_000, cpb: Some(16_000), min_cr: 4, tiles: 4, alt_ref: 4, refs: 8, dim: 4160 },
-    LevelCaps { sr: 160_432_128, pic: 2_228_224, br: 30_000, cpb: Some(18_000), min_cr: 4, tiles: 4, alt_ref: 5, refs: 6, dim: 4160 },
-    LevelCaps { sr: 311_951_360, pic: 8_912_896, br: 60_000, cpb: Some(36_000), min_cr: 6, tiles: 8, alt_ref: 6, refs: 4, dim: 8384 },
-    LevelCaps { sr: 588_251_136, pic: 8_912_896, br: 120_000, cpb: Some(46_000), min_cr: 8, tiles: 8, alt_ref: 10, refs: 4, dim: 8384 },
-    LevelCaps { sr: 1_176_502_272, pic: 8_912_896, br: 180_000, cpb: None, min_cr: 8, tiles: 8, alt_ref: 10, refs: 4, dim: 8384 },
-    LevelCaps { sr: 1_176_502_272, pic: 35_651_584, br: 180_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
-    LevelCaps { sr: 2_353_004_544, pic: 35_651_584, br: 240_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
-    LevelCaps { sr: 4_706_009_088, pic: 35_651_584, br: 480_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
-];
-
-/// Minimum tile width in samples, 4 superblocks (S3).
-pub const MIN_TILE_WIDTH: u32 = 256;
-
-/// Maximum tile width in samples, 64 superblocks (S3).
-pub const MAX_TILE_WIDTH: u32 = 4096;
-
-/// Maximum tile rows (S6.2.13-14).
-pub const MAX_TILE_ROWS: u8 = 4;
-
-/// Maximum superframe frames (S5.26).
-pub const SUPERFRAME_MAX_FRAMES: u8 = 8;
-
-/// Superframe index maximum bytes (S5.26).
-pub const SUPERFRAME_INDEX_MAX: u8 = 34;
-
-/// Superframe marker 0b110 (S5.26).
-pub const SUPERFRAME_MARKER: u8 = 0b110;
-
-/// Inter scale bounds: 2xW at least `RefW`, W at most 16xRefW (S7.2.5).
-#[must_use]
-pub fn inter_scale_valid(width: u32, ref_width: u32) -> bool {
-    u64::from(width) * 2 >= u64::from(ref_width) && u64::from(width) <= u64::from(ref_width) * 16
-}
-
-/// Plain coded frame final byte must not contain the marker (B.4).
-#[must_use]
-pub fn plain_final_byte_valid(byte: u8) -> bool {
-    byte & 0b1110_0000 != SUPERFRAME_MARKER << 5
 }
 
 /// VP9 coding parameters.
@@ -192,6 +174,14 @@ pub struct Params {
     pub tile_cols: Option<u16>,
     /// Tile rows, when tiled.
     pub tile_rows: Option<u8>,
+}
+
+impl Params {
+    /// Maximum tile rows (S6.2.13-14).
+    pub const MAX_TILE_ROWS: u8 = 4;
+
+    /// Minimum tile width in samples, 4 superblocks (S3).
+    pub const MIN_TILE_WIDTH: u32 = 256;
 }
 
 impl Validate for Params {
@@ -248,23 +238,35 @@ impl Validate for Params {
                 });
             }
             let col_width = self.size.width().div_ceil(u32::from(cols.max(1)));
-            if col_width < MIN_TILE_WIDTH {
+            if col_width < Self::MIN_TILE_WIDTH {
                 return Err(Violation::TileTooSmall {
                     actual: col_width,
-                    min: MIN_TILE_WIDTH,
+                    min: Self::MIN_TILE_WIDTH,
                 });
             }
         }
         if let Some(rows) = self.tile_rows {
-            if rows > MAX_TILE_ROWS {
+            if rows > Self::MAX_TILE_ROWS {
                 return Err(Violation::TileCountExceeded {
                     actual: u16::from(rows),
-                    max: u16::from(MAX_TILE_ROWS),
+                    max: u16::from(Self::MAX_TILE_ROWS),
                 });
             }
         }
         Ok(())
     }
+}
+
+/// Inter scale bounds: 2xW at least `RefW`, W at most 16xRefW (S7.2.5).
+#[must_use]
+pub fn inter_scale_valid(width: u32, ref_width: u32) -> bool {
+    u64::from(width) * 2 >= u64::from(ref_width) && u64::from(width) <= u64::from(ref_width) * 16
+}
+
+/// Plain coded frame final byte must not contain the marker (B.4).
+#[must_use]
+pub fn plain_final_byte_valid(byte: u8) -> bool {
+    byte & 0b1110_0000 != SUPERFRAME_MARKER << 5
 }
 
 #[cfg(test)]

@@ -5,6 +5,183 @@
 
 use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};
 
+/// IRAP NAL unit type (Table 7-1).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IrapType {
+    /// Broken link access, types 16-18.
+    Bla,
+    /// Clean random access, type 21.
+    Cra,
+    /// Instantaneous decoding refresh, types 19-20.
+    Idr,
+}
+
+/// H.265 level, `level_idc` 30x the level (A.4.1).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Level {
+    /// Level 1.
+    L1,
+    /// Level 2.
+    L2,
+    /// Level 2.1.
+    L21,
+    /// Level 3.
+    L3,
+    /// Level 3.1.
+    L31,
+    /// Level 4.
+    L4,
+    /// Level 4.1.
+    L41,
+    /// Level 5.
+    L5,
+    /// Level 5.1.
+    L51,
+    /// Level 5.2.
+    L52,
+    /// Level 6.
+    L6,
+    /// Level 6.1.
+    L61,
+    /// Level 6.2.
+    L62,
+    /// Level 6.3.
+    L63,
+    /// Level 7.
+    L7,
+    /// Level 7.1.
+    L71,
+    /// Level 7.2.
+    L72,
+}
+
+impl Level {
+    /// Tables A.8/A.9 rows in level order.
+    #[rustfmt::skip]
+    const CAPS: [LevelCaps; 17] = [
+        LevelCaps { idc: 30, ps: 36_864, cpb_m: 350, cpb_h: None, slices: 16, tiles_x: 1, tiles_y: 1, sr: 552_960, br_m: 128, br_h: None, cr_m: 2, cr_h: 2 },
+        LevelCaps { idc: 60, ps: 122_880, cpb_m: 1500, cpb_h: None, slices: 16, tiles_x: 1, tiles_y: 1, sr: 3_686_400, br_m: 1500, br_h: None, cr_m: 2, cr_h: 2 },
+        LevelCaps { idc: 63, ps: 245_760, cpb_m: 3000, cpb_h: None, slices: 20, tiles_x: 1, tiles_y: 1, sr: 7_372_800, br_m: 3000, br_h: None, cr_m: 2, cr_h: 2 },
+        LevelCaps { idc: 90, ps: 552_960, cpb_m: 6000, cpb_h: None, slices: 30, tiles_x: 2, tiles_y: 2, sr: 16_588_800, br_m: 6000, br_h: None, cr_m: 2, cr_h: 2 },
+        LevelCaps { idc: 93, ps: 983_040, cpb_m: 10_000, cpb_h: None, slices: 40, tiles_x: 3, tiles_y: 3, sr: 33_177_600, br_m: 10_000, br_h: None, cr_m: 2, cr_h: 2 },
+        LevelCaps { idc: 120, ps: 2_228_224, cpb_m: 12_000, cpb_h: Some(30_000), slices: 75, tiles_x: 5, tiles_y: 5, sr: 66_846_720, br_m: 12_000, br_h: Some(30_000), cr_m: 4, cr_h: 4 },
+        LevelCaps { idc: 123, ps: 2_228_224, cpb_m: 20_000, cpb_h: Some(50_000), slices: 75, tiles_x: 5, tiles_y: 5, sr: 133_693_440, br_m: 20_000, br_h: Some(50_000), cr_m: 4, cr_h: 4 },
+        LevelCaps { idc: 150, ps: 8_912_896, cpb_m: 25_000, cpb_h: Some(100_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 267_386_880, br_m: 25_000, br_h: Some(100_000), cr_m: 6, cr_h: 4 },
+        LevelCaps { idc: 153, ps: 8_912_896, cpb_m: 40_000, cpb_h: Some(160_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 534_773_760, br_m: 40_000, br_h: Some(160_000), cr_m: 8, cr_h: 4 },
+        LevelCaps { idc: 156, ps: 8_912_896, cpb_m: 60_000, cpb_h: Some(240_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 1_069_547_520, br_m: 60_000, br_h: Some(240_000), cr_m: 8, cr_h: 4 },
+        LevelCaps { idc: 180, ps: 35_651_584, cpb_m: 60_000, cpb_h: Some(240_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 1_069_547_520, br_m: 60_000, br_h: Some(240_000), cr_m: 8, cr_h: 4 },
+        LevelCaps { idc: 183, ps: 35_651_584, cpb_m: 120_000, cpb_h: Some(480_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 2_139_095_040, br_m: 120_000, br_h: Some(480_000), cr_m: 8, cr_h: 4 },
+        LevelCaps { idc: 186, ps: 35_651_584, cpb_m: 240_000, cpb_h: Some(800_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 4_278_190_080, br_m: 240_000, br_h: Some(800_000), cr_m: 6, cr_h: 4 },
+        LevelCaps { idc: 189, ps: 80_216_064, cpb_m: 240_000, cpb_h: Some(1_600_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 4_812_963_840, br_m: 320_000, br_h: Some(1_600_000), cr_m: 6, cr_h: 4 },
+        LevelCaps { idc: 210, ps: 142_606_336, cpb_m: 240_000, cpb_h: Some(1_600_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 4_812_963_840, br_m: 320_000, br_h: Some(1_600_000), cr_m: 6, cr_h: 4 },
+        LevelCaps { idc: 213, ps: 142_606_336, cpb_m: 480_000, cpb_h: Some(3_200_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 8_556_380_160, br_m: 480_000, br_h: Some(3_200_000), cr_m: 6, cr_h: 4 },
+        LevelCaps { idc: 216, ps: 142_606_336, cpb_m: 960_000, cpb_h: Some(6_400_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 17_112_760_320, br_m: 960_000, br_h: Some(6_400_000), cr_m: 6, cr_h: 4 },
+    ];
+    /// `level_idc`, 30x the level (A.4.1).
+    #[must_use]
+    pub fn idc(self) -> u16 {
+        match self {
+            Self::L1 => 30,
+            Self::L2 => 60,
+            Self::L21 => 63,
+            Self::L3 => 90,
+            Self::L31 => 93,
+            Self::L4 => 120,
+            Self::L41 => 123,
+            Self::L5 => 150,
+            Self::L51 => 153,
+            Self::L52 => 156,
+            Self::L6 => 180,
+            Self::L61 => 183,
+            Self::L62 => 186,
+            Self::L63 => 189,
+            Self::L7 => 210,
+            Self::L71 => 213,
+            Self::L72 => 216,
+        }
+    }
+
+    /// High tier allowed at L4 and up (A.4.1).
+    #[must_use]
+    pub fn allows_high_tier(self) -> bool {
+        !matches!(self, Self::L1 | Self::L2 | Self::L21 | Self::L3 | Self::L31)
+    }
+
+    /// Frame rate cap factor: 1/300 below L7, 1/960 from L7 (A.4.2).
+    #[must_use]
+    pub fn frame_rate_factor(self) -> (u32, u32) {
+        match self {
+            Self::L7 | Self::L71 | Self::L72 => (1, 960),
+            _ => (1, 300),
+        }
+    }
+
+    /// Level caps row (Tables A.8, A.9).
+    #[must_use]
+    pub fn caps(self) -> &'static LevelCaps {
+        match self {
+            Self::L1 => &Self::CAPS[0],
+            Self::L2 => &Self::CAPS[1],
+            Self::L21 => &Self::CAPS[2],
+            Self::L3 => &Self::CAPS[3],
+            Self::L31 => &Self::CAPS[4],
+            Self::L4 => &Self::CAPS[5],
+            Self::L41 => &Self::CAPS[6],
+            Self::L5 => &Self::CAPS[7],
+            Self::L51 => &Self::CAPS[8],
+            Self::L52 => &Self::CAPS[9],
+            Self::L6 => &Self::CAPS[10],
+            Self::L61 => &Self::CAPS[11],
+            Self::L62 => &Self::CAPS[12],
+            Self::L63 => &Self::CAPS[13],
+            Self::L7 => &Self::CAPS[14],
+            Self::L71 => &Self::CAPS[15],
+            Self::L72 => &Self::CAPS[16],
+        }
+    }
+}
+
+/// NAL unit class (Table 7-1, 7.4.2.2).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NalClass {
+    /// Coded slice segment, types 0-15.
+    Vcl {
+        /// IRAP variant when 16-21.
+        irap: Option<IrapType>,
+    },
+    /// Non-VCL unit.
+    NonVcl,
+}
+
+impl NalClass {
+    /// Classify NAL unit type 0-63.
+    #[must_use]
+    pub fn classify(unit_type: u8) -> Option<Self> {
+        if unit_type > 63 {
+            return None;
+        }
+        let irap = match unit_type {
+            16..=18 => Some(IrapType::Bla),
+            19..=20 => Some(IrapType::Idr),
+            21 => Some(IrapType::Cra),
+            _ => None,
+        };
+        if unit_type <= 21 {
+            Some(Self::Vcl { irap })
+        } else if matches!(unit_type, 22 | 23) {
+            None
+        } else {
+            Some(Self::NonVcl)
+        }
+    }
+
+    /// Leading pictures allowed (RADL/RASL rules).
+    #[must_use]
+    pub fn allows_leading(unit_type: u8) -> bool {
+        !matches!(unit_type, 18 | 20)
+    }
+}
+
 /// H.265 profile (ITU-T H.265 A.3, F.3, H.11).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Profile {
@@ -104,110 +281,6 @@ pub enum Tier {
     High,
 }
 
-/// H.265 level, `level_idc` 30x the level (A.4.1).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Level {
-    /// Level 1.
-    L1,
-    /// Level 2.
-    L2,
-    /// Level 2.1.
-    L21,
-    /// Level 3.
-    L3,
-    /// Level 3.1.
-    L31,
-    /// Level 4.
-    L4,
-    /// Level 4.1.
-    L41,
-    /// Level 5.
-    L5,
-    /// Level 5.1.
-    L51,
-    /// Level 5.2.
-    L52,
-    /// Level 6.
-    L6,
-    /// Level 6.1.
-    L61,
-    /// Level 6.2.
-    L62,
-    /// Level 6.3.
-    L63,
-    /// Level 7.
-    L7,
-    /// Level 7.1.
-    L71,
-    /// Level 7.2.
-    L72,
-}
-
-impl Level {
-    /// `level_idc`, 30x the level (A.4.1).
-    #[must_use]
-    pub fn idc(self) -> u16 {
-        match self {
-            Self::L1 => 30,
-            Self::L2 => 60,
-            Self::L21 => 63,
-            Self::L3 => 90,
-            Self::L31 => 93,
-            Self::L4 => 120,
-            Self::L41 => 123,
-            Self::L5 => 150,
-            Self::L51 => 153,
-            Self::L52 => 156,
-            Self::L6 => 180,
-            Self::L61 => 183,
-            Self::L62 => 186,
-            Self::L63 => 189,
-            Self::L7 => 210,
-            Self::L71 => 213,
-            Self::L72 => 216,
-        }
-    }
-
-    /// High tier allowed at L4 and up (A.4.1).
-    #[must_use]
-    pub fn allows_high_tier(self) -> bool {
-        !matches!(self, Self::L1 | Self::L2 | Self::L21 | Self::L3 | Self::L31)
-    }
-
-    /// Frame rate cap factor: 1/300 below L7, 1/960 from L7 (A.4.2).
-    #[must_use]
-    pub fn frame_rate_factor(self) -> (u32, u32) {
-        match self {
-            Self::L7 | Self::L71 | Self::L72 => (1, 960),
-            _ => (1, 300),
-        }
-    }
-
-    /// Level caps row (Tables A.8, A.9).
-    #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
-        match self {
-            Self::L1 => &CAPS[0],
-            Self::L2 => &CAPS[1],
-            Self::L21 => &CAPS[2],
-            Self::L3 => &CAPS[3],
-            Self::L31 => &CAPS[4],
-            Self::L4 => &CAPS[5],
-            Self::L41 => &CAPS[6],
-            Self::L5 => &CAPS[7],
-            Self::L51 => &CAPS[8],
-            Self::L52 => &CAPS[9],
-            Self::L6 => &CAPS[10],
-            Self::L61 => &CAPS[11],
-            Self::L62 => &CAPS[12],
-            Self::L63 => &CAPS[13],
-            Self::L7 => &CAPS[14],
-            Self::L71 => &CAPS[15],
-            Self::L72 => &CAPS[16],
-        }
-    }
-}
-
 /// One Tables A.8/A.9 row: idc, luma picture, CPB Main/High kbit, max
 /// slices, max tiles cols/rows, luma sample rate, BR Main/High kbps,
 /// `MinCR` Main/High.
@@ -236,79 +309,6 @@ pub struct LevelCaps {
     pub cr_m: u8,
     /// `MinCR` High.
     pub cr_h: u8,
-}
-
-#[rustfmt::skip]
-const CAPS: [LevelCaps; 17] = [
-    LevelCaps { idc: 30, ps: 36_864, cpb_m: 350, cpb_h: None, slices: 16, tiles_x: 1, tiles_y: 1, sr: 552_960, br_m: 128, br_h: None, cr_m: 2, cr_h: 2 },
-    LevelCaps { idc: 60, ps: 122_880, cpb_m: 1500, cpb_h: None, slices: 16, tiles_x: 1, tiles_y: 1, sr: 3_686_400, br_m: 1500, br_h: None, cr_m: 2, cr_h: 2 },
-    LevelCaps { idc: 63, ps: 245_760, cpb_m: 3000, cpb_h: None, slices: 20, tiles_x: 1, tiles_y: 1, sr: 7_372_800, br_m: 3000, br_h: None, cr_m: 2, cr_h: 2 },
-    LevelCaps { idc: 90, ps: 552_960, cpb_m: 6000, cpb_h: None, slices: 30, tiles_x: 2, tiles_y: 2, sr: 16_588_800, br_m: 6000, br_h: None, cr_m: 2, cr_h: 2 },
-    LevelCaps { idc: 93, ps: 983_040, cpb_m: 10_000, cpb_h: None, slices: 40, tiles_x: 3, tiles_y: 3, sr: 33_177_600, br_m: 10_000, br_h: None, cr_m: 2, cr_h: 2 },
-    LevelCaps { idc: 120, ps: 2_228_224, cpb_m: 12_000, cpb_h: Some(30_000), slices: 75, tiles_x: 5, tiles_y: 5, sr: 66_846_720, br_m: 12_000, br_h: Some(30_000), cr_m: 4, cr_h: 4 },
-    LevelCaps { idc: 123, ps: 2_228_224, cpb_m: 20_000, cpb_h: Some(50_000), slices: 75, tiles_x: 5, tiles_y: 5, sr: 133_693_440, br_m: 20_000, br_h: Some(50_000), cr_m: 4, cr_h: 4 },
-    LevelCaps { idc: 150, ps: 8_912_896, cpb_m: 25_000, cpb_h: Some(100_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 267_386_880, br_m: 25_000, br_h: Some(100_000), cr_m: 6, cr_h: 4 },
-    LevelCaps { idc: 153, ps: 8_912_896, cpb_m: 40_000, cpb_h: Some(160_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 534_773_760, br_m: 40_000, br_h: Some(160_000), cr_m: 8, cr_h: 4 },
-    LevelCaps { idc: 156, ps: 8_912_896, cpb_m: 60_000, cpb_h: Some(240_000), slices: 200, tiles_x: 11, tiles_y: 10, sr: 1_069_547_520, br_m: 60_000, br_h: Some(240_000), cr_m: 8, cr_h: 4 },
-    LevelCaps { idc: 180, ps: 35_651_584, cpb_m: 60_000, cpb_h: Some(240_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 1_069_547_520, br_m: 60_000, br_h: Some(240_000), cr_m: 8, cr_h: 4 },
-    LevelCaps { idc: 183, ps: 35_651_584, cpb_m: 120_000, cpb_h: Some(480_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 2_139_095_040, br_m: 120_000, br_h: Some(480_000), cr_m: 8, cr_h: 4 },
-    LevelCaps { idc: 186, ps: 35_651_584, cpb_m: 240_000, cpb_h: Some(800_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 4_278_190_080, br_m: 240_000, br_h: Some(800_000), cr_m: 6, cr_h: 4 },
-    LevelCaps { idc: 189, ps: 80_216_064, cpb_m: 240_000, cpb_h: Some(1_600_000), slices: 600, tiles_x: 22, tiles_y: 20, sr: 4_812_963_840, br_m: 320_000, br_h: Some(1_600_000), cr_m: 6, cr_h: 4 },
-    LevelCaps { idc: 210, ps: 142_606_336, cpb_m: 240_000, cpb_h: Some(1_600_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 4_812_963_840, br_m: 320_000, br_h: Some(1_600_000), cr_m: 6, cr_h: 4 },
-    LevelCaps { idc: 213, ps: 142_606_336, cpb_m: 480_000, cpb_h: Some(3_200_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 8_556_380_160, br_m: 480_000, br_h: Some(3_200_000), cr_m: 6, cr_h: 4 },
-    LevelCaps { idc: 216, ps: 142_606_336, cpb_m: 960_000, cpb_h: Some(6_400_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 17_112_760_320, br_m: 960_000, br_h: Some(6_400_000), cr_m: 6, cr_h: 4 },
-];
-
-/// IRAP NAL unit type (Table 7-1).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum IrapType {
-    /// Broken link access, types 16-18.
-    Bla,
-    /// Clean random access, type 21.
-    Cra,
-    /// Instantaneous decoding refresh, types 19-20.
-    Idr,
-}
-
-/// NAL unit class (Table 7-1, 7.4.2.2).
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum NalClass {
-    /// Coded slice segment, types 0-15.
-    Vcl {
-        /// IRAP variant when 16-21.
-        irap: Option<IrapType>,
-    },
-    /// Non-VCL unit.
-    NonVcl,
-}
-
-impl NalClass {
-    /// Classify NAL unit type 0-63.
-    #[must_use]
-    pub fn classify(unit_type: u8) -> Option<Self> {
-        if unit_type > 63 {
-            return None;
-        }
-        let irap = match unit_type {
-            16..=18 => Some(IrapType::Bla),
-            19..=20 => Some(IrapType::Idr),
-            21 => Some(IrapType::Cra),
-            _ => None,
-        };
-        if unit_type <= 21 {
-            Some(Self::Vcl { irap })
-        } else if matches!(unit_type, 22 | 23) {
-            None
-        } else {
-            Some(Self::NonVcl)
-        }
-    }
-
-    /// Leading pictures allowed (RADL/RASL rules).
-    #[must_use]
-    pub fn allows_leading(unit_type: u8) -> bool {
-        !matches!(unit_type, 18 | 20)
-    }
 }
 
 /// H.265 coding parameters.

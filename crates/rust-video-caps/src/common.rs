@@ -232,7 +232,9 @@ impl BitDepth {
 /// Picture dimensions in luma samples.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PictureSize {
+    /// Width in luma samples.
     width: u32,
+    /// Height in luma samples.
     height: u32,
 }
 
