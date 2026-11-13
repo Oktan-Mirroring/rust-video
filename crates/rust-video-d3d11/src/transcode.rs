@@ -8,7 +8,7 @@ use crate::decoder::GpuSurface;
 use crate::decoder::{D3d11Frame, H264Decoder};
 use crate::device::D3d11Device;
 use crate::encoder::D3d11Encoder;
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::scale::{ScaledSurface, Scaler};
 use crate::submit::flag_word;
@@ -60,7 +60,9 @@ impl<'a> Transcoder<'a> {
     /// encoder MFT on the machine.
     pub fn open(device: &'a D3d11Device, decode: Codec, encode: Codec) -> Result<Self, D3d11Error> {
         if decode != Codec::H264 {
-            return Err(D3d11Error::Unsupported(format!("{decode} decode pending")));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::DecodePending {
+                codec: decode,
+            }));
         }
         let share = shared_export(device).ok_or_else(declined_export)?;
         let encoder = D3d11Encoder::open(device, encode)?;
@@ -160,7 +162,9 @@ impl<'a> Transcoder<'a> {
         let mut packets = Vec::new();
         for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
-                return Err(D3d11Error::Unsupported(cause.to_string()));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             if let Some(cause) = self.scale.miss(surface.size()) {
                 let scaled = self.scaled_or_miss(surface, cause)?;
@@ -179,7 +183,9 @@ impl<'a> Transcoder<'a> {
         cause: FallbackCause,
     ) -> Result<ScaledSurface, D3d11Error> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
-            return Err(D3d11Error::Unsupported(cause.to_string()));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                cause,
+            }));
         };
         if self
             .scaler
@@ -189,7 +195,9 @@ impl<'a> Transcoder<'a> {
             match Scaler::open(self.device, from, to) {
                 Ok(scaler) => self.scaler = Some(scaler),
                 Err(D3d11Error::Unsupported(_)) => {
-                    return Err(D3d11Error::Unsupported(cause.to_string()));
+                    return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                        cause,
+                    }));
                 }
                 Err(error) => return Err(error),
             }
@@ -202,14 +210,18 @@ impl<'a> Transcoder<'a> {
     fn encode_cpu(&mut self, frames: &[D3d11Frame]) -> Result<Vec<Packet>, D3d11Error> {
         let mut packets = Vec::new();
         for frame in frames {
-            let cpu = frame
-                .to_cpu()
-                .ok_or_else(|| D3d11Error::Unsupported("nv12 short of its extent".to_owned()))?;
+            let cpu = frame.to_cpu().ok_or(D3d11Error::Unsupported(
+                UnsupportedReason::Nv12ShortOfExtent,
+            ))?;
             if let Some(cause) = self.convert.miss(cpu.format()) {
-                return Err(D3d11Error::Unsupported(cause.to_string()));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             if let Some(cause) = self.scale.miss(cpu.size()) {
-                return Err(D3d11Error::Unsupported(cause.to_string()));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause,
+                }));
             }
             packets.append(&mut self.encoder.encode(&cpu)?);
         }
@@ -254,10 +266,9 @@ fn shared_export(device: &D3d11Device) -> Option<ShareMechanism> {
 
 /// Typed decline for a device without shared-texture export.
 fn declined_export() -> D3d11Error {
-    D3d11Error::Unsupported(format!(
-        "export declined: {}",
-        FallbackCause::NoSharedExport
-    ))
+    D3d11Error::Unsupported(UnsupportedReason::Fallback {
+        cause: FallbackCause::NoSharedExport,
+    })
 }
 
 #[cfg(test)]
@@ -276,7 +287,7 @@ mod tests {
         assert!(matches!(error, crate::error::D3d11Error::Unsupported(_)));
         assert_eq!(
             error.to_string(),
-            "unsupported stream: export declined: decode texture without share handle"
+            "unsupported stream: decode texture without share handle"
         );
     }
 

@@ -1,5 +1,6 @@
 //! Negotiated decode session: decoder, views, staging, readback.
 
+// FFI boundary: decoder-session COM calls live here.
 #![allow(unsafe_code)]
 
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use windows::Win32::Media::DirectShow::DXVA_NoEncrypt;
 
 use crate::device::D3d11Device;
 use crate::dpb::SubmittedPicture;
-use crate::error::D3d11Error;
+use crate::error::{BrokenReferenceReason, D3d11Error};
 use crate::h264::Crop;
 use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock};
@@ -207,7 +208,9 @@ impl Session {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
         let list = lane.record(&self.texture, slot)?;
         let _submit = self.submit.enter()?;
         lane.complete(&self.context, &list);
@@ -224,17 +227,21 @@ impl Session {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
         lane.wait(&self.context)?;
         lane.read(&self.context, crop)
     }
 
     /// Decode `submission` onto its surface slot.
     fn submit_windows(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
-        let view = self
-            .views
-            .get(usize::from(submission.slot))
-            .ok_or_else(|| D3d11Error::BrokenReference("slot outside views".to_owned()))?;
+        let view =
+            self.views
+                .get(usize::from(submission.slot))
+                .ok_or(D3d11Error::BrokenReference(
+                    BrokenReferenceReason::SlotOutsideViews,
+                ))?;
         let _submit = self.submit.enter()?;
         // Sound: the decoder and view are live; no content key.
         unsafe {

@@ -33,7 +33,7 @@ pub use decoder::{Av1Decoder, D3d11Frame, HevcDecoder, Mpeg2Decoder, Vc1Decoder,
 pub use device::D3d11Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d11Encoder;
-pub use error::{D3d11Error, SkipReason};
+pub use error::{BrokenReferenceReason, D3d11Error, ParseReason, SkipReason, UnsupportedReason};
 pub use guid::{Codec, Profile};
 #[cfg(target_os = "windows")]
 pub use transcode::Transcoder;

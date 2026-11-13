@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use crate::bits::BitReader;
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 
 /// Sequence set count, H.264 7.4.2.1.
 pub(crate) const MAX_SPS: usize = 32;
@@ -120,8 +120,11 @@ fn scaling_list<const N: usize>(
                 return Ok(*default);
             }
         }
-        let scale = u8::try_from(if next == 0 { last } else { next })
-            .map_err(|_| D3d11Error::Parse("scaling value range".to_owned()))?;
+        let scale = u8::try_from(if next == 0 { last } else { next }).map_err(|_| {
+            D3d11Error::Parse(ParseReason::Range {
+                syntax: "scaling value",
+            })
+        })?;
         *value = scale;
         last = i32::from(scale);
     }
@@ -146,7 +149,9 @@ impl PocType {
             0 => Ok(Self::Lsb),
             1 => Ok(Self::Delta),
             2 => Ok(Self::FrameNum),
-            _ => Err(D3d11Error::Parse("pic_order_cnt_type range".to_owned())),
+            _ => Err(D3d11Error::Parse(ParseReason::Range {
+                syntax: "pic_order_cnt_type",
+            })),
         }
     }
 
@@ -255,25 +260,36 @@ impl Sps {
 /// Sequence parameter set from RBSP `rbsp`.
 pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d11Error> {
     let mut reader = BitReader::new(rbsp);
-    let profile_idc = u8::try_from(reader.read_bits(8, "profile_idc")?)
-        .map_err(|_| D3d11Error::Parse("profile_idc range".to_owned()))?;
+    let profile_idc = u8::try_from(reader.read_bits(8, "profile_idc")?).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "profile_idc",
+        })
+    })?;
     reader.read_bits(8, "constraints")?;
-    let level_idc = u8::try_from(reader.read_bits(8, "level_idc")?)
-        .map_err(|_| D3d11Error::Parse("level_idc range".to_owned()))?;
+    let level_idc = u8::try_from(reader.read_bits(8, "level_idc")?).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "level_idc",
+        })
+    })?;
     let sps_id = parse_sps_id(&mut reader)?;
     let scaling = parse_sps_chroma(&mut reader, profile_idc)?;
     let log2_max_frame_num_minus4 = parse_log2(&mut reader, "log2_max_frame_num")?;
     let poc = parse_sps_poc(&mut reader)?;
-    let max_num_ref_frames = u8::try_from(reader.read_ue("max_num_ref_frames")?)
-        .map_err(|_| D3d11Error::Parse("max_num_ref_frames range".to_owned()))?;
+    let max_num_ref_frames = u8::try_from(reader.read_ue("max_num_ref_frames")?).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "max_num_ref_frames",
+        })
+    })?;
     if max_num_ref_frames > 16 {
-        return Err(D3d11Error::Parse("max_num_ref_frames range".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "max_num_ref_frames",
+        }));
     }
     let gaps_allowed = reader.read_bit("gaps_in_frame_num")?;
     let width_in_mbs_minus1 = parse_mbs(&mut reader, "pic_width_in_mbs")?;
     let height_in_mbs_minus1 = parse_mbs(&mut reader, "pic_height_in_map_units")?;
     if !reader.read_bit("frame_mbs_only_flag")? {
-        return Err(D3d11Error::Unsupported("interlaced".to_owned()));
+        return Err(D3d11Error::Unsupported(UnsupportedReason::Interlaced));
     }
     let direct_8x8 = reader.read_bit("direct_8x8_inference_flag")?;
     let crop = parse_crop(&mut reader, width_in_mbs_minus1, height_in_mbs_minus1)?;
@@ -302,10 +318,15 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d11Error> {
 /// Set id below the set count.
 fn parse_sps_id(reader: &mut BitReader) -> Result<u8, D3d11Error> {
     let id = reader.read_ue("seq_parameter_set_id")?;
-    let id =
-        u8::try_from(id).map_err(|_| D3d11Error::Parse("seq_parameter_set_id range".to_owned()))?;
+    let id = u8::try_from(id).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "seq_parameter_set_id",
+        })
+    })?;
     if usize::from(id) >= MAX_SPS {
-        return Err(D3d11Error::Parse("seq_parameter_set_id range".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "seq_parameter_set_id",
+        }));
     }
     Ok(id)
 }
@@ -319,18 +340,20 @@ fn parse_sps_chroma(reader: &mut BitReader, profile_idc: u8) -> Result<ScalingSe
         return Ok(fallback_scaling());
     }
     if reader.read_ue("chroma_format_idc")? != 1 {
-        return Err(D3d11Error::Unsupported("chroma outside 4:2:0".to_owned()));
+        return Err(D3d11Error::Unsupported(UnsupportedReason::ChromaOutside420));
     }
     if reader.read_ue("bit_depth_luma_minus8")? != 0 {
-        return Err(D3d11Error::Unsupported("luma depth above 8 bit".to_owned()));
+        return Err(D3d11Error::Unsupported(
+            UnsupportedReason::LumaDepthAbove8Bit,
+        ));
     }
     if reader.read_ue("bit_depth_chroma_minus8")? != 0 {
         return Err(D3d11Error::Unsupported(
-            "chroma depth above 8 bit".to_owned(),
+            UnsupportedReason::ChromaDepthAbove8Bit,
         ));
     }
     if reader.read_bit("qpprime_y_zero_transform_bypass_flag")? {
-        return Err(D3d11Error::Unsupported("transform bypass".to_owned()));
+        return Err(D3d11Error::Unsupported(UnsupportedReason::TransformBypass));
     }
     if !reader.read_bit("seq_scaling_matrix_present_flag")? {
         return Ok(fallback_scaling());
@@ -401,9 +424,9 @@ fn fallback_scaling() -> ScalingSets {
 fn parse_log2(reader: &mut BitReader, syntax: &'static str) -> Result<u8, D3d11Error> {
     let value = reader.read_ue(syntax)?;
     if value > 12 {
-        return Err(D3d11Error::Parse(format!("{syntax} range")));
+        return Err(D3d11Error::Parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| D3d11Error::Parse(format!("{syntax} range")))
+    u8::try_from(value).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax }))
 }
 
 /// POC section: method plus its parameters.
@@ -453,22 +476,28 @@ fn parse_poc_cycle(reader: &mut BitReader, section: &mut PocSection) -> Result<(
     section.offset_non_ref = reader.read_se("offset_for_non_ref_pic")?;
     section.offset_top_bottom = reader.read_se("offset_for_top_to_bottom_field")?;
     let count = reader.read_ue("num_ref_frames_in_pic_order_cnt_cycle")?;
-    section.cycle = u8::try_from(count)
-        .map_err(|_| D3d11Error::Parse("pic_order_cnt_cycle range".to_owned()))?;
+    section.cycle = u8::try_from(count).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "pic_order_cnt_cycle",
+        })
+    })?;
     let mut total: i64 = 0;
     for slot in section.offsets.iter_mut().take(usize::from(section.cycle)) {
         *slot = reader.read_se("offset_for_ref_frame")?;
         total += i64::from(*slot);
     }
-    section.expected = i32::try_from(total)
-        .map_err(|_| D3d11Error::Parse("pic_order_cnt_cycle range".to_owned()))?;
+    section.expected = i32::try_from(total).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "pic_order_cnt_cycle",
+        })
+    })?;
     Ok(())
 }
 
 /// Macroblock count field.
 fn parse_mbs(reader: &mut BitReader, syntax: &'static str) -> Result<u16, D3d11Error> {
     let value = reader.read_ue(syntax)?;
-    u16::try_from(value).map_err(|_| D3d11Error::Parse(format!("{syntax} range")))
+    u16::try_from(value).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax }))
 }
 
 /// Frame crop rectangle in luma samples, validated against the coded size.
@@ -495,9 +524,7 @@ fn parse_crop(
             top: top * 2,
             bottom: bottom * 2,
         })),
-        _ => Err(D3d11Error::Parse(
-            "frame_crop outside coded size".to_owned(),
-        )),
+        _ => Err(D3d11Error::Parse(ParseReason::FrameCropOutsideCodedSize)),
     }
 }
 
@@ -603,7 +630,7 @@ pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d11Error> {
     }
     if reader.read_ue("num_slice_groups_minus1")? != 0 {
         return Err(D3d11Error::Unsupported(
-            "flexible macroblock order".to_owned(),
+            UnsupportedReason::FlexibleMacroblockOrder,
         ));
     }
     let num_ref_l0 = parse_ref_count(&mut reader, "num_ref_idx_l0_default_active_minus1")?;
@@ -613,11 +640,16 @@ pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d11Error> {
     }
     let bipred = reader.read_bits(2, "weighted_bipred_idc")?;
     if bipred > 2 {
-        return Err(D3d11Error::Parse("weighted_bipred_idc range".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "weighted_bipred_idc",
+        }));
     }
     let shifted = bipred << u32::from(PPS_BIPRED_SHIFT);
-    flags |= u16::try_from(shifted)
-        .map_err(|_| D3d11Error::Parse("weighted_bipred_idc range".to_owned()))?;
+    flags |= u16::try_from(shifted).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "weighted_bipred_idc",
+        })
+    })?;
     let luma_qp = parse_qp(&mut reader, "pic_init_qp_minus26")?;
     let switch_qs = parse_qp(&mut reader, "pic_init_qs_minus26")?;
     let chroma_qp = parse_qp(&mut reader, "chroma_qp_index_offset")?;
@@ -659,16 +691,23 @@ pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d11Error> {
 /// Set id below the set count.
 fn parse_pps_id(reader: &mut BitReader) -> Result<u8, D3d11Error> {
     let id = reader.read_ue("pic_parameter_set_id")?;
-    u8::try_from(id).map_err(|_| D3d11Error::Parse("pic_parameter_set_id range".to_owned()))
+    u8::try_from(id).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "pic_parameter_set_id",
+        })
+    })
 }
 
 /// Sequence id matching the supplied sequence set.
 fn parse_pps_sps_id(reader: &mut BitReader, sps: &Sps) -> Result<u8, D3d11Error> {
     let id = reader.read_ue("seq_parameter_set_id")?;
-    let id =
-        u8::try_from(id).map_err(|_| D3d11Error::Parse("seq_parameter_set_id range".to_owned()))?;
+    let id = u8::try_from(id).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "seq_parameter_set_id",
+        })
+    })?;
     if id != sps.seq_parameter_set_id {
-        return Err(D3d11Error::Parse("pps cites unknown sps".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps));
     }
     Ok(id)
 }
@@ -677,15 +716,15 @@ fn parse_pps_sps_id(reader: &mut BitReader, sps: &Sps) -> Result<u8, D3d11Error>
 fn parse_ref_count(reader: &mut BitReader, syntax: &'static str) -> Result<u8, D3d11Error> {
     let value = reader.read_ue(syntax)?;
     if value > 31 {
-        return Err(D3d11Error::Parse(format!("{syntax} range")));
+        return Err(D3d11Error::Parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| D3d11Error::Parse(format!("{syntax} range")))
+    u8::try_from(value).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax }))
 }
 
 /// QP delta field.
 fn parse_qp(reader: &mut BitReader, syntax: &'static str) -> Result<i8, D3d11Error> {
     let value = reader.read_se(syntax)?;
-    i8::try_from(value).map_err(|_| D3d11Error::Parse(format!("{syntax} range")))
+    i8::try_from(value).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax }))
 }
 
 /// Picture scaling lists resolved against the sequence lists.
@@ -755,13 +794,15 @@ impl SliceType {
     /// Type for the `slice_type` value.
     fn new(value: u32) -> Result<Self, D3d11Error> {
         if value > 9 {
-            return Err(D3d11Error::Parse("slice_type range".to_owned()));
+            return Err(D3d11Error::Parse(ParseReason::Range {
+                syntax: "slice_type",
+            }));
         }
         match value % 5 {
             0 => Ok(Self::P),
             1 => Ok(Self::B),
             2 => Ok(Self::I),
-            _ => Err(D3d11Error::Unsupported("sp/si slices".to_owned())),
+            _ => Err(D3d11Error::Unsupported(UnsupportedReason::SpSiSlices)),
         }
     }
 
@@ -923,8 +964,11 @@ fn parse_slice_prefix(reader: &mut BitReader) -> Result<(u32, SliceType, bool, u
     let raw_type = reader.read_ue("slice_type")?;
     let slice_type = SliceType::new(raw_type)?;
     let pps_id = reader.read_ue("pic_parameter_set_id")?;
-    let pps_id = u8::try_from(pps_id)
-        .map_err(|_| D3d11Error::Parse("pic_parameter_set_id range".to_owned()))?;
+    let pps_id = u8::try_from(pps_id).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "pic_parameter_set_id",
+        })
+    })?;
     Ok((first_mb, slice_type, raw_type >= 5, pps_id))
 }
 
@@ -939,7 +983,7 @@ fn parse_slice_rest(
 ) -> Result<SliceHeader, D3d11Error> {
     let (first_mb, slice_type, fixed, pps_id) = prefix;
     if idr && !slice_type.is_intra() {
-        return Err(D3d11Error::Parse("non-intra slice in IDR".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::NonIntraSliceInIdr));
     }
     let width = u32::from(sps.log2_max_frame_num_minus4) + 4;
     let frame_num = reader.read_bits(width, "frame_num")?;
@@ -947,7 +991,9 @@ fn parse_slice_rest(
     let idr_pic_id = parse_idr_pic_id(reader, idr)?;
     let poc = parse_slice_poc(reader, sps, pps)?;
     if pps.redundant_present() && reader.read_ue("redundant_pic_cnt")? != 0 {
-        return Err(D3d11Error::Unsupported("redundant pictures".to_owned()));
+        return Err(D3d11Error::Unsupported(
+            UnsupportedReason::RedundantPictures,
+        ));
     }
     let mut header = SliceHeader {
         first_mb,
@@ -978,7 +1024,7 @@ fn parse_slice_rest(
         offset = offset.next_multiple_of(8);
     }
     header.bit_offset =
-        u16::try_from(offset).map_err(|_| D3d11Error::Parse("slice header too long".to_owned()))?;
+        u16::try_from(offset).map_err(|_| D3d11Error::Parse(ParseReason::SliceHeaderTooLong))?;
     Ok(header)
 }
 
@@ -988,9 +1034,11 @@ fn parse_idr_pic_id(reader: &mut BitReader, idr: bool) -> Result<Option<u16>, D3
         return Ok(None);
     }
     let id = reader.read_ue("idr_pic_id")?;
-    u16::try_from(id)
-        .map(Some)
-        .map_err(|_| D3d11Error::Parse("idr_pic_id range".to_owned()))
+    u16::try_from(id).map(Some).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "idr_pic_id",
+        })
+    })
 }
 
 /// Slice POC syntax for the sequence POC method.
@@ -1068,29 +1116,35 @@ fn parse_ref_modification(reader: &mut BitReader, sps: &Sps) -> Result<Vec<RefMo
             0 => {
                 let diff = reader.read_ue("abs_diff_pic_num_minus1")?;
                 if diff >= sps.max_frame_num() {
-                    return Err(D3d11Error::Parse("abs_diff_pic_num range".to_owned()));
+                    return Err(D3d11Error::Parse(ParseReason::Range {
+                        syntax: "abs_diff_pic_num",
+                    }));
                 }
                 operations.push(RefMod::ShortBelow(diff));
             }
             1 => {
                 let diff = reader.read_ue("abs_diff_pic_num_minus1")?;
                 if diff >= sps.max_frame_num() {
-                    return Err(D3d11Error::Parse("abs_diff_pic_num range".to_owned()));
+                    return Err(D3d11Error::Parse(ParseReason::Range {
+                        syntax: "abs_diff_pic_num",
+                    }));
                 }
                 operations.push(RefMod::ShortAbove(diff));
             }
             2 => {
                 let index = reader.read_ue("long_term_pic_num")?;
                 if index > u32::from(sps.max_num_ref_frames) {
-                    return Err(D3d11Error::Parse("long_term_pic_num range".to_owned()));
+                    return Err(D3d11Error::Parse(ParseReason::Range {
+                        syntax: "long_term_pic_num",
+                    }));
                 }
                 operations.push(RefMod::Long(index));
             }
             3 => return Ok(operations),
             _ => {
-                return Err(D3d11Error::Parse(
-                    "modification_of_pic_nums_idc range".to_owned(),
-                ));
+                return Err(D3d11Error::Parse(ParseReason::Range {
+                    syntax: "modification_of_pic_nums_idc",
+                }));
             }
         }
     }
@@ -1109,13 +1163,15 @@ fn parse_weights(
     }
     let luma_denom = reader.read_ue("luma_log2_weight_denom")?;
     if luma_denom > 7 {
-        return Err(D3d11Error::Parse("luma_log2_weight_denom range".to_owned()));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "luma_log2_weight_denom",
+        }));
     }
     let chroma_denom = reader.read_ue("chroma_log2_weight_denom")?;
     if chroma_denom > 7 {
-        return Err(D3d11Error::Parse(
-            "chroma_log2_weight_denom range".to_owned(),
-        ));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "chroma_log2_weight_denom",
+        }));
     }
     let l0 = parse_weight_list(reader, header.num_ref_l0(pps))?;
     let mut l1 = Vec::new();
@@ -1123,10 +1179,16 @@ fn parse_weights(
         l1 = parse_weight_list(reader, header.num_ref_l1(pps))?;
     }
     header.weights = Weights {
-        luma_denom: u8::try_from(luma_denom)
-            .map_err(|_| D3d11Error::Parse("luma_log2_weight_denom range".to_owned()))?,
-        chroma_denom: u8::try_from(chroma_denom)
-            .map_err(|_| D3d11Error::Parse("chroma_log2_weight_denom range".to_owned()))?,
+        luma_denom: u8::try_from(luma_denom).map_err(|_| {
+            D3d11Error::Parse(ParseReason::Range {
+                syntax: "luma_log2_weight_denom",
+            })
+        })?,
+        chroma_denom: u8::try_from(chroma_denom).map_err(|_| {
+            D3d11Error::Parse(ParseReason::Range {
+                syntax: "chroma_log2_weight_denom",
+            })
+        })?,
         l0,
         l1,
     };
@@ -1206,9 +1268,9 @@ fn parse_marking(
             5 => operations.push(Mmco::MarkAllUnused),
             6 => operations.push(Mmco::CurrentToLong),
             _ => {
-                return Err(D3d11Error::Parse(
-                    "memory_management_control_operation range".to_owned(),
-                ))
+                return Err(D3d11Error::Parse(ParseReason::Range {
+                    syntax: "memory_management_control_operation",
+                }))
             }
         }
     }
@@ -1224,8 +1286,11 @@ fn parse_slice_tail(
 ) -> Result<(), D3d11Error> {
     if pps.entropy() && !header.slice_type.is_intra() {
         let idc = reader.read_ue("cabac_init_idc")?;
-        header.cabac_init_idc =
-            u8::try_from(idc).map_err(|_| D3d11Error::Parse("cabac_init_idc range".to_owned()))?;
+        header.cabac_init_idc = u8::try_from(idc).map_err(|_| {
+            D3d11Error::Parse(ParseReason::Range {
+                syntax: "cabac_init_idc",
+            })
+        })?;
     }
     header.qp_delta = reader.read_se("slice_qp_delta")?;
     if !pps.deblocking_present() {
@@ -1233,12 +1298,15 @@ fn parse_slice_tail(
     }
     let idc = reader.read_ue("disable_deblocking_filter_idc")?;
     if idc > 2 {
-        return Err(D3d11Error::Parse(
-            "disable_deblocking_filter_idc range".to_owned(),
-        ));
+        return Err(D3d11Error::Parse(ParseReason::Range {
+            syntax: "disable_deblocking_filter_idc",
+        }));
     }
-    header.deblocking_idc = u8::try_from(idc)
-        .map_err(|_| D3d11Error::Parse("disable_deblocking_filter_idc range".to_owned()))?;
+    header.deblocking_idc = u8::try_from(idc).map_err(|_| {
+        D3d11Error::Parse(ParseReason::Range {
+            syntax: "disable_deblocking_filter_idc",
+        })
+    })?;
     if idc != 1 {
         header.deblocking_alpha = reader.read_se("slice_alpha_c0_offset_div2")?;
         header.deblocking_beta = reader.read_se("slice_beta_offset_div2")?;
@@ -1349,7 +1417,7 @@ impl Ingest {
             return Ok(());
         };
         if header >> 7 != 0 {
-            return Err(D3d11Error::Parse("nal forbidden bit".to_owned()));
+            return Err(D3d11Error::Parse(ParseReason::NalForbiddenBit));
         }
         let ref_idc = (header >> 5) & 3;
         match header & 0x1F {
@@ -1362,8 +1430,8 @@ impl Ingest {
                 }
                 Ok(())
             }
-            2..=4 => Err(D3d11Error::Unsupported("data partitions".to_owned())),
-            13..=15 | 20 => Err(D3d11Error::Unsupported("multiview".to_owned())),
+            2..=4 => Err(D3d11Error::Unsupported(UnsupportedReason::DataPartitions)),
+            13..=15 | 20 => Err(D3d11Error::Unsupported(UnsupportedReason::Multiview)),
             _ => Ok(()),
         }
     }
@@ -1379,16 +1447,16 @@ impl Ingest {
         let idr = header & 0x1F == 5;
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(1..) else {
-            return Err(D3d11Error::Parse("slice without header".to_owned()));
+            return Err(D3d11Error::Parse(ParseReason::SliceWithoutHeader));
         };
         let mut reader = BitReader::new(body);
         let prefix = parse_slice_prefix(&mut reader)?;
         let pps = self
             .pps(prefix.3)
-            .ok_or_else(|| D3d11Error::Parse("slice cites unknown pps".to_owned()))?;
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownPps))?;
         let sps = self
             .sps(pps.seq_parameter_set_id)
-            .ok_or_else(|| D3d11Error::Parse("slice cites unknown sps".to_owned()))?;
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownSps))?;
         let parsed = parse_slice_rest(&mut reader, prefix, idr, ref_idc, sps, pps)?;
         if parsed.first_mb == 0 && !self.pending.is_empty() {
             if let Some(picture) = self.complete_picture()? {
@@ -1408,7 +1476,7 @@ impl Ingest {
     fn ingest_sps(&mut self, nal: &[u8]) -> Result<(), D3d11Error> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(1..) else {
-            return Err(D3d11Error::Parse("sps without body".to_owned()));
+            return Err(D3d11Error::Parse(ParseReason::SpsWithoutBody));
         };
         let sps = parse_sps(body)?;
         let id = sps.seq_parameter_set_id;
@@ -1420,16 +1488,19 @@ impl Ingest {
     fn ingest_pps(&mut self, nal: &[u8]) -> Result<(), D3d11Error> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(1..) else {
-            return Err(D3d11Error::Parse("pps without body".to_owned()));
+            return Err(D3d11Error::Parse(ParseReason::PpsWithoutBody));
         };
         let mut probe = BitReader::new(body);
         probe.read_ue("pic_parameter_set_id")?;
         let sps_id = probe.read_ue("seq_parameter_set_id")?;
-        let sps_id = u8::try_from(sps_id)
-            .map_err(|_| D3d11Error::Parse("seq_parameter_set_id range".to_owned()))?;
+        let sps_id = u8::try_from(sps_id).map_err(|_| {
+            D3d11Error::Parse(ParseReason::Range {
+                syntax: "seq_parameter_set_id",
+            })
+        })?;
         let sps = self
             .sps(sps_id)
-            .ok_or_else(|| D3d11Error::Parse("pps cites unknown sps".to_owned()))?;
+            .ok_or(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps))?;
         let pps = parse_pps(body, sps)?;
         let id = pps.pic_parameter_set_id;
         self.pps[usize::from(id)] = Some(pps);
@@ -1449,7 +1520,7 @@ impl Ingest {
                 || slice.idr != first.idr
                 || slice.ref_idc != first.ref_idc
             {
-                return Err(D3d11Error::Parse("picture slices disagree".to_owned()));
+                return Err(D3d11Error::Parse(ParseReason::PictureSlicesDisagree));
             }
         }
         let mut previous: Option<u32> = None;
@@ -1459,7 +1530,11 @@ impl Ingest {
                 Some(prev) if slice.header.first_mb > prev => {
                     previous = Some(slice.header.first_mb);
                 }
-                _ => return Err(D3d11Error::Unsupported("arbitrary slice order".to_owned())),
+                _ => {
+                    return Err(D3d11Error::Unsupported(
+                        UnsupportedReason::ArbitrarySliceOrder,
+                    ))
+                }
             }
         }
         Ok(Some(Picture {

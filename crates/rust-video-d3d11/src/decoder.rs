@@ -3,7 +3,7 @@
 use crate::device::D3d11Device;
 #[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb, Output};
-use crate::error::{D3d11Error, SkipReason};
+use crate::error::{D3d11Error, ParseReason, SkipReason, UnsupportedReason};
 use crate::guid::Codec;
 #[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture, Sps};
@@ -206,12 +206,11 @@ struct Active {
 }
 
 #[cfg(target_os = "windows")]
-#[cfg(target_os = "windows")]
 impl Active {
     /// Active sequence behind `sps`.
     fn new(sps: &Sps) -> Result<Self, D3d11Error> {
         let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
-            .ok_or_else(|| D3d11Error::Parse("crop empties picture".to_owned()))?;
+            .ok_or(D3d11Error::Parse(ParseReason::CropEmptiesPicture))?;
         Ok(Self {
             sps_id: sps.seq_parameter_set_id,
             width: sps.width(),
@@ -245,7 +244,6 @@ pub struct H264Decoder<'a> {
     inflight_max: usize,
 }
 
-#[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
 impl<'a> H264Decoder<'a> {
     /// Decoder over `device`; the session starts on the first picture.
@@ -477,9 +475,9 @@ impl<'a> H264Decoder<'a> {
             } else {
                 for output in &decoded.outputs {
                     let Some(surface) = emit_surface(session, output, &active) else {
-                        failed = Some(D3d11Error::Unsupported(
-                            FallbackCause::NoSharedExport.to_string(),
-                        ));
+                        failed = Some(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                            cause: FallbackCause::NoSharedExport,
+                        }));
                         break;
                     };
                     surfaces.push(surface);
@@ -516,9 +514,9 @@ impl<'a> H264Decoder<'a> {
         };
         for output in dpb.drain() {
             let Some(surface) = emit_surface(session, &output, active) else {
-                return Err(D3d11Error::Unsupported(
-                    FallbackCause::NoSharedExport.to_string(),
-                ));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause: FallbackCause::NoSharedExport,
+                }));
             };
             surfaces.push(surface);
         }
@@ -628,168 +626,73 @@ fn emit_surface(session: &Session, output: &Output, active: &Active) -> Option<G
     Some(GpuSurface { export, layout })
 }
 
-/// HEVC decoder; the picture builder is pending.
-pub struct HevcDecoder<'a> {
-    /// Device behind the profile probe.
-    device: &'a D3d11Device,
-}
-
-impl<'a> HevcDecoder<'a> {
-    /// Decoder over `device`; decode reports the pending builder.
-    #[must_use]
-    pub fn open(device: &'a D3d11Device) -> Self {
-        Self { device }
-    }
-}
-
-impl Decoder for HevcDecoder<'_> {
-    type Frame = D3d11Frame;
-    type Error = D3d11Error;
-
-    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        if !self.device.supports(Codec::Hevc) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Hevc }.into());
+/// Probed decoder shell; the picture builder is pending.
+macro_rules! shell {
+    ($decoder:ident, $codec:ident, $doc:literal) => {
+        #[doc = $doc]
+        pub struct $decoder<'a> {
+            /// Device behind the profile probe.
+            device: &'a D3d11Device,
         }
-        Err(D3d11Error::Unsupported(
-            "hevc picture builder pending".to_owned(),
-        ))
-    }
 
-    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        Ok(Vec::new())
-    }
-}
-
-/// VP9 decoder; the picture builder is pending.
-pub struct Vp9Decoder<'a> {
-    /// Device behind the profile probe.
-    device: &'a D3d11Device,
-}
-
-impl<'a> Vp9Decoder<'a> {
-    /// Decoder over `device`; decode reports the pending builder.
-    #[must_use]
-    pub fn open(device: &'a D3d11Device) -> Self {
-        Self { device }
-    }
-}
-
-impl Decoder for Vp9Decoder<'_> {
-    type Frame = D3d11Frame;
-    type Error = D3d11Error;
-
-    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        if !self.device.supports(Codec::Vp9) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Vp9 }.into());
-        }
-        Err(D3d11Error::Unsupported(
-            "vp9 picture builder pending".to_owned(),
-        ))
-    }
-
-    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        Ok(Vec::new())
-    }
-}
-
-/// AV1 decoder; the picture builder is pending.
-pub struct Av1Decoder<'a> {
-    /// Device behind the profile probe.
-    device: &'a D3d11Device,
-}
-
-impl<'a> Av1Decoder<'a> {
-    /// Decoder over `device`; decode reports the pending builder.
-    #[must_use]
-    pub fn open(device: &'a D3d11Device) -> Self {
-        Self { device }
-    }
-}
-
-impl Decoder for Av1Decoder<'_> {
-    type Frame = D3d11Frame;
-    type Error = D3d11Error;
-
-    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        if !self.device.supports(Codec::Av1) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Av1 }.into());
-        }
-        Err(D3d11Error::Unsupported(
-            "av1 picture builder pending".to_owned(),
-        ))
-    }
-
-    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        Ok(Vec::new())
-    }
-}
-
-/// MPEG-2 decoder; the picture builder is pending.
-pub struct Mpeg2Decoder<'a> {
-    /// Device behind the profile probe.
-    device: &'a D3d11Device,
-}
-
-impl<'a> Mpeg2Decoder<'a> {
-    /// Decoder over `device`; decode reports the pending builder.
-    #[must_use]
-    pub fn open(device: &'a D3d11Device) -> Self {
-        Self { device }
-    }
-}
-
-impl Decoder for Mpeg2Decoder<'_> {
-    type Frame = D3d11Frame;
-    type Error = D3d11Error;
-
-    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        if !self.device.supports(Codec::Mpeg2) {
-            return Err(SkipReason::ProfileUnsupported {
-                codec: Codec::Mpeg2,
+        impl<'a> $decoder<'a> {
+            /// Decoder over `device`; decode reports the pending builder.
+            #[must_use]
+            pub fn open(device: &'a D3d11Device) -> Self {
+                Self { device }
             }
-            .into());
         }
-        Err(D3d11Error::Unsupported(
-            "mpeg2 picture builder pending".to_owned(),
-        ))
-    }
 
-    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        Ok(Vec::new())
-    }
-}
+        impl Decoder for $decoder<'_> {
+            type Frame = D3d11Frame;
+            type Error = D3d11Error;
 
-/// VC-1 decoder; the picture builder is pending.
-pub struct Vc1Decoder<'a> {
-    /// Device behind the profile probe.
-    device: &'a D3d11Device,
-}
+            fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+                if !self.device.supports(Codec::$codec) {
+                    return Err(SkipReason::ProfileUnsupported {
+                        codec: Codec::$codec,
+                    }
+                    .into());
+                }
+                Err(D3d11Error::Unsupported(
+                    UnsupportedReason::PictureBuilderPending {
+                        codec: Codec::$codec,
+                    },
+                ))
+            }
 
-impl<'a> Vc1Decoder<'a> {
-    /// Decoder over `device`; decode reports the pending builder.
-    #[must_use]
-    pub fn open(device: &'a D3d11Device) -> Self {
-        Self { device }
-    }
-}
-
-impl Decoder for Vc1Decoder<'_> {
-    type Frame = D3d11Frame;
-    type Error = D3d11Error;
-
-    fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        if !self.device.supports(Codec::Vc1) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Vc1 }.into());
+            fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+                Ok(Vec::new())
+            }
         }
-        Err(D3d11Error::Unsupported(
-            "vc1 picture builder pending".to_owned(),
-        ))
-    }
-
-    fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        Ok(Vec::new())
-    }
+    };
 }
+
+shell!(
+    HevcDecoder,
+    Hevc,
+    "HEVC decoder; the picture builder is pending."
+);
+shell!(
+    Vp9Decoder,
+    Vp9,
+    "VP9 decoder; the picture builder is pending."
+);
+shell!(
+    Av1Decoder,
+    Av1,
+    "AV1 decoder; the picture builder is pending."
+);
+shell!(
+    Mpeg2Decoder,
+    Mpeg2,
+    "MPEG-2 decoder; the picture builder is pending."
+);
+shell!(
+    Vc1Decoder,
+    Vc1,
+    "VC-1 decoder; the picture builder is pending."
+);
 
 #[cfg(test)]
 mod tests {

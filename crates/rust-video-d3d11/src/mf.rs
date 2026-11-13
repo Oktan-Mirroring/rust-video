@@ -3,6 +3,7 @@
 //! <https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Media/MediaFoundation/>
 
+// FFI boundary: Media Foundation transform calls live here.
 #![allow(unsafe_code)]
 // The implement macro expands to inline(always) shims with ref casts.
 #![allow(clippy::inline_always, clippy::ref_as_ptr)]
@@ -13,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use crate::device::D3d11Device;
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::submit::SubmitLock;
 
@@ -224,7 +225,7 @@ impl Session {
         let expect = nv12_len(width, height);
         if u64::try_from(nv12.len()).unwrap_or(0) != expect {
             return Err(D3d11Error::Unsupported(
-                "packed NV12 length outside its extent".to_owned(),
+                UnsupportedReason::PackedNv12OutsideExtent,
             ));
         }
         let mut packets = self.ensure_size(width, height)?;
@@ -289,7 +290,7 @@ impl Session {
     ) -> Result<Vec<Packet>, D3d11Error> {
         let _com = ComGuard::enter();
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(D3d11Error::Unsupported("odd NV12 extent".to_owned()));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
         }
         let mut packets = self.ensure_size(width, height)?;
         let region = Region {
@@ -299,10 +300,9 @@ impl Session {
             width,
             height,
         };
-        let gpu = self
-            .gpu
-            .as_mut()
-            .ok_or_else(|| D3d11Error::Unsupported("encoder without gpu import".to_owned()))?;
+        let gpu = self.gpu.as_mut().ok_or(D3d11Error::Unsupported(
+            UnsupportedReason::EncoderWithoutGpuImport,
+        ))?;
         let sample = gpu.sample(&self.transform, self.input, texture, &region, self.pts)?;
         self.submit_sample(&sample, &mut packets)?;
         Ok(packets)
@@ -505,9 +505,9 @@ impl Session {
 
     /// Async pump, absent on synchronous transforms.
     fn async_pump(&self) -> Result<&EventPump, D3d11Error> {
-        self.pump
-            .as_ref()
-            .ok_or_else(|| D3d11Error::Unsupported("async MFT without an event pump".to_owned()))
+        self.pump.as_ref().ok_or(D3d11Error::Unsupported(
+            UnsupportedReason::AsyncMftWithoutEventPump,
+        ))
     }
 
     /// Drained outputs with the session left streaming.
@@ -1056,7 +1056,7 @@ fn startup() -> Result<(), D3d11Error> {
 
 /// Unsupported error naming the absent `codec` encoder MFT.
 fn missing_encoder(codec: Codec) -> D3d11Error {
-    D3d11Error::Unsupported(format!("no {codec} encoder MFT on this machine"))
+    D3d11Error::Unsupported(UnsupportedReason::NoEncoderMft { codec })
 }
 
 /// Output subtypes for `codec`, preferred first.
@@ -1198,7 +1198,7 @@ fn attributes(transform: &IMFTransform) -> (Option<IMFAttributes>, bool, bool) {
 fn unlock(store: Option<&IMFAttributes>) -> Result<(), D3d11Error> {
     let Some(store) = store else {
         return Err(D3d11Error::Unsupported(
-            "async MFT without an attribute store".to_owned(),
+            UnsupportedReason::AsyncMftWithoutAttributeStore,
         ));
     };
     // Sound: the store is live.
@@ -1354,7 +1354,7 @@ fn u32_flag(bits: i32) -> u32 {
 /// Input sample over `nv12` stamped at `pts`.
 fn input_sample(nv12: &[u8], align: u32, pts: i64) -> Result<IMFSample, D3d11Error> {
     let len = u32::try_from(nv12.len())
-        .map_err(|_| D3d11Error::Unsupported("frame over 4 GiB".to_owned()))?;
+        .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::FrameOver4Gib))?;
     // Sound: the sample and buffer are live for every set below.
     let sample = call(unsafe { MFCreateSample() }, "MFCreateSample")?;
     let buffer = call(

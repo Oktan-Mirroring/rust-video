@@ -1,5 +1,6 @@
 //! D3D11 device with enumerated decoder profiles behind the caps `Device` trait.
 
+// FFI boundary: D3D11 device and video-device COM calls live here.
 #![allow(unsafe_code)]
 
 #[cfg(target_os = "windows")]

@@ -3,12 +3,13 @@
 //! <https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-render-multi-thread-render>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D11/>
 
+// FFI boundary: device-context COM calls live here.
 #![allow(unsafe_code)]
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, UnsupportedReason};
 use crate::h264::Crop;
 
 use bytes::Bytes;
@@ -51,7 +52,7 @@ impl SubmitLock {
     pub(crate) fn enter(&self) -> Result<MutexGuard<'_, ()>, D3d11Error> {
         self.inner
             .lock()
-            .map_err(|_| D3d11Error::Unsupported("submit lock poisoned".to_owned()))
+            .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::SubmitLockPoisoned))
     }
 }
 

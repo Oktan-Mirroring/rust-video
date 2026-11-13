@@ -3,6 +3,7 @@
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D11/>
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11videocontext-videoprocessorblt>
 
+// FFI boundary: video-processor COM calls live here.
 #![allow(unsafe_code)]
 
 #[cfg(test)]
@@ -14,7 +15,7 @@ use std::sync::Arc;
 
 use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 use crate::submit::flag_word;
 use crate::submit::SubmitLock;
 
@@ -95,7 +96,7 @@ impl Scaler {
             || !to.width().is_multiple_of(2)
             || !to.height().is_multiple_of(2)
         {
-            return Err(D3d11Error::Unsupported("odd NV12 extent".to_owned()));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
         }
         let rate = DXGI_RATIONAL {
             Numerator: 30,
@@ -136,7 +137,7 @@ impl Scaler {
         .unwrap_or(0);
         if flags & need != need {
             return Err(D3d11Error::Unsupported(
-                "video processor without nv12 scale".to_owned(),
+                UnsupportedReason::VideoProcessorWithoutNv12Scale,
             ));
         }
         // Sound: the enumerator is live.
@@ -206,7 +207,7 @@ impl Scaler {
     pub(crate) fn scale(&self, surface: &GpuSurface) -> Result<ScaledSurface, D3d11Error> {
         if surface.size() != self.from {
             return Err(D3d11Error::Unsupported(
-                "scale source outside scaler".to_owned(),
+                UnsupportedReason::ScaleSourceOutsideScaler,
             ));
         }
         let layout = surface.layout();
@@ -323,14 +324,16 @@ fn create_target(device: &D3d11Device, to: PictureSize) -> Result<ID3D11Texture2
 
 /// Visible rectangle at (`left`, `top`) sized `size`.
 fn crop_rect(left: u32, top: u32, size: PictureSize) -> Result<RECT, D3d11Error> {
-    let left = i32::try_from(left).map_err(|_| D3d11Error::Parse("extent range".to_owned()))?;
-    let top = i32::try_from(top).map_err(|_| D3d11Error::Parse("extent range".to_owned()))?;
+    let left = i32::try_from(left)
+        .map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "extent" }))?;
+    let top = i32::try_from(top)
+        .map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "extent" }))?;
     let right = left
         .checked_add(i32::try_from(size.width()).unwrap_or(i32::MAX))
-        .ok_or_else(|| D3d11Error::Parse("extent range".to_owned()))?;
+        .ok_or(D3d11Error::Parse(ParseReason::Range { syntax: "extent" }))?;
     let bottom = top
         .checked_add(i32::try_from(size.height()).unwrap_or(i32::MAX))
-        .ok_or_else(|| D3d11Error::Parse("extent range".to_owned()))?;
+        .ok_or(D3d11Error::Parse(ParseReason::Range { syntax: "extent" }))?;
     Ok(RECT {
         left,
         top,

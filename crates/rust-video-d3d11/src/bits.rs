@@ -1,6 +1,6 @@
 //! Bit reader over RBSP bytes.
 
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, ParseReason};
 
 /// Exp-Golomb bit reader.
 pub(crate) struct BitReader<'a> {
@@ -48,7 +48,7 @@ impl<'a> BitReader<'a> {
         syntax: &'static str,
     ) -> Result<u32, D3d11Error> {
         if count > 32 {
-            return Err(D3d11Error::Parse(format!("{syntax} wider than 32 bits")));
+            return Err(D3d11Error::Parse(ParseReason::TooWide { syntax }));
         }
         let mut value: u32 = 0;
         for _ in 0..count {
@@ -61,7 +61,7 @@ impl<'a> BitReader<'a> {
     pub(crate) fn read_bit(&mut self, syntax: &'static str) -> Result<bool, D3d11Error> {
         let total = self.data.len() * 8;
         if self.bit >= total {
-            return Err(D3d11Error::Parse(format!("truncated {syntax}")));
+            return Err(D3d11Error::Parse(ParseReason::Truncated { syntax }));
         }
         let bit = self.peek(self.bit);
         self.bit += 1;
@@ -74,7 +74,7 @@ impl<'a> BitReader<'a> {
         while !self.read_bit(syntax)? {
             leading += 1;
             if leading > 31 {
-                return Err(D3d11Error::Parse(format!("{syntax} overflows u32")));
+                return Err(D3d11Error::Parse(ParseReason::OverflowU32 { syntax }));
             }
         }
         if leading == 0 {
@@ -82,20 +82,20 @@ impl<'a> BitReader<'a> {
         }
         let rest = self.read_bits(leading, syntax)?;
         rest.checked_add((1u32 << leading) - 1)
-            .ok_or_else(|| D3d11Error::Parse(format!("{syntax} overflows u32")))
+            .ok_or(D3d11Error::Parse(ParseReason::OverflowU32 { syntax }))
     }
 
     /// Signed Exp-Golomb code.
     pub(crate) fn read_se(&mut self, syntax: &'static str) -> Result<i32, D3d11Error> {
         let code = self.read_ue(syntax)?;
         let value = i32::try_from(code >> 1)
-            .map_err(|_| D3d11Error::Parse(format!("{syntax} overflows i32")))?;
+            .map_err(|_| D3d11Error::Parse(ParseReason::OverflowI32 { syntax }))?;
         if code & 1 == 0 {
             Ok(-value)
         } else {
             value
                 .checked_add(1)
-                .ok_or_else(|| D3d11Error::Parse(format!("{syntax} overflows i32")))
+                .ok_or(D3d11Error::Parse(ParseReason::OverflowI32 { syntax }))
         }
     }
 

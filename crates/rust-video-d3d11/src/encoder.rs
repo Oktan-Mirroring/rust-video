@@ -5,7 +5,7 @@ use crate::decoder::GpuSurface;
 #[cfg(target_os = "windows")]
 use crate::device::D3d11Device;
 #[cfg(target_os = "windows")]
-use crate::error::D3d11Error;
+use crate::error::{D3d11Error, UnsupportedReason};
 #[cfg(target_os = "windows")]
 use crate::guid::Codec;
 #[cfg(target_os = "windows")]
@@ -83,10 +83,11 @@ impl D3d11Encoder {
     ) -> Result<Vec<Packet>, D3d11Error> {
         let layout = surface.layout();
         if layout.format() != PixelFormat::Nv12 {
-            return Err(D3d11Error::Unsupported(format!(
-                "encoder input {:?}; nv12 only",
-                layout.format()
-            )));
+            return Err(D3d11Error::Unsupported(
+                UnsupportedReason::EncoderInputNotNv12 {
+                    format: layout.format(),
+                },
+            ));
         }
         let size = layout.visible();
         self.session.encode_texture(
@@ -134,20 +135,21 @@ impl Encoder for D3d11Encoder {
 #[cfg(target_os = "windows")]
 fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d11Error> {
     if frame.format() != PixelFormat::Nv12 {
-        return Err(D3d11Error::Unsupported(format!(
-            "encoder input {:?}; nv12 only",
-            frame.format()
-        )));
+        return Err(D3d11Error::Unsupported(
+            UnsupportedReason::EncoderInputNotNv12 {
+                format: frame.format(),
+            },
+        ));
     }
     let width = frame.size().width();
     let height = frame.size().height();
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(D3d11Error::Unsupported("odd NV12 extent".to_owned()));
+        return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
     }
     let planes = frame.planes();
     let (Some(y), Some(uv)) = (planes.first(), planes.get(1)) else {
         return Err(D3d11Error::Unsupported(
-            "nv12 frame without two planes".to_owned(),
+            UnsupportedReason::Nv12WithoutTwoPlanes,
         ));
     };
     let capacity = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2).unwrap_or(0);
@@ -170,7 +172,7 @@ fn copy_plane(
     let width_64 = u64::from(width);
     if stride_64 < width_64 {
         return Err(D3d11Error::Unsupported(
-            "plane stride below width".to_owned(),
+            UnsupportedReason::PlaneStrideBelowWidth,
         ));
     }
     let need = stride_64
@@ -178,7 +180,7 @@ fn copy_plane(
         .saturating_add(width_64);
     if u64::try_from(data.len()).unwrap_or(0) < need {
         return Err(D3d11Error::Unsupported(
-            "plane short of its stride".to_owned(),
+            UnsupportedReason::PlaneShortOfStride,
         ));
     }
     let stride = usize::try_from(stride).unwrap_or(0);
