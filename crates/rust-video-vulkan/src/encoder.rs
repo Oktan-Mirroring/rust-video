@@ -305,6 +305,10 @@ fn pack_plane(
             found: data.len(),
         });
     }
+    if stride == width {
+        out.extend_from_slice(&data[..width * rows]);
+        return Ok(());
+    }
     for row in 0..rows {
         let start = row * stride;
         out.extend_from_slice(&data[start..start + width]);
@@ -549,6 +553,14 @@ mod tests {
     #[test]
     fn pack_copies_visible_bytes_only() {
         let frame = nv12(2, 2, 4, &[1, 2, 0, 0, 3, 4, 0, 0], &[5, 6, 0, 0]);
+        let mut out = Vec::new();
+        super::pack_nv12(&frame, &mut out).expect("in bounds");
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn pack_copies_tight_stride_whole() {
+        let frame = nv12(2, 2, 2, &[1, 2, 3, 4], &[5, 6]);
         let mut out = Vec::new();
         super::pack_nv12(&frame, &mut out).expect("in bounds");
         assert_eq!(out, vec![1, 2, 3, 4, 5, 6]);

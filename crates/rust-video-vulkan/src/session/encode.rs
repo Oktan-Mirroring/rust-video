@@ -1456,19 +1456,16 @@ impl EncodeSession {
     /// Record the staging upload into the source image.
     fn record_upload_head(&mut self, cmd: vk::CommandBuffer) {
         let recorder = self.submit.pool().recorder(cmd);
-        let mut barriers = Vec::new();
         if self.input_layout != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
-            barriers.push(layout_barrier(
+            let barrier = layout_barrier(
                 self.input.image(),
                 self.input_layout,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
                 0,
                 1,
-            ));
-        }
-        if !barriers.is_empty() {
-            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&barriers));
+            );
+            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[barrier]));
         }
         let regions = nv12_copy_regions(self.extent, 0);
         recorder.copy_buffer_to_image(
@@ -1503,19 +1500,16 @@ impl EncodeSession {
             );
             recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[barrier]));
         }
-        let mut barriers = Vec::new();
         if self.input_layout != vk::ImageLayout::TRANSFER_DST_OPTIMAL {
-            barriers.push(layout_barrier(
+            let barrier = layout_barrier(
                 self.input.image(),
                 self.input_layout,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageAspectFlags::COLOR,
                 0,
                 1,
-            ));
-        }
-        if !barriers.is_empty() {
-            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&barriers));
+            );
+            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[barrier]));
         }
         let y_copy = plane_copy(
             vk::ImageAspectFlags::COLOR,
@@ -1648,18 +1642,18 @@ impl EncodeSession {
         let ref_index = narrow_i32(ref_slot, "ref slot")?;
         let mut reference = reference_slot(ref_index, &ref_resource);
         reference.p_next = std::ptr::from_ref(&ref_dpb).cast();
-        let mut begin_slots = Vec::with_capacity(2);
-        let mut encode_refs = Vec::with_capacity(1);
-        if plan.ref_slot.is_some() {
-            begin_slots.push(reference);
-            encode_refs.push(reference);
-        }
-        begin_slots.push(bind);
+        let mut begin_slots = [bind, bind];
+        let (begin_list, ref_list): (&[_], &[_]) = if plan.ref_slot.is_some() {
+            begin_slots[0] = reference;
+            (&begin_slots, &begin_slots[..1])
+        } else {
+            (&begin_slots[..1], &[])
+        };
         let begin = vk::VideoBeginCodingInfoKHR {
             video_session: self.video.session(),
             video_session_parameters: self.params.params(),
-            reference_slot_count: narrow_u32(begin_slots.len(), "begin slots")?,
-            p_reference_slots: begin_slots.as_ptr(),
+            reference_slot_count: narrow_u32(begin_list.len(), "begin slots")?,
+            p_reference_slots: begin_list.as_ptr(),
             ..Default::default()
         };
         let begin = begin.push_next(control);
@@ -1687,7 +1681,7 @@ impl EncodeSession {
             ..Default::default()
         };
         let src = picture_resource(self.input_view.view(), self.extent, 0);
-        let info = encode_info(self.bitstream.buffer(), src, &slot, &encode_refs)?;
+        let info = encode_info(self.bitstream.buffer(), src, &slot, ref_list)?;
         let info = info.push_next(&mut codec);
         self.encode.encode_video(cmd, &info);
         recorder.end_query(self.feedback.pool(), query);
@@ -1743,18 +1737,18 @@ impl EncodeSession {
         let ref_index = narrow_i32(ref_slot, "ref slot")?;
         let mut reference = reference_slot(ref_index, &ref_resource);
         reference.p_next = std::ptr::from_ref(&ref_dpb).cast();
-        let mut begin_slots = Vec::with_capacity(2);
-        let mut encode_refs = Vec::with_capacity(1);
-        if plan.ref_slot.is_some() {
-            begin_slots.push(reference);
-            encode_refs.push(reference);
-        }
-        begin_slots.push(bind);
+        let mut begin_slots = [bind, bind];
+        let (begin_list, ref_list): (&[_], &[_]) = if plan.ref_slot.is_some() {
+            begin_slots[0] = reference;
+            (&begin_slots, &begin_slots[..1])
+        } else {
+            (&begin_slots[..1], &[])
+        };
         let begin = vk::VideoBeginCodingInfoKHR {
             video_session: self.video.session(),
             video_session_parameters: self.params.params(),
-            reference_slot_count: narrow_u32(begin_slots.len(), "begin slots")?,
-            p_reference_slots: begin_slots.as_ptr(),
+            reference_slot_count: narrow_u32(begin_list.len(), "begin slots")?,
+            p_reference_slots: begin_list.as_ptr(),
             ..Default::default()
         };
         let begin = begin.push_next(control);
@@ -1778,7 +1772,7 @@ impl EncodeSession {
             ..Default::default()
         };
         let src = picture_resource(self.input_view.view(), self.extent, 0);
-        let info = encode_info(self.bitstream.buffer(), src, &slot, &encode_refs)?;
+        let info = encode_info(self.bitstream.buffer(), src, &slot, ref_list)?;
         let info = info.push_next(&mut codec);
         self.encode.encode_video(cmd, &info);
         recorder.end_query(self.feedback.pool(), query);

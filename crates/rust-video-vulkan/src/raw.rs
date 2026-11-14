@@ -1096,6 +1096,44 @@ impl GpuMemory {
     /// # Errors
     ///
     /// Returns `Err` when `len` overruns the allocation or mapping fails.
+    pub fn read_to_buf(&self, out: &mut bytes::BytesMut, len: usize) -> Result<(), VulkanError> {
+        let want = u64::try_from(len).unwrap_or(u64::MAX);
+        if want > self.size {
+            return Err(VulkanError::OutOfBounds {
+                len: want,
+                capacity: self.size,
+            });
+        }
+        out.clear();
+        if len == 0 {
+            return Ok(());
+        }
+        out.reserve(len);
+        // SAFETY: the memory is host-visible and owned; the copy lands in
+        // reserved spare capacity, and the length sets only after it.
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(self.memory, 0, want, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(
+                ptr.cast::<u8>(),
+                out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                len,
+            );
+            self.device.unmap_memory(self.memory);
+            out.set_len(len);
+        }
+        Ok(())
+    }
+
+    /// Copy the allocation prefix of `len` bytes into `out`, reusing it.
+    ///
+    /// Maps `len`, never the allocation size; skips the zero-fill a
+    /// `resize` would write before the overwrite.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `len` overruns the allocation or mapping fails.
     pub fn read_to_vec(&self, out: &mut Vec<u8>, len: usize) -> Result<(), VulkanError> {
         let want = u64::try_from(len).unwrap_or(u64::MAX);
         if want > self.size {

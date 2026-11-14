@@ -80,8 +80,8 @@ impl Default for NaluSplitter {
 impl NaluSplitter {
     /// Complete units out of the buffer into `out`.
     ///
-    /// One drain per call: cut points collect first, then the consumed
-    /// prefix moves once and splits into units.
+    /// One split per unit: the retained tail parts first, then each
+    /// cut splits from the back, so consumed bytes move once.
     fn drain_complete(&mut self, out: &mut Vec<Nalu>) {
         let mut cuts = Vec::new();
         let mut from = self.floor;
@@ -92,15 +92,18 @@ impl NaluSplitter {
         let Some(last) = cuts.last().copied() else {
             return;
         };
-        let taken: Vec<u8> = self.buffer.drain(..last).collect();
-        let mut start = 0;
-        for cut in cuts {
-            let unit = taken[start..cut].to_vec();
+        let tail = self.buffer.split_off(last);
+        let mut units = Vec::with_capacity(cuts.len());
+        for cut in cuts[..cuts.len() - 1].iter().rev() {
+            units.push(self.buffer.split_off(*cut));
+        }
+        units.push(std::mem::take(&mut self.buffer));
+        for unit in units.into_iter().rev() {
             if unit_contains_payload(&unit) {
                 out.push(Nalu { bytes: unit });
             }
-            start = cut;
         }
+        self.buffer = tail;
         self.floor = 0;
     }
 

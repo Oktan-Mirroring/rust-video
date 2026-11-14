@@ -946,7 +946,11 @@ fn poc_type2(offset: i32, frame_num: u16, is_reference: bool) -> Option<i32> {
 
 /// Concatenated slice bytes with per-slice offsets behind `code`.
 fn join_coded<S>(slices: &[S], code: &[u8], payload: impl Fn(&S) -> &[u8]) -> (Vec<u8>, Vec<u32>) {
-    let mut bytes = Vec::new();
+    let total: usize = slices
+        .iter()
+        .map(|slice| payload(slice).len() + code.len())
+        .sum();
+    let mut bytes = Vec::with_capacity(total);
     let mut offsets = Vec::with_capacity(slices.len());
     for slice in slices {
         offsets.push(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
@@ -1781,10 +1785,15 @@ struct JoinedTiles {
 
 /// Concatenated tile bytes plus per-tile offsets and sizes.
 fn join_tiles(groups: &[av1::ParsedTileGroup<'_>]) -> Result<JoinedTiles, ParseError> {
+    let tiles: usize = groups.iter().map(|group| group.tiles.len()).sum();
+    let total: usize = groups
+        .iter()
+        .flat_map(|group| group.tiles.iter().map(|(_, size)| size))
+        .sum();
     let mut joined = JoinedTiles {
-        bytes: Vec::new(),
-        offsets: Vec::new(),
-        sizes: Vec::new(),
+        bytes: Vec::with_capacity(total),
+        offsets: Vec::with_capacity(tiles),
+        sizes: Vec::with_capacity(tiles),
     };
     for group in groups {
         for (offset, size) in &group.tiles {

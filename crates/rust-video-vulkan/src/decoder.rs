@@ -1,11 +1,11 @@
 //! Decode behind the caps `Decoder` trait.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use ash::vk;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
@@ -21,8 +21,7 @@ use crate::parse::refs::{
 };
 use crate::raw::{DeviceExport, ExportPair, OwnedDevice};
 use crate::session::decode::{
-    crop_nv12_extend, picture_resource, reference_slot, DpbMeta, ExportTarget, PendingDecode,
-    Session, Submission,
+    picture_resource, reference_slot, DpbMeta, ExportTarget, PendingDecode, Session, Submission,
 };
 use crate::session::geometry::{h264_profile_to_std, SessionGeometry};
 use crate::session::params::{
@@ -180,9 +179,7 @@ pub(crate) struct FrameSink {
     shared: SharedDevice,
     /// Frame generation counter.
     generation: u64,
-    /// Reused coded-extent staging for submits.
-    coded: Vec<u8>,
-    /// Pooled display buffers for the staged size.
+    /// Pooled display buffers for the collected size.
     pool: Option<(PictureSize, FramePool)>,
     /// Pooled exportable planes by display size.
     exports: Vec<ExportEntry>,
@@ -197,7 +194,6 @@ impl FrameSink {
             reorder: ReorderBuffer::with_capacity(0),
             shared,
             generation: 0,
-            coded: Vec::new(),
             pool: None,
             exports: Vec::new(),
             keep,
@@ -209,9 +205,15 @@ impl FrameSink {
         &mut self.reorder
     }
 
-    /// Coded-extent staging for the next submit.
-    pub(crate) fn coded_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.coded
+    /// Pooled readback buffer for `size`, sized for the `coded` extent.
+    pub(crate) fn pooled(&mut self, size: PictureSize, coded: PictureSize) -> BytesMut {
+        if self.pool.as_ref().is_none_or(|(held, _)| *held != size) {
+            self.pool = Some((size, FramePool::new(coded, PixelFormat::Nv12)));
+        }
+        match self.pool.as_mut() {
+            Some((_, pool)) => pool.acquire(),
+            None => BytesMut::new(),
+        }
     }
 
     /// Exportable planes at `extent` copied from `format`.
@@ -282,7 +284,7 @@ impl FrameSink {
         }
     }
 
-    /// Display frame from staged coded bytes through crop, lease, and reorder.
+    /// Display frame from device `lease` through export, lease, and reorder.
     ///
     /// # Errors
     ///
@@ -292,14 +294,14 @@ impl FrameSink {
         session: &Session,
         poc: i32,
         resets: bool,
-        lease: Option<ExportLease>,
+        lease: ExportLease,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage(session, lease)?;
+        let frame = self.stage_export(session, lease)?;
         self.generation += 1;
         Ok(self.reorder.push_flushing_on_reset(resets, poc, frame))
     }
 
-    /// Display frame from staged coded bytes, queued without a reset flush.
+    /// Display frame from device `lease`, queued without a reset flush.
     ///
     /// # Errors
     ///
@@ -308,9 +310,42 @@ impl FrameSink {
         &mut self,
         session: &Session,
         poc: i32,
-        lease: Option<ExportLease>,
+        lease: ExportLease,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage(session, lease)?;
+        let frame = self.stage_export(session, lease)?;
+        self.generation += 1;
+        Ok(self.reorder.push(poc, frame))
+    }
+
+    /// Display frame from collected `buffer` through lease and reorder.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on an exhausted VRAM budget.
+    pub(crate) fn emit_readback(
+        &mut self,
+        size: PictureSize,
+        buffer: BytesMut,
+        poc: i32,
+        resets: bool,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let frame = self.stage_readback(size, buffer)?;
+        self.generation += 1;
+        Ok(self.reorder.push_flushing_on_reset(resets, poc, frame))
+    }
+
+    /// Display frame from collected `buffer`, queued without a reset flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on an exhausted VRAM budget.
+    pub(crate) fn emit_readback_queued(
+        &mut self,
+        size: PictureSize,
+        buffer: BytesMut,
+        poc: i32,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let frame = self.stage_readback(size, buffer)?;
         self.generation += 1;
         Ok(self.reorder.push(poc, frame))
     }
@@ -343,18 +378,15 @@ impl FrameSink {
         ))
     }
 
-    /// Cropped leased frame from staged coded bytes.
-    ///
-    /// A lease skips the crop: the frame carries the device export with
-    /// empty bytes instead.
+    /// Leased frame carrying the device `lease` with empty bytes.
     ///
     /// # Errors
     ///
     /// Returns `Err` on a degenerate display extent or an exhausted VRAM budget.
-    fn stage(
+    fn stage_export(
         &mut self,
         session: &Session,
-        lease: Option<ExportLease>,
+        lease: ExportLease,
     ) -> Result<VulkanFrame, VulkanError> {
         let (display_width, display_height) = session.geometry().display();
         let size =
@@ -363,35 +395,29 @@ impl FrameSink {
                 height: display_height,
             })?;
         let identity = GpuFrame::new(size, PixelFormat::Nv12, self.generation);
-        if let Some(lease) = lease {
-            self.mark_export_used(&lease);
-            let held = self.shared.try_acquire(0)?;
-            return Ok(VulkanFrame {
-                identity,
-                data: Bytes::new(),
-                lease: held,
-                device: Some(DeviceExport::new(lease.pair)),
-            });
-        }
-        let display = vk::Extent2D {
-            width: display_width,
-            height: display_height,
-        };
-        let (coded_width, coded_height) = session.geometry().coded();
-        let coded = vk::Extent2D {
-            width: coded_width,
-            height: coded_height,
-        };
-        if self.pool.as_ref().is_none_or(|(held, _)| *held != size) {
-            self.pool = Some((size, FramePool::new(size, PixelFormat::Nv12)));
-        }
-        let mut buffer = match self.pool.as_mut() {
-            Some((_, pool)) => pool.acquire(),
-            None => bytes::BytesMut::new(),
-        };
-        crop_nv12_extend(coded, display, &self.coded, &mut buffer)?;
+        self.mark_export_used(&lease);
+        let held = self.shared.try_acquire(0)?;
+        Ok(VulkanFrame {
+            identity,
+            data: Bytes::new(),
+            lease: held,
+            device: Some(DeviceExport::new(lease.pair)),
+        })
+    }
+
+    /// Leased frame over the collected `buffer` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on an exhausted VRAM budget.
+    fn stage_readback(
+        &mut self,
+        size: PictureSize,
+        buffer: BytesMut,
+    ) -> Result<VulkanFrame, VulkanError> {
         let bytes = buffer.freeze();
         let lease = self.shared.try_acquire(bytes.len() as u64)?;
+        let identity = GpuFrame::new(size, PixelFormat::Nv12, self.generation);
         Ok(VulkanFrame {
             identity,
             data: bytes,
@@ -803,7 +829,6 @@ fn collect_h264_refs<'a>(
     picture: &'a Picture,
 ) -> Result<Vec<(usize, &'a RefPicture)>, VulkanError> {
     let mut refs = Vec::new();
-    let mut seen = HashSet::new();
     let lists = [picture.l0(), picture.l1()];
     for list in lists.into_iter().flatten() {
         for reference in list {
@@ -811,7 +836,7 @@ fn collect_h264_refs<'a>(
             let Some(slot) = session.slots().slot_of(id) else {
                 continue;
             };
-            if !seen.insert(slot) {
+            if refs.iter().any(|(seen, _)| *seen == slot) {
                 continue;
             }
             refs.push((slot, reference));
@@ -1077,15 +1102,29 @@ fn collect_pending(
     sink: &mut FrameSink,
     picture: PendingPicture,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
-    if picture.lease.is_some() {
+    if let Some(lease) = picture.lease {
         session.collect_gpu(picture.pending)?;
-    } else {
-        session.collect_into(picture.pending, sink.coded_mut())?;
+        if picture.flush_on_reset {
+            return sink.emit(session, picture.poc, picture.resets, lease);
+        }
+        return sink.emit_queued(session, picture.poc, lease);
     }
+    let (display_width, display_height) = session.geometry().display();
+    let size = PictureSize::new(display_width, display_height).ok_or(VulkanError::BadExtent {
+        width: display_width,
+        height: display_height,
+    })?;
+    let (coded_width, coded_height) = session.geometry().coded();
+    let coded = PictureSize::new(coded_width, coded_height).ok_or(VulkanError::BadExtent {
+        width: coded_width,
+        height: coded_height,
+    })?;
+    let mut buffer = sink.pooled(size, coded);
+    session.collect_into(picture.pending, &mut buffer)?;
     if picture.flush_on_reset {
-        sink.emit(session, picture.poc, picture.resets, picture.lease)
+        sink.emit_readback(size, buffer, picture.poc, picture.resets)
     } else {
-        sink.emit_queued(session, picture.poc, picture.lease)
+        sink.emit_readback_queued(size, buffer, picture.poc)
     }
 }
 
@@ -1130,14 +1169,13 @@ fn collect_h265_refs(
     echo: &RpsEcho,
 ) -> Result<Vec<(usize, ReferenceId)>, VulkanError> {
     let mut refs = Vec::new();
-    let mut seen = HashSet::new();
     let lists: [&[Option<ReferenceId>]; 3] = [echo.before(), echo.after(), echo.lt()];
     for list in lists {
         for id in list.iter().flatten() {
             let Some(slot) = session.slots().slot_of(*id) else {
                 continue;
             };
-            if !seen.insert(slot) {
+            if refs.iter().any(|(seen, _)| *seen == slot) {
                 continue;
             }
             refs.push((slot, *id));
@@ -2187,7 +2225,6 @@ fn collect_av1_refs(
     picture: &crate::parse::refs::Av1Picture,
 ) -> Result<Vec<(usize, ReferenceId)>, VulkanError> {
     let mut refs = Vec::new();
-    let mut seen = HashSet::new();
     for id in picture.name_slots().iter().flatten() {
         let Some(slot) = session.slots().slot_of(*id) else {
             return Err(ParseError::MissingSet {
@@ -2197,7 +2234,7 @@ fn collect_av1_refs(
             }
             .into());
         };
-        if !seen.insert(slot) {
+        if refs.iter().any(|(seen, _)| *seen == slot) {
             continue;
         }
         refs.push((slot, *id));

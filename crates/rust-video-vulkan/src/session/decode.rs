@@ -313,27 +313,32 @@ impl Session {
 
     /// Wait `pending` out, then map its readback into `out`.
     ///
+    /// The readback lands directly in the pooled buffer, cropped to
+    /// the display extent in place.
+    ///
     /// # Errors
     ///
-    /// Returns `Err` when the fence wait or the readback map fails.
+    /// Returns `Err` when the fence wait, the readback map, or the
+    /// crop fails.
     pub(crate) fn collect_into(
         &mut self,
         pending: PendingDecode,
-        out: &mut Vec<u8>,
+        out: &mut bytes::BytesMut,
     ) -> Result<(), VulkanError> {
         self.submit
             .poll(pending.slot)
             .inspect_err(|_| self.reset_state())?;
-        let len =
-            usize::try_from(nv12_bytes(coded_extent(self.geometry.coded()))).map_err(|_| {
-                crate::error::ParseError::OutOfRange {
-                    syntax: "readback size",
-                }
-            })?;
+        let coded = coded_extent(self.geometry.coded());
+        let len = usize::try_from(nv12_bytes(coded)).map_err(|_| {
+            crate::error::ParseError::OutOfRange {
+                syntax: "readback size",
+            }
+        })?;
         self.readbacks[pending.slot]
             .memory()
-            .read_to_vec(out, len)?;
-        Ok(())
+            .read_to_buf(out, len)?;
+        let display = coded_extent(self.geometry.display());
+        crop_nv12_in_place(coded, display, out)
     }
 
     /// Wait `pending` out, leaving pixels on the GPU.
@@ -732,26 +737,33 @@ pub(crate) struct Submission<'a> {
     pub picture_next: *const std::ffi::c_void,
 }
 
-/// Crop tight coded NV12 `bytes` down to `display`, appended to `out`.
+/// Crop tight coded NV12 `buf` down to `display`, in place.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the display window escapes the coded extent or
-/// `bytes` is shorter than the coded frame.
-pub(crate) fn crop_nv12_extend(
+/// `buf` is shorter than the coded frame.
+pub(crate) fn crop_nv12_in_place(
     coded: vk::Extent2D,
     display: vk::Extent2D,
-    bytes: &[u8],
-    out: &mut bytes::BytesMut,
+    buf: &mut bytes::BytesMut,
 ) -> Result<(), VulkanError> {
-    use bytes::BufMut;
-    let window = crop_window(coded, display, bytes)?;
+    let window = crop_window(coded, display, buf)?;
     if coded == display {
-        out.extend_from_slice(&bytes[..window.coded_len]);
+        buf.truncate(window.coded_len);
         return Ok(());
     }
-    out.reserve(window.display_len);
-    copy_crop_rows(&window, bytes, &mut |row| out.put_slice(row));
+    // Forward rows only: each destination precedes its source.
+    for row in 0..window.display_h {
+        let src = row * window.coded_w;
+        buf.copy_within(src..src + window.display_w, row * window.display_w);
+    }
+    let luma = window.display_w * window.display_h;
+    for row in 0..window.display_h / 2 {
+        let src = window.chroma_base + row * window.coded_w;
+        buf.copy_within(src..src + window.display_w, luma + row * window.display_w);
+    }
+    buf.truncate(window.display_len);
     Ok(())
 }
 
@@ -806,18 +818,6 @@ fn crop_window(
         coded_len,
         display_len: display_w * display_h * 3 / 2,
     })
-}
-
-/// Visible luma rows then chroma rows of `bytes` into `push`.
-fn copy_crop_rows(window: &CropWindow, bytes: &[u8], push: &mut impl FnMut(&[u8])) {
-    for row in 0..window.display_h {
-        let start = row * window.coded_w;
-        push(&bytes[start..start + window.display_w]);
-    }
-    for row in 0..window.display_h / 2 {
-        let start = window.chroma_base + row * window.coded_w;
-        push(&bytes[start..start + window.display_w]);
-    }
 }
 
 #[cfg(test)]
@@ -927,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn crop_copies_visible_rows_only() {
+    fn crop_compacts_visible_rows_only() {
         let coded = ash::vk::Extent2D {
             width: 4,
             height: 4,
@@ -936,21 +936,20 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let bytes: Vec<u8> = (0..24).collect();
-        let mut pooled = bytes::BytesMut::new();
-        super::crop_nv12_extend(coded, display, &bytes, &mut pooled).expect("in bounds");
+        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
+        super::crop_nv12_in_place(coded, display, &mut pooled).expect("in bounds");
         assert_eq!(pooled.freeze().as_ref(), &[0, 1, 4, 5, 16, 17]);
     }
 
     #[test]
-    fn crop_without_window_returns_input() {
+    fn crop_without_window_keeps_input() {
         let extent = ash::vk::Extent2D {
             width: 4,
             height: 4,
         };
         let bytes: Vec<u8> = (0..24).collect();
-        let mut pooled = bytes::BytesMut::new();
-        super::crop_nv12_extend(extent, extent, &bytes, &mut pooled).expect("in bounds");
+        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
+        super::crop_nv12_in_place(extent, extent, &mut pooled).expect("in bounds");
         assert_eq!(pooled.freeze().as_ref(), bytes.as_slice());
     }
 
@@ -964,15 +963,33 @@ mod tests {
             width: 8,
             height: 4,
         };
-        let bytes: Vec<u8> = (0..24).collect();
-        let mut pooled = bytes::BytesMut::new();
+        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
         assert!(matches!(
-            super::crop_nv12_extend(coded, wide, &bytes, &mut pooled),
+            super::crop_nv12_in_place(coded, wide, &mut pooled),
             Err(super::VulkanError::OverCaps { .. })
         ));
+        let mut short = bytes::BytesMut::from_iter(0..23u8);
         assert!(matches!(
-            super::crop_nv12_extend(coded, coded, &bytes[..23], &mut pooled),
+            super::crop_nv12_in_place(coded, coded, &mut short),
             Err(super::VulkanError::ShortReadback { .. })
         ));
+    }
+
+    #[test]
+    fn crop_compacts_partial_windows() {
+        let coded = ash::vk::Extent2D {
+            width: 6,
+            height: 4,
+        };
+        let display = ash::vk::Extent2D {
+            width: 4,
+            height: 2,
+        };
+        let mut pooled = bytes::BytesMut::from_iter(0..36u8);
+        super::crop_nv12_in_place(coded, display, &mut pooled).expect("in bounds");
+        assert_eq!(
+            pooled.freeze().as_ref(),
+            &[0, 1, 2, 3, 6, 7, 8, 9, 24, 25, 26, 27]
+        );
     }
 }
