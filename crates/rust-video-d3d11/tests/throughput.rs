@@ -206,7 +206,7 @@ fn decode_hevc_1080p_measures_realtime() {
         println!("d3d11 skipped: no hevc decoder profile");
         return;
     }
-    let data = std::fs::read(bench_dir().join("h265-1080p-x265.h265")).expect("vector readable");
+    let data = std::fs::read(bench_dir().join("h265-1080p-nvenc.h265")).expect("vector readable");
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut decoder = HevcDecoder::open(&device);
