@@ -1,16 +1,11 @@
 //! Full-GPU transcode on the D3D12 tier: decode texture to encoder texture.
 //!
-//! Pixels stay device-resident on the GPU route; any hop miss falls back
-//! loud to the proven CPU path, never silently. The committed vector
-//! transcodes without readback and the bitstream lands in the temp dir
-//! for the ffmpeg oracle.
-
-#[path = "common/annexb.rs"]
-#[cfg(target_os = "windows")]
-mod annexb;
+//! Pixels stay device-resident; any hop miss declines loud with the
+//! missing capability named. The committed vector transcodes without
+//! readback and the bitstream lands in the temp dir for the ffmpeg oracle.
 
 #[cfg(target_os = "windows")]
-use annexb::picture_packets;
+use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -21,9 +16,11 @@ use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::Device;
 #[cfg(target_os = "windows")]
-use rust_video_caps::transcode::{Outcome, Route};
+use rust_video_caps::transcode::Outcome;
 #[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, Transcoder};
+#[cfg(target_os = "windows")]
+use rust_video_harness::AnnexB;
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -53,7 +50,10 @@ fn main() {
     let mut packets = 0;
     let mut bytes = 0;
     let mut out = Vec::new();
-    for (index, raw) in picture_packets().into_iter().enumerate() {
+    for (index, raw) in AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl)
+        .into_iter()
+        .enumerate()
+    {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
             Ok(outcome) => {
@@ -110,19 +110,11 @@ fn main() {
 /// One transcode outcome on stdout.
 #[cfg(target_os = "windows")]
 fn report(index: usize, outcome: &Outcome) {
-    let plan = outcome.plan();
-    match plan.route() {
-        Route::Gpu => println!(
-            "packet {index}: {} packet(s) route=gpu",
-            outcome.packets().len()
-        ),
-        Route::Cpu => println!(
-            "packet {index}: {} packet(s) FALLBACK route=cpu cause={}",
-            outcome.packets().len(),
-            plan.cause()
-                .map_or("unknown".to_owned(), |cause| cause.to_string()),
-        ),
-    }
+    println!(
+        "packet {index}: {} packet(s) route={:?}",
+        outcome.packets().len(),
+        outcome.plan().route()
+    );
 }
 
 /// Bitstream bytes behind `outcome`.
@@ -149,7 +141,10 @@ fn probe_scale(device: &D3d12Device) {
     };
     let mut packets = 0;
     let mut bytes = 0;
-    for (index, raw) in picture_packets().into_iter().enumerate() {
+    for (index, raw) in AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl)
+        .into_iter()
+        .enumerate()
+    {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
             Ok(outcome) => {
@@ -185,6 +180,12 @@ fn probe_scale(device: &D3d12Device) {
         std::process::exit(1);
     }
     println!("scale: to 160x112 bitstream {bytes}B route=gpu");
+}
+
+/// Committed vector path.
+#[cfg(target_os = "windows")]
+fn vector() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -4,18 +4,13 @@
 //! and skips loud without it.
 
 #[cfg(any(d3d11_available, d3d12_available))]
-#[path = "../../rust-video-d3d12/examples/common/bits.rs"]
-mod bits;
-#[cfg(any(d3d11_available, d3d12_available))]
-#[path = "../../rust-video-d3d12/examples/common/h264.rs"]
-mod h264;
+use rust_video_harness::H264Synth;
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     have_corpus,
     any(vaapi_available, feature = "vulkan")
 ))]
-#[path = "../../rust-video-vaapi/tests/support/mp4.rs"]
-mod mp4;
+use rust_video_harness::Stream;
 
 use rust_video::{Capabilities, Platform, Tier, TierPreference, VideoCodec};
 
@@ -128,7 +123,7 @@ fn resolved_tier_transcodes_vaapi_hop() {
         println!("facade xcode skipped: va-api without export plus encode caps");
         return;
     }
-    let stream = crate::mp4::demux(&synth_h264()).expect("synth h264 vector");
+    let stream = Stream::demux(&synth_h264()).expect("synth h264 vector");
     let mut count = 0;
     for raw in stream.samples.iter().take(3) {
         let outcome = transcoder
@@ -188,7 +183,7 @@ fn vulkan_hop(platform: Platform) {
         println!("facade xcode skipped: vulkan decode and encode adapters differ");
         return;
     }
-    let stream = crate::mp4::demux(&synth_h264()).expect("synth h264 vector");
+    let stream = Stream::demux(&synth_h264()).expect("synth h264 vector");
     let mut count = 0;
     for raw in stream.samples.iter().take(3) {
         let outcome = transcoder
@@ -252,12 +247,10 @@ fn resolved_tier_transcodes_one_hop() {
         println!("facade xcode skipped: d3d12 without export plus encode caps");
         return;
     }
-    let raws: Vec<Vec<u8>> = crate::h264::annex_b_h264_packets()
+    let raws: Vec<Vec<u8>> = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(crate::h264::annex_b_h264_packets_cropped())
-        .chain(crate::h264::annex_b_h264_packets_cropped_sized(
-            39, 22, 4, 22,
-        ))
+        .chain(H264Synth::annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
         .collect();
     let mut count = 0;
     for raw in raws {
@@ -305,12 +298,10 @@ fn resolved_tier_transcodes_d3d11_hop() {
         println!("facade xcode skipped: d3d11 without export plus encode caps");
         return;
     }
-    let raws: Vec<Vec<u8>> = crate::h264::annex_b_h264_packets()
+    let raws: Vec<Vec<u8>> = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(crate::h264::annex_b_h264_packets_cropped())
-        .chain(crate::h264::annex_b_h264_packets_cropped_sized(
-            39, 22, 4, 22,
-        ))
+        .chain(H264Synth::annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
         .collect();
     let mut count = 0;
     for raw in raws {

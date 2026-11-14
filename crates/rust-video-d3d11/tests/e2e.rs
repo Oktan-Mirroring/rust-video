@@ -3,14 +3,11 @@
 //!
 //! Vector `tests/vectors/valid_320x240.h264` holds 15 ffmpeg
 //! testsrc2 pictures (320x240 constrained baseline, IDR at 0 and
-//! 8); `examples/common/annexb.rs` loads and splits it.
+//! 8); harness `AnnexB` splits it per picture.
 
 #[cfg(target_os = "windows")]
-#[path = "../examples/common/annexb.rs"]
-mod annexb;
+use std::path::PathBuf;
 
-#[cfg(target_os = "windows")]
-use annexb::{picture_packets, vector};
 #[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, H264Decoder, Transcoder};
 
@@ -22,6 +19,8 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
 #[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
+#[cfg(target_os = "windows")]
+use rust_video_harness::AnnexB;
 
 #[cfg(target_os = "windows")]
 /// Pictures in the committed vector.
@@ -57,6 +56,12 @@ fn decode_all(decoder: &mut H264Decoder<'_>, raws: &[Vec<u8>]) -> usize {
     total
 }
 
+/// Committed vector path.
+#[cfg(target_os = "windows")]
+fn vector() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+}
+
 #[cfg(target_os = "windows")]
 /// Whole-file packet queues submits before the first wait.
 #[test]
@@ -90,7 +95,7 @@ fn steady_state_never_resets() {
     let Some(device) = device() else {
         return;
     };
-    let raws = picture_packets();
+    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
     let total = decode_all(&mut decoder, &raws);
@@ -110,7 +115,7 @@ fn reset_after_failure_recovers() {
     let Some(device) = device() else {
         return;
     };
-    let raws = picture_packets();
+    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
     let first = Packet::new(Bytes::copy_from_slice(&raws[0]));
@@ -142,7 +147,7 @@ fn hardware_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let raws = picture_packets();
+    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
     let mut frames = Vec::new();
@@ -213,7 +218,7 @@ fn gpu_transcode_stays_ffmpeg_clean() {
             return;
         }
     };
-    let raws = picture_packets();
+    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut coded_packets = 0;
     let mut coded_bytes = 0;

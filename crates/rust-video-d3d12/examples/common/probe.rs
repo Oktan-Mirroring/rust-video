@@ -1,5 +1,7 @@
 //! Single-packet decode probe for pending-builder tiers.
 
+// Stays: d3d12 device and error types; no twin on other tiers.
+
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};

@@ -1,7 +1,6 @@
-//! Test bit writer with emulation prevention.
-
 /// Test bit writer with emulation prevention.
-pub(crate) struct Bits {
+#[derive(Default)]
+pub struct Bits {
     /// Finished bytes.
     bytes: Vec<u8>,
     /// Open byte under fill.
@@ -12,7 +11,8 @@ pub(crate) struct Bits {
 
 impl Bits {
     /// Empty writer.
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             bytes: Vec::new(),
             current: 0,
@@ -21,7 +21,7 @@ impl Bits {
     }
 
     /// Single bit.
-    pub(crate) fn bit(&mut self, set: bool) {
+    pub fn bit(&mut self, set: bool) {
         if set {
             self.current |= 1 << (7 - self.filled);
         }
@@ -34,14 +34,14 @@ impl Bits {
     }
 
     /// Low `count` bits of `value`, most significant first.
-    pub(crate) fn bits(&mut self, value: u32, count: u32) {
+    pub fn bits(&mut self, value: u32, count: u32) {
         for index in (0..count).rev() {
             self.bit(value >> index & 1 != 0);
         }
     }
 
     /// Unsigned Exp-Golomb code.
-    pub(crate) fn ue(&mut self, value: u32) {
+    pub fn ue(&mut self, value: u32) {
         let code = value + 1;
         let width = 32 - code.leading_zeros();
         for _ in 1..width {
@@ -51,7 +51,7 @@ impl Bits {
     }
 
     /// Signed Exp-Golomb code.
-    pub(crate) fn se(&mut self, value: i32) {
+    pub fn se(&mut self, value: i32) {
         let code = if value > 0 {
             u32::try_from(value).unwrap_or(u32::MAX) * 2 - 1
         } else {
@@ -61,7 +61,8 @@ impl Bits {
     }
 
     /// Finished EBSP with emulation prevention inserted.
-    pub(crate) fn finish(mut self) -> Vec<u8> {
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u8> {
         self.bit(true);
         while self.filled != 0 {
             self.bit(false);
@@ -80,12 +81,24 @@ impl Bits {
     }
 }
 
-/// Packet of NAL units with four-byte start codes.
-pub(crate) fn packet(nals: &[Vec<u8>]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    for nal in nals {
-        packet.extend_from_slice(&[0, 0, 0, 1]);
-        packet.extend_from_slice(nal);
+#[cfg(test)]
+mod tests {
+    use super::Bits;
+
+    #[test]
+    fn golomb_codes_match_bits() {
+        let mut writer = Bits::new();
+        writer.ue(0);
+        assert_eq!(writer.finish(), vec![0xC0]);
+        let mut writer = Bits::new();
+        writer.se(-1);
+        assert_eq!(writer.finish(), vec![0x70]);
     }
-    packet
+
+    #[test]
+    fn finish_inserts_emulation_prevention() {
+        let mut writer = Bits::new();
+        writer.bits(0, 24);
+        assert_eq!(writer.finish(), vec![0, 0, 3, 0, 0x80]);
+    }
 }

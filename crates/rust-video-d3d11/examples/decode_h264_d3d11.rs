@@ -1,14 +1,7 @@
 //! H264 decode on the D3D11 tier, from synthetic Annex B to frames.
 
-#[path = "common/h264.rs"]
 #[cfg(target_os = "windows")]
-mod h264;
-
-#[cfg(target_os = "windows")]
-use h264::{
-    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
-    annex_b_packets,
-};
+use rust_video_harness::H264Synth;
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -31,12 +24,14 @@ fn main() {
     println!("device: {}", device.name());
     let mut decoder = H264Decoder::open(&device);
     let mut total = 0;
-    let packets = annex_b_packets()
+    let packets = H264Synth::annex_b_packets()
         .into_iter()
-        .chain(annex_b_h264_packets())
-        .chain(annex_b_h264_packets_cropped())
-        .chain(annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
-        .chain(annex_b_h264_packets_cropped_sized(119, 67, 4, 40));
+        .chain(H264Synth::annex_b_h264_packets())
+        .chain(H264Synth::annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(
+            119, 67, 4, 40,
+        ));
     for (index, bytes) in packets.enumerate() {
         let packet = Packet::new(Bytes::from(bytes));
         match decoder.decode(&packet) {

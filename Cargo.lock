@@ -348,6 +348,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rust-video-caps",
+ "rust-video-harness",
  "thiserror",
  "windows",
  "windows-core",
@@ -359,6 +360,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rust-video-caps",
+ "rust-video-harness",
  "thiserror",
  "windows",
 ]
@@ -375,7 +377,9 @@ version = "0.1.0"
 name = "rust-video-harness"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "rust-video",
+ "rust-video-caps",
  "sha2",
 ]
 

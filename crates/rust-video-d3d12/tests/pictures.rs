@@ -3,19 +3,13 @@
 //! Skips without hardware.
 
 #[cfg(target_os = "windows")]
-#[path = "../examples/common/bits.rs"]
-mod bits;
-#[cfg(target_os = "windows")]
-#[path = "../examples/common/grey.rs"]
-mod grey;
-#[cfg(target_os = "windows")]
 #[path = "../examples/common/hevc.rs"]
 mod hevc;
 
 #[cfg(target_os = "windows")]
-use grey::grey_nv12;
-#[cfg(target_os = "windows")]
 use hevc::annex_b_packets;
+#[cfg(target_os = "windows")]
+use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
 use rust_video_d3d12::{
@@ -176,7 +170,7 @@ fn drive_encode_roundtrip<D>(
             return;
         }
     };
-    let frame = grey_nv12(width, height);
+    let frame = Synth::grey_nv12(width, height);
     let packets = match encoder.encode(&frame) {
         Ok(packets) => packets,
         Err(error) => {
@@ -229,7 +223,7 @@ fn drive_encode_loud(device: &D3d12Device, codec: Codec, width: u32, height: u32
             return;
         }
     };
-    let frame = grey_nv12(width, height);
+    let frame = Synth::grey_nv12(width, height);
     match encoder.encode(&frame) {
         Ok(packets) => {
             let bytes: usize = packets.iter().map(|packet| packet.data().len()).sum();

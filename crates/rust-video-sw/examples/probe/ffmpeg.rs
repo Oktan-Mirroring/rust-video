@@ -1,9 +1,12 @@
 //! Native ffmpeg decode probe.
 
+// Stays: native ffmpeg decode probe; probe-local, no twin.
+
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+use rust_video_harness::Ivf;
 use rust_video_sw::{Codec, FfmpegDecoder};
 
 /// Codec selector.
@@ -30,7 +33,7 @@ pub fn run_codec(
 
     let inputs = match selected {
         ProbeCodec::AnnexB(_) => vec![fs::read(stream).expect("stream readable")],
-        ProbeCodec::Ivf(_) => crate::ivf::read_ivf(stream).frames,
+        ProbeCodec::Ivf(_) => Ivf::read(stream).frames,
     };
     let inner = match selected {
         ProbeCodec::AnnexB(codec) | ProbeCodec::Ivf(codec) => codec,

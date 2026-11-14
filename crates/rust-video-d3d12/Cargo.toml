@@ -16,3 +16,6 @@ windows = { version = "0.62.2", default-features = false, features = ["Win32_Fou
 bytes = "1"
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 thiserror = "1"
+
+[dev-dependencies]
+rust-video-harness = { path = "../rust-video-harness" }

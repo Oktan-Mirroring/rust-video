@@ -11,13 +11,11 @@ use rust_video_d3d11::{
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
 #[cfg(target_os = "windows")]
-use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "windows")]
-use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
+#[cfg(target_os = "windows")]
+use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
 /// Adapter matrix plus shell and encoder contracts, skipped without hardware.
@@ -90,7 +88,7 @@ fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, re
         Err(error) => return fallback(codec, required, &error),
     };
     assert_eq!(encoder.codec(), codec);
-    let frame = grey_nv12(width, height);
+    let frame = Synth::grey_nv12(width, height);
     let start = std::time::Instant::now();
     let mut count = 0usize;
     let mut bytes = 0usize;
@@ -136,20 +134,4 @@ fn fallback(codec: Codec, required: bool, error: &D3d11Error) {
         error.to_string().contains("encoder MFT"),
         "loud fallback: {error}"
     );
-}
-
-#[cfg(target_os = "windows")]
-/// Mid-grey NV12 frame of `width` x `height`.
-fn grey_nv12(width: u32, height: u32) -> CpuFrame {
-    let size = PictureSize::new(width, height).expect("nonzero extent");
-    let y_len = width as usize * height as usize;
-    CpuFrame::new(
-        size,
-        PixelFormat::Nv12,
-        vec![
-            Plane::new(Bytes::from(vec![0x80; y_len]), width).expect("luma"),
-            Plane::new(Bytes::from(vec![0x80; y_len / 2]), width).expect("chroma"),
-        ],
-    )
-    .expect("frame")
 }

@@ -1,5 +1,7 @@
 //! Frame printing for the VA-API decode examples.
 
+// Stays: VaApiFrame printing; d3d report paths differ per tier.
+
 use rust_video_harness::FrameHash;
 use rust_video_vaapi::VaApiFrame;
 

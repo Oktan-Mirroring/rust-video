@@ -3,16 +3,6 @@
 //! Skips without hardware; a hardware run fails below the bar.
 
 #[cfg(target_os = "windows")]
-#[path = "../examples/common/h264.rs"]
-mod h264;
-
-#[cfg(target_os = "windows")]
-use h264::{
-    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
-    annex_b_packets,
-};
-
-#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, H264Decoder, Transcoder};
 
 #[cfg(target_os = "windows")]
@@ -23,6 +13,8 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 #[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
+#[cfg(target_os = "windows")]
+use rust_video_harness::H264Synth;
 
 #[cfg(target_os = "windows")]
 /// Hops timed after warmup.
@@ -80,7 +72,7 @@ fn xcode_1080p_measures_realtime() {
             return;
         }
     };
-    let small = packets(&annex_b_packets());
+    let small = packets(&H264Synth::annex_b_packets());
     let mut decoder = H264Decoder::open(&device);
     let mut small_frames = 0;
     for packet in &small {
@@ -95,11 +87,11 @@ fn xcode_1080p_measures_realtime() {
             return;
         }
     };
-    let warmup: Vec<Vec<u8>> = annex_b_h264_packets()
+    let warmup: Vec<Vec<u8>> = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped())
         .collect();
-    let raws = annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
     let measured = fps(&mut transcoder, &warmup, &raws);
     println!("xcode 1080p: {measured:.1}fps over {HOPS} hops, bar {BAR:.0}fps");
     assert!(

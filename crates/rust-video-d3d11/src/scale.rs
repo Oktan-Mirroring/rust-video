@@ -6,10 +6,6 @@
 // FFI boundary: video-processor COM calls live here.
 #![allow(unsafe_code)]
 
-#[cfg(test)]
-#[path = "../examples/common/h264.rs"]
-mod fixture;
-
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
@@ -20,6 +16,8 @@ use crate::submit::flag_word;
 use crate::submit::SubmitLock;
 
 use rust_video_caps::common::PictureSize;
+#[cfg(test)]
+use rust_video_harness::H264Synth;
 use windows::Win32::Foundation::{RECT, TRUE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
@@ -356,14 +354,14 @@ mod tests {
         };
         let mut decoder = crate::decoder::H264Decoder::open(&device);
         let mut surfaces = Vec::new();
-        for raw in super::fixture::annex_b_packets()
+        for raw in super::H264Synth::annex_b_packets()
             .into_iter()
-            .chain(super::fixture::annex_b_h264_packets())
-            .chain(super::fixture::annex_b_h264_packets_cropped())
-            .chain(super::fixture::annex_b_h264_packets_cropped_sized(
+            .chain(super::H264Synth::annex_b_h264_packets())
+            .chain(super::H264Synth::annex_b_h264_packets_cropped())
+            .chain(super::H264Synth::annex_b_h264_packets_cropped_sized(
                 39, 22, 4, 22,
             ))
-            .chain(super::fixture::annex_b_h264_packets_cropped_sized(
+            .chain(super::H264Synth::annex_b_h264_packets_cropped_sized(
                 119, 67, 4, 40,
             ))
         {

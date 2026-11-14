@@ -2,6 +2,8 @@
 //!
 //! Single-slice pictures; multi-slice pictures would split early.
 
+// Stays: d3d11 picture splitter; d3d12 carries a synth instead, no twin.
+
 use std::path::PathBuf;
 
 /// Committed 320x240 HEVC vector path.

@@ -1,12 +1,5 @@
 //! GPU transcode: decode texture to encoder texture without readback.
 
-#[cfg(test)]
-#[path = "../examples/common/bits.rs"]
-mod bits;
-#[cfg(test)]
-#[path = "../examples/common/h264.rs"]
-mod h264;
-
 use crate::decoder::{H264Decoder, HevcDecoder};
 use crate::device::D3d12Device;
 use crate::encoder::D3d12Encoder;
@@ -21,6 +14,8 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
+#[cfg(test)]
+use rust_video_harness::H264Synth;
 
 /// Decode source behind transcode packets.
 enum Source<'a> {
@@ -379,9 +374,9 @@ mod tests {
         let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
             return;
         };
-        for raw in super::h264::annex_b_h264_packets()
+        for raw in super::H264Synth::annex_b_h264_packets()
             .into_iter()
-            .chain(super::h264::annex_b_h264_packets_cropped())
+            .chain(super::H264Synth::annex_b_h264_packets_cropped())
         {
             let packet = Packet::new(Bytes::from(raw));
             assert_eq!(
@@ -408,7 +403,7 @@ mod tests {
             return;
         };
         transcoder.scale = Scale::to(PictureSize::new(160, 112).expect("nonzero extent"));
-        let raw = super::h264::annex_b_h264_packets_cropped_sized(39, 22, 4, 22)
+        let raw = super::H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22)
             .into_iter()
             .next()
             .expect("sets plus IDR");

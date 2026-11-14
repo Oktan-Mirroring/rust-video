@@ -1,14 +1,6 @@
 //! Software decode goldens over ffmpeg.
 
 #[cfg(feature = "ffmpeg")]
-#[path = "../../rust-video-vaapi/tests/support/mp4.rs"]
-mod mp4;
-
-#[cfg(feature = "ffmpeg")]
-#[path = "../examples/probe/ivf.rs"]
-mod ivf;
-
-#[cfg(feature = "ffmpeg")]
 use std::env;
 #[cfg(feature = "ffmpeg")]
 use std::path::{Path, PathBuf};
@@ -24,7 +16,7 @@ use rust_video_caps::packet::Packet;
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::traits::Decoder;
 #[cfg(feature = "ffmpeg")]
-use rust_video_harness::{Case, FrameHash, Golden, Suite};
+use rust_video_harness::{Case, FrameHash, Golden, Ivf, Stream, Suite};
 #[cfg(feature = "ffmpeg")]
 use rust_video_sw::{Av1Decoder, H264Decoder, Vp8Decoder, Vp9Decoder};
 
@@ -59,7 +51,7 @@ fn ivf_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
     let ivf = Path::new(case.name())
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ivf"));
-    ivf.then(|| ivf::read_ivf(case.path()).frames)
+    ivf.then(|| Ivf::read(case.path()).frames)
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -72,7 +64,7 @@ fn mp4_payloads(case: &Case) -> Option<Vec<Vec<u8>>> {
         return None;
     }
     Some(
-        mp4::demux(case.path())
+        Stream::demux(case.path())
             .unwrap_or_else(|err| panic!("demux {}: {err}", case.name()))
             .samples,
     )

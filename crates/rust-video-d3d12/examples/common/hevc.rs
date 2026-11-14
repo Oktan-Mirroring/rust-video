@@ -1,15 +1,17 @@
 //! Synthetic HEVC Annex B for d3d12 targets.
 
-use super::bits::{packet, Bits};
+// Stays: HEVC synth; d3d11 carries a splitter instead, no twin.
+
+use rust_video_harness::{AnnexB, Bits};
 
 /// Two packets: sets plus IDR, then one more IDR.
 pub(crate) fn annex_b_packets() -> Vec<Vec<u8>> {
-    let sets = packet(&[
+    let sets = AnnexB::packet(&[
         nal(33, &sps_body()),
         nal(34, &pps_body()),
         nal(19, &idr_slice_body()),
     ]);
-    let second = packet(&[nal(19, &idr_slice_body())]);
+    let second = AnnexB::packet(&[nal(19, &idr_slice_body())]);
     vec![sets, second]
 }
 

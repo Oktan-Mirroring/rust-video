@@ -3,16 +3,7 @@
 //! Skips without hardware.
 
 #[cfg(target_os = "windows")]
-#[path = "../examples/common/bits.rs"]
-mod bits;
-#[cfg(target_os = "windows")]
-#[path = "../examples/common/h264.rs"]
-mod h264;
-
-#[cfg(target_os = "windows")]
-use h264::{
-    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
-};
+use rust_video_harness::H264Synth;
 
 #[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, H264Decoder, Transcoder};
@@ -59,9 +50,9 @@ fn bytes_of(outcome: &Outcome) -> usize {
 #[cfg(target_os = "windows")]
 /// Bitstream bytes through `transcoder`, every hop on the GPU route.
 fn drive(transcoder: &mut Transcoder) -> usize {
-    let packets = annex_b_h264_packets()
+    let packets = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped())
         .collect();
     drive_raw(transcoder, packets)
 }
@@ -104,7 +95,7 @@ fn cropped_360p_transcodes_on_gpu_passthrough() {
     let Some(mut transcoder) = transcoder(&device) else {
         return;
     };
-    let raws = annex_b_h264_packets_cropped_sized(39, 22, 4, 22);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22);
     assert!(drive_raw(&mut transcoder, raws) > 0);
 }
 
@@ -118,7 +109,7 @@ fn cropped_1080p_transcodes_on_gpu_passthrough() {
     let Some(mut transcoder) = transcoder(&device) else {
         return;
     };
-    let raws = annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
     assert!(drive_raw(&mut transcoder, raws) > 0);
 }
 
@@ -160,9 +151,9 @@ fn cropped_stream_output_holds_pixels() {
     let Some(mut transcoder) = transcoder(&device) else {
         return;
     };
-    let raws = annex_b_h264_packets()
+    let raws = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped())
         .collect();
     let bytes = transcode_bytes(&mut transcoder, raws);
     assert_ne!(bytes, [] as [u8; 0]);
@@ -202,9 +193,9 @@ fn cropped_stream_transcodes_on_gpu_scale() {
         Err(_) => return,
     };
     let mut bytes = 0;
-    let packets = annex_b_h264_packets()
+    let packets = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(annex_b_h264_packets_cropped());
+        .chain(H264Synth::annex_b_h264_packets_cropped());
     for raw in packets {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {

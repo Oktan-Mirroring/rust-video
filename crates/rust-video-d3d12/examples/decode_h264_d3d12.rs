@@ -1,21 +1,7 @@
 //! H.264 decode on the D3D12 tier, from synthetic Annex B to frames.
 
-#[path = "common/bits.rs"]
 #[cfg(target_os = "windows")]
-mod bits;
-#[path = "common/grey.rs"]
-#[cfg(target_os = "windows")]
-mod grey;
-#[path = "common/h264.rs"]
-#[cfg(target_os = "windows")]
-mod h264;
-
-#[cfg(target_os = "windows")]
-use grey::grey_nv12;
-#[cfg(target_os = "windows")]
-use h264::{
-    annex_b_h264_packets, annex_b_h264_packets_cropped, annex_b_h264_packets_cropped_sized,
-};
+use rust_video_harness::{H264Synth, Synth};
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -39,11 +25,13 @@ fn main() {
     println!("supports h264: {}", device.supports(Codec::H264));
     let mut decoder = H264Decoder::open(&device);
     let mut total = 0;
-    let packets = annex_b_h264_packets()
+    let packets = H264Synth::annex_b_h264_packets()
         .into_iter()
-        .chain(annex_b_h264_packets_cropped())
-        .chain(annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
-        .chain(annex_b_h264_packets_cropped_sized(119, 67, 4, 40));
+        .chain(H264Synth::annex_b_h264_packets_cropped())
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(39, 22, 4, 22))
+        .chain(H264Synth::annex_b_h264_packets_cropped_sized(
+            119, 67, 4, 40,
+        ));
     for (index, bytes) in packets.enumerate() {
         let packet = Packet::new(Bytes::from(bytes));
         match decoder.decode(&packet) {
@@ -112,7 +100,7 @@ fn probe_encode(device: &D3d12Device) {
             return;
         }
     };
-    let frame = grey_nv12(320, 240);
+    let frame = Synth::grey_nv12(320, 240);
     match encoder.encode(&frame) {
         Ok(packets) => {
             let bytes: usize = packets.iter().map(|packet| packet.data().len()).sum();

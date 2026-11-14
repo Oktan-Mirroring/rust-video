@@ -4,20 +4,6 @@
 #[cfg(target_os = "linux")]
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
-#[path = "support/mp4.rs"]
-mod mp4;
-
-#[cfg(have_corpus)]
-#[cfg(target_os = "linux")]
-#[cfg(have_corpus)]
-#[cfg(target_os = "linux")]
-#[path = "../examples/common/synth.rs"]
-mod synth;
-
-#[cfg(have_corpus)]
-#[cfg(target_os = "linux")]
-#[cfg(have_corpus)]
-#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
@@ -59,7 +45,7 @@ use rust_video_caps::transcode::Route;
 #[cfg(target_os = "linux")]
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
-use rust_video_harness::FrameHash;
+use rust_video_harness::{FrameHash, Stream, Synth};
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
 #[cfg(have_corpus)]
@@ -130,7 +116,7 @@ fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
 /// Demuxed samples as one Annex B blob.
-fn annex_b(stream: &mp4::Stream) -> Vec<u8> {
+fn annex_b(stream: &Stream) -> Vec<u8> {
     let mut out = Vec::new();
     for sample in &stream.samples {
         out.extend_from_slice(sample);
@@ -240,7 +226,7 @@ fn to_planar(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
 /// Decode one packet per sample.
 fn decode_stream(
     decoder: &mut H264Decoder<'_>,
-    stream: &mp4::Stream,
+    stream: &Stream,
 ) -> Result<Vec<VaApiFrame>, VaApiError> {
     let mut frames = Vec::new();
     for sample in &stream.samples {
@@ -302,7 +288,7 @@ fn device() -> Option<VaApiDevice> {
 #[test]
 fn demux_matches_ffmpeg_remux() {
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     assert_eq!(stream.samples.len(), 60);
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x67)));
@@ -329,7 +315,7 @@ fn vaapi_decodes_synth_high() {
         return;
     };
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
     assert_eq!(frames.len(), stream.samples.len());
@@ -363,7 +349,7 @@ fn vaapi_declines_high_chroma() {
     };
     for name in ["h264-high422.mp4", "h264-high444.mp4"] {
         let path = corpus().join("synth/h264").join(name);
-        let stream = mp4::demux(&path).expect("demux chroma vector");
+        let stream = Stream::demux(&path).expect("demux chroma vector");
         let mut decoder = H264Decoder::open(&device);
         match decode_stream(&mut decoder, &stream) {
             Err(VaApiError::Unsupported(_)) => {}
@@ -380,7 +366,7 @@ fn vaapi_declines_high_chroma() {
 #[test]
 fn demux_matches_ffmpeg_remux_h265() {
     let path = corpus().join("synth/h265/h265-main.mp4");
-    let stream = mp4::demux(&path).expect("demux synth main");
+    let stream = Stream::demux(&path).expect("demux synth main");
     assert_eq!(stream.samples.len(), 60);
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x40)));
@@ -404,7 +390,7 @@ fn demux_matches_ffmpeg_remux_h265() {
 #[test]
 fn h265_frontend_gap_is_loud() {
     let path = corpus().join("synth/h265/h265-main.mp4");
-    let stream = mp4::demux(&path).expect("demux synth main");
+    let stream = Stream::demux(&path).expect("demux synth main");
     assert!(!stream.samples.is_empty());
     let mut decoder = H265Decoder;
     let packet = Packet::new(Bytes::copy_from_slice(&stream.samples[0]));
@@ -424,7 +410,7 @@ fn vaapi_exports_dmabuf() {
         return;
     };
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut exported = 0;
     for sample in stream.samples.iter().take(4) {
@@ -485,7 +471,7 @@ fn vaapi_encodes_h264_all_intra() {
     let mut annex_b = Vec::new();
     let mut coded = 0;
     for index in 0..8 {
-        let frame = synth::frame(size, index);
+        let frame = Synth::gradient(size, index);
         for packet in encoder.encode(&frame).expect("encode") {
             assert!(packet.is_keyframe(), "all-intra keyframe");
             annex_b.extend_from_slice(packet.data());
@@ -545,7 +531,7 @@ fn vaapi_encodes_h265_keyframes() {
     let mut annex_b = Vec::new();
     let mut coded = 0;
     for index in 0..4 {
-        let frame = synth::frame(size, index);
+        let frame = Synth::gradient(size, index);
         for packet in encoder.encode(&frame).expect("encode") {
             assert!(packet.is_keyframe(), "all-intra keyframe");
             assert!(!packet.data().is_empty());
@@ -581,7 +567,7 @@ fn vaapi_pipelines_submit_depth() {
         return;
     };
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut frames = Vec::new();
     for sample in stream.samples.iter().take(9) {
@@ -630,7 +616,7 @@ fn vaapi_reuses_decode_buffers() {
         return;
     };
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
     assert_eq!(frames.len(), stream.samples.len());
@@ -668,7 +654,7 @@ fn vaapi_reuses_encode_buffers() {
         Err(error) => panic!("unexpected encode failure: {error}"),
     };
     for index in 0..8 {
-        let frame = synth::frame(size, index);
+        let frame = Synth::gradient(size, index);
         assert_eq!(encoder.encode(&frame).expect("encode").len(), 1);
     }
     for packet in encoder.flush().expect("flush") {
@@ -692,7 +678,7 @@ fn vaapi_recovers_after_bad_packet() {
         return;
     };
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut frames = Vec::new();
     for sample in stream.samples.iter().take(2) {
@@ -734,7 +720,7 @@ fn vaapi_transcodes_scaled_on_device() {
         return;
     }
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
     let mut annex_b = Vec::new();
     for sample in &stream.samples {
@@ -784,7 +770,7 @@ fn vaapi_transcodes_on_device() {
         return;
     }
     let path = corpus().join("synth/h264/h264-high.mp4");
-    let stream = mp4::demux(&path).expect("demux synth high");
+    let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
     for sample in &stream.samples {
         let outcome = transcoder

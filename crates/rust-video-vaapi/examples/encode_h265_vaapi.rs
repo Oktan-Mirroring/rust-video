@@ -3,14 +3,10 @@
 //! `encode_h265_vaapi [width height count]`; defaults `320 240 30`.
 
 #[cfg(target_os = "linux")]
-#[path = "common/synth.rs"]
-mod synth;
-
-#[cfg(target_os = "linux")]
 fn main() {
     use rust_video_caps::common::PictureSize;
     use rust_video_caps::traits::{Device, Encoder};
-    use rust_video_harness::FrameHash;
+    use rust_video_harness::{FrameHash, Synth};
     use rust_video_vaapi::{EncodeCodec, VaApiDevice, VaApiEncoder, VaApiError};
 
     let mut args = std::env::args().skip(1);
@@ -65,7 +61,7 @@ fn main() {
     let mut packets_out = 0;
     let mut bytes_out = 0;
     for index in 0..count {
-        let frame = synth::frame(size, index);
+        let frame = Synth::gradient(size, index);
         match encoder.encode(&frame) {
             Ok(packets) => {
                 for packet in packets {

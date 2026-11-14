@@ -1,11 +1,7 @@
 //! HEVC encode on the D3D12 tier, from synthetic NV12 to packets.
 
-#[path = "common/grey.rs"]
 #[cfg(target_os = "windows")]
-mod grey;
-
-#[cfg(target_os = "windows")]
-use grey::grey_nv12;
+use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
@@ -30,7 +26,7 @@ fn main() {
         }
     };
     println!("codec: {}", encoder.codec());
-    let frame = grey_nv12(320, 240);
+    let frame = Synth::grey_nv12(320, 240);
     let mut packets = 0;
     let mut bytes = 0;
     for _ in 0..8 {

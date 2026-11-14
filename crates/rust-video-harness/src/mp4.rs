@@ -1,5 +1,3 @@
-//! Minimal MP4 demux for H.264/H.265 test vectors: video samples as Annex B.
-
 use std::path::Path;
 
 /// Video stream: samples in decode order with sets injected at IDRs.
@@ -8,14 +6,16 @@ pub struct Stream {
     pub samples: Vec<Vec<u8>>,
 }
 
-/// Demux the first video track of the MP4 at `path`.
-///
-/// # Errors
-///
-/// Returns `Err` describing the first box that fails to parse.
-pub fn demux(path: &Path) -> Result<Stream, String> {
-    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    Demux::new(&bytes).stream()
+impl Stream {
+    /// Demux the first video track of the MP4 at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` describing the first box that fails to parse.
+    pub fn demux(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        Demux::new(&bytes).stream()
+    }
 }
 
 /// MP4 reader over borrowed bytes.

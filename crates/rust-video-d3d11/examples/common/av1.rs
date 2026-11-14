@@ -1,5 +1,7 @@
 //! AV1 test vectors: committed stream plus temporal-unit packets.
 
+// Stays: AV1 OBU splitter; sole consumer pair, no cross-tier twin.
+
 use std::path::PathBuf;
 
 /// Committed 320x240 AV1 vector path.

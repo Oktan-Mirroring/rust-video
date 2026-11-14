@@ -2,20 +2,14 @@
 //!
 //! Encode stays a named miss until the args builder lands.
 
-#[path = "common/bits.rs"]
-#[cfg(target_os = "windows")]
-mod bits;
-#[path = "common/grey.rs"]
-#[cfg(target_os = "windows")]
-mod grey;
 #[path = "common/hevc.rs"]
 #[cfg(target_os = "windows")]
 mod hevc;
 
 #[cfg(target_os = "windows")]
-use grey::grey_nv12;
-#[cfg(target_os = "windows")]
 use hevc::annex_b_packets;
+#[cfg(target_os = "windows")]
+use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -107,7 +101,7 @@ fn probe_encode_miss(device: &D3d12Device) {
             return;
         }
     };
-    let frame = grey_nv12(320, 240);
+    let frame = Synth::grey_nv12(320, 240);
     match encoder.encode(&frame) {
         Ok(packets) => {
             let bytes: usize = packets.iter().map(|packet| packet.data().len()).sum();

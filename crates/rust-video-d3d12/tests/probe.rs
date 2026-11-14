@@ -11,13 +11,11 @@ use rust_video_d3d12::{
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
 #[cfg(target_os = "windows")]
-use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "windows")]
-use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device, Encoder};
+#[cfg(target_os = "windows")]
+use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
 /// Adapter matrix plus picture and encoder contracts, skipped without hardware.
@@ -102,7 +100,7 @@ fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
         }
     };
     assert_eq!(encoder.codec(), codec);
-    let frame = grey_nv12(width, height);
+    let frame = Synth::grey_nv12(width, height);
     match encoder.encode(&frame) {
         Ok(packets) => {
             assert_ne!(packets, [] as [rust_video_caps::packet::Packet; 0]);
@@ -123,20 +121,4 @@ fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
         encoder.flush().expect("flush"),
         [] as [rust_video_caps::packet::Packet; 0]
     );
-}
-
-#[cfg(target_os = "windows")]
-/// Mid-grey NV12 frame of `width` x `height`.
-fn grey_nv12(width: u32, height: u32) -> CpuFrame {
-    let size = PictureSize::new(width, height).expect("nonzero extent");
-    let y_len = width as usize * height as usize;
-    CpuFrame::new(
-        size,
-        PixelFormat::Nv12,
-        vec![
-            Plane::new(Bytes::from(vec![0x80; y_len]), width).expect("luma"),
-            Plane::new(Bytes::from(vec![0x80; y_len / 2]), width).expect("chroma"),
-        ],
-    )
-    .expect("frame")
 }
