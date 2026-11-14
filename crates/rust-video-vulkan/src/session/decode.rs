@@ -89,7 +89,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when session, image, buffer, pool, or fence creation fails.
+    /// Returns `Err` when the display window escapes the coded extent,
+    /// or when session, image, buffer, pool, or fence creation fails.
     pub(crate) fn open(
         device: &VulkanDevice,
         geometry: &SessionGeometry,
@@ -97,6 +98,13 @@ impl Session {
         std_version: &vk::ExtensionProperties,
         template: &mut crate::session::params::ParamsTemplate<'_>,
     ) -> Result<Self, VulkanError> {
+        let (coded_w, coded_h) = geometry.coded();
+        let (display_w, display_h) = geometry.display();
+        if display_w > coded_w || display_h > coded_h {
+            return Err(VulkanError::OverCaps {
+                what: "crop window",
+            });
+        }
         let raw = device.raw().device();
         let properties =
             crate::raw::RawDevice::memory_properties(device.backend(), device.adapter());
@@ -105,7 +113,7 @@ impl Session {
             profile,
             queue_family: device.queue_family(),
             format: geometry.format(),
-            extent: coded_extent(geometry.coded()),
+            extent: as_extent(geometry.coded()),
             dpb_slots: geometry.dpb_slots(),
             active_refs: geometry.active_refs(),
             std_version,
@@ -132,7 +140,7 @@ impl Session {
         };
         let image = crate::raw::GpuImageDesc {
             format: geometry.format(),
-            extent: coded_extent(geometry.coded()),
+            extent: as_extent(geometry.coded()),
             layers: geometry.dpb_slots(),
             tiling: vk::ImageTiling::OPTIMAL,
             usage: vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
@@ -161,7 +169,7 @@ impl Session {
             readbacks.push(GpuBuffer::create_readback(
                 raw,
                 &properties,
-                nv12_bytes(coded_extent(geometry.coded())),
+                nv12_bytes(as_extent(geometry.coded())),
                 vk::BufferUsageFlags::TRANSFER_DST,
                 host,
                 &[],
@@ -313,13 +321,11 @@ impl Session {
 
     /// Wait `pending` out, then map its readback into `out`.
     ///
-    /// The readback lands directly in the pooled buffer, cropped to
-    /// the display extent in place.
+    /// The readback holds the display window, packed tightly by the copy.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the fence wait, the readback map, or the
-    /// crop fails.
+    /// Returns `Err` when the fence wait or the readback map fails.
     pub(crate) fn collect_into(
         &mut self,
         pending: PendingDecode,
@@ -328,17 +334,13 @@ impl Session {
         self.submit
             .poll(pending.slot)
             .inspect_err(|_| self.reset_state())?;
-        let coded = coded_extent(self.geometry.coded());
-        let len = usize::try_from(nv12_bytes(coded)).map_err(|_| {
+        let display = as_extent(self.geometry.display());
+        let len = usize::try_from(nv12_bytes(display)).map_err(|_| {
             crate::error::ParseError::OutOfRange {
                 syntax: "readback size",
             }
         })?;
-        self.readbacks[pending.slot]
-            .memory()
-            .read_to_buf(out, len)?;
-        let display = coded_extent(self.geometry.display());
-        crop_nv12_in_place(coded, display, out)
+        self.readbacks[pending.slot].memory().read_to_buf(out, len)
     }
 
     /// Wait `pending` out, leaving pixels on the GPU.
@@ -448,7 +450,7 @@ impl Session {
         if let Some(target) = export {
             self.record_export(&recorder, layer, target);
         } else {
-            let regions = nv12_copy_regions(coded_extent(self.geometry.coded()), layer);
+            let regions = nv12_copy_regions(as_extent(self.geometry.display()), layer);
             recorder.copy_image_to_buffer(
                 self.dpb.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -535,11 +537,11 @@ pub(crate) fn narrow_u32(value: usize, syntax: &'static str) -> Result<u32, Vulk
     u32::try_from(value).map_err(|_| crate::error::ParseError::OutOfRange { syntax }.into())
 }
 
-/// Coded extent as a Vulkan extent.
-fn coded_extent(coded: (u32, u32)) -> vk::Extent2D {
+/// `(u32, u32)` as a Vulkan extent.
+fn as_extent(extent: (u32, u32)) -> vk::Extent2D {
     vk::Extent2D {
-        width: coded.0,
-        height: coded.1,
+        width: extent.0,
+        height: extent.1,
     }
 }
 
@@ -737,89 +739,6 @@ pub(crate) struct Submission<'a> {
     pub picture_next: *const std::ffi::c_void,
 }
 
-/// Crop tight coded NV12 `buf` down to `display`, in place.
-///
-/// # Errors
-///
-/// Returns `Err` when the display window escapes the coded extent or
-/// `buf` is shorter than the coded frame.
-pub(crate) fn crop_nv12_in_place(
-    coded: vk::Extent2D,
-    display: vk::Extent2D,
-    buf: &mut bytes::BytesMut,
-) -> Result<(), VulkanError> {
-    let window = crop_window(coded, display, buf)?;
-    if coded == display {
-        buf.truncate(window.coded_len);
-        return Ok(());
-    }
-    // Forward rows only: each destination precedes its source.
-    for row in 0..window.display_h {
-        let src = row * window.coded_w;
-        buf.copy_within(src..src + window.display_w, row * window.display_w);
-    }
-    let luma = window.display_w * window.display_h;
-    for row in 0..window.display_h / 2 {
-        let src = window.chroma_base + row * window.coded_w;
-        buf.copy_within(src..src + window.display_w, luma + row * window.display_w);
-    }
-    buf.truncate(window.display_len);
-    Ok(())
-}
-
-/// Validated crop geometry of one frame.
-struct CropWindow {
-    /// Coded luma row width in bytes.
-    coded_w: usize,
-    /// Display width in bytes.
-    display_w: usize,
-    /// Display height in rows.
-    display_h: usize,
-    /// Coded chroma plane base in bytes.
-    chroma_base: usize,
-    /// Coded frame length in bytes.
-    coded_len: usize,
-    /// Display frame length in bytes.
-    display_len: usize,
-}
-
-/// Validated crop geometry, or the bound it breaks.
-///
-/// # Errors
-///
-/// Returns `Err` when the display window escapes the coded extent or
-/// `bytes` is shorter than the coded frame.
-fn crop_window(
-    coded: vk::Extent2D,
-    display: vk::Extent2D,
-    bytes: &[u8],
-) -> Result<CropWindow, VulkanError> {
-    let coded_w = coded.width as usize;
-    let coded_h = coded.height as usize;
-    let display_w = display.width as usize;
-    let display_h = display.height as usize;
-    if display_w > coded_w || display_h > coded_h {
-        return Err(VulkanError::OverCaps {
-            what: "crop window",
-        });
-    }
-    let coded_len = coded_w * coded_h * 3 / 2;
-    if bytes.len() < coded_len {
-        return Err(VulkanError::ShortReadback {
-            expected: coded_len,
-            found: bytes.len(),
-        });
-    }
-    Ok(CropWindow {
-        coded_w,
-        display_w,
-        display_h,
-        chroma_base: coded_w * coded_h,
-        coded_len,
-        display_len: display_w * display_h * 3 / 2,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -924,72 +843,5 @@ mod tests {
         assert!(chroma.image_subresource.aspect_mask == ash::vk::ImageAspectFlags::PLANE_1);
         assert_eq!(chroma.image_extent.width, 32);
         assert_eq!(chroma.image_extent.height, 16);
-    }
-
-    #[test]
-    fn crop_compacts_visible_rows_only() {
-        let coded = ash::vk::Extent2D {
-            width: 4,
-            height: 4,
-        };
-        let display = ash::vk::Extent2D {
-            width: 2,
-            height: 2,
-        };
-        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
-        super::crop_nv12_in_place(coded, display, &mut pooled).expect("in bounds");
-        assert_eq!(pooled.freeze().as_ref(), &[0, 1, 4, 5, 16, 17]);
-    }
-
-    #[test]
-    fn crop_without_window_keeps_input() {
-        let extent = ash::vk::Extent2D {
-            width: 4,
-            height: 4,
-        };
-        let bytes: Vec<u8> = (0..24).collect();
-        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
-        super::crop_nv12_in_place(extent, extent, &mut pooled).expect("in bounds");
-        assert_eq!(pooled.freeze().as_ref(), bytes.as_slice());
-    }
-
-    #[test]
-    fn crop_rejects_window_escape_and_short_bytes() {
-        let coded = ash::vk::Extent2D {
-            width: 4,
-            height: 4,
-        };
-        let wide = ash::vk::Extent2D {
-            width: 8,
-            height: 4,
-        };
-        let mut pooled = bytes::BytesMut::from_iter(0..24u8);
-        assert!(matches!(
-            super::crop_nv12_in_place(coded, wide, &mut pooled),
-            Err(super::VulkanError::OverCaps { .. })
-        ));
-        let mut short = bytes::BytesMut::from_iter(0..23u8);
-        assert!(matches!(
-            super::crop_nv12_in_place(coded, coded, &mut short),
-            Err(super::VulkanError::ShortReadback { .. })
-        ));
-    }
-
-    #[test]
-    fn crop_compacts_partial_windows() {
-        let coded = ash::vk::Extent2D {
-            width: 6,
-            height: 4,
-        };
-        let display = ash::vk::Extent2D {
-            width: 4,
-            height: 2,
-        };
-        let mut pooled = bytes::BytesMut::from_iter(0..36u8);
-        super::crop_nv12_in_place(coded, display, &mut pooled).expect("in bounds");
-        assert_eq!(
-            pooled.freeze().as_ref(),
-            &[0, 1, 2, 3, 6, 7, 8, 9, 24, 25, 26, 27]
-        );
     }
 }
