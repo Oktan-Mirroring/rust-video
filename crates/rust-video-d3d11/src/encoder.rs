@@ -32,7 +32,6 @@ pub struct D3d11Encoder {
 }
 
 #[cfg(target_os = "windows")]
-#[cfg(target_os = "windows")]
 impl D3d11Encoder {
     /// Encoder over `device` for `codec`.
     ///
@@ -116,7 +115,6 @@ impl D3d11Encoder {
     }
 }
 
-#[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
 impl Encoder for D3d11Encoder {
     type Error = D3d11Error;

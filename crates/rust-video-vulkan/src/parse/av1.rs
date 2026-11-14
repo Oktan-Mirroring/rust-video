@@ -2725,19 +2725,19 @@ fn parse_loop_filter(
         Some(&views[usize::from(slot)].loop_filter)
     };
     header.loop_filter.delta_update = reader.bit("frame lf update")?;
-    for index in 0..TOTAL_REFS {
-        let update = header.loop_filter.delta_update && reader.bit("frame lf ref update")?;
+    let delta_update = header.loop_filter.delta_update;
+    for (index, delta) in header.loop_filter.ref_deltas.iter_mut().enumerate() {
+        let update = delta_update && reader.bit("frame lf ref update")?;
         if update {
-            header.loop_filter.ref_deltas[index] =
-                narrow_i8(reader.su("frame lf ref delta", 7)?, "frame lf ref delta")?;
+            *delta = narrow_i8(reader.su("frame lf ref delta", 7)?, "frame lf ref delta")?;
         } else if let Some(prior) = prior {
-            header.loop_filter.ref_deltas[index] = prior.ref_deltas[index];
+            *delta = prior.ref_deltas[index];
         } else {
-            header.loop_filter.ref_deltas[index] = DEFAULT_REF[index];
+            *delta = DEFAULT_REF[index];
         }
     }
     for index in 0..2 {
-        let update = header.loop_filter.delta_update && reader.bit("frame lf mode update")?;
+        let update = delta_update && reader.bit("frame lf mode update")?;
         if update {
             header.loop_filter.mode_deltas[index] =
                 narrow_i8(reader.su("frame lf mode delta", 7)?, "frame lf mode delta")?;

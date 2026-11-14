@@ -5,8 +5,13 @@
 
 // FFI boundary: Media Foundation transform calls live here.
 #![allow(unsafe_code)]
-// The implement macro expands to inline(always) shims with ref casts.
-#![allow(clippy::inline_always, clippy::ref_as_ptr)]
+// The implement macro expands to inline(always) shims with ref and pointer casts.
+#![allow(
+    clippy::borrow_as_ptr,
+    clippy::inline_always,
+    clippy::ptr_as_ptr,
+    clippy::ref_as_ptr
+)]
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;

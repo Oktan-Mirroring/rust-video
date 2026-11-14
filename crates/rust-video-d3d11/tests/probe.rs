@@ -65,9 +65,9 @@ fn probe_reports_or_skips() {
     let mut mpeg2 = Mpeg2Decoder::open(&device);
     assert!(mpeg2.decode(&packet).is_err());
     assert!(mpeg2.flush().expect("flush").is_empty());
-    let mut vc1 = Vc1Decoder::open(&device);
-    assert!(vc1.decode(&packet).is_err());
-    assert!(vc1.flush().expect("flush").is_empty());
+    let mut vc1_decoder = Vc1Decoder::open(&device);
+    assert!(vc1_decoder.decode(&packet).is_err());
+    assert!(vc1_decoder.flush().expect("flush").is_empty());
 
     drive_encoder(&device, Codec::H264, 1280, 720, true);
     drive_encoder(&device, Codec::H264, 64, 48, true);
