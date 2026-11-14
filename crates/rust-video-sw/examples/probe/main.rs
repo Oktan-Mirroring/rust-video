@@ -54,6 +54,15 @@ fn main() {
             ffmpeg::run_codec(codec, Path::new(&args[3]), max, threads, dump, "ffdec");
         }
         #[cfg(feature = "ffmpeg")]
+        "vp8enc" => {
+            let w = args[3].parse().expect("width");
+            let h = args[4].parse().expect("height");
+            let frames = args[5].parse().expect("frames");
+            let encoder = rust_video_sw::Vp8Encoder::open(w, h, 8_000, 4).expect("encoder");
+            let mut probe = rust_video_harness::IvfEncode::new(encoder, "vp8enc", *b"VP80");
+            probe.run(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
+        }
+        #[cfg(feature = "ffmpeg")]
         "vpxenc" => {
             let w = args[3].parse().expect("width");
             let h = args[4].parse().expect("height");
@@ -78,6 +87,6 @@ fn main() {
             let frames = args[5].parse().expect("frames");
             x265::run_encode(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }
-        _ => panic!("usage: probe h264dec|h264enc|ffdec|vpxenc|av1enc|x265enc ..."),
+        _ => panic!("usage: probe h264dec|h264enc|ffdec|vp8enc|vpxenc|av1enc|x265enc ..."),
     }
 }

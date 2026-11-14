@@ -286,5 +286,4 @@ decode the 4:2:2/4:4:4 goldens at all (I420 output only). Throughput
    guard extended).
 4. Throughput numbers for `Vp8Encoder`, `Av1Encoder`, and
    `H265Encoder`: 1080p fps before any realtime claim. Probe modes
-   exist for AV1 (`av1enc`) and H.265 (`x265enc`); VP8 still needs
-   its own mode (`vpxenc` is VP9-hardcoded).
+   exist for all three (`vp8enc`, `av1enc`, `x265enc`).

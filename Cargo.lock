@@ -395,6 +395,7 @@ dependencies = [
  "ndk",
  "ndk-sys",
  "rust-video-caps",
+ "rust-video-harness",
  "thiserror",
 ]
 

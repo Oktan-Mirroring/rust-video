@@ -14,6 +14,9 @@ bytes = "1"
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
 thiserror = "1"
 
+[dev-dependencies]
+rust-video-harness = { path = "../rust-video-harness" }
+
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9.0", default-features = false, features = ["media", "api-level-28"] }
 ndk-sys = "0.6.0"

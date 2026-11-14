@@ -5,14 +5,9 @@
 //! failure is a real failure. Host builds compile this file to nothing.
 
 #[cfg(target_os = "android")]
-use bytes::Bytes;
-
-#[cfg(target_os = "android")]
-use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "android")]
-use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
-#[cfg(target_os = "android")]
 use rust_video_caps::traits::Encoder;
+#[cfg(target_os = "android")]
+use rust_video_harness::Synth;
 #[cfg(target_os = "android")]
 use rust_video_mediacodec::{
     EncodeSpec, EncodeState, MediaCodecEncoder, MediaCodecError, QuirkTable,
@@ -35,31 +30,6 @@ fn open_or_decline(
     }
 }
 
-/// Black planar frame at the spec extent.
-#[cfg(target_os = "android")]
-fn black_frame(spec: &EncodeSpec) -> CpuFrame {
-    let width = usize::try_from(spec.width()).expect("device width fits");
-    let height = usize::try_from(spec.height()).expect("device height fits");
-    CpuFrame::new(
-        PictureSize::new(spec.width(), spec.height()).expect("valid dims"),
-        PixelFormat::Yuv420P,
-        vec![
-            Plane::new(Bytes::from(vec![0_u8; width * height]), spec.width()).expect("valid luma"),
-            Plane::new(
-                Bytes::from(vec![128_u8; width * height / 4]),
-                spec.width() / 2,
-            )
-            .expect("valid chroma"),
-            Plane::new(
-                Bytes::from(vec![128_u8; width * height / 4]),
-                spec.width() / 2,
-            )
-            .expect("valid chroma"),
-        ],
-    )
-    .expect("three planes")
-}
-
 /// Open, one-frame encode, flush, and reset for one codec.
 #[cfg(target_os = "android")]
 fn run_case(name: &str, spec: &EncodeSpec) {
@@ -68,7 +38,7 @@ fn run_case(name: &str, spec: &EncodeSpec) {
         return;
     };
     assert_eq!(encoder.state(), EncodeState::Started);
-    let frame = black_frame(spec);
+    let frame = Synth::black_yuv420p(spec.width(), spec.height());
     encoder.encode(&frame).expect("black frame encodes");
     encoder.flush().expect("flush drains");
     encoder.reset().expect("reset drains and flushes");

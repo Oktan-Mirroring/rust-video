@@ -26,6 +26,31 @@ impl Synth {
         .expect("frame")
     }
 
+    /// Black planar frame of `width` x `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `width` or `height` is zero.
+    #[must_use]
+    pub fn black_yuv420p(width: u32, height: u32) -> CpuFrame {
+        let size = PictureSize::new(width, height).expect("nonzero extent");
+        let luma_len = usize::try_from(width).unwrap_or(0) * usize::try_from(height).unwrap_or(0);
+        let chroma_len = luma_len / 4;
+        let chroma_stride = width / 2;
+        CpuFrame::new(
+            size,
+            PixelFormat::Yuv420P,
+            vec![
+                Plane::new(Bytes::from(vec![0_u8; luma_len]), width).expect("valid luma"),
+                Plane::new(Bytes::from(vec![128_u8; chroma_len]), chroma_stride)
+                    .expect("valid chroma"),
+                Plane::new(Bytes::from(vec![128_u8; chroma_len]), chroma_stride)
+                    .expect("valid chroma"),
+            ],
+        )
+        .expect("three planes")
+    }
+
     /// Gradient frame with a moving bar at `index`.
     ///
     /// # Panics
@@ -78,6 +103,20 @@ mod tests {
         assert_eq!(planes[0].stride(), 4);
         assert_eq!(planes[1].data(), &[0x80; 4]);
         assert_eq!(planes[1].stride(), 4);
+    }
+
+    #[test]
+    fn black_yuv420p_fills_black() {
+        let frame = Synth::black_yuv420p(4, 2);
+        assert_eq!(frame.format(), PixelFormat::Yuv420P);
+        let planes = frame.planes();
+        assert_eq!(planes.len(), 3);
+        assert_eq!(planes[0].data(), &[0; 8]);
+        assert_eq!(planes[0].stride(), 4);
+        assert_eq!(planes[1].data(), &[128; 2]);
+        assert_eq!(planes[1].stride(), 2);
+        assert_eq!(planes[2].data(), &[128; 2]);
+        assert_eq!(planes[2].stride(), 2);
     }
 
     #[test]
