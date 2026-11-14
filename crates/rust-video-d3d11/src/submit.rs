@@ -23,11 +23,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
-/// Completion poll rounds before the wait fails.
-const QUERY_SPINS: u32 = 50_000;
-
-/// Pause between completion polls.
-const QUERY_PAUSE: Duration = Duration::from_micros(100);
+/// Completion wait budget before the wait fails.
+const QUERY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Single-submitter lock over the immediate context.
 pub(crate) struct SubmitLock {
@@ -181,11 +178,15 @@ impl CopySlot {
         if self.signaled(context, 0)? {
             return Ok(());
         }
-        for _ in 1..QUERY_SPINS {
+        let deadline = std::time::Instant::now() + QUERY_BUDGET;
+        loop {
             if self.signaled(context, flag_word(D3D11_ASYNC_GETDATA_DONOTFLUSH.0))? {
                 return Ok(());
             }
-            std::thread::sleep(QUERY_PAUSE);
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::hint::spin_loop();
         }
         Err(D3d11Error::Call {
             call: "QueryWait",
