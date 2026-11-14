@@ -16,6 +16,7 @@ mod oracle;
 mod report;
 mod suite;
 mod synth;
+mod vectors;
 
 pub use alloc_tracker::{assert_no_allocs_after_warmup, CountingAlloc};
 pub use annexb::AnnexB;
@@ -31,3 +32,4 @@ pub use oracle::Oracle;
 pub use report::{Outcome, Report};
 pub use suite::{Case, Suite};
 pub use synth::Synth;
+pub use vectors::bench_dir;
