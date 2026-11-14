@@ -761,48 +761,22 @@ impl InputLayout {
         let [y, u, v] = frame.planes() else {
             return Err(self.mismatch(frame));
         };
+        let width = self.size.width();
+        let height = self.size.height();
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
         let mut packed = Vec::new();
+        let _reserved = packed.try_reserve_exact(self.packed_len());
         match self.layout {
             Layout::Planar => {
                 let half = self.stride / 2;
-                Self::copy_rows(
-                    &mut packed,
-                    y,
-                    self.size.width(),
-                    self.size.height(),
-                    self.stride,
-                )?;
-                Self::copy_rows(
-                    &mut packed,
-                    u,
-                    self.size.width().div_ceil(2),
-                    self.size.height().div_ceil(2),
-                    half,
-                )?;
-                Self::copy_rows(
-                    &mut packed,
-                    v,
-                    self.size.width().div_ceil(2),
-                    self.size.height().div_ceil(2),
-                    half,
-                )?;
+                Self::copy_rows(&mut packed, y, width, height, self.stride)?;
+                Self::copy_rows(&mut packed, u, chroma_width, chroma_height, half)?;
+                Self::copy_rows(&mut packed, v, chroma_width, chroma_height, half)?;
             }
             Layout::Nv12 => {
-                Self::copy_rows(
-                    &mut packed,
-                    y,
-                    self.size.width(),
-                    self.size.height(),
-                    self.stride,
-                )?;
-                Self::interleave_rows(
-                    &mut packed,
-                    u,
-                    v,
-                    self.size.width().div_ceil(2),
-                    self.size.height().div_ceil(2),
-                    self.stride,
-                )?;
+                Self::copy_rows(&mut packed, y, width, height, self.stride)?;
+                Self::interleave_rows(&mut packed, u, v, chroma_width, chroma_height, self.stride)?;
             }
         }
         Ok(Bytes::from(packed))
@@ -826,6 +800,27 @@ impl InputLayout {
         }
     }
 
+    /// Packed byte count for this layout.
+    fn packed_len(&self) -> usize {
+        let width = usize::try_from(self.size.width()).unwrap_or(usize::MAX);
+        let height = usize::try_from(self.size.height()).unwrap_or(usize::MAX);
+        let chroma_width = usize::try_from(self.size.width().div_ceil(2)).unwrap_or(usize::MAX);
+        let chroma_height = usize::try_from(self.size.height().div_ceil(2)).unwrap_or(usize::MAX);
+        let stride = usize::try_from(self.stride).unwrap_or(usize::MAX);
+        let y = width.max(stride).saturating_mul(height);
+        let chroma = match self.layout {
+            Layout::Planar => chroma_width
+                .max(stride / 2)
+                .saturating_mul(chroma_height)
+                .saturating_mul(2),
+            Layout::Nv12 => chroma_width
+                .saturating_mul(2)
+                .max(stride)
+                .saturating_mul(chroma_height),
+        };
+        y.saturating_add(chroma)
+    }
+
     /// Plane rows copied into `dst`, padded to `pitch`.
     fn copy_rows(
         dst: &mut Vec<u8>,
@@ -838,11 +833,13 @@ impl InputLayout {
         let row = usize::try_from(width).unwrap_or(usize::MAX);
         let rows = usize::try_from(height).unwrap_or(usize::MAX);
         let pitch = usize::try_from(pitch).unwrap_or(usize::MAX);
+        let pad = pitch.saturating_sub(row);
+        let src = plane.data();
         for r in 0..rows {
             let start = r.saturating_mul(stride);
             let end = start.saturating_add(row);
-            dst.extend_from_slice(&plane.data()[start..end]);
-            dst.extend(std::iter::repeat_n(0, pitch.saturating_sub(row)));
+            dst.extend_from_slice(&src[start..end]);
+            dst.extend(std::iter::repeat_n(0, pad));
         }
         Ok(())
     }
@@ -861,19 +858,19 @@ impl InputLayout {
         let row = usize::try_from(width).unwrap_or(usize::MAX);
         let rows = usize::try_from(height).unwrap_or(usize::MAX);
         let pitch = usize::try_from(pitch).unwrap_or(usize::MAX);
+        let pad = pitch.saturating_sub(row.saturating_mul(2));
+        let u_src = u.data();
+        let v_src = v.data();
         for r in 0..rows {
             let u_start = r.saturating_mul(u_stride);
             let v_start = r.saturating_mul(v_stride);
-            let u_row = &u.data()[u_start..u_start.saturating_add(row)];
-            let v_row = &v.data()[v_start..v_start.saturating_add(row)];
+            let u_row = &u_src[u_start..u_start.saturating_add(row)];
+            let v_row = &v_src[v_start..v_start.saturating_add(row)];
             for (u_byte, v_byte) in u_row.iter().zip(v_row.iter()) {
                 dst.push(*u_byte);
                 dst.push(*v_byte);
             }
-            dst.extend(std::iter::repeat_n(
-                0,
-                pitch.saturating_sub(row.saturating_mul(2)),
-            ));
+            dst.extend(std::iter::repeat_n(0, pad));
         }
         Ok(())
     }
