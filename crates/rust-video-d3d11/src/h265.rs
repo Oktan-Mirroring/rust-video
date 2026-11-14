@@ -4,7 +4,7 @@
 
 use crate::bits::BitReader;
 use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
-use crate::h264::{rbsp, split_nals, Crop};
+use crate::h264::{rbsp, rbsp_prefix, split_nals, Crop, HEADER_PREFIX};
 
 /// Sequence set count, H.265 7.4.3.2.1.
 pub(crate) const MAX_SPS: usize = 16;
@@ -2526,20 +2526,21 @@ impl Ingest {
         temporal_id: u8,
         pictures: &mut Vec<Picture>,
     ) -> Result<(), D3d11Error> {
-        let bytes = rbsp(nal);
-        let Some(body) = bytes.get(2..) else {
+        let mut prefix_buf = [0u8; HEADER_PREFIX];
+        let prefix_body = rbsp_prefix(nal, &mut prefix_buf);
+        let Some(prefix_body) = prefix_body.get(2..) else {
             return Err(D3d11Error::Parse(ParseReason::SliceWithoutHeader));
         };
-        let mut reader = BitReader::new(body);
-        let prefix = parse_slice_prefix(&mut reader, nal_type)?;
-        let pps_id = prefix.2;
-        let pps = self
-            .pps(pps_id)
-            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownPps))?;
-        let sps = self
-            .sps(pps.sps_id)
-            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownSps))?;
-        let parsed = parse_slice_rest(&mut reader, prefix, nal_type, sps, pps)?;
+        let (parsed, pps_id) = match self.parse_vcl(prefix_body, nal_type) {
+            Err(D3d11Error::Parse(ParseReason::Truncated { .. })) => {
+                let bytes = rbsp(nal);
+                let Some(body) = bytes.get(2..) else {
+                    return Err(D3d11Error::Parse(ParseReason::SliceWithoutHeader));
+                };
+                self.parse_vcl(body, nal_type)?
+            }
+            parsed => parsed?,
+        };
         if parsed.first && !self.pending.is_empty() {
             if let Some(picture) = self.complete_picture()? {
                 pictures.push(picture);
@@ -2553,6 +2554,23 @@ impl Ingest {
             pps_id,
         });
         Ok(())
+    }
+
+    /// Slice header plus set id over an RBSP `body` with the NAL header stripped.
+    fn parse_vcl(&self, body: &[u8], nal_type: u8) -> Result<(SliceHeader, u8), D3d11Error> {
+        let mut reader = BitReader::new(body);
+        let prefix = parse_slice_prefix(&mut reader, nal_type)?;
+        let pps_id = prefix.2;
+        let pps = self
+            .pps(pps_id)
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownPps))?;
+        let sps = self
+            .sps(pps.sps_id)
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownSps))?;
+        Ok((
+            parse_slice_rest(&mut reader, prefix, nal_type, sps, pps)?,
+            pps_id,
+        ))
     }
 
     /// Video set id into the store.

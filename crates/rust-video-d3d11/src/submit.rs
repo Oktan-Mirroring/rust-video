@@ -317,6 +317,19 @@ fn copy_nv12(
     // Sound: the pitch and extents bound every row inside the mapped staging texture.
     unsafe {
         let base = mapped.pData.cast::<u8>();
+        if pitch == visible_width && left == 0 {
+            let y_src = base.add(top * pitch);
+            bytes.extend_from_slice(std::slice::from_raw_parts(
+                y_src,
+                visible_width * visible_height,
+            ));
+            let chroma = base.add(height * pitch + top * pitch / 2);
+            bytes.extend_from_slice(std::slice::from_raw_parts(
+                chroma,
+                visible_width * (visible_height / 2),
+            ));
+            return Ok(Bytes::from(bytes));
+        }
         for row in 0..visible_height {
             let src = base.add(top * pitch + row * pitch + left);
             bytes.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
@@ -388,6 +401,31 @@ mod tests {
         };
         let tight = copy_nv12(&view, 4, 2, Some(crop)).expect("tight");
         assert_eq!(tight.as_ref(), &[3, 4, 7, 8, 11, 12]);
+    }
+
+    #[test]
+    fn copy_tight_pitch() {
+        let mut staged: Vec<u8> = (1..=24).collect();
+        let view = mapped(&mut staged, 4);
+        let tight = copy_nv12(&view, 4, 4, None).expect("tight");
+        assert_eq!(tight.as_ref(), &(1..=24).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn copy_tight_pitch_applies_crop() {
+        let mut staged: Vec<u8> = (1..=24).collect();
+        let view = mapped(&mut staged, 4);
+        let crop = Crop {
+            left: 0,
+            right: 0,
+            top: 2,
+            bottom: 0,
+        };
+        let tight = copy_nv12(&view, 4, 4, Some(crop)).expect("tight");
+        assert_eq!(
+            tight.as_ref(),
+            &[9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24]
+        );
     }
 
     #[test]

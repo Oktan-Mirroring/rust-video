@@ -208,33 +208,17 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the bytes miss the extent, or when
+    /// Returns `Err` when the extent overflows the sample buffer, or when
     /// the transform refuses the frame.
     pub fn encode(
         &mut self,
         width: u32,
         height: u32,
-        nv12: &[u8],
-    ) -> Result<Vec<Packet>, D3d11Error> {
-        self.encode_windows(width, height, nv12)
-    }
-
-    /// Packets coded from one NV12 frame of `width` x `height`.
-    fn encode_windows(
-        &mut self,
-        width: u32,
-        height: u32,
-        nv12: &[u8],
+        fill: impl FnOnce(&mut [u8]),
     ) -> Result<Vec<Packet>, D3d11Error> {
         let _com = ComGuard::enter();
-        let expect = nv12_len(width, height);
-        if u64::try_from(nv12.len()).unwrap_or(0) != expect {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::PackedNv12OutsideExtent,
-            ));
-        }
         let mut packets = self.ensure_size(width, height)?;
-        let sample = input_sample(nv12, self.in_align, self.pts)?;
+        let sample = input_sample(nv12_len(width, height), self.in_align, self.pts, fill)?;
         self.submit_sample(&sample, &mut packets)?;
         Ok(packets)
     }
@@ -1356,9 +1340,14 @@ fn u32_flag(bits: i32) -> u32 {
     u32::try_from(bits).unwrap_or(0)
 }
 
-/// Input sample over `nv12` stamped at `pts`.
-fn input_sample(nv12: &[u8], align: u32, pts: i64) -> Result<IMFSample, D3d11Error> {
-    let len = u32::try_from(nv12.len())
+/// Input sample over `len` bytes stamped at `pts`, filled by `fill`.
+fn input_sample(
+    len: u64,
+    align: u32,
+    pts: i64,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<IMFSample, D3d11Error> {
+    let len = u32::try_from(len)
         .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::FrameOver4Gib))?;
     // Sound: the sample and buffer are live for every set below.
     let sample = call(unsafe { MFCreateSample() }, "MFCreateSample")?;
@@ -1372,9 +1361,7 @@ fn input_sample(nv12: &[u8], align: u32, pts: i64) -> Result<IMFSample, D3d11Err
         "Lock",
     )?;
     // Sound: the lock spans `len` bytes.
-    unsafe {
-        data.copy_from_nonoverlapping(nv12.as_ptr(), nv12.len());
-    }
+    fill(unsafe { std::slice::from_raw_parts_mut(data, usize::try_from(len).unwrap_or(0)) });
     call(unsafe { buffer.Unlock() }, "Unlock")?;
     call(unsafe { buffer.SetCurrentLength(len) }, "SetCurrentLength")?;
     call(unsafe { sample.AddBuffer(&buffer) }, "AddBuffer")?;

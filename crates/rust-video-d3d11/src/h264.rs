@@ -41,22 +41,27 @@ const DEFAULT_8X8_INTER: [u8; 64] = [
 pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut start = 0;
-    let mut zeros = 0;
     let mut index = 0;
     while index < data.len() {
-        if data[index] == 1 && zeros >= 2 {
-            let end = index - zeros;
+        let mut next = index;
+        while next < data.len() && data[next] != 1 {
+            next += 1;
+        }
+        if next == data.len() {
+            break;
+        }
+        let mut zeros = 0;
+        while next - zeros > index && data[next - zeros - 1] == 0 {
+            zeros += 1;
+        }
+        if zeros >= 2 {
+            let end = next - zeros;
             if end > start {
                 nals.push(&data[start..end]);
             }
-            start = index + 1;
-            zeros = 0;
-        } else if data[index] == 0 {
-            zeros += 1;
-        } else {
-            zeros = 0;
+            start = next + 1;
         }
-        index += 1;
+        index = next + 1;
     }
     if start < data.len() {
         nals.push(&data[start..]);
@@ -80,6 +85,28 @@ pub(crate) fn rbsp(nal: &[u8]) -> Cow<'_, [u8]> {
         zeros = if byte == 0 { zeros + 1 } else { 0 };
     }
     Cow::Owned(out)
+}
+
+/// Slice-header scan bound in RBSP bytes.
+pub(crate) const HEADER_PREFIX: usize = 1024;
+
+/// RBSP bytes of `nal` stripped into `buf`, stopping when `buf` fills.
+pub(crate) fn rbsp_prefix<'b>(nal: &[u8], buf: &'b mut [u8]) -> &'b [u8] {
+    let mut zeros = 0;
+    let mut len = 0;
+    for &byte in nal {
+        if len == buf.len() {
+            break;
+        }
+        if zeros == 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        buf[len] = byte;
+        len += 1;
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    &buf[..len]
 }
 
 /// True when `nal` holds an emulation prevention byte.
@@ -1445,19 +1472,21 @@ impl Ingest {
         pictures: &mut Vec<Picture>,
     ) -> Result<(), D3d11Error> {
         let idr = header & 0x1F == 5;
-        let bytes = rbsp(nal);
-        let Some(body) = bytes.get(1..) else {
+        let mut prefix_buf = [0u8; HEADER_PREFIX];
+        let prefix_body = rbsp_prefix(nal, &mut prefix_buf);
+        let Some(prefix_body) = prefix_body.get(1..) else {
             return Err(D3d11Error::Parse(ParseReason::SliceWithoutHeader));
         };
-        let mut reader = BitReader::new(body);
-        let prefix = parse_slice_prefix(&mut reader)?;
-        let pps = self
-            .pps(prefix.3)
-            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownPps))?;
-        let sps = self
-            .sps(pps.seq_parameter_set_id)
-            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownSps))?;
-        let parsed = parse_slice_rest(&mut reader, prefix, idr, ref_idc, sps, pps)?;
+        let parsed = match self.parse_vcl(prefix_body, idr, ref_idc) {
+            Err(D3d11Error::Parse(ParseReason::Truncated { .. })) => {
+                let bytes = rbsp(nal);
+                let Some(body) = bytes.get(1..) else {
+                    return Err(D3d11Error::Parse(ParseReason::SliceWithoutHeader));
+                };
+                self.parse_vcl(body, idr, ref_idc)?
+            }
+            parsed => parsed?,
+        };
         if parsed.first_mb == 0 && !self.pending.is_empty() {
             if let Some(picture) = self.complete_picture()? {
                 pictures.push(picture);
@@ -1470,6 +1499,19 @@ impl Ingest {
             idr,
         });
         Ok(())
+    }
+
+    /// Slice header over an RBSP `body` with the NAL header stripped.
+    fn parse_vcl(&self, body: &[u8], idr: bool, ref_idc: u8) -> Result<SliceHeader, D3d11Error> {
+        let mut reader = BitReader::new(body);
+        let prefix = parse_slice_prefix(&mut reader)?;
+        let pps = self
+            .pps(prefix.3)
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownPps))?;
+        let sps = self
+            .sps(pps.seq_parameter_set_id)
+            .ok_or(D3d11Error::Parse(ParseReason::SliceCitesUnknownSps))?;
+        parse_slice_rest(&mut reader, prefix, idr, ref_idc, sps, pps)
     }
 
     /// Sequence set into the store.
@@ -1547,8 +1589,8 @@ impl Ingest {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_pps, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, split_nals, Ingest,
-        Marking, PocType, SlicePoc, SliceType, Sps, DEFAULT_4X4_INTRA,
+        parse_pps, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, rbsp_prefix, split_nals,
+        Ingest, Marking, PocType, SlicePoc, SliceType, Sps, DEFAULT_4X4_INTRA,
     };
 
     /// Test bit writer with emulation prevention.
@@ -1747,6 +1789,18 @@ mod tests {
     }
 
     #[test]
+    fn split_nals_edges_match() {
+        assert_eq!(split_nals(b""), [] as [&[u8]; 0]);
+        assert_eq!(split_nals(b"\0\0\x01"), [] as [&[u8]; 0]);
+        assert_eq!(split_nals(b"\0\0\x01\0\0\x01"), [] as [&[u8]; 0]);
+        assert_eq!(split_nals(b"\x01\0\0\x01"), vec![b"\x01".as_slice()]);
+        assert_eq!(
+            split_nals(b"\x67\0\x01\x68\0\0\0\x01\x69"),
+            vec![b"\x67\0\x01\x68".as_slice(), b"\x69".as_slice()]
+        );
+    }
+
+    #[test]
     fn rbsp_removes_prevention_bytes() {
         assert_eq!(
             rbsp(&[0, 0, 3, 1, 0, 0, 3, 0, 5]).into_owned(),
@@ -1758,6 +1812,16 @@ mod tests {
     fn rbsp_borrows_without_prevention_bytes() {
         let nal = [0x65, 0x88, 0x00, 0x02];
         assert!(matches!(rbsp(&nal), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn rbsp_prefix_matches_full_strip() {
+        let nal = [0x65, 0, 0, 3, 1, 0, 0, 3, 0, 5, 9, 9, 9];
+        let full = rbsp(&nal).into_owned();
+        let mut buf = [0u8; 8];
+        assert_eq!(rbsp_prefix(&nal, &mut buf), &full[..8]);
+        let mut buf = [0u8; 64];
+        assert_eq!(rbsp_prefix(&nal, &mut buf), full.as_slice());
     }
 
     #[test]

@@ -120,8 +120,9 @@ impl Encoder for D3d11Encoder {
     type Error = D3d11Error;
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, D3d11Error> {
-        let (width, height, nv12) = pack_nv12(frame)?;
-        self.session.encode(width, height, &nv12)
+        let planes = Planes::of(frame)?;
+        let (width, height) = (planes.width(), planes.height());
+        self.session.encode(width, height, |dst| planes.fill(dst))
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, D3d11Error> {
@@ -129,43 +130,92 @@ impl Encoder for D3d11Encoder {
     }
 }
 
-/// Contiguous NV12 bytes plus extents for `frame`.
+/// Validated NV12 plane views over one frame.
 #[cfg(target_os = "windows")]
-fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d11Error> {
-    if frame.format() != PixelFormat::Nv12 {
-        return Err(D3d11Error::Unsupported(
-            UnsupportedReason::EncoderInputNotNv12 {
-                format: frame.format(),
-            },
-        ));
-    }
-    let width = frame.size().width();
-    let height = frame.size().height();
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
-    }
-    let planes = frame.planes();
-    let (Some(y), Some(uv)) = (planes.first(), planes.get(1)) else {
-        return Err(D3d11Error::Unsupported(
-            UnsupportedReason::Nv12WithoutTwoPlanes,
-        ));
-    };
-    let capacity = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2).unwrap_or(0);
-    let mut nv12 = Vec::with_capacity(capacity);
-    copy_plane(y.data(), y.stride(), width, height, &mut nv12)?;
-    copy_plane(uv.data(), uv.stride(), width, height / 2, &mut nv12)?;
-    Ok((width, height, nv12))
+struct Planes<'a> {
+    /// Frame width in luma samples.
+    width: u32,
+    /// Frame height in luma samples.
+    height: u32,
+    /// Luma bytes in row-major order.
+    y: &'a [u8],
+    /// Luma bytes per row.
+    y_stride: u32,
+    /// Chroma bytes in row-major order.
+    uv: &'a [u8],
+    /// Chroma bytes per row.
+    uv_stride: u32,
 }
 
-/// `rows` of `width` bytes from a strided `data` plane into `out`.
 #[cfg(target_os = "windows")]
-fn copy_plane(
-    data: &[u8],
-    stride: u32,
-    width: u32,
-    rows: u32,
-    out: &mut Vec<u8>,
-) -> Result<(), D3d11Error> {
+impl<'a> Planes<'a> {
+    /// Validated views over `frame`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a foreign format, an odd extent, a missing
+    /// plane, a stride below the width, or a plane short of its stride.
+    fn of(frame: &'a CpuFrame) -> Result<Self, D3d11Error> {
+        if frame.format() != PixelFormat::Nv12 {
+            return Err(D3d11Error::Unsupported(
+                UnsupportedReason::EncoderInputNotNv12 {
+                    format: frame.format(),
+                },
+            ));
+        }
+        let width = frame.size().width();
+        let height = frame.size().height();
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
+        }
+        let planes = frame.planes();
+        let (Some(y), Some(uv)) = (planes.first(), planes.get(1)) else {
+            return Err(D3d11Error::Unsupported(
+                UnsupportedReason::Nv12WithoutTwoPlanes,
+            ));
+        };
+        check_plane(y.data(), y.stride(), width, height)?;
+        check_plane(uv.data(), uv.stride(), width, height / 2)?;
+        Ok(Self {
+            width,
+            height,
+            y: y.data(),
+            y_stride: y.stride(),
+            uv: uv.data(),
+            uv_stride: uv.stride(),
+        })
+    }
+
+    /// Frame width in luma samples.
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Frame height in luma samples.
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Contiguous NV12 bytes into `dst`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `dst` is shorter than the packed frame.
+    fn fill(&self, dst: &mut [u8]) {
+        let y_len = usize::try_from(u64::from(self.width) * u64::from(self.height)).unwrap_or(0);
+        let (y_dst, uv_dst) = dst.split_at_mut(y_len);
+        copy_rows(self.y, self.y_stride, self.width, self.height, y_dst);
+        copy_rows(self.uv, self.uv_stride, self.width, self.height / 2, uv_dst);
+    }
+}
+
+/// Validated `rows` of `width` bytes inside a strided `data` plane.
+///
+/// # Errors
+///
+/// Returns `Err` for a stride below the width or a plane short of its stride.
+#[cfg(target_os = "windows")]
+fn check_plane(data: &[u8], stride: u32, width: u32, rows: u32) -> Result<(), D3d11Error> {
     let stride_64 = u64::from(stride);
     let width_64 = u64::from(width);
     if stride_64 < width_64 {
@@ -181,18 +231,28 @@ fn copy_plane(
             UnsupportedReason::PlaneShortOfStride,
         ));
     }
+    Ok(())
+}
+
+/// `rows` of `width` bytes from a validated strided `data` plane into `dst`.
+#[cfg(target_os = "windows")]
+fn copy_rows(data: &[u8], stride: u32, width: u32, rows: u32, dst: &mut [u8]) {
     let stride = usize::try_from(stride).unwrap_or(0);
     let width = usize::try_from(width).unwrap_or(0);
     let rows = usize::try_from(rows).unwrap_or(0);
-    for chunk in data.chunks(stride).take(rows) {
-        out.extend_from_slice(&chunk[..width]);
+    if stride == width {
+        let total = width.saturating_mul(rows);
+        dst[..total].copy_from_slice(&data[..total]);
+        return;
     }
-    Ok(())
+    for (row, chunk) in data.chunks(stride).take(rows).enumerate() {
+        dst[row * width..(row + 1) * width].copy_from_slice(&chunk[..width]);
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{copy_plane, pack_nv12};
+    use super::{check_plane, Planes};
 
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
@@ -222,7 +282,7 @@ mod tests {
         )
         .expect("frame");
         assert!(matches!(
-            pack_nv12(&frame),
+            Planes::of(&frame),
             Err(crate::error::D3d11Error::Unsupported(_))
         ));
     }
@@ -230,9 +290,9 @@ mod tests {
     #[test]
     fn pack_rejects_odd_extent() {
         let frame = nv12(3, 4, 3, vec![0; 12], vec![0; 6]);
-        assert!(pack_nv12(&frame).is_err());
+        assert!(Planes::of(&frame).is_err());
         let frame = nv12(4, 3, 4, vec![0; 12], vec![0; 4]);
-        assert!(pack_nv12(&frame).is_err());
+        assert!(Planes::of(&frame).is_err());
     }
 
     #[test]
@@ -240,9 +300,11 @@ mod tests {
         let y: Vec<u8> = (0..16).collect();
         let uv: Vec<u8> = (16..24).collect();
         let frame = nv12(4, 4, 4, y, uv);
-        let (width, height, nv12) = pack_nv12(&frame).expect("packed");
-        assert_eq!((width, height), (4, 4));
-        assert_eq!(nv12, (0..24).collect::<Vec<u8>>());
+        let planes = Planes::of(&frame).expect("views");
+        assert_eq!((planes.width(), planes.height()), (4, 4));
+        let mut dst = vec![0; 24];
+        planes.fill(&mut dst);
+        assert_eq!(dst, (0..24).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -250,19 +312,19 @@ mod tests {
         let y = vec![1, 2, 9, 9, 3, 4, 9, 9];
         let uv = vec![5, 6, 9, 9];
         let frame = nv12(2, 2, 4, y, uv);
-        let (_, _, nv12) = pack_nv12(&frame).expect("packed");
-        assert_eq!(nv12, vec![1, 2, 3, 4, 5, 6]);
+        let planes = Planes::of(&frame).expect("views");
+        let mut dst = vec![0; 6];
+        planes.fill(&mut dst);
+        assert_eq!(dst, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
     fn pack_rejects_narrow_stride() {
-        let mut out = Vec::new();
-        assert!(copy_plane(&[0; 8], 2, 4, 2, &mut out).is_err());
+        assert!(check_plane(&[0; 8], 2, 4, 2).is_err());
     }
 
     #[test]
     fn pack_rejects_short_plane() {
-        let mut out = Vec::new();
-        assert!(copy_plane(&[0; 5], 4, 4, 2, &mut out).is_err());
+        assert!(check_plane(&[0; 5], 4, 4, 2).is_err());
     }
 }
