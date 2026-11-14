@@ -98,13 +98,7 @@ impl Session {
         std_version: &vk::ExtensionProperties,
         template: &mut crate::session::params::ParamsTemplate<'_>,
     ) -> Result<Self, VulkanError> {
-        let (coded_w, coded_h) = geometry.coded();
-        let (display_w, display_h) = geometry.display();
-        if display_w > coded_w || display_h > coded_h {
-            return Err(VulkanError::OverCaps {
-                what: "crop window",
-            });
-        }
+        check_crop_window(geometry)?;
         let raw = device.raw().device();
         let properties =
             crate::raw::RawDevice::memory_properties(device.backend(), device.adapter());
@@ -535,6 +529,22 @@ impl Session {
 /// Checked narrowing of an index to `u32`.
 pub(crate) fn narrow_u32(value: usize, syntax: &'static str) -> Result<u32, VulkanError> {
     u32::try_from(value).map_err(|_| crate::error::ParseError::OutOfRange { syntax }.into())
+}
+
+/// `Err` when the display window escapes the coded extent.
+///
+/// # Errors
+///
+/// Returns `Err` when `geometry` displays outside its coded extent.
+fn check_crop_window(geometry: &SessionGeometry) -> Result<(), VulkanError> {
+    let (coded_w, coded_h) = geometry.coded();
+    let (display_w, display_h) = geometry.display();
+    if display_w > coded_w || display_h > coded_h {
+        return Err(VulkanError::OverCaps {
+            what: "crop window",
+        });
+    }
+    Ok(())
 }
 
 /// `(u32, u32)` as a Vulkan extent.
