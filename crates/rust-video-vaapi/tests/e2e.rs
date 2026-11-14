@@ -225,7 +225,7 @@ fn to_planar(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 /// Decode one packet per sample.
 fn decode_stream(
-    decoder: &mut H264Decoder<'_>,
+    decoder: &mut impl Decoder<Frame = VaApiFrame, Error = VaApiError>,
     stream: &Stream,
 ) -> Result<Vec<VaApiFrame>, VaApiError> {
     let mut frames = Vec::new();
@@ -385,19 +385,20 @@ fn demux_matches_ffmpeg_remux_h265() {
 
 #[cfg(have_corpus)]
 #[cfg(target_os = "linux")]
-#[cfg(have_corpus)]
-#[cfg(target_os = "linux")]
 #[test]
-fn h265_frontend_gap_is_loud() {
+fn vaapi_decodes_synth_main() {
+    let Some(device) = device() else {
+        return;
+    };
     let path = corpus().join("synth/h265/h265-main.mp4");
     let stream = Stream::demux(&path).expect("demux synth main");
-    assert!(!stream.samples.is_empty());
-    let mut decoder = H265Decoder;
-    let packet = Packet::new(Bytes::copy_from_slice(&stream.samples[0]));
-    let Err(VaApiError::Unsupported(message)) = decoder.decode(&packet) else {
-        panic!("staged frontend declines");
-    };
-    assert!(message.contains("h265"), "loud codec name: {message}");
+    assert_ne!(stream.samples.len(), 0);
+    let mut decoder = H265Decoder::open(&device);
+    let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
+    assert_eq!(frames.len(), stream.samples.len());
+    for frame in &frames {
+        assert_eq!(frame.identity().format(), PixelFormat::Nv12);
+    }
 }
 
 #[cfg(have_corpus)]
@@ -534,7 +535,7 @@ fn vaapi_encodes_h265_keyframes() {
         let frame = Synth::gradient(size, index);
         for packet in encoder.encode(&frame).expect("encode") {
             assert!(packet.is_keyframe(), "all-intra keyframe");
-            assert!(!packet.data().is_empty());
+            assert_ne!(packet.data(), []);
             annex_b.extend_from_slice(packet.data());
             coded += 1;
         }
