@@ -1730,8 +1730,11 @@ fn parse_tile_widths(
     Ok(widths)
 }
 
-/// Picture deblocking offsets, zeroed without override.
+/// Picture deblocking offsets, zeroed without control data.
 fn parse_pps_deblocking(reader: &mut BitReader, flags: &mut u32) -> Result<(i8, i8), D3d11Error> {
+    if !reader.read_bit("deblocking_filter_control_present_flag")? {
+        return Ok((0, 0));
+    }
     if !reader.read_bit("deblocking_filter_override_enabled_flag")? {
         return Ok((0, 0));
     }
