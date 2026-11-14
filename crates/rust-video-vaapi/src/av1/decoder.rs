@@ -260,16 +260,15 @@ impl<'a> Av1Decoder<'a> {
         if self.slice_params.is_empty() {
             return Err(VaApiError::Parse("frame without tiles".to_owned()));
         }
-        let param_bytes: Vec<&[u8]> = self.slice_params.iter().map(bytes_of).collect();
         let backend = self
             .backend
             .as_mut()
             .ok_or_else(|| VaApiError::Parse("decode before sequence header".to_owned()))?;
-        backend.submit_raw(
+        backend.submit_slices(
             surface,
             bytes_of(&picture_params),
             None,
-            &param_bytes,
+            &self.slice_params,
             |index| payloads[index],
         )
     }
@@ -283,15 +282,14 @@ impl<'a> Av1Decoder<'a> {
         readback: bool,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        let (mut emitted, generation) = VaApiFrame::emit(
+        self.generation = VaApiFrame::emit_into(
             self.device,
             backend,
             shared,
             Emit::new(slots, size, (0, 0, size.0, size.1), readback),
+            frames,
             self.generation,
         )?;
-        frames.append(&mut emitted);
-        self.generation = generation;
         Ok(())
     }
 

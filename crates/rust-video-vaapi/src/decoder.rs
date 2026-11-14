@@ -339,15 +339,14 @@ impl<'a> H264Decoder<'a> {
         readback: bool,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        let (mut emitted, generation) = VaApiFrame::emit(
+        self.generation = VaApiFrame::emit_into(
             self.device,
             backend,
             shared,
             Emit::new(slots, size, crop, readback),
+            frames,
             self.generation,
         )?;
-        frames.append(&mut emitted);
-        self.generation = generation;
         Ok(())
     }
 
@@ -427,25 +426,26 @@ pub struct VaApiFrame {
 }
 
 impl VaApiFrame {
-    /// Output frames for `emit`, returning the frames and the next generation.
+    /// Output frames for `emit` appended to `frames`, returning the next generation.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a slot left the pool, the size is empty, or
     /// the budget refuses the bytes.
-    pub(crate) fn emit(
+    pub(crate) fn emit_into(
         device: &VaApiDevice,
         backend: &Backend,
         shared: &SharedDevice,
         emit: Emit,
+        frames: &mut Vec<Self>,
         generation: u64,
-    ) -> Result<(Vec<Self>, u64), VaApiError> {
+    ) -> Result<u64, VaApiError> {
         let frame_size =
             PictureSize::new(emit.size.0, emit.size.1).ok_or(VaApiError::BadExtent {
                 width: emit.size.0,
                 height: emit.size.1,
             })?;
-        let mut frames = Vec::with_capacity(emit.slots.len());
+        frames.reserve(emit.slots.len());
         let mut generation = generation;
         for slot in emit.slots {
             let surface = backend
@@ -476,7 +476,7 @@ impl VaApiFrame {
             });
             generation = generation.wrapping_add(1);
         }
-        Ok((frames, generation))
+        Ok(generation)
     }
 
     /// Frame identity.

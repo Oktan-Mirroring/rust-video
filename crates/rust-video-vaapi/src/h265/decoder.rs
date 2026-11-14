@@ -30,6 +30,12 @@ pub struct H265Decoder<'a> {
     generation: u64,
     /// Scratch slice parameters, reused across pictures.
     slice_params: Vec<VaSliceParameterBufferHevc>,
+    /// Scratch list-zero indices, reused across slices.
+    list0: Vec<Option<usize>>,
+    /// Scratch list-one indices, reused across slices.
+    list1: Vec<Option<usize>>,
+    /// Scratch temporary list, reused across slices.
+    temp: Vec<Option<usize>>,
 }
 
 impl<'a> H265Decoder<'a> {
@@ -43,6 +49,9 @@ impl<'a> H265Decoder<'a> {
             shared: None,
             generation: 0,
             slice_params: Vec::new(),
+            list0: Vec::new(),
+            list1: Vec::new(),
+            temp: Vec::new(),
         }
     }
 
@@ -222,27 +231,31 @@ impl<'a> H265Decoder<'a> {
         self.slice_params.clear();
         let slices = picture.slices();
         for (index, slice) in slices.iter().enumerate() {
-            let (list0, list1) = picture.rps().lists(slice.header())?;
+            picture.rps().lists_into(
+                slice.header(),
+                &mut self.list0,
+                &mut self.list1,
+                &mut self.temp,
+            )?;
             self.slice_params.push(params.slice(
                 slice.header(),
                 slice.data().len(),
-                &list0,
-                &list1,
+                &self.list0,
+                &self.list1,
                 picture.sps(),
                 index + 1 == slices.len(),
             )?);
         }
         debug_assert_eq!(self.slice_params.len(), slices.len());
-        let param_bytes: Vec<&[u8]> = self.slice_params.iter().map(bytes_of).collect();
         let backend = self
             .backend
             .as_mut()
             .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
-        backend.submit_raw(
+        backend.submit_slices(
             surface,
             bytes_of(&picture_params),
             matrix.as_ref().map(bytes_of),
-            &param_bytes,
+            &self.slice_params,
             |index| picture.slices()[index].data(),
         )
     }
@@ -269,15 +282,14 @@ impl<'a> H265Decoder<'a> {
         readback: bool,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        let (mut emitted, generation) = VaApiFrame::emit(
+        self.generation = VaApiFrame::emit_into(
             self.device,
             backend,
             shared,
             Emit::new(slots, size, crop, readback),
+            frames,
             self.generation,
         )?;
-        frames.append(&mut emitted);
-        self.generation = generation;
         Ok(())
     }
 

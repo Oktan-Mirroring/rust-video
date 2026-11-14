@@ -59,6 +59,7 @@ pub struct PendingPicture {
 }
 
 /// Reference lists of one slice: list 0 and list 1 as DPB indices.
+#[cfg(test)]
 type RefLists = (Vec<Option<usize>>, Vec<Option<usize>>);
 
 /// Reference sets of one picture as DPB indices, per 8.3.2.
@@ -113,66 +114,91 @@ impl Rps {
     ///
     /// Returns `Err` when a modification entry points outside the
     /// temporary list.
+    #[cfg(test)]
     pub fn lists(&self, header: &SliceHeader) -> Result<RefLists, VaApiError> {
-        if header.type_.is_i() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        let temp0 = self.temp_list0(header);
-        let list0 = Self::modified(
-            &temp0,
-            header.ref_pic_list_modification.modification_flag_l0,
-            &header.ref_pic_list_modification.list_entry_l0,
-            header.num_ref_idx_l0_active_minus1,
-        )?;
-        if !header.type_.is_b() {
-            return Ok((list0, Vec::new()));
-        }
-        let temp1 = self.temp_list1(header);
-        let list1 = Self::modified(
-            &temp1,
-            header.ref_pic_list_modification.modification_flag_l1,
-            &header.ref_pic_list_modification.list_entry_l1,
-            header.num_ref_idx_l1_active_minus1,
-        )?;
+        let mut list0 = Vec::new();
+        let mut list1 = Vec::new();
+        let mut temp = Vec::new();
+        self.lists_into(header, &mut list0, &mut list1, &mut temp)?;
         Ok((list0, list1))
     }
 
-    /// Temporary list 0 per 8-8.
-    fn temp_list0(&self, header: &SliceHeader) -> Vec<Option<usize>> {
-        let mut temp = Vec::new();
+    /// Reference lists for `header`, rebuilt in `list0`/`list1`.
+    ///
+    /// `temp` stages one temporary list at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a modification entry points outside the
+    /// temporary list.
+    pub fn lists_into(
+        &self,
+        header: &SliceHeader,
+        list0: &mut Vec<Option<usize>>,
+        list1: &mut Vec<Option<usize>>,
+        temp: &mut Vec<Option<usize>>,
+    ) -> Result<(), VaApiError> {
+        if header.type_.is_i() {
+            list0.clear();
+            list1.clear();
+            return Ok(());
+        }
+        self.temp_list0_into(header, temp);
+        Self::modified_into(
+            temp,
+            header.ref_pic_list_modification.modification_flag_l0,
+            &header.ref_pic_list_modification.list_entry_l0,
+            header.num_ref_idx_l0_active_minus1,
+            list0,
+        )?;
+        if !header.type_.is_b() {
+            list1.clear();
+            return Ok(());
+        }
+        self.temp_list1_into(header, temp);
+        Self::modified_into(
+            temp,
+            header.ref_pic_list_modification.modification_flag_l1,
+            &header.ref_pic_list_modification.list_entry_l1,
+            header.num_ref_idx_l1_active_minus1,
+            list1,
+        )
+    }
+
+    /// Temporary list 0 per 8-8, rebuilt in `out`.
+    fn temp_list0_into(&self, header: &SliceHeader, out: &mut Vec<Option<usize>>) {
+        out.clear();
         let end = Self::temp_len(
             header.num_ref_idx_l0_active_minus1,
             header.num_pic_total_curr,
         );
-        while temp.len() < end {
-            let before = temp.len();
-            temp.extend(self.st_curr_before.iter().copied().take(end - temp.len()));
-            temp.extend(self.st_curr_after.iter().copied().take(end - temp.len()));
-            temp.extend(self.lt_curr.iter().copied().take(end - temp.len()));
-            if temp.len() == before {
+        while out.len() < end {
+            let before = out.len();
+            out.extend(self.st_curr_before.iter().copied().take(end - out.len()));
+            out.extend(self.st_curr_after.iter().copied().take(end - out.len()));
+            out.extend(self.lt_curr.iter().copied().take(end - out.len()));
+            if out.len() == before {
                 break;
             }
         }
-        temp
     }
 
-    /// Temporary list 1 per 8-10.
-    fn temp_list1(&self, header: &SliceHeader) -> Vec<Option<usize>> {
-        let mut temp = Vec::new();
+    /// Temporary list 1 per 8-10, rebuilt in `out`.
+    fn temp_list1_into(&self, header: &SliceHeader, out: &mut Vec<Option<usize>>) {
+        out.clear();
         let end = Self::temp_len(
             header.num_ref_idx_l1_active_minus1,
             header.num_pic_total_curr,
         );
-        while temp.len() < end {
-            let before = temp.len();
-            temp.extend(self.st_curr_after.iter().copied().take(end - temp.len()));
-            temp.extend(self.st_curr_before.iter().copied().take(end - temp.len()));
-            temp.extend(self.lt_curr.iter().copied().take(end - temp.len()));
-            if temp.len() == before {
+        while out.len() < end {
+            let before = out.len();
+            out.extend(self.st_curr_after.iter().copied().take(end - out.len()));
+            out.extend(self.st_curr_before.iter().copied().take(end - out.len()));
+            out.extend(self.lt_curr.iter().copied().take(end - out.len()));
+            if out.len() == before {
                 break;
             }
         }
-        temp
     }
 
     /// Temporary list length: active entries or the current count.
@@ -181,18 +207,20 @@ impl Rps {
         active.max(usize::try_from(total_curr).unwrap_or(usize::MAX))
     }
 
-    /// Active entries of `temp`, reordered per modification entries.
-    fn modified(
+    /// Active entries of `temp`, reordered per modification entries, rebuilt in `out`.
+    fn modified_into(
         temp: &[Option<usize>],
         modified: bool,
         entries: &[u32],
         active_minus1: u8,
-    ) -> Result<Vec<Option<usize>>, VaApiError> {
+        out: &mut Vec<Option<usize>>,
+    ) -> Result<(), VaApiError> {
+        out.clear();
         let end = usize::from(active_minus1) + 1;
-        let mut list = Vec::with_capacity(end);
+        out.reserve(end);
         for index in 0..end {
             if !modified {
-                list.push(temp.get(index).copied().flatten());
+                out.push(temp.get(index).copied().flatten());
                 continue;
             }
             let at = usize::try_from(entries.get(index).copied().unwrap_or(u32::MAX))
@@ -200,9 +228,9 @@ impl Rps {
             let entry = temp.get(at).copied().ok_or_else(|| {
                 VaApiError::BrokenReference(format!("list entry {at} outside temp list"))
             })?;
-            list.push(entry);
+            out.push(entry);
         }
-        Ok(list)
+        Ok(())
     }
 }
 

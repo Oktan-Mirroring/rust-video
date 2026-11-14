@@ -874,7 +874,7 @@ impl<T: Clone> Dpb<T> {
             .collect();
         Self::sort_long_term_pic_num_ascending(&mut long_term_refs);
 
-        b_list0.extend(long_term_refs.clone());
+        b_list0.extend_from_slice(&long_term_refs);
 
         // b1 contains three inner lists of pictures, i.e. [[0] [1] [2]]
         // [0]: short term pictures with POC > current, sorted by ascending POC.

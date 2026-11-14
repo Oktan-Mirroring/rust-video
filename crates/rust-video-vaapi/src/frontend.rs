@@ -428,6 +428,7 @@ impl Frontend {
         &mut self,
         pending: PendingPicture,
     ) -> Result<(Picture, Vec<SurfaceSlot>), VaApiError> {
+        let mut pending = pending;
         let first = pending
             .slices
             .first()
@@ -445,7 +446,6 @@ impl Frontend {
         } else {
             IsIdr::No
         };
-        pic.ref_pic_marking = first.header.dec_ref_pic_marking.clone();
         pic.timestamp = self.stamp();
         pic.set_reference(if pending.nal_ref_idc == 0 {
             Reference::None
@@ -463,6 +463,7 @@ impl Frontend {
             }
             _ => {}
         }
+        pic.ref_pic_marking = std::mem::take(&mut pending.slices[0].header.dec_ref_pic_marking);
         self.dpb.set_limits(
             pending.sps.max_dpb_frames(),
             pending.sps.max_num_order_frames() as usize,
@@ -632,7 +633,7 @@ impl Frontend {
             }
         } else if pic.nal_ref_idc != 0 {
             if pic.ref_pic_marking.adaptive_ref_pic_marking_mode_flag {
-                let markings = pic.ref_pic_marking.clone();
+                let markings = std::mem::take(&mut pic.ref_pic_marking);
                 for marking in &markings.inner {
                     match marking.memory_management_control_operation {
                         0 => break,
@@ -662,6 +663,7 @@ impl Frontend {
                         }
                     }
                 }
+                pic.ref_pic_marking = markings;
             } else {
                 self.dpb.sliding_window_marking(&picture.sps);
             }

@@ -265,9 +265,9 @@ impl Backend {
         )
     }
 
-    /// Decode one picture into `target` from raw parameter bytes.
+    /// Decode one picture into `target` from typed slice parameters.
     ///
-    /// Same pipelining as [`Backend::submit`], over caller-packed
+    /// Same pipelining as [`Backend::submit`], over caller-typed slice
     /// buffers: `picture` fills the picture-parameter buffer, `matrix`
     /// the matrix buffer when present, and `slices` the slice-parameter
     /// buffers in order. `data` must answer every index below
@@ -277,12 +277,12 @@ impl Backend {
     /// # Errors
     ///
     /// Returns `Err` off Linux, or when any VA-API call fails.
-    pub fn submit_raw<'d, F>(
+    pub fn submit_slices<'d, T, F>(
         &mut self,
         target: VaSurfaceId,
         picture: &[u8],
         matrix: Option<&[u8]>,
-        slices: &[&'d [u8]],
+        slices: &'d [T],
         data: F,
     ) -> Result<(), VaApiError>
     where
@@ -293,7 +293,7 @@ impl Backend {
             picture,
             matrix,
             slices.len(),
-            |index| slices[index],
+            |index| bytes_of(&slices[index]),
             data,
         )
     }

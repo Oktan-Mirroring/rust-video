@@ -345,7 +345,7 @@ impl Frontend {
                 }
                 self.groups.push(PendingTileGroup {
                     data: payload.clone(),
-                    tiles: group.tiles.clone(),
+                    tiles: group.tiles,
                 });
                 Ok(())
             }
@@ -357,7 +357,7 @@ impl Frontend {
                 }
                 let group = PendingTileGroup {
                     data: payload.slice(frame.header.header_bytes..),
-                    tiles: frame.tile_group.tiles.clone(),
+                    tiles: frame.tile_group.tiles,
                 };
                 self.parser
                     .ref_frame_update(&frame.header)
