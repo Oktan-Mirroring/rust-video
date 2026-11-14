@@ -1305,8 +1305,12 @@ impl EncodeSession {
             )?;
             &padded
         };
-        let staged = self.layout.stride(coded, self.width, self.height)?;
-        DeviceResources::write_upload(&self.upload, &staged)?;
+        let total = usize::try_from(self.layout.total)
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
+        DeviceResources::with_upload(&self.upload, total, |mapped| {
+            self.layout
+                .stride_into(coded, self.width, self.height, mapped)
+        })?;
         let ticket = self.submit_copy()?;
         self.copy_fence.wait(ticket)?;
         let input = self.input.clone();
@@ -1362,10 +1366,12 @@ impl EncodeSession {
                 UnsupportedReason::DriverBitstreamOutsideBuffer,
             ));
         }
-        let buffer = DeviceResources::read_readback(&self.staging, driver_len)?;
         let mut out = Vec::with_capacity(self.headers.len() + driver_len);
         out.extend_from_slice(&self.headers);
-        out.extend_from_slice(&buffer[..driver_len]);
+        DeviceResources::with_readback(&self.staging, driver_len, |mapped| {
+            out.extend_from_slice(mapped);
+            Ok(())
+        })?;
         self.idr_pic_id = self.idr_pic_id.wrapping_add(1);
         Ok(out)
     }
@@ -1821,14 +1827,15 @@ impl EncodeSession {
     /// Output metadata from the resolved staging buffer.
     fn read_metadata(&self) -> Result<D3D12_VIDEO_ENCODER_OUTPUT_METADATA, D3d12Error> {
         let len = std::mem::size_of::<D3D12_VIDEO_ENCODER_OUTPUT_METADATA>();
-        let bytes = DeviceResources::read_readback(&self.resolved_staging, len)?;
-        if bytes.len() < len {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::ResolvedMetadataShort,
-            ));
-        }
-        // Sound: the length is verified; the metadata is plain data.
-        Ok(unsafe { std::ptr::read(bytes.as_ptr().cast()) })
+        DeviceResources::with_readback(&self.resolved_staging, len, |bytes| {
+            if bytes.len() < len {
+                return Err(D3d12Error::Unsupported(
+                    UnsupportedReason::ResolvedMetadataShort,
+                ));
+            }
+            // Sound: the length is verified; the metadata is plain data.
+            Ok(unsafe { std::ptr::read(bytes.as_ptr().cast()) })
+        })
     }
 }
 

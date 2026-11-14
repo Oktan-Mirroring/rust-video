@@ -176,13 +176,14 @@ impl Nv12Layout {
         Ok(out)
     }
 
-    /// Pitched staging bytes from tight `nv12` bytes.
-    pub(crate) fn stride(
+    /// Tight `nv12` bytes pitched into `staged`.
+    pub(crate) fn stride_into(
         &self,
         nv12: &[u8],
         width: u32,
         height: u32,
-    ) -> Result<Vec<u8>, D3d12Error> {
+        staged: &mut [u8],
+    ) -> Result<(), D3d12Error> {
         let y_len = usize::try_from(u64::from(width) * u64::from(height))
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         if nv12.len() < y_len + y_len / 2 {
@@ -192,7 +193,11 @@ impl Nv12Layout {
         }
         let total = usize::try_from(self.total)
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let mut staged = vec![0u8; total];
+        if staged.len() < total {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::StagingShortOfLayout,
+            ));
+        }
         let mut src = 0usize;
         for (plane, rows) in self.planes.iter().zip([height, height / 2]) {
             let pitch = usize::try_from(plane.pitch).unwrap_or(0);
@@ -211,7 +216,7 @@ impl Nv12Layout {
                 src += width;
             }
         }
-        Ok(staged)
+        Ok(())
     }
 }
 
@@ -530,8 +535,20 @@ impl DeviceResources {
 
     /// `bytes` into the upload mapping.
     pub(crate) fn write_upload(upload: &ID3D12Resource, bytes: &[u8]) -> Result<(), D3d12Error> {
+        Self::with_upload(upload, bytes.len(), |mapped| {
+            mapped.copy_from_slice(bytes);
+            Ok(())
+        })
+    }
+
+    /// `f` over the `len`-byte upload mapping.
+    pub(crate) fn with_upload<T>(
+        upload: &ID3D12Resource,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> Result<T, D3d12Error>,
+    ) -> Result<T, D3d12Error> {
         let mut mapped: *mut c_void = std::ptr::null_mut();
-        // Sound: the upload mapping outlives the copy below.
+        // Sound: the upload mapping outlives `f` below.
         unsafe { upload.Map(0, None, Some(std::ptr::addr_of_mut!(mapped))) }.map_err(|error| {
             D3d12Error::Call {
                 call: "Map",
@@ -543,20 +560,14 @@ impl DeviceResources {
                 UnsupportedReason::UploadMapReturnedNull,
             ));
         }
-        // Sound: `mapped` spans `bytes.len()` upload bytes; `bytes` outlives the copy.
+        // Sound: `mapped` spans `len` upload bytes; the mapping outlives `f`.
+        let mapped = unsafe { std::slice::from_raw_parts_mut(mapped.cast::<u8>(), len) };
+        let out = f(mapped);
+        // Sound: the mapping is live; `out` owns its bytes.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
             upload.Unmap(0, None);
         }
-        Ok(())
-    }
-
-    /// `len` bytes out of the readback mapping.
-    pub(crate) fn read_readback(
-        readback: &ID3D12Resource,
-        len: usize,
-    ) -> Result<Vec<u8>, D3d12Error> {
-        Self::with_readback(readback, len, |mapped| Ok(mapped.to_vec()))
+        out
     }
 
     /// `f` over the `len`-byte readback mapping.
@@ -852,16 +863,27 @@ mod tests {
     }
 
     #[test]
-    fn stride_round_trips_tight_bytes() {
+    fn stride_into_round_trips_tight_bytes() {
         let tight: Vec<u8> = (1..=12).collect();
-        let staged = layout().stride(&tight, 4, 2).expect("staged");
+        let mut staged = vec![0u8; 24];
+        layout()
+            .stride_into(&tight, 4, 2, &mut staged)
+            .expect("staged");
         assert_eq!(staged.len(), 24);
         let back = layout().tighten(&staged, 4, 2, None).expect("tight");
         assert_eq!(back, tight);
     }
 
     #[test]
-    fn stride_rejects_short_input() {
-        assert!(layout().stride(&[0; 11], 4, 2).is_err());
+    fn stride_into_rejects_short_input() {
+        let mut staged = vec![0u8; 24];
+        assert!(layout().stride_into(&[0; 11], 4, 2, &mut staged).is_err());
+    }
+
+    #[test]
+    fn stride_into_rejects_short_staging() {
+        let tight: Vec<u8> = (1..=12).collect();
+        let mut staged = vec![0u8; 10];
+        assert!(layout().stride_into(&tight, 4, 2, &mut staged).is_err());
     }
 }
