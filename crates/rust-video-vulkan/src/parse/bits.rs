@@ -1,6 +1,10 @@
 //! Exp-Golomb bit reader over RBSP bytes.
 
+use std::borrow::Cow;
+
 use crate::error::ParseError;
+
+use memchr::memchr_iter;
 
 /// Bit reader over one NAL payload, most significant bit first.
 pub(crate) struct BitReader<'a> {
@@ -56,11 +60,16 @@ impl<'a> BitReader<'a> {
             return Err(ParseError::Truncated { syntax });
         }
         let mut value = 0_u32;
-        for _ in 0..n {
+        let mut remaining = n as usize;
+        while remaining > 0 {
             let byte = self.bytes[self.bit / 8];
-            let shift = 7 - (self.bit % 8);
-            value = (value << 1) | u32::from((byte >> shift) & 1);
-            self.bit += 1;
+            let offset = self.bit % 8;
+            let take = (8 - offset).min(remaining);
+            let shift = 8 - offset - take;
+            let chunk = u32::from(byte >> shift) & ((1_u32 << take) - 1);
+            value = (value << take) | chunk;
+            self.bit += take;
+            remaining -= take;
         }
         Ok(value)
     }
@@ -221,26 +230,46 @@ impl<'a> BitReader<'a> {
 }
 
 /// Raw byte sequence payload with emulation prevention removed.
-pub(crate) struct Rbsp {
-    /// Payload bytes after `0x03` removal.
-    bytes: Vec<u8>,
+pub(crate) struct Rbsp<'a> {
+    /// Payload bytes after `0x03` removal, borrowed when clean.
+    bytes: Cow<'a, [u8]>,
 }
 
-impl Rbsp {
+impl<'a> Rbsp<'a> {
     /// Payload with `0x000003` collapsed to `0x0000`.
+    ///
+    /// Borrows `raw` when it holds no prevention pattern.
     #[must_use]
-    pub fn strip(raw: &[u8]) -> Self {
+    pub fn strip(raw: &'a [u8]) -> Self {
+        let mut hits = memchr_iter(0x03, raw).filter(|index| Self::is_prevention(raw, *index));
+        let Some(first) = hits.next() else {
+            return Self {
+                bytes: Cow::Borrowed(raw),
+            };
+        };
         let mut bytes = Vec::with_capacity(raw.len());
-        let mut zeros = 0_u32;
-        for byte in raw {
-            if zeros == 2 && *byte == 0x03 {
-                zeros = 0;
-                continue;
+        let mut start = 0;
+        let mut hit = first;
+        loop {
+            bytes.extend_from_slice(&raw[start..hit]);
+            start = hit + 1;
+            match hits.next() {
+                Some(next) => hit = next,
+                None => break,
             }
-            zeros = if *byte == 0 { zeros + 1 } else { 0 };
-            bytes.push(*byte);
         }
-        Self { bytes }
+        bytes.extend_from_slice(&raw[start..]);
+        Self {
+            bytes: Cow::Owned(bytes),
+        }
+    }
+
+    /// True when `raw[index]` is a prevention byte after two zeros.
+    fn is_prevention(raw: &[u8], index: usize) -> bool {
+        index >= 2
+            && raw[index - 2] == 0
+            && raw[index - 1] == 0
+            && (index < 3 || raw[index - 3] != 0)
     }
 
     /// Stripped payload bytes.

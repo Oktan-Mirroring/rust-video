@@ -431,6 +431,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytes",
+ "memchr",
  "rust-video",
  "rust-video-caps",
  "rust-video-harness",
