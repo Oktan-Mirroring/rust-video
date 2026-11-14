@@ -140,19 +140,39 @@ impl Codec {
     #[must_use]
     pub fn is_keyframe(self, payload: &[u8]) -> bool {
         match self {
-            Self::H264 => AnnexB::new(payload)
-                .filter_map(|nalu| nalu.first().map(|b| b & 0x1F))
-                .find(|t| (1..=5).contains(t))
-                .is_some_and(|t| t == 5),
-            Self::H265 => AnnexB::new(payload)
-                .filter_map(|nalu| nalu.first().map(|b| (b >> 1) & 0x3F))
-                .find(|t| *t <= 23)
-                .is_some_and(|t| (16..=23).contains(&t)),
+            Self::H264 => Self::first_vcl_header(payload, |b| matches!(b & 0x1F, 1..=5))
+                .is_some_and(|b| b & 0x1F == 5),
+            Self::H265 => Self::first_vcl_header(payload, |b| (b >> 1) & 0x3F <= 23)
+                .is_some_and(|b| matches!((b >> 1) & 0x3F, 16..=23)),
             Self::Av1 => Self::av1_frame_is_key(payload),
             Self::Vp9 => Self::vp9_frame_is_key(payload),
             Self::Vp8 => Self::vp8_frame_is_key(payload),
             Self::Av2 => false,
         }
+    }
+
+    /// Header byte of the first non-empty NALU passing `is_vcl`.
+    ///
+    /// Peeks the byte after each start code and stops at the first
+    /// VCL header; NALU bodies stay unscanned. A peeked zero falls
+    /// back to the next-code scan: it may open the following code.
+    fn first_vcl_header(payload: &[u8], is_vcl: fn(u8) -> bool) -> Option<u8> {
+        let mut at = 0;
+        while at < payload.len() {
+            let (_, content) = AnnexB::start_code(&payload[at..])?;
+            let content = at + content;
+            if content >= payload.len() {
+                return None;
+            }
+            let header = payload[content];
+            let genuine = header != 0
+                || AnnexB::start_code(&payload[content..]).is_none_or(|(code, _)| code > 0);
+            if genuine && is_vcl(header) {
+                return Some(header);
+            }
+            at = content;
+        }
+        None
     }
 
     /// True when the first AV1 frame OBU is a key frame.
@@ -348,12 +368,17 @@ impl<'a> AnnexB<'a> {
 
     /// Next start code as `(code_start, content_start)`, if any.
     fn start_code(bytes: &[u8]) -> Option<(usize, usize)> {
-        let mut zeros = 0;
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == 1 && zeros >= 2 {
-                return Some((i - zeros, i + 1));
+        let mut at = 0;
+        while at < bytes.len() {
+            let one = at + bytes[at..].iter().position(|&b| b == 1)?;
+            let mut run = one;
+            while run > 0 && bytes[run - 1] == 0 {
+                run -= 1;
             }
-            zeros = if b == 0 { zeros + 1 } else { 0 };
+            if one - run >= 2 {
+                return Some((run, one + 1));
+            }
+            at = one + 1;
         }
         None
     }
@@ -511,6 +536,21 @@ mod tests {
     #[test]
     fn h264_first_vcl_wins() {
         assert!(!Codec::H264.is_keyframe(&annexb(&[(0x41, 8), (0x65, 8)])));
+    }
+
+    #[test]
+    fn keyframe_skips_empty_nalus() {
+        assert!(Codec::H264.is_keyframe(&[0, 0, 1, 0, 0, 1, 0x65, 0xFF]));
+        assert!(!Codec::H264.is_keyframe(&[0, 0, 1, 0, 0, 1, 0x41, 0xFF]));
+        assert!(Codec::H265.is_keyframe(&[0, 0, 1, 0, 0, 1, 0x26, 0x01, 0xFF]));
+        assert!(!Codec::H265.is_keyframe(&[0, 0, 1, 0, 0, 1, 0x02, 0x01, 0xFF]));
+        assert!(!Codec::H264.is_keyframe(&[0, 0, 1]));
+    }
+
+    #[test]
+    fn keyframe_reads_zero_header() {
+        assert!(!Codec::H265.is_keyframe(&annexb(&[(0x00, 8)])));
+        assert!(!Codec::H264.is_keyframe(&annexb(&[(0x00, 8)])));
     }
 
     #[test]

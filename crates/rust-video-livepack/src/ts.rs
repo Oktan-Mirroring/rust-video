@@ -437,6 +437,8 @@ struct PesAsm {
     remaining: Option<usize>,
     /// Header seen for the current packet.
     open: bool,
+    /// Last completed payload size; unbounded reserve hint.
+    hint: usize,
 }
 
 impl TsDemux {
@@ -469,7 +471,7 @@ impl TsDemux {
     pub fn finish(&mut self) -> Option<AccessUnit> {
         let (_, codec) = self.video?;
         let unit = self.pes.take(codec);
-        self.pes = PesAsm::default();
+        self.pes.reset();
         unit
     }
 
@@ -486,17 +488,24 @@ impl TsDemux {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<AccessUnit>, TsDemuxError> {
         self.stash.extend_from_slice(bytes);
         let mut units = Vec::new();
-        while let Some(at) = self.sync_at() {
-            self.stash.drain(..at);
-            if self.stash.len() < PACKET_SIZE {
+        let mut stash = std::mem::take(&mut self.stash);
+        let mut at = 0;
+        while let Some(found) = Self::sync_at(&stash[at..]) {
+            at += found;
+            if stash.len() - at < PACKET_SIZE {
                 break;
             }
-            let packet: [u8; PACKET_SIZE] = self.stash[..PACKET_SIZE]
-                .try_into()
-                .map_err(|_| TsDemuxError::BadPacket("short packet"))?;
-            self.stash.drain(..PACKET_SIZE);
-            self.push_packet(&packet, &mut units)?;
+            let end = at + PACKET_SIZE;
+            let result = self.push_packet(&stash[at..end], &mut units);
+            at = end;
+            if let Err(error) = result {
+                stash.drain(..at);
+                self.stash = stash;
+                return Err(error);
+            }
         }
+        stash.drain(..at);
+        self.stash = stash;
         Ok(units)
     }
 
@@ -504,15 +513,15 @@ impl TsDemux {
     ///
     /// Two buffered packets demand double sync; a lone trailing packet
     /// is trusted, else clean EOF holds one packet back forever.
-    fn sync_at(&self) -> Option<usize> {
+    fn sync_at(stash: &[u8]) -> Option<usize> {
         let mut i = 0;
-        while i < self.stash.len() {
-            if self.stash[i] != SYNC_BYTE {
+        while i < stash.len() {
+            if stash[i] != SYNC_BYTE {
                 i += 1;
                 continue;
             }
-            if i + 2 * PACKET_SIZE <= self.stash.len() {
-                if self.stash[i + PACKET_SIZE] == SYNC_BYTE {
+            if i + 2 * PACKET_SIZE <= stash.len() {
+                if stash[i + PACKET_SIZE] == SYNC_BYTE {
                     return Some(i);
                 }
                 i += 1;
@@ -520,8 +529,8 @@ impl TsDemux {
             }
             return Some(i);
         }
-        if self.stash.len() >= PACKET_SIZE {
-            Some(self.stash.len() - (PACKET_SIZE - 1))
+        if stash.len() >= PACKET_SIZE {
+            Some(stash.len() - (PACKET_SIZE - 1))
         } else {
             None
         }
@@ -530,7 +539,7 @@ impl TsDemux {
     /// One packet; completed units appended to `out`.
     fn push_packet(
         &mut self,
-        packet: &[u8; PACKET_SIZE],
+        packet: &[u8],
         out: &mut Vec<AccessUnit>,
     ) -> Result<(), TsDemuxError> {
         if packet[1] & 0x80 != 0 {
@@ -556,7 +565,7 @@ impl TsDemux {
             Some(last) if !discontinuous => {
                 let expected = (last + 1) & 0x0F;
                 if expected != cc {
-                    self.pes = PesAsm::default();
+                    self.pes.reset();
                     *slot = Some(cc);
                     return Err(TsDemuxError::Discontinuity {
                         pid,
@@ -579,11 +588,7 @@ impl TsDemux {
     }
 
     /// Adaptation field skipped; PCR recorded.
-    fn skip_adaptation(
-        &mut self,
-        packet: &[u8; PACKET_SIZE],
-        pos: usize,
-    ) -> Result<usize, TsDemuxError> {
+    fn skip_adaptation(&mut self, packet: &[u8], pos: usize) -> Result<usize, TsDemuxError> {
         let len = usize::from(packet[pos]);
         if pos + 1 + len > PACKET_SIZE {
             return Err(TsDemuxError::BadPacket("adaptation overruns packet"));
@@ -745,12 +750,12 @@ impl PesAsm {
         if pusi {
             if self.open {
                 if self.remaining.is_some_and(|r| r > 0) {
-                    *self = Self::default();
+                    self.reset();
                     return Err(TsDemuxError::BadPacket("short PES"));
                 }
                 out.extend(self.take(codec));
             }
-            *self = Self::default();
+            self.reset();
             self.open_header(payload, cap)?;
         } else if !self.open {
             return Ok(());
@@ -759,9 +764,18 @@ impl PesAsm {
         }
         if self.open && self.remaining == Some(0) {
             out.extend(self.take(codec));
-            *self = Self::default();
+            self.reset();
         }
         Ok(())
+    }
+
+    /// Idle state reusing the payload allocation and size hint.
+    fn reset(&mut self) {
+        self.payload.clear();
+        self.pts = 0;
+        self.dts = 0;
+        self.remaining = None;
+        self.open = false;
     }
 
     /// PES header parsed; its inline payload kept.
@@ -801,6 +815,10 @@ impl PesAsm {
         self.remaining =
             (declared != 0).then(|| usize::from(declared).saturating_sub(3 + header_len));
         let body = &payload[9 + header_len..];
+        match self.remaining {
+            Some(remaining) => self.payload.reserve(remaining.min(cap)),
+            None => self.payload.reserve(self.hint.min(cap)),
+        }
         self.push_body(body, cap)?;
         Ok(())
     }
@@ -833,9 +851,16 @@ impl PesAsm {
 
     /// Current payload wrapped as a classified unit.
     fn take(&mut self, codec: Codec) -> Option<AccessUnit> {
-        (!self.payload.is_empty()).then(|| {
-            AccessUnit::classified(codec, std::mem::take(&mut self.payload), self.pts, self.dts)
-        })
+        if self.payload.is_empty() {
+            return None;
+        }
+        self.hint = self.payload.len();
+        Some(AccessUnit::classified(
+            codec,
+            std::mem::take(&mut self.payload),
+            self.pts,
+            self.dts,
+        ))
     }
 }
 

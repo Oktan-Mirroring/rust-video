@@ -476,10 +476,10 @@ pub struct FragmentMux {
 }
 
 /// Big-endian box byte sink.
-#[derive(Debug, Default)]
-struct ByteSink {
+#[derive(Debug)]
+struct ByteSink<'a> {
     /// Emitted bytes.
-    buf: Vec<u8>,
+    buf: &'a mut Vec<u8>,
 }
 
 impl FragmentMux {
@@ -515,22 +515,24 @@ impl FragmentMux {
     /// Initialization segment: `ftyp` plus `moov`.
     #[must_use]
     pub fn init_segment(&self) -> Vec<u8> {
-        let mut sink = ByteSink::default();
+        let mut buf = Vec::new();
+        let mut sink = ByteSink::new(&mut buf);
         sink.ftyp(&self.track);
         sink.moov(&self.track, self.width, self.height);
-        sink.finish()
+        buf
     }
 
     /// Segment header: `styp` with the CMAF brand.
     #[must_use]
     pub fn start_segment() -> Vec<u8> {
-        let mut sink = ByteSink::default();
+        let mut buf = Vec::new();
+        let mut sink = ByteSink::new(&mut buf);
         let at = sink.open(*b"styp");
         sink.tag(*b"cmfc");
         sink.u32(0);
         sink.tag(*b"cmfc");
         sink.close(at);
-        sink.finish()
+        buf
     }
 
     /// One access unit as a CMAF chunk: `moof` plus `mdat`.
@@ -584,7 +586,7 @@ impl FragmentMux {
             return Err(Fmp4Error::CtsOutOfRange);
         }
         let start = out.len();
-        let mut sink = ByteSink::default();
+        let mut sink = ByteSink::new(&mut *out);
         sink.moof(
             self.sequence,
             decode_time,
@@ -594,7 +596,6 @@ impl FragmentMux {
             keyframe,
         );
         sink.mdatsample(&sample);
-        out.extend_from_slice(&sink.finish());
         self.sequence += 1;
         Ok(PacketAction::Emitted(out.len() - start))
     }
@@ -619,7 +620,12 @@ impl FragmentMux {
     }
 }
 
-impl ByteSink {
+impl<'a> ByteSink<'a> {
+    /// Sink appending to `buf`.
+    fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self { buf }
+    }
+
     /// One byte.
     fn u8(&mut self, value: u8) {
         self.buf.push(value);
@@ -682,11 +688,6 @@ impl ByteSink {
         self.u8(version);
         self.u24(flags);
         at
-    }
-
-    /// Finished bytes.
-    fn finish(self) -> Vec<u8> {
-        self.buf
     }
 
     /// File-type box.
