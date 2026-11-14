@@ -797,6 +797,24 @@ pub(crate) fn pick_memory_type(
     })
 }
 
+/// Memory type index with `HOST_CACHED` when allowed, else exact `flags`.
+///
+/// Readback buffers the host maps every frame take the cached type where
+/// the driver offers one; uncached host reads run at BAR speed.
+#[must_use]
+pub(crate) fn pick_memory_type_cached(
+    requirements: vk::MemoryRequirements,
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    pick_memory_type(
+        requirements,
+        properties,
+        flags | vk::MemoryPropertyFlags::HOST_CACHED,
+    )
+    .or_else(|| pick_memory_type(requirements, properties, flags))
+}
+
 /// Memory type index preferring `flags`, else any allowed type.
 ///
 /// Session and image memory only needs an allowed type; some drivers allow
@@ -1198,6 +1216,58 @@ impl GpuBuffer {
         flags: vk::MemoryPropertyFlags,
         profiles: &[vk::VideoProfileInfoKHR<'_>],
     ) -> Result<Self, VulkanError> {
+        Self::create_picked(
+            device,
+            properties,
+            size,
+            usage,
+            flags,
+            profiles,
+            pick_memory_type,
+        )
+    }
+
+    /// Readback buffer of `size` bytes with `usage`, cached when allowed.
+    ///
+    /// Falls back to `flags` where no cached type holds; `profiles` rides
+    /// a video profile list for video usages, empty otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when creation, type picking, or binding fails.
+    pub fn create_readback(
+        device: &ash::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        flags: vk::MemoryPropertyFlags,
+        profiles: &[vk::VideoProfileInfoKHR<'_>],
+    ) -> Result<Self, VulkanError> {
+        Self::create_picked(
+            device,
+            properties,
+            size,
+            usage,
+            flags,
+            profiles,
+            pick_memory_type_cached,
+        )
+    }
+
+    /// Buffer of `size` bytes with `usage`, memory from `pick`.
+    fn create_picked(
+        device: &ash::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        flags: vk::MemoryPropertyFlags,
+        profiles: &[vk::VideoProfileInfoKHR<'_>],
+        pick: fn(
+            vk::MemoryRequirements,
+            &vk::PhysicalDeviceMemoryProperties,
+            vk::MemoryPropertyFlags,
+        ) -> Option<u32>,
+    ) -> Result<Self, VulkanError> {
         let mut list = vk::VideoProfileListInfoKHR {
             profile_count: u32::try_from(profiles.len()).unwrap_or(u32::MAX),
             p_profiles: profiles.as_ptr(),
@@ -1214,7 +1284,7 @@ impl GpuBuffer {
         let buffer = unsafe { device.create_buffer(&info, None) }?;
         // SAFETY: the buffer is live and owned.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let Some(type_index) = pick_memory_type(requirements, properties, flags) else {
+        let Some(type_index) = pick(requirements, properties, flags) else {
             // SAFETY: the buffer is live and owned.
             unsafe { device.destroy_buffer(buffer, None) };
             let bits = requirements.memory_type_bits;

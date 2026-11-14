@@ -158,7 +158,7 @@ impl Session {
                 host,
                 profiles,
             )?);
-            readbacks.push(GpuBuffer::create(
+            readbacks.push(GpuBuffer::create_readback(
                 raw,
                 &properties,
                 nv12_bytes(coded_extent(geometry.coded())),

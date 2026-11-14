@@ -1089,7 +1089,7 @@ impl EncodeSession {
             host,
             &[],
         )?;
-        let bitstream = GpuBuffer::create(
+        let bitstream = GpuBuffer::create_readback(
             raw,
             properties,
             BITSTREAM_BYTES,
