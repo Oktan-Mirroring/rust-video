@@ -7,6 +7,9 @@ pub const MIN_SDK: u32 = 21;
 /// API level carrying async notify callbacks.
 pub const ASYNC_NOTIFY_SDK: u32 = 28;
 
+/// API level carrying encoder input surfaces.
+pub const INPUT_SURFACE_SDK: u32 = 26;
+
 /// Device API level.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ApiLevel(u32);
@@ -55,16 +58,25 @@ impl ApiLevel {
     pub fn supports_async_notify(self) -> bool {
         self.at_least(ASYNC_NOTIFY_SDK)
     }
+
+    /// True where encoder input surfaces exist.
+    ///
+    /// <https://docs.rs/ndk/0.9.0/ndk/media/media_codec/struct.MediaCodec.html#method.create_input_surface>
+    #[must_use]
+    pub fn supports_input_surface(self) -> bool {
+        self.at_least(INPUT_SURFACE_SDK)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiLevel, ASYNC_NOTIFY_SDK, MIN_SDK};
+    use super::{ApiLevel, ASYNC_NOTIFY_SDK, INPUT_SURFACE_SDK, MIN_SDK};
 
     #[test]
     fn floors_match_ndk_history() {
         assert_eq!(MIN_SDK, 21);
         assert_eq!(ASYNC_NOTIFY_SDK, 28);
+        assert_eq!(INPUT_SURFACE_SDK, 26);
     }
 
     #[test]
@@ -73,6 +85,8 @@ mod tests {
         assert!(ApiLevel::new(21).meets_min());
         assert!(!ApiLevel::new(27).supports_async_notify());
         assert!(ApiLevel::new(28).supports_async_notify());
+        assert!(!ApiLevel::new(25).supports_input_surface());
+        assert!(ApiLevel::new(26).supports_input_surface());
         assert!(ApiLevel::new(29).at_least(29));
         assert!(!ApiLevel::new(28).at_least(29));
     }

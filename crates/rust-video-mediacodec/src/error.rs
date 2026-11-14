@@ -1,7 +1,10 @@
 //! Typed `MediaCodec` tier failures.
 
 use crate::decoder::DecodeState;
+use crate::encoder::EncodeState;
 use crate::quirks::QuirkSyntax;
+
+use rust_video_caps::frame::PixelFormat;
 
 /// `MediaCodec` tier failure.
 #[non_exhaustive]
@@ -18,6 +21,38 @@ pub enum MediaCodecError {
     NoDecoder {
         /// Mime the lookup used.
         mime: &'static str,
+    },
+    /// No encoder for the mime.
+    #[error("no MediaCodec encoder for {mime}")]
+    NoEncoder {
+        /// Mime the lookup used.
+        mime: &'static str,
+    },
+    /// Input frame layout the encoder cannot pack.
+    #[error("unsupported encoder input {format:?}")]
+    UnsupportedInput {
+        /// Rejected pixel layout.
+        format: PixelFormat,
+    },
+    /// Input frame extent against the configured extent.
+    #[error("frame {width}x{height} mismatches configured {expected_width}x{expected_height}")]
+    FrameMismatch {
+        /// Frame width in luma samples.
+        width: u32,
+        /// Frame height in luma samples.
+        height: u32,
+        /// Configured width in luma samples.
+        expected_width: u32,
+        /// Configured height in luma samples.
+        expected_height: u32,
+    },
+    /// Packed frame overflows its input buffer.
+    #[error("frame of {len} bytes exceeds input capacity {capacity}")]
+    FrameTooLarge {
+        /// Packed frame length.
+        len: usize,
+        /// Buffer capacity.
+        capacity: usize,
     },
     /// H.264/H.265 format without its codec-specific blob.
     #[error("missing {key} for {mime}")]
@@ -83,6 +118,14 @@ pub enum MediaCodecError {
         /// State the decoder was in.
         state: DecodeState,
     },
+    /// Operation refused in this state.
+    #[error("cannot {op} while {state:?}")]
+    InvalidEncodeState {
+        /// Refused operation.
+        op: &'static str,
+        /// State the encoder was in.
+        state: EncodeState,
+    },
     /// Quirk table line rejected.
     #[error("quirks.toml:{line}: {reason}")]
     Quirk {
@@ -101,13 +144,27 @@ pub enum MediaCodecError {
 mod tests {
     use super::MediaCodecError;
     use crate::decoder::DecodeState;
+    use crate::encoder::EncodeState;
     use crate::quirks::QuirkSyntax;
+
+    use rust_video_caps::frame::PixelFormat;
 
     #[test]
     fn displays_name_cause() {
         assert_eq!(
             MediaCodecError::NoDecoder { mime: "video/avc" }.to_string(),
             "no MediaCodec decoder for video/avc"
+        );
+        assert_eq!(
+            MediaCodecError::NoEncoder { mime: "video/hevc" }.to_string(),
+            "no MediaCodec encoder for video/hevc"
+        );
+        assert_eq!(
+            MediaCodecError::UnsupportedInput {
+                format: PixelFormat::Nv12,
+            }
+            .to_string(),
+            "unsupported encoder input Nv12"
         );
         assert_eq!(
             MediaCodecError::MissingCsd {
@@ -158,6 +215,24 @@ mod tests {
             kind: "ErrorUnknown".to_owned(),
         };
         assert_eq!(error.to_string(), "codec fault: ErrorUnknown");
+        let error = MediaCodecError::FrameMismatch {
+            width: 64,
+            height: 64,
+            expected_width: 128,
+            expected_height: 64,
+        };
+        assert_eq!(
+            error.to_string(),
+            "frame 64x64 mismatches configured 128x64"
+        );
+        let error = MediaCodecError::FrameTooLarge {
+            len: 2_000,
+            capacity: 512,
+        };
+        assert_eq!(
+            error.to_string(),
+            "frame of 2000 bytes exceeds input capacity 512"
+        );
     }
 
     #[test]
@@ -167,6 +242,11 @@ mod tests {
             state: DecodeState::Unconfigured,
         };
         assert_eq!(error.to_string(), "cannot decode while Unconfigured");
+        let error = MediaCodecError::InvalidEncodeState {
+            op: "encode",
+            state: EncodeState::Configured,
+        };
+        assert_eq!(error.to_string(), "cannot encode while Configured");
         let error = MediaCodecError::Quirk {
             line: 9,
             reason: QuirkSyntax::ExpectedSection,

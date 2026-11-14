@@ -43,7 +43,7 @@ Out: archival demuxing, subtitles, filters, audio.
 | VA-API | ● | ● | – | – | – | ●³ |
 | D3D11 | ●⁴ | ●⁴ | ●⁴ | ●⁴ | – | ●³⁴ |
 | D3D12 | ● | ● | ◐ | – | – | ●⁶ |
-| MediaCodec | – | – | – | – | – | – |
+| MediaCodec | ●⁹ | ●⁹ | ●⁹ | – | – | – |
 
 | Mark | Means |
 |---|---|
@@ -59,6 +59,7 @@ Out: archival demuxing, subtitles, filters, audio.
 ⁶ H.264/H.265 in and out.
 ⁷ Decoder per device mime; needs the device codec.
 ⁸ Wired; hardware fps pending Linux runs.
+⁹ Encoder per device mime; needs the device codec.
 
 Backend policy and platform detail: `docs/matrix.md`, `docs/compat.md`.
 
