@@ -114,4 +114,4 @@ MIT or Apache 2.0, at your choice. See `LICENSE-MIT` and `LICENSE-APACHE`. Third
 
 ## Further reading
 
-`docs/` holds the canonical detail. Start with `docs/matrix.md` for backend policy, `docs/sw-codecs.md` for software codec notes, `docs/compat.md` for platform compatibility, and `docs/testing/goldens.md` for the test story.
+`docs/` holds the canonical detail. Start with `docs/architecture.md` for the system shape, `docs/matrix.md` for backend policy, `docs/sw-codecs.md` for software codec notes, `docs/compat.md` for platform compatibility, and `docs/testing/goldens.md` for the test story. Each crate carries its own README.
