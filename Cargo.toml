@@ -16,3 +16,7 @@ warnings = "deny"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# Bench holds realtime only against optimized assembly.
+[profile.dev.package.openh264-sys2]
+opt-level = 2

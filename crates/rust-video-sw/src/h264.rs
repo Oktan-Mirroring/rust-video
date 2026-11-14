@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use openh264::encoder::{
-    BitRate, EncodedBitStream, Encoder, EncoderConfig, FrameType, RateControlMode,
+    BitRate, Complexity, EncodedBitStream, Encoder, EncoderConfig, FrameType, RateControlMode,
 };
 use openh264::formats::YUVSlices;
 
@@ -14,6 +14,9 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder as CapsEncoder;
 
 use crate::error::SwError;
+
+/// Slice byte budget; several slices per frame engage all threads.
+const SLICE_BYTES: u32 = 3000;
 
 /// Realtime H.264 encoder.
 pub struct H264Encoder {
@@ -36,7 +39,12 @@ impl H264Encoder {
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate_bps))
             .rate_control_mode(RateControlMode::Bitrate)
-            .num_threads(threads);
+            .num_threads(threads)
+            .max_slice_len(SLICE_BYTES)
+            .complexity(Complexity::Low)
+            .scene_change_detect(false)
+            .adaptive_quantization(false)
+            .background_detection(false);
         let api = openh264::OpenH264API::from_source();
         let inner = Encoder::with_api_config(api, config).map_err(|error| SwError::Native {
             code: error.native_code(),
