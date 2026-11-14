@@ -58,7 +58,7 @@ Vulkan decode: packet bytes enter the NAL splitter, the codec parser reads each 
 
 Vulkan encode: a CPU frame or device frame faces NV12 format and extent checks, takes a `PictureStamp`, and encodes through the upload path or the import path. IDR pictures code without references; P pictures predict from the single live reference. Keyframe packets carry driver headers ahead of the coded bytes and the keyframe mark; P packets carry coded bytes alone. Flush emits nothing: no delayed frames exist.
 
-Vulkan transcode: the plan fixes at open from per-hop caps plus same-adapter proof. The encoder opens lazily on the first frame size and reopens on size change. The GPU route runs `decode_surface` into `encode_export` with pixels never mapped. The CPU route runs `decode` into `to_cpu` into `encode`, naming the first miss on stderr. A scale or convert miss fails loud with `Unsupported` on either route.
+Vulkan transcode: the plan fixes at open from per-hop caps plus same-adapter proof. The encoder opens lazily on the first frame size and reopens on size change. The GPU route runs `decode_surface` into `encode_export` with pixels never mapped. A caps miss declines with `Unsupported` naming the first miss. A scale or convert miss fails loud with `Unsupported`.
 
 ## Zero-copy handoff
 
@@ -126,7 +126,7 @@ Tier rule: one row per file, paths relative to the tier crate.
 | `src/inflight.rs` | Fence collection, reaping |
 | `src/decoder.rs` | Decoders, frames, display sink |
 | `src/encoder.rs` | GOP engines, packet assembly |
-| `src/transcode.rs` | GPU and CPU routes, lazy encoder |
+| `src/transcode.rs` | GPU route with typed decline, lazy encoder |
 | `src/error.rs` | Skip reasons, typed failures |
 | `src/session/decode.rs` | Decode submit core, DPB image |
 | `src/session/encode.rs` | Encode submit core, reference tracking, rate control |

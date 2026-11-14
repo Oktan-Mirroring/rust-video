@@ -45,10 +45,10 @@ in caps vocabulary (`GpuCaps`, `Plan`, `Route`, `FallbackCause`)
 when every hop holds on one device: `NtHandle` share plus decode
 export plus encoder import, with surfaces flowing through
 `encode_surface` or `encode_scaled`, pixels never mapped.
-Otherwise the CPU path runs with the first miss named loud:
-`ShareUnsupported` without a share mechanism, else
-`NoSharedExport` or `EncoderCpuOnly`. Scale and convert hops fail
-loud the same way.
+Otherwise `transcode` and `flush` decline with `Unsupported`
+naming the first miss: `ShareUnsupported` without a share
+mechanism, else `NoSharedExport` or `EncoderCpuOnly`. Scale and
+convert hops fail loud the same way.
 
 The route never spans adapters: one device serves both ends, and
 `Plan::for_devices` has no call site in the tier

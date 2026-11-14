@@ -18,7 +18,7 @@ node offers the matching profile into NV12.
 | `decoder.rs` | `H264Decoder`: ingest → begin → submit → commit → readback; `VaApiFrame` with lazy DMA-BUF export |
 | `encoder.rs` | `VaApiEncoder`: all-intra CQP sessions, hand-written packed headers |
 | `scale.rs` | `Scaler`: on-device VPP scale |
-| `transcode.rs` | `Transcoder`: decode surface to encoder input, CPU split on probe miss |
+| `transcode.rs` | `Transcoder`: decode surface to encoder input, typed decline on probe miss |
 | `frontend.rs` | Annex B into ordered `Picture`s over DPB slots, POC, reference lists |
 | `params.rs` | syntax onto VA-API picture/slice buffers |
 | `buffer.rs` | owned data buffers: create, map-rewrite, destroy on drop |

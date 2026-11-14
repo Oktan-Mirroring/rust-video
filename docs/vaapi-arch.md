@@ -62,7 +62,7 @@ VA-API decode: packet bytes enter the NAL splitter, the parser reads each unit, 
 
 VA-API encode: a CPU frame faces NV12 format and size checks, copies through the upload image onto the upload surface, and encodes from there. A device surface skips the upload. Every picture codes as an IDR at CQP 26, and the packet carries driver headers ahead of the coded bytes marked a keyframe. Flush emits nothing: each IDR stands alone.
 
-VA-API transcode: the plan fixes at open from per-hop caps plus the export and encode probes. The encoder opens lazily on the first frame size and reopens on size change. The GPU route runs `decode_surface` into `encode_surface`, scaling through the VPP pipeline on a size miss with one scaled picture held back so the following scale submits before the previous encode runs. The CPU route runs `decode` into `to_cpu` into `encode`, naming the first miss on stderr. A scale or convert miss fails loud with `Unsupported` on either route.
+VA-API transcode: the plan fixes at open from per-hop caps plus the export and encode probes. The encoder opens lazily on the first frame size and reopens on size change. The GPU route runs `decode_surface` into `encode_surface`, scaling through the VPP pipeline on a size miss with one scaled picture held back so the following scale submits before the previous encode runs. A caps miss declines with `Unsupported` naming the first miss. A scale or convert miss fails loud with `Unsupported`.
 
 ## Zero-copy handoff
 
@@ -134,7 +134,7 @@ Tier rule: one row per file, paths relative to the tier crate.
 | `src/params.rs` | Syntax onto VA-API buffers |
 | `src/encoder.rs` | All-intra CQP sessions, packed headers |
 | `src/scale.rs` | VPP scaler, two-output overlap |
-| `src/transcode.rs` | GPU and CPU routes, lazy encoder |
+| `src/transcode.rs` | GPU route with typed decline, lazy encoder |
 | `src/buffer.rs` | Owned data buffers, map-rewrite |
 | `src/bitstream.rs` | Bit reader, Exp-Golomb |
 | `src/error.rs` | Skip reasons, typed failures |

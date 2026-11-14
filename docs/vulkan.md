@@ -33,10 +33,11 @@ chain stays.
 caps vocabulary (`GpuCaps`, `Plan`, `Route`, `FallbackCause`). The
 route stays on the GPU when every hop holds on one adapter: decode
 exports DMA-BUF planes, the encoder imports them, pixels never map.
-Otherwise the CPU path runs with the first miss named loud:
-`ShareUnsupported` without an external-memory mechanism, else
-`NoSharedExport`, `EncoderCpuOnly`, or `DeviceMismatch` across
-adapters. Scale and convert hops fail loud the same way.
+Otherwise `transcode` and `flush` decline with `Unsupported`
+naming the first miss: `ShareUnsupported` without an
+external-memory mechanism, else `NoSharedExport`,
+`EncoderCpuOnly`, or `DeviceMismatch` across adapters. Scale
+and convert hops fail loud the same way.
 
 Pairing compares adapter fingerprints (vendor, device, LUID hashed),
 stable across instances; raw physical-device handles differ per
@@ -44,7 +45,7 @@ instance and compared unequal on the same GPU.
 
 ## Frames
 
-`VulkanFrame` holds NV12 bytes on the CPU path and a device export
+`VulkanFrame` holds NV12 bytes from CPU decode and a device export
 on the GPU path, where `export()` returns DMA-BUF planes on Unix
 and `nv12` is empty; without a DMA-BUF export it is
 `Opaque { name: "vulkan" }`. `VulkanDevice::share_mechanism` reports

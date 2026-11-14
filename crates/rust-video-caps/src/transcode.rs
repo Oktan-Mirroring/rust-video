@@ -63,7 +63,7 @@ impl std::error::Error for FallbackCause {}
 pub enum Route {
     /// Device-resident textures, pixels never mapped.
     Gpu,
-    /// Proven CPU copy path.
+    /// Caller-built CPU route.
     Cpu,
 }
 

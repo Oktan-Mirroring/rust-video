@@ -9,8 +9,8 @@ use crate::ladder::CodecOp;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_caps::transcode::{Convert, FallbackCause, GpuCaps, Outcome, Plan, Route, Scale};
+use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Route, Scale};
 
 /// Encoder behind one transcode route.
 enum Encode {
@@ -48,10 +48,6 @@ pub struct Transcoder<'a> {
     convert: Convert,
     /// Executed plan.
     plan: Plan,
-    /// Decode adapter id.
-    decode_adapter: u64,
-    /// Encode adapter id.
-    encode_adapter: u64,
 }
 
 /// Decoder with its borrowed device lifetime.
@@ -113,8 +109,6 @@ impl<'a> Transcoder<'a> {
             scale: Scale::passthrough(),
             convert: Convert::passthrough(),
             plan,
-            decode_adapter,
-            encode_adapter,
         })
     }
 
@@ -154,56 +148,40 @@ impl<'a> Transcoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when a hop misses its target or either backend
-    /// refuses the picture.
+    /// Returns `Err` when the plan missed a hop or the target, or when
+    /// either backend refuses the picture.
     pub fn transcode(&mut self, packet: &Packet) -> Result<Outcome, VulkanError> {
-        if self.plan.route() == Route::Gpu {
-            self.transcode_gpu(packet)
-        } else {
-            let frames = self.decode(packet)?;
-            let packets = self.encode_cpu(&frames)?;
-            Ok(Outcome::new(packets, self.plan))
-        }
+        self.check_ready()?;
+        self.transcode_gpu(packet)
     }
 
     /// Packets held back for reordering or buffering.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when a hop misses its target or either backend
-    /// refuses the drain.
+    /// Returns `Err` when the plan missed a hop or the target, or when
+    /// either backend refuses the drain.
     pub fn flush(&mut self) -> Result<Outcome, VulkanError> {
-        if self.plan.route() == Route::Gpu {
-            self.flush_gpu()
-        } else {
-            let frames = match &mut self.decoder {
-                DecodeRouted::H264(decoder) => decoder.flush()?,
-                DecodeRouted::H265(decoder) => decoder.flush()?,
-                DecodeRouted::Av1(decoder) => decoder.flush()?,
-            };
-            let mut packets = self.encode_cpu(&frames)?;
-            if let Some(encoder) = self.encoder.as_mut() {
-                match encoder {
-                    Encode::H264(encoder) => packets.append(&mut encoder.flush()?),
-                    Encode::H265(encoder) => packets.append(&mut encoder.flush()?),
-                }
-            }
-            Ok(Outcome::new(packets, self.plan))
-        }
+        self.check_ready()?;
+        self.flush_gpu()
     }
 
-    /// Frames decoded from `packet` through the decode hop.
-    fn decode(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        match &mut self.decoder {
-            DecodeRouted::H264(decoder) => decoder.decode(packet),
-            DecodeRouted::H265(decoder) => decoder.decode(packet),
-            DecodeRouted::Av1(decoder) => decoder.decode(packet),
+    /// GPU route unless the plan missed, else the typed decline naming the miss.
+    fn check_ready(&self) -> Result<(), VulkanError> {
+        if self.plan.route() == Route::Gpu {
+            Ok(())
+        } else if let Some(cause) = self.plan.cause() {
+            Err(VulkanError::Unsupported {
+                what: cause.to_string(),
+            })
+        } else {
+            // open routes Cpu only with a named cause.
+            Ok(())
         }
     }
 
     /// Packets transcoded from `packet` through device exports.
     fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, VulkanError> {
-        self.check_devices()?;
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.decode_surface(packet)?,
             DecodeRouted::H265(decoder) => decoder.decode_surface(packet)?,
@@ -215,7 +193,6 @@ impl<'a> Transcoder<'a> {
 
     /// Drained packets through device exports.
     fn flush_gpu(&mut self) -> Result<Outcome, VulkanError> {
-        self.check_devices()?;
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.flush_surface()?,
             DecodeRouted::H265(decoder) => decoder.flush_surface()?,
@@ -247,46 +224,6 @@ impl<'a> Transcoder<'a> {
             }
             let encoder = self.encoder_for(frame.identity().size())?;
             packets.append(&mut encoder.encode_export(frame)?);
-        }
-        Ok(packets)
-    }
-
-    /// Loud refusal when decode and encode adapters differ.
-    fn check_devices(&self) -> Result<(), VulkanError> {
-        if self.decode_adapter == self.encode_adapter {
-            Ok(())
-        } else {
-            Err(VulkanError::Unsupported {
-                what: FallbackCause::DeviceMismatch.to_string(),
-            })
-        }
-    }
-
-    /// `frames` through the proven CPU path.
-    fn encode_cpu(&mut self, frames: &[VulkanFrame]) -> Result<Vec<Packet>, VulkanError> {
-        if let Some(cause) = self.plan.cause() {
-            eprintln!("vulkan transcode: cpu split ({cause})");
-        }
-        let mut packets = Vec::new();
-        for frame in frames {
-            let cpu = frame.to_cpu().ok_or_else(|| VulkanError::Unsupported {
-                what: "nv12 short of its extent".to_owned(),
-            })?;
-            if let Some(cause) = self.convert.miss(cpu.format()) {
-                return Err(VulkanError::Unsupported {
-                    what: cause.to_string(),
-                });
-            }
-            if let Some(cause) = self.scale.miss(cpu.size()) {
-                return Err(VulkanError::Unsupported {
-                    what: cause.to_string(),
-                });
-            }
-            let encoder = self.encoder_for(cpu.size())?;
-            match encoder {
-                Encode::H264(encoder) => packets.append(&mut encoder.encode(&cpu)?),
-                Encode::H265(encoder) => packets.append(&mut encoder.encode(&cpu)?),
-            }
         }
         Ok(packets)
     }
@@ -367,7 +304,9 @@ fn decode_two_plane(device: &VulkanDevice, op: CodecOp) -> bool {
 mod tests {
     use bytes::Bytes;
     use rust_video_caps::packet::Packet;
-    use rust_video_caps::transcode::Route;
+    use rust_video_caps::transcode::{
+        Convert, FallbackCause, GpuCaps, Plan, Route, Scale, ShareMechanism,
+    };
 
     use crate::error::VulkanError;
     use crate::ladder::CodecOp;
@@ -378,6 +317,26 @@ mod tests {
         encode: &'a crate::device::VulkanDevice,
     ) -> Option<super::Transcoder<'a>> {
         super::Transcoder::open(decode, CodecOp::H264Decode, encode, CodecOp::H264Encode).ok()
+    }
+
+    /// Transcoder with `caps` and `plan` forced past `open`, absent without hardware.
+    fn forced<'a>(
+        decode: &'a crate::device::VulkanDevice,
+        encode: &'a crate::device::VulkanDevice,
+        caps: GpuCaps,
+        plan: Plan,
+    ) -> Option<super::Transcoder<'a>> {
+        let decoder = super::DecodeRouted::H264(crate::decoder::H264Decoder::open(decode).ok()?);
+        Some(super::Transcoder {
+            decoder,
+            encode_device: encode,
+            encode_op: CodecOp::H264Encode,
+            encoder: None,
+            caps,
+            scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
+            plan,
+        })
     }
 
     /// Live H.264 decode plus encode devices, absent without hardware.
@@ -422,6 +381,9 @@ mod tests {
         let Some(mut transcoder) = pair(&decode, &encode) else {
             return;
         };
+        if transcoder.plan().route() != Route::Gpu {
+            return;
+        }
         let outcome = transcoder.flush().expect("flush drains");
         assert_eq!(outcome.packets(), []);
     }
@@ -434,6 +396,9 @@ mod tests {
         let Some(mut transcoder) = pair(&decode, &encode) else {
             return;
         };
+        if transcoder.plan().route() != Route::Gpu {
+            return;
+        }
         assert_eq!(transcoder.flush().expect("first flush").packets(), []);
         assert_eq!(transcoder.flush().expect("second flush").packets(), []);
     }
@@ -446,6 +411,9 @@ mod tests {
         let Some(mut transcoder) = pair(&decode, &encode) else {
             return;
         };
+        if transcoder.plan().route() != Route::Gpu {
+            return;
+        }
         let packet = Packet::new(Bytes::new());
         let outcome = transcoder.transcode(&packet).expect("empty packet");
         assert_eq!(outcome.packets(), []);
@@ -476,9 +444,70 @@ mod tests {
         let Some(mut transcoder) = pair(&decode, &encode) else {
             return;
         };
+        if transcoder.plan().route() != Route::Gpu {
+            return;
+        }
         let plan = transcoder.plan();
         let outcome = transcoder.flush().expect("flush drains");
         assert_eq!(outcome.packets(), []);
         assert_eq!(outcome.plan(), plan);
+    }
+
+    #[test]
+    fn caps_miss_declines_typed() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, false);
+        assert!(!caps.ready());
+        let Some(mut transcoder) = forced(
+            &decode,
+            &encode,
+            caps,
+            Plan::cpu(FallbackCause::EncoderCpuOnly),
+        ) else {
+            return;
+        };
+        let packet = Packet::new(Bytes::new());
+        assert_eq!(
+            transcoder
+                .transcode(&packet)
+                .expect_err("caps miss declines")
+                .to_string(),
+            "unsupported encoder without gpu import"
+        );
+        assert_eq!(
+            transcoder.flush().expect_err("drain declines").to_string(),
+            "unsupported encoder without gpu import"
+        );
+    }
+
+    #[test]
+    fn device_mismatch_declines_typed() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, true);
+        assert!(caps.ready());
+        let Some(mut transcoder) = forced(
+            &decode,
+            &encode,
+            caps,
+            Plan::cpu(FallbackCause::DeviceMismatch),
+        ) else {
+            return;
+        };
+        let packet = Packet::new(Bytes::new());
+        assert_eq!(
+            transcoder
+                .transcode(&packet)
+                .expect_err("mismatch declines")
+                .to_string(),
+            "unsupported decode and encode devices differ"
+        );
+        assert_eq!(
+            transcoder.flush().expect_err("drain declines").to_string(),
+            "unsupported decode and encode devices differ"
+        );
     }
 }

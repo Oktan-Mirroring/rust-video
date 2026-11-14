@@ -41,10 +41,10 @@ encoder and plans in caps vocabulary (`GpuCaps`, `Plan`,
 holds on one device: `NtHandle` share plus decode export
 plus encoder import, with textures flowing through
 `decode_texture` and `encode_texture`, pixels never mapped.
-Otherwise the CPU path runs with the first miss named loud:
-`ShareUnsupported` without a share mechanism, else
-`NoSharedExport` or `EncoderCpuOnly`. Scale and convert hops
-fail loud the same way; HEVC GPU decode rejects
+Otherwise `transcode` and `flush` decline with `Unsupported`
+naming the first miss: `ShareUnsupported` without a share
+mechanism, else `NoSharedExport` or `EncoderCpuOnly`. Scale and
+convert hops fail loud the same way; HEVC GPU decode rejects
 multi-picture packets loud (`transcode.rs`, `decoder.rs`).
 
 The route never spans adapters: one device serves both ends,

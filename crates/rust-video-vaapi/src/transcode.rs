@@ -10,7 +10,7 @@ use crate::scale::{ScaledSurface, Scaler};
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::{
     Convert, FallbackCause, GpuCaps, Outcome, Plan, Scale, ShareMechanism,
 };
@@ -97,34 +97,33 @@ impl<'a> Transcoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the scale hop misses its target or when either
-    /// backend refuses the picture.
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the picture.
     pub fn transcode(&mut self, packet: &Packet) -> Result<Outcome, VaApiError> {
-        if self.caps.ready() {
-            self.transcode_gpu(packet)
-        } else {
-            let frames = self.decoder.decode(packet)?;
-            let packets = self.encode_cpu(&frames)?;
-            Ok(Outcome::new(packets, self.plan))
-        }
+        self.check_ready()?;
+        self.transcode_gpu(packet)
     }
 
     /// Packets held back for reordering or buffering.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the scale hop misses its target or when either
-    /// backend refuses the drain.
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the drain.
     pub fn flush(&mut self) -> Result<Outcome, VaApiError> {
+        self.check_ready()?;
+        self.flush_gpu()
+    }
+
+    /// GPU route unless a hop missed, else the typed decline naming the miss.
+    fn check_ready(&self) -> Result<(), VaApiError> {
         if self.caps.ready() {
-            self.flush_gpu()
+            Ok(())
+        } else if let Some(cause) = self.plan.cause() {
+            Err(VaApiError::Unsupported(cause.to_string()))
         } else {
-            let frames = self.decoder.flush()?;
-            let mut packets = self.encode_cpu(&frames)?;
-            if let Some(encoder) = self.encoder.as_mut() {
-                packets.append(&mut encoder.flush()?);
-            }
-            Ok(Outcome::new(packets, self.plan))
+            // open derives plan from caps, so a miss names its cause.
+            Ok(())
         }
     }
 
@@ -245,26 +244,54 @@ impl<'a> Transcoder<'a> {
             None => Err(VaApiError::Parse("encoder without a session".to_owned())),
         }
     }
+}
 
-    /// `frames` through the CPU split, loud about the cause.
-    fn encode_cpu(&mut self, frames: &[VaApiFrame]) -> Result<Vec<Packet>, VaApiError> {
-        if let Some(cause) = self.plan.cause() {
-            log::warn!("va-api transcode: cpu split ({cause})");
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use rust_video_caps::packet::Packet;
+    use rust_video_caps::transcode::{
+        Convert, FallbackCause, GpuCaps, Plan, Scale, ShareMechanism,
+    };
+
+    /// Transcoder with `caps` forced past `open`.
+    fn forced(
+        device: &crate::device::VaApiDevice,
+        caps: GpuCaps,
+        cause: FallbackCause,
+    ) -> super::Transcoder<'_> {
+        super::Transcoder {
+            decoder: crate::decoder::H264Decoder::open(device),
+            encode_codec: crate::encoder::EncodeCodec::H264,
+            encoder: None,
+            caps,
+            scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
+            device,
+            scaler: None,
+            plan: Plan::cpu(cause),
         }
-        let mut packets = Vec::new();
-        for frame in frames {
-            let cpu = frame
-                .to_cpu()
-                .ok_or_else(|| VaApiError::Unsupported("nv12 short of its extent".to_owned()))?;
-            if let Some(cause) = self.convert.miss(cpu.format()) {
-                return Err(VaApiError::Unsupported(cause.to_string()));
-            }
-            if let Some(cause) = self.scale.miss(cpu.size()) {
-                return Err(VaApiError::Unsupported(cause.to_string()));
-            }
-            let size = cpu.size();
-            packets.append(&mut self.encoder_for(size)?.encode(&cpu)?);
-        }
-        Ok(packets)
+    }
+
+    #[test]
+    fn caps_miss_declines_typed() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let caps = GpuCaps::new(Some(ShareMechanism::DmaBuf), true, false);
+        assert!(!caps.ready());
+        let mut transcoder = forced(&device, caps, FallbackCause::EncoderCpuOnly);
+        let packet = Packet::new(Bytes::new());
+        assert_eq!(
+            transcoder
+                .transcode(&packet)
+                .expect_err("caps miss declines")
+                .to_string(),
+            "unsupported stream: encoder without gpu import"
+        );
+        assert_eq!(
+            transcoder.flush().expect_err("drain declines").to_string(),
+            "unsupported stream: encoder without gpu import"
+        );
     }
 }

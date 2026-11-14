@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use crate::decoder::GpuSurface;
-use crate::decoder::{D3d11Frame, H264Decoder};
+use crate::decoder::H264Decoder;
 use crate::device::D3d11Device;
 use crate::encoder::D3d11Encoder;
 use crate::error::{D3d11Error, UnsupportedReason};
@@ -16,7 +16,7 @@ use crate::submit::flag_word;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
 use windows::core::Interface;
@@ -113,32 +113,35 @@ impl<'a> Transcoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the scale hop misses its target or when either
-    /// backend refuses the picture.
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the picture.
     pub fn transcode(&mut self, packet: &Packet) -> Result<Outcome, D3d11Error> {
-        if self.caps.ready() {
-            self.transcode_gpu(packet)
-        } else {
-            let frames = self.decoder.decode(packet)?;
-            let packets = self.encode_cpu(&frames)?;
-            Ok(Outcome::new(packets, self.plan))
-        }
+        self.check_ready()?;
+        self.transcode_gpu(packet)
     }
 
     /// Packets held back for reordering or buffering.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the scale hop misses its target or when either
-    /// backend refuses the drain.
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the drain.
     pub fn flush(&mut self) -> Result<Outcome, D3d11Error> {
+        self.check_ready()?;
+        self.flush_gpu()
+    }
+
+    /// GPU route unless a hop missed, else the typed decline naming the miss.
+    fn check_ready(&self) -> Result<(), D3d11Error> {
         if self.caps.ready() {
-            self.flush_gpu()
+            Ok(())
+        } else if let Some(cause) = self.plan.cause() {
+            Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                cause,
+            }))
         } else {
-            let frames = self.decoder.flush()?;
-            let mut packets = self.encode_cpu(&frames)?;
-            packets.append(&mut self.encoder.flush()?);
-            Ok(Outcome::new(packets, self.plan))
+            // open derives plan from caps, so a miss names its cause.
+            Ok(())
         }
     }
 
@@ -205,28 +208,6 @@ impl<'a> Transcoder<'a> {
         let scaler = self.scaler.as_ref().ok_or(D3d11Error::NoSession)?;
         scaler.scale(surface)
     }
-
-    /// `frames` through the proven CPU path.
-    fn encode_cpu(&mut self, frames: &[D3d11Frame]) -> Result<Vec<Packet>, D3d11Error> {
-        let mut packets = Vec::new();
-        for frame in frames {
-            let cpu = frame.to_cpu().ok_or(D3d11Error::Unsupported(
-                UnsupportedReason::Nv12ShortOfExtent,
-            ))?;
-            if let Some(cause) = self.convert.miss(cpu.format()) {
-                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                    cause,
-                }));
-            }
-            if let Some(cause) = self.scale.miss(cpu.size()) {
-                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                    cause,
-                }));
-            }
-            packets.append(&mut self.encoder.encode(&cpu)?);
-        }
-        Ok(packets)
-    }
 }
 
 /// NT-handle share behind `device`, absent without shared-texture export.
@@ -275,10 +256,32 @@ fn declined_export() -> D3d11Error {
 mod tests {
     use bytes::Bytes;
     use rust_video_caps::packet::Packet;
+    use rust_video_caps::transcode::{
+        Convert, FallbackCause, GpuCaps, Plan, Scale, ShareMechanism,
+    };
 
     /// Live H.264 transcoder, absent without hardware.
     fn transcoder(device: &crate::device::D3d11Device) -> Option<super::Transcoder<'_>> {
         super::Transcoder::open(device, crate::guid::Codec::H264, crate::guid::Codec::H264).ok()
+    }
+
+    /// Transcoder with `caps` forced past `open`, absent without hardware.
+    fn forced(
+        device: &crate::device::D3d11Device,
+        caps: GpuCaps,
+        cause: FallbackCause,
+    ) -> Option<super::Transcoder<'_>> {
+        let encoder = crate::encoder::D3d11Encoder::open(device, crate::guid::Codec::H264).ok()?;
+        Some(super::Transcoder {
+            decoder: Box::new(crate::decoder::H264Decoder::open(device)),
+            encoder,
+            caps,
+            scale: Scale::passthrough(),
+            convert: Convert::passthrough(),
+            device,
+            scaler: None,
+            plan: Plan::cpu(cause),
+        })
     }
 
     #[test]
@@ -312,6 +315,9 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
+        if !transcoder.caps().ready() {
+            return;
+        }
         let outcome = transcoder.flush().expect("flush drains");
         assert_eq!(outcome.packets(), []);
     }
@@ -324,6 +330,9 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
+        if !transcoder.caps().ready() {
+            return;
+        }
         assert_eq!(transcoder.flush().expect("first flush").packets(), []);
         assert_eq!(transcoder.flush().expect("second flush").packets(), []);
     }
@@ -336,6 +345,9 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
+        if !transcoder.caps().ready() {
+            return;
+        }
         let packet = Packet::new(Bytes::new());
         let outcome = transcoder.transcode(&packet).expect("empty packet");
         assert_eq!(outcome.packets(), []);
@@ -349,6 +361,9 @@ mod tests {
         let Some(mut transcoder) = transcoder(&device) else {
             return;
         };
+        if !transcoder.caps().ready() {
+            return;
+        }
         let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1]));
         let outcome = transcoder.transcode(&packet).expect("truncated packet");
         assert_eq!(outcome.packets(), []);
@@ -376,5 +391,29 @@ mod tests {
         };
         let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0xFF, 0xFF, 0x00]));
         assert!(transcoder.transcode(&packet).is_err());
+    }
+
+    #[test]
+    fn caps_miss_declines_typed() {
+        let Ok(device) = crate::device::D3d11Device::open() else {
+            return;
+        };
+        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, false);
+        assert!(!caps.ready());
+        let Some(mut transcoder) = forced(&device, caps, FallbackCause::EncoderCpuOnly) else {
+            return;
+        };
+        let packet = Packet::new(Bytes::new());
+        assert_eq!(
+            transcoder
+                .transcode(&packet)
+                .expect_err("caps miss declines")
+                .to_string(),
+            "unsupported stream: encoder without gpu import"
+        );
+        assert_eq!(
+            transcoder.flush().expect_err("drain declines").to_string(),
+            "unsupported stream: encoder without gpu import"
+        );
     }
 }
