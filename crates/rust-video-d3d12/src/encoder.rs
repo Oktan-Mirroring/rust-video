@@ -78,7 +78,8 @@ impl<'a> D3d12Encoder<'a> {
         height: u32,
     ) -> Result<&mut EncodeSession, D3d12Error> {
         if self.active != Some((width, height)) {
-            let session = EncodeSession::open(self.device, self.codec, width, height)?;
+            let queues = self.session.take().map(EncodeSession::into_queues);
+            let session = EncodeSession::open(self.device, self.codec, width, height, queues)?;
             self.session = Some(session);
             self.active = Some((width, height));
         }

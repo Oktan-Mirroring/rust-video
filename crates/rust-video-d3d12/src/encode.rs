@@ -636,6 +636,34 @@ struct Buffers {
     resolved_staging: ID3D12Resource,
 }
 
+/// Submit queues plus slots reused across session rebuilds.
+pub(crate) struct EncodeQueues {
+    /// Video encode queue.
+    video_queue: ID3D12CommandQueue,
+    /// Video encode slot.
+    video: CommandSlot<ID3D12VideoEncodeCommandList2>,
+    /// Direct queue behind uploads.
+    copy_queue: ID3D12CommandQueue,
+    /// Upload slot.
+    copy: CommandSlot<ID3D12GraphicsCommandList>,
+}
+
+impl EncodeQueues {
+    /// Queues plus slots over `resources`.
+    fn open(resources: &DeviceResources) -> Result<Self, D3d12Error> {
+        let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
+        let video = CommandSlot::open(resources, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
+        let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let copy = CommandSlot::open(resources, D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        Ok(Self {
+            video_queue,
+            video,
+            copy_queue,
+            copy,
+        })
+    }
+}
+
 /// D3D12 video encode session over one codec geometry.
 pub(crate) struct EncodeSession {
     /// Video encode queue.
@@ -741,13 +769,34 @@ impl EncodeSession {
     ///
     /// Returns `Err` without a `codec` encoder, past the
     /// adapter encode caps, or when the driver refuses the session.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - D3D12 device behind the session.
+    /// * `codec` - codec the session encodes.
+    /// * `width` - visible width in luma samples.
+    /// * `height` - visible height in luma samples.
+    /// * `queues` - submit queues from the dropped session, absent on first open.
     pub(crate) fn open(
         device: &crate::device::D3d12Device,
         codec: crate::guid::Codec,
         width: u32,
         height: u32,
+        queues: Option<EncodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        Self::open_windows(device, codec, width, height)
+        Self::open_windows(device, codec, width, height, queues)
+    }
+
+    /// Submit queues plus slots for the next session rebuild.
+    ///
+    /// Call past the session waits only; in-flight slots reset under the GPU.
+    pub(crate) fn into_queues(self) -> EncodeQueues {
+        EncodeQueues {
+            video_queue: self.video_queue,
+            video: self.video,
+            copy_queue: self.copy_queue,
+            copy: self.copy,
+        }
     }
 
     /// Session over `device` for `codec` at `width` by `height`.
@@ -756,6 +805,7 @@ impl EncodeSession {
         codec: crate::guid::Codec,
         width: u32,
         height: u32,
+        queues: Option<EncodeQueues>,
     ) -> Result<Self, D3d12Error> {
         if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
             return Err(D3d12Error::Unsupported(
@@ -770,10 +820,16 @@ impl EncodeSession {
         let video3 = device.video3()?;
         let (encoder, heap) = Self::create_codec(&video3, &mut descriptors)?;
         let resources = DeviceResources::new(device.device());
-        let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
-        let video = CommandSlot::open(&resources, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)?;
-        let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let copy = CommandSlot::open(&resources, D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let queues = match queues {
+            Some(queues) => queues,
+            None => EncodeQueues::open(&resources)?,
+        };
+        let EncodeQueues {
+            video_queue,
+            video,
+            copy_queue,
+            copy,
+        } = queues;
         let video_fence = Fence::open(device.device())?;
         let copy_fence = Fence::open(device.device())?;
         let meta_cap =
@@ -1253,7 +1309,8 @@ impl EncodeSession {
         DeviceResources::write_upload(&self.upload, &staged)?;
         let ticket = self.submit_copy()?;
         self.copy_fence.wait(ticket)?;
-        self.finish_picture()
+        let input = self.input.clone();
+        self.finish_picture(&input)
     }
 
     /// Bitstream bytes encoded from the `src` texture on the GPU.
@@ -1268,14 +1325,25 @@ impl EncodeSession {
                 UnsupportedReason::TextureExtentOutsideSession,
             ));
         }
+        if self.spans_coded(src) {
+            return self.finish_picture(src);
+        }
         let ticket = self.submit_copy_from(src, width, height)?;
         self.copy_fence.wait(ticket)?;
-        self.finish_picture()
+        let input = self.input.clone();
+        self.finish_picture(&input)
+    }
+
+    /// True when `resource` spans the session coded extent.
+    fn spans_coded(&self, resource: &ID3D12Resource) -> bool {
+        // Sound: the resource is live; the descriptor describes it.
+        let desc = unsafe { resource.GetDesc() };
+        desc.Width == u64::from(self.width) && desc.Height == self.height
     }
 
     /// Picture through the video queue plus metadata into Annex B bytes.
-    fn finish_picture(&mut self) -> Result<Vec<u8>, D3d12Error> {
-        let ticket = self.submit_video()?;
+    fn finish_picture(&mut self, input: &ID3D12Resource) -> Result<Vec<u8>, D3d12Error> {
+        let ticket = self.submit_video(input)?;
         self.video_fence.wait(ticket)?;
         let ticket = self.submit_download()?;
         self.copy_fence.wait(ticket)?;
@@ -1531,7 +1599,7 @@ impl EncodeSession {
     }
 
     /// `EncodeFrame` plus metadata resolve through the video queue.
-    fn submit_video(&mut self) -> Result<Ticket, D3d12Error> {
+    fn submit_video(&mut self, input: &ID3D12Resource) -> Result<Ticket, D3d12Error> {
         self.video.reset()?;
         let hevc = matches!(self.codec, crate::guid::Codec::Hevc);
         let mut pic_h264 = Self::pic_h264(self.idr_pic_id);
@@ -1554,7 +1622,7 @@ impl EncodeSession {
         let input_args = D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS {
             SequenceControlDesc: sequence,
             PictureControlDesc: picture_control,
-            pInputFrame: ManuallyDrop::new(Some(self.input.clone())),
+            pInputFrame: ManuallyDrop::new(Some(input.clone())),
             InputFrameSubresource: 0,
             CurrentFrameBitstreamMetadataSize: 0,
         };
@@ -1595,7 +1663,7 @@ impl EncodeSession {
                 Offset: 0,
             },
         };
-        self.record_video(&input_args, &output_args, &resolve_in, &resolve_out);
+        self.record_video(input, &input_args, &output_args, &resolve_in, &resolve_out);
         let ticket = self
             .video
             .close_execute(&self.video_queue, &mut self.video_fence)?;
@@ -1609,6 +1677,7 @@ impl EncodeSession {
     /// Encode plus resolve records behind the argument structs.
     fn record_video(
         &self,
+        input: &ID3D12Resource,
         input_args: &D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS,
         output_args: &D3D12_VIDEO_ENCODER_ENCODEFRAME_OUTPUT_ARGUMENTS,
         resolve_in: &D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS,
@@ -1629,7 +1698,7 @@ impl EncodeSession {
             self.video
                 .list()
                 .ResourceBarrier(&[DeviceResources::barrier(
-                    &self.input,
+                    input,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
                 )]);
@@ -1680,7 +1749,7 @@ impl EncodeSession {
             self.video
                 .list()
                 .ResourceBarrier(&[DeviceResources::barrier(
-                    &self.input,
+                    input,
                     D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
                     D3D12_RESOURCE_STATE_COMMON,
                 )]);

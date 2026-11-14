@@ -212,12 +212,14 @@ macro_rules! real_decoder {
                     }
                 };
                 if self.active != Some(active) {
+                    let queues = self.session.take().map(DecodeSession::into_queues);
                     let session = DecodeSession::open(
                         self.device,
                         Codec::$codec,
                         active.width,
                         active.height,
                         active.crop,
+                        queues,
                     )?;
                     self.session = Some(session);
                     self.active = Some(active);
@@ -512,12 +514,14 @@ impl<'a> H264Decoder<'a> {
 
     /// Session plus picture buffer for `active`.
     fn open_session(&mut self, active: Active) -> Result<(), D3d12Error> {
+        let queues = self.session.take().map(DecodeSession::into_queues);
         let session = DecodeSession::open(
             self.device,
             Codec::H264,
             active.width,
             active.height,
             active.crop,
+            queues,
         )?;
         self.session = Some(session);
         let sps = self

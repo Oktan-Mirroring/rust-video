@@ -417,6 +417,14 @@ struct CropPlan {
     chroma: [u32; 4],
 }
 
+/// Crop target plan for `crop` in `width` by `height`, absent without an offset crop.
+fn crop_copy_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
+    if crop.is_none_or(|crop| crop.left == 0 && crop.top == 0) {
+        return None;
+    }
+    crop_plan(width, height, crop)
+}
+
 /// Crop copy plan for `crop` in `width` by `height`, absent when uncropped.
 fn crop_plan(width: u32, height: u32, crop: Option<Crop>) -> Option<CropPlan> {
     let crop = crop?;
@@ -467,6 +475,46 @@ impl Drop for SharedExport {
     }
 }
 
+/// Submit queues plus slots reused across session rebuilds.
+pub(crate) struct DecodeQueues {
+    /// Video decode queue.
+    video_queue: ID3D12CommandQueue,
+    /// Video decode slots, one per pool texture.
+    video_slots: Vec<CommandSlot<ID3D12VideoDecodeCommandList>>,
+    /// Direct queue behind downloads.
+    copy_queue: ID3D12CommandQueue,
+    /// Download slots, one per pool texture.
+    copy_slots: Vec<CommandSlot<ID3D12GraphicsCommandList>>,
+}
+
+impl DecodeQueues {
+    /// Queues plus slots over `resources`.
+    fn open(resources: &DeviceResources) -> Result<Self, D3d12Error> {
+        let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE)?;
+        let mut video_slots = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            video_slots.push(CommandSlot::open(
+                resources,
+                D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+            )?);
+        }
+        let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let mut copy_slots = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            copy_slots.push(CommandSlot::open(
+                resources,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+            )?);
+        }
+        Ok(Self {
+            video_queue,
+            video_slots,
+            copy_queue,
+            copy_slots,
+        })
+    }
+}
+
 /// D3D12 video decode session over one codec geometry.
 pub(crate) struct DecodeSession {
     /// Logical device behind shared-handle export.
@@ -493,7 +541,7 @@ pub(crate) struct DecodeSession {
     decoder: ID3D12VideoDecoder,
     /// NV12 output texture pool, one per DPB slot.
     outputs: Vec<ID3D12Resource>,
-    /// Visible-size crop targets, one per pool slot, empty when uncropped.
+    /// Visible-size crop targets, one per pool slot, empty without an offset crop.
     crops: Vec<ID3D12Resource>,
     /// Bitstream upload buffer.
     bitstream: ID3D12Resource,
@@ -518,14 +566,36 @@ impl DecodeSession {
     ///
     /// Returns `Err` without a `codec` profile, past the
     /// adapter decode caps, or when the driver refuses the session.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - D3D12 device behind the session.
+    /// * `codec` - codec the session decodes.
+    /// * `width` - coded width in luma samples.
+    /// * `height` - coded height in luma samples.
+    /// * `crop` - visible rectangle, absent when uncropped.
+    /// * `queues` - submit queues from the dropped session, absent on first open.
     pub(crate) fn open(
         device: &crate::device::D3d12Device,
         codec: crate::guid::Codec,
         width: u32,
         height: u32,
         crop: Option<Crop>,
+        queues: Option<DecodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        Self::open_windows(device, codec, width, height, crop)
+        Self::open_windows(device, codec, width, height, crop, queues)
+    }
+
+    /// Submit queues plus slots for the next session rebuild.
+    ///
+    /// Call past the session waits only; in-flight slots reset under the GPU.
+    pub(crate) fn into_queues(self) -> DecodeQueues {
+        DecodeQueues {
+            video_queue: self.video_queue,
+            video_slots: self.video_slots,
+            copy_queue: self.copy_queue,
+            copy_slots: self.copy_slots,
+        }
     }
 
     /// Session over `device` for `codec` at `width` by `height`.
@@ -535,6 +605,7 @@ impl DecodeSession {
         width: u32,
         height: u32,
         crop: Option<Crop>,
+        queues: Option<DecodeQueues>,
     ) -> Result<Self, D3d12Error> {
         if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
             return Err(D3d12Error::Unsupported(
@@ -548,22 +619,16 @@ impl DecodeSession {
         let resources = DeviceResources::new(device.device());
         let heap = crate::device::create_decoder_heap(device.video(), profile, width, height)?;
         let decoder = crate::device::create_decoder(device.video(), profile)?;
-        let video_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE)?;
-        let mut video_slots = Vec::with_capacity(POOL);
-        for _ in 0..POOL {
-            video_slots.push(CommandSlot::open(
-                &resources,
-                D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
-            )?);
-        }
-        let copy_queue = resources.queue(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let mut copy_slots = Vec::with_capacity(POOL);
-        for _ in 0..POOL {
-            copy_slots.push(CommandSlot::open(
-                &resources,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-            )?);
-        }
+        let queues = match queues {
+            Some(queues) => queues,
+            None => DecodeQueues::open(&resources)?,
+        };
+        let DecodeQueues {
+            video_queue,
+            video_slots,
+            copy_queue,
+            copy_slots,
+        } = queues;
         let video_fence = Fence::open(device.device())?;
         let copy_fence = Fence::open(device.device())?;
         let texture_desc = DeviceResources::texture_desc(width, height);
@@ -577,7 +642,7 @@ impl DecodeSession {
             )?);
         }
         let mut crops = Vec::new();
-        if let Some(plan) = crop_plan(width, height, crop) {
+        if let Some(plan) = crop_copy_plan(width, height, crop) {
             let crop_desc = DeviceResources::texture_desc(plan.width, plan.height);
             crops.reserve(POOL);
             for _ in 0..POOL {
@@ -764,7 +829,7 @@ impl DecodeSession {
 
     /// NT-handle export for pool `slot`, absent when cropped or refused.
     pub(crate) fn shared_handle(&self, slot: u8) -> Option<SharedExport> {
-        if !self.crops.is_empty() {
+        if crop_plan(self.width, self.height, self.crop).is_some() {
             return None;
         }
         let resource = self.outputs.get(usize::from(slot))?.clone();
