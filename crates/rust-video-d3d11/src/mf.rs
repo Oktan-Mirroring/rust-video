@@ -118,6 +118,8 @@ pub struct Session {
     pts: i64,
     /// Queued input credits from the event pump.
     credits: u32,
+    /// Consumed input samples for reuse at the negotiated extent.
+    spare_inputs: Vec<IMFSample>,
 }
 
 impl Session {
@@ -167,6 +169,7 @@ impl Session {
             size: None,
             pts: 0,
             credits: 0,
+            spare_inputs: Vec::new(),
         })
     }
 
@@ -183,6 +186,7 @@ impl Session {
         self.output = opened.output;
         self.in_align = SAMPLE_ALIGN;
         self.credits = 0;
+        self.spare_inputs.clear();
         Ok(())
     }
 
@@ -218,9 +222,28 @@ impl Session {
     ) -> Result<Vec<Packet>, D3d11Error> {
         let _com = ComGuard::enter();
         let mut packets = self.ensure_size(width, height)?;
-        let sample = input_sample(nv12_len(width, height), self.in_align, self.pts, fill)?;
+        let sample = self.take_input_sample(nv12_len(width, height), fill)?;
         self.submit_sample(&sample, &mut packets)?;
         Ok(packets)
+    }
+
+    /// Input sample of `len` bytes at the next stamp, filled by `fill`.
+    ///
+    /// Reuses a consumed sample when one waits; the pool only ever
+    /// holds the negotiated extent.
+    fn take_input_sample(
+        &mut self,
+        len: u64,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<IMFSample, D3d11Error> {
+        let pts = self.pts;
+        if let Some(sample) = self.spare_inputs.pop() {
+            let bytes = u32::try_from(len)
+                .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::FrameOver4Gib))?;
+            fill_sample(&sample, bytes, pts, fill)?;
+            return Ok(sample);
+        }
+        input_sample(len, self.in_align, pts, fill)
     }
 
     /// Drained packets across the size switch to `width` x `height`.
@@ -231,6 +254,7 @@ impl Session {
                 packets.append(&mut self.drain()?);
                 self.message(MFT_MESSAGE_COMMAND_FLUSH)?;
             }
+            self.spare_inputs.clear();
             self.configure(width, height)?;
         }
         Ok(packets)
@@ -250,6 +274,11 @@ impl Session {
         };
         if outcome.is_err() {
             self.reset_after_failure();
+            return outcome;
+        }
+        let stamped = sample_time(sample);
+        if packets.iter().any(|packet| packet.pts() == Some(stamped)) {
+            self.spare_inputs.push(sample.clone());
         }
         outcome
     }
@@ -1379,6 +1408,20 @@ fn input_sample(
         unsafe { MFCreateAlignedMemoryBuffer(len, align) },
         "MFCreateAlignedMemoryBuffer",
     )?;
+    call(unsafe { sample.AddBuffer(&buffer) }, "AddBuffer")?;
+    fill_sample(&sample, len, pts, fill)?;
+    Ok(sample)
+}
+
+/// `len` bytes of `sample` stamped at `pts`, filled by `fill`.
+fn fill_sample(
+    sample: &IMFSample,
+    len: u32,
+    pts: i64,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<(), D3d11Error> {
+    // Sound: the sample is live past output.
+    let buffer = call(unsafe { sample.GetBufferByIndex(0) }, "GetBufferByIndex")?;
     let mut data: *mut u8 = std::ptr::null_mut();
     call(
         unsafe { buffer.Lock(std::ptr::addr_of_mut!(data), None, None) },
@@ -1388,13 +1431,12 @@ fn input_sample(
     fill(unsafe { std::slice::from_raw_parts_mut(data, usize::try_from(len).unwrap_or(0)) });
     call(unsafe { buffer.Unlock() }, "Unlock")?;
     call(unsafe { buffer.SetCurrentLength(len) }, "SetCurrentLength")?;
-    call(unsafe { sample.AddBuffer(&buffer) }, "AddBuffer")?;
     call(unsafe { sample.SetSampleTime(pts) }, "SetSampleTime")?;
     call(
         unsafe { sample.SetSampleDuration(FRAME_HNS) },
         "SetSampleDuration",
     )?;
-    Ok(sample)
+    Ok(())
 }
 
 /// Packet behind one output sample.
