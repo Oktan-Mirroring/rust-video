@@ -11,6 +11,16 @@
 /// Panics when the `ffmpeg` feature is on, targeting Windows without
 /// `FFMPEG_LIB_DIR` set.
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(nasm_available)");
+    println!("cargo:rerun-if-env-changed=PATH");
+    if std::env::var_os("CARGO_FEATURE_H264_OPENH264").is_some()
+        && std::process::Command::new("nasm")
+            .arg("-v")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    {
+        println!("cargo::rustc-cfg=nasm_available");
+    }
     println!("cargo:rerun-if-env-changed=FFMPEG_LIB_DIR");
     if std::env::var_os("CARGO_FEATURE_FFMPEG").is_none() {
         return;

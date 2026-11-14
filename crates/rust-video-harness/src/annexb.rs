@@ -61,7 +61,8 @@ impl AnnexB {
     }
 
     /// NAL units without start codes.
-    fn split_nals(data: &[u8]) -> Vec<&[u8]> {
+    #[must_use]
+    pub fn split_nals(data: &[u8]) -> Vec<&[u8]> {
         let mut nals = Vec::new();
         let mut start = 0;
         let mut zeros = 0;
@@ -110,6 +111,15 @@ mod tests {
             vec![0, 0, 0, 1, 0x67, 0, 0, 0, 1, 0x41, 0x9A]
         );
         assert_eq!(AnnexB::packet(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn split_strips_start_codes() {
+        assert_eq!(
+            AnnexB::split_nals(&[0, 0, 0, 1, 0x67, 0, 0, 1, 0x41]),
+            vec![vec![0x67], vec![0x41]]
+        );
+        assert_eq!(AnnexB::split_nals(&[]), Vec::<Vec<u8>>::new());
     }
 
     #[test]

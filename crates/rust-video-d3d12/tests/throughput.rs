@@ -8,11 +8,19 @@ use rust_video_d3d12::{Codec, D3d12Device, Transcoder};
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
 #[cfg(target_os = "windows")]
+use rust_video_caps::frame::CpuFrame;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
+#[cfg(target_os = "windows")]
+use rust_video_caps::traits::{Decoder, Encoder};
 #[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
 #[cfg(target_os = "windows")]
+use rust_video_d3d12::{D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder};
+#[cfg(target_os = "windows")]
 use rust_video_harness::H264Synth;
+#[cfg(target_os = "windows")]
+use rust_video_harness::{bench_dir, AnnexB, Synth};
 
 #[cfg(target_os = "windows")]
 /// Hops timed after warmup.
@@ -21,6 +29,10 @@ const HOPS: u32 = 30;
 #[cfg(target_os = "windows")]
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
+
+#[cfg(target_os = "windows")]
+/// Serializes added benches sharing one adapter.
+static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "windows")]
 /// Packets over `raws`, built once outside the timed loop.
@@ -84,6 +96,221 @@ fn xcode_1080p_measures_realtime() {
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
     let measured = fps(&mut transcoder, &warmup, &raws);
     println!("xcode 1080p: {measured:.1}fps over {HOPS} hops, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(target_os = "windows")]
+/// Measured fps of `HOPS` 1080p decodes through `decoder`.
+fn decode_fps<D>(decoder: &mut D, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> Result<f64, D3d12Error>
+where
+    D: Decoder<Frame = D3d12Frame, Error = D3d12Error>,
+{
+    let warmup = packets(warmup);
+    let raws = packets(raws);
+    for packet in &warmup {
+        decoder.decode(packet)?;
+    }
+    decoder.flush()?;
+    let mut frames = 0;
+    let start = std::time::Instant::now();
+    for _ in 0..HOPS {
+        for packet in &raws {
+            frames += decoder.decode(packet).expect("timed decode").len();
+        }
+    }
+    frames += decoder.flush().expect("timed drain").len();
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(frames > 0);
+    let total = u32::try_from(frames).expect("frame count fits");
+    Ok(f64::from(total) / elapsed)
+}
+
+#[cfg(target_os = "windows")]
+/// Measured fps of `HOPS` 1080p encodes through `encoder`.
+fn encode_fps(
+    encoder: &mut D3d12Encoder,
+    warmup: &CpuFrame,
+    frames: &[CpuFrame],
+) -> Result<f64, D3d12Error> {
+    encoder.encode(warmup)?;
+    let mut bytes = 0;
+    let start = std::time::Instant::now();
+    for frame in frames {
+        for packet in encoder.encode(frame).expect("timed encode") {
+            bytes += packet.data().len();
+        }
+    }
+    for packet in encoder.flush().expect("timed drain") {
+        bytes += packet.data().len();
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(bytes > 0);
+    Ok(f64::from(HOPS) / elapsed)
+}
+
+#[cfg(target_os = "windows")]
+/// 1080p H.264 decode measured against the realtime bar.
+#[test]
+fn decode_h264_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::H264) {
+        println!("d3d12 skipped: no h264 decoder profile");
+        return;
+    }
+    let mut decoder = H264Decoder::open(&device);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let measured = match decode_fps(&mut decoder, &raws, &raws) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 h264 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(target_os = "windows")]
+/// 1080p HEVC decode measured against the realtime bar.
+#[test]
+fn decode_hevc_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("d3d12 skipped: no hevc decoder profile");
+        return;
+    }
+    let mut decoder = HevcDecoder::open(&device);
+    let path = bench_dir().join("h265-1080p-nvenc.h265");
+    let data = std::fs::read(&path).expect("vector readable");
+    let grouped = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
+    assert!(!grouped.is_empty(), "hevc vector groups to pictures");
+    let first = grouped[..1].to_vec();
+    let measured = match decode_fps(&mut decoder, &grouped, &first) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 hevc decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(target_os = "windows")]
+/// 1080p H.264 encode measured against the realtime bar.
+#[test]
+fn encode_h264_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d12Encoder::open(&device, Codec::H264) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    let frames: Vec<CpuFrame> = (0..HOPS)
+        .map(|seed| Synth::noise(1920, 1080, u64::from(seed)))
+        .collect();
+    let warmup = Synth::noise(1920, 1080, u64::from(HOPS));
+    let measured = match encode_fps(&mut encoder, &warmup, &frames) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup encode: {error}"),
+    };
+    println!("d3d12 h264 encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(target_os = "windows")]
+/// 1080p HEVC encode measured against the realtime bar.
+#[test]
+fn encode_hevc_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d12Encoder::open(&device, Codec::Hevc) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+    };
+    let frames: Vec<CpuFrame> = (0..HOPS)
+        .map(|seed| Synth::noise(1920, 1080, u64::from(seed)))
+        .collect();
+    let warmup = Synth::noise(1920, 1080, u64::from(HOPS));
+    let measured = match encode_fps(&mut encoder, &warmup, &frames) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("d3d12 skipped: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup encode: {error}"),
+    };
+    println!("d3d12 hevc encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
