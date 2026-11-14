@@ -460,7 +460,31 @@ impl Session {
             unsafe { self.transform.ProcessInput(self.input, sample, 0) },
             "ProcessInput",
         )?;
-        self.poll(packets)
+        self.poll(packets)?;
+        self.await_output(sample, packets)
+    }
+
+    /// Output stamped like `sample` into `packets`.
+    ///
+    /// The transform answers asynchronously; without this wait each call
+    /// returns the previous frame's packet.
+    fn await_output(
+        &mut self,
+        sample: &IMFSample,
+        packets: &mut Vec<Packet>,
+    ) -> Result<(), D3d11Error> {
+        let want = sample_time(sample);
+        loop {
+            if packets.iter().any(|packet| packet.pts() == Some(want)) {
+                return Ok(());
+            }
+            let typ = self.async_pump()?.pop()?;
+            if is_event(typ, METransformHaveOutput) {
+                self.try_output(packets)?;
+            } else if is_event(typ, METransformNeedInput) {
+                self.credits += 1;
+            }
+        }
     }
 
     /// One input credit, collecting outputs queued ahead of it.
@@ -1396,6 +1420,12 @@ fn extract(sample: &IMFSample) -> Result<Packet, D3d11Error> {
         packet = packet.mark_keyframe();
     }
     Ok(packet)
+}
+
+/// Stamp of `sample`, zero when the transform left none.
+fn sample_time(sample: &IMFSample) -> Duration {
+    // Sound: the sample is live; a missing stamp reads as zero.
+    unsafe { sample.GetSampleTime() }.map_or(Duration::ZERO, pts_duration)
 }
 
 /// Duration behind `hns` 100ns units.
