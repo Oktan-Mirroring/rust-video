@@ -19,3 +19,8 @@ thiserror = "1"
 [dev-dependencies]
 rust-video = { path = "../rust-video" }
 rust-video-harness = { path = "../rust-video-harness" }
+
+[[test]]
+name = "throughput"
+test = false
+bench = true

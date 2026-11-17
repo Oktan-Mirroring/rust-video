@@ -469,8 +469,10 @@ fn encode_hevc_1080p_measures_realtime() {
 
 /// 1080p VP9 encode measured against the realtime bar.
 ///
-/// Median of three runs; single-run timing straddles the bar under load.
+/// Median of three runs, alone via just benches: sharing a run taxes
+/// the software encoder past the bar.
 #[test]
+#[ignore = "runs alone under just benches"]
 fn encode_vp9_1080p_measures_realtime() {
     let _serial = measure();
     let device = match D3d11Device::open() {

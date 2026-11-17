@@ -25,3 +25,8 @@ openh264 = { version = "0.9", optional = true }
 [dev-dependencies]
 rust-video = { path = "../rust-video" }
 rust-video-harness = { path = "../rust-video-harness" }
+
+[[test]]
+name = "throughput"
+test = false
+bench = true

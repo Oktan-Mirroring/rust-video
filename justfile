@@ -24,6 +24,19 @@ test:
     cargo test --workspace --no-default-features
     cargo test -p rust-video-sw --features h264-openh264
 
+# Throughput bars, one binary at a time: bars measure an unloaded box.
+benches:
+    {{python}} scripts/check-bench-legs.py
+    cargo test -p rust-video-d3d11 --test throughput
+    cargo test -p rust-video-d3d11 --test throughput -- --ignored --exact encode_vp9_1080p_measures_realtime
+    cargo test -p rust-video-d3d12 --test throughput
+    cargo test -p rust-video-vulkan --test throughput
+    cargo test -p rust-video-vaapi --test throughput
+    cargo test -p rust-video-mediacodec --test throughput
+    cargo test -p rust-video-sw --test throughput
+    cargo test -p rust-video-sw --features h264-openh264 --test throughput
+    cargo test -p rust-video-livepack --test throughput
+
 # Debug build of the workspace.
 build:
     cargo build --workspace
@@ -37,8 +50,8 @@ doc:
 fmt-check:
     cargo fmt --all --check
 
-# Full gate: format, lints, build, tests, docs, spec tables.
-ci: fmt-check check build test doc spec-check
+# Full gate: format, lints, build, tests, benches, docs, spec tables.
+ci: fmt-check check build test benches doc spec-check
 
 # Diff spec doc tables against caps const tables.
 spec-check:
@@ -67,3 +80,11 @@ msrv:
     cargo +1.87.0 clippy -p rust-video-sw --all-targets -- -D warnings
     cargo +1.87.0 test --workspace
     cargo +1.87.0 test --workspace --no-default-features
+    cargo +1.87.0 test -p rust-video-d3d11 --test throughput
+    cargo +1.87.0 test -p rust-video-d3d11 --test throughput -- --ignored --exact encode_vp9_1080p_measures_realtime
+    cargo +1.87.0 test -p rust-video-d3d12 --test throughput
+    cargo +1.87.0 test -p rust-video-vulkan --test throughput
+    cargo +1.87.0 test -p rust-video-vaapi --test throughput
+    cargo +1.87.0 test -p rust-video-mediacodec --test throughput
+    cargo +1.87.0 test -p rust-video-sw --test throughput
+    cargo +1.87.0 test -p rust-video-livepack --test throughput

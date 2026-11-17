@@ -15,3 +15,8 @@ oracle = []
 [[test]]
 name = "fmp4_ffmpeg"
 required-features = ["oracle"]
+
+[[test]]
+name = "throughput"
+test = false
+bench = true
