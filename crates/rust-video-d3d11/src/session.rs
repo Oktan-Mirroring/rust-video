@@ -30,6 +30,7 @@ use crate::h264::Crop;
 use crate::hevc_dpb::SubmittedHevc;
 use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock, SurfaceFence};
+use crate::vp9_dpb::SubmittedVp9;
 
 use bytes::Bytes;
 use rust_video_caps::frame::GpuExport;
@@ -136,6 +137,7 @@ impl Session {
             Codec::H264 => crate::device::h264_guid(),
             Codec::Hevc => crate::device::hevc_guid(),
             Codec::Av1 => crate::device::av1_guid(),
+            Codec::Vp9 => crate::device::vp9_guid(),
             _ => {
                 return Err(D3d11Error::Unsupported(
                     UnsupportedReason::NoSessionForCodec { codec },
@@ -297,6 +299,27 @@ impl Session {
                 0,
             ),
             (D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, tiles, 0),
+        ];
+        self.submit_parts(submission.slot, &parts)
+    }
+
+    /// Decode VP9 `submission` onto its surface view.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a buffer overruns the driver
+    /// allocation, or when the driver refuses the submission.
+    pub fn submit_vp9(&self, submission: &SubmittedVp9) -> Result<(), D3d11Error> {
+        let params = struct_slice(&submission.params);
+        let slices = slice_slice(&submission.slices);
+        let parts = [
+            (D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, params, 0),
+            (
+                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                submission.bitstream.as_slice(),
+                0,
+            ),
+            (D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, slices, 0),
         ];
         self.submit_parts(submission.slot, &parts)
     }

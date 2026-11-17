@@ -379,6 +379,11 @@ pub(crate) fn av1_guid() -> GUID {
     windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0
 }
 
+/// VP9 profile 0 GUID the tier decodes.
+pub(crate) fn vp9_guid() -> GUID {
+    windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0
+}
+
 #[cfg(test)]
 mod tests {
     use windows::core::GUID;

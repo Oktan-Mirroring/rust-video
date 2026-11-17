@@ -51,6 +51,7 @@ macro_rules! shell {
     };
 }
 
+#[cfg(not(target_os = "windows"))]
 shell!(
     Vp9Decoder,
     Vp9,

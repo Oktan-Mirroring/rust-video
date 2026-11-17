@@ -49,9 +49,11 @@ mod submit;
 mod transcode;
 #[cfg(target_os = "windows")]
 mod vp9;
+#[cfg(target_os = "windows")]
+mod vp9_dpb;
 
 #[cfg(target_os = "windows")]
-pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder};
+pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
 pub use delivery::DecoderPump;
 #[cfg(target_os = "windows")]
@@ -67,7 +69,9 @@ pub use guid::{Codec, Profile};
 pub use inflight::{FramePhases, OverlappedPump, PhaseCapture, SplitDecoder};
 #[cfg(target_os = "windows")]
 pub use mf::Vp9Tuning;
-pub use shell::{Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
+#[cfg(not(target_os = "windows"))]
+pub use shell::Vp9Decoder;
+pub use shell::{Mpeg2Decoder, Vc1Decoder};
 #[cfg(target_os = "windows")]
 pub use submit::SubmitLock;
 #[cfg(target_os = "windows")]

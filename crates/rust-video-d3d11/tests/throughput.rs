@@ -6,7 +6,7 @@
 
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, GpuSurface, H264Decoder,
-    HevcDecoder, Transcoder,
+    HevcDecoder, Transcoder, Vp9Decoder,
 };
 
 use bytes::Bytes;
@@ -14,7 +14,7 @@ use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Synth};
+use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf, Synth};
 
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
@@ -82,6 +82,16 @@ impl SurfaceDecode for Av1Decoder<'_> {
 
     fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
         Av1Decoder::flush_surface(self)
+    }
+}
+
+impl SurfaceDecode for Vp9Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        Vp9Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        Vp9Decoder::flush_surface(self)
     }
 }
 
@@ -377,6 +387,32 @@ fn decode_av1_1080p_measures_realtime() {
     );
 }
 
+/// 1080p VP9 decode measured against the realtime bar.
+#[test]
+fn decode_vp9_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Vp9) {
+        println!("d3d11 skipped: no vp9 decoder profile");
+        return;
+    }
+    let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let mut decoder = Vp9Decoder::open(&device);
+    let measured = decode_fps(&mut decoder, &raws, &raws);
+    println!("d3d11 vp9 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
@@ -564,6 +600,32 @@ fn decode_surface_av1_1080p_measures_realtime() {
     let mut decoder = Av1Decoder::open(&device);
     let measured = decode_surface_fps(&mut decoder, &raws, &raws);
     println!("d3d11 av1 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p VP9 surface decode measured against the realtime bar.
+#[test]
+fn decode_surface_vp9_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Vp9) {
+        println!("d3d11 skipped: no vp9 decoder profile");
+        return;
+    }
+    let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let mut decoder = Vp9Decoder::open(&device);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    println!("d3d11 vp9 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"

@@ -1,10 +1,10 @@
 # rust-video-d3d11
 
-Direct3D 11 tier for Windows: H.264, H.265, and AV1 decode, Media Foundation encode, and GPU transcode behind the caps traits.
+Direct3D 11 tier for Windows: H.264, H.265, VP9, and AV1 decode, Media Foundation encode, and GPU transcode behind the caps traits.
 
 ## Decode
 
-`D3d11Device::open` probes the adapter and declines machines it cannot run on with `D3d11Error::Skipped`, naming the cause in `SkipReason`; the runners print `SKIP` and exit. `H264Decoder`, `HevcDecoder`, and `Av1Decoder` take Annex B or OBU bytes in and return NV12 frames. `Vp9Decoder`, `Mpeg2Decoder`, and `Vc1Decoder` are shell decoders: profile probe only, a loud typed error per packet, empty flush.
+`D3d11Device::open` probes the adapter and declines machines it cannot run on with `D3d11Error::Skipped`, naming the cause in `SkipReason`; the runners print `SKIP` and exit. `H264Decoder`, `HevcDecoder`, `Vp9Decoder`, and `Av1Decoder` take Annex B, IVF, or OBU bytes in and return NV12 frames. `Mpeg2Decoder` and `Vc1Decoder` are shell decoders: profile probe only, a loud typed error per packet, empty flush.
 
 ```rust
 use rust_video_caps::packet::Packet;

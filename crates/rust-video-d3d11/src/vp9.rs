@@ -2,9 +2,6 @@
 //!
 //! Reference sizes behind frame-size inheritance; the DPB owns surfaces and output.
 
-// Tests are the only consumer until decode wires the parser.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use crate::bits::BitReader;
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 
@@ -270,11 +267,6 @@ impl FrameHeader {
     /// Segmentation temporal update.
     pub(crate) const fn segmentation_temporal_update(&self) -> bool {
         self.flags & FH_SEG_TEMPORAL_UPDATE != 0
-    }
-
-    /// Segmentation data update.
-    pub(crate) const fn segmentation_update_data(&self) -> bool {
-        self.flags & FH_SEG_UPDATE_DATA != 0
     }
 
     /// Segmentation absolute delta.
@@ -1072,6 +1064,7 @@ fn split_tiles(frame: &[u8], header: &FrameHeader) -> Result<Vec<TileData>, D3d1
 #[cfg(test)]
 mod tests {
     use super::Ingest;
+    use super::FH_SEG_UPDATE_DATA;
     use crate::error::{D3d11Error, ParseReason};
 
     /// Bit writer behind synthetic headers.
@@ -1294,7 +1287,7 @@ mod tests {
         assert!(header.segmentation_enabled());
         assert!(header.segmentation_update_map());
         assert!(header.segmentation_temporal_update());
-        assert!(header.segmentation_update_data());
+        assert_ne!(header.flags & FH_SEG_UPDATE_DATA, 0);
         assert!(header.segmentation_abs_delta());
         assert_eq!(header.tree_probs, [128; 7]);
         assert_eq!(header.pred_probs, [200; 3]);
@@ -1483,6 +1476,25 @@ mod tests {
             let fill = 0xA0 + u8::try_from(index).expect("tile fits");
             let len = if index < 7 { index + 1 } else { 8 };
             assert_eq!(tile.bytes, vec![fill; len], "tile {index} bytes");
+        }
+    }
+
+    #[test]
+    fn dpb_slices_land_on_tile_payloads() {
+        let bytes = tiled_4096x16();
+        let frames = Ingest::new().ingest_packet(&bytes).expect("tiled");
+        assert_eq!(frames.len(), 1);
+        let mut dpb = crate::vp9_dpb::Vp9Dpb::new();
+        let decoded = dpb.decode(&frames[0]).expect("dpb accepts key");
+        let submission = decoded.submission.expect("submission");
+        assert_eq!(submission.slices.len(), frames[0].tiles.len());
+        for (slice, tile) in submission.slices.iter().zip(frames[0].tiles.iter()) {
+            let start = usize::try_from(slice.location).expect("offset fits");
+            let len = usize::try_from(slice.bytes).expect("size fits");
+            assert_eq!(
+                &submission.bitstream[start..start + len],
+                tile.bytes.as_slice()
+            );
         }
     }
 
