@@ -326,6 +326,9 @@ impl Session {
 
     /// Array `slot` copied to its lane staging through the immediate context.
     ///
+    /// The copy orders the lane marker behind the video decode; surface
+    /// waits depend on it.
+    ///
     /// # Errors
     ///
     /// Returns `Err` for a slot outside the views or when the driver

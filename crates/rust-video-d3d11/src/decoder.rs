@@ -477,6 +477,8 @@ impl<'a> H264Decoder<'a> {
             // Submit before any surface handoff: outputs may name the submission slot.
             if let Err(error) = session.submit(&decoded.submission) {
                 failed = Some(error);
+            } else if let Err(error) = session.copy_slot(decoded.submission.slot) {
+                failed = Some(error);
             } else {
                 for output in &decoded.outputs {
                     let Some(surface) = emit_surface(session, output, &active, &pins) else {
@@ -992,6 +994,8 @@ impl<'a> HevcDecoder<'a> {
             // Submit before any surface handoff: outputs may name the submission slot.
             if let Err(error) = session.submit_hevc(&decoded.submission) {
                 failed = Some(error);
+            } else if let Err(error) = session.copy_slot(decoded.submission.slot) {
+                failed = Some(error);
             } else {
                 for output in &decoded.outputs {
                     let Some(surface) = emit_surface(session, output, &active, &pins) else {
@@ -1489,6 +1493,8 @@ impl<'a> Av1Decoder<'a> {
             // Submit before any surface handoff: outputs may name the submission view.
             if let Some(submission) = decoded.submission.as_ref() {
                 if let Err(error) = session.submit_av1(submission) {
+                    failed = Some(error);
+                } else if let Err(error) = session.copy_slot(submission.slot) {
                     failed = Some(error);
                 }
             }
@@ -1999,6 +2005,8 @@ impl<'a> Vp9Decoder<'a> {
             // Submit before any surface handoff: outputs may name the submission view.
             if let Some(submission) = decoded.submission.as_ref() {
                 if let Err(error) = session.submit_vp9(submission) {
+                    failed = Some(error);
+                } else if let Err(error) = session.copy_slot(submission.slot) {
                     failed = Some(error);
                 }
             }
