@@ -5,8 +5,8 @@
 #![cfg(target_os = "windows")]
 
 use rust_video_d3d11::{
-    Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, H264Decoder, HevcDecoder,
-    Transcoder,
+    Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, GpuSurface, H264Decoder,
+    HevcDecoder, Transcoder,
 };
 
 use bytes::Bytes;
@@ -24,6 +24,63 @@ const BAR: f64 = 60.0;
 
 /// Warmup frames ahead of the timed loop.
 const WARMUP: u64 = 4;
+
+/// Serialized benches: one test at a time per binary.
+///
+/// Parallel benches share NVDEC/NVENC engines, CPU, and the software
+/// VP9 MFT; contention inside the timed loop reads as flake
+/// (`encode_vp9_1080p` passes isolated, fails in-suite at ~57fps even
+/// with timed-section-only serialization, because sibling warmups and
+/// noise generation overlap the measurement). Every test holds the
+/// lock for its whole body, so the bar and the measured path are
+/// unchanged and the measurement sees a quiet binary.
+static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whole-test serial guard, poison-tolerant.
+fn measure() -> std::sync::MutexGuard<'static, ()> {
+    MEASURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Surface decode behind the surface benches.
+trait SurfaceDecode {
+    /// GPU surfaces decoded from `packet`, possibly none.
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error>;
+
+    /// GPU surfaces held back for reordering or buffering.
+    fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error>;
+}
+
+impl SurfaceDecode for H264Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        H264Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        H264Decoder::flush_surface(self)
+    }
+}
+
+impl SurfaceDecode for HevcDecoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        HevcDecoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        HevcDecoder::flush_surface(self)
+    }
+}
+
+impl SurfaceDecode for Av1Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        Av1Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        Av1Decoder::flush_surface(self)
+    }
+}
 
 /// Packets over `raws`, built once outside the timed loop.
 fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
@@ -105,6 +162,65 @@ fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFram
     f64::from(HOPS) / elapsed
 }
 
+/// Measured fps decoding `HOPS` surface passes over `raws` after `warmup`.
+///
+/// Every surface waits for GPU completion inside the timed loop, so the
+/// number paces engine-plus-fence cost without any CPU readback. Each
+/// surface drops after its wait, keeping the 16 decoder slots free.
+fn decode_surface_fps(
+    decoder: &mut impl SurfaceDecode,
+    warmup: &[Vec<u8>],
+    raws: &[Vec<u8>],
+) -> f64 {
+    let warmup = packets(warmup);
+    let raws = packets(raws);
+    for packet in &warmup {
+        for surface in decoder.decode_surface(packet).expect("warmup decode") {
+            surface.wait().expect("warmup wait");
+        }
+    }
+    let mut surfaces = 0;
+    let start = std::time::Instant::now();
+    for _ in 0..HOPS {
+        for packet in &raws {
+            for surface in decoder.decode_surface(packet).expect("timed decode") {
+                surface.wait().expect("timed wait");
+                surfaces += 1;
+            }
+        }
+    }
+    for surface in decoder.flush_surface().expect("timed flush") {
+        surface.wait().expect("timed wait");
+        surfaces += 1;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(surfaces > 0);
+    f64::from(surfaces) / elapsed
+}
+
+/// Measured fps encoding `surface` `HOPS` times after `warmup` encodes.
+///
+/// One decoded 1080p surface feeds every call: the leg under test is
+/// texture import plus engine encode, not decode.
+fn encode_surface_fps(encoder: &mut D3d11Encoder, surface: &GpuSurface) -> f64 {
+    for _ in 0..WARMUP {
+        encoder.encode_surface(surface).expect("warmup encode");
+    }
+    let mut bytes = 0;
+    let start = std::time::Instant::now();
+    for _ in 0..HOPS {
+        for packet in encoder.encode_surface(surface).expect("timed encode") {
+            bytes += packet.data().len();
+        }
+    }
+    for packet in encoder.flush().expect("timed flush") {
+        bytes += packet.data().len();
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(bytes > 0);
+    f64::from(HOPS) / elapsed
+}
+
 /// Noise 1080p frame from `seed`.
 fn noise(seed: u64) -> CpuFrame {
     Synth::noise(1920, 1080, seed)
@@ -117,9 +233,38 @@ fn noise_frames() -> (Vec<CpuFrame>, Vec<CpuFrame>) {
     (warmup, timed)
 }
 
+/// One decoded 1080p surface behind the encode-surface benches.
+///
+/// The synth set holds a single IDR; the surface outlives its decoder
+/// by shared ownership, so any encoder MFT can import it.
+fn surface_1080p(device: &D3d11Device) -> GpuSurface {
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let mut decoder = H264Decoder::open(device);
+    let mut surfaces = Vec::new();
+    for raw in &raws {
+        surfaces.extend(
+            decoder
+                .decode_surface(&Packet::new(Bytes::copy_from_slice(raw)))
+                .expect("surface decode"),
+        );
+    }
+    surfaces.extend(decoder.flush_surface().expect("surface drain"));
+    assert_eq!(surfaces.len(), 1, "synth set holds one picture");
+    let surface = surfaces.pop().expect("one surface");
+    surface.wait().expect("surface completes");
+    let size = surface.size();
+    assert_eq!(
+        (size.width(), size.height()),
+        (1920, 1080),
+        "synth set is 1080p"
+    );
+    surface
+}
+
 /// 1080p GPU hops measured against the realtime bar.
 #[test]
 fn xcode_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -158,6 +303,7 @@ fn xcode_1080p_measures_realtime() {
 /// 1080p H.264 decode measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -178,6 +324,7 @@ fn decode_h264_1080p_measures_realtime() {
 /// 1080p HEVC decode measured against the realtime bar.
 #[test]
 fn decode_hevc_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -204,6 +351,7 @@ fn decode_hevc_1080p_measures_realtime() {
 /// 1080p AV1 decode measured against the realtime bar.
 #[test]
 fn decode_av1_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -229,6 +377,7 @@ fn decode_av1_1080p_measures_realtime() {
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -255,6 +404,7 @@ fn encode_h264_1080p_measures_realtime() {
 /// 1080p HEVC encode measured against the realtime bar.
 #[test]
 fn encode_hevc_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -281,6 +431,7 @@ fn encode_hevc_1080p_measures_realtime() {
 /// 1080p VP9 encode measured against the realtime bar.
 #[test]
 fn encode_vp9_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -307,6 +458,7 @@ fn encode_vp9_1080p_measures_realtime() {
 /// 1080p AV1 encode measured against the realtime bar.
 #[test]
 fn encode_av1_1080p_measures_realtime() {
+    let _serial = measure();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -324,6 +476,212 @@ fn encode_av1_1080p_measures_realtime() {
     let (warmup, frames) = noise_frames();
     let measured = encode_fps(&mut encoder, &warmup, &frames);
     println!("d3d11 av1 encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p H.264 surface decode measured against the realtime bar.
+#[test]
+fn decode_surface_h264_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let mut decoder = H264Decoder::open(&device);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    println!(
+        "d3d11 h264 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p HEVC surface decode measured against the realtime bar.
+#[test]
+fn decode_surface_hevc_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("d3d11 skipped: no hevc decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("h265-1080p-nvenc.h265")).expect("vector readable");
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let mut decoder = HevcDecoder::open(&device);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    println!(
+        "d3d11 hevc surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p AV1 surface decode measured against the realtime bar.
+#[test]
+fn decode_surface_av1_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Av1) {
+        println!("d3d11 skipped: no av1 decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
+    let raws = vec![data];
+    let mut decoder = Av1Decoder::open(&device);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    println!("d3d11 av1 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p H.264 surface encode measured against the realtime bar.
+#[test]
+fn encode_surface_h264_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, Codec::H264) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d11 skipped: no h264 encoder MFT ({error})");
+            return;
+        }
+    };
+    let surface = surface_1080p(&device);
+    if let Err(error) = encoder.encode_surface(&surface) {
+        println!("d3d11 skipped: no surface encode import ({error})");
+        return;
+    }
+    let measured = encode_surface_fps(&mut encoder, &surface);
+    println!(
+        "d3d11 h264 surface encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p HEVC surface encode measured against the realtime bar.
+#[test]
+fn encode_surface_hevc_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d11 skipped: no hevc encoder MFT ({error})");
+            return;
+        }
+    };
+    let surface = surface_1080p(&device);
+    if let Err(error) = encoder.encode_surface(&surface) {
+        println!("d3d11 skipped: no surface encode import ({error})");
+        return;
+    }
+    let measured = encode_surface_fps(&mut encoder, &surface);
+    println!(
+        "d3d11 hevc surface encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p VP9 surface encode measured against the realtime bar.
+#[test]
+fn encode_surface_vp9_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d11 skipped: no vp9 encoder MFT ({error})");
+            return;
+        }
+    };
+    let surface = surface_1080p(&device);
+    if let Err(error) = encoder.encode_surface(&surface) {
+        println!("d3d11 skipped: no surface encode import ({error})");
+        return;
+    }
+    let measured = encode_surface_fps(&mut encoder, &surface);
+    println!("d3d11 vp9 surface encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p AV1 surface encode measured against the realtime bar.
+#[test]
+fn encode_surface_av1_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, Codec::Av1) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("d3d11 skipped: no av1 encoder MFT ({error})");
+            return;
+        }
+    };
+    let surface = surface_1080p(&device);
+    if let Err(error) = encoder.encode_surface(&surface) {
+        println!("d3d11 skipped: no surface encode import ({error})");
+        return;
+    }
+    let measured = encode_surface_fps(&mut encoder, &surface);
+    println!("d3d11 av1 surface encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
