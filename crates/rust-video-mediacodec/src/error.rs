@@ -2,7 +2,6 @@
 
 use crate::decoder::DecodeState;
 use crate::encoder::EncodeState;
-use crate::quirks::QuirkSyntax;
 
 use rust_video_caps::frame::PixelFormat;
 
@@ -129,18 +128,6 @@ pub enum MediaCodecError {
         /// State the encoder was in.
         state: EncodeState,
     },
-    /// Quirk table line rejected.
-    #[error("quirks.toml:{line}: {reason}")]
-    Quirk {
-        /// Failing line number.
-        line: u64,
-        /// Rejection cause.
-        reason: QuirkSyntax,
-    },
-    /// NDK media call failure.
-    #[cfg(target_os = "android")]
-    #[error("media call failed: {0}")]
-    Ndk(#[from] ndk::media_error::MediaError),
 }
 
 #[cfg(test)]
@@ -148,7 +135,6 @@ mod tests {
     use super::MediaCodecError;
     use crate::decoder::DecodeState;
     use crate::encoder::EncodeState;
-    use crate::quirks::QuirkSyntax;
 
     use rust_video_caps::frame::PixelFormat;
 
@@ -243,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn state_and_quirk_name_operation() {
+    fn state_names_operation() {
         let error = MediaCodecError::InvalidState {
             op: "decode",
             state: DecodeState::Unconfigured,
@@ -254,10 +240,5 @@ mod tests {
             state: EncodeState::Configured,
         };
         assert_eq!(error.to_string(), "cannot encode while Configured");
-        let error = MediaCodecError::Quirk {
-            line: 9,
-            reason: QuirkSyntax::ExpectedSection,
-        };
-        assert_eq!(error.to_string(), "quirks.toml:9: expected [[quirk]]");
     }
 }

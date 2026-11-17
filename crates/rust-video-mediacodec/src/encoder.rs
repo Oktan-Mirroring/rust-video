@@ -1,47 +1,15 @@
 //! Byte-buffer encode behind the caps `Encoder` trait.
 
-#[cfg(target_os = "android")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
-#[cfg(any(test, target_os = "android"))]
 use std::time::Duration;
 
-#[cfg(target_os = "android")]
-use crate::bridge::{CodecEvent, EventQueue, PendingInputs};
-#[cfg(target_os = "android")]
-use crate::decoder::ranged_bytes;
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
-#[cfg(target_os = "android")]
-use crate::quirks::QuirkTable;
-#[cfg(target_os = "android")]
-use crate::sdk::ApiLevel;
+use crate::seam::{CodecSeam, SeamItem};
 
 use bytes::Bytes;
-#[cfg(target_os = "android")]
-use ndk::media::media_codec::{
-    DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, InputBuffer, MediaCodec,
-    MediaCodecDirection,
-};
-#[cfg(target_os = "android")]
-use ndk::media::media_format::MediaFormat;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
-#[cfg(any(test, target_os = "android"))]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "android")]
-use rust_video_caps::traits::Encoder;
-
-/// `MediaCodec#BUFFER_FLAG_KEY_FRAME`; `MediaCodecEncoder::packet` and `Inner` share it.
-#[cfg(any(test, target_os = "android"))]
-const BUFFER_FLAG_KEY_FRAME: u32 = 1;
-
-/// `MediaCodec#BUFFER_FLAG_CODEC_CONFIG`; `MediaCodecEncoder::packet` and `Inner` share it.
-#[cfg(any(test, target_os = "android"))]
-const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
-
-/// `MediaCodec#BUFFER_FLAG_END_OF_STREAM`; `Inner` drain loops share it.
-#[cfg(target_os = "android")]
-const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
 
 /// Codec carried by an encode spec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -52,16 +20,6 @@ enum Codec {
     H265,
     /// AV1.
     Av1,
-}
-
-/// Output arrival path.
-#[cfg(target_os = "android")]
-#[derive(Debug)]
-enum DrainMode {
-    /// Synchronous dequeue with timeouts.
-    Sync,
-    /// Async callbacks feeding a polled queue.
-    Async(AsyncDrain),
 }
 
 /// Encoder lifecycle state.
@@ -148,114 +106,6 @@ enum Layout {
     Nv12,
     /// Planar Y, U, V.
     Planar,
-}
-
-/// Async callback state.
-#[cfg(target_os = "android")]
-#[derive(Debug)]
-struct AsyncDrain {
-    /// Callback-side event intake.
-    queue: EventQueue,
-    /// Input indices awaiting a frame.
-    pending: PendingInputs,
-}
-
-#[cfg(target_os = "android")]
-impl AsyncDrain {
-    /// Drain over `queue` with an empty stash.
-    fn new(queue: EventQueue) -> Self {
-        Self {
-            queue,
-            pending: PendingInputs::new(),
-        }
-    }
-
-    /// Frame queued; packets freed along the way.
-    fn push(
-        &mut self,
-        codec: &MediaCodec,
-        bytes: &[u8],
-        pts: u64,
-    ) -> Result<Vec<Packet>, MediaCodecError> {
-        let mut packets = Vec::new();
-        for _ in 0..Inner::INPUT_ATTEMPTS {
-            if let Some(index) = self.pending.pop() {
-                Inner::write_input(codec, index, bytes, pts)?;
-                return Ok(packets);
-            }
-            let batch = self.queue.drain_blocking(Inner::INPUT_TIMEOUT);
-            for event in self.pending.stash_inputs(batch) {
-                match event {
-                    CodecEvent::InputAvailable { index } => self.pending.push(index),
-                    CodecEvent::OutputAvailable {
-                        index,
-                        offset,
-                        size,
-                        pts_us,
-                        flags,
-                        ..
-                    } => {
-                        if let Some(packet) =
-                            Inner::pull_output(codec, index, offset, size, flags, pts_us)?
-                        {
-                            packets.push(packet);
-                        }
-                    }
-                    CodecEvent::FormatChanged => {}
-                    CodecEvent::Error {
-                        recoverable,
-                        transient,
-                        kind,
-                    } => {
-                        return Err(MediaCodecError::CodecFault {
-                            recoverable,
-                            transient,
-                            kind,
-                        });
-                    }
-                }
-            }
-        }
-        Err(MediaCodecError::InputStarved)
-    }
-
-    /// Packets collected from queued async events.
-    fn drain(&mut self, codec: &MediaCodec) -> Result<Vec<Packet>, MediaCodecError> {
-        let mut packets = Vec::new();
-        let batch = self.queue.drain();
-        for event in self.pending.stash_inputs(batch) {
-            match event {
-                CodecEvent::InputAvailable { index } => self.pending.push(index),
-                CodecEvent::OutputAvailable {
-                    index,
-                    offset,
-                    size,
-                    pts_us,
-                    flags,
-                    ..
-                } => {
-                    if let Some(packet) =
-                        Inner::pull_output(codec, index, offset, size, flags, pts_us)?
-                    {
-                        packets.push(packet);
-                    }
-                }
-                CodecEvent::FormatChanged => {}
-                CodecEvent::Error {
-                    recoverable,
-                    transient,
-                    kind,
-                } => {
-                    return Err(MediaCodecError::CodecFault {
-                        recoverable,
-                        transient,
-                        kind,
-                    });
-                }
-            }
-        }
-        Ok(packets)
-    }
 }
 
 /// Encoder input format.
@@ -469,201 +319,6 @@ impl EncodeSpec {
     pub fn pts_for(&self, index: u64) -> u64 {
         let pts = u128::from(index) * Self::MICROS_PER_SECOND / u128::from(self.frame_rate);
         u64::try_from(pts).unwrap_or(u64::MAX)
-    }
-
-    /// Native format for `configure`.
-    ///
-    /// <https://docs.rs/ndk/0.9.0/ndk/media/media_format/struct.MediaFormat.html>
-    #[cfg(target_os = "android")]
-    #[must_use]
-    pub fn materialize(&self) -> MediaFormat {
-        let mut format = MediaFormat::new();
-        format.set_str(FormatSpec::KEY_MIME, self.mime());
-        format.set_i32(FormatSpec::KEY_WIDTH, self.width_as_i32());
-        format.set_i32(FormatSpec::KEY_HEIGHT, self.height_as_i32());
-        format.set_i32(
-            Self::KEY_BIT_RATE,
-            i32::try_from(self.bitrate).unwrap_or(i32::MAX),
-        );
-        format.set_i32(
-            FormatSpec::KEY_FRAME_RATE,
-            i32::try_from(self.frame_rate).unwrap_or(i32::MAX),
-        );
-        format.set_i32(
-            Self::KEY_I_FRAME_INTERVAL,
-            i32::try_from(self.keyframe_interval).unwrap_or(i32::MAX),
-        );
-        format.set_i32(FormatSpec::KEY_COLOR_FORMAT, self.color_format);
-        format
-    }
-
-    /// Width as a native `i32`; construction bounds it.
-    #[cfg(target_os = "android")]
-    fn width_as_i32(&self) -> i32 {
-        i32::try_from(self.width).unwrap_or(i32::MAX)
-    }
-
-    /// Height as a native `i32`; construction bounds it.
-    #[cfg(target_os = "android")]
-    fn height_as_i32(&self) -> i32 {
-        i32::try_from(self.height).unwrap_or(i32::MAX)
-    }
-}
-
-/// Native codec and drain mode.
-#[cfg(target_os = "android")]
-#[derive(Debug)]
-struct Inner {
-    /// Owned codec handle.
-    codec: MediaCodec,
-    /// Sync dequeue or async callbacks.
-    mode: DrainMode,
-}
-
-#[cfg(target_os = "android")]
-impl Inner {
-    /// Input attempts per frame before starvation.
-    const INPUT_ATTEMPTS: u32 = 3;
-    /// Dequeue wait per attempt.
-    const INPUT_TIMEOUT: Duration = Duration::from_millis(10);
-
-    /// Frame queued; packets freed along the way.
-    fn push_frame(&mut self, bytes: &[u8], pts: u64) -> Result<Vec<Packet>, MediaCodecError> {
-        match &mut self.mode {
-            DrainMode::Sync => Self::push_sync(&self.codec, bytes, pts),
-            DrainMode::Async(drain) => drain.push(&self.codec, bytes, pts),
-        }
-    }
-
-    /// Frame queued through sync dequeue.
-    fn push_sync(
-        codec: &MediaCodec,
-        bytes: &[u8],
-        pts: u64,
-    ) -> Result<Vec<Packet>, MediaCodecError> {
-        let mut packets = Vec::new();
-        for _ in 0..Self::INPUT_ATTEMPTS {
-            match codec.dequeue_input_buffer(Self::INPUT_TIMEOUT)? {
-                DequeuedInputBufferResult::Buffer(mut buffer) => {
-                    Self::fill_buffer(&mut buffer, bytes)?;
-                    codec.queue_input_buffer(buffer, 0, bytes.len(), pts, 0)?;
-                    return Ok(packets);
-                }
-                DequeuedInputBufferResult::TryAgainLater => {
-                    packets.extend(Self::drain_sync(codec)?);
-                }
-            }
-        }
-        Err(MediaCodecError::InputStarved)
-    }
-
-    /// Frame bytes copied into one input buffer.
-    fn fill_buffer(buffer: &mut InputBuffer<'_>, bytes: &[u8]) -> Result<(), MediaCodecError> {
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let dst = buffer.buffer_mut();
-            if bytes.len() > dst.len() {
-                return Err(MediaCodecError::FrameTooLarge {
-                    len: bytes.len(),
-                    capacity: dst.len(),
-                });
-            }
-            for (slot, byte) in dst.iter_mut().zip(bytes.iter()) {
-                slot.write(*byte);
-            }
-            Ok(())
-        }));
-        match outcome {
-            Ok(result) => result,
-            Err(_) => Err(MediaCodecError::BufferLost),
-        }
-    }
-
-    /// Frame bytes queued into input buffer `index`.
-    fn write_input(
-        codec: &MediaCodec,
-        index: usize,
-        bytes: &[u8],
-        pts: u64,
-    ) -> Result<(), MediaCodecError> {
-        let Some(dst) = codec.input_buffer(index) else {
-            return Err(MediaCodecError::BufferLost);
-        };
-        if bytes.len() > dst.len() {
-            return Err(MediaCodecError::FrameTooLarge {
-                len: bytes.len(),
-                capacity: dst.len(),
-            });
-        }
-        for (slot, byte) in dst.iter_mut().zip(bytes.iter()) {
-            slot.write(*byte);
-        }
-        codec.queue_input_buffer_by_index(index, 0, bytes.len(), pts, 0)?;
-        Ok(())
-    }
-
-    /// Available outputs as packets.
-    fn drain_packets(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
-        match &mut self.mode {
-            DrainMode::Sync => Self::drain_sync(&self.codec),
-            DrainMode::Async(drain) => drain.drain(&self.codec),
-        }
-    }
-
-    /// Packets collected through sync dequeue.
-    fn drain_sync(codec: &MediaCodec) -> Result<Vec<Packet>, MediaCodecError> {
-        let mut packets = Vec::new();
-        loop {
-            match codec.dequeue_output_buffer(Duration::ZERO)? {
-                DequeuedOutputBufferInfoResult::Buffer(buffer) => {
-                    let info = *buffer.info();
-                    let caught = catch_unwind(AssertUnwindSafe(|| buffer.buffer()));
-                    let Ok(slice) = caught else {
-                        let _released = codec.release_output_buffer(buffer, false);
-                        return Err(MediaCodecError::BufferLost);
-                    };
-                    let bytes = match ranged_bytes(slice, info.offset(), info.size()) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            let _released = codec.release_output_buffer(buffer, false);
-                            return Err(error);
-                        }
-                    };
-                    let flags = info.flags();
-                    let pts = info.presentation_time_us();
-                    codec.release_output_buffer(buffer, false)?;
-                    if flags & BUFFER_FLAG_END_OF_STREAM != 0 {
-                        continue;
-                    }
-                    if let Some(packet) = MediaCodecEncoder::packet(bytes, flags, pts) {
-                        packets.push(packet);
-                    }
-                }
-                DequeuedOutputBufferInfoResult::OutputFormatChanged
-                | DequeuedOutputBufferInfoResult::OutputBuffersChanged => {}
-                DequeuedOutputBufferInfoResult::TryAgainLater => return Ok(packets),
-            }
-        }
-    }
-
-    /// Packet pulled from output buffer `index`, unless config-only.
-    fn pull_output(
-        codec: &MediaCodec,
-        index: usize,
-        offset: i32,
-        size: i32,
-        flags: u32,
-        pts_us: i64,
-    ) -> Result<Option<Packet>, MediaCodecError> {
-        if flags & BUFFER_FLAG_END_OF_STREAM != 0 {
-            codec.release_output_buffer_by_index(index, false)?;
-            return Ok(None);
-        }
-        let Some(buffer) = codec.output_buffer(index) else {
-            return Err(MediaCodecError::BufferLost);
-        };
-        let bytes = ranged_bytes(buffer, offset, size);
-        codec.release_output_buffer_by_index(index, false)?;
-        Ok(MediaCodecEncoder::packet(bytes?, flags, pts_us))
     }
 }
 
@@ -910,85 +565,38 @@ pub struct MediaCodecEncoder {
     spec: EncodeSpec,
     /// Packed input layout.
     input: InputLayout,
-    /// Matched quirk identifiers.
-    applied: Vec<String>,
     /// Frames queued; stamps the next presentation time.
-    #[cfg(target_os = "android")]
+    // Reached only from the Android module.
+    #[allow(dead_code)]
     frames: u64,
-    /// Native codec and drain mode.
-    #[cfg(target_os = "android")]
-    inner: Inner,
+    /// OS codec session.
+    // Reached only from the Android module.
+    #[allow(dead_code)]
+    backend: Box<dyn CodecSeam>,
 }
 
+// Constructors and directors run only behind the Android module.
+#[allow(dead_code)]
 impl MediaCodecEncoder {
-    /// Encoder for `spec` on device `soc` with `quirks`.
-    ///
-    /// # Arguments
-    ///
-    /// * `spec` - codec output format.
-    /// * `soc` - device `SoC` name for quirk matching.
-    /// * `quirks` - quirk table.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` below the device floor, when the input color has no
-    /// plane layout, or when no encoder answers the mime.
-    #[cfg(target_os = "android")]
-    pub fn open(
-        spec: &EncodeSpec,
-        soc: &str,
-        quirks: &QuirkTable,
-    ) -> Result<Self, MediaCodecError> {
-        Self::open_android(spec, soc, quirks)
-    }
+    /// `MediaCodec#BUFFER_FLAG_KEY_FRAME`.
+    const BUFFER_FLAG_KEY_FRAME: u32 = 1;
+    /// `MediaCodec#BUFFER_FLAG_CODEC_CONFIG`.
+    const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
 
-    /// Native encoder after the SDK gates.
-    #[cfg(target_os = "android")]
-    fn open_android(
-        spec: &EncodeSpec,
-        soc: &str,
-        quirks: &QuirkTable,
-    ) -> Result<Self, MediaCodecError> {
-        let level = ApiLevel::current();
-        if !level.meets_min() || !level.at_least(spec.min_sdk()) {
-            return Err(MediaCodecError::BelowMinSdk { found: level.get() });
-        }
-        let mut codec = MediaCodec::from_encoder_type(spec.mime())
-            .ok_or(MediaCodecError::NoEncoder { mime: spec.mime() })?;
-        let state = EncodeState::Unconfigured.configured()?;
-        codec.configure(&spec.materialize(), None, MediaCodecDirection::Encoder)?;
-        let mode = if level.supports_async_notify() {
-            let queue = EventQueue::new();
-            codec.set_async_notify_callback(Some(queue.async_callbacks()))?;
-            DrainMode::Async(AsyncDrain::new(queue))
-        } else {
-            DrainMode::Sync
-        };
-        codec.start()?;
-        let state = state.started()?;
-        let applied = quirks
-            .matching(soc, spec.mime())
-            .iter()
-            .map(|quirk| quirk.id().to_owned())
-            .collect();
-        let mut input = InputLayout::tentative(spec).ok_or(MediaCodecError::BadExtent {
-            width: i32::try_from(spec.width()).unwrap_or(i32::MAX),
-            height: i32::try_from(spec.height()).unwrap_or(i32::MAX),
-        })?;
-        let format = codec.input_format();
-        input.apply_format(
-            format.i32(FormatSpec::KEY_COLOR_FORMAT),
-            format.i32(FormatSpec::KEY_STRIDE),
-            format.i32(FormatSpec::KEY_SLICE_HEIGHT),
-        )?;
-        Ok(Self {
+    /// Encoder in `state` for `spec` with `input` layout and `backend` session.
+    pub(crate) fn from_backend(
+        state: EncodeState,
+        spec: EncodeSpec,
+        input: InputLayout,
+        backend: Box<dyn CodecSeam>,
+    ) -> Self {
+        Self {
             state,
-            spec: spec.clone(),
+            spec,
             input,
-            applied,
             frames: 0,
-            inner: Inner { codec, mode },
-        })
+            backend,
+        }
     }
 
     /// Lifecycle state.
@@ -1009,68 +617,34 @@ impl MediaCodecEncoder {
         &self.input
     }
 
-    /// Quirk identifiers matched at open.
-    #[must_use]
-    pub fn applied_quirks(&self) -> &[String] {
-        &self.applied
-    }
-
     /// Packet from one output range, unless config-only.
-    #[cfg(any(test, target_os = "android"))]
     fn packet(bytes: Bytes, flags: u32, pts_us: i64) -> Option<Packet> {
-        if flags & BUFFER_FLAG_CODEC_CONFIG != 0 && flags & BUFFER_FLAG_KEY_FRAME == 0 {
+        if flags & Self::BUFFER_FLAG_CODEC_CONFIG != 0 && flags & Self::BUFFER_FLAG_KEY_FRAME == 0 {
             return None;
         }
         let mut packet =
             Packet::new(bytes).with_pts(Duration::from_micros(u64::try_from(pts_us).unwrap_or(0)));
-        if flags & BUFFER_FLAG_KEY_FRAME != 0 {
+        if flags & Self::BUFFER_FLAG_KEY_FRAME != 0 {
             packet = packet.mark_keyframe();
         }
         Some(packet)
     }
 
-    /// Drained packets, then a codec flush; stays started.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, or when the codec faults.
-    #[cfg(target_os = "android")]
-    pub fn reset(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
-        self.state.ensure_started("reset")?;
-        let packets = self.inner.drain_packets()?;
-        if let DrainMode::Async(drain) = &mut self.inner.mode {
-            drain.pending.clear();
-        }
-        self.inner.codec.flush()?;
-        if matches!(self.inner.mode, DrainMode::Async(_)) {
-            self.inner.codec.start()?;
-        }
-        Ok(packets)
-    }
-}
-
-#[cfg(target_os = "android")]
-impl Encoder for MediaCodecEncoder {
-    type Error = MediaCodecError;
-
     /// Packets coded from `frame`, possibly none.
-    ///
-    /// # Arguments
-    ///
-    /// * `frame` - raw input frame.
     ///
     /// # Errors
     ///
     /// Returns `Err` unless started, when the frame is not planar 4:2:0
-    /// at the configured extent, or when the codec faults.
-    fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
+    /// at the configured extent, when no input buffer frees inside the
+    /// queue budget, or when the codec faults.
+    pub(crate) fn push_frame(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, MediaCodecError> {
         self.state.ensure_started("encode")?;
         let bytes = self.input.pack(frame)?;
         let pts = self.spec.pts_for(self.frames);
-        let mut packets = self.inner.push_frame(&bytes, pts)?;
+        let mut items = self.backend.submit(&bytes, pts)?;
         self.frames += 1;
-        packets.extend(self.inner.drain_packets()?);
-        Ok(packets)
+        items.extend(self.backend.read()?);
+        Ok(Self::packets(items))
     }
 
     /// Packets held back for reordering or buffering.
@@ -1078,18 +652,41 @@ impl Encoder for MediaCodecEncoder {
     /// # Errors
     ///
     /// Returns `Err` unless started, or when the codec faults.
-    fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
+    pub(crate) fn drain_packets(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
         self.state.ensure_started("flush")?;
-        self.inner.drain_packets()
+        let items = self.backend.read()?;
+        Ok(Self::packets(items))
     }
-}
 
-#[cfg(target_os = "android")]
-impl Drop for MediaCodecEncoder {
-    /// Codec stopped; buffers release with the handle.
-    fn drop(&mut self) {
-        let _stopped = self.inner.codec.stop();
+    /// Drained packets, then a codec flush; stays started.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, or when the codec faults.
+    pub(crate) fn reset_packets(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
+        self.state.ensure_started("reset")?;
+        let items = self.backend.reset()?;
+        Ok(Self::packets(items))
+    }
+
+    /// Encoder marked released.
+    pub(crate) fn mark_released(&mut self) {
         self.state = self.state.released().unwrap_or(EncodeState::Released);
+    }
+
+    /// Packets over drained `items`, config-only outputs dropped.
+    fn packets(items: Vec<SeamItem>) -> Vec<Packet> {
+        items
+            .into_iter()
+            .filter_map(|item| match item {
+                SeamItem::Output(output) => {
+                    let flags = output.flags();
+                    let pts_us = output.pts_us();
+                    Self::packet(output.into_bytes(), flags, pts_us)
+                }
+                SeamItem::Format(_) => None,
+            })
+            .collect()
     }
 }
 

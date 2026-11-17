@@ -4,7 +4,8 @@
 
 `rust-video-mediacodec` decodes H.264, H.265, AV1, VP9, and VP8 through the
 platform `MediaCodec` on Android, behind the facade `Decoder` trait.
-Byte buffers in, `CpuFrame` out. No surface path yet.
+Byte buffers in, `MediaCodecSurface` out; each surface carries its
+`CpuFrame` plus slot pinning.
 
 Source tiers: **[T1]** read from the artifact, **[T2]** consistent
 secondary, **[?]** unresolved, never filled.
@@ -63,25 +64,12 @@ unset while any other is set faults on Android 12 and earlier
 Input indices the current call cannot use go back on the queue;
 frames are never dropped to make progress.
 
-## Quirks
-
-`crates/rust-video-mediacodec/quirks.toml` holds the per-`SoC` table,
-embedded at build time and matched by lowercase substring against the
-device `SoC` name. Every entry names its `fallback`: the behavior the
-code takes when the quirk does not match.
-
-Suspected entries graduate to confirmed only under the 2-`SoC`
-device-proof rule: the misbehavior reproduces on two distinct chips,
-different vendors preferred, through the repo device tier, and the
-entry's `source` names both runs. Until then the code takes the
-fallback everywhere and the entry stays `suspected`.
-
 ## Host behavior
 
 Off Android everything native is compiled out: `open`, `reset`,
 and the `Decoder` impl exist on Android only. Format builders,
-quirk matching, the `DecodeState` machine, plane splitting, and
-the event queue all run as host unit tests (37 tests).
+the `DecodeState` machine, plane splitting, and
+the event queue all run as host unit tests (57 tests).
 Device-only code is covered by
 `cargo check --target aarch64-linux-android`.
 

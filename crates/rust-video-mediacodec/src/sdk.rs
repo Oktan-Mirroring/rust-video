@@ -1,4 +1,3 @@
-#![allow(unsafe_code)]
 //! Device API level and SDK gates.
 
 /// Lowest supported device API; `AMediaCodec` starts here.
@@ -19,17 +18,6 @@ impl ApiLevel {
     #[must_use]
     pub fn new(level: u32) -> Self {
         Self(level)
-    }
-
-    /// Live device level.
-    ///
-    /// <https://docs.rs/ndk-sys/0.6.0/ndk_sys/fn.android_get_device_api_level.html>
-    #[cfg(target_os = "android")]
-    #[must_use]
-    pub fn current() -> Self {
-        // SAFETY: pure query without preconditions; any thread, any time.
-        let level = unsafe { ndk_sys::android_get_device_api_level() };
-        Self(u32::try_from(level).unwrap_or(0))
     }
 
     /// Raw SDK integer.

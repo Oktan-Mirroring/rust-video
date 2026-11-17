@@ -4,9 +4,6 @@ use rust_video_caps::frame::PixelFormat;
 
 use crate::error::MediaCodecError;
 
-#[cfg(target_os = "android")]
-use ndk::media::media_format::MediaFormat;
-
 /// Codec carried by a format.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Codec {
@@ -228,43 +225,6 @@ impl FormatSpec {
     /// True when the blob is unset or empty.
     fn absent(blob: Option<&Vec<u8>>) -> bool {
         blob.is_none_or(Vec::is_empty)
-    }
-
-    /// Native format for `configure`.
-    ///
-    /// <https://docs.rs/ndk/0.9.0/ndk/media/media_format/struct.MediaFormat.html>
-    #[cfg(target_os = "android")]
-    #[must_use]
-    pub fn materialize(&self) -> MediaFormat {
-        let mut format = MediaFormat::new();
-        format.set_str(Self::KEY_MIME, self.mime());
-        format.set_i32(Self::KEY_WIDTH, self.width_as_i32());
-        format.set_i32(Self::KEY_HEIGHT, self.height_as_i32());
-        if let Some(rate) = self.frame_rate {
-            format.set_i32(
-                Self::KEY_FRAME_RATE,
-                i32::try_from(rate).unwrap_or(i32::MAX),
-            );
-        }
-        if let Some(csd) = self.csd_0.as_deref() {
-            format.set_buffer(Self::KEY_CSD_0, csd);
-        }
-        if let Some(csd) = self.csd_1.as_deref() {
-            format.set_buffer(Self::KEY_CSD_1, csd);
-        }
-        format
-    }
-
-    /// Width as a native `i32`; construction bounds it.
-    #[cfg(target_os = "android")]
-    fn width_as_i32(&self) -> i32 {
-        i32::try_from(self.width).unwrap_or(i32::MAX)
-    }
-
-    /// Height as a native `i32`; construction bounds it.
-    #[cfg(target_os = "android")]
-    fn height_as_i32(&self) -> i32 {
-        i32::try_from(self.height).unwrap_or(i32::MAX)
     }
 }
 

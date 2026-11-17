@@ -4,9 +4,6 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::Duration;
 
-#[cfg(target_os = "android")]
-use ndk::media::media_codec::AsyncNotifyCallback;
-
 /// Codec occurrence awaiting a poll.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodecEvent {
@@ -62,43 +59,6 @@ impl EventQueue {
     #[must_use]
     pub fn sender(&self) -> mpsc::Sender<CodecEvent> {
         self.sender.clone()
-    }
-
-    /// Async callbacks pushing into this queue.
-    ///
-    /// All four slots stay set; unset slots fault on older devices.
-    /// <https://docs.rs/ndk/0.9.0/ndk/media/media_codec/struct.MediaCodec.html#method.set_async_notify_callback>
-    #[cfg(target_os = "android")]
-    #[must_use]
-    pub fn async_callbacks(&self) -> AsyncNotifyCallback {
-        let input = self.sender();
-        let output = self.sender();
-        let format = self.sender();
-        let error = self.sender();
-        AsyncNotifyCallback {
-            on_input_available: Some(Box::new(move |index| {
-                let _sent = input.send(CodecEvent::InputAvailable { index });
-            })),
-            on_output_available: Some(Box::new(move |index, info| {
-                let _sent = output.send(CodecEvent::OutputAvailable {
-                    index,
-                    offset: info.offset(),
-                    size: info.size(),
-                    pts_us: info.presentation_time_us(),
-                    flags: info.flags(),
-                });
-            })),
-            on_format_changed: Some(Box::new(move |_format| {
-                let _sent = format.send(CodecEvent::FormatChanged);
-            })),
-            on_error: Some(Box::new(move |kind, action, _detail| {
-                let _sent = error.send(CodecEvent::Error {
-                    recoverable: action.is_recoverable(),
-                    transient: action.is_transient(),
-                    kind: format!("{kind:?}"),
-                });
-            })),
-        }
     }
 
     /// Queued events in arrival order, without blocking.

@@ -22,13 +22,12 @@ impl MediaCodecDevice {
     /// Tier name.
     const NAME: &'static str = "mediacodec";
 
-    /// Device probed on this machine.
-    #[cfg(target_os = "android")]
+    /// Device holding `level`.
+    // Reached only from the Android module.
+    #[allow(dead_code)]
     #[must_use]
-    pub fn probe() -> Self {
-        Self {
-            level: Some(ApiLevel::current()),
-        }
+    pub(crate) fn from_level(level: ApiLevel) -> Self {
+        Self { level: Some(level) }
     }
 
     /// True on a supported device floor.
@@ -48,20 +47,5 @@ impl Device for MediaCodecDevice {
     /// Tier name.
     fn name(&self) -> &str {
         Self::NAME
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(target_os = "android")]
-    use super::MediaCodecDevice;
-
-    #[cfg(target_os = "android")]
-    use rust_video_caps::traits::Device;
-
-    #[cfg(target_os = "android")]
-    #[test]
-    fn probe_names_tier() {
-        assert_eq!(MediaCodecDevice::probe().name(), "mediacodec");
     }
 }

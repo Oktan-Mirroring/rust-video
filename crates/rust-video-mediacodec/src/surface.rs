@@ -2,7 +2,7 @@
 //!
 //! A [`MediaCodecSurface`] is one decoded picture: owned CPU pixels plus the
 //! canonical surface metadata (`size`, `format`, `slice`, `coded`, `origin`)
-//! and a native ticket from [`MediaCodecSurface::export`]. Each live surface
+//! and an opaque export from [`MediaCodecSurface::export`]. Each live surface
 //! pins one decoder slot; the pool is bounded, so backpressure is a loud
 //! [`MediaCodecError::NoFreeSlot`], never silent corruption.
 //!
@@ -24,42 +24,32 @@
 
 use std::sync::{Arc, Mutex};
 
-use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, PixelFormat};
-
 use crate::error::MediaCodecError;
 
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, GpuExport, PixelFormat};
+
 /// Decoded picture pinning one decoder slot.
+///
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
 #[derive(Debug)]
 pub struct MediaCodecSurface {
     /// Owned picture pixels.
     frame: CpuFrame,
     /// Full buffer extent from stride by slice height.
     coded: PictureSize,
-    /// Decoder-issued sequence number plus geometry.
-    ticket: SurfaceTicket,
     /// Slot lease; drop releases the slot.
     _slot: SlotGuard,
 }
 
 impl MediaCodecSurface {
-    /// Surface over `frame` with `coded` extent, `slot` lease, and `generation`.
-    #[cfg(any(test, target_os = "android"))]
-    pub(crate) fn new(
-        frame: CpuFrame,
-        coded: PictureSize,
-        slot: SlotGuard,
-        generation: u64,
-    ) -> Self {
-        let ticket = SurfaceTicket {
-            generation,
-            size: frame.size(),
-            format: frame.format(),
-        };
+    /// Surface over `frame` with `coded` extent and `slot` lease.
+    // Reached only from the Android module and tests.
+    #[allow(dead_code)]
+    pub(crate) fn new(frame: CpuFrame, coded: PictureSize, slot: SlotGuard) -> Self {
         Self {
             frame,
             coded,
-            ticket,
             _slot: slot,
         }
     }
@@ -94,15 +84,15 @@ impl MediaCodecSurface {
         (0, 0)
     }
 
-    /// Native ticket: decoder-issued sequence plus geometry.
+    /// Opaque export behind the surface.
     ///
-    /// The ticket is metadata only; pixels stay in the surface and cross to
+    /// The export is metadata only; pixels stay in the surface and cross to
     /// other consumers through [`MediaCodecSurface::frame`]. There is no
     /// re-import: byte-buffer mode never mints `AImage`/`HardwareBuffer`
     /// objects.
     #[must_use]
-    pub fn export(&self) -> SurfaceTicket {
-        self.ticket
+    pub fn export(&self) -> GpuExport {
+        GpuExport::Opaque { name: "mediacodec" }
     }
 
     /// Image pixels by reference.
@@ -116,42 +106,14 @@ impl MediaCodecSurface {
     /// Byte-buffer pixels complete synchronously at emission, so this
     /// observes completion without blocking. It stays in the contract so
     /// readers written against fence-backed tiers compile unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok` always; byte-buffer pixels complete at emission.
     // Receiver is contract surface; completion needs no state read.
     #[allow(clippy::unused_self)]
-    pub fn wait(&self) {}
-}
-
-/// Native ticket for a [`MediaCodecSurface`].
-///
-/// Copyable metadata: the decoder-issued sequence number plus the geometry
-/// needed to describe the picture without touching its pixels.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SurfaceTicket {
-    /// Decoder-issued sequence number.
-    generation: u64,
-    /// Visible picture extent.
-    size: PictureSize,
-    /// Pixel layout.
-    format: PixelFormat,
-}
-
-impl SurfaceTicket {
-    /// Decoder-issued sequence number.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Visible picture extent in luma samples.
-    #[must_use]
-    pub fn size(&self) -> PictureSize {
-        self.size
-    }
-
-    /// Pixel layout.
-    #[must_use]
-    pub fn format(&self) -> PixelFormat {
-        self.format
+    pub fn wait(&self) -> Result<(), MediaCodecError> {
+        Ok(())
     }
 }
 
@@ -247,7 +209,7 @@ mod tests {
     use bytes::Bytes;
 
     use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+    use rust_video_caps::frame::{CpuFrame, GpuExport, PixelFormat, Plane};
 
     use super::{MediaCodecSurface, SurfaceSlots};
     use crate::error::MediaCodecError;
@@ -259,12 +221,12 @@ mod tests {
         CpuFrame::new(size, PixelFormat::Nv12, vec![y, uv]).expect("valid frame")
     }
 
-    fn surface(generation: u64) -> (MediaCodecSurface, SurfaceSlots) {
+    fn surface() -> (MediaCodecSurface, SurfaceSlots) {
         let slots = SurfaceSlots::new(2);
         let coded = PictureSize::new(32, 16).expect("valid coded");
         let slot = slots.acquire().expect("free slot");
         (
-            MediaCodecSurface::new(frame_16x16_nv12(), coded, slot, generation),
+            MediaCodecSurface::new(frame_16x16_nv12(), coded, slot),
             slots,
         )
     }
@@ -273,7 +235,7 @@ mod tests {
 
     #[test]
     fn metadata_matches_frame_and_layout() {
-        let (surface, _slots) = surface(9);
+        let (surface, _slots) = surface();
         assert_eq!(surface.size(), PictureSize::new(16, 16).expect("valid"));
         assert_eq!(surface.format(), PixelFormat::Nv12);
         assert_eq!(surface.slice(), 0);
@@ -283,14 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn export_carries_generation_and_geometry() {
-        let (surface, _slots) = surface(9);
-        let ticket = surface.export();
-        assert_eq!(ticket.generation(), 9);
-        assert_eq!(ticket.size(), surface.size());
-        assert_eq!(ticket.format(), surface.format());
-        let copy = ticket;
-        assert_eq!(copy, ticket);
+    fn export_answers_opaque() {
+        let (surface, _slots) = surface();
+        assert!(matches!(
+            surface.export(),
+            GpuExport::Opaque { name: "mediacodec" }
+        ));
     }
 
     #[test]
@@ -300,14 +260,14 @@ mod tests {
         let slots = SurfaceSlots::new(1);
         let coded = PictureSize::new(16, 16).expect("valid coded");
         let slot = slots.acquire().expect("free slot");
-        let surface = MediaCodecSurface::new(frame, coded, slot, 0);
+        let surface = MediaCodecSurface::new(frame, coded, slot);
         assert_eq!(surface.frame().planes()[0].data().as_ptr(), base);
     }
 
     #[test]
     fn wait_returns_on_complete_pixels() {
-        let (surface, _slots) = surface(0);
-        surface.wait();
+        let (surface, _slots) = surface();
+        surface.wait().expect("wait completes");
     }
 
     #[test]
@@ -330,7 +290,7 @@ mod tests {
         let slots = SurfaceSlots::new(1);
         let coded = PictureSize::new(16, 16).expect("valid coded");
         let slot = slots.acquire().expect("free slot");
-        let surface = MediaCodecSurface::new(frame_16x16_nv12(), coded, slot, 0);
+        let surface = MediaCodecSurface::new(frame_16x16_nv12(), coded, slot);
         assert_eq!(slots.live(), 1);
         drop(surface);
         assert_eq!(slots.live(), 0);
@@ -369,6 +329,5 @@ mod tests {
         assert_send_sync::<MediaCodecSurface>();
         assert_send_sync::<SurfaceSlots>();
         assert_send_sync::<super::SlotGuard>();
-        assert_send_sync::<super::SurfaceTicket>();
     }
 }

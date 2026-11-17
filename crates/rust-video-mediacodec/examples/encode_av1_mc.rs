@@ -5,7 +5,7 @@ use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "android")]
 use rust_video_harness::Synth;
 #[cfg(target_os = "android")]
-use rust_video_mediacodec::{EncodeSpec, MediaCodecDevice, MediaCodecEncoder, QuirkTable};
+use rust_video_mediacodec::{EncodeSpec, MediaCodecDevice, MediaCodecEncoder};
 
 #[cfg(target_os = "android")]
 fn main() {
@@ -15,22 +15,14 @@ fn main() {
         device.name(),
         device.available()
     );
-    let quirks = match QuirkTable::load() {
-        Ok(quirks) => quirks,
-        Err(error) => {
-            eprintln!("mediacodec: quirk table failed ({error})");
-            std::process::exit(1);
-        }
-    };
-    println!("mediacodec: {} quirk entries", quirks.len());
     let Some(spec) = EncodeSpec::av1(64, 64, 1_000_000, 30, 1) else {
         println!("ERROR: av1 spec rejected");
         std::process::exit(1);
     };
-    let mut encoder = match MediaCodecEncoder::open(&spec, "generic", &quirks) {
+    let mut encoder = match MediaCodecEncoder::open(&spec) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("SKIP: no av1 encoder ({error})");
+            println!("SKIP no av1 encoder ({error})");
             return;
         }
     };
@@ -52,4 +44,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "android"))]
-fn main() {}
+fn main() {
+    println!("SKIP: mediacodec needs android");
+}

@@ -4,29 +4,20 @@
 //! A missing codec or a device below the floor declines loudly; any other
 //! failure is a real failure. Host builds compile this file to nothing.
 
-#[cfg(target_os = "android")]
+#![cfg(target_os = "android")]
+
 use bytes::Bytes;
 
-#[cfg(target_os = "android")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "android")]
 use rust_video_caps::traits::Decoder;
-#[cfg(target_os = "android")]
-use rust_video_mediacodec::{
-    DecodeState, FormatSpec, MediaCodecDecoder, MediaCodecError, QuirkTable,
-};
+use rust_video_mediacodec::{DecodeState, FormatSpec, MediaCodecDecoder, MediaCodecError};
 
 /// Decoder for `spec`, or loud decline when the device lacks the codec.
-#[cfg(target_os = "android")]
-fn open_or_decline(
-    name: &str,
-    spec: &FormatSpec,
-    quirks: &QuirkTable,
-) -> Option<MediaCodecDecoder> {
-    match MediaCodecDecoder::open(spec, "generic", quirks) {
+fn open_or_decline(name: &str, spec: &FormatSpec) -> Option<MediaCodecDecoder> {
+    match MediaCodecDecoder::open(spec) {
         Ok(decoder) => Some(decoder),
         Err(error @ (MediaCodecError::NoDecoder { .. } | MediaCodecError::BelowMinSdk { .. })) => {
-            println!("declined: mediacodec {name} on this device: {error}");
+            println!("SKIP mediacodec {name} on this device: {error}");
             None
         }
         Err(error) => panic!("{name}: unexpected open failure: {error}"),
@@ -34,10 +25,8 @@ fn open_or_decline(
 }
 
 /// Open, empty decode, flush, and reset for one codec.
-#[cfg(target_os = "android")]
 fn run_case(name: &str, spec: &FormatSpec) {
-    let quirks = QuirkTable::load().expect("embedded quirks parse");
-    let Some(mut decoder) = open_or_decline(name, spec, &quirks) else {
+    let Some(mut decoder) = open_or_decline(name, spec) else {
         return;
     };
     assert_eq!(decoder.state(), DecodeState::Started);
@@ -48,40 +37,34 @@ fn run_case(name: &str, spec: &FormatSpec) {
 }
 
 /// `open` demands both blobs on H.264/H.265; the empty packet never decodes them.
-#[cfg(target_os = "android")]
 fn with_csd(spec: FormatSpec) -> FormatSpec {
     spec.with_csd_0(vec![0, 0, 1]).with_csd_1(vec![0, 0, 1])
 }
 
-#[cfg(target_os = "android")]
 #[test]
 fn h264_decodes_empty_packet() {
     let spec = with_csd(FormatSpec::h264(64, 64).expect("valid dims"));
     run_case("h264", &spec);
 }
 
-#[cfg(target_os = "android")]
 #[test]
 fn h265_decodes_empty_packet() {
     let spec = with_csd(FormatSpec::h265(64, 64).expect("valid dims"));
     run_case("h265", &spec);
 }
 
-#[cfg(target_os = "android")]
 #[test]
 fn av1_decodes_empty_packet() {
     let spec = FormatSpec::av1(64, 64).expect("valid dims");
     run_case("av1", &spec);
 }
 
-#[cfg(target_os = "android")]
 #[test]
 fn vp9_decodes_empty_packet() {
     let spec = FormatSpec::vp9(64, 64).expect("valid dims");
     run_case("vp9", &spec);
 }
 
-#[cfg(target_os = "android")]
 #[test]
 fn vp8_decodes_empty_packet() {
     let spec = FormatSpec::vp8(64, 64).expect("valid dims");

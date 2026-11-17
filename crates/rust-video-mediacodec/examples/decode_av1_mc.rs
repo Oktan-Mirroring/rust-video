@@ -8,9 +8,7 @@ use rust_video_caps::packet::Packet;
 #[cfg(target_os = "android")]
 use rust_video_caps::traits::{Decoder, Device};
 #[cfg(target_os = "android")]
-use rust_video_mediacodec::{
-    FormatSpec, MediaCodecDecoder, MediaCodecDevice, OutputLayout, QuirkTable,
-};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecDevice, OutputLayout};
 
 #[cfg(target_os = "android")]
 fn main() {
@@ -20,14 +18,6 @@ fn main() {
         device.name(),
         device.available()
     );
-    let quirks = match QuirkTable::load() {
-        Ok(quirks) => quirks,
-        Err(error) => {
-            eprintln!("mediacodec: quirk table failed ({error})");
-            std::process::exit(1);
-        }
-    };
-    println!("mediacodec: {} quirk entries", quirks.len());
     let Some(spec) = FormatSpec::av1(64, 64) else {
         println!("ERROR: av1 spec rejected");
         std::process::exit(1);
@@ -38,18 +28,14 @@ fn main() {
         spec.mime(),
         spec.min_sdk()
     );
-    let mut decoder = match MediaCodecDecoder::open(&spec, "generic", &quirks) {
+    let mut decoder = match MediaCodecDecoder::open(&spec) {
         Ok(decoder) => decoder,
         Err(error) => {
-            println!("SKIP: no av1 decoder ({error})");
+            println!("SKIP no av1 decoder ({error})");
             return;
         }
     };
-    println!(
-        "av1: opened state={:?} quirks={:?}",
-        decoder.state(),
-        decoder.applied_quirks()
-    );
+    println!("av1: opened state={:?}", decoder.state());
     let empty = Packet::new(Bytes::new());
     match decoder.decode(&empty) {
         Ok(frames) => println!("av1: empty packet -> {} frames", frames.len()),
@@ -61,4 +47,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "android"))]
-fn main() {}
+fn main() {
+    println!("SKIP: mediacodec needs android");
+}

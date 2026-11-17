@@ -4,17 +4,16 @@ Android MediaCodec tier: H.264, H.265, AV1, VP9, and VP8 byte-buffer decode plus
 
 ## Decode
 
-`MediaCodecDecoder::open` takes a `FormatSpec`, an SoC string, and a `QuirkTable`, and refuses below the device floor with `BelowMinSdk`. Lookup answers by mime or fails with `NoDecoder` naming it. API 28 and up register all four async callback slots into one `EventQueue`; lower levels use sync dequeue with bounded waits. Each queued packet copies once into an input buffer and each output drains into refcounted bytes, so there is no export type and no import path: input is packet bytes, output is a `CpuFrame`.
+`MediaCodecDecoder::open` takes a `FormatSpec` and refuses below the device floor with `BelowMinSdk`. Lookup answers by mime or fails with `NoDecoder` naming it. API 28 and up register all four async callback slots into one `EventQueue`; lower levels use sync dequeue with bounded waits. Each queued packet copies once into an input buffer and each output drains into refcounted bytes behind a `MediaCodecSurface`; `export` answers `GpuExport::Opaque` and there is no import path.
 
 ```rust
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError, QuirkTable};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError};
 
 fn run(packet: &Packet) -> Result<usize, MediaCodecError> {
     let spec = FormatSpec::h264(1920, 1080).expect("dims");
-    let quirks = QuirkTable::load().expect("quirks");
-    let mut decoder = MediaCodecDecoder::open(&spec, "generic", &quirks)?;
+    let mut decoder = MediaCodecDecoder::open(&spec)?;
     let mut total = decoder.decode(packet)?.len();
     total += decoder.flush()?.len();
     Ok(total)

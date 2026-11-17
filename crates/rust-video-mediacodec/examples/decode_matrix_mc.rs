@@ -8,9 +8,7 @@ use rust_video_caps::packet::Packet;
 #[cfg(target_os = "android")]
 use rust_video_caps::traits::{Decoder, Device};
 #[cfg(target_os = "android")]
-use rust_video_mediacodec::{
-    FormatSpec, MediaCodecDecoder, MediaCodecDevice, OutputLayout, QuirkTable,
-};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecDevice, OutputLayout};
 
 #[cfg(target_os = "android")]
 fn main() {
@@ -20,14 +18,6 @@ fn main() {
         device.name(),
         device.available()
     );
-    let quirks = match QuirkTable::load() {
-        Ok(quirks) => quirks,
-        Err(error) => {
-            eprintln!("mediacodec: quirk table failed ({error})");
-            std::process::exit(1);
-        }
-    };
-    println!("mediacodec: {} quirk entries", quirks.len());
     for (name, spec) in [
         ("h264", FormatSpec::h264(64, 64)),
         ("h265", FormatSpec::h265(64, 64)),
@@ -45,23 +35,21 @@ fn main() {
             spec.mime(),
             spec.min_sdk()
         );
-        match MediaCodecDecoder::open(&spec, "generic", &quirks) {
+        match MediaCodecDecoder::open(&spec) {
             Ok(mut decoder) => {
-                println!(
-                    "{name}: opened state={:?} quirks={:?}",
-                    decoder.state(),
-                    decoder.applied_quirks()
-                );
+                println!("{name}: opened state={:?}", decoder.state());
                 let empty = Packet::new(Bytes::new());
                 match decoder.decode(&empty) {
                     Ok(frames) => println!("{name}: empty packet -> {} frames", frames.len()),
                     Err(error) => println!("{name}: empty packet rejected ({error})"),
                 }
             }
-            Err(error) => println!("{name}: skipped ({error})"),
+            Err(error) => println!("SKIP {name} ({error})"),
         }
     }
 }
 
 #[cfg(not(target_os = "android"))]
-fn main() {}
+fn main() {
+    println!("SKIP: mediacodec needs android");
+}
