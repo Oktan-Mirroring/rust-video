@@ -61,6 +61,9 @@ pub enum D3d11Error {
     /// DPB has no free slot for the next picture.
     #[error("dpb full")]
     DpbFull,
+    /// Live surfaces pin every decoder slot.
+    #[error("no free surface slot")]
+    NoFreeSlot,
     /// Frame over the VRAM budget.
     #[error("frame over budget: {0}")]
     OverBudget(#[from] rust_video_caps::traits::OverBudget),
@@ -423,6 +426,9 @@ pub enum UnsupportedReason {
     /// Video processor without NV12 scale.
     #[error("video processor without nv12 scale")]
     VideoProcessorWithoutNv12Scale,
+    /// Video processor without RGBA convert input.
+    #[error("video processor without rgba convert")]
+    VideoProcessorWithoutRgbaConvert,
 }
 
 #[cfg(test)]
@@ -494,6 +500,7 @@ mod tests {
             "broken reference list: slot outside views"
         );
         assert_eq!(D3d11Error::DpbFull.to_string(), "dpb full");
+        assert_eq!(D3d11Error::NoFreeSlot.to_string(), "no free surface slot");
         assert_eq!(D3d11Error::NoSession.to_string(), "picture before session");
     }
 

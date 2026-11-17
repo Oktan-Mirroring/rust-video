@@ -27,7 +27,12 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC}
 const QUERY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Single-submitter lock over the immediate context.
-pub(crate) struct SubmitLock {
+///
+/// A single thread needs nothing: every crate submission takes this lock
+/// internally. Threads sharing one device hold it around their own direct
+/// context calls to serialize with crate submissions; waits never hold it.
+#[derive(Debug, Default)]
+pub struct SubmitLock {
     /// Held across immediate-context submissions, never across waits.
     inner: Mutex<()>,
 }
@@ -35,7 +40,7 @@ pub(crate) struct SubmitLock {
 impl SubmitLock {
     /// Unheld submit lock.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Mutex::new(()),
         }
@@ -46,7 +51,7 @@ impl SubmitLock {
     /// # Errors
     ///
     /// Returns `Err` when a previous holder panicked.
-    pub(crate) fn enter(&self) -> Result<MutexGuard<'_, ()>, D3d11Error> {
+    pub fn enter(&self) -> Result<MutexGuard<'_, ()>, D3d11Error> {
         self.inner
             .lock()
             .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::SubmitLockPoisoned))
@@ -175,23 +180,23 @@ impl CopySlot {
     ///
     /// Returns `Err` when the GPU misses the wait budget or reports failure.
     pub(crate) fn wait(&self, context: &ID3D11DeviceContext) -> Result<(), D3d11Error> {
-        if self.signaled(context, 0)? {
-            return Ok(());
+        wait_for_query(context, &self.signal)
+    }
+
+    /// Completion marker behind the last submit to this lane.
+    pub(crate) fn mark(&self, context: &ID3D11DeviceContext) {
+        // Sound: the query is live; the caller holds the submit lock.
+        unsafe {
+            context.End(&self.signal);
         }
-        let deadline = std::time::Instant::now() + QUERY_BUDGET;
-        loop {
-            if self.signaled(context, flag_word(D3D11_ASYNC_GETDATA_DONOTFLUSH.0))? {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::hint::spin_loop();
+    }
+
+    /// Completion fence behind this lane.
+    pub(crate) fn fence(&self, context: &ID3D11DeviceContext) -> SurfaceFence {
+        SurfaceFence {
+            context: context.clone(),
+            signal: self.signal.clone(),
         }
-        Err(D3d11Error::Call {
-            call: "QueryWait",
-            hresult: WAIT_TIMEOUT.0.cast_signed(),
-        })
     }
 
     /// NV12 bytes from staging cropped to the visible rectangle.
@@ -226,27 +231,78 @@ impl CopySlot {
         }
         bytes
     }
+}
 
-    /// True once the GPU passes the query end marker.
-    fn signaled(&self, context: &ID3D11DeviceContext, flags: u32) -> Result<bool, D3d11Error> {
-        let mut done = FALSE;
-        // Sound: the query is live; the flag word stays valid for the call.
-        let outcome = unsafe {
-            context.GetData(
-                &self.signal,
-                Some(std::ptr::addr_of_mut!(done).cast()),
-                u32::try_from(std::mem::size_of_val(&done)).unwrap_or(0),
-                flags,
-            )
-        };
-        match outcome {
-            Ok(()) => Ok(done.as_bool()),
-            Err(error) if error.code() == S_FALSE => Ok(false),
-            Err(error) => Err(D3d11Error::Call {
-                call: "GetData",
-                hresult: error.code().0,
-            }),
+/// Completion fence behind one decode surface.
+pub(crate) struct SurfaceFence {
+    /// Immediate context behind the wait.
+    context: ID3D11DeviceContext,
+    /// Event query ended after the submission.
+    signal: ID3D11Asynchronous,
+}
+
+impl SurfaceFence {
+    /// Completion of the submission, outside the submit lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU misses the wait budget or reports failure.
+    pub(crate) fn wait(&self) -> Result<(), D3d11Error> {
+        wait_for_query(&self.context, &self.signal)
+    }
+}
+
+/// Completion of `signal` on `context` within the wait budget.
+///
+/// # Errors
+///
+/// Returns `Err` when the GPU misses the wait budget or reports failure.
+fn wait_for_query(
+    context: &ID3D11DeviceContext,
+    signal: &ID3D11Asynchronous,
+) -> Result<(), D3d11Error> {
+    if query_signaled(context, signal, 0)? {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + QUERY_BUDGET;
+    loop {
+        if query_signaled(context, signal, flag_word(D3D11_ASYNC_GETDATA_DONOTFLUSH.0))? {
+            return Ok(());
         }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    Err(D3d11Error::Call {
+        call: "QueryWait",
+        hresult: WAIT_TIMEOUT.0.cast_signed(),
+    })
+}
+
+/// True once the GPU passes the query end marker.
+fn query_signaled(
+    context: &ID3D11DeviceContext,
+    signal: &ID3D11Asynchronous,
+    flags: u32,
+) -> Result<bool, D3d11Error> {
+    let mut done = FALSE;
+    // Sound: the query is live; the flag word stays valid for the call.
+    let outcome = unsafe {
+        context.GetData(
+            signal,
+            Some(std::ptr::addr_of_mut!(done).cast()),
+            u32::try_from(std::mem::size_of_val(&done)).unwrap_or(0),
+            flags,
+        )
+    };
+    match outcome {
+        Ok(()) => Ok(done.as_bool()),
+        Err(error) if error.code() == S_FALSE => Ok(false),
+        Err(error) => Err(D3d11Error::Call {
+            call: "GetData",
+            hresult: error.code().0,
+        }),
     }
 }
 

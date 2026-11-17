@@ -28,7 +28,7 @@ use crate::guid::Codec;
 use crate::h264::Crop;
 use crate::hevc_dpb::SubmittedHevc;
 use crate::submit::flag_word;
-use crate::submit::{CopySlot, SubmitLock};
+use crate::submit::{CopySlot, SubmitLock, SurfaceFence};
 
 use bytes::Bytes;
 
@@ -216,13 +216,17 @@ impl Session {
         self.export.clone()
     }
 
-    /// Shared decode texture plus `slot`, absent without NT-handle sharing.
+    /// Shared decode texture plus `slot` and its fence, absent without NT-handle sharing.
     #[must_use]
-    pub(crate) fn surface(&self, slot: u8) -> Option<(SharedExport, u8)> {
+    pub(crate) fn surface(&self, slot: u8) -> Option<(SharedExport, u8, SurfaceFence)> {
         if usize::from(slot) >= self.views.len() {
             return None;
         }
-        self.export.clone().map(|export| (export, slot))
+        let fence = self
+            .slots
+            .get(usize::from(slot))
+            .map(|lane| lane.fence(&self.context))?;
+        self.export.clone().map(|export| (export, slot, fence))
     }
 
     /// Decode `submission` onto its surface slot.
@@ -382,7 +386,12 @@ impl Session {
         // Sound: the frame began above.
         let end = unsafe { self.video_context.DecoderEndFrame(&self.decoder) };
         match (result, end) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => {
+                if let Some(lane) = self.slots.get(usize::from(slot)) {
+                    lane.mark(&self.context);
+                }
+                Ok(())
+            }
             (Err(error), _) => Err(error),
             (Ok(()), Err(error)) => Err(D3d11Error::Call {
                 call: "DecoderEndFrame",
@@ -586,7 +595,7 @@ fn create_texture(
 }
 
 /// NT-handle export for a shared texture, absent without sharing.
-fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
+pub(crate) fn shared_export(texture: &ID3D11Texture2D) -> Option<SharedExport> {
     let resource: IDXGIResource = texture.cast().ok()?;
     // Sound: the resource is live.
     let handle = unsafe { resource.GetSharedHandle() }.ok()?;

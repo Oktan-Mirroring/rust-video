@@ -150,37 +150,57 @@ impl D3d11Device {
     }
 
     /// Logical device behind the tier.
+    ///
+    /// A single thread needs nothing. Threads sharing this device hold
+    /// [`SubmitLock`](crate::SubmitLock) around their own direct context
+    /// calls to serialize with crate submissions.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn device(&self) -> &ID3D11Device {
+    pub fn device(&self) -> &ID3D11Device {
         &self.device
     }
 
     /// Immediate context behind copies and readback.
+    ///
+    /// A single thread needs nothing. Threads sharing this device hold
+    /// [`SubmitLock`](crate::SubmitLock) around their own direct context
+    /// calls to serialize with crate submissions.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn context(&self) -> &ID3D11DeviceContext {
+    pub fn context(&self) -> &ID3D11DeviceContext {
         &self.context
     }
 
     /// Video device behind decode creation.
+    ///
+    /// A single thread needs nothing. Threads sharing this device hold
+    /// [`SubmitLock`](crate::SubmitLock) around their own direct context
+    /// calls to serialize with crate submissions.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn video_device(&self) -> &ID3D11VideoDevice {
+    pub fn video_device(&self) -> &ID3D11VideoDevice {
         &self.video_device
     }
 
     /// Video context behind frame submission.
+    ///
+    /// A single thread needs nothing. Threads sharing this device hold
+    /// [`SubmitLock`](crate::SubmitLock) around their own direct context
+    /// calls to serialize with crate submissions.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn video_context(&self) -> &ID3D11VideoContext {
+    pub fn video_context(&self) -> &ID3D11VideoContext {
         &self.video_context
     }
 
     /// Single-submitter lock over the immediate context.
+    ///
+    /// A single thread needs nothing. Threads sharing this device hold
+    /// the lock around their own direct context calls to serialize with
+    /// crate submissions; waits never hold it.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn submit_lock(&self) -> &Arc<SubmitLock> {
+    pub fn submit_lock(&self) -> &Arc<SubmitLock> {
         &self.submit
     }
 }

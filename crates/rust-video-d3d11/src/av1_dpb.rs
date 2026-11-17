@@ -1,5 +1,7 @@
 //! AV1 reference slots with DXVA submission payloads.
 
+use std::sync::Arc;
+
 use crate::av1::{
     Frame, FrameHeader, FrameType, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES, REFS_PER_FRAME,
     SEG_LEVELS,
@@ -24,6 +26,7 @@ use crate::dxva::{
     AV1_SEG_ENABLED, AV1_SEG_TEMPORAL_UPDATE, AV1_SEG_UPDATE_DATA, AV1_SEG_UPDATE_MAP,
 };
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
+use crate::pins::SlotPins;
 
 /// Session view count behind current view selection.
 const VIEWS: u8 = 16;
@@ -46,6 +49,8 @@ struct Av1Slot {
 pub(crate) struct Av1Dpb {
     /// Reference slots.
     slots: [Option<Av1Slot>; NUM_REF_FRAMES],
+    /// Pins held by live surfaces.
+    pins: Arc<SlotPins>,
 }
 
 impl Av1Dpb {
@@ -53,7 +58,14 @@ impl Av1Dpb {
     pub(crate) fn new() -> Self {
         Self {
             slots: core::array::from_fn(|_| None),
+            pins: Arc::new(SlotPins::new()),
         }
+    }
+
+    /// Pins shared with live surfaces.
+    #[must_use]
+    pub(crate) fn pins(&self) -> &Arc<SlotPins> {
+        &self.pins
     }
 
     /// Submission plus display-order outputs for `frame`.
@@ -89,7 +101,7 @@ impl Av1Dpb {
         if !header.frame_type.is_intra() {
             check_slots(&self.slots, header)?;
         }
-        let current = self.free_view();
+        let current = self.free_view()?;
         let submission = self.submit(frame, seq, current)?;
         self.refresh(header, current);
         let (outputs, current_index) = if header.show_frame() {
@@ -109,11 +121,14 @@ impl Av1Dpb {
         Vec::new()
     }
 
-    /// View outside the reference map.
-    fn free_view(&self) -> u8 {
+    /// View outside the reference map and live surface pins.
+    fn free_view(&self) -> Result<u8, D3d11Error> {
         (0..VIEWS)
-            .find(|view| !self.slots.iter().flatten().any(|slot| slot.view == *view))
-            .unwrap_or(0)
+            .find(|view| {
+                !self.pins.is_pinned(usize::from(*view))
+                    && !self.slots.iter().flatten().any(|slot| slot.view == *view)
+            })
+            .ok_or(D3d11Error::NoFreeSlot)
     }
 
     /// Submission payload for the decoded frame.
@@ -667,6 +682,17 @@ mod tests {
         assert_eq!(params.feedback, 0);
         assert_eq!(params.tiles.cols, 1);
         assert_eq!(params.tiles.widths[0], 1);
+    }
+
+    #[test]
+    fn all_views_pinned_errors_no_free_slot() {
+        let mut dpb = Av1Dpb::new();
+        for view in 0u8..16 {
+            dpb.pins().pin(view);
+        }
+        let error = dpb.decode(&key(true), &seq()).unwrap_err();
+        assert!(matches!(error, crate::error::D3d11Error::NoFreeSlot));
+        assert_eq!(error.to_string(), "no free surface slot");
     }
 
     #[test]

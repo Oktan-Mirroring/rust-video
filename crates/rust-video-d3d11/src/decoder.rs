@@ -1,5 +1,8 @@
 //! H.264 decode plus probed shells behind the caps `Decoder` trait.
 
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
+
 use crate::device::D3d11Device;
 #[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb, Output};
@@ -8,9 +11,13 @@ use crate::guid::Codec;
 #[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
 #[cfg(target_os = "windows")]
+use crate::pins::SlotPins;
+#[cfg(target_os = "windows")]
 use crate::session::Session;
 #[cfg(target_os = "windows")]
 use crate::session::SharedExport;
+#[cfg(target_os = "windows")]
+use crate::submit::SurfaceFence;
 
 use bytes::Bytes;
 #[cfg(target_os = "windows")]
@@ -22,6 +29,8 @@ use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::traits::{Decoder, Lease};
 #[cfg(target_os = "windows")]
 use rust_video_caps::transcode::FallbackCause;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d11Frame {
@@ -92,32 +101,92 @@ impl D3d11Frame {
 }
 
 /// Device-resident decode surface without CPU access.
+///
+/// A single thread needs nothing. Threads sharing one device hold
+/// [`SubmitLock`](crate::SubmitLock) around their own direct context calls
+/// to serialize with crate submissions; [`wait`](Self::wait) never holds it.
+///
+/// A surface borrows nothing: it holds shared ownership of its decode
+/// texture, its completion fence, and its decoder slot pin. Dropping the
+/// decoder never invalidates a live surface; dropping the surface releases
+/// its slot for reuse.
 #[cfg(target_os = "windows")]
-pub(crate) struct GpuSurface {
+pub struct GpuSurface {
     /// Shared decode texture plus its NT handle.
     export: SharedExport,
     /// Two-plane export description behind the surface.
     layout: ExportLayout,
+    /// Completion fence behind the submission.
+    fence: SurfaceFence,
+    /// Decoder slot pins; the surface pin releases on drop.
+    pins: Arc<SlotPins>,
+    /// Pinned decoder slot.
+    slot: u8,
 }
 
 #[cfg(target_os = "windows")]
 impl GpuSurface {
     /// Picture dimensions in luma samples.
     #[must_use]
-    pub(crate) fn size(&self) -> PictureSize {
+    pub fn size(&self) -> PictureSize {
         self.layout.visible()
     }
 
-    /// Shared decode texture plus its NT handle.
+    /// Pixel layout behind the surface.
     #[must_use]
-    pub(crate) fn export(&self) -> &SharedExport {
+    pub fn format(&self) -> PixelFormat {
+        self.layout.format()
+    }
+
+    /// Array layer behind the picture.
+    #[must_use]
+    pub fn slice(&self) -> u32 {
+        u32::from(self.layout.slice())
+    }
+
+    /// Full texture extent in luma samples.
+    #[must_use]
+    pub fn coded(&self) -> PictureSize {
+        self.layout.coded()
+    }
+
+    /// Crop left and top in luma samples.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        (self.layout.left(), self.layout.top())
+    }
+
+    /// Portable export behind the surface.
+    #[must_use]
+    pub fn export(&self) -> GpuExport {
+        GpuExport::NtHandle {
+            handle: self.export.handle(),
+        }
+    }
+
+    /// Decode texture behind the surface.
+    ///
+    /// Valid while the surface lives; the array layer is [`slice`](Self::slice).
+    #[must_use]
+    pub fn texture(&self) -> &ID3D11Texture2D {
         &self.export
     }
 
-    /// Two-plane export description behind the surface.
-    #[must_use]
-    pub(crate) fn layout(&self) -> &ExportLayout {
-        &self.layout
+    /// Completion of the submission behind the surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU misses the wait budget or reports failure.
+    pub fn wait(&self) -> Result<(), D3d11Error> {
+        self.fence.wait()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for GpuSurface {
+    /// Decoder slot pin release.
+    fn drop(&mut self) {
+        self.pins.unpin(self.slot);
     }
 }
 
@@ -134,6 +203,8 @@ pub(crate) struct ExportLayout {
     top: u32,
     /// Visible extent in luma samples.
     visible: PictureSize,
+    /// Full texture extent in luma samples.
+    coded: PictureSize,
 }
 
 #[cfg(target_os = "windows")]
@@ -147,7 +218,7 @@ impl ExportLayout {
         crop: Option<Crop>,
         visible: PictureSize,
     ) -> Option<Self> {
-        PictureSize::new(coded_width, coded_height)?;
+        let coded = PictureSize::new(coded_width, coded_height)?;
         let (left, top) = crop.map_or((0, 0), |crop| (crop.left, crop.top));
         Some(Self {
             format: PixelFormat::Nv12,
@@ -155,6 +226,7 @@ impl ExportLayout {
             left,
             top,
             visible,
+            coded,
         })
     }
 
@@ -186,6 +258,12 @@ impl ExportLayout {
     #[must_use]
     pub(crate) fn visible(&self) -> PictureSize {
         self.visible
+    }
+
+    /// Full texture extent in luma samples.
+    #[must_use]
+    pub(crate) fn coded(&self) -> PictureSize {
+        self.coded
     }
 }
 
@@ -307,6 +385,20 @@ impl<'a> H264Decoder<'a> {
                 return Err(error);
             }
         };
+        // Consume before submit when the submission reuses a slot with
+        // unread outputs, or when the queue exceeds the overlap window:
+        // staging lanes and the driver queue are both bounded.
+        let collision = pending
+            .iter()
+            .any(|(slot, _)| *slot == decoded.submission.slot);
+        if collision || pending.len() >= PENDING_FLUSH {
+            self.note_inflight(pending.len());
+            if let Err(error) = self.consume_pending(pending, frames) {
+                self.reset_stream();
+                return Err(error);
+            }
+            pending.clear();
+        }
         let mut failed = None;
         {
             let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
@@ -484,6 +576,12 @@ impl<'a> H264Decoder<'a> {
                 return Err(error);
             }
         };
+        let pins = self
+            .dpb
+            .as_ref()
+            .ok_or(D3d11Error::NoSession)?
+            .pins()
+            .clone();
         let mut failed = None;
         {
             let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
@@ -492,7 +590,7 @@ impl<'a> H264Decoder<'a> {
                 failed = Some(error);
             } else {
                 for output in &decoded.outputs {
-                    let Some(surface) = emit_surface(session, output, &active) else {
+                    let Some(surface) = emit_surface(session, output, &active, &pins) else {
                         failed = Some(D3d11Error::Unsupported(UnsupportedReason::Fallback {
                             cause: FallbackCause::NoSharedExport,
                         }));
@@ -530,8 +628,9 @@ impl<'a> H264Decoder<'a> {
         let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_ref()) else {
             return Ok(());
         };
+        let pins = dpb.pins().clone();
         for output in dpb.drain() {
-            let Some(surface) = emit_surface(session, &output, active) else {
+            let Some(surface) = emit_surface(session, &output, active, &pins) else {
                 return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
                     cause: FallbackCause::NoSharedExport,
                 }));
@@ -542,10 +641,11 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// GPU surfaces decoded from `packet`, possibly none.
-    pub(crate) fn decode_surface(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<Vec<GpuSurface>, D3d11Error> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the picture fails to upload or convert.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
         let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut surfaces = Vec::new();
         for picture in &pictures {
@@ -555,7 +655,11 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// GPU surfaces held back for reordering or buffering.
-    pub(crate) fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the trailing picture fails to convert.
+    pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
         let mut surfaces = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
             self.surface_picture(&picture, &mut surfaces)?;
@@ -632,8 +736,13 @@ fn emit_frame(
 
 /// Surface for `output`, absent without NT-handle sharing.
 #[cfg(target_os = "windows")]
-fn emit_surface(session: &Session, output: &Output, active: &Active) -> Option<GpuSurface> {
-    let (export, slot) = session.surface(output.slot())?;
+fn emit_surface(
+    session: &Session,
+    output: &Output,
+    active: &Active,
+    pins: &Arc<SlotPins>,
+) -> Option<GpuSurface> {
+    let (export, slot, fence) = session.surface(output.slot())?;
     let layout = ExportLayout::for_output(
         active.width,
         active.height,
@@ -641,7 +750,14 @@ fn emit_surface(session: &Session, output: &Output, active: &Active) -> Option<G
         active.crop,
         active.visible,
     )?;
-    Some(GpuSurface { export, layout })
+    pins.pin(slot);
+    Some(GpuSurface {
+        export,
+        layout,
+        fence,
+        pins: Arc::clone(pins),
+        slot,
+    })
 }
 
 /// HEVC decoder over a D3D11 device.
@@ -891,6 +1007,131 @@ impl<'a> HevcDecoder<'a> {
         }
         self.note_inflight(slots.len());
         Ok(())
+    }
+
+    /// Decode `picture` into GPU `surfaces`.
+    fn surface_picture(
+        &mut self,
+        picture: &crate::h265::Picture,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let outcome = self.surface_inner(picture, surfaces);
+        if outcome.is_err() {
+            self.reset_stream();
+        }
+        outcome
+    }
+
+    /// Decode `picture` into GPU `surfaces` without resetting on failure.
+    fn surface_inner(
+        &mut self,
+        picture: &crate::h265::Picture,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let active = self.sequence(picture)?;
+        if self.active != Some(active) {
+            self.reconfigure_surface(active, surfaces)?;
+        }
+        let active = self.active.ok_or(D3d11Error::NoSession)?;
+        let decoded = match self.decode_dpb(picture) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        let pins = self
+            .dpb
+            .as_ref()
+            .ok_or(D3d11Error::NoSession)?
+            .pins()
+            .clone();
+        let mut failed = None;
+        {
+            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+            // Submit before any surface handoff: outputs may name the submission slot.
+            if let Err(error) = session.submit_hevc(&decoded.submission) {
+                failed = Some(error);
+            } else {
+                for output in &decoded.outputs {
+                    let Some(surface) = emit_surface(session, output, &active, &pins) else {
+                        failed = Some(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                            cause: FallbackCause::NoSharedExport,
+                        }));
+                        break;
+                    };
+                    surfaces.push(surface);
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    fn reconfigure_surface(
+        &mut self,
+        active: Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        if let Some(previous) = self.active {
+            self.drain_live_surface(&previous, surfaces)?;
+        }
+        self.open_session(active)
+    }
+
+    /// Live DPB outputs into GPU `surfaces`.
+    fn drain_live_surface(
+        &mut self,
+        active: &Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_ref()) else {
+            return Ok(());
+        };
+        let pins = dpb.pins().clone();
+        for output in dpb.drain() {
+            let Some(surface) = emit_surface(session, &output, active, &pins) else {
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause: FallbackCause::NoSharedExport,
+                }));
+            };
+            surfaces.push(surface);
+        }
+        Ok(())
+    }
+
+    /// GPU surfaces decoded from `packet`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the picture fails to upload or convert.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut surfaces = Vec::new();
+        for picture in &pictures {
+            self.surface_picture(picture, &mut surfaces)?;
+        }
+        Ok(surfaces)
+    }
+
+    /// GPU surfaces held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the trailing picture fails to convert.
+    pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let mut surfaces = Vec::new();
+        if let Some(picture) = self.ingest.finish()? {
+            self.surface_picture(&picture, &mut surfaces)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live_surface(&active, &mut surfaces)?;
+        }
+        Ok(surfaces)
     }
 }
 
@@ -1201,6 +1442,150 @@ impl<'a> Av1Decoder<'a> {
         self.note_inflight(slots.len());
         Ok(())
     }
+
+    /// Decode `frame` into GPU `surfaces`.
+    fn surface_frame(
+        &mut self,
+        frame: &crate::av1::Frame,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let outcome = self.surface_inner(frame, surfaces);
+        if outcome.is_err() {
+            self.reset_stream();
+        }
+        outcome
+    }
+
+    /// Decode `frame` into GPU `surfaces` without resetting on failure.
+    fn surface_inner(
+        &mut self,
+        frame: &crate::av1::Frame,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let active = self.frame_active(frame)?;
+        let live = self.active;
+        if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
+            self.reconfigure_surface(active, surfaces)?;
+        } else if live != Some(active) {
+            self.active = Some(active);
+        }
+        let active = self.active.ok_or(D3d11Error::NoSession)?;
+        let decoded = match self.decode_dpb(frame) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        let pins = self
+            .dpb
+            .as_ref()
+            .ok_or(D3d11Error::NoSession)?
+            .pins()
+            .clone();
+        let mut failed = None;
+        {
+            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+            // Submit before any surface handoff: outputs may name the submission view.
+            if let Some(submission) = decoded.submission.as_ref() {
+                if let Err(error) = session.submit_av1(submission) {
+                    failed = Some(error);
+                }
+            }
+            if failed.is_none() {
+                for output in &decoded.outputs {
+                    let Some(surface) = emit_surface(session, output, &active, &pins) else {
+                        failed = Some(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                            cause: FallbackCause::NoSharedExport,
+                        }));
+                        break;
+                    };
+                    surfaces.push(surface);
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.reset_stream();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Session for `active`, draining the previous sequence first.
+    fn reconfigure_surface(
+        &mut self,
+        active: Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        if let Some(previous) = self.active {
+            self.drain_live_surface(&previous, surfaces)?;
+        }
+        self.open_session(active)
+    }
+
+    /// Live DPB outputs into GPU `surfaces`.
+    fn drain_live_surface(
+        &mut self,
+        active: &Active,
+        surfaces: &mut Vec<GpuSurface>,
+    ) -> Result<(), D3d11Error> {
+        let (Some(dpb), Some(session)) = (self.dpb.as_ref(), self.session.as_ref()) else {
+            return Ok(());
+        };
+        let pins = dpb.pins().clone();
+        for output in crate::av1_dpb::Av1Dpb::drain() {
+            let Some(surface) = emit_surface(session, &output, active, &pins) else {
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
+                    cause: FallbackCause::NoSharedExport,
+                }));
+            };
+            surfaces.push(surface);
+        }
+        Ok(())
+    }
+
+    /// GPU surfaces decoded from `packet`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the frame fails to upload or convert.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let frames_in = match self.ingest.ingest_packet(packet.data()) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        let mut surfaces = Vec::new();
+        for frame in &frames_in {
+            self.surface_frame(frame, &mut surfaces)?;
+        }
+        Ok(surfaces)
+    }
+
+    /// GPU surfaces held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`D3d11Error`] when the trailing frame fails to convert.
+    pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
+        let mut surfaces = Vec::new();
+        let trailing = match self.ingest.finish() {
+            Ok(trailing) => trailing,
+            Err(error) => {
+                self.reset_stream();
+                return Err(error);
+            }
+        };
+        if let Some(frame) = trailing {
+            self.surface_frame(&frame, &mut surfaces)?;
+        }
+        if let Some(active) = self.active {
+            self.drain_live_surface(&active, &mut surfaces)?;
+        }
+        Ok(surfaces)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1405,6 +1790,10 @@ mod tests {
         assert_eq!(layout.slice(), 3);
         assert_eq!((layout.left(), layout.top()), (0, 0));
         assert_eq!(layout.visible(), visible);
+        assert_eq!(
+            layout.coded(),
+            PictureSize::new(1920, 1088).expect("nonzero coded")
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1421,6 +1810,10 @@ mod tests {
             ExportLayout::for_output(1920, 1088, 0, Some(crop), visible).expect("nonzero coded");
         assert_eq!((layout.left(), layout.top()), (0, 0));
         assert_eq!(layout.visible(), visible);
+        assert_eq!(
+            layout.coded(),
+            PictureSize::new(1920, 1088).expect("nonzero coded")
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1428,5 +1821,66 @@ mod tests {
     fn layout_rejects_empty_coded() {
         let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
         assert!(ExportLayout::for_output(0, 1088, 0, None, visible).is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pinned_surface_keeps_pixels_under_pressure() {
+        use rust_video_caps::traits::Encoder;
+
+        let Ok(device) = crate::device::D3d11Device::open() else {
+            return;
+        };
+        let Ok(mut encoder) = crate::encoder::D3d11Encoder::open(&device, crate::guid::Codec::H264)
+        else {
+            return;
+        };
+        let mut decoder = super::H264Decoder::open(&device);
+        let first = rust_video_harness::Synth::noise(320, 240, 0);
+        let mut held = None;
+        for packet in encoder.encode(&first).expect("encode runs") {
+            let mut surfaces = decoder.decode_surface(&packet).expect("decode runs");
+            if held.is_none() {
+                held = surfaces.pop();
+            }
+        }
+        let held = held.expect("first picture surfaces");
+        let slot = held.slot;
+        let crop = decoder.active.expect("live sequence").crop;
+        decoder
+            .session
+            .as_ref()
+            .expect("live session")
+            .copy_slot(slot)
+            .expect("copy runs");
+        let before = decoder
+            .session
+            .as_ref()
+            .expect("live session")
+            .read_slot(slot, crop)
+            .expect("read runs");
+        for seed in 1..20u64 {
+            let frame = rust_video_harness::Synth::noise(320, 240, seed);
+            for packet in encoder.encode(&frame).expect("encode runs") {
+                decoder.decode_surface(&packet).expect("decode runs");
+            }
+        }
+        for packet in encoder.flush().expect("encode drains") {
+            decoder.decode_surface(&packet).expect("decode runs");
+        }
+        decoder.flush_surface().expect("decode drains");
+        decoder
+            .session
+            .as_ref()
+            .expect("live session")
+            .copy_slot(slot)
+            .expect("copy runs");
+        let after = decoder
+            .session
+            .as_ref()
+            .expect("live session")
+            .read_slot(slot, crop)
+            .expect("read runs");
+        assert_eq!(before.as_ref(), after.as_ref());
     }
 }

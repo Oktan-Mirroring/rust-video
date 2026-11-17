@@ -208,18 +208,17 @@ impl Scaler {
                 UnsupportedReason::ScaleSourceOutsideScaler,
             ));
         }
-        let layout = surface.layout();
         let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_VPIV {
                     MipSlice: 0,
-                    ArraySlice: u32::from(layout.slice()),
+                    ArraySlice: surface.slice(),
                 },
             },
         };
-        let texture: &ID3D11Texture2D = surface.export();
+        let texture: &ID3D11Texture2D = surface.texture();
         let mut view = None;
         // Sound: the texture and descriptor stay live for the call.
         unsafe {
@@ -240,8 +239,9 @@ impl Scaler {
                 hresult: windows::Win32::Foundation::E_FAIL.0,
             });
         };
-        let size = layout.visible();
-        let source = crop_rect(layout.left(), layout.top(), size)?;
+        let size = surface.size();
+        let (left, top) = surface.origin();
+        let source = crop_rect(left, top, size)?;
         let target = full_rect(self.to)?;
         let _submit = self.submit.enter()?;
         // Sound: the processor and rects stay live for each call.
@@ -341,7 +341,7 @@ fn crop_rect(left: u32, top: u32, size: PictureSize) -> Result<RECT, D3d11Error>
 }
 
 /// Full-frame rectangle for `size`.
-fn full_rect(size: PictureSize) -> Result<RECT, D3d11Error> {
+pub(crate) fn full_rect(size: PictureSize) -> Result<RECT, D3d11Error> {
     crop_rect(0, 0, size)
 }
 

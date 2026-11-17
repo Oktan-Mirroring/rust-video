@@ -1,6 +1,7 @@
 //! Frame-only decoded picture buffer with DXVA submission payloads.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::dxva::{
     PicEntryH264, PicParamsH264, QmatrixH264, SliceLongH264, BITS_CHROMA_420,
@@ -10,6 +11,7 @@ use crate::dxva::{
 };
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason, UnsupportedReason};
 use crate::h264::{Marking, Mmco, Picture, PocType, Pps, RefMod, SlicePoc, Sps, Weights};
+use crate::pins::SlotPins;
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -91,6 +93,8 @@ struct SliceSpan {
 pub(crate) struct Dpb {
     /// Picture slots.
     slots: [Option<Occupant>; SLOTS],
+    /// Pins held by live surfaces.
+    pins: Arc<SlotPins>,
     /// Maximum reference count.
     max_refs: u8,
     /// Frame number modulus.
@@ -120,6 +124,7 @@ impl Dpb {
     pub(crate) fn new(sps: &Sps) -> Self {
         Self {
             slots: core::array::from_fn(|_| None),
+            pins: Arc::new(SlotPins::new()),
             max_refs: sps.max_num_ref_frames,
             max_frame_num: sps.max_frame_num(),
             max_long_idx: -1,
@@ -132,6 +137,12 @@ impl Dpb {
             max_decoded_poc: None,
             feedback: 1,
         }
+    }
+
+    /// Pins shared with live surfaces.
+    #[must_use]
+    pub(crate) fn pins(&self) -> &Arc<SlotPins> {
+        &self.pins
     }
 
     /// Submission plus display-order outputs for `picture`.
@@ -180,6 +191,9 @@ impl Dpb {
         });
         self.close_picture(picture, frame_num, poc);
         self.bump(&mut emits);
+        if sps.poc_type == PocType::FrameNum {
+            self.emit_current(slot, poc, &mut emits);
+        }
         let submission = self.submit(picture, sps, pps, &refs, slot, poc)?;
         emits.sort_unstable();
         let outputs = emits
@@ -489,12 +503,21 @@ impl Dpb {
         }
     }
 
-    /// First free slot.
+    /// First free slot outside live surface pins.
     fn alloc(&self) -> Result<usize, D3d11Error> {
-        self.slots
+        if let Some(free) = self
+            .slots
             .iter()
-            .position(Option::is_none)
-            .ok_or(D3d11Error::DpbFull)
+            .enumerate()
+            .position(|(index, slot)| slot.is_none() && !self.pins.is_pinned(index))
+        {
+            return Ok(free);
+        }
+        if self.slots.iter().any(Option::is_none) {
+            Err(D3d11Error::NoFreeSlot)
+        } else {
+            Err(D3d11Error::DpbFull)
+        }
     }
 
     /// Wrapped frame number for the current picture.
@@ -694,6 +717,20 @@ impl Dpb {
             emits.push((poc, index));
             if let Some(occupant) = self.slots[index].as_mut() {
                 occupant.displayed = true;
+            }
+        }
+        self.free_displayed_non_refs();
+    }
+
+    /// Current picture out on no-reorder streams.
+    ///
+    /// Type 2 POC doubles the frame number, so display order matches decode
+    /// order and the picture completes on its own decode call.
+    fn emit_current(&mut self, slot: usize, poc: i32, emits: &mut Vec<(i32, usize)>) {
+        if let Some(occupant) = self.slots[slot].as_mut() {
+            if !occupant.displayed {
+                occupant.displayed = true;
+                emits.push((poc, slot));
             }
         }
         self.free_displayed_non_refs();
@@ -1507,11 +1544,37 @@ mod tests {
             },
             SliceType::I,
         );
-        dpb.decode(&idr, &sequence, &pps()).expect("idr");
+        let decoded = dpb.decode(&idr, &sequence, &pps()).expect("idr");
+        assert_eq!(decoded.submission.slot, 0);
+        assert_eq!(slots(&decoded.outputs), vec![0]);
         let p = picture(false, 2, 1, SlicePoc::None, Marking::Silent, SliceType::P);
         let decoded = dpb.decode(&p, &sequence, &pps()).expect("p");
         assert_eq!(decoded.submission.params.curr_field_order_cnt, [2, 2]);
-        assert_eq!(slots(&decoded.outputs), vec![0]);
+        assert_eq!(decoded.submission.slot, 1);
+        assert_eq!(slots(&decoded.outputs), vec![1]);
+    }
+
+    #[test]
+    fn pinned_slot_skips_alloc() {
+        let mut dpb = Dpb::new(&sps());
+        dpb.pins().pin(0);
+        let decoded = dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
+        assert_eq!(decoded.submission.slot, 1);
+        assert!(decoded.outputs.is_empty());
+    }
+
+    #[test]
+    fn all_pinned_errors_no_free_slot() {
+        let mut dpb = Dpb::new(&sps());
+        for slot in 0u8..16 {
+            dpb.pins().pin(slot);
+        }
+        let error = dpb.decode(&idr(0, 0), &sps(), &pps()).unwrap_err();
+        assert!(matches!(error, crate::error::D3d11Error::NoFreeSlot));
+        assert_eq!(error.to_string(), "no free surface slot");
+        dpb.pins().unpin(0);
+        let decoded = dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
+        assert_eq!(decoded.submission.slot, 0);
     }
 
     #[test]

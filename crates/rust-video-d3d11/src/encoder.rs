@@ -19,6 +19,8 @@ use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::Encoder;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
 ///
@@ -76,27 +78,53 @@ impl D3d11Encoder {
     ///
     /// Returns `Err` without a D3D11 bind or when the backend cannot
     /// encode `surface`.
-    pub(crate) fn encode_surface(
-        &mut self,
-        surface: &GpuSurface,
-    ) -> Result<Vec<Packet>, D3d11Error> {
-        let layout = surface.layout();
-        if layout.format() != PixelFormat::Nv12 {
+    pub fn encode_surface(&mut self, surface: &GpuSurface) -> Result<Vec<Packet>, D3d11Error> {
+        if surface.format() != PixelFormat::Nv12 {
             return Err(D3d11Error::Unsupported(
                 UnsupportedReason::EncoderInputNotNv12 {
-                    format: layout.format(),
+                    format: surface.format(),
                 },
             ));
         }
-        let size = layout.visible();
+        let size = surface.size();
+        let (left, top) = surface.origin();
         self.session.encode_texture(
-            surface.export(),
-            u32::from(layout.slice()),
-            layout.left(),
-            layout.top(),
+            surface.texture(),
+            surface.slice(),
+            left,
+            top,
             size.width(),
             size.height(),
         )
+    }
+
+    /// Packets coded from an NV12 `texture` region, possibly none.
+    ///
+    /// The region must sit on even offsets with an even extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an odd region or when the backend cannot
+    /// encode `texture`.
+    pub fn encode_texture(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        slice: u32,
+        left: u32,
+        top: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Packet>, D3d11Error> {
+        if left.is_multiple_of(2)
+            && top.is_multiple_of(2)
+            && width.is_multiple_of(2)
+            && height.is_multiple_of(2)
+        {
+            self.session
+                .encode_texture(texture, slice, left, top, width, height)
+        } else {
+            Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent))
+        }
     }
 
     /// Packets coded from `scaled`, possibly none.

@@ -1,5 +1,7 @@
 //! HEVC decoded picture buffer with DXVA submission payloads.
 
+use std::sync::Arc;
+
 use crate::dpb::Output;
 use crate::dxva::{
     PicEntryHevc, PicParamsHevc, QmatrixHevc, SliceShortHevc, HEVC_FORMAT_CHROMA_420,
@@ -16,6 +18,7 @@ use crate::dxva::{
 };
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::h265::{LtSpec, Picture, Pps, ShortTermRps, Sps};
+use crate::pins::SlotPins;
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -51,6 +54,8 @@ struct RefState {
 pub(crate) struct HevcDpb {
     /// Picture slots.
     slots: [Option<Occupant>; SLOTS],
+    /// Pins held by live surfaces.
+    pins: Arc<SlotPins>,
     /// Picture capacity.
     capacity: u8,
     /// Reorder limit.
@@ -72,6 +77,7 @@ impl HevcDpb {
     pub(crate) fn new(sps: &Sps) -> Self {
         Self {
             slots: core::array::from_fn(|_| None),
+            pins: Arc::new(SlotPins::new()),
             capacity: sps.max_dec_pic_buffering_minus1 + 1,
             max_reorder: sps.max_num_reorder_pics,
             max_poc_lsb: sps.max_poc_lsb(),
@@ -80,6 +86,12 @@ impl HevcDpb {
             has_prev_tid0: false,
             feedback: 1,
         }
+    }
+
+    /// Pins shared with live surfaces.
+    #[must_use]
+    pub(crate) fn pins(&self) -> &Arc<SlotPins> {
+        &self.pins
     }
 
     /// Submission plus display-order outputs for `picture`.
@@ -351,12 +363,21 @@ impl HevcDpb {
         }
     }
 
-    /// First free slot.
+    /// First free slot outside live surface pins.
     fn alloc(&self) -> Result<usize, D3d11Error> {
-        self.slots
+        if let Some(free) = self
+            .slots
             .iter()
-            .position(Option::is_none)
-            .ok_or(D3d11Error::DpbFull)
+            .enumerate()
+            .position(|(index, slot)| slot.is_none() && !self.pins.is_pinned(index))
+        {
+            return Ok(free);
+        }
+        if self.slots.iter().any(Option::is_none) {
+            Err(D3d11Error::NoFreeSlot)
+        } else {
+            Err(D3d11Error::DpbFull)
+        }
     }
 
     /// Reference pictures behind parameter construction.
@@ -1026,6 +1047,38 @@ mod tests {
         );
         assert_eq!(params.width_in_min_cbs, 40);
         assert_eq!(params.height_in_min_cbs, 30);
+    }
+
+    #[test]
+    fn no_reorder_emits_per_call() {
+        let mut sequence = sps();
+        sequence.max_num_reorder_pics = 0;
+        let mut dpb = HevcDpb::new(&sequence);
+        let decoded = dpb.decode(&idr(), &sequence, &pps()).expect("idr");
+        assert_eq!(slots(&decoded.outputs), vec![0]);
+        assert_eq!(decoded.current_index, Some(0));
+        let decoded = dpb.decode(&p(2, -2), &sequence, &pps()).expect("p");
+        assert_eq!(slots(&decoded.outputs), vec![1]);
+        assert_eq!(decoded.current_index, Some(0));
+    }
+
+    #[test]
+    fn pinned_slot_skips_alloc() {
+        let mut dpb = HevcDpb::new(&sps());
+        dpb.pins().pin(0);
+        let decoded = dpb.decode(&idr(), &sps(), &pps()).expect("idr");
+        assert_eq!(decoded.submission.slot, 1);
+    }
+
+    #[test]
+    fn all_pinned_errors_no_free_slot() {
+        let mut dpb = HevcDpb::new(&sps());
+        for slot in 0u8..16 {
+            dpb.pins().pin(slot);
+        }
+        let error = dpb.decode(&idr(), &sps(), &pps()).unwrap_err();
+        assert!(matches!(error, crate::error::D3d11Error::NoFreeSlot));
+        assert_eq!(error.to_string(), "no free surface slot");
     }
 
     #[test]

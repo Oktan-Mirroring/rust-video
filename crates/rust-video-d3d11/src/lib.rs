@@ -27,6 +27,8 @@ mod hevc_dpb;
 #[cfg(target_os = "windows")]
 mod mf;
 #[cfg(target_os = "windows")]
+mod pins;
+#[cfg(target_os = "windows")]
 mod scale;
 #[cfg(target_os = "windows")]
 mod session;
@@ -38,13 +40,15 @@ mod transcode;
 #[cfg(target_os = "windows")]
 pub use decoder::H264Decoder;
 #[cfg(target_os = "windows")]
-pub use decoder::{Av1Decoder, HevcDecoder};
+pub use decoder::{Av1Decoder, GpuSurface, HevcDecoder};
 pub use decoder::{D3d11Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 pub use device::D3d11Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d11Encoder;
 pub use error::{BrokenReferenceReason, D3d11Error, ParseReason, SkipReason, UnsupportedReason};
 pub use guid::{Codec, Profile};
+#[cfg(target_os = "windows")]
+pub use submit::SubmitLock;
 #[cfg(target_os = "windows")]
 pub use transcode::Transcoder;
 
