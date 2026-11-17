@@ -9,6 +9,7 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::time::Duration;
 
 use crate::error::{D3d12Error, UnsupportedReason};
 use windows::core::{Interface, PCWSTR};
@@ -709,6 +710,32 @@ impl Fence {
         Self::signal_and_wait(&self.inner, ticket.value(), self.event)
     }
 
+    /// `ticket` completion through the fence event before `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the event call fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket` - fence value the queue signals.
+    /// * `timeout` - wait budget.
+    ///
+    /// # Returns
+    ///
+    /// True when the GPU signaled `ticket` before `timeout` lapsed.
+    pub(crate) fn wait_timeout(
+        &self,
+        ticket: Ticket,
+        timeout: Duration,
+    ) -> Result<bool, D3d12Error> {
+        if self.poll(ticket) {
+            return Ok(true);
+        }
+        let budget = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        Self::signal_and_wait_timeout(&self.inner, ticket.value(), self.event, budget)
+    }
+
     /// `value` completion on `fence` through a transient event.
     pub(crate) fn wait_on(fence: &ID3D12Fence, value: u64) -> Result<(), D3d12Error> {
         // Sound: default security, auto-reset, unnamed.
@@ -727,21 +754,34 @@ impl Fence {
 
     /// `value` completion on `fence` through `event`.
     fn signal_and_wait(fence: &ID3D12Fence, value: u64, event: HANDLE) -> Result<(), D3d12Error> {
+        if Self::signal_and_wait_timeout(fence, value, event, Self::WAIT_MS)? {
+            return Ok(());
+        }
+        Err(D3d12Error::Call {
+            call: "FenceWait",
+            hresult: WAIT_TIMEOUT.0.cast_signed(),
+        })
+    }
+
+    /// `value` completion on `fence` through `event` before `timeout_ms`.
+    fn signal_and_wait_timeout(
+        fence: &ID3D12Fence,
+        value: u64,
+        event: HANDLE,
+        timeout_ms: u32,
+    ) -> Result<bool, D3d12Error> {
         // Sound: the fence and event are live.
         unsafe { fence.SetEventOnCompletion(value, event) }.map_err(|error| D3d12Error::Call {
             call: "SetEventOnCompletion",
             hresult: error.code().0,
         })?;
         // Sound: the event is live with a bounded wait.
-        let outcome = unsafe { WaitForSingleObject(event, Self::WAIT_MS) };
+        let outcome = unsafe { WaitForSingleObject(event, timeout_ms) };
         if outcome == WAIT_OBJECT_0 {
-            return Ok(());
+            return Ok(true);
         }
         if outcome == WAIT_TIMEOUT {
-            return Err(D3d12Error::Call {
-                call: "FenceWait",
-                hresult: WAIT_TIMEOUT.0.cast_signed(),
-            });
+            return Ok(false);
         }
         Err(D3d12Error::Call {
             call: "WaitForSingleObject",

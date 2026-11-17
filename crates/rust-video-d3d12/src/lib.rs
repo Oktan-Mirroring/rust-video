@@ -46,7 +46,7 @@ mod transcode;
 
 pub use decoder::{Av1Decoder, D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
-pub use decoder_os::{H264Decoder, HevcDecoder};
+pub use decoder_os::{H264Decoder, HevcDecoder, OverlappedH264Pump, PhaseTiming};
 #[cfg(target_os = "windows")]
 pub use delivery::DecoderPump;
 pub use device::D3d12Device;

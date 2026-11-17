@@ -10,6 +10,7 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::time::Duration;
 
 use crate::dxva::{
     PicEntryHevc, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264,
@@ -52,6 +53,9 @@ use windows::Win32::Media::MediaFoundation::{
 
 /// Bitstream upload capacity in bytes.
 const BITSTREAM_CAP: u64 = 8 << 20;
+
+/// Bitstream upload buffers behind pipelined submits.
+const BITSTREAM_SLOTS: usize = 4;
 
 /// Output texture pool behind the DPB slots.
 const POOL: usize = 16;
@@ -530,8 +534,8 @@ pub(crate) struct DecodeSession {
     video_queue: ID3D12CommandQueue,
     /// Video decode slots, one per pool texture.
     video_slots: Vec<CommandSlot<ID3D12VideoDecodeCommandList>>,
-    /// In-flight video ticket, waited before the next video submit.
-    video_busy: Option<Ticket>,
+    /// In-flight video ticket per slot, waited before the slot re-records.
+    video_busy: Vec<Option<Ticket>>,
     /// Direct queue behind downloads.
     copy_queue: ID3D12CommandQueue,
     /// Download slots, one per pool texture.
@@ -550,8 +554,12 @@ pub(crate) struct DecodeSession {
     outputs: Vec<ID3D12Resource>,
     /// Visible-size crop targets, one per pool slot, empty without an offset crop.
     crops: Vec<ID3D12Resource>,
-    /// Bitstream upload buffer.
-    bitstream: ID3D12Resource,
+    /// Bitstream upload buffers, one per pipelined submit.
+    bitstreams: Vec<ID3D12Resource>,
+    /// In-flight video ticket per upload buffer.
+    bitstream_busy: Vec<Option<Ticket>>,
+    /// Next upload buffer behind a submit.
+    bitstream_next: usize,
     /// Download staging buffers, one per pool slot.
     staging: Vec<ID3D12Resource>,
     /// Staging layout.
@@ -662,12 +670,15 @@ impl DecodeSession {
             }
         }
         let upload_desc = DeviceResources::buffer_desc(BITSTREAM_CAP);
-        let bitstream = resources.committed(
-            D3D12_HEAP_TYPE_UPLOAD,
-            &upload_desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            "CreateBitstream",
-        )?;
+        let mut bitstreams = Vec::with_capacity(BITSTREAM_SLOTS);
+        for _ in 0..BITSTREAM_SLOTS {
+            bitstreams.push(resources.committed(
+                D3D12_HEAP_TYPE_UPLOAD,
+                &upload_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                "CreateBitstream",
+            )?);
+        }
         let (layout, footprints) = resources.nv12_layout(width, height)?;
         let staging_desc = DeviceResources::buffer_desc(layout.total);
         let mut staging = Vec::with_capacity(POOL);
@@ -683,7 +694,7 @@ impl DecodeSession {
             device: device.device().clone(),
             video_queue,
             video_slots,
-            video_busy: None,
+            video_busy: vec![None; POOL],
             copy_queue,
             copy_slots,
             copy_busy: vec![None; POOL],
@@ -693,7 +704,9 @@ impl DecodeSession {
             decoder,
             outputs,
             crops,
-            bitstream,
+            bitstreams,
+            bitstream_busy: vec![None; BITSTREAM_SLOTS],
+            bitstream_next: 0,
             staging,
             layout,
             footprints,
@@ -722,6 +735,69 @@ impl DecodeSession {
     /// Returns `Err` when the GPU misses the wait budget.
     pub(crate) fn wait_video(&self, ticket: Ticket) -> Result<(), D3d12Error> {
         self.video_fence.wait(ticket)
+    }
+
+    /// True once the GPU signals video `ticket`.
+    pub(crate) fn video_signaled(&self, ticket: Ticket) -> bool {
+        self.video_fence.poll(ticket)
+    }
+
+    /// Video `ticket` completion through the fence event before `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the event call fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket` - fence value the video queue signals.
+    /// * `timeout` - wait budget.
+    ///
+    /// # Returns
+    ///
+    /// True when the GPU signaled `ticket` before `timeout` lapsed.
+    pub(crate) fn wait_video_timeout(
+        &self,
+        ticket: Ticket,
+        timeout: Duration,
+    ) -> Result<bool, D3d12Error> {
+        self.video_fence.wait_timeout(ticket, timeout)
+    }
+
+    /// Copy `ticket` completion through the fence event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU misses the wait budget.
+    pub(crate) fn wait_copy(&self, ticket: Ticket) -> Result<(), D3d12Error> {
+        self.copy_fence.wait(ticket)
+    }
+
+    /// True once the GPU signals copy `ticket`.
+    pub(crate) fn copy_signaled(&self, ticket: Ticket) -> bool {
+        self.copy_fence.poll(ticket)
+    }
+
+    /// Copy `ticket` completion through the fence event before `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the event call fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket` - fence value the copy queue signals.
+    /// * `timeout` - wait budget.
+    ///
+    /// # Returns
+    ///
+    /// True when the GPU signaled `ticket` before `timeout` lapsed.
+    pub(crate) fn wait_copy_timeout(
+        &self,
+        ticket: Ticket,
+        timeout: Duration,
+    ) -> Result<bool, D3d12Error> {
+        self.copy_fence.wait_timeout(ticket, timeout)
     }
 
     /// Video decode queue behind submissions.
@@ -762,6 +838,43 @@ impl DecodeSession {
     /// Returns `Err` for a slot outside the pool, or when
     /// the copy fails.
     pub(crate) fn start_download(&mut self, slot: u8) -> Result<Ticket, D3d12Error> {
+        let index = self.record_download(slot)?;
+        self.execute_download(index)
+    }
+
+    /// Pool `slot` planes through the direct queue after video `ticket`, without waiting.
+    ///
+    /// The copy queue waits on the video fence; the copy runs beside the
+    /// next video submit on its own queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, or when
+    /// the copy fails.
+    pub(crate) fn start_download_after(
+        &mut self,
+        slot: u8,
+        video: Ticket,
+    ) -> Result<Ticket, D3d12Error> {
+        let index = self.record_download(slot)?;
+        let fence = self.video_fence.handle();
+        // Sound: the fence and queue are live; the value is a submitted ticket.
+        unsafe { self.copy_queue.Wait(&fence, video.value()) }.map_err(|error| {
+            D3d12Error::Call {
+                call: "QueueWait",
+                hresult: error.code().0,
+            }
+        })?;
+        self.execute_download(index)
+    }
+
+    /// Download list for pool `slot`, recorded and open.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, or when
+    /// the copy fails.
+    fn record_download(&mut self, slot: u8) -> Result<usize, D3d12Error> {
         let index = usize::from(slot);
         let source = self
             .outputs
@@ -814,6 +927,16 @@ impl DecodeSession {
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
         }
+        Ok(index)
+    }
+
+    /// Recorded download list for pool `index` through the direct queue, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an index outside the pool, or when
+    /// the copy fails.
+    fn execute_download(&mut self, index: usize) -> Result<Ticket, D3d12Error> {
         let pair = self
             .copy_slots
             .get_mut(index)
@@ -832,11 +955,38 @@ impl DecodeSession {
     /// Returns `Err` for a slot outside the pool, when the GPU misses
     /// the wait budget, or when staging falls short of the layout.
     pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Vec<u8>, D3d12Error> {
+        self.copy_fence.wait(ticket)?;
+        self.readback(slot)
+    }
+
+    /// Tight NV12 bytes for a started `slot` when `ticket` signaled, absent while the copy runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, or when
+    /// staging falls short of the layout.
+    pub(crate) fn poll_download(
+        &self,
+        slot: u8,
+        ticket: Ticket,
+    ) -> Result<Option<Vec<u8>>, D3d12Error> {
+        if !self.copy_fence.poll(ticket) {
+            return Ok(None);
+        }
+        self.readback(slot).map(Some)
+    }
+
+    /// Tight NV12 bytes mapped from the staging buffer behind `slot`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, or when
+    /// staging falls short of the layout.
+    fn readback(&self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
         let index = usize::from(slot);
         let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
             BrokenReferenceReason::SlotOutsidePool,
         ))?;
-        self.copy_fence.wait(ticket)?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
@@ -1032,10 +1182,38 @@ impl DecodeSession {
     /// `submission` through the video queue into its pool slot.
     fn submit_h264(&mut self, submission: &H264Submission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
-        DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
+        let (upload, upload_index) = self.acquire_bitstream()?;
+        DeviceResources::write_upload(&upload, &submission.bitstream)?;
         let mut refs = self.ref_tables();
-        let input = self.input_args(submission, Some(&mut refs))?;
-        self.submit_video(&input, submission.slot)
+        let input = self.input_args(submission, Some(&mut refs), &upload)?;
+        let ticket = self.submit_video(&input, submission.slot)?;
+        self.bitstream_busy[upload_index] = Some(ticket);
+        Ok(ticket)
+    }
+
+    /// Upload buffer plus index behind the next submit.
+    ///
+    /// Scans past buffers whose video ticket signaled; waits the next one
+    /// only when every buffer is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU misses the wait budget.
+    fn acquire_bitstream(&mut self) -> Result<(ID3D12Resource, usize), D3d12Error> {
+        for _ in 0..BITSTREAM_SLOTS {
+            let index = self.bitstream_next;
+            self.bitstream_next = (self.bitstream_next + 1) % BITSTREAM_SLOTS;
+            let busy =
+                self.bitstream_busy[index].is_some_and(|ticket| !self.video_fence.poll(ticket));
+            if !busy {
+                return Ok((self.bitstreams[index].clone(), index));
+            }
+        }
+        let index = self.bitstream_next;
+        if let Some(ticket) = self.bitstream_busy[index] {
+            self.video_fence.wait(ticket)?;
+        }
+        Ok((self.bitstreams[index].clone(), index))
     }
 
     /// NV12 bytes decoded from `submission` on the GPU.
@@ -1064,9 +1242,12 @@ impl DecodeSession {
     /// `submission` through the video queue into pool slot zero.
     fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
-        DeviceResources::write_upload(&self.bitstream, &submission.bitstream)?;
-        let input = self.input_args(submission, None)?;
-        self.submit_video(&input, 0)
+        let (upload, upload_index) = self.acquire_bitstream()?;
+        DeviceResources::write_upload(&upload, &submission.bitstream)?;
+        let input = self.input_args(submission, None, &upload)?;
+        let ticket = self.submit_video(&input, 0)?;
+        self.bitstream_busy[upload_index] = Some(ticket);
+        Ok(ticket)
     }
 
     /// Bitstream length against the upload capacity.
@@ -1093,15 +1274,18 @@ impl DecodeSession {
     }
 
     /// `DecodeFrame` for `input` through the video queue into pool `slot`.
+    ///
+    /// Submits without waiting on other slots; only the target slot
+    /// re-record waits its own prior ticket.
     fn submit_video(
         &mut self,
         input: &D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS,
         slot: u8,
     ) -> Result<Ticket, D3d12Error> {
-        if let Some(ticket) = self.video_busy {
+        let index = usize::from(slot);
+        if let Some(ticket) = self.video_busy.get(index).copied().flatten() {
             self.video_fence.wait(ticket)?;
         }
-        let index = usize::from(slot);
         let target = self
             .outputs
             .get(index)
@@ -1157,7 +1341,7 @@ impl DecodeSession {
                 BrokenReferenceReason::SlotOutsidePool,
             ))?;
         let ticket = pair.close_execute(&self.video_queue, &mut self.video_fence)?;
-        self.video_busy = Some(ticket);
+        self.video_busy[index] = Some(ticket);
         Ok(ticket)
     }
 
@@ -1166,6 +1350,7 @@ impl DecodeSession {
         &self,
         submission: &S,
         refs: Option<&mut RefTables>,
+        bitstream: &ID3D12Resource,
     ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
         let params_len = u32::try_from(std::mem::size_of::<S::Params>())
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
@@ -1211,7 +1396,7 @@ impl DecodeSession {
             FrameArguments: args,
             ReferenceFrames: references,
             CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
-                pBuffer: ManuallyDrop::new(Some(self.bitstream.clone())),
+                pBuffer: ManuallyDrop::new(Some(bitstream.clone())),
                 Offset: 0,
                 Size: bitstream_len,
             },
