@@ -25,6 +25,9 @@ const BAR: f64 = 60.0;
 /// Warmup frames ahead of the timed loop.
 const WARMUP: u64 = 4;
 
+/// Timed runs behind the VP9 median.
+const VP9_REPEATS: usize = 3;
+
 /// Serialized benches: one test at a time per binary.
 ///
 /// Parallel benches share NVDEC/NVENC engines, CPU, and the software
@@ -429,6 +432,8 @@ fn encode_hevc_1080p_measures_realtime() {
 }
 
 /// 1080p VP9 encode measured against the realtime bar.
+///
+/// Median of three runs; single-run timing straddles the bar under load.
 #[test]
 fn encode_vp9_1080p_measures_realtime() {
     let _serial = measure();
@@ -439,16 +444,21 @@ fn encode_vp9_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
-        Ok(encoder) => encoder,
-        Err(error) => {
-            println!("d3d11 skipped: no vp9 encoder MFT ({error})");
-            return;
-        }
-    };
     let (warmup, frames) = noise_frames();
-    let measured = encode_fps(&mut encoder, &warmup, &frames);
-    println!("d3d11 vp9 encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    let mut runs = Vec::new();
+    for _ in 0..VP9_REPEATS {
+        let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                println!("d3d11 skipped: no vp9 encoder MFT ({error})");
+                return;
+            }
+        };
+        runs.push(encode_fps(&mut encoder, &warmup, &frames));
+    }
+    runs.sort_by(f64::total_cmp);
+    let measured = runs[VP9_REPEATS / 2];
+    println!("d3d11 vp9 encode 1080p: {measured:.1}fps median of {runs:?} over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
