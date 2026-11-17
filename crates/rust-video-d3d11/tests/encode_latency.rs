@@ -3,14 +3,12 @@
 //! Skips without hardware; fails when any call returns another
 //! frame's packet or holds one back for the flush.
 
-#[cfg(target_os = "windows")]
+#![cfg(target_os = "windows")]
+
 use rust_video_caps::traits::Encoder;
-#[cfg(target_os = "windows")]
 use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder};
-#[cfg(target_os = "windows")]
 use rust_video_harness::Synth;
 
-#[cfg(target_os = "windows")]
 /// Calls of `codec` each return their own stamped packet, flush stays empty.
 fn audit_own_frames(codec: Codec, tag: &str) {
     let device = match D3d11Device::open() {
@@ -58,7 +56,6 @@ fn audit_own_frames(codec: Codec, tag: &str) {
     );
 }
 
-#[cfg(target_os = "windows")]
 #[test]
 fn encode_returns_own_frames() {
     audit_own_frames(Codec::H264, "h264");
@@ -66,7 +63,3 @@ fn encode_returns_own_frames() {
     audit_own_frames(Codec::Av1, "av1");
     audit_own_frames(Codec::Vp9, "vp9");
 }
-
-#[cfg(not(target_os = "windows"))]
-#[test]
-fn encode_returns_own_frames() {}

@@ -1,8 +1,8 @@
-#![cfg(target_os = "windows")]
-
 //! Surface contract: per-call parity, reorder holdback, pinning, metadata.
 //!
 //! Skips without hardware; fails when the contract breaks.
+
+#![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
 #[allow(dead_code)]

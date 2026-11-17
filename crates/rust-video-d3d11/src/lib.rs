@@ -9,16 +9,22 @@ mod av1;
 mod av1_dpb;
 #[cfg(target_os = "windows")]
 mod bits;
+#[cfg(target_os = "windows")]
 mod decoder;
 #[cfg(target_os = "windows")]
 mod delivery;
+#[cfg(target_os = "windows")]
 mod device;
+#[cfg(not(target_os = "windows"))]
+mod device_portable;
 #[cfg(target_os = "windows")]
 mod dpb;
 #[cfg(target_os = "windows")]
 mod dxva;
+#[cfg(target_os = "windows")]
 mod encoder;
 mod error;
+mod frame;
 mod guid;
 #[cfg(target_os = "windows")]
 mod h264;
@@ -34,23 +40,26 @@ mod pins;
 mod scale;
 #[cfg(target_os = "windows")]
 mod session;
+mod shell;
 #[cfg(target_os = "windows")]
 mod submit;
 #[cfg(target_os = "windows")]
 mod transcode;
 
 #[cfg(target_os = "windows")]
-pub use decoder::H264Decoder;
-#[cfg(target_os = "windows")]
-pub use decoder::{Av1Decoder, GpuSurface, HevcDecoder};
-pub use decoder::{D3d11Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
+pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder};
 #[cfg(target_os = "windows")]
 pub use delivery::DecoderPump;
+#[cfg(target_os = "windows")]
 pub use device::D3d11Device;
+#[cfg(not(target_os = "windows"))]
+pub use device_portable::D3d11Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d11Encoder;
 pub use error::{BrokenReferenceReason, D3d11Error, ParseReason, SkipReason, UnsupportedReason};
+pub use frame::D3d11Frame;
 pub use guid::{Codec, Profile};
+pub use shell::{Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
 pub use submit::SubmitLock;
 #[cfg(target_os = "windows")]

@@ -1,104 +1,25 @@
-//! H.264 decode plus probed shells behind the caps `Decoder` trait.
+//! Hardware decode plus device-resident surfaces behind the caps `Decoder` trait.
 
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
 
 use crate::device::D3d11Device;
-#[cfg(target_os = "windows")]
 use crate::dpb::{Decoded, Dpb, Output};
-use crate::error::{D3d11Error, ParseReason, SkipReason, UnsupportedReason};
+use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
+use crate::frame::{D3d11Frame, FrameExport};
 use crate::guid::Codec;
-#[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
-#[cfg(target_os = "windows")]
 use crate::pins::SlotPins;
-#[cfg(target_os = "windows")]
 use crate::session::Session;
-#[cfg(target_os = "windows")]
 use crate::session::SharedExport;
-#[cfg(target_os = "windows")]
 use crate::submit::SurfaceFence;
 
-use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
+use rust_video_caps::traits::Decoder;
 use rust_video_caps::traits::SharedDevice;
-use rust_video_caps::traits::{Decoder, Lease};
-#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::FallbackCause;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
-
-/// Decoded frame: NV12 bytes with identity and a budget lease.
-pub struct D3d11Frame {
-    /// Frame identity: size, format, generation.
-    identity: GpuFrame,
-    /// NV12 frame bytes in row-major order.
-    data: Bytes,
-    /// VRAM budget held for the bytes.
-    lease: Lease,
-    /// Shared-texture export, absent without NT-handle sharing.
-    #[cfg(target_os = "windows")]
-    shared: Option<SharedExport>,
-}
-
-impl D3d11Frame {
-    /// Frame identity.
-    #[must_use]
-    pub fn identity(&self) -> GpuFrame {
-        self.identity
-    }
-
-    /// NV12 frame bytes in row-major order.
-    #[must_use]
-    pub fn nv12(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Budget bytes the frame holds.
-    #[must_use]
-    pub fn lease_bytes(&self) -> u64 {
-        self.lease.bytes()
-    }
-
-    /// Platform export handle for the frame.
-    ///
-    /// NT handle over the shared decode texture, or an opaque backend
-    /// descriptor when the driver declines sharing.
-    #[must_use]
-    pub fn export(&self) -> GpuExport {
-        #[cfg(target_os = "windows")]
-        if let Some(shared) = &self.shared {
-            return GpuExport::NtHandle {
-                handle: shared.handle(),
-            };
-        }
-        GpuExport::Opaque { name: "d3d11" }
-    }
-
-    /// CPU copy split into NV12 planes.
-    #[must_use]
-    pub fn to_cpu(&self) -> Option<CpuFrame> {
-        let size = self.identity.size();
-        let luma = u64::from(size.width()) * u64::from(size.height());
-        let y_len = usize::try_from(luma).ok()?;
-        let uv_len = y_len / 2;
-        if self.data.len() < y_len + uv_len {
-            return None;
-        }
-        let y = self.data.slice(..y_len);
-        let uv = self.data.slice(y_len..y_len + uv_len);
-        let stride = size.width();
-        CpuFrame::new(
-            size,
-            PixelFormat::Nv12,
-            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
-        )
-    }
-}
 
 /// Device-resident decode surface without CPU access.
 ///
@@ -107,10 +28,9 @@ impl D3d11Frame {
 /// to serialize with crate submissions; [`wait`](Self::wait) never holds it.
 ///
 /// A surface borrows nothing: it holds shared ownership of its decode
-/// texture, its completion fence, and its decoder slot pin. Dropping the
-/// decoder never invalidates a live surface; dropping the surface releases
-/// its slot for reuse.
-#[cfg(target_os = "windows")]
+/// texture, its completion fence, and its decoder slot pin.
+///
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
 pub struct GpuSurface {
     /// Shared decode texture plus its NT handle.
     export: SharedExport,
@@ -124,7 +44,6 @@ pub struct GpuSurface {
     slot: u8,
 }
 
-#[cfg(target_os = "windows")]
 impl GpuSurface {
     /// Picture dimensions in luma samples.
     #[must_use]
@@ -182,7 +101,6 @@ impl GpuSurface {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Drop for GpuSurface {
     /// Decoder slot pin release.
     fn drop(&mut self) {
@@ -191,7 +109,6 @@ impl Drop for GpuSurface {
 }
 
 /// NV12 two-plane export description over one array slice.
-#[cfg(target_os = "windows")]
 pub(crate) struct ExportLayout {
     /// Pixel layout; NV12 stores luma plus one chroma plane.
     format: PixelFormat,
@@ -207,7 +124,6 @@ pub(crate) struct ExportLayout {
     coded: PictureSize,
 }
 
-#[cfg(target_os = "windows")]
 impl ExportLayout {
     /// Layout for `slot` at `visible` inside the coded extent, absent when empty.
     #[must_use]
@@ -268,11 +184,9 @@ impl ExportLayout {
 }
 
 /// Pending outputs behind a mid-call consume.
-#[cfg(target_os = "windows")]
 const PENDING_FLUSH: usize = 8;
 
 /// Active sequence behind the live session.
-#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Active {
     /// Sequence set id.
@@ -287,7 +201,6 @@ struct Active {
     visible: PictureSize,
 }
 
-#[cfg(target_os = "windows")]
 impl Active {
     /// Active sequence for `sps_id` at `width` x `height` with `crop` and visible extent.
     fn new(
@@ -311,7 +224,6 @@ impl Active {
 }
 
 /// H.264 decoder over a D3D11 device.
-#[cfg(target_os = "windows")]
 pub struct H264Decoder<'a> {
     /// Device owning the decode session.
     device: &'a D3d11Device,
@@ -333,7 +245,6 @@ pub struct H264Decoder<'a> {
     inflight_max: usize,
 }
 
-#[cfg(target_os = "windows")]
 impl<'a> H264Decoder<'a> {
     /// Decoder over `device`; the session starts on the first picture.
     #[must_use]
@@ -671,7 +582,6 @@ impl<'a> H264Decoder<'a> {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Decoder for H264Decoder<'_> {
     type Frame = D3d11Frame;
     type Error = D3d11Error;
@@ -716,7 +626,6 @@ impl Decoder for H264Decoder<'_> {
 }
 
 /// Frame for copied `slot`.
-#[cfg(target_os = "windows")]
 fn emit_frame(
     session: &Session,
     shared: &SharedDevice,
@@ -726,16 +635,19 @@ fn emit_frame(
 ) -> Result<D3d11Frame, D3d11Error> {
     let data = session.read_slot(slot, active.crop)?;
     let lease = shared.try_acquire(data.len() as u64)?;
+    let export = session.export().map(|shared| {
+        let export: Box<dyn FrameExport> = Box::new(shared);
+        export
+    });
     Ok(D3d11Frame {
         identity: GpuFrame::new(active.visible, PixelFormat::Nv12, generation),
         data,
         lease,
-        shared: session.export(),
+        export,
     })
 }
 
 /// Surface for `output`, absent without NT-handle sharing.
-#[cfg(target_os = "windows")]
 fn emit_surface(
     session: &Session,
     output: &Output,
@@ -761,7 +673,6 @@ fn emit_surface(
 }
 
 /// HEVC decoder over a D3D11 device.
-#[cfg(target_os = "windows")]
 pub struct HevcDecoder<'a> {
     /// Device owning the decode session.
     device: &'a D3d11Device,
@@ -783,7 +694,6 @@ pub struct HevcDecoder<'a> {
     inflight_max: usize,
 }
 
-#[cfg(target_os = "windows")]
 impl<'a> HevcDecoder<'a> {
     /// Decoder over `device`; the session starts on the first picture.
     #[must_use]
@@ -1135,7 +1045,6 @@ impl<'a> HevcDecoder<'a> {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Decoder for HevcDecoder<'_> {
     type Frame = D3d11Frame;
     type Error = D3d11Error;
@@ -1180,7 +1089,6 @@ impl Decoder for HevcDecoder<'_> {
 }
 
 /// AV1 decoder over a D3D11 device.
-#[cfg(target_os = "windows")]
 pub struct Av1Decoder<'a> {
     /// Device owning the decode session.
     device: &'a D3d11Device,
@@ -1202,7 +1110,6 @@ pub struct Av1Decoder<'a> {
     inflight_max: usize,
 }
 
-#[cfg(target_os = "windows")]
 impl<'a> Av1Decoder<'a> {
     /// Decoder over `device`; the session starts on the first frame.
     #[must_use]
@@ -1588,7 +1495,6 @@ impl<'a> Av1Decoder<'a> {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Decoder for Av1Decoder<'_> {
     type Frame = D3d11Frame;
     type Error = D3d11Error;
@@ -1645,142 +1551,14 @@ impl Decoder for Av1Decoder<'_> {
     }
 }
 
-/// Probed decoder shell; the picture builder is pending.
-macro_rules! shell {
-    ($decoder:ident, $codec:ident, $doc:literal) => {
-        #[doc = $doc]
-        pub struct $decoder<'a> {
-            /// Device behind the profile probe.
-            device: &'a D3d11Device,
-        }
-
-        impl<'a> $decoder<'a> {
-            /// Decoder over `device`; decode reports the pending builder.
-            #[must_use]
-            pub fn open(device: &'a D3d11Device) -> Self {
-                Self { device }
-            }
-        }
-
-        impl Decoder for $decoder<'_> {
-            type Frame = D3d11Frame;
-            type Error = D3d11Error;
-
-            fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-                if !self.device.supports(Codec::$codec) {
-                    return Err(SkipReason::ProfileUnsupported {
-                        codec: Codec::$codec,
-                    }
-                    .into());
-                }
-                Err(D3d11Error::Unsupported(
-                    UnsupportedReason::PictureBuilderPending {
-                        codec: Codec::$codec,
-                    },
-                ))
-            }
-
-            fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
-                Ok(Vec::new())
-            }
-        }
-    };
-}
-
-shell!(
-    Vp9Decoder,
-    Vp9,
-    "VP9 decoder; the picture builder is pending."
-);
-shell!(
-    Mpeg2Decoder,
-    Mpeg2,
-    "MPEG-2 decoder; the picture builder is pending."
-);
-shell!(
-    Vc1Decoder,
-    Vc1,
-    "VC-1 decoder; the picture builder is pending."
-);
-
 #[cfg(test)]
 mod tests {
-    use super::D3d11Frame;
-    #[cfg(target_os = "windows")]
     use super::ExportLayout;
-    #[cfg(target_os = "windows")]
     use crate::h264::Crop;
 
-    use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
-    use rust_video_caps::traits::SharedDevice;
+    use rust_video_caps::frame::PixelFormat;
 
-    /// Frame over `data` leased against `shared`.
-    fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> D3d11Frame {
-        let size = PictureSize::new(width, height).expect("nonzero extent");
-        let identity = GpuFrame::new(size, PixelFormat::Nv12, 3);
-        let bytes = Bytes::from(data);
-        let lease = shared
-            .try_acquire(bytes.len() as u64)
-            .expect("within budget");
-        D3d11Frame {
-            identity,
-            data: bytes,
-            lease,
-            #[cfg(target_os = "windows")]
-            shared: None,
-        }
-    }
-
-    #[test]
-    fn frame_holds_lease_against_budget() {
-        let shared = SharedDevice::new("d3d11", 100);
-        let held = frame(&shared, 4, 2, vec![7; 12]);
-        assert_eq!(held.lease_bytes(), 12);
-        assert_eq!(shared.used(), 12);
-        assert_eq!(held.nv12(), &[7; 12]);
-        assert_eq!(held.identity().generation(), 3);
-    }
-
-    #[test]
-    fn dropped_frame_releases_budget() {
-        let shared = SharedDevice::new("d3d11", 100);
-        {
-            let _held = frame(&shared, 4, 2, vec![0; 12]);
-            assert_eq!(shared.used(), 12);
-        }
-        assert_eq!(shared.used(), 0);
-    }
-
-    #[test]
-    fn export_without_sharing_names_backend() {
-        let shared = SharedDevice::new("d3d11", 100);
-        let held = frame(&shared, 4, 2, vec![0; 12]);
-        assert!(matches!(held.export(), GpuExport::Opaque { name: "d3d11" }));
-    }
-
-    #[test]
-    fn to_cpu_splits_nv12_planes() {
-        let shared = SharedDevice::new("d3d11", 100);
-        let mut data = vec![1; 8];
-        data.extend_from_slice(&[2; 4]);
-        let held = frame(&shared, 4, 2, data);
-        let cpu = held.to_cpu().expect("full nv12");
-        assert_eq!(cpu.format(), PixelFormat::Nv12);
-        assert_eq!(cpu.planes().len(), 2);
-        assert_eq!(cpu.planes()[0].data(), &[1; 8]);
-        assert_eq!(cpu.planes()[1].data(), &[2; 4]);
-    }
-
-    #[test]
-    fn to_cpu_rejects_truncated_bytes() {
-        let shared = SharedDevice::new("d3d11", 100);
-        let held = frame(&shared, 4, 2, vec![0; 11]);
-        assert!(held.to_cpu().is_none());
-    }
-
-    #[cfg(target_os = "windows")]
     #[test]
     fn layout_names_both_planes() {
         let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
@@ -1796,7 +1574,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn layout_carries_crop_origin() {
         let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
@@ -1816,14 +1593,12 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn layout_rejects_empty_coded() {
         let visible = PictureSize::new(1920, 1080).expect("nonzero extent");
         assert!(ExportLayout::for_output(0, 1088, 0, None, visible).is_none());
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn pinned_surface_keeps_pixels_under_pressure() {
         use rust_video_caps::traits::Encoder;

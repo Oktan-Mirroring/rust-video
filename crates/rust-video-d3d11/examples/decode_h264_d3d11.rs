@@ -85,4 +85,6 @@ fn report(frame: &D3d11Frame) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn main() {}
+fn main() {
+    println!("SKIP: d3d11 needs windows");
+}

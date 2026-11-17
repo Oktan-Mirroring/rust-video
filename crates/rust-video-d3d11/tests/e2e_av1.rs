@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 //! AV1 end to end on the D3D11 tier: file vector through decode
 //! overlap and reset recovery.
 //!
@@ -9,6 +7,8 @@
 //! `tests/vectors/tiled_320x240.obu` and
 //! `tests/vectors/grain_320x240.obu` cover tiled frames and
 //! film grain through parity.
+
+#![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
 mod av1;

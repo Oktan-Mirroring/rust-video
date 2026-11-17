@@ -3,66 +3,47 @@
 // FFI boundary: D3D11 device and video-device COM calls live here.
 #![allow(unsafe_code)]
 
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
 
-#[cfg(target_os = "windows")]
 use windows::core::Interface;
-#[cfg(target_os = "windows")]
 use windows::core::GUID;
-#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HMODULE;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11VideoContext,
     ID3D11VideoDevice, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
-#[cfg(target_os = "windows")]
 use crate::error::D3d11Error;
-#[cfg(target_os = "windows")]
 use crate::error::SkipReason;
 use crate::guid::{Codec, Profile};
-#[cfg(target_os = "windows")]
 use crate::submit::SubmitLock;
 
 use rust_video_caps::traits::Device;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::SharedDevice;
 
 /// H.264 VLD profile name the tier decodes.
-#[cfg(target_os = "windows")]
 const H264_PROFILE: &str = "h264-vld-nofgt";
 
 /// D3D11 device with video interfaces and a VRAM budget.
 pub struct D3d11Device {
     /// Logical device.
-    #[cfg(target_os = "windows")]
     device: ID3D11Device,
     /// Immediate context.
-    #[cfg(target_os = "windows")]
     context: ID3D11DeviceContext,
     /// Video device behind decode creation.
-    #[cfg(target_os = "windows")]
     video_device: ID3D11VideoDevice,
     /// Video context behind frame submission.
-    #[cfg(target_os = "windows")]
     video_context: ID3D11VideoContext,
     /// Matched decoder profiles.
     profiles: Vec<Profile>,
     /// VRAM budget shared with decoders.
-    #[cfg(target_os = "windows")]
     shared: SharedDevice,
     /// Single-submitter lock over the immediate context.
-    #[cfg(target_os = "windows")]
     submit: Arc<SubmitLock>,
     /// Negotiated feature level.
     level: i32,
@@ -78,13 +59,11 @@ impl D3d11Device {
     /// Returns `Err` without a hardware device, without
     /// video interfaces, without decoder profiles, or without an
     /// NV12 H.264 profile.
-    #[cfg(target_os = "windows")]
     pub fn open() -> Result<Self, D3d11Error> {
         Self::open_windows()
     }
 
     /// Device over the default hardware adapter.
-    #[cfg(target_os = "windows")]
     fn open_windows() -> Result<Self, D3d11Error> {
         let (device, context, level) = create_device()?;
         // Sound: the context is live; protection precedes any shared use.
@@ -143,7 +122,6 @@ impl D3d11Device {
     }
 
     /// VRAM budget shared with decoders.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) fn shared(&self) -> &SharedDevice {
         &self.shared
@@ -154,7 +132,6 @@ impl D3d11Device {
     /// A single thread needs nothing. Threads sharing this device hold
     /// [`SubmitLock`](crate::SubmitLock) around their own direct context
     /// calls to serialize with crate submissions.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn device(&self) -> &ID3D11Device {
         &self.device
@@ -165,7 +142,6 @@ impl D3d11Device {
     /// A single thread needs nothing. Threads sharing this device hold
     /// [`SubmitLock`](crate::SubmitLock) around their own direct context
     /// calls to serialize with crate submissions.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn context(&self) -> &ID3D11DeviceContext {
         &self.context
@@ -176,7 +152,6 @@ impl D3d11Device {
     /// A single thread needs nothing. Threads sharing this device hold
     /// [`SubmitLock`](crate::SubmitLock) around their own direct context
     /// calls to serialize with crate submissions.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn video_device(&self) -> &ID3D11VideoDevice {
         &self.video_device
@@ -187,7 +162,6 @@ impl D3d11Device {
     /// A single thread needs nothing. Threads sharing this device hold
     /// [`SubmitLock`](crate::SubmitLock) around their own direct context
     /// calls to serialize with crate submissions.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn video_context(&self) -> &ID3D11VideoContext {
         &self.video_context
@@ -198,7 +172,6 @@ impl D3d11Device {
     /// A single thread needs nothing. Threads sharing this device hold
     /// the lock around their own direct context calls to serialize with
     /// crate submissions; waits never hold it.
-    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn submit_lock(&self) -> &Arc<SubmitLock> {
         &self.submit
@@ -212,7 +185,6 @@ impl Device for D3d11Device {
 }
 
 /// Hardware device with video support at feature level 11.
-#[cfg(target_os = "windows")]
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, D3D_FEATURE_LEVEL), D3d11Error> {
     let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
     let mut device = None;
@@ -245,7 +217,6 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, D3D_FEATURE_LEV
 }
 
 /// Decoder profiles the adapter reports, matched against the tier table.
-#[cfg(target_os = "windows")]
 fn enumerate(video_device: &ID3D11VideoDevice) -> Result<Vec<Profile>, D3d11Error> {
     // Sound: the count bounds every indexed read below.
     let count = unsafe { video_device.GetVideoDecoderProfileCount() };
@@ -266,7 +237,6 @@ fn enumerate(video_device: &ID3D11VideoDevice) -> Result<Vec<Profile>, D3d11Erro
 }
 
 /// NV12 render target behind the H.264 profile.
-#[cfg(target_os = "windows")]
 fn check_nv12(video_device: &ID3D11VideoDevice) -> Result<(), D3d11Error> {
     use windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
 
@@ -287,7 +257,6 @@ fn check_nv12(video_device: &ID3D11VideoDevice) -> Result<(), D3d11Error> {
 }
 
 /// Adapter description plus dedicated video memory in bytes.
-#[cfg(target_os = "windows")]
 fn adapter_info(device: &ID3D11Device) -> Result<(String, u64), D3d11Error> {
     // Sound: each cast queries a live object; the descriptor is plain data.
     let dxgi: IDXGIDevice = device.cast().map_err(|error| D3d11Error::Call {
@@ -313,7 +282,6 @@ fn adapter_info(device: &ID3D11Device) -> Result<(String, u64), D3d11Error> {
 }
 
 /// Profile for `guid`, if the tier drives it.
-#[cfg(target_os = "windows")]
 fn match_profile(guid: &GUID) -> Option<Profile> {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_DECODER_PROFILE_MPEG2and1_VLD, D3D11_DECODER_PROFILE_AV1_VLD_12BIT_PROFILE2,
@@ -390,37 +358,34 @@ fn match_profile(guid: &GUID) -> Option<Profile> {
     TABLE
         .iter()
         .find(|entry| entry.1 == *guid)
-        .map(|entry| Profile::new(entry.0, entry.2))
+        .map(|entry| Profile {
+            codec: entry.0,
+            name: entry.2,
+        })
 }
 
 /// H.264 profile GUID the tier decodes.
-#[cfg(target_os = "windows")]
 pub(crate) fn h264_guid() -> GUID {
     windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_H264_VLD_NOFGT
 }
 
 /// HEVC Main profile GUID the tier decodes.
-#[cfg(target_os = "windows")]
 pub(crate) fn hevc_guid() -> GUID {
     windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_HEVC_VLD_MAIN
 }
 
 /// AV1 profile 0 GUID the tier decodes.
-#[cfg(target_os = "windows")]
 pub(crate) fn av1_guid() -> GUID {
     windows::Win32::Graphics::Direct3D11::D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
     use windows::core::GUID;
-    #[cfg(target_os = "windows")]
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, D3D11_DECODER_PROFILE_VC1_VLD,
     };
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn match_profile_names_table_entries() {
         let profile =

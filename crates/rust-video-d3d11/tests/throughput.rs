@@ -2,38 +2,29 @@
 //!
 //! Skips without hardware; a hardware run fails below the bar.
 
-#[cfg(target_os = "windows")]
+#![cfg(target_os = "windows")]
+
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, H264Decoder, HevcDecoder,
     Transcoder,
 };
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::frame::CpuFrame;
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Encoder};
-#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::Route;
-#[cfg(target_os = "windows")]
 use rust_video_harness::{bench_dir, AnnexB, H264Synth, Synth};
 
-#[cfg(target_os = "windows")]
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
 
-#[cfg(target_os = "windows")]
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
-#[cfg(target_os = "windows")]
 /// Warmup frames ahead of the timed loop.
 const WARMUP: u64 = 4;
 
-#[cfg(target_os = "windows")]
 /// Packets over `raws`, built once outside the timed loop.
 fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
     raws.iter()
@@ -41,7 +32,6 @@ fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
         .collect()
 }
 
-#[cfg(target_os = "windows")]
 /// Measured fps of `HOPS` 1080p hops through `transcoder`.
 fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64 {
     let warmup = packets(warmup);
@@ -70,7 +60,6 @@ fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64
     f64::from(HOPS) / elapsed
 }
 
-#[cfg(target_os = "windows")]
 /// Measured fps decoding `HOPS` passes over `raws` after `warmup`.
 fn decode_fps(
     decoder: &mut impl Decoder<Frame = D3d11Frame, Error = D3d11Error>,
@@ -96,7 +85,6 @@ fn decode_fps(
     f64::from(total) / elapsed
 }
 
-#[cfg(target_os = "windows")]
 /// Measured fps encoding `frames` after `warmup`.
 fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFrame]) -> f64 {
     for frame in warmup {
@@ -117,13 +105,11 @@ fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFram
     f64::from(HOPS) / elapsed
 }
 
-#[cfg(target_os = "windows")]
 /// Noise 1080p frame from `seed`.
 fn noise(seed: u64) -> CpuFrame {
     Synth::noise(1920, 1080, seed)
 }
 
-#[cfg(target_os = "windows")]
 /// Warmup plus timed noise 1080p frames on distinct seeds.
 fn noise_frames() -> (Vec<CpuFrame>, Vec<CpuFrame>) {
     let warmup = (0..WARMUP).map(noise).collect();
@@ -131,7 +117,6 @@ fn noise_frames() -> (Vec<CpuFrame>, Vec<CpuFrame>) {
     (warmup, timed)
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p GPU hops measured against the realtime bar.
 #[test]
 fn xcode_1080p_measures_realtime() {
@@ -170,7 +155,6 @@ fn xcode_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p H.264 decode measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_measures_realtime() {
@@ -191,7 +175,6 @@ fn decode_h264_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p HEVC decode measured against the realtime bar.
 #[test]
 fn decode_hevc_1080p_measures_realtime() {
@@ -218,7 +201,6 @@ fn decode_hevc_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p AV1 decode measured against the realtime bar.
 #[test]
 fn decode_av1_1080p_measures_realtime() {
@@ -244,7 +226,6 @@ fn decode_av1_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
@@ -271,7 +252,6 @@ fn encode_h264_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p HEVC encode measured against the realtime bar.
 #[test]
 fn encode_hevc_1080p_measures_realtime() {
@@ -298,7 +278,6 @@ fn encode_hevc_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p VP9 encode measured against the realtime bar.
 #[test]
 fn encode_vp9_1080p_measures_realtime() {
@@ -325,7 +304,6 @@ fn encode_vp9_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "windows")]
 /// 1080p AV1 encode measured against the realtime bar.
 #[test]
 fn encode_av1_1080p_measures_realtime() {

@@ -54,19 +54,12 @@ impl fmt::Display for Codec {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Profile {
     /// Codec the profile decodes.
-    codec: Codec,
+    pub(crate) codec: Codec,
     /// Profile name.
-    name: &'static str,
+    pub(crate) name: &'static str,
 }
 
 impl Profile {
-    /// Profile of `codec` named `name`.
-    #[cfg(target_os = "windows")]
-    #[must_use]
-    pub(crate) const fn new(codec: Codec, name: &'static str) -> Self {
-        Self { codec, name }
-    }
-
     /// Codec the profile decodes.
     #[must_use]
     pub const fn codec(&self) -> Codec {
@@ -83,7 +76,6 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::Codec;
-    #[cfg(target_os = "windows")]
     use super::Profile;
 
     #[test]
@@ -104,10 +96,12 @@ mod tests {
         assert_eq!(Codec::Hevc.to_string(), "hevc");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn profile_reports_fields() {
-        let profile = Profile::new(Codec::Hevc, "hevc-main10");
+        let profile = Profile {
+            codec: Codec::Hevc,
+            name: "hevc-main10",
+        };
         assert_eq!(profile.codec(), Codec::Hevc);
         assert_eq!(profile.name(), "hevc-main10");
     }

@@ -24,6 +24,7 @@ use crate::av1_dpb::SubmittedAv1;
 use crate::device::D3d11Device;
 use crate::dpb::SubmittedPicture;
 use crate::error::{BrokenReferenceReason, D3d11Error, SkipReason, UnsupportedReason};
+use crate::frame::FrameExport;
 use crate::guid::Codec;
 use crate::h264::Crop;
 use crate::hevc_dpb::SubmittedHevc;
@@ -31,6 +32,7 @@ use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock, SurfaceFence};
 
 use bytes::Bytes;
+use rust_video_caps::frame::GpuExport;
 
 /// Reference surface count.
 const VIEWS: u32 = 16;
@@ -85,6 +87,14 @@ impl std::ops::Deref for SharedExport {
 
     fn deref(&self) -> &Self::Target {
         &self.texture
+    }
+}
+
+impl FrameExport for SharedExport {
+    fn export(&self) -> GpuExport {
+        GpuExport::NtHandle {
+            handle: self.handle(),
+        }
     }
 }
 

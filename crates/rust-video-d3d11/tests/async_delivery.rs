@@ -1,8 +1,8 @@
-#![cfg(target_os = "windows")]
-
 //! Async delivery: loopback frames, trailing receive, drop policies.
 //!
 //! Skips without hardware; fails when the contract breaks.
+
+#![cfg(target_os = "windows")]
 
 use std::num::NonZeroUsize;
 

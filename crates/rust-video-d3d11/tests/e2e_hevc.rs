@@ -1,5 +1,3 @@
-#![cfg(target_os = "windows")]
-
 //! HEVC end to end on the D3D11 tier: file vector through decode
 //! overlap and reset recovery.
 //!
@@ -9,6 +7,8 @@
 //! `tests/vectors/mslice_320x240.hevc` and
 //! `tests/vectors/sl_320x240.hevc` cover multi-slice pictures
 //! and scaling lists through parity.
+
+#![cfg(target_os = "windows")]
 
 #[path = "../examples/common/hevc.rs"]
 mod hevc;

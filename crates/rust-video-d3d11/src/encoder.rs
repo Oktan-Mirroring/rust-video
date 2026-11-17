@@ -1,31 +1,20 @@
 //! D3D11 hardware encode over `MediaFoundation` encoder MFTs.
 
-#[cfg(target_os = "windows")]
 use crate::decoder::GpuSurface;
-#[cfg(target_os = "windows")]
 use crate::device::D3d11Device;
-#[cfg(target_os = "windows")]
 use crate::error::{D3d11Error, UnsupportedReason};
-#[cfg(target_os = "windows")]
 use crate::guid::Codec;
-#[cfg(target_os = "windows")]
 use crate::mf::Session;
-#[cfg(target_os = "windows")]
 use crate::scale::ScaledSurface;
 
-#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Encoder;
-#[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
 ///
 /// Encoders run 30 fps progressive with an area-scaled bitrate; input is NV12.
-#[cfg(target_os = "windows")]
 pub struct D3d11Encoder {
     /// Negotiated MF session.
     session: Session,
@@ -33,7 +22,6 @@ pub struct D3d11Encoder {
     codec: Codec,
 }
 
-#[cfg(target_os = "windows")]
 impl D3d11Encoder {
     /// Encoder over `device` for `codec`.
     ///
@@ -143,7 +131,6 @@ impl D3d11Encoder {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Encoder for D3d11Encoder {
     type Error = D3d11Error;
 
@@ -159,7 +146,6 @@ impl Encoder for D3d11Encoder {
 }
 
 /// Validated NV12 plane views over one frame.
-#[cfg(target_os = "windows")]
 struct Planes<'a> {
     /// Frame width in luma samples.
     width: u32,
@@ -175,7 +161,6 @@ struct Planes<'a> {
     uv_stride: u32,
 }
 
-#[cfg(target_os = "windows")]
 impl<'a> Planes<'a> {
     /// Validated views over `frame`.
     ///
@@ -242,7 +227,6 @@ impl<'a> Planes<'a> {
 /// # Errors
 ///
 /// Returns `Err` for a stride below the width or a plane short of its stride.
-#[cfg(target_os = "windows")]
 fn check_plane(data: &[u8], stride: u32, width: u32, rows: u32) -> Result<(), D3d11Error> {
     let stride_64 = u64::from(stride);
     let width_64 = u64::from(width);
@@ -263,7 +247,6 @@ fn check_plane(data: &[u8], stride: u32, width: u32, rows: u32) -> Result<(), D3
 }
 
 /// `rows` of `width` bytes from a validated strided `data` plane into `dst`.
-#[cfg(target_os = "windows")]
 fn copy_rows(data: &[u8], stride: u32, width: u32, rows: u32, dst: &mut [u8]) {
     let stride = usize::try_from(stride).unwrap_or(0);
     let width = usize::try_from(width).unwrap_or(0);
@@ -278,7 +261,7 @@ fn copy_rows(data: &[u8], stride: u32, width: u32, rows: u32, dst: &mut [u8]) {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::{check_plane, Planes};
 
