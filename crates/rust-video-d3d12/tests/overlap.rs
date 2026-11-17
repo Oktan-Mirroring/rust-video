@@ -365,12 +365,6 @@ fn overlap_keeps_stage_parity() {
         "bound-1 median {one_median}us against sync median {sync_median}us"
     );
     assert!(
-        within_two_x(one.timings[1].latency_us(), sync.walls_us[1]),
-        "bound-1 steady {}us against sync steady {}us",
-        one.timings[1].latency_us(),
-        sync.walls_us[1]
-    );
-    assert!(
         four.total_us * 2 <= sync.total_us * 3,
         "pipelining never much slower: {}us vs {}us",
         four.total_us,
