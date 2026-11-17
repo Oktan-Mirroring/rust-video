@@ -4,6 +4,7 @@
 //! Reached only from the Android module.
 
 use crate::error::MediaCodecError;
+use crate::pipeline::SubmitOutcome;
 
 use bytes::Bytes;
 
@@ -14,16 +15,37 @@ use bytes::Bytes;
 pub(crate) trait CodecSeam: std::fmt::Debug {
     /// One input payload queued; outputs freed along the way.
     ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no input buffer frees inside the queue budget,
+    /// when the payload overflows its buffer, or when the codec faults.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload` - packet or packed frame bytes.
+    /// * `pts_us` - presentation time in microseconds.
+    fn submit(&mut self, payload: &[u8], pts_us: u64) -> Result<Vec<SeamItem>, MediaCodecError>;
+
+    /// One input payload queued without waiting for a buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the payload overflows its buffer or the codec
+    /// faults. A busy codec answers `Starved`, never `InputStarved`.
+    ///
     /// # Arguments
     ///
     /// * `payload` - packet or packed frame bytes.
     /// * `pts_us` - presentation time in microseconds.
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// Returns `Err` when no input buffer frees inside the queue budget,
-    /// when the payload overflows its buffer, or when the codec faults.
-    fn submit(&mut self, payload: &[u8], pts_us: u64) -> Result<Vec<SeamItem>, MediaCodecError>;
+    /// Queue outcome plus outputs freed along the way, if any.
+    fn submit_nowait(
+        &mut self,
+        payload: &[u8],
+        pts_us: u64,
+    ) -> Result<(SubmitOutcome, Vec<SeamItem>), MediaCodecError>;
 
     /// Available outputs.
     ///

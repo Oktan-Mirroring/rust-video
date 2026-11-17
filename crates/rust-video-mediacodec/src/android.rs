@@ -10,6 +10,7 @@ use crate::device::MediaCodecDevice;
 use crate::encoder::{EncodeSpec, EncodeState, InputLayout, MediaCodecEncoder};
 use crate::error::MediaCodecError;
 use crate::format::FormatSpec;
+use crate::pipeline::SubmitOutcome;
 use crate::sdk::ApiLevel;
 use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};
@@ -134,6 +135,23 @@ impl AndroidSeam {
         }
     }
 
+    /// Payload queued through one zero-wait dequeue; outputs stay for the poll.
+    fn queue_nowait_sync(
+        codec: &MediaCodec,
+        payload: &[u8],
+        pts_us: u64,
+        role: Role,
+    ) -> Result<SubmitOutcome, MediaCodecError> {
+        match codec.dequeue_input_buffer(Duration::ZERO)? {
+            DequeuedInputBufferResult::Buffer(mut buffer) => {
+                Self::fill_buffer(&mut buffer, payload, role)?;
+                codec.queue_input_buffer(buffer, 0, payload.len(), pts_us, 0)?;
+                Ok(SubmitOutcome::Queued)
+            }
+            DequeuedInputBufferResult::TryAgainLater => Ok(SubmitOutcome::Starved),
+        }
+    }
+
     /// Payload queued through sync dequeue; outputs freed along the way.
     fn submit_sync(
         codec: &MediaCodec,
@@ -255,6 +273,25 @@ impl CodecSeam for AndroidSeam {
         Ok(items)
     }
 
+    /// One input payload queued without waiting for a buffer.
+    fn submit_nowait(
+        &mut self,
+        payload: &[u8],
+        pts_us: u64,
+    ) -> Result<(SubmitOutcome, Vec<SeamItem>), MediaCodecError> {
+        let mut items = self.primed_format();
+        let outcome = match &mut self.mode {
+            DrainMode::Sync => Self::queue_nowait_sync(&self.codec, payload, pts_us, self.role)?,
+            DrainMode::Async(drain) => {
+                let (outcome, mut drained) =
+                    drain.queue_nowait(&self.codec, payload, pts_us, self.role)?;
+                items.append(&mut drained);
+                outcome
+            }
+        };
+        Ok((outcome, items))
+    }
+
     /// Available outputs.
     fn read(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
         let mut items = self.primed_format();
@@ -316,41 +353,7 @@ impl AsyncDrain {
                 return Ok(items);
             }
             let batch = self.queue.drain_blocking(INPUT_TIMEOUT);
-            for event in self.pending.stash_inputs(batch) {
-                match event {
-                    CodecEvent::InputAvailable { index } => self.pending.push(index),
-                    CodecEvent::OutputAvailable {
-                        index,
-                        offset,
-                        size,
-                        pts_us,
-                        flags,
-                        ..
-                    } => {
-                        if let Some(output) =
-                            Self::pull_output(codec, index, offset, size, flags, pts_us, role)?
-                        {
-                            items.push(SeamItem::Output(output));
-                        }
-                    }
-                    CodecEvent::FormatChanged => {
-                        if role == Role::Decode {
-                            items.push(SeamItem::Format(AndroidSeam::format_of(codec)));
-                        }
-                    }
-                    CodecEvent::Error {
-                        recoverable,
-                        transient,
-                        kind,
-                    } => {
-                        return Err(MediaCodecError::CodecFault {
-                            recoverable,
-                            transient,
-                            kind,
-                        });
-                    }
-                }
-            }
+            self.absorb(codec, batch, role, &mut items)?;
         }
         Err(MediaCodecError::InputStarved)
     }
@@ -359,6 +362,52 @@ impl AsyncDrain {
     fn read(&mut self, codec: &MediaCodec, role: Role) -> Result<Vec<SeamItem>, MediaCodecError> {
         let mut items = Vec::new();
         let batch = self.queue.drain();
+        self.absorb(codec, batch, role, &mut items)?;
+        Ok(items)
+    }
+
+    /// Payload queued without waiting; stashed inputs first, one drain after.
+    fn queue_nowait(
+        &mut self,
+        codec: &MediaCodec,
+        payload: &[u8],
+        pts_us: u64,
+        role: Role,
+    ) -> Result<(SubmitOutcome, Vec<SeamItem>), MediaCodecError> {
+        let mut items = Vec::new();
+        if let Some(index) = self.pending.pop() {
+            AndroidSeam::write_input(codec, index, payload, pts_us, role)?;
+            return Ok((SubmitOutcome::Queued, items));
+        }
+        let batch = self.queue.drain();
+        self.absorb(codec, batch, role, &mut items)?;
+        if let Some(index) = self.pending.pop() {
+            AndroidSeam::write_input(codec, index, payload, pts_us, role)?;
+            return Ok((SubmitOutcome::Queued, items));
+        }
+        Ok((SubmitOutcome::Starved, items))
+    }
+
+    /// Queued `batch` absorbed: inputs stashed, outputs collected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the codec faults or a pulled output range leaves
+    /// its buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `codec` - session owning the buffers.
+    /// * `batch` - drained queue events.
+    /// * `role` - session direction.
+    /// * `items` - drained outputs and formats, appended in arrival order.
+    fn absorb(
+        &mut self,
+        codec: &MediaCodec,
+        batch: Vec<CodecEvent>,
+        role: Role,
+        items: &mut Vec<SeamItem>,
+    ) -> Result<(), MediaCodecError> {
         for event in self.pending.stash_inputs(batch) {
             match event {
                 CodecEvent::InputAvailable { index } => self.pending.push(index),
@@ -368,7 +417,6 @@ impl AsyncDrain {
                     size,
                     pts_us,
                     flags,
-                    ..
                 } => {
                     if let Some(output) =
                         Self::pull_output(codec, index, offset, size, flags, pts_us, role)?
@@ -394,7 +442,7 @@ impl AsyncDrain {
                 }
             }
         }
-        Ok(items)
+        Ok(())
     }
 
     /// Output pulled from buffer `index`, unless dropped for `role`.
@@ -589,6 +637,40 @@ impl MediaCodecDecoder {
     /// every slot (`NoFreeSlot`).
     pub fn reset(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.reset_surfaces()
+    }
+
+    /// One packet queued without blocking on its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`). A full bound or a busy codec answers
+    /// `Starved`, never `Err`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// Queue outcome plus surfaces freed along the way, if any.
+    pub fn submit_nowait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<(SubmitOutcome, Vec<MediaCodecSurface>), MediaCodecError> {
+        self.submit_packet_nowait(packet)
+    }
+
+    /// Surfaces decoded so far, draining every available output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    pub fn poll(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.poll_surfaces()
     }
 }
 

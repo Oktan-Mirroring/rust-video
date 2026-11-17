@@ -1,7 +1,10 @@
 //! Byte-buffer decode behind the caps `Decoder` trait.
 
+use std::time::Instant;
+
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
+use crate::pipeline::{PipelineLedger, SubmitOutcome};
 use crate::seam::{CodecSeam, SeamItem};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};
 
@@ -124,6 +127,8 @@ pub struct MediaCodecDecoder {
     output: OutputLayout,
     /// Bounded surface slot pool.
     slots: SurfaceSlots,
+    /// In-flight bound plus phase timings.
+    ledger: PipelineLedger,
     /// OS codec session.
     // Reached only from the Android module.
     #[allow(dead_code)]
@@ -144,6 +149,7 @@ impl MediaCodecDecoder {
             state,
             output,
             slots,
+            ledger: PipelineLedger::new(PipelineLedger::DEFAULT_DEPTH),
             backend,
         }
     }
@@ -166,6 +172,12 @@ impl MediaCodecDecoder {
         self.slots.live()
     }
 
+    /// In-flight bound plus phase timings.
+    #[must_use]
+    pub fn ledger(&self) -> &PipelineLedger {
+        &self.ledger
+    }
+
     /// Presentation time in microseconds; unstamped packets read zero.
     #[must_use]
     pub fn pts_us(packet: &Packet) -> u64 {
@@ -186,8 +198,59 @@ impl MediaCodecDecoder {
         packet: &Packet,
     ) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("decode")?;
-        let mut items = self.backend.submit(packet.data(), Self::pts_us(packet))?;
+        let pts = Self::pts_us(packet);
+        let start = Instant::now();
+        let mut items = self.backend.submit(packet.data(), pts)?;
+        self.ledger
+            .note_submitted(pts, PipelineLedger::elapsed_us(start));
         items.extend(self.backend.read()?);
+        self.surfaces(items)
+    }
+
+    /// Surfaces decoded from `packet`, queued without blocking on its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`). A full bound or a busy codec answers
+    /// `Starved`, never `Err`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// Queue outcome plus surfaces freed along the way, if any.
+    pub(crate) fn submit_packet_nowait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<(SubmitOutcome, Vec<MediaCodecSurface>), MediaCodecError> {
+        self.state.ensure_started("decode")?;
+        if !self.ledger.can_submit() {
+            return Ok((SubmitOutcome::Starved, Vec::new()));
+        }
+        let pts = Self::pts_us(packet);
+        let start = Instant::now();
+        let (outcome, items) = self.backend.submit_nowait(packet.data(), pts)?;
+        if outcome == SubmitOutcome::Queued {
+            self.ledger
+                .note_submitted(pts, PipelineLedger::elapsed_us(start));
+        }
+        Ok((outcome, self.surfaces(items)?))
+    }
+
+    /// Surfaces decoded so far, draining every available output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    pub(crate) fn poll_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.state.ensure_started("poll")?;
+        let items = self.backend.read()?;
         self.surfaces(items)
     }
 
@@ -214,7 +277,9 @@ impl MediaCodecDecoder {
     pub(crate) fn reset_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("reset")?;
         let items = self.backend.reset()?;
-        self.surfaces(items)
+        let surfaces = self.surfaces(items)?;
+        self.ledger.discard_pending();
+        Ok(surfaces)
     }
 
     /// Decoder marked released.
@@ -243,7 +308,14 @@ impl MediaCodecDecoder {
                     format.stride(),
                     format.slice_height(),
                 )?,
-                SeamItem::Output(output) => frames.push(self.output.split(output.into_bytes())?),
+                SeamItem::Output(output) => {
+                    let pts = output.pts_us();
+                    let start = Instant::now();
+                    let frame = self.output.split(output.into_bytes())?;
+                    self.ledger
+                        .note_completed(pts, PipelineLedger::elapsed_us(start));
+                    frames.push(frame);
+                }
             }
         }
         self.wrap(frames)
@@ -480,16 +552,21 @@ pub fn ranged_bytes(buffer: &[u8], offset: i32, size: i32) -> Result<Bytes, Medi
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use super::{ranged_bytes, DecodeState, MediaCodecDecoder, MediaCodecError, OutputLayout};
+    use crate::format::FormatSpec;
+    use crate::pipeline::SubmitOutcome;
+    use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
+    use crate::surface::{MediaCodecSurface, SurfaceSlots};
 
     use bytes::Bytes;
 
     use rust_video_caps::frame::PixelFormat;
     use rust_video_caps::packet::Packet;
-
-    use super::{ranged_bytes, DecodeState, MediaCodecDecoder, MediaCodecError, OutputLayout};
-
-    use crate::format::FormatSpec;
 
     fn layout_16x16_nv12() -> OutputLayout {
         let spec = FormatSpec::h264(16, 16).expect("valid dims");
@@ -682,5 +759,318 @@ mod tests {
         assert_eq!(MediaCodecDecoder::pts_us(&bare), 0);
         let huge = Packet::new(Bytes::from_static(&[0])).with_pts(Duration::from_secs(u64::MAX));
         assert_eq!(MediaCodecDecoder::pts_us(&huge), u64::MAX);
+    }
+
+    /// Seam call observed by the script.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Call {
+        /// Blocking queue.
+        Submit,
+        /// Non-blocking queue.
+        SubmitNowait,
+        /// Output drain.
+        Read,
+        /// Drain plus flush.
+        Reset,
+    }
+
+    /// Scripted codec session; queued inputs release as outputs on drain.
+    #[derive(Debug)]
+    struct ScriptSeam {
+        /// Calls in arrival order.
+        log: Rc<RefCell<Vec<Call>>>,
+        /// Inputs awaiting release, oldest first.
+        held: VecDeque<(Vec<u8>, u64)>,
+        /// Input buffer count; fuller queues starve nowait submits.
+        capacity: usize,
+        /// Drain latency modeling engine time.
+        latency: Duration,
+        /// True after the format shipped.
+        primed: bool,
+    }
+
+    impl ScriptSeam {
+        /// Seam holding `capacity` inputs, draining after `latency`.
+        fn new(log: Rc<RefCell<Vec<Call>>>, capacity: usize, latency: Duration) -> Self {
+            Self {
+                log,
+                held: VecDeque::new(),
+                capacity,
+                latency,
+                primed: false,
+            }
+        }
+
+        /// Call appended to the log.
+        fn note(&self, call: Call) {
+            self.log.borrow_mut().push(call);
+        }
+
+        /// Format once, then every held input as one output.
+        fn release(&mut self) -> Vec<SeamItem> {
+            let mut items = Vec::new();
+            if !self.primed {
+                self.primed = true;
+                items.push(SeamItem::Format(SeamFormat::new(
+                    Some(16),
+                    Some(16),
+                    Some(21),
+                    Some(16),
+                    Some(16),
+                )));
+            }
+            while let Some((payload, pts)) = self.held.pop_front() {
+                let marker = payload.first().copied().unwrap_or(0);
+                let bytes = Bytes::from(vec![marker; 16 * 16 * 3 / 2]);
+                items.push(SeamItem::Output(SeamOutput::new(
+                    bytes,
+                    0,
+                    i64::try_from(pts).unwrap_or(i64::MAX),
+                )));
+            }
+            items
+        }
+    }
+
+    impl CodecSeam for ScriptSeam {
+        fn submit(
+            &mut self,
+            payload: &[u8],
+            pts_us: u64,
+        ) -> Result<Vec<SeamItem>, MediaCodecError> {
+            self.note(Call::Submit);
+            self.held.push_back((payload.to_vec(), pts_us));
+            Ok(Vec::new())
+        }
+
+        fn submit_nowait(
+            &mut self,
+            payload: &[u8],
+            pts_us: u64,
+        ) -> Result<(SubmitOutcome, Vec<SeamItem>), MediaCodecError> {
+            self.note(Call::SubmitNowait);
+            if self.held.len() >= self.capacity {
+                return Ok((SubmitOutcome::Starved, Vec::new()));
+            }
+            self.held.push_back((payload.to_vec(), pts_us));
+            Ok((SubmitOutcome::Queued, Vec::new()))
+        }
+
+        fn read(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            self.note(Call::Read);
+            std::thread::sleep(self.latency);
+            Ok(self.release())
+        }
+
+        fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            self.note(Call::Reset);
+            Ok(self.release())
+        }
+    }
+
+    fn script_decoder(seam: ScriptSeam) -> MediaCodecDecoder {
+        let spec = FormatSpec::h264(16, 16).expect("valid dims");
+        let layout = OutputLayout::tentative(&spec).expect("valid tentative");
+        MediaCodecDecoder::from_backend(
+            DecodeState::Started,
+            layout,
+            SurfaceSlots::new(16),
+            Box::new(seam),
+        )
+    }
+
+    fn script_packets(count: u8) -> Vec<Packet> {
+        (0..count)
+            .map(|i| {
+                Packet::new(Bytes::from(vec![i; 8]))
+                    .with_pts(Duration::from_micros(u64::from(i) * 1000))
+            })
+            .collect()
+    }
+
+    fn surface_bytes(surfaces: &[MediaCodecSurface]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for surface in surfaces {
+            for plane in surface.frame().planes() {
+                bytes.extend_from_slice(plane.data());
+            }
+        }
+        bytes
+    }
+
+    fn drain_all(decoder: &mut MediaCodecDecoder) -> Vec<MediaCodecSurface> {
+        let mut surfaces = Vec::new();
+        loop {
+            let batch = decoder.poll_surfaces().expect("drain");
+            if batch.is_empty() {
+                return surfaces;
+            }
+            surfaces.extend(batch);
+        }
+    }
+
+    #[test]
+    fn nowait_batches_four_inputs_before_first_drain() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO));
+        for packet in &script_packets(4) {
+            let (outcome, surfaces) = decoder.submit_packet_nowait(packet).expect("queue");
+            assert_eq!(outcome, SubmitOutcome::Queued);
+            assert!(surfaces.is_empty());
+        }
+        assert_eq!(*log.borrow(), [Call::SubmitNowait; 4]);
+        assert_eq!(decoder.ledger().in_flight(), 4);
+        assert_eq!(decoder.ledger().max_in_flight(), 4);
+        assert!(decoder.ledger().overlap_observed());
+        let surfaces = decoder.poll_surfaces().expect("drain");
+        assert_eq!(surfaces.len(), 4);
+        assert_eq!(*log.borrow().last().expect("drain logged"), Call::Read);
+        assert_eq!(decoder.ledger().in_flight(), 0);
+        let timings = decoder.ledger().timings();
+        assert_eq!(timings.len(), 4);
+        for (n, timing) in timings.iter().enumerate() {
+            assert_eq!(timing.seq(), u64::try_from(n).expect("small seq"));
+            assert_eq!(
+                timing.submitted_pts_us(),
+                u64::try_from(n).expect("small seq") * 1000
+            );
+            assert_eq!(
+                timing.completed_pts_us(),
+                i64::try_from(n).expect("small seq") * 1000
+            );
+        }
+    }
+
+    #[test]
+    fn fifth_submit_starves_at_depth_bound() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO));
+        for packet in &script_packets(4) {
+            let (outcome, _) = decoder.submit_packet_nowait(packet).expect("queue");
+            assert_eq!(outcome, SubmitOutcome::Queued);
+        }
+        assert!(!decoder.ledger().can_submit());
+        let (outcome, surfaces) = decoder
+            .submit_packet_nowait(&script_packets(1)[0])
+            .expect("bound answers");
+        assert_eq!(outcome, SubmitOutcome::Starved);
+        assert!(surfaces.is_empty());
+        assert_eq!(log.borrow().len(), 4);
+        assert!(decoder.ledger().max_in_flight() <= decoder.ledger().depth());
+    }
+
+    #[test]
+    fn pipelined_bytes_match_sync_decode() {
+        let packets = script_packets(6);
+        let mut sync = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        let mut sync_surfaces = Vec::new();
+        for packet in &packets {
+            sync_surfaces.extend(sync.push_packet(packet).expect("sync decode"));
+        }
+        sync_surfaces.extend(drain_all(&mut sync));
+
+        let mut pipelined = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        let mut pipe_surfaces = Vec::new();
+        for packet in &packets {
+            loop {
+                let (outcome, surfaces) = pipelined.submit_packet_nowait(packet).expect("queue");
+                pipe_surfaces.extend(surfaces);
+                if outcome == SubmitOutcome::Queued {
+                    break;
+                }
+                pipe_surfaces.extend(drain_all(&mut pipelined));
+            }
+        }
+        pipe_surfaces.extend(drain_all(&mut pipelined));
+
+        assert_eq!(pipe_surfaces.len(), sync_surfaces.len());
+        assert_eq!(surface_bytes(&pipe_surfaces), surface_bytes(&sync_surfaces));
+        assert!(pipelined.ledger().overlap_observed());
+    }
+
+    #[test]
+    fn pipelined_wall_beats_serial_wall_with_latency_parity() {
+        let packets = script_packets(4);
+        let latency = Duration::from_millis(15);
+        let mut sync = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            latency,
+        ));
+        let start = Instant::now();
+        for packet in &packets {
+            sync.push_packet(packet).expect("sync decode");
+        }
+        let serial = start.elapsed();
+
+        let mut pipelined = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            latency,
+        ));
+        let start = Instant::now();
+        for packet in &packets {
+            let (outcome, _) = pipelined.submit_packet_nowait(packet).expect("queue");
+            assert_eq!(outcome, SubmitOutcome::Queued);
+        }
+        pipelined.poll_surfaces().expect("drain");
+        let overlapped = start.elapsed();
+
+        println!("serial {serial:?} vs overlapped {overlapped:?}");
+        for timing in pipelined.ledger().timings() {
+            println!(
+                "frame {} submit {}us engine {}us copy {}us total {}us",
+                timing.seq(),
+                timing.submit_us(),
+                timing.engine_wait_us(),
+                timing.copy_us(),
+                timing.total_us(),
+            );
+        }
+        assert!(overlapped < serial / 2);
+        let mean = |timings: &VecDeque<crate::pipeline::PhaseTiming>| {
+            timings
+                .iter()
+                .map(crate::pipeline::PhaseTiming::total_us)
+                .sum::<u64>()
+                / 4
+        };
+        let sync_mean = mean(sync.ledger().timings());
+        let pipe_mean = mean(pipelined.ledger().timings());
+        let gap = sync_mean.abs_diff(pipe_mean);
+        assert!(gap < 15_000, "per-frame means within one engine window");
+        for timing in pipelined.ledger().timings() {
+            assert!(timing.engine_wait_us() >= 5_000);
+        }
+    }
+
+    #[test]
+    fn decode_continues_past_reset() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        for packet in &script_packets(2) {
+            decoder.submit_packet_nowait(packet).expect("queue");
+        }
+        assert_eq!(drain_all(&mut decoder).len(), 2);
+        assert!(decoder.reset_surfaces().expect("reset").is_empty());
+        assert_eq!(decoder.ledger().in_flight(), 0);
+        for packet in &script_packets(2) {
+            decoder.submit_packet_nowait(packet).expect("queue");
+        }
+        assert_eq!(drain_all(&mut decoder).len(), 2);
+        let timings = decoder.ledger().timings();
+        assert_eq!(timings.len(), 4);
+        assert_eq!(timings.back().expect("fourth timing").seq(), 3);
     }
 }
