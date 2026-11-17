@@ -100,6 +100,9 @@ pub enum MediaCodecError {
         /// Buffer capacity.
         capacity: usize,
     },
+    /// Live surfaces hold every decoder slot.
+    #[error("no free surface slot")]
+    NoFreeSlot,
     /// Native codec fault.
     #[error("codec fault: {kind}")]
     CodecFault {
@@ -181,6 +184,10 @@ mod tests {
         assert_eq!(
             MediaCodecError::InputStarved.to_string(),
             "no input buffer inside the queue budget"
+        );
+        assert_eq!(
+            MediaCodecError::NoFreeSlot.to_string(),
+            "no free surface slot"
         );
     }
 

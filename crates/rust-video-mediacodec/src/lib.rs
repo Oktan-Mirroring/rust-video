@@ -8,6 +8,7 @@ mod error;
 mod format;
 mod quirks;
 mod sdk;
+mod surface;
 
 pub use bridge::{CodecEvent, EventQueue, PendingInputs};
 pub use decoder::{ranged_bytes, DecodeState, MediaCodecDecoder, OutputLayout};
@@ -17,3 +18,4 @@ pub use error::MediaCodecError;
 pub use format::{pixel_format_for, FormatSpec};
 pub use quirks::{Quirk, QuirkStatus, QuirkSyntax, QuirkTable};
 pub use sdk::{ApiLevel, ASYNC_NOTIFY_SDK, MIN_SDK};
+pub use surface::{MediaCodecSurface, SlotGuard, SurfaceSlots, SurfaceTicket};

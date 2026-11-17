@@ -13,6 +13,9 @@ use crate::format::{pixel_format_for, FormatSpec};
 use crate::quirks::QuirkTable;
 #[cfg(target_os = "android")]
 use crate::sdk::ApiLevel;
+#[cfg(target_os = "android")]
+use crate::surface::MediaCodecSurface;
+use crate::surface::SurfaceSlots;
 
 use bytes::Bytes;
 #[cfg(target_os = "android")]
@@ -447,6 +450,15 @@ impl Inner {
 }
 
 /// `MediaCodec` decoder over byte buffers.
+///
+/// Threading rule: single-threaded use needs nothing. Threads sharing one
+/// decoder serialize through `&mut` (for example behind a `Mutex`); every
+/// native codec call happens inside an `&mut` method, and `decode` takes
+/// `&mut` precisely so sharing cannot slip past the borrow checker.
+///
+/// Lifetime rule: each issued surface pins one decoder slot until it drops;
+/// surfaces own their pixels and stay valid past decoder drop. Slot
+/// exhaustion fails loudly with `NoFreeSlot`, never silent corruption.
 #[derive(Debug)]
 pub struct MediaCodecDecoder {
     /// Lifecycle gate.
@@ -455,6 +467,11 @@ pub struct MediaCodecDecoder {
     output: OutputLayout,
     /// Matched quirk identifiers.
     applied: Vec<String>,
+    /// Bounded surface slot pool.
+    slots: SurfaceSlots,
+    /// Next surface sequence number.
+    #[cfg(target_os = "android")]
+    generation: u64,
     /// Native codec and drain mode.
     #[cfg(target_os = "android")]
     inner: Inner,
@@ -520,6 +537,8 @@ impl MediaCodecDecoder {
             state,
             output,
             applied,
+            slots: SurfaceSlots::new(SurfaceSlots::DEFAULT_CAPACITY),
+            generation: 0,
             inner: Inner { codec, mode },
         })
     }
@@ -542,6 +561,25 @@ impl MediaCodecDecoder {
         &self.applied
     }
 
+    /// Native codec handle: queue, context, and buffer owner.
+    ///
+    /// Borrowed for interop that needs the live `MediaCodec`, such as
+    /// querying the output format directly. Calls made through this handle
+    /// run outside the decoder's `&mut` serialization, so the threading rule
+    /// on the decoder still applies: never touch it from another thread
+    /// while a decode call runs.
+    #[cfg(target_os = "android")]
+    #[must_use]
+    pub fn codec(&self) -> &MediaCodec {
+        &self.inner.codec
+    }
+
+    /// Surfaces currently pinning decoder slots.
+    #[must_use]
+    pub fn live_surfaces(&self) -> usize {
+        self.slots.live()
+    }
+
     /// Presentation time in microseconds; unstamped packets read zero.
     #[must_use]
     pub fn pts_us(packet: &Packet) -> u64 {
@@ -550,13 +588,14 @@ impl MediaCodecDecoder {
             .map_or(0, |pts| u64::try_from(pts.as_micros()).unwrap_or(u64::MAX))
     }
 
-    /// Drained frames, then a codec flush; stays started.
+    /// Drained surfaces, then a codec flush; stays started.
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless started, or when the codec faults.
+    /// Returns `Err` unless started, when the codec faults, or when live
+    /// surfaces hold every slot (`NoFreeSlot`).
     #[cfg(target_os = "android")]
-    pub fn reset(&mut self) -> Result<Vec<CpuFrame>, MediaCodecError> {
+    pub fn reset(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("reset")?;
         let frames = self.inner.drain_outputs(&mut self.output)?;
         if let DrainMode::Async(drain) = &mut self.inner.mode {
@@ -566,35 +605,64 @@ impl MediaCodecDecoder {
         if matches!(self.inner.mode, DrainMode::Async(_)) {
             self.inner.codec.start()?;
         }
-        Ok(frames)
+        self.wrap(frames)
+    }
+
+    /// Surfaces over `frames`, each pinning one decoder slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoFreeSlot` when live surfaces hold every slot; the frame
+    /// that found no slot drops with its codec buffer already released, and
+    /// surfaces wrapped earlier in this call keep their slots.
+    #[cfg(target_os = "android")]
+    fn wrap(&mut self, frames: Vec<CpuFrame>) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        let mut surfaces = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let slot = self.slots.acquire()?;
+            let coded = PictureSize::new(self.output.stride(), self.output.slice_height())
+                .unwrap_or_else(|| frame.size());
+            let generation = self.generation;
+            self.generation = self.generation.wrapping_add(1);
+            surfaces.push(MediaCodecSurface::new(frame, coded, slot, generation));
+        }
+        Ok(surfaces)
     }
 }
 
 #[cfg(target_os = "android")]
 impl Decoder for MediaCodecDecoder {
-    type Frame = CpuFrame;
+    type Frame = MediaCodecSurface;
     type Error = MediaCodecError;
 
-    /// Frames decoded from `packet`, possibly none.
+    /// Surfaces decoded from `packet`, possibly none.
+    ///
+    /// Per-call emission: the packet queues and the drain runs in this same
+    /// call, so a stream with no reordering emits each picture on its
+    /// completing `decode` call. The client holds no decoded-picture buffer;
+    /// whatever the codec holds back for reordering stays inside the codec.
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless started, or when the codec faults.
+    /// Returns `Err` unless started, when the codec faults, or when live
+    /// surfaces hold every slot (`NoFreeSlot`).
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.state.ensure_started("decode")?;
         let mut frames = self.inner.push_packet(packet, &mut self.output)?;
         frames.extend(self.inner.drain_outputs(&mut self.output)?);
-        Ok(frames)
+        self.wrap(frames)
     }
 
-    /// Frames held back for reordering or buffering.
+    /// Surfaces held back for reordering or buffering.
     ///
     /// # Errors
     ///
-    /// Returns `Err` unless started, or when the codec faults.
+    /// Returns `Err` unless started, when the codec faults, or when live
+    /// surfaces hold every slot (`NoFreeSlot`).
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.state.ensure_started("flush")?;
-        self.inner.drain_outputs(&mut self.output)
+        let frames = self.inner.drain_outputs(&mut self.output)?;
+        self.wrap(frames)
     }
 }
 
@@ -693,6 +761,24 @@ impl OutputLayout {
     #[must_use]
     pub fn negotiated(&self) -> bool {
         self.negotiated
+    }
+
+    /// Visible picture extent in luma samples.
+    #[must_use]
+    pub fn size(&self) -> PictureSize {
+        self.size
+    }
+
+    /// Luma bytes per row.
+    #[must_use]
+    pub fn stride(&self) -> u32 {
+        self.stride
+    }
+
+    /// Luma row count.
+    #[must_use]
+    pub fn slice_height(&self) -> u32 {
+        self.slice_height
     }
 
     /// Frame split from one contiguous output buffer.
@@ -871,6 +957,17 @@ mod tests {
         let spec = FormatSpec::h264(16, 16).expect("valid dims");
         let layout = OutputLayout::tentative(&spec).expect("valid tentative");
         assert!(!layout.negotiated());
+    }
+
+    #[test]
+    fn layout_exposes_surface_geometry() {
+        let layout = layout_16x16_nv12();
+        assert_eq!(
+            layout.size(),
+            rust_video_caps::common::PictureSize::new(16, 16).expect("valid size")
+        );
+        assert_eq!(layout.stride(), 16);
+        assert_eq!(layout.slice_height(), 16);
     }
 
     #[test]
