@@ -19,10 +19,15 @@ check:
 # Unit tests across the workspace: default, no-default, sw codec.
 # The livepack ffmpeg oracle stays out: it needs --features
 # rust-video-livepack/oracle, which only the e2e path passes.
+# Builds stay parallel; test binaries run serially so throughput bars
+# measure an unloaded box instead of cargo-sibling contention.
 test:
-    cargo test --workspace
-    cargo test --workspace --no-default-features
-    cargo test -p rust-video-sw --features h264-openh264
+    cargo test --workspace --no-run
+    cargo test --workspace --no-default-features --no-run
+    cargo test -p rust-video-sw --features h264-openh264 --no-run
+    cargo test --workspace -j1
+    cargo test --workspace --no-default-features -j1
+    cargo test -p rust-video-sw --features h264-openh264 -j1
 
 # Debug build of the workspace.
 build:
@@ -65,5 +70,7 @@ commit-lint-gate:
 msrv:
     cargo +1.87.0 clippy --workspace --exclude rust-video-sw --all-targets --all-features -- -D warnings
     cargo +1.87.0 clippy -p rust-video-sw --all-targets -- -D warnings
-    cargo +1.87.0 test --workspace
-    cargo +1.87.0 test --workspace --no-default-features
+    cargo +1.87.0 test --workspace --no-run
+    cargo +1.87.0 test --workspace --no-default-features --no-run
+    cargo +1.87.0 test --workspace -j1
+    cargo +1.87.0 test --workspace --no-default-features -j1
