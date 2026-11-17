@@ -29,6 +29,8 @@ mod h264;
 #[cfg(target_os = "windows")]
 mod hevc;
 #[cfg(target_os = "windows")]
+mod hevc_dpb;
+#[cfg(target_os = "windows")]
 mod os;
 #[cfg(not(target_os = "windows"))]
 mod os_stub;

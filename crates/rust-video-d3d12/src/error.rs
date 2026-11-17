@@ -17,6 +17,12 @@ pub enum BrokenReferenceReason {
     /// Sliding window finds no short-term picture.
     #[error("no short-term to slide")]
     NoShortTermToSlide,
+    /// Reference POC absent from the buffer.
+    #[error("reference poc {poc} absent")]
+    ReferencePocAbsent {
+        /// Missing picture order count.
+        poc: i32,
+    },
     /// Move names an absent short-term picture.
     #[error("short-term target absent")]
     ShortTermTargetAbsent,
@@ -98,6 +104,9 @@ pub enum ParseReason {
     /// NAL `forbidden_zero_bit` set.
     #[error("nal forbidden bit")]
     NalForbiddenBit,
+    /// NAL temporal id zero.
+    #[error("nal temporal id")]
+    NalTemporalId,
     /// Non-intra slice inside an IDR picture.
     #[error("non-intra slice in IDR")]
     NonIntraSliceInIdr,
@@ -119,6 +128,12 @@ pub enum ParseReason {
     /// Picture without its first slice.
     #[error("picture without first slice")]
     PictureWithoutFirstSlice,
+    /// Picture without an order count.
+    #[error("picture without poc")]
+    PictureWithoutPoc,
+    /// Picture without a reference set.
+    #[error("picture without reference set")]
+    PictureWithoutReferenceSet,
     /// Picture without slices.
     #[error("picture without slices")]
     PictureWithoutSlices,
@@ -140,6 +155,9 @@ pub enum ParseReason {
     /// Reference with zero reference frames.
     #[error("reference with zero ref frames")]
     ReferenceWithZeroRefFrames,
+    /// Short-term set past its size.
+    #[error("short_term_ref_pic_set size")]
+    ShortTermRefPicSetSize,
     /// Slice cites an unseen picture set.
     #[error("slice cites unknown pps")]
     SliceCitesUnknownPps,

@@ -130,32 +130,42 @@ fn cropped_surface_separates_visible_from_coded() {
     surface.wait().expect("surface complete");
 }
 
-/// Held HEVC surface pins the single pool slot with a loud typed error.
+/// Held HEVC surfaces pin their slots while other slots keep decoding; a full pool fails loud.
 #[test]
-fn hevc_held_surface_pins_single_slot() {
+fn hevc_held_surfaces_pin_pool_slots() {
     let Some(device) = device() else {
         return;
     };
     let mut raws = hevc::annex_b_packets().into_iter();
     let first = Packet::new(Bytes::from(raws.next().expect("sets plus IDR")));
-    let second = Packet::new(Bytes::from(raws.next().expect("second IDR")));
+    let second = Bytes::from(raws.next().expect("second IDR"));
     let mut decoder = HevcDecoder::open(&device);
-    let held = decoder.decode_surface(&first).expect("first surface");
+    let mut held = decoder.decode_surface(&first).expect("first surface");
     assert_eq!(held.len(), 1);
-    let Err(error) = decoder.decode_surface(&second) else {
-        panic!("pinned slot fails loud")
+    for _ in 1..16 {
+        let surfaces = decoder
+            .decode_surface(&Packet::new(second.clone()))
+            .expect("other slots decode past held surfaces");
+        assert_eq!(surfaces.len(), 1);
+        held.extend(surfaces);
+    }
+    assert_eq!(held.len(), 16, "pool holds sixteen live surfaces");
+    let Err(error) = decoder.decode_surface(&Packet::new(second.clone())) else {
+        panic!("pinned pool fails loud")
     };
     assert!(
         matches!(error, D3d12Error::NoFreeSlot),
         "typed pin error, got {error}"
     );
     assert_eq!(error.to_string(), "no free surface slot");
-    let Err(error) = decoder.decode(&second) else {
+    let Err(error) = decoder.decode(&Packet::new(second.clone())) else {
         panic!("readback honors the pin")
     };
     assert!(matches!(error, D3d12Error::NoFreeSlot));
     drop(held);
-    let surfaces = decoder.decode_surface(&second).expect("slot frees on drop");
+    let surfaces = decoder
+        .decode_surface(&Packet::new(second))
+        .expect("slots free on drop");
     assert_eq!(surfaces.len(), 1);
 }
 

@@ -848,12 +848,12 @@ fn index_u8(index: u32) -> Result<u8, D3d12Error> {
 }
 
 /// Slot number as a byte.
-fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
+pub(crate) fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
     u8::try_from(slot).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "slot" }))
 }
 
 /// Outputs for `emits` in display order.
-fn outputs_sorted(mut emits: Vec<(i32, usize)>) -> Vec<Output> {
+pub(crate) fn outputs_sorted(mut emits: Vec<(i32, usize)>) -> Vec<Output> {
     emits.sort_unstable();
     emits
         .into_iter()

@@ -1,6 +1,6 @@
 //! D3D12 video decode: picture arguments plus GPU submission.
 //!
-//! H.264 decodes through the DPB; HEVC stays intra-only.
+//! H.264 and HEVC decode through their DPBs.
 //!
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
@@ -13,16 +13,7 @@ use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 use crate::dxva::{
-    PicEntryHevc, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264,
-    SliceShortHevc, HEVC_CHROMA_420, HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC,
-    HEVC_POC_LSB_SHIFT, HEVC_PROP_CHROMA_QP_OFFSETS, HEVC_PROP_CONSTRAINED_INTRA,
-    HEVC_PROP_CU_QP_DELTA, HEVC_PROP_DEBLOCK_DISABLED, HEVC_PROP_DEBLOCK_OVERRIDE,
-    HEVC_PROP_ENTROPY_SYNC, HEVC_PROP_LISTS_MOD, HEVC_PROP_LOOP_SLICES, HEVC_PROP_LOOP_TILES,
-    HEVC_PROP_SLICE_EXT, HEVC_PROP_TILES, HEVC_PROP_TRANSFORM_SKIP, HEVC_PROP_TRANSQUANT_BYPASS,
-    HEVC_PROP_UNIFORM_SPACING, HEVC_PROP_WEIGHTED_BIPRED, HEVC_PROP_WEIGHTED_PRED, HEVC_TOOL_AMP,
-    HEVC_TOOL_CABAC_INIT, HEVC_TOOL_DEPENDENT_SLICES, HEVC_TOOL_EXTRA_BITS_SHIFT,
-    HEVC_TOOL_OUTPUT_FLAG, HEVC_TOOL_SAO, HEVC_TOOL_SIGN_HIDING, HEVC_TOOL_STRONG_INTRA,
-    HEVC_TOOL_TEMPORAL_MVP,
+    PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264, SliceShortHevc,
 };
 use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::Crop;
@@ -121,229 +112,18 @@ pub(crate) fn start_coded_bitstream(nals: &[&[u8]]) -> Result<CodedBitstream, D3
 }
 
 /// H.265 picture arguments for one `DecodeFrame` call.
+#[derive(Debug)]
 pub(crate) struct HevcSubmission {
     /// Picture parameters.
-    params: PicParamsHevc,
+    pub(crate) params: PicParamsHevc,
     /// Inverse quantization matrices.
-    qmatrix: QmatrixHevc,
+    pub(crate) qmatrix: QmatrixHevc,
     /// Slice control entries.
-    slices: Vec<SliceShortHevc>,
+    pub(crate) slices: Vec<SliceShortHevc>,
     /// Start-coded slices padded to 128 bytes.
-    bitstream: Vec<u8>,
-}
-
-impl HevcSubmission {
-    /// Arguments for `picture` under its parameter sets.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for inter pictures, non-IDR intra pictures, or a
-    /// bitstream past the driver buffer.
-    pub(crate) fn build(
-        sps: &crate::hevc::Sps,
-        pps: &crate::hevc::Pps,
-        picture: &crate::hevc::Picture,
-        feedback: u32,
-    ) -> Result<Self, D3d12Error> {
-        if !picture.intra() {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::InterPictureNeedsReferences,
-            ));
-        }
-        if !picture.idr {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::NonIdrIntraNeedsPocTracking,
-            ));
-        }
-        if picture.slices.is_empty() {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::PictureWithoutSlices,
-            ));
-        }
-        let min_cb = sps.min_cb();
-        let width_in_min_cbs = u16::try_from(sps.width().div_ceil(min_cb))
-            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let height_in_min_cbs = u16::try_from(sps.height().div_ceil(min_cb))
-            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let mut params = PicParamsHevc::empty();
-        params.pic_width_in_min_cbs_y = width_in_min_cbs;
-        params.pic_height_in_min_cbs_y = height_in_min_cbs;
-        params.format_flags =
-            HEVC_CHROMA_420 | (u16::from(sps.log2_max_poc_lsb_minus4) << HEVC_POC_LSB_SHIFT);
-        params.curr_pic = PicEntryHevc::frame(0);
-        params.sps_max_dec_pic_buffering_minus1 = sps.max_dec_pic_buffering_minus1;
-        params.log2_min_luma_coding_block_size_minus3 = sps.log2_min_cb_minus3;
-        params.log2_diff_max_min_luma_coding_block_size = sps.log2_diff_max_min_cb;
-        params.log2_min_transform_block_size_minus2 = sps.log2_min_tb_minus2;
-        params.log2_diff_max_min_transform_block_size = sps.log2_diff_max_min_tb;
-        params.max_transform_hierarchy_depth_inter = sps.max_depth_inter;
-        params.max_transform_hierarchy_depth_intra = sps.max_depth_intra;
-        params.num_ref_idx_l0_default_active_minus1 = pps.num_ref_l0;
-        params.num_ref_idx_l1_default_active_minus1 = pps.num_ref_l1;
-        params.init_qp_minus26 = pps.init_qp_minus26;
-        params.tool_flags = Self::tool_flags(sps, pps);
-        params.property_flags = Self::property_flags(pps);
-        params.pps_cb_qp_offset = pps.cb_qp_offset;
-        params.pps_cr_qp_offset = pps.cr_qp_offset;
-        params.num_tile_columns_minus1 = pps.tile_columns_minus1;
-        params.num_tile_rows_minus1 = pps.tile_rows_minus1;
-        params.column_width_minus1 = pps.column_width_minus1;
-        params.row_height_minus1 = pps.row_height_minus1;
-        params.diff_cu_qp_delta_depth = pps.diff_cu_qp_delta_depth;
-        params.pps_beta_offset_div2 = pps.beta_offset_div2;
-        params.pps_tc_offset_div2 = pps.tc_offset_div2;
-        params.log2_parallel_merge_level_minus2 = pps.log2_parallel_merge_level_minus2;
-        params.curr_pic_order_cnt_val = 0;
-        params.status_report_feedback_number = feedback;
-        let qmatrix = QmatrixHevc {
-            lists0: [[16; 16]; 6],
-            lists1: [[16; 64]; 6],
-            lists2: [[16; 64]; 6],
-            lists3: [[16; 64]; 2],
-            dc2: [16; 6],
-            dc3: [16; 2],
-        };
-        let nals: Vec<&[u8]> = picture
-            .slices
-            .iter()
-            .map(|slice| slice.nal.as_slice())
-            .collect();
-        let (spans, bitstream) = start_coded_bitstream(&nals)?;
-        let slices = spans
-            .into_iter()
-            .map(|(location, bytes)| SliceShortHevc {
-                location,
-                bytes,
-                chopping: 0,
-            })
-            .collect();
-        Ok(Self {
-            params,
-            qmatrix,
-            slices,
-            bitstream,
-        })
-    }
-
-    /// Packed coding tool flags.
-    fn tool_flags(sps: &crate::hevc::Sps, pps: &crate::hevc::Pps) -> u32 {
-        let mut flags = 0;
-        if sps.amp() {
-            flags |= HEVC_TOOL_AMP;
-        }
-        if sps.sao() {
-            flags |= HEVC_TOOL_SAO;
-        }
-        if sps.temporal_mvp() {
-            flags |= HEVC_TOOL_TEMPORAL_MVP;
-        }
-        if sps.strong_intra_smoothing() {
-            flags |= HEVC_TOOL_STRONG_INTRA;
-        }
-        if pps.dependent_slices() {
-            flags |= HEVC_TOOL_DEPENDENT_SLICES;
-        }
-        if pps.output_flag_present() {
-            flags |= HEVC_TOOL_OUTPUT_FLAG;
-        }
-        flags |= u32::from(pps.num_extra_slice_header_bits) << HEVC_TOOL_EXTRA_BITS_SHIFT;
-        if pps.sign_data_hiding() {
-            flags |= HEVC_TOOL_SIGN_HIDING;
-        }
-        if pps.cabac_init_present() {
-            flags |= HEVC_TOOL_CABAC_INIT;
-        }
-        flags
-    }
-
-    /// Packed picture property flags.
-    fn property_flags(pps: &crate::hevc::Pps) -> u32 {
-        let mut flags = HEVC_IRAP_PIC | HEVC_IDR_PIC | HEVC_INTRA_PIC;
-        if pps.constrained_intra() {
-            flags |= HEVC_PROP_CONSTRAINED_INTRA;
-        }
-        if pps.transform_skip() {
-            flags |= HEVC_PROP_TRANSFORM_SKIP;
-        }
-        if pps.cu_qp_delta() {
-            flags |= HEVC_PROP_CU_QP_DELTA;
-        }
-        if pps.slice_chroma_qp_offsets_present() {
-            flags |= HEVC_PROP_CHROMA_QP_OFFSETS;
-        }
-        if pps.weighted_pred() {
-            flags |= HEVC_PROP_WEIGHTED_PRED;
-        }
-        if pps.weighted_bipred() {
-            flags |= HEVC_PROP_WEIGHTED_BIPRED;
-        }
-        if pps.transquant_bypass() {
-            flags |= HEVC_PROP_TRANSQUANT_BYPASS;
-        }
-        if pps.tiles() {
-            flags |= HEVC_PROP_TILES;
-        }
-        if pps.entropy_sync() {
-            flags |= HEVC_PROP_ENTROPY_SYNC;
-        }
-        if pps.uniform_spacing() {
-            flags |= HEVC_PROP_UNIFORM_SPACING;
-        }
-        if pps.loop_across_tiles() {
-            flags |= HEVC_PROP_LOOP_TILES;
-        }
-        if pps.loop_across_slices() {
-            flags |= HEVC_PROP_LOOP_SLICES;
-        }
-        if pps.deblocking_override() {
-            flags |= HEVC_PROP_DEBLOCK_OVERRIDE;
-        }
-        if pps.deblocking_disabled() {
-            flags |= HEVC_PROP_DEBLOCK_DISABLED;
-        }
-        if pps.lists_modification_present() {
-            flags |= HEVC_PROP_LISTS_MOD;
-        }
-        if pps.slice_ext_present() {
-            flags |= HEVC_PROP_SLICE_EXT;
-        }
-        flags
-    }
-}
-
-/// Picture arguments behind one session submission.
-pub(crate) trait PictureSubmission {
-    /// NV12 bytes decoded from the arguments on the GPU.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` past the bitstream buffer, or when the
-    /// driver refuses the picture.
-    fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error>;
-
-    /// Output texture plus its completion wait behind the arguments decode.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` past the bitstream buffer or when the driver refuses
-    /// the picture.
-    fn submit_texture(
-        &self,
-        session: &mut DecodeSession,
-    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error>;
-}
-
-impl PictureSubmission for HevcSubmission {
-    fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error> {
-        session.decode_hevc(self)
-    }
-
-    fn submit_texture(
-        &self,
-        session: &mut DecodeSession,
-    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error> {
-        session.decode_texture_hevc(self)
-    }
+    pub(crate) bitstream: Vec<u8>,
+    /// Output texture slot.
+    pub(crate) slot: u8,
 }
 
 /// Pool texture tables behind one decode call.
@@ -820,17 +600,6 @@ impl DecodeSession {
         SurfaceWait::new(self.copy_fence.handle(), ticket.value())
     }
 
-    /// NV12 bytes for pool `slot` cropped to the visible rectangle.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for a slot outside the pool, or when
-    /// the copy fails.
-    pub(crate) fn download(&mut self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
-        let ticket = self.start_download(slot)?;
-        self.finish_download(slot, ticket)
-    }
-
     /// Pool `slot` planes through the direct queue, without waiting.
     ///
     /// # Errors
@@ -1166,19 +935,6 @@ impl DecodeSession {
             ))
     }
 
-    /// NV12 bytes decoded from `submission` on the GPU.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` past the bitstream buffer, or when the
-    /// driver refuses the picture.
-    pub(crate) fn decode_hevc(
-        &mut self,
-        submission: &HevcSubmission,
-    ) -> Result<Vec<u8>, D3d12Error> {
-        self.decode_hevc_windows(submission)
-    }
-
     /// `submission` through the video queue into its pool slot.
     fn submit_h264(&mut self, submission: &H264Submission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
@@ -1216,36 +972,24 @@ impl DecodeSession {
         Ok((self.bitstreams[index].clone(), index))
     }
 
-    /// NV12 bytes decoded from `submission` on the GPU.
-    fn decode_hevc_windows(&mut self, submission: &HevcSubmission) -> Result<Vec<u8>, D3d12Error> {
-        let ticket = self.submit_hevc(submission)?;
-        self.wait_video(ticket)?;
-        self.download(0)
-    }
-
-    /// Output texture plus its completion wait behind `submission` decode.
-    pub(crate) fn decode_texture_hevc(
+    /// `submission` through the video queue into its pool slot.
+    ///
+    /// The ticket completes before the next submit reuses the pool barriers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` past the bitstream buffer, or when the
+    /// driver refuses the picture.
+    pub(crate) fn submit_hevc(
         &mut self,
         submission: &HevcSubmission,
-    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error> {
-        let video = self.submit_hevc(submission)?;
-        self.wait_video(video)?;
-        if !self.cropped() {
-            let wait = self.video_wait(video);
-            return Ok((self.texture(0)?, wait));
-        }
-        let copy = self.start_crop(0)?;
-        let resource = self.finish_crop(0, copy)?;
-        Ok((resource, self.copy_wait(copy)))
-    }
-
-    /// `submission` through the video queue into pool slot zero.
-    fn submit_hevc(&mut self, submission: &HevcSubmission) -> Result<Ticket, D3d12Error> {
+    ) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         let (upload, upload_index) = self.acquire_bitstream()?;
         DeviceResources::write_upload(&upload, &submission.bitstream)?;
-        let input = self.input_args(submission, None, &upload)?;
-        let ticket = self.submit_video(&input, 0)?;
+        let mut refs = self.ref_tables();
+        let input = self.input_args(submission, Some(&mut refs), &upload)?;
+        let ticket = self.submit_video(&input, submission.slot)?;
         self.bitstream_busy[upload_index] = Some(ticket);
         Ok(ticket)
     }
@@ -1787,76 +1531,5 @@ mod tests {
         assert_eq!(decoded.submission.params.used_for_reference_flags, 0b11);
         assert_eq!(decoded.outputs.len(), 1);
         assert_eq!(decoded.outputs[0].slot(), 0);
-    }
-
-    #[test]
-    fn hevc_submission_carries_params_and_start_codes() {
-        use super::HevcSubmission;
-        use crate::hevc::fixtures::{idr_body, nal, p_body, packet, pps_body, sps_body};
-        use crate::hevc::{
-            parse_pps as parse_hevc_pps, parse_sps as parse_hevc_sps, Ingest as HevcIngest,
-        };
-
-        let data = packet(&[
-            nal(33, &sps_body()),
-            nal(34, &pps_body()),
-            nal(19, &idr_body()),
-        ]);
-        let mut ingest = HevcIngest::new();
-        let pictures = ingest.ingest_packet(&data).expect("ingest");
-        assert_eq!(pictures.len(), 1);
-        let sps = parse_hevc_sps(&crate::bits::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
-        let pps =
-            parse_hevc_pps(&crate::bits::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
-        let submission = HevcSubmission::build(&sps, &pps, &pictures[0], 7).expect("submission");
-        assert_eq!(submission.params.pic_width_in_min_cbs_y, 8);
-        assert_eq!(submission.params.pic_height_in_min_cbs_y, 6);
-        assert_eq!(submission.params.status_report_feedback_number, 7);
-        assert_eq!(submission.params.curr_pic_order_cnt_val, 0);
-        assert_eq!(submission.slices.len(), 1);
-        assert_eq!(submission.slices[0].location, 0);
-        assert_eq!(&submission.bitstream[..5], &[0, 0, 1, 0x26, 0x01]);
-        assert_eq!(submission.bitstream.len() % 128, 0);
-
-        let data = packet(&[
-            nal(33, &sps_body()),
-            nal(34, &pps_body()),
-            nal(1, &p_body()),
-        ]);
-        let mut ingest = HevcIngest::new();
-        assert!(ingest.ingest_packet(&data).is_err());
-    }
-
-    #[test]
-    fn hevc_submission_rejects_inter_and_empty() {
-        use super::HevcSubmission;
-        use crate::hevc::fixtures::{nal, pps_body, sps_body};
-        use crate::hevc::{
-            parse_pps as parse_hevc_pps, parse_sps as parse_hevc_sps, PendingSlice,
-            Picture as HevcPicture, SliceHeader, SliceType,
-        };
-
-        let sps = parse_hevc_sps(&crate::bits::rbsp(&nal(33, &sps_body()))[2..]).expect("sps");
-        let pps =
-            parse_hevc_pps(&crate::bits::rbsp(&nal(34, &pps_body()))[2..], &sps).expect("pps");
-        let inter = HevcPicture {
-            slices: vec![PendingSlice {
-                header: SliceHeader {
-                    pps_id: 0,
-                    slice_type: SliceType::P,
-                    address: 0,
-                    first: true,
-                },
-                nal: Vec::new(),
-                idr: false,
-            }],
-            idr: false,
-        };
-        assert!(HevcSubmission::build(&sps, &pps, &inter, 1).is_err());
-        let empty = HevcPicture {
-            slices: Vec::new(),
-            idr: true,
-        };
-        assert!(HevcSubmission::build(&sps, &pps, &empty, 1).is_err());
     }
 }
