@@ -2,22 +2,14 @@
 //!
 //! NV12 input through the video encoder into driver bitstreams.
 
-#[cfg(target_os = "windows")]
 use crate::device::D3d12Device;
-#[cfg(target_os = "windows")]
 use crate::encode::EncodeSession;
-#[cfg(target_os = "windows")]
 use crate::error::{D3d12Error, UnsupportedReason};
-#[cfg(target_os = "windows")]
 use crate::guid::Codec;
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Encoder;
 
 /// D3D12 hardware encoder over the video encode session.
@@ -32,7 +24,6 @@ use rust_video_caps::traits::Encoder;
 /// fixed slice assumptions. HEVC encode needs driver
 /// configuration support: boxes reporting the codec but refusing
 /// its configuration fail the first frame loud with `OverCaps`.
-#[cfg(target_os = "windows")]
 pub struct D3d12Encoder<'a> {
     /// Device owning the encode session.
     device: &'a D3d12Device,
@@ -44,7 +35,6 @@ pub struct D3d12Encoder<'a> {
     active: Option<(u32, u32)>,
 }
 
-#[cfg(target_os = "windows")]
 impl<'a> D3d12Encoder<'a> {
     /// Encoder over `device` for `codec`.
     ///
@@ -116,7 +106,6 @@ impl<'a> D3d12Encoder<'a> {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Encoder for D3d12Encoder<'_> {
     type Error = D3d12Error;
 
@@ -139,7 +128,6 @@ impl Encoder for D3d12Encoder<'_> {
 }
 
 /// Contiguous NV12 bytes plus extents for `frame`.
-#[cfg(target_os = "windows")]
 fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d12Error> {
     if frame.format() != PixelFormat::Nv12 {
         return Err(D3d12Error::Unsupported(
@@ -167,7 +155,6 @@ fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d12Error> {
 }
 
 /// `rows` of `width` bytes from a strided `data` plane into `out`.
-#[cfg(target_os = "windows")]
 fn copy_plane(
     data: &[u8],
     stride: u32,
@@ -199,7 +186,7 @@ fn copy_plane(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::{copy_plane, pack_nv12};
 

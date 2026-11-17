@@ -195,7 +195,7 @@ fn check_support(
         OutputFrameRate: rate,
         ..Default::default()
     };
-    crate::device::feature_support(
+    crate::device_os::feature_support(
         video,
         D3D12_FEATURE_VIDEO_PROCESS_SUPPORT,
         &mut support,

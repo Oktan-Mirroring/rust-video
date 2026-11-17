@@ -2,28 +2,21 @@
 //!
 //! Skips without hardware.
 
-#[cfg(target_os = "windows")]
+#![cfg(target_os = "windows")]
+
 #[path = "../examples/common/hevc.rs"]
 mod hevc;
 
-#[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
-#[cfg(target_os = "windows")]
 use rust_video_d3d12::{D3d12Device, D3d12Error, H264Decoder, HevcDecoder};
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::frame::{GpuExport, PixelFormat};
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Device};
-#[cfg(target_os = "windows")]
 use rust_video_harness::{AnnexB, H264Synth};
 
-#[cfg(target_os = "windows")]
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d12Device> {
     match D3d12Device::open() {
@@ -32,19 +25,17 @@ fn device() -> Option<D3d12Device> {
             Some(device)
         }
         Err(error) => {
-            println!("d3d12 skipped: {error}");
+            println!("SKIP: no d3d12 device ({error})");
             None
         }
     }
 }
 
 /// Committed vector path.
-#[cfg(target_os = "windows")]
 fn vector() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
 }
 
-#[cfg(target_os = "windows")]
 /// No-reorder vector emits one frame per decode call.
 #[test]
 fn h264_no_reorder_emits_per_call() {
@@ -65,7 +56,6 @@ fn h264_no_reorder_emits_per_call() {
     assert!(decoder.flush().expect("flush drains").is_empty());
 }
 
-#[cfg(target_os = "windows")]
 /// Stream without a reorder guarantee holds its first picture back.
 #[test]
 fn h264_without_guarantee_holds_back() {
@@ -84,8 +74,7 @@ fn h264_without_guarantee_holds_back() {
     assert_eq!(drained.len(), 1);
 }
 
-#[cfg(target_os = "windows")]
-/// Surfaces carry visible size, format, slot, coded extent, and origin.
+/// Surfaces carry visible size, format, array layer, coded extent, and origin.
 #[test]
 fn surface_geometry_matches_stream() {
     let Some(device) = device() else {
@@ -102,7 +91,7 @@ fn surface_geometry_matches_stream() {
         assert_eq!(surface.size().width(), 320);
         assert_eq!(surface.size().height(), 240);
         assert_eq!(surface.format(), PixelFormat::Nv12);
-        assert!(surface.slice() < 16, "slot {}", surface.slice());
+        assert_eq!(surface.slice(), 0, "single-layer array layer");
         assert_eq!(surface.coded().width(), 320);
         assert_eq!(surface.coded().height(), 240);
         assert_eq!(surface.origin(), (0, 0));
@@ -117,7 +106,6 @@ fn surface_geometry_matches_stream() {
     assert!(decoder.flush_surface().expect("flush drains").is_empty());
 }
 
-#[cfg(target_os = "windows")]
 /// Cropped surfaces separate visible size from coded extent.
 #[test]
 fn cropped_surface_separates_visible_from_coded() {
@@ -142,7 +130,6 @@ fn cropped_surface_separates_visible_from_coded() {
     surface.wait().expect("surface complete");
 }
 
-#[cfg(target_os = "windows")]
 /// Held HEVC surface pins the single pool slot with a loud typed error.
 #[test]
 fn hevc_held_surface_pins_single_slot() {
@@ -156,7 +143,7 @@ fn hevc_held_surface_pins_single_slot() {
     let held = decoder.decode_surface(&first).expect("first surface");
     assert_eq!(held.len(), 1);
     let Err(error) = decoder.decode_surface(&second) else {
-        panic!("pinned slot fails loud");
+        panic!("pinned slot fails loud")
     };
     assert!(
         matches!(error, D3d12Error::NoFreeSlot),
@@ -164,7 +151,7 @@ fn hevc_held_surface_pins_single_slot() {
     );
     assert_eq!(error.to_string(), "no free surface slot");
     let Err(error) = decoder.decode(&second) else {
-        panic!("readback honors the pin");
+        panic!("readback honors the pin")
     };
     assert!(matches!(error, D3d12Error::NoFreeSlot));
     drop(held);
@@ -172,7 +159,6 @@ fn hevc_held_surface_pins_single_slot() {
     assert_eq!(surfaces.len(), 1);
 }
 
-#[cfg(target_os = "windows")]
 /// Held H264 surface pins its slot while other slots keep decoding.
 #[test]
 fn h264_held_surface_leaves_other_slots_open() {
@@ -197,7 +183,6 @@ fn h264_held_surface_leaves_other_slots_open() {
     drop(held);
 }
 
-#[cfg(target_os = "windows")]
 /// Device exposes its native handles by reference.
 #[test]
 fn device_exposes_native_handles() {

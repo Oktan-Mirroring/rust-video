@@ -619,13 +619,13 @@ impl DecodeSession {
                 UnsupportedReason::PictureArgsPending { codec },
             ));
         }
-        let profile = crate::device::decode_profile(codec).ok_or(D3d12Error::Unsupported(
+        let profile = crate::device_os::decode_profile(codec).ok_or(D3d12Error::Unsupported(
             UnsupportedReason::NoDecodeProfile { codec },
         ))?;
-        crate::device::check_decode_support(device.video(), profile, width, height)?;
+        crate::device_os::check_decode_support(device.video(), profile, width, height)?;
         let resources = DeviceResources::new(device.device());
-        let heap = crate::device::create_decoder_heap(device.video(), profile, width, height)?;
-        let decoder = crate::device::create_decoder(device.video(), profile)?;
+        let heap = crate::device_os::create_decoder_heap(device.video(), profile, width, height)?;
+        let decoder = crate::device_os::create_decoder(device.video(), profile)?;
         let queues = match queues {
             Some(queues) => queues,
             None => DecodeQueues::open(&resources)?,

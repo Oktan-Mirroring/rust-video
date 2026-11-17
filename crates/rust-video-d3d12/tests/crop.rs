@@ -2,42 +2,34 @@
 //!
 //! Skips without hardware.
 
-#[cfg(target_os = "windows")]
+#![cfg(target_os = "windows")]
+
 use rust_video_harness::H264Synth;
 
-#[cfg(target_os = "windows")]
 use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, H264Decoder, Transcoder};
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::Decoder;
-#[cfg(target_os = "windows")]
 use rust_video_caps::transcode::{Outcome, Route};
 
-#[cfg(target_os = "windows")]
 /// Live D3D12 device, absent without hardware.
 fn device() -> Option<D3d12Device> {
     match D3d12Device::open() {
         Ok(device) => Some(device),
         Err(error) => {
-            println!("d3d12 skipped: {error}");
+            println!("SKIP: no d3d12 device ({error})");
             None
         }
     }
 }
 
-#[cfg(target_os = "windows")]
 /// Live H.264 transcoder, absent without hardware.
 fn transcoder(device: &D3d12Device) -> Option<Transcoder<'_>> {
     Transcoder::open(device, Codec::H264, Codec::H264).ok()
 }
 
-#[cfg(target_os = "windows")]
 /// Bitstream bytes behind `outcome`.
 fn bytes_of(outcome: &Outcome) -> usize {
     outcome
@@ -47,7 +39,6 @@ fn bytes_of(outcome: &Outcome) -> usize {
         .sum()
 }
 
-#[cfg(target_os = "windows")]
 /// Bitstream bytes through `transcoder`, every hop on the GPU route.
 fn drive(transcoder: &mut Transcoder) -> usize {
     let packets = H264Synth::annex_b_h264_packets()
@@ -57,7 +48,6 @@ fn drive(transcoder: &mut Transcoder) -> usize {
     drive_raw(transcoder, packets)
 }
 
-#[cfg(target_os = "windows")]
 /// Bitstream bytes for `raws` through `transcoder`, every hop on the GPU route.
 fn drive_raw(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> usize {
     let mut bytes = 0;
@@ -72,7 +62,6 @@ fn drive_raw(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> usize {
     bytes + bytes_of(&outcome)
 }
 
-#[cfg(target_os = "windows")]
 /// 320x224-visible stream through GPU passthrough.
 #[test]
 fn cropped_stream_transcodes_on_gpu_passthrough() {
@@ -85,7 +74,6 @@ fn cropped_stream_transcodes_on_gpu_passthrough() {
     assert!(drive(&mut transcoder) > 0);
 }
 
-#[cfg(target_os = "windows")]
 /// 640x360-visible stream through GPU passthrough on a padded session.
 #[test]
 fn cropped_360p_transcodes_on_gpu_passthrough() {
@@ -99,7 +87,6 @@ fn cropped_360p_transcodes_on_gpu_passthrough() {
     assert!(drive_raw(&mut transcoder, raws) > 0);
 }
 
-#[cfg(target_os = "windows")]
 /// 1920x1080-visible stream through GPU passthrough on a padded session.
 #[test]
 fn cropped_1080p_transcodes_on_gpu_passthrough() {
@@ -113,7 +100,6 @@ fn cropped_1080p_transcodes_on_gpu_passthrough() {
     assert!(drive_raw(&mut transcoder, raws) > 0);
 }
 
-#[cfg(target_os = "windows")]
 /// Transcoded bitstream bytes for `raws` through `transcoder`.
 fn transcode_bytes(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -133,7 +119,6 @@ fn transcode_bytes(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> Vec<u8> {
     bytes
 }
 
-#[cfg(target_os = "windows")]
 /// Luma mean of `nv12` at `width` by `height`.
 fn luma_mean(nv12: &[u8], width: usize, height: usize) -> u64 {
     let y_len = width * height;
@@ -141,7 +126,6 @@ fn luma_mean(nv12: &[u8], width: usize, height: usize) -> u64 {
     sum / u64::try_from(y_len).expect("nonzero extent")
 }
 
-#[cfg(target_os = "windows")]
 /// Cropped-stream output decodes back to nonzero pixels.
 #[test]
 fn cropped_stream_output_holds_pixels() {
@@ -180,7 +164,6 @@ fn cropped_stream_output_holds_pixels() {
     }
 }
 
-#[cfg(target_os = "windows")]
 /// 320x224-visible stream through the GPU scale hop.
 #[test]
 fn cropped_stream_transcodes_on_gpu_scale() {
@@ -204,7 +187,7 @@ fn cropped_stream_transcodes_on_gpu_scale() {
                 bytes += bytes_of(&outcome);
             }
             Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
-                println!("d3d12 scale skipped: {error}");
+                println!("SKIP: d3d12 scale ({error})");
                 return;
             }
             Err(error) => panic!("cropped scale transcode: {error}"),

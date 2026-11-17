@@ -112,4 +112,6 @@ fn probe_encode_miss(device: &D3d12Device) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn main() {}
+fn main() {
+    println!("SKIP: d3d12 needs windows");
+}

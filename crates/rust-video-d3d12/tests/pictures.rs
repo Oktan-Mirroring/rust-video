@@ -2,38 +2,31 @@
 //!
 //! Skips without hardware.
 
-#[cfg(target_os = "windows")]
+#![cfg(target_os = "windows")]
+
 #[path = "../examples/common/hevc.rs"]
 mod hevc;
 
-#[cfg(target_os = "windows")]
 use hevc::annex_b_packets;
-#[cfg(target_os = "windows")]
 use rust_video_harness::Synth;
 
-#[cfg(target_os = "windows")]
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
     Mpeg2Decoder, Vc1Decoder, Vp9Decoder,
 };
 
-#[cfg(target_os = "windows")]
 use bytes::Bytes;
-#[cfg(target_os = "windows")]
 use rust_video_caps::frame::GpuExport;
-#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Decoder, Encoder};
 
-#[cfg(target_os = "windows")]
 /// GPU-sourced frames plus bitstreams, skipped without hardware.
 #[test]
 fn pictures_hold_frames_and_bitstreams() {
     let device = match D3d12Device::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("d3d12 skipped: {error}");
+            println!("SKIP: no d3d12 device ({error})");
             return;
         }
     };
@@ -81,7 +74,6 @@ fn pictures_hold_frames_and_bitstreams() {
     }
 }
 
-#[cfg(target_os = "windows")]
 /// Loud fallback for a pending `codec` builder.
 fn drive_shell<D>(decoder: &mut D, codec: Codec, packet: &Packet)
 where
@@ -96,7 +88,6 @@ where
     }
 }
 
-#[cfg(target_os = "windows")]
 /// HEVC decode of a synthetic IDR through the GPU.
 fn drive_hevc_decode(device: &D3d12Device) {
     let mut decoder = HevcDecoder::open(device);
@@ -150,7 +141,6 @@ fn drive_hevc_decode(device: &D3d12Device) {
     }
 }
 
-#[cfg(target_os = "windows")]
 /// `codec` encode plus decode roundtrip through the GPU.
 fn drive_encode_roundtrip<D>(
     device: &D3d12Device,
@@ -212,7 +202,6 @@ fn drive_encode_roundtrip<D>(
     println!("{codec} roundtrip: {width}x{height} GPU frame proven, luma mean {mean}");
 }
 
-#[cfg(target_os = "windows")]
 /// Bitstream or loud fallback for `codec`.
 fn drive_encode_loud(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
     let mut encoder = match D3d12Encoder::open(device, codec) {

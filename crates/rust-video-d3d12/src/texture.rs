@@ -11,8 +11,9 @@ use windows::Win32::Graphics::Direct3D12::{ID3D12Fence, ID3D12Resource};
 
 /// Device-resident decode surface without CPU access.
 ///
-/// A surface holds its own resource reference and stays valid after its
-/// decoder drops. Each live surface pins its decoder pool slot until dropped;
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
+///
+/// Each live surface pins its decoder pool slot until dropped;
 /// decoders report [`NoFreeSlot`](crate::error::D3d12Error::NoFreeSlot) instead
 /// of overwriting a held picture.
 ///
@@ -66,13 +67,16 @@ impl GpuSurface {
         self.identity.format()
     }
 
-    /// Pool slot behind the picture.
+    /// Image array layer behind the picture.
+    ///
+    /// Single-layer textures always report layer 0; the decoder pool
+    /// slot stays internal.
     #[must_use]
     pub fn slice(&self) -> u32 {
         if let Some(pin) = &self.pin {
-            debug_assert_eq!(u32::from(pin.slot()), self.layout.slice);
+            debug_assert_eq!(u32::from(pin.slot()), self.layout.slot);
         }
-        self.layout.slice
+        0
     }
 
     /// Full texture extent in luma samples.
@@ -129,7 +133,7 @@ impl GpuSurface {
                 visible: size,
                 coded: size,
                 origin: (0, 0),
-                slice: self.layout.slice,
+                slot: self.layout.slot,
             },
             pin: None,
             wait: None,
@@ -147,22 +151,22 @@ pub(crate) struct SurfaceLayout {
     /// Crop left and top offsets in luma samples.
     origin: (u32, u32),
     /// Pool slot behind the picture.
-    slice: u32,
+    slot: u32,
 }
 
 impl SurfaceLayout {
-    /// Layout for `slice` at `visible` inside the `coded` extent.
+    /// Layout for pool `slot` at `visible` inside the `coded` extent.
     pub(crate) fn new(
         visible: PictureSize,
         coded: PictureSize,
         origin: (u32, u32),
-        slice: u32,
+        slot: u32,
     ) -> Self {
         Self {
             visible,
             coded,
             origin,
-            slice,
+            slot,
         }
     }
 }
