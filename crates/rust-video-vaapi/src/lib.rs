@@ -13,6 +13,8 @@ mod buffer;
 #[cfg(target_os = "linux")]
 mod decoder;
 #[cfg(target_os = "linux")]
+mod delivery;
+#[cfg(target_os = "linux")]
 mod device;
 #[cfg(target_os = "linux")]
 mod encoder;
@@ -47,6 +49,8 @@ pub use av1::Av1Decoder;
 pub use backend::{Backend, SubmitStats};
 #[cfg(target_os = "linux")]
 pub use decoder::{H264Decoder, VaApiFrame};
+#[cfg(target_os = "linux")]
+pub use delivery::DecoderPump;
 #[cfg(target_os = "linux")]
 pub use device::{DisplayHandle, VaApiDevice};
 #[cfg(target_os = "linux")]

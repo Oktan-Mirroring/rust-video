@@ -21,6 +21,53 @@ const BAR: f64 = 60.0;
 /// Timed iterations per bench.
 const ITERS: u32 = 30;
 
+/// Surface decode behind one benchmark pass.
+trait SurfaceDecode {
+    /// Surface frames decoded from one packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot decode `packet`.
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError>;
+
+    /// Trailing surface frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    fn flush_surface(&mut self) -> Result<Vec<VaApiFrame>, VaApiError>;
+}
+
+impl SurfaceDecode for Av1Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Av1Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Av1Decoder::flush_surface(self)
+    }
+}
+
+impl SurfaceDecode for H264Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
+        H264Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        H264Decoder::flush_surface(self)
+    }
+}
+
+impl SurfaceDecode for H265Decoder<'_> {
+    fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
+        H265Decoder::decode_surface(self, packet)
+    }
+
+    fn flush_surface(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        H265Decoder::flush_surface(self)
+    }
+}
+
 /// Measured fps of `ITERS` passes of `packets` through `decoder`.
 fn decode_fps(
     decoder: &mut impl Decoder<Frame = VaApiFrame, Error = VaApiError>,
@@ -38,6 +85,26 @@ fn decode_fps(
         }
     }
     let drained = decoder.flush().expect("timed flush");
+    count += u32::try_from(drained.len()).expect("drain count fits");
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(count > 0, "bench decoded no frames");
+    f64::from(count) / elapsed
+}
+
+/// Measured fps of `ITERS` passes of `packets` through the surface path.
+fn surface_fps(decoder: &mut impl SurfaceDecode, packets: &[Packet]) -> f64 {
+    for packet in packets {
+        decoder.decode_surface(packet).expect("warmup decode");
+    }
+    let mut count = 0_u32;
+    let start = std::time::Instant::now();
+    for _ in 0..ITERS {
+        for packet in packets {
+            let frames = decoder.decode_surface(packet).expect("timed decode");
+            count += u32::try_from(frames.len()).expect("frame count fits");
+        }
+    }
+    let drained = decoder.flush_surface().expect("timed flush");
     count += u32::try_from(drained.len()).expect("drain count fits");
     let elapsed = start.elapsed().as_secs_f64();
     assert!(count > 0, "bench decoded no frames");
@@ -199,6 +266,78 @@ fn h265_encode_1080p_measures_realtime() {
     ];
     let measured = encode_fps(&mut encoder, &frames);
     println!("vaapi h265 encode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// VA-API AV1 1080p surface decode measured against the realtime bar.
+#[test]
+fn av1_decode_surface_1080p_measures_realtime() {
+    let device = match VaApiDevice::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP vaapi av1 surface decode 1080p: {error}");
+            return;
+        }
+    };
+    let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
+    let packets = packets(&[bytes]);
+    let mut decoder = Av1Decoder::open(&device);
+    let measured = surface_fps(&mut decoder, &packets);
+    println!(
+        "vaapi av1 surface decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// VA-API H.264 1080p surface decode measured against the realtime bar.
+#[test]
+fn h264_decode_surface_1080p_measures_realtime() {
+    let device = match VaApiDevice::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP vaapi h264 surface decode 1080p: {error}");
+            return;
+        }
+    };
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let packets = packets(&raws);
+    let mut decoder = H264Decoder::open(&device);
+    let measured = surface_fps(&mut decoder, &packets);
+    println!(
+        "vaapi h264 surface decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps"
+    );
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// VA-API H.265 1080p surface decode measured against the realtime bar.
+#[test]
+fn h265_decode_surface_1080p_measures_realtime() {
+    let device = match VaApiDevice::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP vaapi h265 surface decode 1080p: {error}");
+            return;
+        }
+    };
+    let raws = AnnexB::picture_packets(
+        &bench_dir().join("h265-1080p-nvenc.h265"),
+        AnnexB::is_hevc_vcl,
+    );
+    let packets = packets(&raws);
+    let mut decoder = H265Decoder::open(&device);
+    let measured = surface_fps(&mut decoder, &packets);
+    println!(
+        "vaapi h265 surface decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps"
+    );
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
