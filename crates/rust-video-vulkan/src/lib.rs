@@ -12,8 +12,10 @@ mod raw;
 mod session;
 mod transcode;
 
-pub use decoder::{Av1Decoder, H264Decoder, H265Decoder, VulkanFrame, VulkanPlanes};
-pub use delivery::DecoderPump;
+pub use decoder::{
+    Av1Decoder, H264Decoder, H265Decoder, OverlappedDecode, PhaseTiming, VulkanFrame, VulkanPlanes,
+};
+pub use delivery::{DecoderPump, OverlapPump};
 pub use device::VulkanDevice;
 pub use encoder::{Gop, H264Encoder, H265Encoder};
 pub use error::{ParseError, SkipReason, VulkanError};

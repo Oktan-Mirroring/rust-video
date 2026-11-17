@@ -276,8 +276,9 @@ impl Session {
     ///
     /// Records on a free ring slot and commits the planned layouts once
     /// the submit queues; same-queue submission order plus the recorded
-    /// barriers carry the layout assumptions to the device. Collect the
-    /// returned pending through `collect_into` or `collect_gpu`.
+    /// barriers carry the layout assumptions to the device. Wait the
+    /// returned pending through `wait_pending`, then read its pixels
+    /// through `copy_pending_into` on the readback path.
     ///
     /// # Errors
     ///
@@ -313,21 +314,60 @@ impl Session {
         Ok(PendingDecode { slot: index })
     }
 
-    /// Wait `pending` out, then map its readback into `out`.
-    ///
-    /// The readback holds the display window, packed tightly by the copy.
+    /// True once `pending` completes, without waiting.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the fence wait or the readback map fails.
-    pub(crate) fn collect_into(
+    /// Returns `Err` when the fence query fails.
+    pub(crate) fn is_ready(&self, pending: PendingDecode) -> Result<bool, VulkanError> {
+        self.submit.signaled(pending.slot)
+    }
+
+    /// Wait `pending` out, freeing its ring slot.
+    ///
+    /// Readback pixels stay mapped after the wait; follow with
+    /// `copy_pending_into` before the next submit reuses the slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the fence wait fails.
+    pub(crate) fn wait_pending(&mut self, pending: PendingDecode) -> Result<(), VulkanError> {
+        self.submit
+            .poll(pending.slot)
+            .inspect_err(|_| self.reset_state())
+    }
+
+    /// Wait `pending` out up to `timeout_ns`, freeing its ring slot.
+    ///
+    /// `Ok(false)` reports the lapsed budget with the ring intact; the
+    /// completion stays pending for a later wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the fence wait fails.
+    pub(crate) fn wait_pending_timeout(
         &mut self,
+        pending: PendingDecode,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanError> {
+        self.submit
+            .try_poll_timeout(pending.slot, timeout_ns)
+            .inspect_err(|_| self.reset_state())
+    }
+
+    /// Map the waited `pending` readback into `out`.
+    ///
+    /// The readback holds the display window, packed tightly by the copy.
+    /// Call only after `wait_pending`; an unwaited slot reads stale bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the readback map fails.
+    pub(crate) fn copy_pending_into(
+        &self,
         pending: PendingDecode,
         out: &mut bytes::BytesMut,
     ) -> Result<(), VulkanError> {
-        self.submit
-            .poll(pending.slot)
-            .inspect_err(|_| self.reset_state())?;
         let display = as_extent(self.geometry.display());
         let len = usize::try_from(nv12_bytes(display)).map_err(|_| {
             crate::error::ParseError::OutOfRange {
@@ -335,17 +375,6 @@ impl Session {
             }
         })?;
         self.readbacks[pending.slot].memory().read_to_buf(out, len)
-    }
-
-    /// Wait `pending` out, leaving pixels on the GPU.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the fence wait fails.
-    pub(crate) fn collect_gpu(&mut self, pending: PendingDecode) -> Result<(), VulkanError> {
-        self.submit
-            .poll(pending.slot)
-            .inspect_err(|_| self.reset_state())
     }
 
     /// Submit-core gauges snapshot.

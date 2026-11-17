@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use bytes::{Bytes, BytesMut};
@@ -306,6 +307,8 @@ pub(crate) struct FrameSink {
     reorder: ReorderBuffer<VulkanFrame>,
     /// VRAM budget shared with frames.
     shared: SharedDevice,
+    /// Phase timing per collected picture, oldest first.
+    timings: Vec<PhaseTiming>,
     /// Frame generation counter.
     generation: u64,
     /// Pooled display buffers for the collected size.
@@ -322,6 +325,7 @@ impl FrameSink {
         Self {
             reorder: ReorderBuffer::with_capacity(0),
             shared,
+            timings: Vec::new(),
             generation: 0,
             pool: None,
             exports: Vec::new(),
@@ -332,6 +336,16 @@ impl FrameSink {
     /// Display reordering.
     pub(crate) fn reorder(&mut self) -> &mut ReorderBuffer<VulkanFrame> {
         &mut self.reorder
+    }
+
+    /// Log the phase timing of one collected picture.
+    pub(crate) fn push_timing(&mut self, timing: PhaseTiming) {
+        self.timings.push(timing);
+    }
+
+    /// Logged phase timings, oldest first, clearing the log.
+    pub(crate) fn take_timings(&mut self) -> Vec<PhaseTiming> {
+        std::mem::take(&mut self.timings)
     }
 
     /// Pooled readback buffer for `size`, sized for the `coded` extent.
@@ -581,6 +595,122 @@ impl FrameSink {
     }
 }
 
+/// Split-phase decode: submit without waiting, poll completions in order.
+///
+/// `submit_packet` queues pictures and returns the frames already
+/// complete; `poll_ready` collects further completions without waiting;
+/// `collect_next` waits the oldest picture out. Completions hand off in
+/// submit order: same-queue execution completes in order, and every
+/// collect matches the pending picture explicitly.
+pub trait OverlappedDecode {
+    /// Queue `packet` pictures without waiting on their completion.
+    ///
+    /// Collects completions already signaled; back-pressures past the
+    /// ring depth only inside multi-picture packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot decode `packet`.
+    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Completed pictures, oldest first, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its ready frames.
+    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Oldest submitted picture, waiting it out.
+    ///
+    /// Empty when nothing is submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its oldest picture.
+    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Oldest submitted picture, waiting up to `timeout` for it.
+    ///
+    /// `None` reports the lapsed budget with the picture still pending.
+    /// Empty when nothing is submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its oldest picture.
+    fn collect_next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError>;
+
+    /// Trailing frames, then end of stream.
+    ///
+    /// Waits every submitted picture out, like `flush`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Submitted but uncollected picture count.
+    fn inflight_len(&self) -> usize;
+
+    /// Logged phase timings, oldest first, clearing the log.
+    fn take_timings(&mut self) -> Vec<PhaseTiming>;
+}
+
+/// Submit, engine-wait, and copy phases of one collected picture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseTiming {
+    /// Queue-submit phase: record plus submit, no completion wait.
+    submit: Duration,
+    /// Engine-wait phase: fence wait for the decode to complete.
+    engine_wait: Duration,
+    /// Copy phase: readback map into the staging buffer.
+    copy: Duration,
+    /// Submit instant of the picture.
+    submitted_at: Instant,
+    /// Collection instant of the picture.
+    collected_at: Instant,
+}
+
+impl PhaseTiming {
+    /// Queue-submit phase: record plus submit, no completion wait.
+    #[must_use]
+    pub fn submit(&self) -> Duration {
+        self.submit
+    }
+
+    /// Engine-wait phase: fence wait for the decode to complete.
+    #[must_use]
+    pub fn engine_wait(&self) -> Duration {
+        self.engine_wait
+    }
+
+    /// Copy phase: readback map into the staging buffer.
+    #[must_use]
+    pub fn copy(&self) -> Duration {
+        self.copy
+    }
+
+    /// Submit instant of the picture.
+    #[must_use]
+    pub fn submitted_at(&self) -> Instant {
+        self.submitted_at
+    }
+
+    /// Collection instant of the picture.
+    #[must_use]
+    pub fn collected_at(&self) -> Instant {
+        self.collected_at
+    }
+
+    /// Stage-time sum: submit plus engine-wait plus copy.
+    #[must_use]
+    pub fn stage_sum(&self) -> Duration {
+        self.submit + self.engine_wait + self.copy
+    }
+}
+
 /// H.264 decoder over a negotiated Vulkan device.
 ///
 /// Thread-local: parser state holds `Rc` tables, so the decoder stays on
@@ -673,8 +803,14 @@ impl<'a> H264Decoder<'a> {
         }
     }
 
-    /// Session for `sps`, recreated on geometry change; reports recreation.
-    fn ensure_session(&mut self, sps: &crate::parse::h264::Sps) -> Result<bool, VulkanError> {
+    /// Session for `sps`, recreated on geometry change.
+    ///
+    /// Reports recreation plus pre-recreation frames; drains submitted
+    /// pictures before replacing the session they reference.
+    fn ensure_session(
+        &mut self,
+        sps: &crate::parse::h264::Sps,
+    ) -> Result<(bool, Vec<VulkanFrame>), VulkanError> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
@@ -694,8 +830,14 @@ impl<'a> H264Decoder<'a> {
             .as_ref()
             .is_some_and(|session| session.geometry() == &geometry)
         {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
         let std_version = crate::raw::std_header_version(H264_DECODE_STD_NAME, facts.std_version);
         let mut template = ParamsTemplate::H264(h264_params_create());
         let mut session = Session::open(
@@ -725,7 +867,7 @@ impl<'a> H264Decoder<'a> {
             session.params_mut().update(&update)?;
         }
         self.session = Some(session);
-        Ok(true)
+        Ok((true, drained))
     }
 
     /// Queue-submit one decoded picture without waiting.
@@ -807,29 +949,74 @@ impl<'a> H264Decoder<'a> {
         Ok(())
     }
 
+    /// Submit one picture, then collect per `mode`.
+    fn run_picture(
+        &mut self,
+        picture: &Picture,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        if mode == DrainMode::Overlap {
+            out.extend(backpressure_to_depth(
+                &mut self.session,
+                &mut self.sink,
+                &mut self.pending,
+                &mut self.stats,
+            )?);
+        }
+        self.submit_picture(picture, gpu)?;
+        match mode {
+            DrainMode::Sync => {
+                if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                    out.extend(drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?);
+                }
+            }
+            DrainMode::Overlap => {
+                out.extend(collect_ready(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Run one access unit through the context, submitting its picture.
     fn run_unit(
         &mut self,
         unit: crate::parse::au::AccessUnit<crate::parse::h264::Nalu>,
         gpu: bool,
+        mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         for instruction in self.context.compile(unit) {
             match instruction {
                 H264Instruction::Sps(sps) => {
-                    let drained = drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?;
-                    out.extend(drained);
+                    let fresh = !self.sps.contains_key(&sps.id());
                     self.tables.insert_sps(&sps)?;
+                    if fresh {
+                        let drained = drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?;
+                        out.extend(drained);
+                    }
                     self.sink
                         .reorder()
                         .set_capacity(sps.max_num_reorder_frames());
-                    let fresh = self.sps.insert(sps.id(), sps.clone()).is_none();
-                    let recreated = self.ensure_session(&sps)?;
+                    self.sps.insert(sps.id(), sps.clone());
+                    let (recreated, drained) = self.ensure_session(&sps)?;
+                    out.extend(drained);
                     let Some(session) = self.session.as_mut() else {
                         return Err(VulkanError::NoSession);
                     };
@@ -844,15 +1031,18 @@ impl<'a> H264Decoder<'a> {
                     }
                 }
                 H264Instruction::Pps(pps) => {
-                    let drained = drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?;
-                    out.extend(drained);
+                    let fresh = !self.pps.contains_key(&pps.id());
                     self.tables.insert_pps(&pps)?;
-                    let fresh = self.pps.insert(pps.id(), pps.clone()).is_none();
+                    if fresh {
+                        let drained = drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?;
+                        out.extend(drained);
+                    }
+                    self.pps.insert(pps.id(), pps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
                             if let Some(std) = self.tables.pps(pps.id(), &pps) {
@@ -866,15 +1056,7 @@ impl<'a> H264Decoder<'a> {
                     }
                 }
                 H264Instruction::Picture(picture) => {
-                    self.submit_picture(&picture, gpu)?;
-                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                        out.extend(drain_pending(
-                            &mut self.session,
-                            &mut self.sink,
-                            &mut self.pending,
-                            &mut self.stats,
-                        )?);
-                    }
+                    out.extend(self.run_picture(&picture, gpu, mode)?);
                 }
             }
         }
@@ -886,26 +1068,43 @@ impl<'a> H264Decoder<'a> {
     /// Streams with zero reorder depth emit each picture on the call
     /// carrying its last byte; deeper streams buffer the trailing unit
     /// across calls exactly as before.
-    fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
+    fn run_bytes(
+        &mut self,
+        bytes: &[u8],
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         for raw in self.splitter.push(bytes) {
-            out.extend(self.run_nal(&raw, gpu)?);
+            out.extend(self.run_nal(&raw, gpu, mode)?);
         }
         if self.sink.reorder().capacity() == 0 {
             for raw in self.splitter.flush() {
-                out.extend(self.run_nal(&raw, gpu)?);
+                out.extend(self.run_nal(&raw, gpu, mode)?);
             }
             if let Some(unit) = self.aus.flush() {
-                out.extend(self.run_unit(unit, gpu)?);
+                out.extend(self.run_unit(unit, gpu, mode)?);
             }
         }
-        let drained = drain_pending(
-            &mut self.session,
-            &mut self.sink,
-            &mut self.pending,
-            &mut self.stats,
-        )?;
-        out.extend(drained);
+        match mode {
+            DrainMode::Sync => {
+                let drained = drain_pending(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?;
+                out.extend(drained);
+            }
+            DrainMode::Overlap => {
+                out.extend(collect_ready(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?);
+            }
+        }
         Ok(out)
     }
 
@@ -914,12 +1113,13 @@ impl<'a> H264Decoder<'a> {
         &mut self,
         raw: &crate::parse::nal::Nalu,
         gpu: bool,
+        mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         let parsed = self.parser.parse(raw)?;
         let nalu = crate::parse::h264::Nalu::new(parsed);
         if let Some(unit) = self.aus.put(nalu) {
-            out.extend(self.run_unit(unit, gpu)?);
+            out.extend(self.run_unit(unit, gpu, mode)?);
         }
         Ok(out)
     }
@@ -933,7 +1133,7 @@ impl<'a> H264Decoder<'a> {
     ///
     /// Returns `Err` when the backend cannot decode `packet` or export it.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), true)
+        self.run_bytes(packet.data(), true, DrainMode::Sync)
     }
 
     /// Surface frames held back for reordering or buffering.
@@ -952,11 +1152,11 @@ impl<'a> H264Decoder<'a> {
             let parsed = self.parser.parse(&raw)?;
             let nalu = crate::parse::h264::Nalu::new(parsed);
             if let Some(unit) = self.aus.put(nalu) {
-                out.extend(self.run_unit(unit, gpu)?);
+                out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
             }
         }
         if let Some(unit) = self.aus.flush() {
-            out.extend(self.run_unit(unit, gpu)?);
+            out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
         }
         let drained = drain_pending(
             &mut self.session,
@@ -975,11 +1175,60 @@ impl Decoder for H264Decoder<'_> {
     type Error = VulkanError;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.run_bytes(packet.data(), false)
+        self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.flush_inner(false)
+    }
+}
+
+impl OverlappedDecode for H264Decoder<'_> {
+    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), false, DrainMode::Overlap)
+    }
+
+    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        collect_ready(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )
+    }
+
+    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        collect_oldest(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )
+    }
+
+    fn collect_next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        collect_oldest_timeout(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+            timeout,
+        )
+    }
+
+    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner(false)
+    }
+
+    fn inflight_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn take_timings(&mut self) -> Vec<PhaseTiming> {
+        self.sink.take_timings()
     }
 }
 
@@ -1200,10 +1449,23 @@ struct SubmitPlan<'a, 'b, 'c> {
     emit: bool,
 }
 
+/// Drain contract behind a decode call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DrainMode {
+    /// Wait every submitted picture out before returning.
+    Sync,
+    /// Submit without waiting; collect signaled completions only.
+    Overlap,
+}
+
 /// Submitted but uncollected picture.
 struct PendingPicture {
     /// Submitted decode behind the picture.
     pending: PendingDecode,
+    /// Queue-submit phase behind the picture.
+    submit: Duration,
+    /// Submit instant of the picture.
+    submitted_at: Instant,
     /// DPB slot the picture decoded into.
     setup_slot: usize,
     /// Picture order count.
@@ -1248,6 +1510,7 @@ fn plan_submit(
     let export = lease
         .as_ref()
         .map(|held| ExportTarget::new(held.pair(), held.first()));
+    let submitted_at = Instant::now();
     let pending = match session.submit_async(&sub, export.as_ref()) {
         Ok(pending) => pending,
         Err(error) => {
@@ -1256,6 +1519,7 @@ fn plan_submit(
             return Err(error);
         }
     };
+    let submit = submitted_at.elapsed();
     if body.is_reference() {
         session.set_meta(plan.setup_slot, Some(plan.meta));
     } else {
@@ -1263,6 +1527,8 @@ fn plan_submit(
     }
     Ok(PendingPicture {
         pending,
+        submit,
+        submitted_at,
         setup_slot: plan.setup_slot,
         poc: body.poc(),
         resets: body.resets_dpb(),
@@ -1273,7 +1539,7 @@ fn plan_submit(
     })
 }
 
-/// Collect one submitted picture into display frames.
+/// Collect one submitted picture into display frames plus its phase timing.
 ///
 /// Always reads the picture back: callers drop unshown frames after
 /// retaining their bytes, never before.
@@ -1281,7 +1547,19 @@ fn collect_pending(
     session: &mut Session,
     sink: &mut FrameSink,
     picture: PendingPicture,
-) -> Result<Vec<VulkanFrame>, VulkanError> {
+) -> Result<(Vec<VulkanFrame>, PhaseTiming), VulkanError> {
+    let start = Instant::now();
+    session.wait_pending(picture.pending)?;
+    stage_waited(session, sink, picture, start.elapsed())
+}
+
+/// Stage a waited picture into display frames plus its phase timing.
+fn stage_waited(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    picture: PendingPicture,
+    engine_wait: Duration,
+) -> Result<(Vec<VulkanFrame>, PhaseTiming), VulkanError> {
     let slice = u32::try_from(picture.setup_slot).map_err(|_| ParseError::OutOfRange {
         syntax: "setup slot",
     })?;
@@ -1291,12 +1569,20 @@ fn collect_pending(
         height: coded_height,
     })?;
     let layout = SurfaceLayout::new(slice, coded, session.geometry().origin());
+    let timing_of = |copy: Duration| PhaseTiming {
+        submit: picture.submit,
+        engine_wait,
+        copy,
+        submitted_at: picture.submitted_at,
+        collected_at: Instant::now(),
+    };
     if let Some(lease) = picture.lease {
-        session.collect_gpu(picture.pending)?;
-        if picture.flush_on_reset {
-            return sink.emit(session, picture.poc, picture.resets, lease, layout);
-        }
-        return sink.emit_queued(session, picture.poc, lease, layout);
+        let frames = if picture.flush_on_reset {
+            sink.emit(session, picture.poc, picture.resets, lease, layout)?
+        } else {
+            sink.emit_queued(session, picture.poc, lease, layout)?
+        };
+        return Ok((frames, timing_of(Duration::ZERO)));
     }
     let (display_width, display_height) = session.geometry().display();
     let size = PictureSize::new(display_width, display_height).ok_or(VulkanError::BadExtent {
@@ -1304,21 +1590,34 @@ fn collect_pending(
         height: display_height,
     })?;
     let mut buffer = sink.pooled(size, coded);
-    session.collect_into(picture.pending, &mut buffer)?;
-    if picture.flush_on_reset {
-        sink.emit_readback(size, buffer, picture.poc, picture.resets, layout)
+    let copy_start = Instant::now();
+    session.copy_pending_into(picture.pending, &mut buffer)?;
+    let copy = copy_start.elapsed();
+    let frames = if picture.flush_on_reset {
+        sink.emit_readback(size, buffer, picture.poc, picture.resets, layout)?
     } else {
-        sink.emit_readback_queued(size, buffer, picture.poc, layout)
-    }
+        sink.emit_readback_queued(size, buffer, picture.poc, layout)?
+    };
+    Ok((frames, timing_of(copy)))
 }
 
-/// DPB slot for `id`, or `NoFreeSlot` when every slot is pinned.
-fn claim_slot(slots: &mut SlotBook, id: ReferenceId) -> Result<usize, VulkanError> {
-    slots.claim(id).map_err(|_| VulkanError::NoFreeSlot)
+/// Fold one collection into the sink log plus the submit gauges.
+fn fold_collection(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
+    timing: PhaseTiming,
+) {
+    sink.push_timing(timing);
+    let snapshot = session.submit_stats();
+    stats.peak_inflight = stats.peak_inflight.max(snapshot.peak_inflight);
+    stats.resets += session.take_resets();
 }
 
-/// Collect every submitted picture into display frames.
-fn drain_pending(
+/// Collect the oldest submitted picture, waiting it out.
+///
+/// Empty when nothing is submitted.
+fn collect_oldest(
     session: &mut Option<Session>,
     sink: &mut FrameSink,
     pending: &mut Vec<PendingPicture>,
@@ -1330,13 +1629,92 @@ fn drain_pending(
     let Some(session) = session.as_mut() else {
         return Err(VulkanError::NoSession);
     };
-    let mut out = Vec::new();
-    for picture in pending.drain(..) {
-        out.extend(collect_pending(session, sink, picture)?);
+    let picture = pending.remove(0);
+    let (frames, timing) = collect_pending(session, sink, picture)?;
+    fold_collection(session, sink, stats, timing);
+    Ok(frames)
+}
+
+/// Collect the oldest submitted picture, waiting up to `timeout` for it.
+///
+/// `None` reports the lapsed budget with the picture still pending.
+/// Empty when nothing is submitted.
+fn collect_oldest_timeout(
+    session: &mut Option<Session>,
+    sink: &mut FrameSink,
+    pending: &mut Vec<PendingPicture>,
+    stats: &mut SubmitStats,
+    timeout: Duration,
+) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+    if pending.is_empty() {
+        return Ok(Some(Vec::new()));
     }
-    let snapshot = session.submit_stats();
-    stats.peak_inflight = stats.peak_inflight.max(snapshot.peak_inflight);
-    stats.resets += session.take_resets();
+    let Some(session) = session.as_mut() else {
+        return Err(VulkanError::NoSession);
+    };
+    let picture = pending.remove(0);
+    let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    let start = Instant::now();
+    if !session.wait_pending_timeout(picture.pending, budget)? {
+        pending.insert(0, picture);
+        return Ok(None);
+    }
+    let (frames, timing) = stage_waited(session, sink, picture, start.elapsed())?;
+    fold_collection(session, sink, stats, timing);
+    Ok(Some(frames))
+}
+
+/// Collect signaled pictures in order, stopping at the first pending one.
+fn collect_ready(
+    session: &mut Option<Session>,
+    sink: &mut FrameSink,
+    pending: &mut Vec<PendingPicture>,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let mut out = Vec::new();
+    loop {
+        let ready = match (session.as_ref(), pending.first()) {
+            (Some(session), Some(picture)) => session.is_ready(picture.pending)?,
+            _ => false,
+        };
+        if !ready {
+            break;
+        }
+        out.extend(collect_oldest(session, sink, pending, stats)?);
+    }
+    Ok(out)
+}
+
+/// DPB slot for `id`, or `NoFreeSlot` when every slot is pinned.
+fn claim_slot(slots: &mut SlotBook, id: ReferenceId) -> Result<usize, VulkanError> {
+    slots.claim(id).map_err(|_| VulkanError::NoFreeSlot)
+}
+
+/// Wait oldest pictures out until the submitted count fits the ring.
+fn backpressure_to_depth(
+    session: &mut Option<Session>,
+    sink: &mut FrameSink,
+    pending: &mut Vec<PendingPicture>,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let mut out = Vec::new();
+    while pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+        out.extend(collect_oldest(session, sink, pending, stats)?);
+    }
+    Ok(out)
+}
+
+/// Collect every submitted picture into display frames.
+fn drain_pending(
+    session: &mut Option<Session>,
+    sink: &mut FrameSink,
+    pending: &mut Vec<PendingPicture>,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let mut out = Vec::new();
+    while !pending.is_empty() {
+        out.extend(collect_oldest(session, sink, pending, stats)?);
+    }
     Ok(out)
 }
 
@@ -1519,8 +1897,14 @@ impl<'a> H265Decoder<'a> {
         }
     }
 
-    /// Session for `sps`, recreated on geometry change; reports recreation.
-    fn ensure_session(&mut self, sps: &crate::parse::h265::Sps) -> Result<bool, VulkanError> {
+    /// Session for `sps`, recreated on geometry change.
+    ///
+    /// Reports recreation plus pre-recreation frames; drains submitted
+    /// pictures before replacing the session they reference.
+    fn ensure_session(
+        &mut self,
+        sps: &crate::parse::h265::Sps,
+    ) -> Result<(bool, Vec<VulkanFrame>), VulkanError> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
@@ -1541,8 +1925,14 @@ impl<'a> H265Decoder<'a> {
             .as_ref()
             .is_some_and(|session| session.geometry() == &geometry)
         {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         }
+        let drained = drain_pending(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )?;
         let std_version = crate::raw::std_header_version(
             crate::session::params::H265_DECODE_STD_NAME,
             facts.std_version,
@@ -1579,7 +1969,7 @@ impl<'a> H265Decoder<'a> {
             session.params_mut().update(&update)?;
         }
         self.session = Some(session);
-        Ok(true)
+        Ok((true, drained))
     }
 
     /// Queue-submit one decoded picture without waiting.
@@ -1668,26 +2058,70 @@ impl<'a> H265Decoder<'a> {
         Ok(())
     }
 
+    /// Submit one picture, then collect per `mode`.
+    fn run_picture(
+        &mut self,
+        picture: &crate::parse::refs::H265Picture,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        if mode == DrainMode::Overlap {
+            out.extend(backpressure_to_depth(
+                &mut self.session,
+                &mut self.sink,
+                &mut self.pending,
+                &mut self.stats,
+            )?);
+        }
+        self.submit_picture(picture, gpu)?;
+        match mode {
+            DrainMode::Sync => {
+                if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                    out.extend(drain_pending(
+                        &mut self.session,
+                        &mut self.sink,
+                        &mut self.pending,
+                        &mut self.stats,
+                    )?);
+                }
+            }
+            DrainMode::Overlap => {
+                out.extend(collect_ready(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Run one access unit through the context, submitting its picture.
     fn run_unit(
         &mut self,
         unit: crate::parse::au::AccessUnit<crate::parse::h265::Nalu>,
         gpu: bool,
+        mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         use crate::parse::refs::H265Instruction;
         let mut out = Vec::new();
         for instruction in self.context.compile(unit) {
             match instruction {
                 H265Instruction::Vps(vps) => {
-                    let drained = drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?;
-                    out.extend(drained);
+                    let fresh = !self.vps.contains_key(&vps.id());
                     self.tables.insert_vps(&vps)?;
-                    let fresh = self.vps.insert(vps.id(), vps.clone()).is_none();
+                    if fresh {
+                        let drained = drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?;
+                        out.extend(drained);
+                    }
+                    self.vps.insert(vps.id(), vps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
                             if let Some(std) = self.tables.vps(vps.id(), &vps) {
@@ -1702,17 +2136,21 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Sps(sps) => {
-                    let drained = drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?;
-                    out.extend(drained);
+                    let fresh = !self.sps.contains_key(&sps.id());
                     self.tables.insert_sps(&sps)?;
+                    if fresh {
+                        let drained = drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?;
+                        out.extend(drained);
+                    }
                     self.sink.reorder().set_capacity(sps.max_num_reorder_pics());
-                    let fresh = self.sps.insert(sps.id(), sps.clone()).is_none();
-                    let recreated = self.ensure_session(&sps)?;
+                    self.sps.insert(sps.id(), sps.clone());
+                    let (recreated, drained) = self.ensure_session(&sps)?;
+                    out.extend(drained);
                     let Some(session) = self.session.as_mut() else {
                         return Err(VulkanError::NoSession);
                     };
@@ -1728,13 +2166,16 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Pps(pps) => {
-                    let drained = drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?;
-                    out.extend(drained);
+                    let fresh = !self.pps.contains_key(&pps.id());
+                    if fresh {
+                        let drained = drain_pending(
+                            &mut self.session,
+                            &mut self.sink,
+                            &mut self.pending,
+                            &mut self.stats,
+                        )?;
+                        out.extend(drained);
+                    }
                     let sps_id = pps.sps_id();
                     let Some(sps) = self.sps.get(&sps_id).cloned() else {
                         return Err(ParseError::MissingSet {
@@ -1743,7 +2184,7 @@ impl<'a> H265Decoder<'a> {
                         .into());
                     };
                     self.tables.insert_pps(&pps, &sps)?;
-                    let fresh = self.pps.insert(pps.id(), pps.clone()).is_none();
+                    self.pps.insert(pps.id(), pps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
                             if let Some(std) = self.tables.pps(pps.id(), &pps).transpose()? {
@@ -1758,15 +2199,7 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Picture(picture) => {
-                    self.submit_picture(&picture, gpu)?;
-                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                        out.extend(drain_pending(
-                            &mut self.session,
-                            &mut self.sink,
-                            &mut self.pending,
-                            &mut self.stats,
-                        )?);
-                    }
+                    out.extend(self.run_picture(&picture, gpu, mode)?);
                 }
             }
         }
@@ -1778,26 +2211,43 @@ impl<'a> H265Decoder<'a> {
     /// Streams with zero reorder depth emit each picture on the call
     /// carrying its last byte; deeper streams buffer the trailing unit
     /// across calls exactly as before.
-    fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
+    fn run_bytes(
+        &mut self,
+        bytes: &[u8],
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         for raw in self.splitter.push(bytes) {
-            out.extend(self.run_nal(&raw, gpu)?);
+            out.extend(self.run_nal(&raw, gpu, mode)?);
         }
         if self.sink.reorder().capacity() == 0 {
             for raw in self.splitter.flush() {
-                out.extend(self.run_nal(&raw, gpu)?);
+                out.extend(self.run_nal(&raw, gpu, mode)?);
             }
             if let Some(unit) = self.aus.flush() {
-                out.extend(self.run_unit(unit, gpu)?);
+                out.extend(self.run_unit(unit, gpu, mode)?);
             }
         }
-        let drained = drain_pending(
-            &mut self.session,
-            &mut self.sink,
-            &mut self.pending,
-            &mut self.stats,
-        )?;
-        out.extend(drained);
+        match mode {
+            DrainMode::Sync => {
+                let drained = drain_pending(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?;
+                out.extend(drained);
+            }
+            DrainMode::Overlap => {
+                out.extend(collect_ready(
+                    &mut self.session,
+                    &mut self.sink,
+                    &mut self.pending,
+                    &mut self.stats,
+                )?);
+            }
+        }
         Ok(out)
     }
 
@@ -1806,12 +2256,13 @@ impl<'a> H265Decoder<'a> {
         &mut self,
         raw: &crate::parse::nal::Nalu,
         gpu: bool,
+        mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         let parsed = self.parser.parse(raw)?;
         let nalu = crate::parse::h265::Nalu::new(parsed);
         if let Some(unit) = self.aus.put(nalu) {
-            out.extend(self.run_unit(unit, gpu)?);
+            out.extend(self.run_unit(unit, gpu, mode)?);
         }
         Ok(out)
     }
@@ -1825,7 +2276,7 @@ impl<'a> H265Decoder<'a> {
     ///
     /// Returns `Err` when the backend cannot decode `packet` or export it.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), true)
+        self.run_bytes(packet.data(), true, DrainMode::Sync)
     }
 
     /// Surface frames held back for reordering or buffering.
@@ -1844,11 +2295,11 @@ impl<'a> H265Decoder<'a> {
             let parsed = self.parser.parse(&raw)?;
             let nalu = crate::parse::h265::Nalu::new(parsed);
             if let Some(unit) = self.aus.put(nalu) {
-                out.extend(self.run_unit(unit, gpu)?);
+                out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
             }
         }
         if let Some(unit) = self.aus.flush() {
-            out.extend(self.run_unit(unit, gpu)?);
+            out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
         }
         let drained = drain_pending(
             &mut self.session,
@@ -1867,11 +2318,60 @@ impl Decoder for H265Decoder<'_> {
     type Error = VulkanError;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.run_bytes(packet.data(), false)
+        self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.flush_inner(false)
+    }
+}
+
+impl OverlappedDecode for H265Decoder<'_> {
+    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), false, DrainMode::Overlap)
+    }
+
+    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        collect_ready(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )
+    }
+
+    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        collect_oldest(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+        )
+    }
+
+    fn collect_next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        collect_oldest_timeout(
+            &mut self.session,
+            &mut self.sink,
+            &mut self.pending,
+            &mut self.stats,
+            timeout,
+        )
+    }
+
+    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner(false)
+    }
+
+    fn inflight_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn take_timings(&mut self) -> Vec<PhaseTiming> {
+        self.sink.take_timings()
     }
 }
 
@@ -2231,21 +2731,52 @@ impl<'a> Av1Decoder<'a> {
         Ok(())
     }
 
+    /// Submit one picture, then collect per `mode`.
+    fn run_picture(
+        &mut self,
+        picture: &crate::parse::refs::Av1Picture,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        if mode == DrainMode::Overlap {
+            while self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                out.extend(self.collect_one()?);
+            }
+        }
+        self.submit_picture(picture, gpu)?;
+        match mode {
+            DrainMode::Sync => {
+                if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                    out.extend(self.drain()?);
+                }
+            }
+            DrainMode::Overlap => {
+                out.extend(self.collect_ready_pictures()?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Run one temporal unit through the context, submitting its pictures.
     fn run_unit(
         &mut self,
         unit: &crate::parse::av1::TemporalUnit<'_>,
         gpu: bool,
+        mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         use crate::parse::refs::Av1Instruction;
         let mut out = Vec::new();
         for instruction in self.context.compile(unit)? {
             match instruction {
                 Av1Instruction::Sequence(seq) => {
-                    let drained = self.drain()?;
-                    out.extend(drained);
+                    let changed = self.seq.as_ref().is_none_or(|cur| cur != &seq);
+                    if changed {
+                        let drained = self.drain()?;
+                        out.extend(drained);
+                    }
                     self.tables.insert(&seq);
-                    if self.seq.as_ref().is_some_and(|cur| cur != &seq) {
+                    if changed {
                         self.session = None;
                         self.shown.clear();
                     }
@@ -2256,10 +2787,7 @@ impl<'a> Av1Decoder<'a> {
                         return Err(VulkanError::NoSession);
                     };
                     self.ensure_session(&seq, picture.header().display_size())?;
-                    self.submit_picture(picture.as_ref(), gpu)?;
-                    if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                        out.extend(self.drain()?);
-                    }
+                    out.extend(self.run_picture(picture.as_ref(), gpu, mode)?);
                 }
                 Av1Instruction::ShowExisting { id, releases } => {
                     let drained = self.drain()?;
@@ -2294,53 +2822,130 @@ impl<'a> Av1Decoder<'a> {
         Ok(out)
     }
 
-    /// Collect every submitted picture, retaining reference frames.
-    fn drain(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+    /// Retain `frames` for show-existing displays, dropping unshown ones.
+    fn finish_retained(
+        &mut self,
+        emit: bool,
+        show_id: Option<ReferenceId>,
+        pair: Option<&Arc<ExportPair>>,
+        frames: Vec<VulkanFrame>,
+    ) -> Vec<VulkanFrame> {
+        if let Some(id) = show_id {
+            for frame in &frames {
+                let cpu = frame
+                    .device_export()
+                    .is_none()
+                    .then(|| frame.bytes().clone());
+                self.shown.insert(
+                    id,
+                    frame.identity().size(),
+                    cpu,
+                    pair.cloned(),
+                    frame.layout(),
+                );
+            }
+        }
+        if emit {
+            frames
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Collect the oldest submitted picture, retaining reference frames.
+    ///
+    /// Empty when nothing is submitted.
+    fn collect_one(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
         };
-        let mut out = Vec::new();
-        for picture in self.pending.drain(..) {
-            let emit = picture.emit;
-            let show_id = picture.show_id;
-            let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
-            let frames = collect_pending(session, &mut self.sink, picture)?;
-            if let Some(id) = show_id {
-                for frame in &frames {
-                    let cpu = frame
-                        .device_export()
-                        .is_none()
-                        .then(|| frame.bytes().clone());
-                    self.shown.insert(
-                        id,
-                        frame.identity().size(),
-                        cpu,
-                        pair.clone(),
-                        frame.layout(),
-                    );
-                }
-            }
-            if emit {
-                out.extend(frames);
-            }
+        let picture = self.pending.remove(0);
+        let emit = picture.emit;
+        let show_id = picture.show_id;
+        let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
+        let (frames, timing) = collect_pending(session, &mut self.sink, picture)?;
+        fold_collection(session, &mut self.sink, &mut self.stats, timing);
+        Ok(self.finish_retained(emit, show_id, pair.as_ref(), frames))
+    }
+
+    /// Collect the oldest submitted picture, waiting up to `timeout` for it.
+    ///
+    /// `None` reports the lapsed budget with the picture still pending.
+    /// Empty when nothing is submitted.
+    fn collect_one_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        if self.pending.is_empty() {
+            return Ok(Some(Vec::new()));
         }
-        let snapshot = session.submit_stats();
-        self.stats.peak_inflight = self.stats.peak_inflight.max(snapshot.peak_inflight);
-        self.stats.resets += session.take_resets();
+        let Some(session) = self.session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
+        let picture = self.pending.remove(0);
+        let emit = picture.emit;
+        let show_id = picture.show_id;
+        let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
+        let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        let start = Instant::now();
+        if !session.wait_pending_timeout(picture.pending, budget)? {
+            self.pending.insert(0, picture);
+            return Ok(None);
+        }
+        let (frames, timing) = stage_waited(session, &mut self.sink, picture, start.elapsed())?;
+        fold_collection(session, &mut self.sink, &mut self.stats, timing);
+        Ok(Some(self.finish_retained(
+            emit,
+            show_id,
+            pair.as_ref(),
+            frames,
+        )))
+    }
+
+    /// Collect signaled pictures in order, stopping at the first pending one.
+    fn collect_ready_pictures(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        loop {
+            let ready = match (self.session.as_ref(), self.pending.first()) {
+                (Some(session), Some(picture)) => session.is_ready(picture.pending)?,
+                _ => false,
+            };
+            if !ready {
+                break;
+            }
+            out.extend(self.collect_one()?);
+        }
+        Ok(out)
+    }
+
+    /// Collect every submitted picture, retaining reference frames.
+    fn drain(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        while !self.pending.is_empty() {
+            out.extend(self.collect_one()?);
+        }
         Ok(out)
     }
 
     /// Decode raw OBU bytes, returning display-ready frames.
-    fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
+    fn run_bytes(
+        &mut self,
+        bytes: &[u8],
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         let obus = crate::parse::av1::split_obus(bytes)?;
         for unit in crate::parse::av1::temporal_units(obus) {
-            out.extend(self.run_unit(&unit, gpu)?);
+            out.extend(self.run_unit(&unit, gpu, mode)?);
         }
-        out.extend(self.drain()?);
+        match mode {
+            DrainMode::Sync => out.extend(self.drain()?),
+            DrainMode::Overlap => out.extend(self.collect_ready_pictures()?),
+        }
         Ok(out)
     }
 
@@ -2353,7 +2958,7 @@ impl<'a> Av1Decoder<'a> {
     ///
     /// Returns `Err` when the backend cannot decode `packet` or export it.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), true)
+        self.run_bytes(packet.data(), true, DrainMode::Sync)
     }
 
     /// Surface frames held back for reordering or buffering.
@@ -2378,11 +2983,44 @@ impl Decoder for Av1Decoder<'_> {
     type Error = VulkanError;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.run_bytes(packet.data(), false)
+        self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.flush_inner()
+    }
+}
+
+impl OverlappedDecode for Av1Decoder<'_> {
+    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), false, DrainMode::Overlap)
+    }
+
+    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.collect_ready_pictures()
+    }
+
+    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.collect_one()
+    }
+
+    fn collect_next_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        self.collect_one_timeout(timeout)
+    }
+
+    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner()
+    }
+
+    fn inflight_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn take_timings(&mut self) -> Vec<PhaseTiming> {
+        self.sink.take_timings()
     }
 }
 

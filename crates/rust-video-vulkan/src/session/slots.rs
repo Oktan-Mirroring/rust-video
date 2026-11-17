@@ -198,6 +198,15 @@ impl SubmitSlots {
         }
     }
 
+    /// True once the fence behind `index` signals, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the fence query fails.
+    pub(crate) fn signaled(&self, index: usize) -> Result<bool, VulkanError> {
+        self.slots[index].fence.signaled()
+    }
+
     /// Wait `index` out, then free it plus any completed siblings.
     ///
     /// The wait runs outside the queue lock. A timeout or wait failure
@@ -209,10 +218,26 @@ impl SubmitSlots {
     /// Returns `Err` on timeout, on wait failure, or when the reset
     /// after either fails.
     pub(crate) fn poll(&mut self, index: usize) -> Result<(), VulkanError> {
+        self.poll_timeout(index, crate::raw::SUBMIT_TIMEOUT_NS)
+    }
+
+    /// Wait `index` out up to `timeout_ns`, then free completed slots.
+    ///
+    /// Same reset contract as [`poll`](Self::poll) under a caller budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on timeout, on wait failure, or when the reset
+    /// after either fails.
+    pub(crate) fn poll_timeout(
+        &mut self,
+        index: usize,
+        timeout_ns: u64,
+    ) -> Result<(), VulkanError> {
         if self.poisoned {
             self.reset_ring()?;
         }
-        match self.slots[index].fence.wait(crate::raw::SUBMIT_TIMEOUT_NS) {
+        match self.slots[index].fence.wait(timeout_ns) {
             Ok(true) => {
                 self.slots[index].busy = false;
                 self.free_completed()?;
@@ -223,6 +248,37 @@ impl SubmitSlots {
                 self.reset_ring()?;
                 Err(VulkanError::Timeout)
             }
+            Err(error) => {
+                eprintln!("vulkan: fence wait failed ({error}); resetting");
+                self.reset_ring()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Wait `index` out up to `timeout_ns`, leaving the ring intact on lapse.
+    ///
+    /// `Ok(false)` reports the lapsed budget; the completion stays
+    /// pending for a later wait. A failed wait still resets the ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on wait failure, or when the reset after it fails.
+    pub(crate) fn try_poll_timeout(
+        &mut self,
+        index: usize,
+        timeout_ns: u64,
+    ) -> Result<bool, VulkanError> {
+        if self.poisoned {
+            self.reset_ring()?;
+        }
+        match self.slots[index].fence.wait(timeout_ns) {
+            Ok(true) => {
+                self.slots[index].busy = false;
+                self.free_completed()?;
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
             Err(error) => {
                 eprintln!("vulkan: fence wait failed ({error}); resetting");
                 self.reset_ring()?;
