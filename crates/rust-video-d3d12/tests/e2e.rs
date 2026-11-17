@@ -8,13 +8,21 @@
 //! pictures (320x240 main profile, every picture an IDR). Vector
 //! `tests/vectors/inter_320x240.hevc` holds 15 ffmpeg testsrc2
 //! pictures (320x240 main profile, IDR at 0 and CRA at 8 with B
-//! reordering).
+//! reordering). Vector `tests/vectors/valid_320x240.obu` holds 15
+//! ffmpeg testsrc2 frames (320x240, reordered with show-existing
+//! display); `examples/common/av1.rs` loads and splits it.
 
 #![cfg(target_os = "windows")]
 
+#[path = "../examples/common/av1.rs"]
+mod av1;
+
 use std::path::PathBuf;
 
-use rust_video_d3d12::{Codec, D3d12Device, D3d12Frame, H264Decoder, HevcDecoder, Transcoder};
+use av1::{split_obus, tu_packets};
+use rust_video_d3d12::{
+    Av1Decoder, Codec, D3d12Device, D3d12Frame, H264Decoder, HevcDecoder, Transcoder,
+};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
@@ -161,6 +169,125 @@ fn hevc_inter_vector_decodes_on_gpu() {
     );
     assert_eq!(total, PICTURES, "vector yields every picture");
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
+}
+
+/// AV1 vector frames decode on the GPU.
+#[test]
+fn av1_vector_decodes_on_gpu() {
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let raws = tu_packets(&data);
+    assert_eq!(raws.len(), 16, "vector holds one packet per unit");
+    let mut decoder = Av1Decoder::open(&device);
+    let total = decode_all(&mut decoder, &raws);
+    println!(
+        "av1 decode: {total} frames, resets={} max_inflight={}",
+        decoder.resets(),
+        decoder.max_inflight()
+    );
+    assert_eq!(total, PICTURES, "vector yields every frame");
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+}
+
+/// Whole-file AV1 packet queues submits before the first wait.
+#[test]
+fn av1_overlap_queues_before_first_wait() {
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let raw = std::fs::read(av1::vector()).expect("vector readable");
+    let mut decoder = Av1Decoder::open(&device);
+    let packet = Packet::new(Bytes::from(raw));
+    let mut frames = decoder.decode(&packet).expect("whole-file decode");
+    frames.extend(decoder.flush().expect("flush drains"));
+    let inflight = decoder.max_inflight();
+    println!(
+        "overlap: {} frames from one packet, max_inflight={inflight} resets={}",
+        frames.len(),
+        decoder.resets()
+    );
+    assert_eq!(frames.len(), PICTURES, "whole file yields every frame");
+    assert!(
+        inflight > 1,
+        "overlap needs inflight above 1, got {inflight}"
+    );
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+}
+
+/// Skipped key fails once, then the stream recovers clean.
+#[test]
+fn av1_reset_after_failure_recovers() {
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let raws = tu_packets(&data);
+    let obus = split_obus(&data);
+    let mut decoder = Av1Decoder::open(&device);
+    for (unit_type, obu) in obus.iter().take(2) {
+        assert_ne!(*unit_type, 6, "prefix holds no frame");
+        let packet = Packet::new(Bytes::copy_from_slice(obu));
+        decoder.decode(&packet).expect("sequence opens the stream");
+    }
+    assert_eq!(decoder.resets(), 0, "open never resets");
+    let inter = obus
+        .iter()
+        .filter(|(unit_type, _)| *unit_type == 6)
+        .nth(1)
+        .expect("vector holds an inter frame")
+        .1
+        .clone();
+    let skipped = Packet::new(Bytes::from(inter));
+    let Err(error) = decoder.decode(&skipped) else {
+        panic!("skipped key fails")
+    };
+    println!("failure: {error}");
+    assert!(
+        error.to_string().contains("names empty slot"),
+        "intended trigger, got {error}"
+    );
+    assert_eq!(decoder.resets(), 1, "failure resets once");
+    let total = decode_all(&mut decoder, &raws);
+    println!("recovery: {total} frames, resets={}", decoder.resets());
+    assert_eq!(total, PICTURES, "recovery yields every frame");
+    assert_eq!(decoder.resets(), 1, "recovery adds no reset");
+}
+
+/// AV1 hardware NV12 bytes match the ffmpeg software oracle byte-exact.
+#[test]
+fn av1_hardware_matches_software_oracle() {
+    const FRAME_BYTES: usize = 320 * 240 * 3 / 2;
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let path = av1::vector();
+    let data = std::fs::read(&path).expect("vector readable");
+    let raws = tu_packets(&data);
+    assert_eq!(raws.len(), 16, "vector holds one packet per unit");
+    let mut decoder = Av1Decoder::open(&device);
+    let mut frames = Vec::new();
+    for (index, raw) in raws.iter().enumerate() {
+        let packet = Packet::new(Bytes::copy_from_slice(raw));
+        match decoder.decode(&packet) {
+            Ok(out) => frames.extend(out),
+            Err(error) => panic!("steady packet {index}: {error}"),
+        }
+    }
+    frames.extend(decoder.flush().expect("flush drains"));
+    assert_eq!(frames.len(), PICTURES, "steady vector yields every frame");
+    parity(&path, &frames, FRAME_BYTES);
+}
+
+/// Open device with the AV1 profile, loud skip without either.
+fn device_for_av1() -> Option<D3d12Device> {
+    let device = device()?;
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return None;
+    }
+    Some(device)
 }
 
 /// Skipped HEVC references fail once, then the stream recovers clean.

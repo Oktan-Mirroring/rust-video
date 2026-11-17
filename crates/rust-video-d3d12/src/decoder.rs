@@ -142,6 +142,7 @@ macro_rules! shell {
     };
 }
 
+#[cfg(not(target_os = "windows"))]
 shell!(
     Av1Decoder,
     Av1,

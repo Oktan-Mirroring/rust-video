@@ -1,6 +1,6 @@
 //! D3D12 video decode: picture arguments plus GPU submission.
 //!
-//! H.264 and HEVC decode through their DPBs.
+//! H.264, HEVC, and AV1 decode through their DPBs.
 //!
 //! <https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D12/>
@@ -13,7 +13,8 @@ use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 use crate::dxva::{
-    PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264, SliceShortHevc,
+    PicParamsAv1, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264,
+    SliceShortHevc, TileAv1,
 };
 use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::Crop;
@@ -121,6 +122,19 @@ pub(crate) struct HevcSubmission {
     /// Slice control entries.
     pub(crate) slices: Vec<SliceShortHevc>,
     /// Start-coded slices padded to 128 bytes.
+    pub(crate) bitstream: Vec<u8>,
+    /// Output texture slot.
+    pub(crate) slot: u8,
+}
+
+/// AV1 picture arguments for one `DecodeFrame` call.
+#[derive(Debug)]
+pub(crate) struct Av1Submission {
+    /// Picture parameters.
+    pub(crate) params: PicParamsAv1,
+    /// Tile control entries.
+    pub(crate) tiles: Vec<TileAv1>,
+    /// Concatenated tile payloads padded to 128 bytes.
     pub(crate) bitstream: Vec<u8>,
     /// Output texture slot.
     pub(crate) slot: u8,
@@ -402,7 +416,10 @@ impl DecodeSession {
         crop: Option<Crop>,
         queues: Option<DecodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
+        if codec != crate::guid::Codec::H264
+            && codec != crate::guid::Codec::Hevc
+            && codec != crate::guid::Codec::Av1
+        {
             return Err(D3d12Error::Unsupported(
                 UnsupportedReason::PictureArgsPending { codec },
             ));
@@ -994,6 +1011,25 @@ impl DecodeSession {
         Ok(ticket)
     }
 
+    /// `submission` through the video queue into its pool slot.
+    ///
+    /// The ticket completes before the next submit reuses the pool barriers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` past the bitstream buffer, or when the
+    /// driver refuses the picture.
+    pub(crate) fn submit_av1(&mut self, submission: &Av1Submission) -> Result<Ticket, D3d12Error> {
+        Self::check_bitstream_len(submission.bitstream.len())?;
+        let (upload, upload_index) = self.acquire_bitstream()?;
+        DeviceResources::write_upload(&upload, &submission.bitstream)?;
+        let mut refs = self.ref_tables();
+        let input = self.input_args_av1(submission, &mut refs, &upload)?;
+        let ticket = self.submit_video(&input, submission.slot)?;
+        self.bitstream_busy[upload_index] = Some(ticket);
+        Ok(ticket)
+    }
+
     /// Bitstream length against the upload capacity.
     fn check_bitstream_len(len: usize) -> Result<(), D3d12Error> {
         if u64::try_from(len).unwrap_or(u64::MAX) > BITSTREAM_CAP {
@@ -1139,6 +1175,53 @@ impl DecodeSession {
             NumFrameArguments: 3,
             FrameArguments: args,
             ReferenceFrames: references,
+            CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
+                pBuffer: ManuallyDrop::new(Some(bitstream.clone())),
+                Offset: 0,
+                Size: bitstream_len,
+            },
+            pHeap: ManuallyDrop::new(Some(self.heap.clone())),
+        })
+    }
+
+    /// AV1 decode input arguments borrowing `submission` plus `refs`.
+    ///
+    /// Two frame arguments: AV1 carries no inverse quantization matrix.
+    fn input_args_av1(
+        &self,
+        submission: &Av1Submission,
+        refs: &mut RefTables,
+        bitstream: &ID3D12Resource,
+    ) -> Result<D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS, D3d12Error> {
+        let params_len = u32::try_from(std::mem::size_of::<PicParamsAv1>())
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
+        let tiles_len =
+            u32::try_from(std::mem::size_of::<TileAv1>().saturating_mul(submission.tiles.len()))
+                .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureArgsTooLarge))?;
+        let bitstream_len = u64::try_from(submission.bitstream.len())
+            .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
+        let mut args = [D3D12_VIDEO_DECODE_FRAME_ARGUMENT::default(); 10];
+        args[0] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
+            Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS,
+            Size: params_len,
+            pData: std::ptr::from_ref(&submission.params)
+                .cast_mut()
+                .cast::<c_void>(),
+        };
+        args[1] = D3D12_VIDEO_DECODE_FRAME_ARGUMENT {
+            Type: D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL,
+            Size: tiles_len,
+            pData: submission.tiles.as_ptr().cast_mut().cast::<c_void>(),
+        };
+        Ok(D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS {
+            NumFrameArguments: 2,
+            FrameArguments: args,
+            ReferenceFrames: D3D12_VIDEO_DECODE_REFERENCE_FRAMES {
+                NumTexture2Ds: u32::try_from(POOL).unwrap_or(u32::MAX),
+                ppTexture2Ds: refs.textures.as_mut_ptr(),
+                pSubresources: refs.subs.as_mut_ptr(),
+                ppHeaps: std::ptr::null_mut(),
+            },
             CompressedBitstream: D3D12_VIDEO_DECODE_COMPRESSED_BITSTREAM {
                 pBuffer: ManuallyDrop::new(Some(bitstream.clone())),
                 Offset: 0,

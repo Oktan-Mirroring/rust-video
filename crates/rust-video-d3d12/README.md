@@ -1,10 +1,10 @@
 # rust-video-d3d12
 
-Direct3D 12 tier for Windows: H.264 and IDR-only HEVC decode, video encoder encode, and GPU transcode behind the caps traits.
+Direct3D 12 tier for Windows: H.264, HEVC, and AV1 decode, video encoder encode, and GPU transcode behind the caps traits.
 
 ## Decode
 
-`D3d12Device::open` probes the adapter and feature level, and declines machines it cannot run on with `D3d12Error::Skipped`, naming the cause in `SkipReason`; the runners print `SKIP` and exit. Decode needs tier 2 or later; tier 1 fails loud with `DecodeTier1`. `H264Decoder` carries a full decoded picture buffer while `HevcDecoder` is IDR-only: inter pictures decline with `InterPictureNeedsReferences` and non-IDR intra pictures with `NonIdrIntraNeedsPocTracking`. `Av1Decoder`, `Mpeg2Decoder`, `Vc1Decoder`, and `Vp9Decoder` are shell decoders: profile probe only, a loud typed error per packet, empty flush.
+`D3d12Device::open` probes the adapter and feature level, and declines machines it cannot run on with `D3d12Error::Skipped`, naming the cause in `SkipReason`; the runners print `SKIP` and exit. Decode needs tier 2 or later; tier 1 fails loud with `DecodeTier1`. `H264Decoder` carries a full decoded picture buffer, `HevcDecoder` an HEVC picture buffer with reorder output, and `Av1Decoder` AV1 reference slots with show-existing display. `Mpeg2Decoder`, `Vc1Decoder`, and `Vp9Decoder` are shell decoders: profile probe only, a loud typed error per packet, empty flush.
 
 ```rust
 use rust_video_caps::packet::Packet;

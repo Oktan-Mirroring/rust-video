@@ -3,6 +3,10 @@
 //! Single-picture sessions over video command lists with loud fallbacks.
 
 #[cfg(target_os = "windows")]
+mod av1;
+#[cfg(target_os = "windows")]
+mod av1_dpb;
+#[cfg(target_os = "windows")]
 mod bits;
 #[cfg(target_os = "windows")]
 mod decode;
@@ -46,9 +50,11 @@ mod texture;
 #[cfg(target_os = "windows")]
 mod transcode;
 
-pub use decoder::{Av1Decoder, D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
+#[cfg(not(target_os = "windows"))]
+pub use decoder::Av1Decoder;
+pub use decoder::{D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
-pub use decoder_os::{H264Decoder, HevcDecoder, OverlappedH264Pump, PhaseTiming};
+pub use decoder_os::{Av1Decoder, H264Decoder, HevcDecoder, OverlappedH264Pump, PhaseTiming};
 #[cfg(target_os = "windows")]
 pub use delivery::DecoderPump;
 pub use device::D3d12Device;

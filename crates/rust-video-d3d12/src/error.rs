@@ -14,6 +14,12 @@ pub enum BrokenReferenceReason {
     /// Marking sweep names an absent picture.
     #[error("marking target absent")]
     MarkingTargetAbsent,
+    /// Reference naming an empty slot.
+    #[error("{reference} names empty slot")]
+    NamesEmptySlot {
+        /// Reference naming the empty slot.
+        reference: &'static str,
+    },
     /// Sliding window finds no short-term picture.
     #[error("no short-term to slide")]
     NoShortTermToSlide,
@@ -95,12 +101,27 @@ pub enum ParseReason {
     /// Coded size of zero.
     #[error("empty coded size")]
     EmptyCodedSize,
+    /// Frame before its sequence header.
+    #[error("frame before sequence header")]
+    FrameBeforeSequenceHeader,
     /// Crop extends past the coded size.
     #[error("frame_crop outside coded size")]
     FrameCropOutsideCodedSize,
     /// Gap with gaps forbidden by the sequence.
     #[error("frame_num gap with gaps forbidden")]
     FrameNumGapForbidden,
+    /// Frame size above the sequence maximum.
+    #[error("frame size above sequence maximum")]
+    FrameSizeAboveSequenceMaximum,
+    /// Frame without tile data.
+    #[error("frame without tile data")]
+    FrameWithoutTileData,
+    /// Frame without tiles.
+    #[error("frame without tiles")]
+    FrameWithoutTiles,
+    /// Tile group short of its tiles.
+    #[error("incomplete tile group")]
+    IncompleteTileGroup,
     /// NAL `forbidden_zero_bit` set.
     #[error("nal forbidden bit")]
     NalForbiddenBit,
@@ -110,6 +131,18 @@ pub enum ParseReason {
     /// Non-intra slice inside an IDR picture.
     #[error("non-intra slice in IDR")]
     NonIntraSliceInIdr,
+    /// OBU extension reserved bits set.
+    #[error("obu extension reserved bits")]
+    ObuExtensionReservedBits,
+    /// OBU `forbidden_zero_bit` set.
+    #[error("obu forbidden bit")]
+    ObuForbiddenBit,
+    /// OBU reserved bit set.
+    #[error("obu reserved bit")]
+    ObuReservedBit,
+    /// OBU size past its payload.
+    #[error("obu size exceeds payload")]
+    ObuSizeExceedsPayload,
     /// Signed Exp-Golomb code exceeds `i32`.
     #[error("{syntax} overflows i32")]
     OverflowI32 {
@@ -152,9 +185,15 @@ pub enum ParseReason {
         /// Syntax element under parse.
         syntax: &'static str,
     },
+    /// Redundant header against the first.
+    #[error("redundant header mismatch")]
+    RedundantHeaderMismatch,
     /// Reference with zero reference frames.
     #[error("reference with zero ref frames")]
     ReferenceWithZeroRefFrames,
+    /// Reserved OBU type.
+    #[error("reserved obu type")]
+    ReservedObuType,
     /// Short-term set past its size.
     #[error("short_term_ref_pic_set size")]
     ShortTermRefPicSetSize,
@@ -173,6 +212,18 @@ pub enum ParseReason {
     /// Sequence set without a body.
     #[error("sps without body")]
     SpsWithoutBody,
+    /// Tile grid short of the frame.
+    #[error("tile grid coverage")]
+    TileGridCoverage,
+    /// Tile groups out of order.
+    #[error("tile group order")]
+    TileGroupOrder,
+    /// Tile group without data.
+    #[error("tile group without data")]
+    TileGroupWithoutData,
+    /// Tile group without a frame header.
+    #[error("tile group without frame header")]
+    TileGroupWithoutFrameHeader,
     /// Element wider than 32 bits.
     #[error("{syntax} wider than 32 bits")]
     TooWide {
@@ -219,6 +270,18 @@ pub enum UnsupportedReason {
     /// Slices out of decode order.
     #[error("arbitrary slice order")]
     ArbitrarySliceOrder,
+    /// AV1 bit depth above the 8-bit target.
+    #[error("av1 {depth}-bit needs a {depth}-bit target")]
+    Av1BitDepthNeedsTarget {
+        /// Sequence bit depth.
+        depth: u8,
+    },
+    /// AV1 chroma outside 4:2:0.
+    #[error("av1 chroma outside 4:2:0")]
+    Av1ChromaOutside420,
+    /// AV1 monochrome.
+    #[error("av1 monochrome")]
+    Av1Monochrome,
     /// Driver bitstream above the length cap.
     #[error("bitstream too large")]
     BitstreamTooLarge,
@@ -396,6 +459,9 @@ pub enum UnsupportedReason {
     /// Reference picture sets.
     #[error("reference sets pending")]
     ReferenceSetsPending,
+    /// Render size against the frame size.
+    #[error("render size differs from frame size")]
+    RenderSizeDiffersFromFrameSize,
     /// Reserved slice type.
     #[error("reserved slice type")]
     ReservedSliceType,
@@ -420,6 +486,9 @@ pub enum UnsupportedReason {
     /// SP/SI slices.
     #[error("sp/si slices")]
     SpSiSlices,
+    /// Spatial layers.
+    #[error("spatial layers")]
+    SpatialLayers,
     /// Sequence-set extension data.
     #[error("sps extension pending")]
     SpsExtensionPending,
@@ -429,12 +498,21 @@ pub enum UnsupportedReason {
     /// Temporal sublayers.
     #[error("sublayers")]
     Sublayers,
+    /// Superres upscale.
+    #[error("superres upscale")]
+    SuperresUpscale,
     /// Texture extent outside the session.
     #[error("texture extent outside session")]
     TextureExtentOutsideSession,
+    /// Tile count above 256.
+    #[error("tile count above 256")]
+    TileCountAbove256,
     /// Tile grid.
     #[error("tile grid pending")]
     TileGridPending,
+    /// Tile list.
+    #[error("tile list")]
+    TileList,
     /// Transform bypass.
     #[error("transform bypass")]
     TransformBypass,

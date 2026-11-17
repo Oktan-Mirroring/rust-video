@@ -869,6 +869,11 @@ pub(crate) struct Output {
 }
 
 impl Output {
+    /// Output naming `slot`.
+    pub(crate) const fn from_slot(slot: u8) -> Self {
+        Self { slot }
+    }
+
     /// Output surface slot.
     pub(crate) const fn slot(&self) -> u8 {
         self.slot

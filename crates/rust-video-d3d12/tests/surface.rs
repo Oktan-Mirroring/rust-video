@@ -4,12 +4,15 @@
 
 #![cfg(target_os = "windows")]
 
+#[path = "../examples/common/av1.rs"]
+mod av1;
 #[path = "../examples/common/hevc.rs"]
 mod hevc;
 
 use std::path::PathBuf;
 
-use rust_video_d3d12::{D3d12Device, D3d12Error, H264Decoder, HevcDecoder};
+use av1::tu_packets;
+use rust_video_d3d12::{Av1Decoder, Codec, D3d12Device, D3d12Error, H264Decoder, HevcDecoder};
 
 use bytes::Bytes;
 use rust_video_caps::frame::{GpuExport, PixelFormat};
@@ -191,6 +194,81 @@ fn h264_held_surface_leaves_other_slots_open() {
         assert_eq!(surfaces.len(), 1);
     }
     drop(held);
+}
+
+/// Reordered AV1 displays exactly as coded: held head, then one per call.
+#[test]
+fn av1_reorder_holds_back_unchanged() {
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let raws = tu_packets(&data);
+    assert_eq!(raws.len(), 16, "vector holds one packet per unit");
+    let mut decoder = Av1Decoder::open(&device);
+    let mut counts = Vec::new();
+    for raw in &raws {
+        let packet = Packet::new(Bytes::copy_from_slice(raw));
+        counts.push(decoder.decode(&packet).expect("steady decode").len());
+    }
+    counts.push(decoder.flush().expect("flush drains").len());
+    assert_eq!(
+        counts.as_slice(),
+        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+        "display pattern unchanged"
+    );
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+}
+
+/// AV1 surfaces match frames with contract metadata.
+#[test]
+fn av1_surfaces_match_frames() {
+    let Some(device) = device_for_av1() else {
+        return;
+    };
+    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let raws = tu_packets(&data);
+    assert_eq!(raws.len(), 16, "vector holds one packet per unit");
+    let mut decoder = Av1Decoder::open(&device);
+    let mut total = 0;
+    for raw in &raws {
+        let packet = Packet::new(Bytes::copy_from_slice(raw));
+        for surface in decoder.decode_surface(&packet).expect("steady decode") {
+            surface.wait().expect("surface completes");
+            if total == 0 {
+                assert_eq!(surface.size().width(), 320);
+                assert_eq!(surface.size().height(), 240);
+                assert_eq!(surface.format(), PixelFormat::Nv12);
+                assert!(surface.slice() < 16, "slice inside the pool");
+                assert_eq!(surface.coded().width(), 320);
+                assert_eq!(surface.coded().height(), 240);
+                assert_eq!(surface.origin(), (0, 0));
+                match surface.export() {
+                    GpuExport::NtHandle { handle } => assert_ne!(handle, 0),
+                    GpuExport::Opaque { name } => assert_eq!(name, "d3d12"),
+                    _ => panic!("unproven export shape"),
+                }
+                let _ = surface.texture();
+            }
+            total += 1;
+        }
+    }
+    for surface in decoder.flush_surface().expect("flush drains") {
+        surface.wait().expect("surface completes");
+        total += 1;
+    }
+    assert_eq!(total, 15, "every frame surfaces");
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+}
+
+/// Open device with the AV1 profile, loud skip without either.
+fn device_for_av1() -> Option<D3d12Device> {
+    let device = device()?;
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return None;
+    }
+    Some(device)
 }
 
 /// Device exposes its native handles by reference.

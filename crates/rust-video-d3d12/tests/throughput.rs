@@ -12,7 +12,7 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
 use rust_video_d3d12::{
-    D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
+    Av1Decoder, D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
 };
 use rust_video_harness::H264Synth;
 use rust_video_harness::{bench_dir, AnnexB, Synth};
@@ -257,6 +257,44 @@ fn decode_hevc_1080p_measures_realtime() {
     );
 }
 
+/// 1080p AV1 decode measured against the realtime bar.
+#[test]
+fn decode_av1_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return;
+    }
+    let mut decoder = Av1Decoder::open(&device);
+    let data = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
+    let raws = vec![data];
+    let measured = match decode_fps(&mut decoder, &raws, &raws) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("SKIP: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 av1 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
@@ -425,6 +463,50 @@ fn decode_hevc_surface_1080p_measures_realtime() {
         Err(error) => panic!("warmup decode: {error}"),
     };
     println!("d3d12 hevc surface 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p AV1 surface decode measured against the realtime bar.
+#[test]
+fn decode_av1_surface_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return;
+    }
+    let mut decoder = Av1Decoder::open(&device);
+    let data = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
+    let raws = vec![data];
+    let measured = match surface_fps(
+        &mut decoder,
+        Av1Decoder::decode_surface,
+        Av1Decoder::flush_surface,
+        &raws,
+        &raws,
+    ) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("SKIP: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 av1 surface 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
