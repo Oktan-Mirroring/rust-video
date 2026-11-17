@@ -9,6 +9,7 @@ use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::VaSliceParameterBufferAv1;
 use crate::frontend::SurfaceSlot;
+use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 
 use rust_video_caps::packet::Packet;
@@ -32,6 +33,8 @@ pub struct Av1Decoder<'a> {
     shared: Option<SharedDevice>,
     /// Next frame generation number.
     generation: u64,
+    /// Decoded surfaces awaiting sync plus copy.
+    pending: PendingQueue,
     /// Scratch slice parameters, reused across pictures.
     slice_params: Vec<VaSliceParameterBufferAv1>,
 }
@@ -46,6 +49,7 @@ impl<'a> Av1Decoder<'a> {
             backend: None,
             shared: None,
             generation: 0,
+            pending: PendingQueue::new(PendingQueue::DEFAULT_DEPTH),
             slice_params: Vec::new(),
         }
     }
@@ -96,6 +100,27 @@ impl<'a> Av1Decoder<'a> {
         self.backend.as_ref().map(Backend::stats)
     }
 
+    /// Phase timings of the live context, absent before the first sequence header.
+    #[must_use]
+    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+        self.backend.as_ref().map(Backend::phase_stats)
+    }
+
+    /// Submitted-ahead ceiling, 1..=4.
+    #[must_use]
+    pub fn pipeline_depth(&self) -> usize {
+        self.pending.depth()
+    }
+
+    /// Submitted-ahead ceiling, clamped to 1..=4.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - submits ahead of a sync; one syncs every picture first.
+    pub fn set_pipeline_depth(&mut self, depth: usize) {
+        self.pending.set_depth(depth);
+    }
+
     /// Decode `packet`, reading back pixels when `readback` holds.
     fn decode_inner(
         &mut self,
@@ -106,6 +131,7 @@ impl<'a> Av1Decoder<'a> {
         let mut ingest = self.frontend.ingest(&owned)?;
         let mut frames = Vec::new();
         if ingest.reconfigured() {
+            self.emit_all(&mut frames)?;
             self.maybe_drop_backend();
         }
         for pending in ingest.frames() {
@@ -120,6 +146,7 @@ impl<'a> Av1Decoder<'a> {
         if let Some(pending) = self.frontend.take_pending()? {
             self.decode_frame(pending, &mut frames, readback)?;
         }
+        self.emit_all(&mut frames)?;
         Ok(frames)
     }
 
@@ -137,9 +164,9 @@ impl<'a> Av1Decoder<'a> {
             }
             Begun::Picture(picture) => {
                 let picture = picture.as_ref();
-                let slot = self.acquire_slot(None)?;
+                let slot = self.acquire_pipelined(frames, None)?;
                 let display = if picture.header().film_grain_params.apply.apply_grain {
-                    Some(self.acquire_slot(Some(slot.index()))?)
+                    Some(self.acquire_pipelined(frames, Some(slot.index()))?)
                 } else {
                     None
                 };
@@ -232,6 +259,90 @@ impl<'a> Av1Decoder<'a> {
         })
     }
 
+    /// Free pool slot past `except`, emitting staged reads when pinned.
+    fn acquire_pipelined(
+        &mut self,
+        frames: &mut Vec<VaApiFrame>,
+        except: Option<u32>,
+    ) -> Result<SurfaceSlot, VaApiError> {
+        loop {
+            match self.acquire_slot(except) {
+                Ok(slot) => return Ok(slot),
+                Err(error) if self.pending.is_empty() => return Err(error),
+                Err(_) => self.emit_oldest(frames)?,
+            }
+        }
+    }
+
+    /// Stage `slots` behind the holdback, reserving generations.
+    fn stage_emit(
+        &mut self,
+        slots: Vec<SurfaceSlot>,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+    ) -> Result<(), VaApiError> {
+        let guards = {
+            let (backend, _) = self.active()?;
+            slots
+                .iter()
+                .map(|slot| {
+                    backend.surface_guard(slot.index()).ok_or_else(|| {
+                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (slot, guard) in slots.into_iter().zip(guards) {
+            let generation = self.generation;
+            self.generation = self.generation.wrapping_add(1);
+            self.pending
+                .push(PendingSlot::new(slot, size, crop, generation, guard));
+        }
+        Ok(())
+    }
+
+    /// Frames for staged slots past the holdback.
+    fn emit_ready(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        while let Some(staged) = self.pending.pop_ready() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frames for every staged slot, oldest first.
+    fn emit_all(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        while let Some(staged) = self.pending.pop_oldest() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frame for the oldest staged slot, if any.
+    fn emit_oldest(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        if let Some(staged) = self.pending.pop_oldest() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frame for one staged slot.
+    fn emit_one(
+        &mut self,
+        staged: &PendingSlot,
+        frames: &mut Vec<VaApiFrame>,
+    ) -> Result<(), VaApiError> {
+        let (backend, shared) = self.active()?;
+        VaApiFrame::emit_into(
+            self.device,
+            backend,
+            shared,
+            Emit::new(vec![staged.slot()], staged.size(), staged.crop(), true),
+            frames,
+            staged.generation(),
+        )?;
+        Ok(())
+    }
+
     /// Submit `picture` on `slot`, graining into `display` when present.
     fn submit_picture(
         &mut self,
@@ -312,6 +423,10 @@ impl<'a> Av1Decoder<'a> {
         size: (u32, u32),
         readback: bool,
     ) -> Result<(), VaApiError> {
+        if readback && !slots.is_empty() {
+            self.stage_emit(slots, size, (0, 0, size.0, size.1))?;
+            return self.emit_ready(frames);
+        }
         let (backend, shared) = self.active()?;
         self.generation = VaApiFrame::emit_into(
             self.device,

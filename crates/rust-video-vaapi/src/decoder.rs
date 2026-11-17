@@ -12,6 +12,7 @@ use crate::error::VaApiError;
 use crate::ffi::{self, VaSliceParameterBufferH264};
 use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
 use crate::h264::parser::{SliceHeader, SliceType};
+use crate::inflight::{PendingQueue, PendingSlot};
 use crate::params::Params;
 use crate::seam::{SurfaceId, VaSeam};
 use crate::sys;
@@ -37,6 +38,8 @@ pub struct H264Decoder<'a> {
     shared: Option<SharedDevice>,
     /// Next frame generation number.
     generation: u64,
+    /// Decoded surfaces awaiting sync plus copy.
+    pending: PendingQueue,
     /// Scratch slice parameters, reused across pictures.
     slice_params: Vec<VaSliceParameterBufferH264>,
     /// Scratch list-zero indices, reused across slices.
@@ -55,6 +58,7 @@ impl<'a> H264Decoder<'a> {
             backend: None,
             shared: None,
             generation: 0,
+            pending: PendingQueue::new(PendingQueue::DEFAULT_DEPTH),
             slice_params: Vec::new(),
             list0: Vec::new(),
             list1: Vec::new(),
@@ -107,6 +111,27 @@ impl<'a> H264Decoder<'a> {
         self.backend.as_ref().map(Backend::stats)
     }
 
+    /// Phase timings of the live context, absent before the first sequence set.
+    #[must_use]
+    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+        self.backend.as_ref().map(Backend::phase_stats)
+    }
+
+    /// Submitted-ahead ceiling, 1..=4.
+    #[must_use]
+    pub fn pipeline_depth(&self) -> usize {
+        self.pending.depth()
+    }
+
+    /// Submitted-ahead ceiling, clamped to 1..=4.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - submits ahead of a sync; one syncs every picture first.
+    pub fn set_pipeline_depth(&mut self, depth: usize) {
+        self.pending.set_depth(depth);
+    }
+
     /// Decode `packet`, reading back pixels when `readback` holds.
     fn decode_inner(
         &mut self,
@@ -120,7 +145,8 @@ impl<'a> H264Decoder<'a> {
             let drained = ingest.drained();
             match (ingest.drained_size(), ingest.drained_crop()) {
                 (Some(size), Some(crop)) => {
-                    self.read_cropped(drained, &mut frames, size, crop, readback)?;
+                    self.emit_all(&mut frames)?;
+                    self.read_immediate(drained, &mut frames, size, crop, readback)?;
                 }
                 _ if drained.is_empty() => {}
                 _ => {
@@ -147,6 +173,7 @@ impl<'a> H264Decoder<'a> {
         if !drained.is_empty() {
             self.read_slots(drained, &mut frames, readback)?;
         }
+        self.emit_all(&mut frames)?;
         Ok(frames)
     }
 
@@ -160,7 +187,7 @@ impl<'a> H264Decoder<'a> {
         self.ensure_backend()?;
         let (picture, bumped) = self.frontend.begin(pending)?;
         self.read_slots(bumped, frames, readback)?;
-        let slot = self.acquire_slot()?;
+        let slot = self.acquire_pipelined(frames)?;
         self.submit_picture(&picture, slot)?;
         let outputs = self.frontend.commit(picture, slot)?;
         self.read_slots(outputs, frames, readback)
@@ -239,6 +266,89 @@ impl<'a> H264Decoder<'a> {
         } else {
             VaApiError::DpbFull
         })
+    }
+
+    /// Free pool slot, emitting staged reads when the pool is pinned.
+    fn acquire_pipelined(
+        &mut self,
+        frames: &mut Vec<VaApiFrame>,
+    ) -> Result<SurfaceSlot, VaApiError> {
+        loop {
+            match self.acquire_slot() {
+                Ok(slot) => return Ok(slot),
+                Err(error) if self.pending.is_empty() => return Err(error),
+                Err(_) => self.emit_oldest(frames)?,
+            }
+        }
+    }
+
+    /// Stage `slots` behind the holdback, reserving generations.
+    fn stage_emit(
+        &mut self,
+        slots: Vec<SurfaceSlot>,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+    ) -> Result<(), VaApiError> {
+        let guards = {
+            let (backend, _) = self.active()?;
+            slots
+                .iter()
+                .map(|slot| {
+                    backend.surface_guard(slot.index()).ok_or_else(|| {
+                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (slot, guard) in slots.into_iter().zip(guards) {
+            let generation = self.generation;
+            self.generation = self.generation.wrapping_add(1);
+            self.pending
+                .push(PendingSlot::new(slot, size, crop, generation, guard));
+        }
+        Ok(())
+    }
+
+    /// Frames for staged slots past the holdback.
+    fn emit_ready(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        while let Some(staged) = self.pending.pop_ready() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frames for every staged slot, oldest first.
+    fn emit_all(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        while let Some(staged) = self.pending.pop_oldest() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frame for the oldest staged slot, if any.
+    fn emit_oldest(&mut self, frames: &mut Vec<VaApiFrame>) -> Result<(), VaApiError> {
+        if let Some(staged) = self.pending.pop_oldest() {
+            self.emit_one(&staged, frames)?;
+        }
+        Ok(())
+    }
+
+    /// Frame for one staged slot.
+    fn emit_one(
+        &mut self,
+        staged: &PendingSlot,
+        frames: &mut Vec<VaApiFrame>,
+    ) -> Result<(), VaApiError> {
+        let (backend, shared) = self.active()?;
+        VaApiFrame::emit_into(
+            self.device,
+            backend,
+            shared,
+            Emit::new(vec![staged.slot()], staged.size(), staged.crop(), true),
+            frames,
+            staged.generation(),
+        )?;
+        Ok(())
     }
 
     /// Submit `picture` on `slot`.
@@ -365,6 +475,22 @@ impl<'a> H264Decoder<'a> {
 
     /// Output frames for `slots` under an explicit crop rectangle.
     fn read_cropped(
+        &mut self,
+        slots: Vec<SurfaceSlot>,
+        frames: &mut Vec<VaApiFrame>,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+        readback: bool,
+    ) -> Result<(), VaApiError> {
+        if readback && !slots.is_empty() {
+            self.stage_emit(slots, size, crop)?;
+            return self.emit_ready(frames);
+        }
+        self.read_immediate(slots, frames, size, crop, readback)
+    }
+
+    /// Output frames for `slots` now, syncing before the next submit.
+    fn read_immediate(
         &mut self,
         slots: Vec<SurfaceSlot>,
         frames: &mut Vec<VaApiFrame>,

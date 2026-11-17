@@ -29,6 +29,8 @@ mod h264;
 #[allow(dead_code)]
 mod h265;
 #[allow(dead_code)]
+mod inflight;
+#[allow(dead_code)]
 mod params;
 #[cfg(target_os = "linux")]
 mod scale;
@@ -46,7 +48,7 @@ mod vp9;
 #[cfg(target_os = "linux")]
 pub use av1::Av1Decoder;
 #[cfg(target_os = "linux")]
-pub use backend::{Backend, SubmitStats};
+pub use backend::{Backend, PhaseStats, SubmitStats};
 #[cfg(target_os = "linux")]
 pub use decoder::{H264Decoder, VaApiFrame};
 #[cfg(target_os = "linux")]

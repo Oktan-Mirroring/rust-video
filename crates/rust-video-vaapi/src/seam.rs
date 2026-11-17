@@ -85,6 +85,12 @@ pub trait VaSeam {
         let _ = self.sync(surface);
     }
 
+    /// True when `surface` already finished, without blocking.
+    ///
+    /// Errors read as unfinished; the later sync surfaces them.
+    #[must_use]
+    fn poll(&self, surface: SurfaceId) -> bool;
+
     /// Pool surfaces, borrowed from the pool.
     #[must_use]
     fn surfaces(&self) -> &[SurfaceId];

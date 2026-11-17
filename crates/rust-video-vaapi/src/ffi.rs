@@ -22,6 +22,16 @@ pub type VaImageId = u32;
 
 /// Successful VA-API call.
 pub const VA_STATUS_SUCCESS: VaStatus = 0;
+/// VA-API surface status.
+pub type VaSurfaceStatus = c_int;
+/// Surface decode in progress.
+pub const VA_SURFACE_RENDERING: VaSurfaceStatus = 1;
+/// Surface on display.
+pub const VA_SURFACE_DISPLAYING: VaSurfaceStatus = 2;
+/// Surface decode complete.
+pub const VA_SURFACE_READY: VaSurfaceStatus = 4;
+/// Surface decode skipped.
+pub const VA_SURFACE_SKIPPED: VaSurfaceStatus = 8;
 /// Invalid VA-API handle.
 pub const VA_INVALID_ID: u32 = 0xffff_ffff;
 /// H.264 Constrained Baseline profile.

@@ -8,7 +8,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 use crate::error::VaApiError;
 use crate::ffi::{
     VaBufferId, VaConfigAttrib, VaConfigId, VaContextId, VaDisplay, VaImage, VaImageFormat,
-    VaImageId, VaStatus, VaSurfaceId,
+    VaImageId, VaStatus, VaSurfaceId, VaSurfaceStatus,
 };
 
 #[link(name = "va")]
@@ -113,6 +113,12 @@ unsafe extern "C" {
     pub fn vaEndPicture(dpy: VaDisplay, context: VaContextId) -> VaStatus;
     /// Block until `surface` finishes decoding.
     pub fn vaSyncSurface(dpy: VaDisplay, surface: VaSurfaceId) -> VaStatus;
+    /// Status of `surface` without blocking.
+    pub fn vaQuerySurfaceStatus(
+        dpy: VaDisplay,
+        surface: VaSurfaceId,
+        status: *mut VaSurfaceStatus,
+    ) -> VaStatus;
     /// Image view over `surface`.
     pub fn vaDeriveImage(dpy: VaDisplay, surface: VaSurfaceId, image: *mut VaImage) -> VaStatus;
     /// Release `image`.

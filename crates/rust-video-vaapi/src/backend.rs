@@ -3,11 +3,13 @@
 #![allow(unsafe_code)]
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::buffer::{bytes_of, VaBuffer};
 use crate::device::VaApiDevice;
@@ -186,6 +188,12 @@ impl Backend {
         self.gauges.snapshot()
     }
 
+    /// Phase timings since open.
+    #[must_use]
+    pub fn phase_stats(&self) -> PhaseStats {
+        self.gauges.phase_snapshot()
+    }
+
     /// Shared gauges for frames syncing outside the backend.
     #[must_use]
     pub(crate) fn gauges(&self) -> Arc<StatsInner> {
@@ -212,6 +220,7 @@ impl Backend {
         P: Fn(usize) -> &'d [u8],
         F: Fn(usize) -> &'d [u8],
     {
+        let started = Instant::now();
         let set = self.next;
         self.next = (self.next + 1) % Self::ASYNC_DEPTH;
         if let Some(previous) = self.last[set].replace(target) {
@@ -226,6 +235,7 @@ impl Backend {
             self.sync_quiet(target);
         } else {
             self.gauges.note_submitted();
+            self.gauges.note_submit(target, started);
         }
         outcome
     }
@@ -405,6 +415,31 @@ impl Backend {
         }
         Ok(())
     }
+
+    /// NV12 bytes of `surface` cropped to `crop`, after its sync.
+    fn read_image(
+        &self,
+        surface: SurfaceId,
+        crop: (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, VaApiError> {
+        let (x, y, width, height) = crop;
+        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
+            return Err(VaApiError::Unsupported(
+                "crop outside coded size".to_owned(),
+            ));
+        }
+        // Sound: the display and surface are live.
+        let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
+        sys::status(unsafe { sys::vaDeriveImage(self.pool.display, surface, image.as_mut_ptr()) })?;
+        // Sound: `vaDeriveImage` succeeded, so the image is initialized.
+        let image = unsafe { image.assume_init() };
+        let outcome = self.copy_nv12(&image, crop);
+        // Sound: the image was derived above.
+        unsafe {
+            sys::vaDestroyImage(self.pool.display, image.image_id);
+        }
+        outcome
+    }
 }
 
 impl VaSeam for Backend {
@@ -434,23 +469,14 @@ impl VaSeam for Backend {
         surface: SurfaceId,
         crop: (u32, u32, u32, u32),
     ) -> Result<Vec<u8>, VaApiError> {
+        let wait_start = Instant::now();
+        let ready = self.poll(surface);
         self.sync(surface)?;
-        let (x, y, width, height) = crop;
-        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
-            return Err(VaApiError::Unsupported(
-                "crop outside coded size".to_owned(),
-            ));
-        }
-        // Sound: the display and surface are live.
-        let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
-        sys::status(unsafe { sys::vaDeriveImage(self.pool.display, surface, image.as_mut_ptr()) })?;
-        // Sound: `vaDeriveImage` succeeded, so the image is initialized.
-        let image = unsafe { image.assume_init() };
-        let outcome = self.copy_nv12(&image, crop);
-        // Sound: the image was derived above.
-        unsafe {
-            sys::vaDestroyImage(self.pool.display, image.image_id);
-        }
+        let waited = wait_start.elapsed();
+        let copy_start = Instant::now();
+        let outcome = self.read_image(surface, crop);
+        self.gauges
+            .note_read(surface, ready, waited, copy_start.elapsed());
         outcome
     }
 
@@ -459,6 +485,15 @@ impl VaSeam for Backend {
         let outcome = sys::status(unsafe { sys::vaSyncSurface(self.pool.display, surface) });
         self.gauges.note_synced();
         outcome
+    }
+
+    fn poll(&self, surface: SurfaceId) -> bool {
+        let mut status = 0;
+        // Sound: the surface belongs to the pool; the status outlives the call.
+        let outcome =
+            unsafe { sys::vaQuerySurfaceStatus(self.pool.display, surface, &raw mut status) };
+        outcome == ffi::VA_STATUS_SUCCESS
+            && (status == ffi::VA_SURFACE_READY || status == ffi::VA_SURFACE_SKIPPED)
     }
 
     fn surfaces(&self) -> &[SurfaceId] {
@@ -611,6 +646,80 @@ unsafe impl Send for Pool {}
 // only copy handles out.
 unsafe impl Sync for Pool {}
 
+/// Submit stamps plus overlap proof behind one decode context.
+#[derive(Debug, Default)]
+struct PhaseLog {
+    /// Submit instant per surface.
+    submits: HashMap<SurfaceId, Instant>,
+    /// Previous copy end.
+    last_copy_end: Option<Instant>,
+    /// Waits proving a previous copy ran with this surface in flight.
+    overlapped: u64,
+}
+
+/// Phase timings since backend open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseStats {
+    /// Readback calls.
+    frames: u64,
+    /// Submit microseconds.
+    submit_us: u64,
+    /// Engine-wait microseconds.
+    wait_us: u64,
+    /// Readback-copy microseconds.
+    copy_us: u64,
+    /// Submit-to-ready microseconds.
+    latency_us: u64,
+    /// Waits finding the surface already complete.
+    polled_ready: u64,
+    /// Waits proving a previous copy ran with this surface in flight.
+    overlapped: u64,
+}
+
+impl PhaseStats {
+    /// Readback calls.
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Submit microseconds.
+    #[must_use]
+    pub const fn submit_us(&self) -> u64 {
+        self.submit_us
+    }
+
+    /// Engine-wait microseconds.
+    #[must_use]
+    pub const fn wait_us(&self) -> u64 {
+        self.wait_us
+    }
+
+    /// Readback-copy microseconds.
+    #[must_use]
+    pub const fn copy_us(&self) -> u64 {
+        self.copy_us
+    }
+
+    /// Submit-to-ready microseconds.
+    #[must_use]
+    pub const fn latency_us(&self) -> u64 {
+        self.latency_us
+    }
+
+    /// Waits finding the surface already complete.
+    #[must_use]
+    pub const fn polled_ready(&self) -> u64 {
+        self.polled_ready
+    }
+
+    /// Waits proving a previous copy ran with this surface in flight.
+    #[must_use]
+    pub const fn overlapped(&self) -> u64 {
+        self.overlapped
+    }
+}
+
 /// Shared submit gauges behind one decode context.
 #[derive(Debug, Default)]
 pub(crate) struct StatsInner {
@@ -624,6 +733,20 @@ pub(crate) struct StatsInner {
     resets: AtomicU64,
     /// Driver buffers created.
     buffer_creates: AtomicU64,
+    /// Readback calls.
+    frames: AtomicU64,
+    /// Submit microseconds.
+    submit_us: AtomicU64,
+    /// Engine-wait microseconds.
+    wait_us: AtomicU64,
+    /// Readback-copy microseconds.
+    copy_us: AtomicU64,
+    /// Submit-to-ready microseconds.
+    latency_us: AtomicU64,
+    /// Waits finding the surface already complete.
+    polled_ready: AtomicU64,
+    /// Submit stamps plus overlap proof.
+    phases: Mutex<PhaseLog>,
 }
 
 impl StatsInner {
@@ -650,6 +773,56 @@ impl StatsInner {
         self.buffer_creates.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// One submit of `target` started at `started`.
+    pub(crate) fn note_submit(&self, target: SurfaceId, started: Instant) {
+        let ended = Instant::now();
+        self.submit_us.fetch_add(
+            Self::micros(ended.saturating_duration_since(started)),
+            Ordering::Relaxed,
+        );
+        self.lock_phases().submits.insert(target, ended);
+    }
+
+    /// One readback of `surface`, polled `ready`, waited `wait`, copied `copy`.
+    pub(crate) fn note_read(
+        &self,
+        surface: SurfaceId,
+        ready: bool,
+        wait: Duration,
+        copy: Duration,
+    ) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        self.wait_us
+            .fetch_add(Self::micros(wait), Ordering::Relaxed);
+        self.copy_us
+            .fetch_add(Self::micros(copy), Ordering::Relaxed);
+        if ready {
+            self.polled_ready.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut phases = self.lock_phases();
+        let copy_end = Instant::now();
+        if let Some(submitted) = phases.submits.get(&surface).copied() {
+            self.latency_us.fetch_add(
+                Self::micros(copy_end.saturating_duration_since(submitted)),
+                Ordering::Relaxed,
+            );
+            if !ready && phases.last_copy_end.is_some_and(|end| end > submitted) {
+                phases.overlapped += 1;
+            }
+        }
+        phases.last_copy_end = Some(copy_end);
+    }
+
+    /// Whole microseconds, saturating.
+    fn micros(duration: Duration) -> u64 {
+        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// Submit stamps plus overlap proof, poison-tolerant.
+    fn lock_phases(&self) -> MutexGuard<'_, PhaseLog> {
+        self.phases.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Gauge snapshot.
     fn snapshot(&self) -> SubmitStats {
         SubmitStats {
@@ -657,6 +830,19 @@ impl StatsInner {
             peak: self.peak.load(Ordering::Relaxed),
             resets: self.resets.load(Ordering::Relaxed),
             buffer_creates: self.buffer_creates.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Phase-timing snapshot.
+    fn phase_snapshot(&self) -> PhaseStats {
+        PhaseStats {
+            frames: self.frames.load(Ordering::Relaxed),
+            submit_us: self.submit_us.load(Ordering::Relaxed),
+            wait_us: self.wait_us.load(Ordering::Relaxed),
+            copy_us: self.copy_us.load(Ordering::Relaxed),
+            latency_us: self.latency_us.load(Ordering::Relaxed),
+            polled_ready: self.polled_ready.load(Ordering::Relaxed),
+            overlapped: self.lock_phases().overlapped,
         }
     }
 }
