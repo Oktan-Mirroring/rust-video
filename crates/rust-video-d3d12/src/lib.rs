@@ -9,6 +9,8 @@ mod decode;
 mod decoder;
 #[cfg(target_os = "windows")]
 mod decoder_os;
+#[cfg(target_os = "windows")]
+mod delivery;
 mod device;
 #[cfg(target_os = "windows")]
 mod device_os;
@@ -45,6 +47,8 @@ mod transcode;
 pub use decoder::{Av1Decoder, D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
 pub use decoder_os::{H264Decoder, HevcDecoder};
+#[cfg(target_os = "windows")]
+pub use delivery::DecoderPump;
 pub use device::D3d12Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d12Encoder;

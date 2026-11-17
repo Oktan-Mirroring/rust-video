@@ -11,7 +11,9 @@ use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
-use rust_video_d3d12::{D3d12Encoder, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder};
+use rust_video_d3d12::{
+    D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
+};
 use rust_video_harness::H264Synth;
 use rust_video_harness::{bench_dir, AnnexB, Synth};
 
@@ -62,6 +64,7 @@ fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64
 /// 1080p GPU hops measured against the realtime bar.
 #[test]
 fn xcode_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
     let device = match D3d12Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -134,6 +137,46 @@ fn encode_fps(
     let elapsed = start.elapsed().as_secs_f64();
     assert!(bytes > 0);
     Ok(f64::from(HOPS) / elapsed)
+}
+
+/// Measured fps of `HOPS` 1080p surface decodes through `decode` plus `flush`.
+///
+/// Each surface waits on its fence before drop, so the loop paces completed
+/// GPU work rather than queued submits.
+fn surface_fps<D>(
+    decoder: &mut D,
+    decode: fn(&mut D, &Packet) -> Result<Vec<GpuSurface>, D3d12Error>,
+    flush: fn(&mut D) -> Result<Vec<GpuSurface>, D3d12Error>,
+    warmup: &[Vec<u8>],
+    raws: &[Vec<u8>],
+) -> Result<f64, D3d12Error> {
+    let warmup = packets(warmup);
+    let raws = packets(raws);
+    for packet in &warmup {
+        for surface in decode(decoder, packet)? {
+            surface.wait()?;
+        }
+    }
+    for surface in flush(decoder)? {
+        surface.wait()?;
+    }
+    let mut surfaces = 0u32;
+    let start = std::time::Instant::now();
+    for _ in 0..HOPS {
+        for packet in &raws {
+            for surface in decode(decoder, packet).expect("timed decode") {
+                surface.wait().expect("surface completes");
+                surfaces += 1;
+            }
+        }
+    }
+    for surface in flush(decoder).expect("timed drain") {
+        surface.wait().expect("surface completes");
+        surfaces += 1;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(surfaces > 0);
+    Ok(f64::from(surfaces) / elapsed)
 }
 
 /// 1080p H.264 decode measured against the realtime bar.
@@ -292,6 +335,96 @@ fn encode_hevc_1080p_measures_realtime() {
         Err(error) => panic!("warmup encode: {error}"),
     };
     println!("d3d12 hevc encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p H.264 surface decode measured against the realtime bar.
+#[test]
+fn decode_h264_surface_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::H264) {
+        println!("SKIP: no h264 decoder profile");
+        return;
+    }
+    let mut decoder = H264Decoder::open(&device);
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let measured = match surface_fps(
+        &mut decoder,
+        H264Decoder::decode_surface,
+        H264Decoder::flush_surface,
+        &raws,
+        &raws,
+    ) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("SKIP: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 h264 surface 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// 1080p HEVC surface decode measured against the realtime bar.
+#[test]
+fn decode_hevc_surface_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("SKIP: no hevc decoder profile");
+        return;
+    }
+    let mut decoder = HevcDecoder::open(&device);
+    let path = bench_dir().join("h265-1080p-nvenc.h265");
+    let data = std::fs::read(&path).expect("vector readable");
+    let grouped = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
+    assert!(!grouped.is_empty(), "hevc vector groups to pictures");
+    let first = grouped[..1].to_vec();
+    let measured = match surface_fps(
+        &mut decoder,
+        HevcDecoder::decode_surface,
+        HevcDecoder::flush_surface,
+        &grouped,
+        &first,
+    ) {
+        Ok(fps) => fps,
+        Err(error)
+            if matches!(
+                error,
+                D3d12Error::Skipped(_) | D3d12Error::Unsupported(_) | D3d12Error::OverCaps { .. }
+            ) =>
+        {
+            println!("SKIP: {error}");
+            return;
+        }
+        Err(error) => panic!("warmup decode: {error}"),
+    };
+    println!("d3d12 hevc surface 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
