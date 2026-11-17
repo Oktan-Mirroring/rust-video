@@ -35,7 +35,8 @@ use crate::raw::{
     ImportPair, SessionParameters, VideoSession,
 };
 use crate::session::decode::{
-    layout_barrier, narrow_u32, nv12_copy_regions, picture_resource, plane_copy, reference_slot,
+    follow_barrier, layout_barrier, narrow_u32, nv12_copy_regions, picture_resource, plane_copy,
+    reference_slot,
 };
 use crate::session::geometry::{h264_level_to_std, h265_level_to_std};
 use crate::session::params::{
@@ -1569,23 +1570,38 @@ impl EncodeSession {
         let query = u32::try_from(index).map_err(|_| crate::error::ParseError::OutOfRange {
             syntax: "submit slot",
         })?;
-        let setup_layer =
-            u32::try_from(plan.setup_slot).map_err(|_| crate::error::ParseError::OutOfRange {
+        let recorder = self.submit.pool().recorder(cmd);
+        let mut head = Vec::new();
+        for slot in [Some(plan.setup_slot), plan.ref_slot].into_iter().flatten() {
+            let target = vk::ImageLayout::VIDEO_ENCODE_DPB_KHR;
+            let layer = u32::try_from(slot).map_err(|_| crate::error::ParseError::OutOfRange {
                 syntax: "setup slot",
             })?;
-        let recorder = self.submit.pool().recorder(cmd);
-        if self.dpb_layouts[plan.setup_slot] != vk::ImageLayout::VIDEO_ENCODE_DPB_KHR {
-            let to_dpb = layout_barrier(
-                self.dpb.image(),
-                self.dpb_layouts[plan.setup_slot],
-                vk::ImageLayout::VIDEO_ENCODE_DPB_KHR,
-                vk::ImageAspectFlags::COLOR,
-                setup_layer,
-                1,
-            );
-            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&[to_dpb]));
+            if self.dpb_layouts[slot] == target {
+                head.push(follow_barrier(
+                    self.dpb.image(),
+                    target,
+                    vk::ImageAspectFlags::COLOR,
+                    layer,
+                    vk::PipelineStageFlags2::VIDEO_ENCODE_KHR,
+                    vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR
+                        | vk::AccessFlags2::VIDEO_ENCODE_READ_KHR,
+                ));
+            } else {
+                head.push(layout_barrier(
+                    self.dpb.image(),
+                    self.dpb_layouts[slot],
+                    target,
+                    vk::ImageAspectFlags::COLOR,
+                    layer,
+                    1,
+                ));
+                self.dpb_layouts[slot] = target;
+            }
         }
-        self.dpb_layouts[plan.setup_slot] = vk::ImageLayout::VIDEO_ENCODE_DPB_KHR;
+        if !head.is_empty() {
+            recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&head));
+        }
         recorder.reset_queries(self.feedback.pool(), query, 1);
         let layer = rc_layer(&self.rate);
         let mut control = rc_control(&layer);

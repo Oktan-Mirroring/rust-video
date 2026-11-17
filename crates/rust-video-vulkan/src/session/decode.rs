@@ -84,6 +84,12 @@ pub(crate) struct Session {
     ext: Option<khr::external_memory_fd::Device>,
 }
 
+/// Head barriers plus layout commits of one submit.
+type HeadBarriers = (
+    Vec<vk::ImageMemoryBarrier2<'static>>,
+    Vec<(usize, vk::ImageLayout)>,
+);
+
 impl Session {
     /// Session over `device` for `geometry`, `profile`, and `template`.
     ///
@@ -401,6 +407,45 @@ impl Session {
     }
 
     /// Record decode commands, returning the planned layout commits.
+    /// Transition-or-follow barriers over the setup plus live DPB layers.
+    ///
+    /// Changed layers transition and commit; steady layers chain prior
+    /// submits through a same-layout memory barrier.
+    fn head_barriers(&self, setup_slot: usize) -> Result<HeadBarriers, VulkanError> {
+        let mut planned = Vec::new();
+        let mut barriers = Vec::new();
+        for (slot, layout) in self.dpb_layouts.iter().enumerate() {
+            if slot != setup_slot && self.meta[slot].is_none() {
+                continue;
+            }
+            let target = vk::ImageLayout::VIDEO_DECODE_DPB_KHR;
+            let layer = narrow_u32(slot, "dpb slot")?;
+            if *layout == target {
+                barriers.push(follow_barrier(
+                    self.dpb.image(),
+                    target,
+                    vk::ImageAspectFlags::COLOR,
+                    layer,
+                    vk::PipelineStageFlags2::VIDEO_DECODE_KHR | vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
+                        | vk::AccessFlags2::VIDEO_DECODE_READ_KHR
+                        | vk::AccessFlags2::TRANSFER_READ,
+                ));
+            } else {
+                barriers.push(layout_barrier(
+                    self.dpb.image(),
+                    *layout,
+                    target,
+                    vk::ImageAspectFlags::COLOR,
+                    layer,
+                    1,
+                ));
+                planned.push((slot, target));
+            }
+        }
+        Ok((barriers, planned))
+    }
+
     fn record(
         &self,
         slot: usize,
@@ -411,25 +456,7 @@ impl Session {
     ) -> Result<Vec<(usize, vk::ImageLayout)>, VulkanError> {
         self.submit.pool().begin_buffer(cmd)?;
         let recorder = self.submit.pool().recorder(cmd);
-        let mut planned = Vec::new();
-        let mut barriers = Vec::new();
-        for (slot, layout) in self.dpb_layouts.iter().enumerate() {
-            if slot != sub.setup_slot && self.meta[slot].is_none() {
-                continue;
-            }
-            let target = vk::ImageLayout::VIDEO_DECODE_DPB_KHR;
-            if *layout != target {
-                barriers.push(layout_barrier(
-                    self.dpb.image(),
-                    *layout,
-                    target,
-                    vk::ImageAspectFlags::COLOR,
-                    narrow_u32(slot, "dpb slot")?,
-                    1,
-                ));
-                planned.push((slot, target));
-            }
-        }
+        let (barriers, mut planned) = self.head_barriers(sub.setup_slot)?;
         if !barriers.is_empty() {
             recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&barriers));
         }
@@ -437,7 +464,11 @@ impl Session {
             video_session: self.video.session(),
             video_session_parameters: self.params.params(),
             reference_slot_count: narrow_u32(sub.begin.len(), "begin slots")?,
-            p_reference_slots: sub.begin.as_ptr(),
+            p_reference_slots: if sub.begin.is_empty() {
+                std::ptr::null()
+            } else {
+                sub.begin.as_ptr()
+            },
             ..Default::default()
         };
         self.video.begin_coding(cmd, &begin);
@@ -453,7 +484,11 @@ impl Session {
             dst_picture_resource: sub.dst,
             p_setup_reference_slot: std::ptr::from_ref(sub.setup),
             reference_slot_count: narrow_u32(sub.refs.len(), "decode refs")?,
-            p_reference_slots: sub.refs.as_ptr(),
+            p_reference_slots: if sub.refs.is_empty() {
+                std::ptr::null()
+            } else {
+                sub.refs.as_ptr()
+            },
             p_next: sub.picture_next,
             ..Default::default()
         };
@@ -641,6 +676,39 @@ pub(crate) fn layout_barrier(
             level_count: 1,
             base_array_layer: base_layer,
             layer_count: layers,
+        },
+        ..Default::default()
+    }
+}
+
+/// Same-layout memory barrier chaining prior submits into this one.
+///
+/// Submission order alone leaves earlier writes invisible to later
+/// submits on one queue. Emitted for every touched layer on every
+/// submit whether or not its layout changes, so overlapped submits
+/// stay ordered without CPU waits.
+pub(crate) fn follow_barrier(
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
+    base_layer: u32,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2 {
+        src_stage_mask: src_stage,
+        src_access_mask: src_access,
+        dst_stage_mask: stage_for(layout),
+        dst_access_mask: access_for(layout),
+        old_layout: layout,
+        new_layout: layout,
+        image,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: base_layer,
+            layer_count: 1,
         },
         ..Default::default()
     }
