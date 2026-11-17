@@ -101,6 +101,9 @@ pub enum ParseReason {
     /// Crop extends past the coded size.
     #[error("frame_crop outside coded size")]
     FrameCropOutsideCodedSize,
+    /// Frame marker against the codec bits.
+    #[error("frame marker mismatch")]
+    FrameMarkerMismatch,
     /// Gap with gaps forbidden by the sequence.
     #[error("frame_num gap with gaps forbidden")]
     FrameNumGapForbidden,
@@ -185,6 +188,9 @@ pub enum ParseReason {
     /// Reserved OBU type.
     #[error("reserved obu type")]
     ReservedObuType,
+    /// Reserved profile bits.
+    #[error("reserved profile")]
+    ReservedProfile,
     /// Short-term set past its size.
     #[error("short_term_ref_pic_set size")]
     ShortTermRefPicSetSize,
@@ -206,6 +212,9 @@ pub enum ParseReason {
     /// Sequence set without a body.
     #[error("sps without body")]
     SpsWithoutBody,
+    /// Sync code against the codec bytes.
+    #[error("sync code mismatch")]
+    SyncCodeMismatch,
     /// Tile grid short of the frame.
     #[error("tile grid coverage")]
     TileGridCoverage,

@@ -47,6 +47,8 @@ mod shell;
 mod submit;
 #[cfg(target_os = "windows")]
 mod transcode;
+#[cfg(target_os = "windows")]
+mod vp9;
 
 #[cfg(target_os = "windows")]
 pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder};
