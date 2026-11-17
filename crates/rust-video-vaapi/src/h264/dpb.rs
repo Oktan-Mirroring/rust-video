@@ -448,6 +448,20 @@ impl<T: Clone> Dpb<T> {
         pics
     }
 
+    /// Bumps every picture still needed for output, in output order.
+    ///
+    /// The no-reorder fast path: output order matches decode order,
+    /// so everything ready emits on the completing commit. Reference
+    /// pictures stay stored; only their output handle leaves.
+    pub(crate) fn bump_ready(&mut self) -> Vec<T> {
+        let mut pics = Vec::new();
+        while let Some(pic) = self.bump() {
+            pics.push(pic);
+            self.remove_unused();
+        }
+        pics
+    }
+
     // 8.2.5.3
     pub fn sliding_window_marking(&mut self, sps: &Sps) {
         let mut num_ref_pics = self.num_ref_frames();
@@ -1111,5 +1125,28 @@ impl<T> std::fmt::Debug for Dpb<T> {
             .field("max_num_pics", &self.max_num_pics)
             .field("max_num_reorder_frames", &self.max_num_reorder_frames)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dpb;
+    use crate::h264::picture::{PictureData, Reference};
+
+    #[test]
+    fn bump_ready_emits_in_output_order_and_keeps_refs() {
+        let mut dpb = Dpb::default();
+        dpb.set_limits(16, 16);
+        for (order, slot, reference) in [(2, 0u32, false), (0, 1, true), (4, 2, false)] {
+            let mut pic = PictureData::default();
+            pic.pic_order_cnt = order;
+            if reference {
+                pic.set_reference(Reference::ShortTerm);
+            }
+            dpb.store_picture(pic.into_rc(), Some(slot)).expect("room");
+        }
+        assert_eq!(dpb.bump_ready(), vec![1, 0, 2]);
+        // References stay stored; output-only pictures leave.
+        assert_eq!(dpb.len(), 1);
     }
 }

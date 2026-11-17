@@ -5,7 +5,7 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use crate::backend::{Backend, StatsInner};
+use crate::backend::{Backend, StatsInner, SurfaceId};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::{self, VaSliceParameterBufferH264};
@@ -63,13 +63,28 @@ impl<'a> H264Decoder<'a> {
     /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
     /// is absent. Each frame pins its pool slot until dropped, so a
     /// caller holding more frames than the pool holds back fails with
-    /// `DpbFull`; `decode` copies pixels and releases immediately.
+    /// `NoFreeSlot`; `decode` copies pixels and releases immediately.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the backend cannot decode `packet`.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.decode_inner(packet, false)
+    }
+
+    /// Device owning the decode context.
+    #[must_use]
+    pub fn device(&self) -> &VaApiDevice {
+        self.device
+    }
+
+    /// Live decode context, absent before the first sequence set.
+    ///
+    /// The borrow ties the context to the decoder; see
+    /// [`Backend`](crate::Backend) for the native handles behind it.
+    #[must_use]
+    pub fn context(&self) -> Option<&Backend> {
+        self.backend.as_ref()
     }
 
     /// Surface frames held back for reordering or buffering.
@@ -194,7 +209,7 @@ impl<'a> H264Decoder<'a> {
     /// Free pool slot: neither DPB-backed nor leased to a live frame.
     fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
-        let end = u32::try_from(pool).map_err(|_| VaApiError::DpbFull)?;
+        let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
         (0..end)
             .map(SurfaceSlot::new)
             .find(|slot| {
@@ -204,7 +219,7 @@ impl<'a> H264Decoder<'a> {
                         .as_ref()
                         .is_some_and(|backend| backend.surface_live(slot.index()))
             })
-            .ok_or(VaApiError::DpbFull)
+            .ok_or(VaApiError::NoFreeSlot)
     }
 
     /// Submit `picture` on `slot`.
@@ -423,6 +438,12 @@ pub struct VaApiFrame {
     lease: Lease,
     /// Device surface behind the frame, absent without one.
     device: Option<DeviceSurface>,
+    /// Pool slot holding this picture.
+    slot: u32,
+    /// Full texture extent in luma samples.
+    coded: PictureSize,
+    /// Crop left/top in luma samples.
+    origin: (u32, u32),
 }
 
 impl VaApiFrame {
@@ -445,6 +466,12 @@ impl VaApiFrame {
                 width: emit.size.0,
                 height: emit.size.1,
             })?;
+        let (coded_width, coded_height) = backend.coded_size();
+        let coded = PictureSize::new(coded_width, coded_height).ok_or(VaApiError::BadExtent {
+            width: coded_width,
+            height: coded_height,
+        })?;
+        let origin = (emit.crop.0, emit.crop.1);
         frames.reserve(emit.slots.len());
         let mut generation = generation;
         for slot in emit.slots {
@@ -473,6 +500,9 @@ impl VaApiFrame {
                 data,
                 lease,
                 device,
+                slot: slot.index(),
+                coded,
+                origin,
             });
             generation = generation.wrapping_add(1);
         }
@@ -483,6 +513,65 @@ impl VaApiFrame {
     #[must_use]
     pub fn identity(&self) -> GpuFrame {
         self.identity
+    }
+
+    /// Visible picture size in luma samples.
+    #[must_use]
+    pub fn size(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Pixel layout of the frame.
+    #[must_use]
+    pub fn format(&self) -> PixelFormat {
+        self.identity.format()
+    }
+
+    /// Pool slot holding this picture.
+    ///
+    /// Device frames pin the slot while live; readback frames name
+    /// the slot their pixels were copied from and hold no lease.
+    #[must_use]
+    pub fn slice(&self) -> u32 {
+        self.slot
+    }
+
+    /// Full texture extent in luma samples.
+    #[must_use]
+    pub fn coded(&self) -> PictureSize {
+        self.coded
+    }
+
+    /// Crop left/top in luma samples: the visible origin in the texture.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        self.origin
+    }
+
+    /// Native surface behind the frame, absent after a pixels-only readback.
+    ///
+    /// See [`SurfaceId`](crate::SurfaceId) for the threading and
+    /// lifetime rules.
+    #[must_use]
+    pub fn surface(&self) -> Option<SurfaceId> {
+        self.device.as_ref().map(|surface| surface.surface)
+    }
+
+    /// Block until the frame's decode finishes.
+    ///
+    /// Readback frames return immediately: their pixels were copied
+    /// after a sync. External readers import the
+    /// [`export`](Self::export) ticket only after this returns, so
+    /// they never read a partial picture.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver reports the surface failed.
+    pub fn wait(&self) -> Result<(), VaApiError> {
+        match self.device.as_ref() {
+            Some(surface) => surface.wait(),
+            None => Ok(()),
+        }
     }
 
     /// NV12 frame bytes in row-major order.
@@ -569,6 +658,18 @@ impl DeviceSurface {
             _guard: guard,
             gauges,
         }
+    }
+
+    /// Block until the surface finishes decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver reports the surface failed.
+    fn wait(&self) -> Result<(), VaApiError> {
+        // Sound: the display and surface are live behind the pool lease.
+        let outcome = unsafe { ffi::vaSyncSurface(self.display, self.surface) };
+        self.gauges.note_synced();
+        VaApiError::status(outcome)
     }
 
     /// NV12 DMA-BUF planes for the surface, absent when the export fails.
@@ -671,6 +772,9 @@ mod tests {
             data: bytes,
             lease,
             device: None,
+            slot: 2,
+            coded: size,
+            origin: (0, 0),
         }
     }
 
@@ -727,6 +831,25 @@ mod tests {
     fn frame_moves_across_threads() {
         fn is_send<T: Send>() {}
         is_send::<VaApiFrame>();
+    }
+
+    #[test]
+    fn surface_contract_names_geometry_and_provenance() {
+        let shared = SharedDevice::new("vaapi", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        assert_eq!(held.size(), PictureSize::new(4, 2).expect("extent"));
+        assert_eq!(held.format(), PixelFormat::Nv12);
+        assert_eq!(held.slice(), 2);
+        assert_eq!(held.coded(), PictureSize::new(4, 2).expect("extent"));
+        assert_eq!(held.origin(), (0, 0));
+    }
+
+    #[test]
+    fn readback_frame_has_no_surface_but_waits_clean() {
+        let shared = SharedDevice::new("vaapi", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        assert_eq!(held.surface(), None);
+        assert!(held.wait().is_ok());
     }
 
     #[test]

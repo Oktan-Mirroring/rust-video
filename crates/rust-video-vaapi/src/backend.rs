@@ -18,6 +18,31 @@ use crate::error::VaApiError;
 use crate::ffi::{self, VaSurfaceId};
 use crate::ffi::{VaBufferId, VaConfigId, VaContextId};
 
+/// Native VA-API surface handle (`VASurfaceID`).
+///
+/// Threading: a single thread needs nothing; threads sharing one
+/// device serialize context calls with crate submissions — sequence
+/// driver calls made through the handle with `submit`, `sync`,
+/// `wait`, and `export`, never overlapping them.
+///
+/// Lifetime: the handle borrows the backend pool and stays valid
+/// only while the owning decoder lives — and for one frame's
+/// surface, only while that frame or its DPB reference pins the
+/// slot; using a handle after its owner drops is undefined behavior.
+pub type SurfaceId = u32;
+
+/// Native VA-API decode-context handle (`VAContextID`).
+///
+/// Threading: a single thread needs nothing; threads sharing one
+/// device serialize context calls with crate submissions — sequence
+/// driver calls made through the handle with `submit` and `sync`,
+/// never overlapping them.
+///
+/// Lifetime: the handle borrows the backend and stays valid only
+/// while the owning decoder lives; using it after the decoder
+/// drops is undefined behavior.
+pub type ContextId = u32;
+
 /// VA-API decode context over a surface pool.
 ///
 /// `Send`, never `Sync`: hand the context to another thread when idle,
@@ -177,10 +202,18 @@ impl Backend {
         })
     }
 
-    /// Pool surfaces.
+    /// Pool surfaces, borrowed from the pool.
     #[must_use]
-    pub fn surfaces(&self) -> &[VaSurfaceId] {
+    pub fn surfaces(&self) -> &[SurfaceId] {
         &self.surfaces
+    }
+
+    /// Native decode-context handle behind the backend.
+    ///
+    /// See [`ContextId`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> ContextId {
+        self.context
     }
 
     /// Pool size.
@@ -244,7 +277,7 @@ impl Backend {
     /// # Errors
     ///
     /// Returns `Err` off Linux, or when any VA-API call fails.
-    pub fn submit<'d, F>(
+    pub(crate) fn submit<'d, F>(
         &mut self,
         target: VaSurfaceId,
         picture: &ffi::VaPictureParameterBufferH264,
@@ -267,8 +300,8 @@ impl Backend {
 
     /// Decode one picture into `target` from typed slice parameters.
     ///
-    /// Same pipelining as [`Backend::submit`], over caller-typed slice
-    /// buffers: `picture` fills the picture-parameter buffer, `matrix`
+    /// Same pipelining as the H.264 submit path, over caller-typed
+    /// slice buffers: `picture` fills the picture-parameter buffer, `matrix`
     /// the matrix buffer when present, and `slices` the slice-parameter
     /// buffers in order. `data` must answer every index below
     /// `slices`. A failed submit quiets the target and leaves the
@@ -279,7 +312,7 @@ impl Backend {
     /// Returns `Err` off Linux, or when any VA-API call fails.
     pub fn submit_slices<'d, T, F>(
         &mut self,
-        target: VaSurfaceId,
+        target: SurfaceId,
         picture: &[u8],
         matrix: Option<&[u8]>,
         slices: &'d [T],
@@ -351,7 +384,7 @@ impl Backend {
     /// # Errors
     ///
     /// Returns `Err` when the driver reports the surface failed.
-    pub fn sync(&self, surface: VaSurfaceId) -> Result<(), VaApiError> {
+    pub fn sync(&self, surface: SurfaceId) -> Result<(), VaApiError> {
         // Sound: the surface belongs to the pool.
         let outcome = VaApiError::status(unsafe { ffi::vaSyncSurface(self.display, surface) });
         self.gauges.note_synced();
@@ -359,7 +392,7 @@ impl Backend {
     }
 
     /// Block until `surface` finishes, dropping any failure.
-    pub fn sync_quiet(&self, surface: VaSurfaceId) {
+    pub fn sync_quiet(&self, surface: SurfaceId) {
         let _ = self.sync(surface);
     }
 
@@ -371,7 +404,7 @@ impl Backend {
     /// when its layout overruns its bytes, or when any call fails.
     pub fn read_nv12(
         &self,
-        surface: VaSurfaceId,
+        surface: SurfaceId,
         crop: (u32, u32, u32, u32),
     ) -> Result<Vec<u8>, VaApiError> {
         self.sync(surface)?;

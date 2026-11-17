@@ -604,10 +604,14 @@ impl Frontend {
 
     /// Mark, store, and bump `picture` on `slot`, returning output slots.
     ///
+    /// Streams whose sequence set guarantees no reordering emit the
+    /// picture on its completing commit; reorder streams hold the
+    /// picture back until a later bump, exactly as before.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when a memory-management command is unknown or
-    /// names a missing picture, or the DPB has no free slot.
+    /// names a missing picture, or no surface slot is free.
     pub fn commit(
         &mut self,
         picture: Picture,
@@ -684,9 +688,15 @@ impl Frontend {
         if is_ref || self.dpb.has_empty_frame_buffer() {
             self.dpb
                 .store_picture(pic.into_rc(), Some(slot))
-                .map_err(|_| VaApiError::DpbFull)?;
+                .map_err(|_| VaApiError::NoFreeSlot)?;
         } else {
             outputs.push(slot);
+        }
+        if picture.sps.max_num_order_frames() == 0 {
+            // No-reorder stream: output order matches decode order,
+            // and every earlier commit drained its ready pictures,
+            // so the just-stored picture emits now, in order.
+            outputs.extend(self.dpb.bump_ready());
         }
         if is_ref {
             self.prev_ref_frame_num = Some(frame_num);
@@ -725,7 +735,7 @@ impl Frontend {
             bumped.extend(self.dpb.bump_as_needed(&gap));
             self.dpb
                 .store_picture(gap.into_rc(), None)
-                .map_err(|_| VaApiError::DpbFull)?;
+                .map_err(|_| VaApiError::NoFreeSlot)?;
             let noted = self.dpb.entries().last().map(|stored| {
                 let picture = stored.pic.borrow();
                 (
@@ -1109,8 +1119,8 @@ mod tests {
     use crate::error::VaApiError;
     use crate::h264::dpb::ReferencePicLists;
     use crate::h264::parser::{
-        ChromaFormat, FrameFieldCoding, Level, ListModificationFlags, PpsBuilder,
-        RefPicListModification, RefPicMarking, SliceHeader, Sps,
+        BitstreamRestriction, ChromaFormat, FrameFieldCoding, Level, ListModificationFlags,
+        PpsBuilder, RefPicListModification, RefPicMarking, SliceHeader, Sps, VuiParams,
     };
     use crate::h264::picture::{IsIdr, PictureData, Reference};
 
@@ -1451,5 +1461,60 @@ mod tests {
         delayed.pic.bottom_field_order_cnt = 6;
         let bumped = frontend.commit(delayed, SurfaceSlot::new(3)).expect("p");
         assert_eq!(bumped, vec![SurfaceSlot::new(0)]);
+    }
+
+    /// Sequence set signalling zero reorder frames through the VUI.
+    fn sps_no_reorder() -> Sps {
+        let mut sps = sps(0);
+        sps.vui = Some(VuiParams {
+            restriction: Some(BitstreamRestriction {
+                max_num_reorder_frames: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        sps
+    }
+
+    #[test]
+    fn commit_no_reorder_emits_each_picture() {
+        let sps = Rc::new(sps_no_reorder());
+        assert_eq!(sps.max_num_order_frames(), 0);
+        let mut frontend = Frontend::new();
+        frontend.dpb.set_limits(sps.max_dpb_frames(), 0);
+
+        let idr = committable(&sps, 0, true);
+        assert_eq!(
+            frontend.commit(idr, SurfaceSlot::new(0)).expect("idr"),
+            vec![SurfaceSlot::new(0)]
+        );
+        // The emitted IDR stays stored as a reference.
+        assert_eq!(frontend.dpb.len(), 1);
+
+        let next = committable(&sps, 1, false);
+        assert_eq!(
+            frontend.commit(next, SurfaceSlot::new(1)).expect("p"),
+            vec![SurfaceSlot::new(1)]
+        );
+        assert_eq!(frontend.dpb.len(), 2);
+    }
+
+    #[test]
+    fn commit_reorder_holds_back_until_full() {
+        let sps = Rc::new(sps(0));
+        assert_ne!(sps.max_num_order_frames(), 0);
+        let mut frontend = Frontend::new();
+        frontend.dpb.set_limits(sps.max_dpb_frames(), 16);
+
+        let idr = committable(&sps, 0, true);
+        assert_eq!(
+            frontend.commit(idr, SurfaceSlot::new(0)).expect("idr"),
+            Vec::new()
+        );
+        let next = committable(&sps, 1, false);
+        assert_eq!(
+            frontend.commit(next, SurfaceSlot::new(1)).expect("p"),
+            Vec::new()
+        );
     }
 }

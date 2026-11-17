@@ -38,11 +38,11 @@ mod vp9;
 #[cfg(target_os = "linux")]
 pub use av1::Av1Decoder;
 #[cfg(target_os = "linux")]
-pub use backend::SubmitStats;
+pub use backend::{Backend, ContextId, SubmitStats, SurfaceId};
 #[cfg(target_os = "linux")]
 pub use decoder::{H264Decoder, VaApiFrame};
 #[cfg(target_os = "linux")]
-pub use device::VaApiDevice;
+pub use device::{DisplayHandle, VaApiDevice};
 #[cfg(target_os = "linux")]
 pub use encoder::{EncodeCodec, VaApiEncoder};
 #[cfg(target_os = "linux")]

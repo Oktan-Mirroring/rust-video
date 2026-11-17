@@ -13,6 +13,18 @@ use crate::ffi;
 
 use rust_video_caps::traits::Device;
 
+/// Native VA-API display handle (`VADisplay`).
+///
+/// Threading: a single thread needs nothing; threads sharing one
+/// device serialize context calls with crate submissions — sequence
+/// driver calls made through the handle with decoder, backend, and
+/// frame calls, never overlapping them.
+///
+/// Lifetime: the handle borrows the device and stays valid only
+/// while the device lives; using it after the device drops is
+/// undefined behavior.
+pub type DisplayHandle = *mut std::ffi::c_void;
+
 /// VA-API display over one DRM render node.
 ///
 /// `Send`, never `Sync`: hand the display to another thread when idle,
@@ -93,9 +105,11 @@ impl VaApiDevice {
         Err(SkipReason::NoNv12Target.into())
     }
 
-    /// Initialized VA-API display.
+    /// Initialized native VA-API display.
+    ///
+    /// See [`DisplayHandle`] for the threading and lifetime rules.
     #[must_use]
-    pub(crate) fn display(&self) -> ffi::VaDisplay {
+    pub fn display(&self) -> DisplayHandle {
         self.display
     }
 

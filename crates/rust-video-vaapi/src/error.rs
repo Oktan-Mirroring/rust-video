@@ -46,9 +46,13 @@ pub enum VaApiError {
     /// Reference list names a picture the DPB cannot supply.
     #[error("broken reference list: {0}")]
     BrokenReference(String),
-    /// DPB has no free slot for the next picture.
-    #[error("dpb full")]
-    DpbFull,
+    /// Decoder has no free surface slot for the next picture.
+    ///
+    /// A live held surface pins its slot, so callers holding more
+    /// frames than the pool holds exhaust the pool loudly here
+    /// instead of corrupting a held picture.
+    #[error("no free surface slot")]
+    NoFreeSlot,
     /// Frame over the VRAM budget.
     #[error("frame over budget: {0}")]
     OverBudget(#[from] rust_video_caps::traits::OverBudget),
@@ -124,6 +128,11 @@ mod tests {
             VaApiError::Unsupported("fmo".to_owned()).to_string(),
             "unsupported stream: fmo"
         );
+    }
+
+    #[test]
+    fn no_free_slot_names_exhaustion() {
+        assert_eq!(VaApiError::NoFreeSlot.to_string(), "no free surface slot");
     }
 
     #[test]

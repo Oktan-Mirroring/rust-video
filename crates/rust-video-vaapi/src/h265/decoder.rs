@@ -60,13 +60,28 @@ impl<'a> H265Decoder<'a> {
     /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
     /// is absent. Each frame pins its pool slot until dropped, so a
     /// caller holding more frames than the pool holds back fails with
-    /// `DpbFull`; `decode` copies pixels and releases immediately.
+    /// `NoFreeSlot`; `decode` copies pixels and releases immediately.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the backend cannot decode `packet`.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.decode_inner(packet, false)
+    }
+
+    /// Device owning the decode context.
+    #[must_use]
+    pub fn device(&self) -> &VaApiDevice {
+        self.device
+    }
+
+    /// Live decode context, absent before the first sequence set.
+    ///
+    /// The borrow ties the context to the decoder; see
+    /// [`Backend`](crate::Backend) for the native handles behind it.
+    #[must_use]
+    pub fn context(&self) -> Option<&Backend> {
+        self.backend.as_ref()
     }
 
     /// Surface frames held back for reordering or buffering.
@@ -193,7 +208,7 @@ impl<'a> H265Decoder<'a> {
     /// Free pool slot: neither DPB-backed nor leased to a live frame.
     fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
-        let end = u32::try_from(pool).map_err(|_| VaApiError::DpbFull)?;
+        let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
         (0..end)
             .map(SurfaceSlot::new)
             .find(|slot| {
@@ -203,7 +218,7 @@ impl<'a> H265Decoder<'a> {
                         .as_ref()
                         .is_some_and(|backend| backend.surface_live(slot.index()))
             })
-            .ok_or(VaApiError::DpbFull)
+            .ok_or(VaApiError::NoFreeSlot)
     }
 
     /// Submit `picture` on `slot`.
