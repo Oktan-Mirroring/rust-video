@@ -21,6 +21,8 @@ pub mod h264;
 #[cfg(feature = "gpl")]
 pub mod h265;
 #[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
+pub mod pipeline;
+#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
 pub mod surface;
 #[cfg(feature = "ffmpeg")]
 pub mod vpx;
@@ -39,6 +41,11 @@ pub use ffmpeg::{
 pub use h264::H264Encoder;
 #[cfg(feature = "gpl")]
 pub use h265::{H265Encoder, H265Preset};
+#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
+pub use pipeline::{
+    EnginePoll, PhaseSpan, PhaseStats, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource,
+    SplitDecoder,
+};
 #[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
 pub use surface::SwSurface;
 #[cfg(feature = "ffmpeg")]

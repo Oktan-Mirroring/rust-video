@@ -16,8 +16,44 @@ use rust_video_caps::traits::Decoder;
 
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
+use crate::pipeline::RawSource;
 
 pub use crate::ffmpeg_sys::AVCodecContext;
+
+/// Sink for pictures drained from the decoder.
+trait PictureSink {
+    /// Pictures staged so far.
+    fn staged(&self) -> usize;
+
+    /// One decoded picture staged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the picture is unusable.
+    fn push_frame(&mut self, frame: &sys::AVFrame) -> Result<(), SwError>;
+}
+
+impl PictureSink for Vec<CpuFrame> {
+    fn staged(&self) -> usize {
+        self.len()
+    }
+
+    fn push_frame(&mut self, frame: &sys::AVFrame) -> Result<(), SwError> {
+        self.push(convert(frame)?);
+        Ok(())
+    }
+}
+
+impl PictureSink for Vec<RawPicture> {
+    fn staged(&self) -> usize {
+        self.len()
+    }
+
+    fn push_frame(&mut self, frame: &sys::AVFrame) -> Result<(), SwError> {
+        self.push(RawPicture::copy_from(frame)?);
+        Ok(())
+    }
+}
 
 /// Codec decoded through libavcodec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -228,7 +264,7 @@ impl FfmpegDecoder {
     /// # Errors
     ///
     /// Returns `Err` when the packet is rejected or a drained picture is unusable.
-    fn send(&mut self, bytes: &[u8], out: &mut Vec<CpuFrame>) -> Result<(), SwError> {
+    fn send(&mut self, bytes: &[u8], out: &mut impl PictureSink) -> Result<(), SwError> {
         let size = std::ffi::c_int::try_from(bytes.len()).map_err(|_| SwError::Rejected)?;
         // SAFETY: packet is live; unref resets it for reuse.
         unsafe { sys::av_packet_unref(self.packet) };
@@ -253,9 +289,9 @@ impl FfmpegDecoder {
                     code: i64::from(err),
                 });
             }
-            let drained = out.len();
+            let drained = out.staged();
             self.receive(out)?;
-            if out.len() == drained {
+            if out.staged() == drained {
                 return Err(SwError::Rejected);
             }
         }
@@ -266,7 +302,7 @@ impl FfmpegDecoder {
     /// # Errors
     ///
     /// Returns `Err` when a ready picture breaks mid-decode.
-    fn receive(&mut self, out: &mut Vec<CpuFrame>) -> Result<(), SwError> {
+    fn receive(&mut self, out: &mut impl PictureSink) -> Result<(), SwError> {
         loop {
             // SAFETY: frame is a valid output slot; success lends its planes.
             let err = unsafe { sys::avcodec_receive_frame(self.ctx, self.frame) };
@@ -279,10 +315,10 @@ impl FfmpegDecoder {
                 });
             }
             // SAFETY: success initialized the frame; unref below balances it.
-            let frame = convert(unsafe { &*self.frame });
+            let pushed = out.push_frame(unsafe { &*self.frame });
             // SAFETY: frame is live and uniquely borrowed here.
             unsafe { sys::av_frame_unref(self.frame) };
-            out.push(frame?);
+            pushed?;
         }
     }
 
@@ -291,7 +327,7 @@ impl FfmpegDecoder {
     /// # Errors
     ///
     /// Returns `Err` when the parser or the decoder rejects its input.
-    fn parse(&mut self, bytes: &[u8], out: &mut Vec<CpuFrame>) -> Result<(), SwError> {
+    fn parse(&mut self, bytes: &[u8], out: &mut impl PictureSink) -> Result<(), SwError> {
         let mut rest = bytes;
         while !rest.is_empty() {
             let size = std::ffi::c_int::try_from(rest.len()).map_err(|_| SwError::Rejected)?;
@@ -333,28 +369,49 @@ impl FfmpegDecoder {
         }
         Ok(())
     }
-}
 
-impl Decoder for FfmpegDecoder {
-    type Frame = CpuFrame;
-    type Error = SwError;
-
-    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        let mut out = Vec::new();
+    /// Input frames from `packet` queued.
+    ///
+    /// Pictures freed only to make room surface in `freed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the packet is rejected or a freed picture is unusable.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    /// * `freed` - pictures freed to make room.
+    ///
+    /// # Returns
+    ///
+    /// False when `packet` held no framed input and nothing queued.
+    fn submit_into(
+        &mut self,
+        packet: &Packet,
+        freed: &mut impl PictureSink,
+    ) -> Result<bool, SwError> {
         if self.framed {
             if packet.data().is_empty() {
-                return Ok(out);
+                return Ok(false);
             }
-            self.send(packet.data(), &mut out)?;
+            self.send(packet.data(), freed)?;
         } else {
-            self.parse(packet.data(), &mut out)?;
+            self.parse(packet.data(), freed)?;
         }
-        self.receive(&mut out)?;
-        Ok(out)
+        Ok(true)
     }
 
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
-        let mut out = Vec::new();
+    /// Parser tail plus held pictures staged; resets the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the tail breaks mid-decode.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - pictures staged, oldest first.
+    fn flush_into(&mut self, out: &mut impl PictureSink) -> Result<(), SwError> {
         if !self.framed {
             loop {
                 let mut pout = ptr::null_mut();
@@ -384,13 +441,13 @@ impl Decoder for FfmpegDecoder {
                 let len = usize::try_from(pout_size).map_err(|_| SwError::Rejected)?;
                 // SAFETY: parser lends the tail frame, copied into the send below.
                 let frame = unsafe { std::slice::from_raw_parts(pout, len) };
-                self.send(frame, &mut out)?;
+                self.send(frame, out)?;
             }
         }
         // SAFETY: null packet signals end of stream.
         let err = unsafe { sys::avcodec_send_packet(self.ctx, ptr::null()) };
         if err == sys::AGAIN {
-            self.receive(&mut out)?;
+            self.receive(out)?;
             // SAFETY: queue drained above, so the signal fits now.
             let err = unsafe { sys::avcodec_send_packet(self.ctx, ptr::null()) };
             if err != 0 {
@@ -403,10 +460,58 @@ impl Decoder for FfmpegDecoder {
                 code: i64::from(err),
             });
         }
-        self.receive(&mut out)?;
+        self.receive(out)?;
         // SAFETY: context is live; reset readies it for the next stream.
         unsafe { sys::avcodec_flush_buffers(self.ctx) };
+        Ok(())
+    }
+}
+
+impl Decoder for FfmpegDecoder {
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        let mut out = Vec::new();
+        if self.submit_into(packet, &mut out)? {
+            self.receive(&mut out)?;
+        }
         Ok(out)
+    }
+
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        let mut out = Vec::new();
+        self.flush_into(&mut out)?;
+        Ok(out)
+    }
+}
+
+impl RawSource for FfmpegDecoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.submit_into(packet, freed)?;
+        Ok(())
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.receive(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        let mut out = Vec::new();
+        self.flush_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        raw.gather()
     }
 }
 
@@ -455,6 +560,32 @@ impl Decoder for H264Decoder {
     }
 }
 
+impl RawSource for H264Decoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.inner.submit_raw(packet, freed)
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.inner.poll_raw(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        self.inner.flush_raw()
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        FfmpegDecoder::convert(raw)
+    }
+}
+
 /// Threaded HEVC decoder.
 pub struct H265Decoder {
     inner: FfmpegDecoder,
@@ -490,6 +621,32 @@ impl Decoder for H265Decoder {
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.flush()
+    }
+}
+
+impl RawSource for H265Decoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.inner.submit_raw(packet, freed)
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.inner.poll_raw(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        self.inner.flush_raw()
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        FfmpegDecoder::convert(raw)
     }
 }
 
@@ -531,6 +688,32 @@ impl Decoder for Vp8Decoder {
     }
 }
 
+impl RawSource for Vp8Decoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.inner.submit_raw(packet, freed)
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.inner.poll_raw(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        self.inner.flush_raw()
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        FfmpegDecoder::convert(raw)
+    }
+}
+
 /// Threaded VP9 decoder.
 pub struct Vp9Decoder {
     inner: FfmpegDecoder,
@@ -566,6 +749,32 @@ impl Decoder for Vp9Decoder {
 
     fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.flush()
+    }
+}
+
+impl RawSource for Vp9Decoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.inner.submit_raw(packet, freed)
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.inner.poll_raw(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        self.inner.flush_raw()
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        FfmpegDecoder::convert(raw)
     }
 }
 
@@ -607,6 +816,180 @@ impl Decoder for Av1Decoder {
     }
 }
 
+impl RawSource for Av1Decoder {
+    type Raw = RawPicture;
+    type Frame = CpuFrame;
+    type Error = SwError;
+
+    fn submit_raw(
+        &mut self,
+        packet: &Packet,
+        freed: &mut Vec<Self::Raw>,
+    ) -> Result<(), Self::Error> {
+        self.inner.submit_raw(packet, freed)
+    }
+
+    fn poll_raw(&mut self, out: &mut Vec<Self::Raw>) -> Result<(), Self::Error> {
+        self.inner.poll_raw(out)
+    }
+
+    fn flush_raw(&mut self) -> Result<Vec<Self::Raw>, Self::Error> {
+        self.inner.flush_raw()
+    }
+
+    fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error> {
+        FfmpegDecoder::convert(raw)
+    }
+}
+
+/// Validated geometry plus row strides behind one decoded picture.
+struct PictureLayout {
+    /// Visible extent.
+    size: PictureSize,
+    /// Luma bytes per row.
+    y_stride: usize,
+    /// Chroma U bytes per row.
+    u_stride: usize,
+    /// Chroma V bytes per row.
+    v_stride: usize,
+}
+
+impl PictureLayout {
+    /// Layout read from a decoded frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
+    fn read(frame: &sys::AVFrame) -> Result<Self, SwError> {
+        if frame.format != sys::PIX_FMT_YUV420P {
+            return Err(SwError::BadFrame);
+        }
+        let width = u32::try_from(frame.width).map_err(|_| SwError::BadFrame)?;
+        let height = u32::try_from(frame.height).map_err(|_| SwError::BadFrame)?;
+        let Some(size) = PictureSize::new(width, height) else {
+            return Err(SwError::BadFrame);
+        };
+        if frame.data[0].is_null() || frame.data[1].is_null() || frame.data[2].is_null() {
+            return Err(SwError::BadFrame);
+        }
+        let y_stride = usize::try_from(frame.linesize[0]).map_err(|_| SwError::BadFrame)?;
+        let u_stride = usize::try_from(frame.linesize[1]).map_err(|_| SwError::BadFrame)?;
+        let v_stride = usize::try_from(frame.linesize[2]).map_err(|_| SwError::BadFrame)?;
+        let chroma_width = width.div_ceil(2);
+        if y_stride < width as usize
+            || u_stride < chroma_width as usize
+            || v_stride < chroma_width as usize
+        {
+            return Err(SwError::BadFrame);
+        }
+        Ok(Self {
+            size,
+            y_stride,
+            u_stride,
+            v_stride,
+        })
+    }
+
+    /// Plane bytes behind the frame; luma, chroma U, chroma V.
+    ///
+    /// # Safety
+    ///
+    /// `frame` planes span the layout spans; read the layout from `frame`.
+    unsafe fn planes<'a>(&self, frame: &'a sys::AVFrame) -> [&'a [u8]; 3] {
+        let height = self.size.height() as usize;
+        let chroma_height = self.size.height().div_ceil(2) as usize;
+        // SAFETY: planes span live decoder memory per the contract above.
+        let y = unsafe {
+            std::slice::from_raw_parts(frame.data[0].cast_const(), height * self.y_stride)
+        };
+        // SAFETY: planes span live decoder memory per the contract above.
+        let u = unsafe {
+            std::slice::from_raw_parts(frame.data[1].cast_const(), chroma_height * self.u_stride)
+        };
+        // SAFETY: planes span live decoder memory per the contract above.
+        let v = unsafe {
+            std::slice::from_raw_parts(frame.data[2].cast_const(), chroma_height * self.v_stride)
+        };
+        [y, u, v]
+    }
+}
+
+/// Owned strided copy of one decoded picture.
+pub struct RawPicture {
+    /// Visible extent.
+    size: PictureSize,
+    /// Luma bytes per row.
+    y_stride: usize,
+    /// Chroma U bytes per row.
+    u_stride: usize,
+    /// Chroma V bytes per row.
+    v_stride: usize,
+    /// Strided luma bytes.
+    y: Vec<u8>,
+    /// Strided chroma U bytes.
+    u: Vec<u8>,
+    /// Strided chroma V bytes.
+    v: Vec<u8>,
+}
+
+impl RawPicture {
+    /// Strided copy of a decoded frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
+    fn copy_from(frame: &sys::AVFrame) -> Result<Self, SwError> {
+        let layout = PictureLayout::read(frame)?;
+        // SAFETY: layout was read from this frame above.
+        let [y, u, v] = unsafe { layout.planes(frame) };
+        Ok(Self {
+            size: layout.size,
+            y_stride: layout.y_stride,
+            u_stride: layout.u_stride,
+            v_stride: layout.v_stride,
+            y: y.to_vec(),
+            u: u.to_vec(),
+            v: v.to_vec(),
+        })
+    }
+
+    /// CPU frame gathered from the strided copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the planes cannot form a frame.
+    pub(crate) fn gather(self) -> Result<CpuFrame, SwError> {
+        let width = self.size.width() as usize;
+        let height = self.size.height() as usize;
+        let chroma_width = self.size.width().div_ceil(2) as usize;
+        let chroma_height = self.size.height().div_ceil(2) as usize;
+        let y = gather_plane(&self.y, self.y_stride, height, width);
+        let u = gather_plane(&self.u, self.u_stride, chroma_height, chroma_width);
+        let v = gather_plane(&self.v, self.v_stride, chroma_height, chroma_width);
+        pack_yuv420p(self.size, y, u, v)
+    }
+}
+
+/// CPU frame packed from tight planes.
+fn pack_yuv420p(
+    size: PictureSize,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+) -> Result<CpuFrame, SwError> {
+    let width = size.width();
+    let chroma_width = width.div_ceil(2);
+    let planes = [
+        Plane::new(Bytes::from(y), width),
+        Plane::new(Bytes::from(u), chroma_width),
+        Plane::new(Bytes::from(v), chroma_width),
+    ];
+    let [Some(y), Some(u), Some(v)] = planes else {
+        return Err(SwError::BadFrame);
+    };
+    CpuFrame::new(size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
+}
+
 /// CPU frame copied from a decoded frame.
 ///
 /// # Performance
@@ -617,68 +1000,17 @@ impl Decoder for Av1Decoder {
 ///
 /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
 fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
-    if frame.format != sys::PIX_FMT_YUV420P {
-        return Err(SwError::BadFrame);
-    }
-    let width = u32::try_from(frame.width).map_err(|_| SwError::BadFrame)?;
-    let height = u32::try_from(frame.height).map_err(|_| SwError::BadFrame)?;
-    let Some(size) = PictureSize::new(width, height) else {
-        return Err(SwError::BadFrame);
-    };
-    if frame.data[0].is_null() || frame.data[1].is_null() || frame.data[2].is_null() {
-        return Err(SwError::BadFrame);
-    }
-    let y_stride = usize::try_from(frame.linesize[0]).map_err(|_| SwError::BadFrame)?;
-    let u_stride = usize::try_from(frame.linesize[1]).map_err(|_| SwError::BadFrame)?;
-    let v_stride = usize::try_from(frame.linesize[2]).map_err(|_| SwError::BadFrame)?;
-    let chroma_width = width.div_ceil(2);
-    let chroma_height = height.div_ceil(2);
-    if y_stride < width as usize
-        || u_stride < chroma_width as usize
-        || v_stride < chroma_width as usize
-    {
-        return Err(SwError::BadFrame);
-    }
-    // SAFETY: luma rows span live decoder memory, gathered below.
-    let y_source = unsafe {
-        std::slice::from_raw_parts(frame.data[0].cast_const(), height as usize * y_stride)
-    };
-    // SAFETY: chroma rows span live decoder memory, gathered below.
-    let u_source = unsafe {
-        std::slice::from_raw_parts(
-            frame.data[1].cast_const(),
-            chroma_height as usize * u_stride,
-        )
-    };
-    // SAFETY: chroma rows span live decoder memory, gathered below.
-    let v_source = unsafe {
-        std::slice::from_raw_parts(
-            frame.data[2].cast_const(),
-            chroma_height as usize * v_stride,
-        )
-    };
-    let y = gather_plane(y_source, y_stride, height as usize, width as usize);
-    let u = gather_plane(
-        u_source,
-        u_stride,
-        chroma_height as usize,
-        chroma_width as usize,
-    );
-    let v = gather_plane(
-        v_source,
-        v_stride,
-        chroma_height as usize,
-        chroma_width as usize,
-    );
-    let planes = [
-        Plane::new(Bytes::from(y), width),
-        Plane::new(Bytes::from(u), chroma_width),
-        Plane::new(Bytes::from(v), chroma_width),
-    ];
-    let [Some(y), Some(u), Some(v)] = planes else {
-        return Err(SwError::BadFrame);
-    };
-    CpuFrame::new(size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
+    let layout = PictureLayout::read(frame)?;
+    // SAFETY: layout was read from this frame above.
+    let [y_source, u_source, v_source] = unsafe { layout.planes(frame) };
+    let width = layout.size.width() as usize;
+    let height = layout.size.height() as usize;
+    let chroma_width = layout.size.width().div_ceil(2) as usize;
+    let chroma_height = layout.size.height().div_ceil(2) as usize;
+    let y = gather_plane(y_source, layout.y_stride, height, width);
+    let u = gather_plane(u_source, layout.u_stride, chroma_height, chroma_width);
+    let v = gather_plane(v_source, layout.v_stride, chroma_height, chroma_width);
+    pack_yuv420p(layout.size, y, u, v)
 }
 
 /// Plane bytes gathered from stride-separated source rows.
