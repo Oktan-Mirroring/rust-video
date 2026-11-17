@@ -4,6 +4,10 @@
 
 #[cfg(feature = "ffmpeg")]
 use std::fs;
+#[cfg(feature = "ffmpeg")]
+use std::hint::black_box;
+#[cfg(feature = "ffmpeg")]
+use std::num::NonZeroUsize;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use std::time::Instant;
 
@@ -11,6 +15,12 @@ use std::time::Instant;
 use bytes::Bytes;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::common::PictureSize;
+#[cfg(feature = "ffmpeg")]
+use rust_video_caps::delivery::{
+    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
+};
+#[cfg(feature = "ffmpeg")]
+use rust_video_caps::frame::GpuExport;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 #[cfg(feature = "ffmpeg")]
@@ -28,7 +38,9 @@ use rust_video_sw::H264Encoder;
 #[cfg(feature = "gpl")]
 use rust_video_sw::H265Encoder;
 #[cfg(feature = "ffmpeg")]
-use rust_video_sw::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+use rust_video_sw::{
+    Av1Decoder, DecoderPump, H264Decoder, H265Decoder, SwSurface, Vp8Decoder, Vp9Decoder,
+};
 #[cfg(feature = "ffmpeg")]
 use rust_video_sw::{Av1Encoder, Vp8Encoder, Vp9Encoder};
 
@@ -79,6 +91,98 @@ where
     }
     let tail = decoder.flush().expect("timed flush").len();
     frames += u32::try_from(tail).expect("tail frames fit");
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(frames > 0);
+    f64::from(frames) / elapsed
+}
+
+#[cfg(feature = "ffmpeg")]
+/// Queue bound behind the surface benches; polled eager, never near full.
+fn surface_config() -> ChannelConfig {
+    let bound = NonZeroUsize::new(1024).expect("queue bound");
+    ChannelConfig::new(bound, DropPolicy::DropOldest)
+}
+
+#[cfg(feature = "ffmpeg")]
+/// Folded plane bytes of `frame` with the surface legs read.
+///
+/// # Performance
+///
+/// One pass over every plane byte.
+///
+/// # Arguments
+///
+/// * `frame` - decoded frame; single layer, opaque export, complete at return.
+fn touch_surface(frame: &CpuFrame) -> u64 {
+    assert_eq!(frame.slice(), 0);
+    assert_eq!(frame.coded(), frame.size());
+    assert_eq!(frame.origin(), (0, 0));
+    assert!(matches!(frame.export(), GpuExport::Opaque { name: "sw" }));
+    frame.wait();
+    let mut folded = 0u64;
+    for plane in frame.planes() {
+        for byte in plane.data() {
+            folded = folded.wrapping_add(u64::from(*byte));
+        }
+    }
+    folded
+}
+
+#[cfg(feature = "ffmpeg")]
+/// Drained frame count plus folded surface bytes from `pump`.
+///
+/// # Arguments
+///
+/// * `pump` - split-phase pump drained through non-blocking polls.
+fn drain_surfaces<D>(pump: &mut DecoderPump<D>) -> (u32, u64)
+where
+    D: Decoder<Frame = CpuFrame>,
+    D::Error: std::fmt::Debug,
+{
+    let mut count = 0u32;
+    let mut folded = 0u64;
+    while let Some(frame) = pump.try_receive().expect("surface poll") {
+        count += 1;
+        folded = folded.wrapping_add(touch_surface(&frame));
+    }
+    (count, folded)
+}
+
+#[cfg(feature = "ffmpeg")]
+/// Measured fps of `ITERS` 1080p surface passes through `decoder`.
+///
+/// Each pass sends every packet through a split-phase pump and reads each
+/// frame through the surface legs plus a plane fold.
+fn surface_fps<D>(decoder: D, packets: &[Packet]) -> f64
+where
+    D: Decoder<Frame = CpuFrame>,
+    D::Error: std::fmt::Debug,
+{
+    let mut pump = DecoderPump::open(decoder, surface_config());
+    let mut warm = 0u32;
+    for packet in packets {
+        pump.try_send(packet.clone()).expect("warmup send");
+        warm += drain_surfaces(&mut pump).0;
+    }
+    assert!(warm > 0, "vector decodes");
+    let mut frames = 0u32;
+    let mut folded = 0u64;
+    let start = Instant::now();
+    for _ in 0..ITERS {
+        for packet in packets {
+            pump.try_send(packet.clone()).expect("timed send");
+            let (count, bytes) = drain_surfaces(&mut pump);
+            frames += count;
+            folded = folded.wrapping_add(bytes);
+        }
+    }
+    pump.finish().expect("timed finish");
+    while let Some(frame) = pump.receive().expect("tail drain") {
+        frames += 1;
+        folded = folded.wrapping_add(touch_surface(&frame));
+    }
+    assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
+    black_box(folded);
     let elapsed = start.elapsed().as_secs_f64();
     assert!(frames > 0);
     f64::from(frames) / elapsed
@@ -234,6 +338,108 @@ fn av1_decode_1080p_measures_realtime() {
     let packets = [Packet::new(Bytes::from(bytes))];
     let measured = decode_fps(&mut decoder, &packets);
     println!("sw av1 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(feature = "ffmpeg")]
+/// 1080p H.264 surface path measured against the realtime bar.
+#[test]
+fn h264_surface_1080p_measures_realtime() {
+    let decoder = match H264Decoder::open(4) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("sw h264 surface 1080p skipped: {error}");
+            return;
+        }
+    };
+    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let measured = surface_fps(decoder, &packets(&raws));
+    println!("sw h264 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(feature = "ffmpeg")]
+/// 1080p HEVC surface path measured against the realtime bar.
+#[test]
+fn h265_surface_1080p_measures_realtime() {
+    let decoder = match H265Decoder::open(4) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("sw h265 surface 1080p skipped: {error}");
+            return;
+        }
+    };
+    let bytes = fs::read(bench_dir().join("h265-1080p-nvenc.h265")).expect("h265 vector readable");
+    let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
+    let measured = surface_fps(decoder, &packets(&raws));
+    println!("sw h265 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(feature = "ffmpeg")]
+/// 1080p VP8 surface path measured against the realtime bar.
+#[test]
+fn vp8_surface_1080p_measures_realtime() {
+    let decoder = match Vp8Decoder::open(4) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("sw vp8 surface 1080p skipped: {error}");
+            return;
+        }
+    };
+    let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
+    let measured = surface_fps(decoder, &packets(&raws));
+    println!("sw vp8 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(feature = "ffmpeg")]
+/// 1080p VP9 surface path measured against the realtime bar.
+#[test]
+fn vp9_surface_1080p_measures_realtime() {
+    let decoder = match Vp9Decoder::open(4) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("sw vp9 surface 1080p skipped: {error}");
+            return;
+        }
+    };
+    let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
+    let measured = surface_fps(decoder, &packets(&raws));
+    println!("sw vp9 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+#[cfg(feature = "ffmpeg")]
+/// 1080p AV1 surface path measured against the realtime bar.
+#[test]
+fn av1_surface_1080p_measures_realtime() {
+    let decoder = match Av1Decoder::open(4) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("sw av1 surface 1080p skipped: {error}");
+            return;
+        }
+    };
+    let bytes = fs::read(bench_dir().join("av1-1080p.obu")).expect("av1 vector readable");
+    let packets = [Packet::new(Bytes::from(bytes))];
+    let measured = surface_fps(decoder, &packets);
+    println!("sw av1 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
