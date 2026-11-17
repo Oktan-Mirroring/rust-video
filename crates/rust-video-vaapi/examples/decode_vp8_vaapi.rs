@@ -25,4 +25,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() {}
+fn main() {
+    println!("SKIP: vaapi needs linux");
+}

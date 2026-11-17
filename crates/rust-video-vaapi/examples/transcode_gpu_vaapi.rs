@@ -3,8 +3,8 @@
 //! Reads MP4 (demuxed) or raw Annex B H.264:
 //! `transcode_gpu_vaapi <input> [h264|h265] [width height]`.
 
-#[cfg(target_os = "linux")]
 #[path = "common/input.rs"]
+#[cfg(target_os = "linux")]
 mod input;
 
 #[cfg(target_os = "linux")]
@@ -51,7 +51,7 @@ fn main() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(VaApiError::Skipped(reason)) => {
-            println!("va-api transcode: skipped ({reason})");
+            println!("SKIP va-api transcode ({reason})");
             return;
         }
         Err(error) => {
@@ -83,7 +83,7 @@ fn main() {
                 }
             }
             Err(VaApiError::Unsupported(message)) => {
-                println!("va-api transcode: unsupported ({message})");
+                println!("SKIP va-api transcode ({message})");
                 return;
             }
             Err(error) => {
@@ -103,4 +103,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() {}
+fn main() {
+    println!("SKIP: vaapi needs linux");
+}

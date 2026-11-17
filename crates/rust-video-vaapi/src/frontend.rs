@@ -611,7 +611,7 @@ impl Frontend {
     /// # Errors
     ///
     /// Returns `Err` when a memory-management command is unknown or
-    /// names a missing picture, or no surface slot is free.
+    /// names a missing picture, or the DPB has no free slot.
     pub fn commit(
         &mut self,
         picture: Picture,
@@ -688,7 +688,7 @@ impl Frontend {
         if is_ref || self.dpb.has_empty_frame_buffer() {
             self.dpb
                 .store_picture(pic.into_rc(), Some(slot))
-                .map_err(|_| VaApiError::NoFreeSlot)?;
+                .map_err(|_| VaApiError::DpbFull)?;
         } else {
             outputs.push(slot);
         }
@@ -735,7 +735,7 @@ impl Frontend {
             bumped.extend(self.dpb.bump_as_needed(&gap));
             self.dpb
                 .store_picture(gap.into_rc(), None)
-                .map_err(|_| VaApiError::NoFreeSlot)?;
+                .map_err(|_| VaApiError::DpbFull)?;
             let noted = self.dpb.entries().last().map(|stored| {
                 let picture = stored.pic.borrow();
                 (
@@ -1469,6 +1469,7 @@ mod tests {
         sps.vui = Some(VuiParams {
             restriction: Some(BitstreamRestriction {
                 max_num_reorder_frames: 0,
+                max_dec_frame_buffering: 4,
                 ..Default::default()
             }),
             ..Default::default()

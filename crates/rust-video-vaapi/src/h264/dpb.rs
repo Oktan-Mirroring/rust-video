@@ -655,7 +655,6 @@ impl<T: Clone> Dpb<T> {
         pic.long_term_frame_idx = long_term_frame_idx;
     }
 
-    #[cfg(debug_assertions)]
     fn debug_ref_list_p(ref_pic_list: &[&DpbEntry<T>], field_pic: bool) {
         debug!(
             "ref_list_p0: (ShortTerm|LongTerm, pic_num) {:?}",
@@ -688,7 +687,6 @@ impl<T: Clone> Dpb<T> {
         );
     }
 
-    #[cfg(debug_assertions)]
     fn debug_ref_list_b(ref_pic_list: &[&DpbEntry<T>], ref_pic_list_name: &str) {
         debug!(
             "{:?}: (ShortTerm|LongTerm, (POC|LongTermPicNum)) {:?}",
@@ -809,8 +807,9 @@ impl<T: Clone> Dpb<T> {
         p_list.extend(self.long_term_refs_iter());
         Self::sort_long_term_pic_num_ascending(&mut p_list[num_short_term_refs..]);
 
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_p(&p_list, false);
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_p(&p_list, false);
+        }
 
         p_list
     }
@@ -840,8 +839,9 @@ impl<T: Clone> Dpb<T> {
             &mut p_list,
         );
 
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_p(&p_list, true);
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_p(&p_list, true);
+        }
 
         p_list
     }
@@ -916,10 +916,12 @@ impl<T: Clone> Dpb<T> {
         // are switched.
         Self::swap_b1_if_needed(&b_list0, &mut b_list1);
 
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&b_list0, "b_list0");
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&b_list1, "b_list1");
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&b_list0, "b_list0");
+        }
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&b_list1, "b_list1");
+        }
 
         (b_list0, b_list1)
     }
@@ -1006,12 +1008,15 @@ impl<T: Clone> Dpb<T> {
 
         Self::sort_long_term_frame_idx_ascending(&mut ref_frame_list_long_term);
 
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&ref_frame_list_0_short_term, "ref_frame_list_0_short_term");
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&ref_frame_list_1_short_term, "ref_frame_list_1_short_term");
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&ref_frame_list_long_term, "ref_frame_list_long_term");
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&ref_frame_list_0_short_term, "ref_frame_list_0_short_term");
+        }
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&ref_frame_list_1_short_term, "ref_frame_list_1_short_term");
+        }
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&ref_frame_list_long_term, "ref_frame_list_long_term");
+        }
 
         // 8.2.4.2.5
         let field = cur_pic.field;
@@ -1047,10 +1052,12 @@ impl<T: Clone> Dpb<T> {
         // are switched.
         Self::swap_b1_if_needed(&b_list0, &mut b_list1);
 
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&b_list0, "b_list0");
-        #[cfg(debug_assertions)]
-        Self::debug_ref_list_b(&b_list1, "b_list1");
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&b_list0, "b_list0");
+        }
+        if cfg!(debug_assertions) {
+            Self::debug_ref_list_b(&b_list1, "b_list1");
+        }
 
         (b_list0, b_list1)
     }

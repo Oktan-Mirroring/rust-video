@@ -5,12 +5,14 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
+use std::sync::Arc;
 
 use crate::buffer::{bytes_of, VaBuffer};
 use crate::decoder::VaApiFrame;
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
+use crate::sys;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::transcode::FallbackCause;
@@ -63,7 +65,7 @@ impl Scaler {
         let display = device.display();
         let pipeline = VaBuffer::empty(
             display,
-            session.context,
+            session.inner.context,
             ffi::VA_PROC_PIPELINE_PARAMETER_BUFFER_TYPE,
             size_of::<ffi::VaProcPipelineParameterBuffer>(),
         )?;
@@ -107,7 +109,7 @@ impl Scaler {
                 "scale without a device surface".to_owned(),
             ));
         };
-        if display != self.session.display {
+        if display != self.session.inner.display {
             return Err(VaApiError::Unsupported(
                 FallbackCause::DeviceMismatch.to_string(),
             ));
@@ -123,10 +125,10 @@ impl Scaler {
             )));
         }
         let slot = self.next;
-        let target = self.session.surfaces[slot];
+        let target = self.session.inner.surfaces[slot];
         if !self.settled[slot] {
             // Sound: the surface was just submitted.
-            VaApiError::status(unsafe { ffi::vaSyncSurface(self.session.display, target) })?;
+            sys::status(unsafe { sys::vaSyncSurface(self.session.inner.display, target) })?;
             self.settled[slot] = true;
         }
         self.next = (self.next + 1) % Self::OUTPUTS;
@@ -159,22 +161,22 @@ impl Scaler {
             va_reserved: [0; 16],
         };
         self.pipeline.rewrite(bytes_of(&params))?;
-        let display = self.session.display;
-        let context = self.session.context;
+        let display = self.session.inner.display;
+        let context = self.session.inner.context;
         let mut id = self.pipeline.id();
         // Sound: the context and target are live; the pipeline buffer holds one struct.
-        VaApiError::status(unsafe { ffi::vaBeginPicture(display, context, target) })?;
-        let rendered = unsafe { ffi::vaRenderPicture(display, context, &raw mut id, 1) };
-        let end = unsafe { ffi::vaEndPicture(display, context) };
-        let outcome = VaApiError::status(rendered).and(VaApiError::status(end));
+        sys::status(unsafe { sys::vaBeginPicture(display, context, target) })?;
+        let rendered = unsafe { sys::vaRenderPicture(display, context, &raw mut id, 1) };
+        let end = unsafe { sys::vaEndPicture(display, context) };
+        let outcome = sys::status(rendered).and(sys::status(end));
         if outcome.is_err() {
             // Sound: the target was just submitted.
-            let _ = unsafe { ffi::vaSyncSurface(display, target) };
+            let _ = unsafe { sys::vaSyncSurface(display, target) };
         }
         outcome?;
         self.settled[slot] = false;
         Ok(ScaledSurface {
-            display,
+            session: Arc::clone(&self.session.inner),
             surface: target,
             size: self.to,
         })
@@ -182,9 +184,12 @@ impl Scaler {
 }
 
 /// Scaled device surface at the pipeline target size.
+///
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
 pub struct ScaledSurface {
-    /// Display owning the surface.
-    display: ffi::VaDisplay,
+    /// Owned processing session behind the surface; the context and
+    /// output surfaces stay alive past scaler drop while held.
+    session: Arc<SessionInner>,
     /// Surface handle.
     surface: ffi::VaSurfaceId,
     /// Surface size in luma samples.
@@ -195,7 +200,7 @@ impl ScaledSurface {
     /// Display owning the surface.
     #[must_use]
     pub(crate) fn display(&self) -> ffi::VaDisplay {
-        self.display
+        self.session.display
     }
 
     /// Surface handle.
@@ -211,8 +216,17 @@ impl ScaledSurface {
     }
 }
 
-/// Owned processing session: config, context, and output surfaces.
+/// Owned processing session over a shared inner.
 struct Session {
+    /// Config, context, and output surfaces, shared with live outputs.
+    inner: Arc<SessionInner>,
+}
+
+/// Owned processing session: config, context, and output surfaces.
+///
+/// Shared with live outputs: dropping the scaler destroys the
+/// session only once the last output holding it drops.
+struct SessionInner {
     /// Initialized display.
     display: ffi::VaDisplay,
     /// Processing configuration.
@@ -236,8 +250,8 @@ impl Session {
         let mut config = 0;
         // Sound: the display is initialized; no attributes travel with a
         // processing config.
-        VaApiError::status(unsafe {
-            ffi::vaCreateConfig(
+        sys::status(unsafe {
+            sys::vaCreateConfig(
                 display,
                 ffi::VA_PROFILE_NONE,
                 ffi::VA_ENTRYPOINT_VIDEO_PROC,
@@ -250,7 +264,7 @@ impl Session {
         let mut surfaces = vec![0; count];
         // Sound: the surface array holds `count` live entries.
         let status = unsafe {
-            ffi::vaCreateSurfaces(
+            sys::vaCreateSurfaces(
                 display,
                 ffi::VA_RT_FORMAT_YUV420,
                 to.width(),
@@ -263,10 +277,10 @@ impl Session {
                 0,
             )
         };
-        if let Err(error) = VaApiError::status(status) {
+        if let Err(error) = sys::status(status) {
             // Sound: `config` was created above.
             unsafe {
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
@@ -275,7 +289,7 @@ impl Session {
         let mut context = 0;
         // Sound: the surface array outlives context creation.
         let status = unsafe {
-            ffi::vaCreateContext(
+            sys::vaCreateContext(
                 display,
                 config,
                 width_c,
@@ -286,34 +300,44 @@ impl Session {
                 &raw mut context,
             )
         };
-        if let Err(error) = VaApiError::status(status) {
+        if let Err(error) = sys::status(status) {
             // Sound: the surfaces and config were created above.
             unsafe {
-                ffi::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
         Ok(Self {
-            display,
-            config,
-            context,
-            surfaces,
-            count_c,
+            inner: Arc::new(SessionInner {
+                display,
+                config,
+                context,
+                surfaces,
+                count_c,
+            }),
         })
     }
 }
 
-impl Drop for Session {
+impl Drop for SessionInner {
     fn drop(&mut self) {
         // Sound: context, surfaces, and config were created in `open`.
         unsafe {
-            ffi::vaDestroyContext(self.display, self.context);
-            ffi::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
-            ffi::vaDestroyConfig(self.display, self.config);
+            sys::vaDestroyContext(self.display, self.context);
+            sys::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
+            sys::vaDestroyConfig(self.display, self.config);
         }
     }
 }
+
+// Sound: moves hand ownership to the new thread; the last drop
+// destroys the driver objects, never shared.
+unsafe impl Send for SessionInner {}
+
+// Sound: every field is read-only after `open`; shared references
+// only copy handles out.
+unsafe impl Sync for SessionInner {}
 
 // Sound: a move hands exclusive ownership to the new thread; the
 // session destroys wherever the value drops, never shared.

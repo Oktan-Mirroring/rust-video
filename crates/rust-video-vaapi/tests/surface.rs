@@ -2,22 +2,16 @@
 //!
 //! Needs Linux with VA-API hardware; every test skips loudly without it.
 
-#[cfg(target_os = "linux")]
-use bytes::Bytes;
-#[cfg(target_os = "linux")]
-use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "linux")]
-use rust_video_caps::frame::{GpuExport, PixelFormat};
-#[cfg(target_os = "linux")]
-use rust_video_caps::packet::Packet;
-#[cfg(target_os = "linux")]
-use rust_video_caps::traits::{Decoder, Device};
-#[cfg(target_os = "linux")]
-use rust_video_harness::H264Synth;
-#[cfg(target_os = "linux")]
-use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError};
+#![cfg(target_os = "linux")]
 
-#[cfg(target_os = "linux")]
+use bytes::Bytes;
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{GpuExport, PixelFormat};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::{Decoder, Device};
+use rust_video_harness::H264Synth;
+use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaSeam};
+
 /// Packets over raw Annex B payloads.
 fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
     raws.iter()
@@ -25,19 +19,17 @@ fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 /// Open device, skipping `test` loudly without hardware.
 fn device(test: &str) -> Option<VaApiDevice> {
     match VaApiDevice::open() {
         Ok(device) => Some(device),
         Err(error) => {
-            println!("vaapi {test} skipped: {error}");
+            println!("SKIP vaapi {test}: {error}");
             None
         }
     }
 }
 
-#[cfg(target_os = "linux")]
 /// Native device, decoder, and context handles are exposed by reference.
 #[test]
 fn native_handles_are_exposed() {
@@ -59,8 +51,7 @@ fn native_handles_are_exposed() {
     assert_eq!(context.coded_size(), (64, 64));
 }
 
-#[cfg(target_os = "linux")]
-/// Readback frames carry visible size, format, slot, coded extent, and origin.
+/// Readback frames carry visible size, format, layer, coded extent, and origin.
 #[test]
 fn readback_frames_carry_surface_metadata() {
     let Some(device) = device("surface readback metadata") else {
@@ -90,7 +81,6 @@ fn readback_frames_carry_surface_metadata() {
     assert_eq!(frame.nv12().len(), 320 * 240 * 3 / 2);
 }
 
-#[cfg(target_os = "linux")]
 /// Cropped frames separate the visible size from the coded extent.
 #[test]
 fn cropped_frames_separate_visible_from_coded() {
@@ -113,7 +103,6 @@ fn cropped_frames_separate_visible_from_coded() {
     assert_eq!(frame.nv12().len(), 320 * 224 * 3 / 2);
 }
 
-#[cfg(target_os = "linux")]
 /// Device frames wait cleanly and name their native surface.
 #[test]
 fn device_frames_wait_and_name_their_surface() {
@@ -142,7 +131,6 @@ fn device_frames_wait_and_name_their_surface() {
     assert!(frame.to_cpu().is_none());
 }
 
-#[cfg(target_os = "linux")]
 /// Held device frames pin their slots; exhaustion fails loud, never corrupts.
 #[test]
 fn exhausted_pool_fails_loud_with_no_free_slot() {

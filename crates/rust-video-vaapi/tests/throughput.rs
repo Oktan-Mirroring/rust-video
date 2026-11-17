@@ -2,33 +2,25 @@
 //!
 //! Skips without hardware; a hardware run fails below the bar.
 
-#[cfg(target_os = "linux")]
+#![cfg(target_os = "linux")]
+
 use bytes::Bytes;
-#[cfg(target_os = "linux")]
 use rust_video_caps::common::PictureSize;
-#[cfg(target_os = "linux")]
 use rust_video_caps::frame::CpuFrame;
-#[cfg(target_os = "linux")]
 use rust_video_caps::packet::Packet;
-#[cfg(target_os = "linux")]
 use rust_video_caps::traits::{Decoder, Encoder};
-#[cfg(target_os = "linux")]
 use rust_video_harness::{bench_dir, AnnexB, H264Synth, Synth};
-#[cfg(target_os = "linux")]
 use rust_video_vaapi::{
     Av1Decoder, EncodeCodec, H264Decoder, H265Decoder, VaApiDevice, VaApiEncoder, VaApiError,
     VaApiFrame,
 };
 
-#[cfg(target_os = "linux")]
 /// Tier realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
-#[cfg(target_os = "linux")]
 /// Timed iterations per bench.
 const ITERS: u32 = 30;
 
-#[cfg(target_os = "linux")]
 /// Measured fps of `ITERS` passes of `packets` through `decoder`.
 fn decode_fps(
     decoder: &mut impl Decoder<Frame = VaApiFrame, Error = VaApiError>,
@@ -52,7 +44,6 @@ fn decode_fps(
     f64::from(count) / elapsed
 }
 
-#[cfg(target_os = "linux")]
 /// Measured fps of `ITERS` passes of `frames` through `encoder`.
 fn encode_fps(encoder: &mut impl Encoder<Error = VaApiError>, frames: &[CpuFrame]) -> f64 {
     for frame in frames {
@@ -77,7 +68,6 @@ fn encode_fps(encoder: &mut impl Encoder<Error = VaApiError>, frames: &[CpuFrame
     f64::from(coded) / elapsed
 }
 
-#[cfg(target_os = "linux")]
 /// Packets over `raws`, built once outside the timed loop.
 fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
     raws.iter()
@@ -85,14 +75,13 @@ fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 /// VA-API AV1 1080p decode measured against the realtime bar.
 #[test]
 fn av1_decode_1080p_measures_realtime() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("vaapi av1 decode 1080p skipped: {error}");
+            println!("SKIP vaapi av1 decode 1080p: {error}");
             return;
         }
     };
@@ -107,14 +96,13 @@ fn av1_decode_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "linux")]
 /// VA-API H.264 1080p decode measured against the realtime bar.
 #[test]
 fn h264_decode_1080p_measures_realtime() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("vaapi h264 decode 1080p skipped: {error}");
+            println!("SKIP vaapi h264 decode 1080p: {error}");
             return;
         }
     };
@@ -129,14 +117,13 @@ fn h264_decode_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "linux")]
 /// VA-API H.264 1080p encode measured against the realtime bar.
 #[test]
 fn h264_encode_1080p_measures_realtime() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("vaapi h264 encode 1080p skipped: {error}");
+            println!("SKIP vaapi h264 encode 1080p: {error}");
             return;
         }
     };
@@ -144,7 +131,7 @@ fn h264_encode_1080p_measures_realtime() {
     let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("vaapi h264 encode 1080p skipped: {error}");
+            println!("SKIP vaapi h264 encode 1080p: {error}");
             return;
         }
     };
@@ -162,14 +149,13 @@ fn h264_encode_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "linux")]
 /// VA-API H.265 1080p decode measured against the realtime bar.
 #[test]
 fn h265_decode_1080p_measures_realtime() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("vaapi h265 decode 1080p skipped: {error}");
+            println!("SKIP vaapi h265 decode 1080p: {error}");
             return;
         }
     };
@@ -187,14 +173,13 @@ fn h265_decode_1080p_measures_realtime() {
     );
 }
 
-#[cfg(target_os = "linux")]
 /// VA-API H.265 1080p encode measured against the realtime bar.
 #[test]
 fn h265_encode_1080p_measures_realtime() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("vaapi h265 encode 1080p skipped: {error}");
+            println!("SKIP vaapi h265 encode 1080p: {error}");
             return;
         }
     };
@@ -202,7 +187,7 @@ fn h265_encode_1080p_measures_realtime() {
     let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("vaapi h265 encode 1080p skipped: {error}");
+            println!("SKIP vaapi h265 encode 1080p: {error}");
             return;
         }
     };
@@ -218,11 +203,4 @@ fn h265_encode_1080p_measures_realtime() {
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
     );
-}
-
-#[cfg(not(target_os = "linux"))]
-/// VA-API tier absent off Linux; the benches compile out.
-#[test]
-fn throughput_skipped_off_linux() {
-    println!("vaapi throughput skipped: linux-only tier");
 }

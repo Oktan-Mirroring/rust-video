@@ -9,6 +9,7 @@ use crate::ffi::VaSliceParameterBufferHevc;
 use crate::frontend::SurfaceSlot;
 use crate::h265::frontend::{Frontend, PendingPicture, Picture};
 use crate::h265::params::Params;
+use crate::seam::VaSeam;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
@@ -60,7 +61,9 @@ impl<'a> H265Decoder<'a> {
     /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
     /// is absent. Each frame pins its pool slot until dropped, so a
     /// caller holding more frames than the pool holds back fails with
-    /// `NoFreeSlot`; `decode` copies pixels and releases immediately.
+    /// `NoFreeSlot` when live frames pin every free slot, or `DpbFull`
+    /// when the picture buffer itself is full; `decode` copies pixels
+    /// and releases immediately.
     ///
     /// # Errors
     ///
@@ -206,19 +209,33 @@ impl<'a> H265Decoder<'a> {
     }
 
     /// Free pool slot: neither DPB-backed nor leased to a live frame.
+    ///
+    /// `NoFreeSlot` when live frames pin every DPB-free slot;
+    /// `DpbFull` when no slot is DPB-free.
     fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
         let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
-        (0..end)
-            .map(SurfaceSlot::new)
-            .find(|slot| {
-                !self.frontend.slot_in_use(slot.index())
-                    && !self
-                        .backend
-                        .as_ref()
-                        .is_some_and(|backend| backend.surface_live(slot.index()))
-            })
-            .ok_or(VaApiError::NoFreeSlot)
+        let mut pinned = false;
+        for index in 0..end {
+            let slot = SurfaceSlot::new(index);
+            if self.frontend.slot_in_use(slot.index()) {
+                continue;
+            }
+            if self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.surface_live(slot.index()))
+            {
+                pinned = true;
+                continue;
+            }
+            return Ok(slot);
+        }
+        Err(if pinned {
+            VaApiError::NoFreeSlot
+        } else {
+            VaApiError::DpbFull
+        })
     }
 
     /// Submit `picture` on `slot`.

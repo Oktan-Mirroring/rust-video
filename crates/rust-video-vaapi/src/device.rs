@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use crate::error::{SkipReason, VaApiError};
 use crate::ffi;
+use crate::sys;
 
 use rust_video_caps::traits::Device;
 
@@ -141,7 +142,7 @@ impl VaApiDevice {
         // surface and any exported descriptors close on every path.
         unsafe {
             let mut surface = 0;
-            let created = ffi::vaCreateSurfaces(
+            let created = sys::vaCreateSurfaces(
                 self.display,
                 ffi::VA_RT_FORMAT_YUV420,
                 64,
@@ -155,7 +156,7 @@ impl VaApiDevice {
                 return false;
             }
             let mut descriptor = std::mem::MaybeUninit::<ffi::VaDrmPrimeDescriptor>::uninit();
-            let status = ffi::vaExportSurfaceHandle(
+            let status = sys::vaExportSurfaceHandle(
                 self.display,
                 surface,
                 ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -171,7 +172,7 @@ impl VaApiDevice {
                     }
                 }
             }
-            ffi::vaDestroySurfaces(self.display, &raw mut surface, 1);
+            sys::vaDestroySurfaces(self.display, &raw mut surface, 1);
             status == ffi::VA_STATUS_SUCCESS
         }
     }
@@ -187,7 +188,7 @@ impl Drop for VaApiDevice {
     fn drop(&mut self) {
         // Sound: `display` initialized in `open` and never terminated before drop.
         unsafe {
-            ffi::vaTerminate(self.display);
+            sys::vaTerminate(self.display);
         }
     }
 }
@@ -225,18 +226,18 @@ impl Display {
     fn open(node: &OwnedFd) -> Option<Self> {
         // Sound: `vaGetDisplayDRM` borrows the live descriptor without taking
         // ownership; `vaInitialize` runs before any other call on the display.
-        let display = unsafe { ffi::vaGetDisplayDRM(node.as_raw_fd()) };
+        let display = unsafe { sys::vaGetDisplayDRM(node.as_raw_fd()) };
         if display.is_null() {
             return None;
         }
         let mut major = 0;
         let mut minor = 0;
         // Sound: `display` is non-null and freshly opened.
-        let status = unsafe { ffi::vaInitialize(display, &raw mut major, &raw mut minor) };
+        let status = unsafe { sys::vaInitialize(display, &raw mut major, &raw mut minor) };
         if status != ffi::VA_STATUS_SUCCESS {
             // Sound: `display` came from `vaGetDisplayDRM` on this node.
             unsafe {
-                ffi::vaTerminate(display);
+                sys::vaTerminate(display);
             }
             return None;
         }
@@ -253,7 +254,7 @@ impl Display {
     /// Driver description.
     fn vendor(&self) -> String {
         // Sound: the driver owns the string for the display lifetime.
-        let raw = unsafe { ffi::vaQueryVendorString(self.display) };
+        let raw = unsafe { sys::vaQueryVendorString(self.display) };
         if raw.is_null() {
             return "vaapi".to_owned();
         }
@@ -268,11 +269,11 @@ impl Display {
         // Sound: all calls below take the initialized display; each list is
         // sized by its `vaMaxNum*` capacity query.
         unsafe {
-            let capacity = usize::try_from(ffi::vaMaxNumProfiles(self.display)).unwrap_or(0);
+            let capacity = usize::try_from(sys::vaMaxNumProfiles(self.display)).unwrap_or(0);
             let mut profiles = vec![0; capacity];
             let mut count = 0;
             let status =
-                ffi::vaQueryConfigProfiles(self.display, profiles.as_mut_ptr(), &raw mut count);
+                sys::vaQueryConfigProfiles(self.display, profiles.as_mut_ptr(), &raw mut count);
             if status != ffi::VA_STATUS_SUCCESS {
                 return Vec::new();
             }
@@ -316,10 +317,10 @@ impl Display {
 fn entrypoints(display: ffi::VaDisplay, profile: std::os::raw::c_int) -> Vec<std::os::raw::c_int> {
     // Sound: the entrypoint list is sized by its capacity query.
     unsafe {
-        let capacity = usize::try_from(ffi::vaMaxNumEntrypoints(display)).unwrap_or(0);
+        let capacity = usize::try_from(sys::vaMaxNumEntrypoints(display)).unwrap_or(0);
         let mut entrypoints = vec![0; capacity];
         let mut count = 0;
-        let status = ffi::vaQueryConfigEntrypoints(
+        let status = sys::vaQueryConfigEntrypoints(
             display,
             profile,
             entrypoints.as_mut_ptr(),
@@ -347,7 +348,7 @@ fn config_attr(
             attr_type,
             value: 0,
         };
-        let status = ffi::vaGetConfigAttributes(display, profile, entrypoint, &raw mut attrib, 1);
+        let status = sys::vaGetConfigAttributes(display, profile, entrypoint, &raw mut attrib, 1);
         (status == ffi::VA_STATUS_SUCCESS && attrib.value != ffi::VA_ATTRIB_NOT_SUPPORTED)
             .then_some(attrib.value)
     }
@@ -357,7 +358,7 @@ impl Drop for Display {
     fn drop(&mut self) {
         // Sound: `display` initialized in `open` and never terminated before drop.
         unsafe {
-            ffi::vaTerminate(self.display);
+            sys::vaTerminate(self.display);
         }
     }
 }

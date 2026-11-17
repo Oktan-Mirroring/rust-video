@@ -670,7 +670,7 @@ impl Frontend {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when no surface slot is free for the picture.
+    /// Returns `Err` when the DPB has no free slot for the picture.
     pub fn commit(
         &mut self,
         picture: Picture,
@@ -681,7 +681,7 @@ impl Frontend {
         }
         self.dpb
             .store_picture(Rc::new(RefCell::new(picture.pic)), slot)
-            .map_err(|_| VaApiError::NoFreeSlot)?;
+            .map_err(|_| VaApiError::DpbFull)?;
         let mut outputs = Vec::new();
         while self.dpb.needs_additional_bumping(&picture.sps) {
             let Some(entry) = self.dpb.bump(false) else {

@@ -6,6 +6,7 @@ use std::os::raw::{c_int, c_void};
 
 use crate::error::VaApiError;
 use crate::ffi;
+use crate::sys;
 
 /// Owned VA-API data buffer, destroyed on drop.
 pub(crate) struct VaBuffer {
@@ -37,8 +38,8 @@ impl VaBuffer {
         let len = u32::try_from(data.len())
             .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
         // Sound: the context is live; `data` holds `len` bytes.
-        VaApiError::status(unsafe {
-            ffi::vaCreateBuffer(
+        sys::status(unsafe {
+            sys::vaCreateBuffer(
                 display,
                 context,
                 buffer_type,
@@ -72,8 +73,8 @@ impl VaBuffer {
         let size = u32::try_from(len)
             .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
         // Sound: the context is live; a null payload means uninitialized.
-        VaApiError::status(unsafe {
-            ffi::vaCreateBuffer(
+        sys::status(unsafe {
+            sys::vaCreateBuffer(
                 display,
                 context,
                 buffer_type,
@@ -114,7 +115,7 @@ impl VaBuffer {
         }
         // Sound: the buffer is live until the context drops.
         let mut mapped: *mut c_void = std::ptr::null_mut();
-        VaApiError::status(unsafe { ffi::vaMapBuffer(self.display, self.id, &raw mut mapped) })?;
+        sys::status(unsafe { sys::vaMapBuffer(self.display, self.id, &raw mut mapped) })?;
         if !data.is_empty() {
             // Sound: the mapping spans the creation size, which fits `data`.
             unsafe {
@@ -122,7 +123,7 @@ impl VaBuffer {
             }
         }
         // Sound: the buffer was mapped above.
-        VaApiError::status(unsafe { ffi::vaUnmapBuffer(self.display, self.id) })?;
+        sys::status(unsafe { sys::vaUnmapBuffer(self.display, self.id) })?;
         Ok(false)
     }
 }
@@ -131,7 +132,7 @@ impl Drop for VaBuffer {
     fn drop(&mut self) {
         // Sound: the id came from a successful `vaCreateBuffer`.
         unsafe {
-            ffi::vaDestroyBuffer(self.display, self.id);
+            sys::vaDestroyBuffer(self.display, self.id);
         }
     }
 }

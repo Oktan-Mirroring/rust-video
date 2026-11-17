@@ -5,13 +5,16 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use crate::backend::{Backend, StatsInner, SurfaceId};
+use crate::backend::{Backend, Pool, StatsInner};
+use crate::buffer::bytes_of;
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::{self, VaSliceParameterBufferH264};
 use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
 use crate::h264::parser::{SliceHeader, SliceType};
 use crate::params::Params;
+use crate::seam::{SurfaceId, VaSeam};
+use crate::sys;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
@@ -63,7 +66,9 @@ impl<'a> H264Decoder<'a> {
     /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
     /// is absent. Each frame pins its pool slot until dropped, so a
     /// caller holding more frames than the pool holds back fails with
-    /// `NoFreeSlot`; `decode` copies pixels and releases immediately.
+    /// `NoFreeSlot` when live frames pin every free slot, or `DpbFull`
+    /// when the picture buffer itself is full; `decode` copies pixels
+    /// and releases immediately.
     ///
     /// # Errors
     ///
@@ -207,19 +212,33 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Free pool slot: neither DPB-backed nor leased to a live frame.
+    ///
+    /// `NoFreeSlot` when live frames pin every DPB-free slot;
+    /// `DpbFull` when no slot is DPB-free.
     fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
         let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
-        (0..end)
-            .map(SurfaceSlot::new)
-            .find(|slot| {
-                !self.frontend.slot_in_use(slot.index())
-                    && !self
-                        .backend
-                        .as_ref()
-                        .is_some_and(|backend| backend.surface_live(slot.index()))
-            })
-            .ok_or(VaApiError::NoFreeSlot)
+        let mut pinned = false;
+        for index in 0..end {
+            let slot = SurfaceSlot::new(index);
+            if self.frontend.slot_in_use(slot.index()) {
+                continue;
+            }
+            if self
+                .backend
+                .as_ref()
+                .is_some_and(|backend| backend.surface_live(slot.index()))
+            {
+                pinned = true;
+                continue;
+            }
+            return Ok(slot);
+        }
+        Err(if pinned {
+            VaApiError::NoFreeSlot
+        } else {
+            VaApiError::DpbFull
+        })
     }
 
     /// Submit `picture` on `slot`.
@@ -274,10 +293,10 @@ impl<'a> H264Decoder<'a> {
             .backend
             .as_mut()
             .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
-        backend.submit(
+        backend.submit_slices(
             surface,
-            &picture_params,
-            &matrix,
+            bytes_of(&picture_params),
+            Some(bytes_of(&matrix)),
             &self.slice_params,
             |index| picture.slices()[index].data(),
         )
@@ -425,6 +444,8 @@ impl Emit {
 
 /// Decoded frame: NV12 bytes with identity, lease, and device surface.
 ///
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
+///
 /// `Send`, never `Sync`: hand the frame to another thread when idle,
 /// but export from one thread at a time. The surface handle behind
 /// the frame is only dereferenced through driver calls the owner
@@ -438,8 +459,6 @@ pub struct VaApiFrame {
     lease: Lease,
     /// Device surface behind the frame, absent without one.
     device: Option<DeviceSurface>,
-    /// Pool slot holding this picture.
-    slot: u32,
     /// Full texture extent in luma samples.
     coded: PictureSize,
     /// Crop left/top in luma samples.
@@ -492,7 +511,13 @@ impl VaApiFrame {
                 None
             } else {
                 backend.surface_guard(slot.index()).map(|guard| {
-                    DeviceSurface::new(device.display(), surface, guard, backend.gauges())
+                    DeviceSurface::new(
+                        device.display(),
+                        surface,
+                        guard,
+                        backend.pool(),
+                        backend.gauges(),
+                    )
                 })
             };
             frames.push(Self {
@@ -500,7 +525,6 @@ impl VaApiFrame {
                 data,
                 lease,
                 device,
-                slot: slot.index(),
                 coded,
                 origin,
             });
@@ -527,13 +551,12 @@ impl VaApiFrame {
         self.identity.format()
     }
 
-    /// Pool slot holding this picture.
+    /// Array layer behind the picture.
     ///
-    /// Device frames pin the slot while live; readback frames name
-    /// the slot their pixels were copied from and hold no lease.
+    /// VA-API surfaces carry a single layer.
     #[must_use]
     pub fn slice(&self) -> u32 {
-        self.slot
+        0
     }
 
     /// Full texture extent in luma samples.
@@ -633,6 +656,8 @@ impl VaApiFrame {
 }
 
 /// Device surface behind a frame, leased against pool reuse.
+///
+/// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
 struct DeviceSurface {
     /// Display owning the surface.
     display: ffi::VaDisplay,
@@ -640,6 +665,9 @@ struct DeviceSurface {
     surface: ffi::VaSurfaceId,
     /// Pool-slot lease; the slot stays out of the free set while live.
     _guard: Arc<()>,
+    /// Decode pool behind the surface; the context and pool surfaces
+    /// stay alive past decoder drop while held.
+    _pool: Arc<Pool>,
     /// Submit gauges of the owning context.
     gauges: Arc<StatsInner>,
 }
@@ -650,12 +678,14 @@ impl DeviceSurface {
         display: ffi::VaDisplay,
         surface: ffi::VaSurfaceId,
         guard: Arc<()>,
+        pool: Arc<Pool>,
         gauges: Arc<StatsInner>,
     ) -> Self {
         Self {
             display,
             surface,
             _guard: guard,
+            _pool: pool,
             gauges,
         }
     }
@@ -667,15 +697,15 @@ impl DeviceSurface {
     /// Returns `Err` when the driver reports the surface failed.
     fn wait(&self) -> Result<(), VaApiError> {
         // Sound: the display and surface are live behind the pool lease.
-        let outcome = unsafe { ffi::vaSyncSurface(self.display, self.surface) };
+        let outcome = unsafe { sys::vaSyncSurface(self.display, self.surface) };
         self.gauges.note_synced();
-        VaApiError::status(outcome)
+        sys::status(outcome)
     }
 
     /// NV12 DMA-BUF planes for the surface, absent when the export fails.
     fn export(&self) -> Option<[DmaBufPlane; 2]> {
         // Sound: the display and surface are live behind the pool lease.
-        let synced = unsafe { ffi::vaSyncSurface(self.display, self.surface) };
+        let synced = unsafe { sys::vaSyncSurface(self.display, self.surface) };
         if synced != ffi::VA_STATUS_SUCCESS {
             return None;
         }
@@ -683,7 +713,7 @@ impl DeviceSurface {
         let mut descriptor = std::mem::MaybeUninit::<ffi::VaDrmPrimeDescriptor>::uninit();
         // Sound: the descriptor outlives the call.
         let status = unsafe {
-            ffi::vaExportSurfaceHandle(
+            sys::vaExportSurfaceHandle(
                 self.display,
                 self.surface,
                 ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -772,7 +802,6 @@ mod tests {
             data: bytes,
             lease,
             device: None,
-            slot: 2,
             coded: size,
             origin: (0, 0),
         }
@@ -839,7 +868,7 @@ mod tests {
         let held = frame(&shared, 4, 2, vec![0; 12]);
         assert_eq!(held.size(), PictureSize::new(4, 2).expect("extent"));
         assert_eq!(held.format(), PixelFormat::Nv12);
-        assert_eq!(held.slice(), 2);
+        assert_eq!(held.slice(), 0);
         assert_eq!(held.coded(), PictureSize::new(4, 2).expect("extent"));
         assert_eq!(held.origin(), (0, 0));
     }

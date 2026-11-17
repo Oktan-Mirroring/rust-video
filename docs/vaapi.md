@@ -1,12 +1,13 @@
 # VA-API tier
 
-H.264 decode, H.264/H.265 encode, and GPU transcode over DRM render
-nodes behind the facade shapes: `crates/rust-video-vaapi`. H.265,
-VP8, VP9, and AV1 decode carry staged frontends: parser sources on
-disk with typed decline until each is wired. The libva binding is a
-minimal hand rebind; syntax and parameters meet in a portable layer.
-The crate builds on every platform and runs on Linux where a render
-node offers the matching profile into NV12.
+H.264, H.265, and AV1 decode, H.264/H.265 encode, and GPU
+transcode over DRM render nodes behind the facade shapes:
+`crates/rust-video-vaapi`. VP8 and VP9 decode carry staged
+frontends: parser sources on disk with typed decline until each is
+wired. The libva binding is a minimal hand rebind; syntax and
+parameters meet in a portable layer. The crate builds on every
+platform and runs on Linux where a render node offers the matching
+profile into NV12.
 
 ## Module map
 
@@ -22,31 +23,33 @@ node offers the matching profile into NV12.
 | `frontend.rs` | Annex B into ordered `Picture`s over DPB slots, POC, reference lists |
 | `params.rs` | syntax onto VA-API picture/slice buffers |
 | `buffer.rs` | owned data buffers: create, map-rewrite, destroy on drop |
-| `ffi.rs` | hand rebind of the used libva subset, layouts pinned against `/usr/include/va/va.h` (libva 1.22.0) with size tests |
+| `ffi.rs` | portable half of the hand rebind: layouts and constants, pinned against `/usr/include/va/va.h` (libva 1.22.0) with size tests |
+| `sys.rs` | Linux-only half: the `extern` entry points plus the driver status mapping |
+| `seam.rs` | `VaSeam`: the single decoder-to-context seam (submit, read, wait, pool access), implemented once by `Backend` |
 | `error.rs` | `VaApiError`/`SkipReason` |
 | `bitstream.rs` | `BitReader`: bits, Exp-Golomb, emulation prevention, `more_rbsp_data` |
 | `h264.rs` + `h264/` | wired H.264 syntax: `nalu`, `parser`, `dpb`, `picture` |
-| `h265.rs` + `h265/` | staged H.265 syntax: `parser`, `dpb`, `picture` (dormant) |
+| `h265.rs` + `h265/` | wired H.265 syntax: `decoder`, `parser`, `frontend`, `params`, `dpb`, `picture` |
 | `vp8.rs` + `vp8/` | staged VP8 syntax: `parser`, `bool_decoder`, `probs` (dormant) |
 | `vp9.rs` + `vp9/` | staged VP9 syntax: `parser`, `lookups` (dormant) |
-| `av1.rs` + `av1/` | staged AV1 syntax: `parser`, `reader`, `helpers` (dormant) |
+| `av1.rs` + `av1/` | wired AV1 syntax: `decoder`, `parser`, `reader`, `frontend`, `params`, `helpers` |
 
 Dormant means the subdirectory files are not declared with `mod` and
-do not join the build; the sibling shim (`h265.rs`, `vp8.rs`,
-`vp9.rs`, `av1.rs`) exports the decoder handle whose `decode`
-declines every packet with typed `Unsupported`, covered by unit
-tests. Off Linux the crate compiles empty: every module is
-Linux-gated at the crate root.
+do not join the build; the sibling shim (`vp8.rs`, `vp9.rs`)
+exports the decoder handle whose `decode` declines every packet
+with typed `Unsupported`, covered by unit tests. Off Linux the
+public API vanishes while the portable syntax modules still
+compile: only the OS modules are Linux-gated at the crate root.
 
 ## Per-codec now / later
 
 | Codec | Now | Later |
 |---|---|---|
 | H.264 | fully wired: Annex B parse, POC (8.2.1), first-VCL (7.4.1.2.4), list modification (8.2.4.3), marking (8.2.5.1), DPB, VA-API submit, NV12 readback | interlaced, FMO, separate planes, non-4:2:0, high bit depth stay typed `Unsupported` (no H.264 VLD profile covers them) |
-| H.265 | parser + DPB + picture sources staged with attribution; shell declines typed | wire parser `mod`, frontend, params, e2e against ffmpeg oracle |
+| H.265 | wired: Annex B parse, reference sets (8.3.2/8.3.4), DPB, VA-API submit, NV12 readback, e2e against ffmpeg oracle | multilayer, interlaced, high bit depth, range and screen-content extensions stay typed `Unsupported` |
 | VP8 | parser + boolean decoder + probability tables staged with attribution; shell declines typed | restore `position` on `BitReader`, wire parser `mod`, frontend, params, e2e |
 | VP9 | parser + lookup tables staged with attribution; shell declines typed | restore `position` and `read_bits_signed` on `BitReader`, wire parser `mod`, frontend, params, e2e |
-| AV1 | OBU parser + reader + helpers staged with attribution; shell declines typed | restore `position` and `read_bits_aligned` on `BitReader`, wire reader/parser `mod`, frontend, params, e2e |
+| AV1 | wired: OBU parse, reference slots, film-grain display slot, VA-API submit, NV12 readback | large-scale tiles, high bit depth, monochrome, non-4:2:0, scalable stay typed `Unsupported` |
 
 The missing `BitReader` surface (`position`, `read_bits_aligned`,
 `read_bits_signed`, `read_le`) was cut with the old `vendor/`

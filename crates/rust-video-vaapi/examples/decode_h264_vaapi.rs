@@ -3,12 +3,12 @@
 //! Reads MP4 (demuxed) or raw Annex B; pass a corpus vector:
 //! `decode_h264_vaapi corpus/synth/h264/h264-high.mp4`.
 
-#[cfg(target_os = "linux")]
 #[path = "common/frames.rs"]
+#[cfg(target_os = "linux")]
 mod frames;
 
-#[cfg(target_os = "linux")]
 #[path = "common/input.rs"]
+#[cfg(target_os = "linux")]
 mod input;
 
 #[cfg(target_os = "linux")]
@@ -25,7 +25,7 @@ fn main() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(VaApiError::Skipped(reason)) => {
-            println!("va-api h264: skipped ({reason})");
+            println!("SKIP va-api h264 ({reason})");
             return;
         }
         Err(error) => {
@@ -59,4 +59,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() {}
+fn main() {
+    println!("SKIP: vaapi needs linux");
+}

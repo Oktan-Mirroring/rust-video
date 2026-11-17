@@ -1,7 +1,4 @@
 //! VA-API decode context: surfaces, submit, and readback.
-//!
-//! The live implementation targets Linux; other platforms decline at
-//! `open` with a typed skip.
 
 #![allow(unsafe_code)]
 
@@ -15,33 +12,10 @@ use std::sync::Arc;
 use crate::buffer::{bytes_of, VaBuffer};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
-use crate::ffi::{self, VaSurfaceId};
+use crate::ffi;
 use crate::ffi::{VaBufferId, VaConfigId, VaContextId};
-
-/// Native VA-API surface handle (`VASurfaceID`).
-///
-/// Threading: a single thread needs nothing; threads sharing one
-/// device serialize context calls with crate submissions — sequence
-/// driver calls made through the handle with `submit`, `sync`,
-/// `wait`, and `export`, never overlapping them.
-///
-/// Lifetime: the handle borrows the backend pool and stays valid
-/// only while the owning decoder lives — and for one frame's
-/// surface, only while that frame or its DPB reference pins the
-/// slot; using a handle after its owner drops is undefined behavior.
-pub type SurfaceId = u32;
-
-/// Native VA-API decode-context handle (`VAContextID`).
-///
-/// Threading: a single thread needs nothing; threads sharing one
-/// device serialize context calls with crate submissions — sequence
-/// driver calls made through the handle with `submit` and `sync`,
-/// never overlapping them.
-///
-/// Lifetime: the handle borrows the backend and stays valid only
-/// while the owning decoder lives; using it after the decoder
-/// drops is undefined behavior.
-pub type ContextId = u32;
+use crate::seam::{ContextId, SurfaceId, VaSeam};
+use crate::sys;
 
 /// VA-API decode context over a surface pool.
 ///
@@ -49,16 +23,10 @@ pub type ContextId = u32;
 /// but run every call on one thread. The contract matches the display
 /// behind it; see `VaApiDevice`.
 pub struct Backend {
-    /// Initialized display.
-    display: ffi::VaDisplay,
+    /// Owned decode pool, shared with live frames.
+    pool: Arc<Pool>,
     /// VA-API profile the config was built for.
     profile: c_int,
-    /// Decode configuration.
-    config: VaConfigId,
-    /// Decode context.
-    context: VaContextId,
-    /// Render-target pool.
-    surfaces: Vec<VaSurfaceId>,
     /// Export lease per pool slot; a live frame holds a clone.
     guards: Vec<Arc<()>>,
     /// Rotating parameter-buffer sets, one per in-flight picture.
@@ -66,13 +34,11 @@ pub struct Backend {
     /// Next set to submit on.
     next: usize,
     /// Surface last submitted per set, synced before the set is reused.
-    last: Vec<Option<VaSurfaceId>>,
+    last: Vec<Option<SurfaceId>>,
     /// Submit gauges, shared with exported frames syncing outside.
     gauges: Arc<StatsInner>,
     /// Scratch render list, reused across submits.
     render: Vec<VaBufferId>,
-    /// Pool size as the driver takes it.
-    count_c: c_int,
     /// Coded width in luma samples.
     width: u32,
     /// Coded height in luma samples.
@@ -91,8 +57,8 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// Returns `Err` off Linux, or when the driver refuses the config,
-    /// the surfaces, or the context.
+    /// Returns `Err` when the driver refuses the config, the surfaces,
+    /// or the context.
     pub fn open(
         device: &VaApiDevice,
         profile: c_int,
@@ -112,8 +78,8 @@ impl Backend {
         let mut config = 0;
         // Sound: the display is initialized; the attribute and the
         // out-parameter are live for the call.
-        VaApiError::status(unsafe {
-            ffi::vaCreateConfig(
+        sys::status(unsafe {
+            sys::vaCreateConfig(
                 display,
                 profile,
                 ffi::VA_ENTRYPOINT_VLD,
@@ -125,7 +91,7 @@ impl Backend {
         let mut surfaces = vec![0; count];
         // Sound: the surface array holds `count` live entries.
         let surfaces_status = unsafe {
-            ffi::vaCreateSurfaces(
+            sys::vaCreateSurfaces(
                 display,
                 ffi::VA_RT_FORMAT_YUV420,
                 width,
@@ -136,17 +102,17 @@ impl Backend {
                 0,
             )
         };
-        if let Err(error) = VaApiError::status(surfaces_status) {
+        if let Err(error) = sys::status(surfaces_status) {
             // Sound: `config` was created above.
             unsafe {
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
         let mut context = 0;
         // Sound: the render-target array outlives context creation.
         let context_status = unsafe {
-            ffi::vaCreateContext(
+            sys::vaCreateContext(
                 display,
                 config,
                 width_c,
@@ -157,11 +123,11 @@ impl Backend {
                 &raw mut context,
             )
         };
-        if let Err(error) = VaApiError::status(context_status) {
+        if let Err(error) = sys::status(context_status) {
             // Sound: the surfaces and config were created above.
             unsafe {
-                ffi::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
@@ -174,27 +140,30 @@ impl Backend {
                     drop(sets);
                     // Sound: the context, surfaces, and config were created above.
                     unsafe {
-                        ffi::vaDestroyContext(display, context);
-                        ffi::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
-                        ffi::vaDestroyConfig(display, config);
+                        sys::vaDestroyContext(display, context);
+                        sys::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
+                        sys::vaDestroyConfig(display, config);
                     }
                     return Err(error);
                 }
             }
         }
-        Ok(Self {
+        let pool = Pool {
             display,
-            profile,
             config,
             context,
             surfaces,
+            count_c,
+        };
+        Ok(Self {
+            pool: Arc::new(pool),
+            profile,
             guards: (0..count).map(|_| Arc::new(())).collect(),
             sets,
             next: 0,
             last: vec![None; Self::ASYNC_DEPTH],
             gauges,
             render: Vec::new(),
-            count_c,
             width,
             height,
             count,
@@ -202,36 +171,13 @@ impl Backend {
         })
     }
 
-    /// Pool surfaces, borrowed from the pool.
-    #[must_use]
-    pub fn surfaces(&self) -> &[SurfaceId] {
-        &self.surfaces
-    }
-
     /// Native decode-context handle behind the backend.
     ///
-    /// See [`ContextId`] for the threading and lifetime rules.
+    /// See [`ContextId`](crate::seam::ContextId) for the threading and
+    /// lifetime rules.
     #[must_use]
     pub fn context(&self) -> ContextId {
-        self.context
-    }
-
-    /// Pool size.
-    #[must_use]
-    pub fn pool_size(&self) -> usize {
-        self.count
-    }
-
-    /// Coded size in luma samples.
-    #[must_use]
-    pub fn coded_size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    /// VA-API profile the config was built for.
-    #[must_use]
-    pub fn profile(&self) -> c_int {
-        self.profile
+        self.pool.context
     }
 
     /// Submit gauges since open.
@@ -246,95 +192,16 @@ impl Backend {
         Arc::clone(&self.gauges)
     }
 
-    /// Lease for pool slot `index`, keeping it out of the free set.
+    /// Owned decode pool, shared with live frames.
     #[must_use]
-    pub fn surface_guard(&self, index: u32) -> Option<Arc<()>> {
-        usize::try_from(index)
-            .ok()
-            .and_then(|slot| self.guards.get(slot).cloned())
-    }
-
-    /// True when a live frame holds pool slot `index`.
-    #[must_use]
-    pub fn surface_live(&self, index: u32) -> bool {
-        usize::try_from(index)
-            .ok()
-            .and_then(|slot| self.guards.get(slot))
-            .is_some_and(|guard| Arc::strong_count(guard) > 1)
-    }
-
-    /// Decode one picture into `target`, returning before it finishes.
-    ///
-    /// The picture joins at most `ASYNC_DEPTH` in-flight submits; the
-    /// set it reuses was synced against its own previous surface, so
-    /// the buffers are safe to rewrite. Callers sync at consumption:
-    /// `read_nv12` and the DMA-BUF export both sync first. Slice
-    /// payloads arrive through `data` so the caller keeps no pairing
-    /// allocation; `data` must answer every index below `slices`. A
-    /// failed submit quiets the target and leaves the context
-    /// reusable; the next submit runs without a rebuild.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` off Linux, or when any VA-API call fails.
-    pub(crate) fn submit<'d, F>(
-        &mut self,
-        target: VaSurfaceId,
-        picture: &ffi::VaPictureParameterBufferH264,
-        matrix: &ffi::VaIqMatrixBufferH264,
-        slices: &'d [ffi::VaSliceParameterBufferH264],
-        data: F,
-    ) -> Result<(), VaApiError>
-    where
-        F: Fn(usize) -> &'d [u8],
-    {
-        self.submit_inner(
-            target,
-            bytes_of(picture),
-            Some(bytes_of(matrix)),
-            slices.len(),
-            |index| bytes_of(&slices[index]),
-            data,
-        )
-    }
-
-    /// Decode one picture into `target` from typed slice parameters.
-    ///
-    /// Same pipelining as the H.264 submit path, over caller-typed
-    /// slice buffers: `picture` fills the picture-parameter buffer, `matrix`
-    /// the matrix buffer when present, and `slices` the slice-parameter
-    /// buffers in order. `data` must answer every index below
-    /// `slices`. A failed submit quiets the target and leaves the
-    /// context reusable.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` off Linux, or when any VA-API call fails.
-    pub fn submit_slices<'d, T, F>(
-        &mut self,
-        target: SurfaceId,
-        picture: &[u8],
-        matrix: Option<&[u8]>,
-        slices: &'d [T],
-        data: F,
-    ) -> Result<(), VaApiError>
-    where
-        F: Fn(usize) -> &'d [u8],
-    {
-        self.submit_inner(
-            target,
-            picture,
-            matrix,
-            slices.len(),
-            |index| bytes_of(&slices[index]),
-            data,
-        )
+    pub(crate) fn pool(&self) -> Arc<Pool> {
+        Arc::clone(&self.pool)
     }
 
     /// Pipelined submit over byte-level parameter accessors.
     fn submit_inner<'d, P, F>(
         &mut self,
-        target: VaSurfaceId,
+        target: SurfaceId,
         picture: &[u8],
         matrix: Option<&[u8]>,
         count: usize,
@@ -352,7 +219,7 @@ impl Backend {
         }
         self.fill(set, picture, matrix, count, params, data)?;
         // Sound: the context and target are live; the buffers were created above.
-        VaApiError::status(unsafe { ffi::vaBeginPicture(self.display, self.context, target) })?;
+        sys::status(unsafe { sys::vaBeginPicture(self.pool.display, self.pool.context, target) })?;
         let outcome = self.render();
         if outcome.is_err() {
             self.gauges.note_reset();
@@ -367,66 +234,16 @@ impl Backend {
     fn render(&mut self) -> Result<(), VaApiError> {
         let buffer_count = c_int::try_from(self.render.len()).map_err(|_| Self::range())?;
         let rendered = unsafe {
-            ffi::vaRenderPicture(
-                self.display,
-                self.context,
+            sys::vaRenderPicture(
+                self.pool.display,
+                self.pool.context,
                 self.render.as_mut_ptr(),
                 buffer_count,
             )
         };
-        let end = unsafe { ffi::vaEndPicture(self.display, self.context) };
-        VaApiError::status(rendered)?;
-        VaApiError::status(end)
-    }
-
-    /// Block until `surface` finishes decoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the driver reports the surface failed.
-    pub fn sync(&self, surface: SurfaceId) -> Result<(), VaApiError> {
-        // Sound: the surface belongs to the pool.
-        let outcome = VaApiError::status(unsafe { ffi::vaSyncSurface(self.display, surface) });
-        self.gauges.note_synced();
-        outcome
-    }
-
-    /// Block until `surface` finishes, dropping any failure.
-    pub fn sync_quiet(&self, surface: SurfaceId) {
-        let _ = self.sync(surface);
-    }
-
-    /// NV12 bytes of `surface` cropped to `crop` `(x, y, width, height)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` off Linux, when the driver image is not NV12,
-    /// when its layout overruns its bytes, or when any call fails.
-    pub fn read_nv12(
-        &self,
-        surface: SurfaceId,
-        crop: (u32, u32, u32, u32),
-    ) -> Result<Vec<u8>, VaApiError> {
-        self.sync(surface)?;
-        let (x, y, width, height) = crop;
-        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
-            return Err(VaApiError::Unsupported(
-                "crop outside coded size".to_owned(),
-            ));
-        }
-        // Sound: the display and surface are live.
-        let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
-        VaApiError::status(unsafe {
-            ffi::vaDeriveImage(self.display, surface, image.as_mut_ptr())
-        })?;
-        // Sound: `vaDeriveImage` succeeded, so the image is initialized.
-        let image = unsafe { image.assume_init() };
-        let outcome = self.copy_nv12(&image, crop);
-        // Sound: the image was derived above.
-        unsafe {
-            ffi::vaDestroyImage(self.display, image.image_id);
-        }
-        outcome
+        let end = unsafe { sys::vaEndPicture(self.pool.display, self.pool.context) };
+        sys::status(rendered)?;
+        sys::status(end)
     }
 
     /// Rewrite set `set` for the next picture; the render list is rebuilt.
@@ -443,8 +260,8 @@ impl Backend {
         P: Fn(usize) -> &'d [u8],
         F: Fn(usize) -> &'d [u8],
     {
-        let display = self.display;
-        let context = self.context;
+        let display = self.pool.display;
+        let context = self.pool.context;
         let gauges = Arc::clone(&self.gauges);
         let Some(entry) = self.sets.get_mut(set) else {
             return Err(Self::range());
@@ -490,7 +307,7 @@ impl Backend {
         let (x, y, width, height) = crop;
         // Sound: the image buffer is live until `vaDestroyImage`.
         let mut data: *mut c_void = std::ptr::null_mut();
-        VaApiError::status(unsafe { ffi::vaMapBuffer(self.display, image.buf, &raw mut data) })?;
+        sys::status(unsafe { sys::vaMapBuffer(self.pool.display, image.buf, &raw mut data) })?;
         let outcome = Self::copy_planes(
             data as *const u8,
             u64::from(image.data_size),
@@ -500,7 +317,7 @@ impl Backend {
         );
         // Sound: the buffer was mapped above.
         unsafe {
-            ffi::vaUnmapBuffer(self.display, image.buf);
+            sys::vaUnmapBuffer(self.pool.display, image.buf);
         }
         outcome
     }
@@ -590,15 +407,95 @@ impl Backend {
     }
 }
 
+impl VaSeam for Backend {
+    fn submit_slices<'d, T, F>(
+        &mut self,
+        target: SurfaceId,
+        picture: &[u8],
+        matrix: Option<&[u8]>,
+        slices: &'d [T],
+        data: F,
+    ) -> Result<(), VaApiError>
+    where
+        F: Fn(usize) -> &'d [u8],
+    {
+        self.submit_inner(
+            target,
+            picture,
+            matrix,
+            slices.len(),
+            |index| bytes_of(&slices[index]),
+            data,
+        )
+    }
+
+    fn read_nv12(
+        &self,
+        surface: SurfaceId,
+        crop: (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, VaApiError> {
+        self.sync(surface)?;
+        let (x, y, width, height) = crop;
+        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
+            return Err(VaApiError::Unsupported(
+                "crop outside coded size".to_owned(),
+            ));
+        }
+        // Sound: the display and surface are live.
+        let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
+        sys::status(unsafe { sys::vaDeriveImage(self.pool.display, surface, image.as_mut_ptr()) })?;
+        // Sound: `vaDeriveImage` succeeded, so the image is initialized.
+        let image = unsafe { image.assume_init() };
+        let outcome = self.copy_nv12(&image, crop);
+        // Sound: the image was derived above.
+        unsafe {
+            sys::vaDestroyImage(self.pool.display, image.image_id);
+        }
+        outcome
+    }
+
+    fn sync(&self, surface: SurfaceId) -> Result<(), VaApiError> {
+        // Sound: the surface belongs to the pool.
+        let outcome = sys::status(unsafe { sys::vaSyncSurface(self.pool.display, surface) });
+        self.gauges.note_synced();
+        outcome
+    }
+
+    fn surfaces(&self) -> &[SurfaceId] {
+        &self.pool.surfaces
+    }
+
+    fn surface_guard(&self, index: u32) -> Option<Arc<()>> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|slot| self.guards.get(slot).cloned())
+    }
+
+    fn surface_live(&self, index: u32) -> bool {
+        usize::try_from(index)
+            .ok()
+            .and_then(|slot| self.guards.get(slot))
+            .is_some_and(|guard| Arc::strong_count(guard) > 1)
+    }
+
+    fn pool_size(&self) -> usize {
+        self.count
+    }
+
+    fn profile(&self) -> c_int {
+        self.profile
+    }
+
+    fn coded_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
+        // Buffers first: they belong to the context, which the pool
+        // below may keep alive for outstanding frames.
         drop(std::mem::take(&mut self.sets));
-        // Sound: context, surfaces, and config were created in `open`.
-        unsafe {
-            ffi::vaDestroyContext(self.display, self.context);
-            ffi::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
-            ffi::vaDestroyConfig(self.display, self.config);
-        }
     }
 }
 
@@ -677,6 +574,42 @@ impl BufferSet {
         Ok(())
     }
 }
+
+/// Owned decode pool: config, context, and surfaces.
+///
+/// Shared with live frames: dropping the backend destroys the pool
+/// only once the last frame holding it drops.
+pub(crate) struct Pool {
+    /// Initialized display.
+    display: ffi::VaDisplay,
+    /// Decode configuration.
+    config: VaConfigId,
+    /// Decode context.
+    context: VaContextId,
+    /// Render-target pool.
+    surfaces: Vec<SurfaceId>,
+    /// Pool size as the driver takes it.
+    count_c: c_int,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Sound: context, surfaces, and config were created in `open`.
+        unsafe {
+            sys::vaDestroyContext(self.display, self.context);
+            sys::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
+            sys::vaDestroyConfig(self.display, self.config);
+        }
+    }
+}
+
+// Sound: moves hand ownership to the new thread; the last drop
+// destroys the driver objects, never shared.
+unsafe impl Send for Pool {}
+
+// Sound: every field is read-only after `open`; shared references
+// only copy handles out.
+unsafe impl Sync for Pool {}
 
 /// Shared submit gauges behind one decode context.
 #[derive(Debug, Default)]

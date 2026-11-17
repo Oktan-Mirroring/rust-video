@@ -1,6 +1,6 @@
 # rust-video-vaapi
 
-VA-API tier for Linux: H.264, H.265, and AV1 decode, all-intra H.264 and H.265 encode, and GPU transcode behind the caps traits. Off Linux the crate compiles empty; every module is Linux-gated at the root.
+VA-API tier for Linux: H.264, H.265, and AV1 decode, all-intra H.264 and H.265 encode, and GPU transcode behind the caps traits. Off Linux the public API vanishes while the portable syntax modules still compile; only the OS modules are Linux-gated at the root.
 
 ## Decode
 

@@ -17,6 +17,7 @@ use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::scale::ScaledSurface;
+use crate::sys;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
@@ -362,7 +363,7 @@ impl VaApiEncoder {
     ) -> Result<Vec<Packet>, VaApiError> {
         self.check_surface(scaled.display(), scaled.size())?;
         // Sound: the source surface is live behind the scaler.
-        VaApiError::status(unsafe { ffi::vaSyncSurface(self.session.display, scaled.surface()) })?;
+        sys::status(unsafe { sys::vaSyncSurface(self.session.display, scaled.surface()) })?;
         self.encode_inner(scaled.surface())
     }
 
@@ -397,15 +398,15 @@ impl VaApiEncoder {
         let display = self.session.display;
         let context = self.session.context;
         // Sound: the context and source surface are live.
-        VaApiError::status(unsafe { ffi::vaBeginPicture(display, context, source) })?;
+        sys::status(unsafe { sys::vaBeginPicture(display, context, source) })?;
         let count = c_int::try_from(self.render.len()).map_err(|_| Self::range())?;
         let rendered =
-            unsafe { ffi::vaRenderPicture(display, context, self.render.as_mut_ptr(), count) };
-        let end = unsafe { ffi::vaEndPicture(display, context) };
-        VaApiError::status(rendered)?;
-        VaApiError::status(end)?;
+            unsafe { sys::vaRenderPicture(display, context, self.render.as_mut_ptr(), count) };
+        let end = unsafe { sys::vaEndPicture(display, context) };
+        sys::status(rendered)?;
+        sys::status(end)?;
         // Sound: the surface was just submitted.
-        VaApiError::status(unsafe { ffi::vaSyncSurface(display, source) })?;
+        sys::status(unsafe { sys::vaSyncSurface(display, source) })?;
         let bytes = self.harvest()?;
         self.count += 1;
         Ok(vec![Packet::new(Bytes::from(bytes)).mark_keyframe()])
@@ -425,8 +426,8 @@ impl VaApiEncoder {
         let surface = self.session.surfaces[Self::UPLOAD];
         self.copy_into(&self.upload, frame)?;
         // Sound: the surface and image are live; the rectangles fit both.
-        VaApiError::status(unsafe {
-            ffi::vaPutImage(
+        sys::status(unsafe {
+            sys::vaPutImage(
                 display,
                 surface,
                 self.upload.image_id,
@@ -453,8 +454,8 @@ impl VaApiEncoder {
         let height_c = c_int::try_from(coded.1).map_err(|_| Self::range())?;
         let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
         // Sound: the display is initialized; the format and image outlive the call.
-        VaApiError::status(unsafe {
-            ffi::vaCreateImage(display, format, width_c, height_c, image.as_mut_ptr())
+        sys::status(unsafe {
+            sys::vaCreateImage(display, format, width_c, height_c, image.as_mut_ptr())
         })?;
         // Sound: `vaCreateImage` succeeded, so the image is initialized.
         Ok(unsafe { image.assume_init() })
@@ -502,7 +503,7 @@ impl VaApiEncoder {
         let display = self.session.display;
         // Sound: the image buffer is live until `vaDestroyImage`.
         let mut data: *mut c_void = std::ptr::null_mut();
-        VaApiError::status(unsafe { ffi::vaMapBuffer(display, image.buf, &raw mut data) })?;
+        sys::status(unsafe { sys::vaMapBuffer(display, image.buf, &raw mut data) })?;
         // Sound: every row below was bounds-checked against both sides above.
         unsafe {
             let base = data.cast::<u8>();
@@ -516,7 +517,7 @@ impl VaApiEncoder {
                 let dst = base.add(uv_base + uv_pitch * row);
                 std::ptr::copy_nonoverlapping(src, dst, width);
             }
-            ffi::vaUnmapBuffer(display, image.buf);
+            sys::vaUnmapBuffer(display, image.buf);
         }
         Ok(())
     }
@@ -526,9 +527,7 @@ impl VaApiEncoder {
         let display = self.session.display;
         // Sound: the coded buffer is live until the session drops.
         let mut mapped: *mut c_void = std::ptr::null_mut();
-        VaApiError::status(unsafe {
-            ffi::vaMapBuffer(display, self.coded_buf.id(), &raw mut mapped)
-        })?;
+        sys::status(unsafe { sys::vaMapBuffer(display, self.coded_buf.id(), &raw mut mapped) })?;
         let mut out = Vec::with_capacity(1 << 16);
         let mut segment = mapped.cast_const().cast::<ffi::VaCodedBufferSegment>();
         let mut failed = false;
@@ -554,7 +553,7 @@ impl VaApiEncoder {
                     .cast_const()
                     .cast::<ffi::VaCodedBufferSegment>();
             }
-            ffi::vaUnmapBuffer(display, self.coded_buf.id());
+            sys::vaUnmapBuffer(display, self.coded_buf.id());
         }
         if failed {
             return Err(VaApiError::Unsupported(
@@ -988,10 +987,10 @@ impl VaApiEncoder {
         let display = device.display();
         // Sound: the format list is sized by its capacity query.
         unsafe {
-            let capacity = usize::try_from(ffi::vaMaxNumImageFormats(display)).unwrap_or(0);
+            let capacity = usize::try_from(sys::vaMaxNumImageFormats(display)).unwrap_or(0);
             let mut formats = vec![ffi::VaImageFormat::default(); capacity];
             let mut count = 0;
-            VaApiError::status(ffi::vaQueryImageFormats(
+            sys::status(sys::vaQueryImageFormats(
                 display,
                 formats.as_mut_ptr(),
                 &raw mut count,
@@ -1115,8 +1114,8 @@ impl Session {
         ];
         let mut config = 0;
         // Sound: the display is initialized; the attributes outlive the call.
-        VaApiError::status(unsafe {
-            ffi::vaCreateConfig(
+        sys::status(unsafe {
+            sys::vaCreateConfig(
                 display,
                 profile,
                 ffi::VA_ENTRYPOINT_ENC_SLICE,
@@ -1129,7 +1128,7 @@ impl Session {
         let mut surfaces = vec![0; count];
         // Sound: the surface array holds `count` live entries.
         let status = unsafe {
-            ffi::vaCreateSurfaces(
+            sys::vaCreateSurfaces(
                 display,
                 ffi::VA_RT_FORMAT_YUV420,
                 coded.0,
@@ -1142,10 +1141,10 @@ impl Session {
                 0,
             )
         };
-        if let Err(error) = VaApiError::status(status) {
+        if let Err(error) = sys::status(status) {
             // Sound: `config` was created above.
             unsafe {
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
@@ -1154,7 +1153,7 @@ impl Session {
         let mut context = 0;
         // Sound: the surface array outlives context creation.
         let status = unsafe {
-            ffi::vaCreateContext(
+            sys::vaCreateContext(
                 display,
                 config,
                 width_c,
@@ -1165,11 +1164,11 @@ impl Session {
                 &raw mut context,
             )
         };
-        if let Err(error) = VaApiError::status(status) {
+        if let Err(error) = sys::status(status) {
             // Sound: the surfaces and config were created above.
             unsafe {
-                ffi::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
-                ffi::vaDestroyConfig(display, config);
+                sys::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
+                sys::vaDestroyConfig(display, config);
             }
             return Err(error);
         }
@@ -1187,9 +1186,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Sound: context, surfaces, and config were created in `open`.
         unsafe {
-            ffi::vaDestroyContext(self.display, self.context);
-            ffi::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
-            ffi::vaDestroyConfig(self.display, self.config);
+            sys::vaDestroyContext(self.display, self.context);
+            sys::vaDestroySurfaces(self.display, self.surfaces.as_mut_ptr(), self.count_c);
+            sys::vaDestroyConfig(self.display, self.config);
         }
     }
 }
@@ -1203,7 +1202,7 @@ impl Drop for VaApiEncoder {
         // Sound: the image was created in `open`; the session outlives
         // this drop, so the display is still initialized.
         unsafe {
-            ffi::vaDestroyImage(self.session.display, self.upload.image_id);
+            sys::vaDestroyImage(self.session.display, self.upload.image_id);
         }
     }
 }

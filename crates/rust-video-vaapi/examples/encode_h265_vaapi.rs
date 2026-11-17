@@ -34,7 +34,7 @@ fn main() {
     let device = match VaApiDevice::open() {
         Ok(device) => device,
         Err(VaApiError::Skipped(reason)) => {
-            println!("va-api h265 encode: skipped ({reason})");
+            println!("SKIP va-api h265 encode ({reason})");
             return;
         }
         Err(error) => {
@@ -50,7 +50,7 @@ fn main() {
     let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
         Ok(encoder) => encoder,
         Err(VaApiError::Unsupported(message)) => {
-            println!("va-api h265 encode: unsupported ({message})");
+            println!("SKIP va-api h265 encode ({message})");
             return;
         }
         Err(error) => {
@@ -98,4 +98,6 @@ fn main() {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn main() {}
+fn main() {
+    println!("SKIP: vaapi needs linux");
+}

@@ -1,10 +1,7 @@
 //! Typed VA-API tier failures and skip reasons.
-
-#![allow(unsafe_code)]
-
-use std::ffi::CStr;
-
-use crate::ffi;
+//!
+//! Portable: the driver status mapping lives in the Linux-only
+//! `sys` module; this module holds only the types.
 
 /// Machine declined by the VA-API tier, with the cause.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
@@ -46,6 +43,9 @@ pub enum VaApiError {
     /// Reference list names a picture the DPB cannot supply.
     #[error("broken reference list: {0}")]
     BrokenReference(String),
+    /// DPB has no free slot for the next picture.
+    #[error("dpb full")]
+    DpbFull,
     /// Decoder has no free surface slot for the next picture.
     ///
     /// A live held surface pins its slot, so callers holding more
@@ -64,26 +64,6 @@ pub enum VaApiError {
         /// Returned height in luma samples.
         height: u32,
     },
-}
-
-impl VaApiError {
-    /// VA-API status as a result, carrying the driver status text.
-    pub(crate) fn status(status: i32) -> Result<(), Self> {
-        if status == ffi::VA_STATUS_SUCCESS {
-            return Ok(());
-        }
-        // Sound: `vaStatusStr` returns a static NUL-terminated string.
-        let raw = unsafe { ffi::vaStatusStr(status) };
-        let message = if raw.is_null() {
-            format!("status {status}")
-        } else {
-            // Sound: `vaStatusStr` returned non-null above.
-            unsafe { CStr::from_ptr(raw) }
-                .to_string_lossy()
-                .into_owned()
-        };
-        Err(Self::Call { status, message })
-    }
 }
 
 #[cfg(test)]
@@ -128,6 +108,11 @@ mod tests {
             VaApiError::Unsupported("fmo".to_owned()).to_string(),
             "unsupported stream: fmo"
         );
+    }
+
+    #[test]
+    fn dpb_full_names_exhaustion() {
+        assert_eq!(VaApiError::DpbFull.to_string(), "dpb full");
     }
 
     #[test]
