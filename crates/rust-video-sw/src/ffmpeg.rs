@@ -17,6 +17,8 @@ use rust_video_caps::traits::Decoder;
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
 
+pub use crate::ffmpeg_sys::AVCodecContext;
+
 /// Codec decoded through libavcodec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Codec {
@@ -66,7 +68,9 @@ impl Codec {
 /// Threaded decoder over one libavcodec decoder.
 ///
 /// `Send`, never `Sync`: hand the decoder to another thread when idle,
-/// but run every call on one thread.
+/// but run every call on one thread. Each `decode` drains every
+/// picture the library has ready; any hold-back on reorder streams
+/// happens inside libavcodec.
 pub struct FfmpegDecoder {
     ctx: *mut sys::AVCodecContext,
     parser: *mut sys::AVCodecParserContext,
@@ -165,6 +169,22 @@ impl FfmpegDecoder {
             packet,
             framed: codec.framed(),
         })
+    }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// Threading: a single thread needs nothing; threads sharing one
+    /// decoder serialize context calls with crate submissions —
+    /// sequence calls made through the pointer with `decode` and
+    /// `flush`, never overlapping them.
+    ///
+    /// Lifetime: the pointer borrows the decoder and stays valid only
+    /// while the decoder lives; using it after the decoder drops, or
+    /// freeing or reconfiguring the context through it, is undefined
+    /// behavior.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.ctx.cast_const()
     }
 
     /// Partially built state released; null slots are skipped.
@@ -412,6 +432,14 @@ impl H264Decoder {
     pub fn open(threads: u32) -> Result<Self, SwError> {
         FfmpegDecoder::open(Codec::H264, threads).map(|inner| Self { inner })
     }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// See [`FfmpegDecoder::context`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.inner.context()
+    }
 }
 
 impl Decoder for H264Decoder {
@@ -441,6 +469,14 @@ impl H265Decoder {
     /// rejects the configuration.
     pub fn open(threads: u32) -> Result<Self, SwError> {
         FfmpegDecoder::open(Codec::H265, threads).map(|inner| Self { inner })
+    }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// See [`FfmpegDecoder::context`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.inner.context()
     }
 }
 
@@ -472,6 +508,14 @@ impl Vp8Decoder {
     pub fn open(threads: u32) -> Result<Self, SwError> {
         FfmpegDecoder::open(Codec::Vp8, threads).map(|inner| Self { inner })
     }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// See [`FfmpegDecoder::context`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.inner.context()
+    }
 }
 
 impl Decoder for Vp8Decoder {
@@ -502,6 +546,14 @@ impl Vp9Decoder {
     pub fn open(threads: u32) -> Result<Self, SwError> {
         FfmpegDecoder::open(Codec::Vp9, threads).map(|inner| Self { inner })
     }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// See [`FfmpegDecoder::context`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.inner.context()
+    }
 }
 
 impl Decoder for Vp9Decoder {
@@ -531,6 +583,14 @@ impl Av1Decoder {
     /// rejects the configuration.
     pub fn open(threads: u32) -> Result<Self, SwError> {
         FfmpegDecoder::open(Codec::Av1, threads).map(|inner| Self { inner })
+    }
+
+    /// Native libavcodec context behind the decoder.
+    ///
+    /// See [`FfmpegDecoder::context`] for the threading and lifetime rules.
+    #[must_use]
+    pub fn context(&self) -> *const AVCodecContext {
+        self.inner.context()
     }
 }
 
@@ -714,6 +774,13 @@ mod tests {
         for codec in [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1] {
             assert!(FfmpegDecoder::open(codec, 1).is_ok(), "{codec:?}");
         }
+    }
+
+    #[test]
+    fn context_names_the_live_native_context() {
+        let decoder = H264Decoder::open(1).expect("decoder");
+        assert!(!decoder.context().is_null());
+        assert_eq!(decoder.context(), decoder.context());
     }
 
     #[test]
