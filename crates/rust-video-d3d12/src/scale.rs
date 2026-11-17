@@ -11,7 +11,7 @@ use std::mem::ManuallyDrop;
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
 use crate::submit::{CommandSlot, DeviceResources, Fence};
-use crate::texture::GpuTexture;
+use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
 use windows::Win32::Foundation::RECT;
@@ -102,20 +102,20 @@ impl Scaler {
         self.to
     }
 
-    /// `texture` scaled to the target extent on the GPU.
+    /// `surface` scaled to the target extent on the GPU.
     ///
     /// # Errors
     ///
     /// Returns `Err` for a source outside the scaler extent or when the
     /// driver refuses the scale.
-    pub(crate) fn scale(&mut self, texture: &GpuTexture) -> Result<GpuTexture, D3d12Error> {
-        if texture.size() != self.from {
+    pub(crate) fn scale(&mut self, surface: &GpuSurface) -> Result<GpuSurface, D3d12Error> {
+        if surface.size() != self.from {
             return Err(D3d12Error::Unsupported(
                 UnsupportedReason::ScaleSourceOutsideScaler,
             ));
         }
         self.slot.reset()?;
-        let source = texture.resource();
+        let source = surface.texture();
         let list = self.slot.list();
         // Sound: the barriers name live textures; the list is open.
         unsafe {
@@ -163,7 +163,7 @@ impl Scaler {
         }
         let ticket = self.slot.close_execute(&self.queue, &mut self.fence)?;
         self.fence.wait(ticket)?;
-        Ok(texture.rescaled(self.target.clone(), self.to))
+        Ok(surface.rescaled(self.target.clone(), self.to))
     }
 }
 

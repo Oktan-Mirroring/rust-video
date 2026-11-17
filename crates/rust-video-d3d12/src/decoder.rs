@@ -1,6 +1,9 @@
 //! H.264 and HEVC decode plus probed shells behind the caps `Decoder` trait.
 
 #[cfg(target_os = "windows")]
+use std::sync::Arc;
+
+#[cfg(target_os = "windows")]
 use crate::decode::{DecodeSession, HevcSubmission, PictureSubmission, SharedExport};
 use crate::device::D3d12Device;
 #[cfg(target_os = "windows")]
@@ -10,9 +13,11 @@ use crate::guid::Codec;
 #[cfg(target_os = "windows")]
 use crate::h264::{Crop, Ingest, Picture};
 #[cfg(target_os = "windows")]
+use crate::pins::SlotPins;
+#[cfg(target_os = "windows")]
 use crate::submit::Ticket;
 #[cfg(target_os = "windows")]
-use crate::texture::GpuTexture;
+use crate::texture::{GpuSurface, SurfaceLayout};
 
 use bytes::Bytes;
 #[cfg(target_os = "windows")]
@@ -22,6 +27,8 @@ use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::traits::{Decoder, Lease};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d12Frame {
@@ -127,6 +134,8 @@ macro_rules! real_decoder {
             feedback: u32,
             /// Next frame generation number.
             generation: u64,
+            /// Live-surface pin counts over the decoder pool.
+            pins: Arc<SlotPins>,
         }
 
         impl<'a> $decoder<'a> {
@@ -141,7 +150,24 @@ macro_rules! real_decoder {
                     active: None,
                     feedback: 1,
                     generation: 0,
+                    pins: Arc::new(SlotPins::new()),
                 }
+            }
+
+            /// Video decode queue behind submissions, absent before the first picture builds the session.
+            ///
+            /// Shares the session queue; threading follows [`D3d12Device`].
+            #[must_use]
+            pub fn video_queue(&self) -> Option<&ID3D12CommandQueue> {
+                self.session.as_ref().map(DecodeSession::video_queue)
+            }
+
+            /// Direct queue behind downloads, absent before the first picture builds the session.
+            ///
+            /// Shares the session queue; threading follows [`D3d12Device`].
+            #[must_use]
+            pub fn copy_queue(&self) -> Option<&ID3D12CommandQueue> {
+                self.session.as_ref().map(DecodeSession::copy_queue)
             }
 
             /// Decode `picture` into `frames`.
@@ -151,8 +177,10 @@ macro_rules! real_decoder {
                 frames: &mut Vec<D3d12Frame>,
             ) -> Result<(), D3d12Error> {
                 let outcome = self.decode_picture_inner(picture, frames);
-                if outcome.is_err() {
-                    self.reset_stream();
+                if let Err(error) = &outcome {
+                    if !matches!(error, D3d12Error::NoFreeSlot) {
+                        self.reset_stream();
+                    }
                 }
                 outcome
             }
@@ -164,6 +192,9 @@ macro_rules! real_decoder {
                 frames: &mut Vec<D3d12Frame>,
             ) -> Result<(), D3d12Error> {
                 let (active, submission) = self.prepare_picture(picture)?;
+                if self.pins.pinned(0) {
+                    return Err(D3d12Error::NoFreeSlot);
+                }
                 let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
                 let nv12 = submission.submit(session)?;
                 let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
@@ -222,6 +253,7 @@ macro_rules! real_decoder {
                         queues,
                     )?;
                     self.session = Some(session);
+                    self.pins = Arc::new(SlotPins::new());
                     self.active = Some(active);
                 }
                 let active = self.active.ok_or(D3d12Error::NoSession)?;
@@ -240,30 +272,45 @@ macro_rules! real_decoder {
                 Ok((active, submission))
             }
 
-            /// `picture` into GPU `textures` without resetting on failure.
+            /// `picture` into GPU `surfaces` without resetting on failure.
             fn texture_inner(
                 &mut self,
                 picture: &$picture,
-                textures: &mut Vec<GpuTexture>,
+                surfaces: &mut Vec<GpuSurface>,
             ) -> Result<(), D3d12Error> {
                 let (active, submission) = self.prepare_picture(picture)?;
+                if self.pins.pinned(0) {
+                    return Err(D3d12Error::NoFreeSlot);
+                }
                 let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-                let resource = submission.submit_texture(session)?;
-                let texture = GpuTexture::new(resource, active.visible, self.generation);
+                let (resource, wait) = submission.submit_texture(session)?;
+                let shared = session_surface_export(session, 0);
+                let layout = surface_layout(&active, 0)?;
+                let pin = self.pins.pin(0);
+                let surface = GpuSurface::new(
+                    resource,
+                    layout,
+                    self.generation,
+                    Some(pin),
+                    Some(wait),
+                    shared,
+                );
                 self.generation = self.generation.wrapping_add(1);
-                textures.push(texture);
+                surfaces.push(surface);
                 Ok(())
             }
 
-            /// `picture` into GPU `textures`.
+            /// `picture` into GPU `surfaces`.
             fn texture_picture(
                 &mut self,
                 picture: &$picture,
-                textures: &mut Vec<GpuTexture>,
+                surfaces: &mut Vec<GpuSurface>,
             ) -> Result<(), D3d12Error> {
-                let outcome = self.texture_inner(picture, textures);
-                if outcome.is_err() {
-                    self.reset_stream();
+                let outcome = self.texture_inner(picture, surfaces);
+                if let Err(error) = &outcome {
+                    if !matches!(error, D3d12Error::NoFreeSlot) {
+                        self.reset_stream();
+                    }
                 }
                 outcome
             }
@@ -274,7 +321,7 @@ macro_rules! real_decoder {
                 self.active = None;
             }
 
-            /// GPU textures decoded from `packet`, possibly none.
+            /// GPU surfaces decoded from `packet`, possibly none.
             ///
             /// # Errors
             ///
@@ -284,10 +331,10 @@ macro_rules! real_decoder {
             /// # Arguments
             ///
             /// * `packet` - compressed picture data.
-            pub(crate) fn decode_texture(
+            pub fn decode_surface(
                 &mut self,
                 packet: &Packet,
-            ) -> Result<Vec<GpuTexture>, D3d12Error> {
+            ) -> Result<Vec<GpuSurface>, D3d12Error> {
                 if !self.device.supports(Codec::$codec) {
                     return Err(SkipReason::ProfileUnsupported {
                         codec: Codec::$codec,
@@ -300,24 +347,24 @@ macro_rules! real_decoder {
                         UnsupportedReason::MultiPicturePacketNeedsPerPictureEncode,
                     ));
                 }
-                let mut textures = Vec::new();
+                let mut surfaces = Vec::new();
                 for picture in &pictures {
-                    self.texture_picture(picture, &mut textures)?;
+                    self.texture_picture(picture, &mut surfaces)?;
                 }
-                Ok(textures)
+                Ok(surfaces)
             }
 
-            /// GPU textures held back for reordering or buffering.
+            /// GPU surfaces held back for reordering or buffering.
             ///
             /// # Errors
             ///
             /// Returns `Err` when the backend cannot release its held frames.
-            pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
-                let mut textures = Vec::new();
+            pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d12Error> {
+                let mut surfaces = Vec::new();
                 if let Some(picture) = self.ingest.finish()? {
-                    self.texture_picture(&picture, &mut textures)?;
+                    self.texture_picture(&picture, &mut surfaces)?;
                 }
-                Ok(textures)
+                Ok(surfaces)
             }
         }
 
@@ -382,6 +429,8 @@ pub struct H264Decoder<'a> {
     resets: u64,
     /// Peak outputs queued before readback in one call.
     inflight_max: usize,
+    /// Live-surface pin counts over the decoder pool.
+    pins: Arc<SlotPins>,
 }
 
 #[cfg(target_os = "windows")]
@@ -399,7 +448,24 @@ impl<'a> H264Decoder<'a> {
             generation: 0,
             resets: 0,
             inflight_max: 0,
+            pins: Arc::new(SlotPins::new()),
         }
+    }
+
+    /// Video decode queue behind submissions, absent before the first picture builds the session.
+    ///
+    /// Shares the session queue; threading follows [`D3d12Device`].
+    #[must_use]
+    pub fn video_queue(&self) -> Option<&ID3D12CommandQueue> {
+        self.session.as_ref().map(DecodeSession::video_queue)
+    }
+
+    /// Direct queue behind downloads, absent before the first picture builds the session.
+    ///
+    /// Shares the session queue; threading follows [`D3d12Device`].
+    #[must_use]
+    pub fn copy_queue(&self) -> Option<&ID3D12CommandQueue> {
+        self.session.as_ref().map(DecodeSession::copy_queue)
     }
 
     /// Stream resets after mid-picture failures.
@@ -431,7 +497,9 @@ impl<'a> H264Decoder<'a> {
         let decoded = match self.decode_dpb(picture) {
             Ok(decoded) => decoded,
             Err(error) => {
-                self.reset_stream();
+                if !matches!(error, D3d12Error::NoFreeSlot) {
+                    self.reset_stream();
+                }
                 return Err(error);
             }
         };
@@ -528,7 +596,8 @@ impl<'a> H264Decoder<'a> {
             .ingest
             .sps(active.sps_id)
             .ok_or(D3d12Error::NoSession)?;
-        self.dpb = Some(Dpb::new(sps));
+        self.pins = Arc::new(SlotPins::new());
+        self.dpb = Some(Dpb::new(sps, Arc::clone(&self.pins)));
         self.active = Some(active);
         Ok(())
     }
@@ -596,59 +665,75 @@ impl<'a> H264Decoder<'a> {
         Ok(())
     }
 
-    /// Decode `picture` into GPU `textures`.
+    /// Decode `picture` into GPU `surfaces`.
     fn texture_picture(
         &mut self,
         picture: &Picture,
-        textures: &mut Vec<GpuTexture>,
+        surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
-        let outcome = self.texture_inner(picture, textures);
-        if outcome.is_err() {
-            self.reset_stream();
+        let outcome = self.texture_inner(picture, surfaces);
+        if let Err(error) = &outcome {
+            if !matches!(error, D3d12Error::NoFreeSlot) {
+                self.reset_stream();
+            }
         }
         outcome
     }
 
-    /// Decode `picture` into GPU `textures` without resetting on failure.
+    /// Decode `picture` into GPU `surfaces` without resetting on failure.
     fn texture_inner(
         &mut self,
         picture: &Picture,
-        textures: &mut Vec<GpuTexture>,
+        surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
-            self.reconfigure_texture(active, textures)?;
+            self.reconfigure_texture(active, surfaces)?;
         }
         let active = self.active.ok_or(D3d12Error::NoSession)?;
         let decoded = match self.decode_dpb(picture) {
             Ok(decoded) => decoded,
             Err(error) => {
-                self.reset_stream();
+                if !matches!(error, D3d12Error::NoFreeSlot) {
+                    self.reset_stream();
+                }
                 return Err(error);
             }
         };
-        if let Err(error) = self.submit_textures(&decoded, &active, textures) {
+        if let Err(error) = self.submit_textures(&decoded, &active, surfaces) {
             self.reset_stream();
             return Err(error);
         }
         Ok(())
     }
 
-    /// `decoded` submission plus display-order outputs into GPU `textures`.
+    /// `decoded` submission plus display-order outputs into GPU `surfaces`.
     fn submit_textures(
         &mut self,
         decoded: &Decoded,
         active: &Active,
-        textures: &mut Vec<GpuTexture>,
+        surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-        // Submit before any texture handoff: outputs may name the submission slot.
+        // Submit before any surface handoff: outputs may name the submission slot.
         let ticket = session.submit(&decoded.submission)?;
         session.wait_video(ticket)?;
         if !session.cropped() {
             for output in &decoded.outputs {
-                let resource = session.texture(output.slot())?;
-                textures.push(GpuTexture::new(resource, active.visible, self.generation));
+                let slot = output.slot();
+                let resource = session.texture(slot)?;
+                let shared = session_surface_export(session, slot);
+                let layout = surface_layout(active, slot)?;
+                let pin = self.pins.pin(slot);
+                let wait = session.video_wait(ticket);
+                surfaces.push(GpuSurface::new(
+                    resource,
+                    layout,
+                    self.generation,
+                    Some(pin),
+                    Some(wait),
+                    shared,
+                ));
                 self.generation = self.generation.wrapping_add(1);
             }
             return Ok(());
@@ -659,7 +744,18 @@ impl<'a> H264Decoder<'a> {
         }
         for (slot, ticket) in pending {
             let resource = session.finish_crop(slot, ticket)?;
-            textures.push(GpuTexture::new(resource, active.visible, self.generation));
+            let shared = session_surface_export(session, slot);
+            let layout = surface_layout(active, slot)?;
+            let pin = self.pins.pin(slot);
+            let wait = session.copy_wait(ticket);
+            surfaces.push(GpuSurface::new(
+                resource,
+                layout,
+                self.generation,
+                Some(pin),
+                Some(wait),
+                shared,
+            ));
             self.generation = self.generation.wrapping_add(1);
         }
         Ok(())
@@ -669,19 +765,19 @@ impl<'a> H264Decoder<'a> {
     fn reconfigure_texture(
         &mut self,
         active: Active,
-        textures: &mut Vec<GpuTexture>,
+        surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
         if let Some(previous) = self.active {
-            self.drain_live_texture(&previous, textures)?;
+            self.drain_live_texture(&previous, surfaces)?;
         }
         self.open_session(active)
     }
 
-    /// Live DPB outputs into GPU `textures`.
+    /// Live DPB outputs into GPU `surfaces`.
     fn drain_live_texture(
         &mut self,
         active: &Active,
-        textures: &mut Vec<GpuTexture>,
+        surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
         let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
             return Ok(());
@@ -689,8 +785,19 @@ impl<'a> H264Decoder<'a> {
         let outputs = dpb.drain();
         if !session.cropped() {
             for output in &outputs {
-                let resource = session.texture(output.slot())?;
-                textures.push(GpuTexture::new(resource, active.visible, self.generation));
+                let slot = output.slot();
+                let resource = session.texture(slot)?;
+                let shared = session_surface_export(session, slot);
+                let layout = surface_layout(active, slot)?;
+                let pin = self.pins.pin(slot);
+                surfaces.push(GpuSurface::new(
+                    resource,
+                    layout,
+                    self.generation,
+                    Some(pin),
+                    None,
+                    shared,
+                ));
                 self.generation = self.generation.wrapping_add(1);
             }
             return Ok(());
@@ -701,13 +808,24 @@ impl<'a> H264Decoder<'a> {
         }
         for (slot, ticket) in pending {
             let resource = session.finish_crop(slot, ticket)?;
-            textures.push(GpuTexture::new(resource, active.visible, self.generation));
+            let shared = session_surface_export(session, slot);
+            let layout = surface_layout(active, slot)?;
+            let pin = self.pins.pin(slot);
+            let wait = session.copy_wait(ticket);
+            surfaces.push(GpuSurface::new(
+                resource,
+                layout,
+                self.generation,
+                Some(pin),
+                Some(wait),
+                shared,
+            ));
             self.generation = self.generation.wrapping_add(1);
         }
         Ok(())
     }
 
-    /// GPU textures decoded from `packet`, possibly none.
+    /// GPU surfaces decoded from `packet`, possibly none.
     ///
     /// # Errors
     ///
@@ -717,35 +835,32 @@ impl<'a> H264Decoder<'a> {
     /// # Arguments
     ///
     /// * `packet` - compressed picture data.
-    pub(crate) fn decode_texture(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<Vec<GpuTexture>, D3d12Error> {
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d12Error> {
         if !self.device.supports(Codec::H264) {
             return Err(SkipReason::ProfileUnsupported { codec: Codec::H264 }.into());
         }
         let pictures = self.ingest.ingest_packet(packet.data())?;
-        let mut textures = Vec::new();
+        let mut surfaces = Vec::new();
         for picture in &pictures {
-            self.texture_picture(picture, &mut textures)?;
+            self.texture_picture(picture, &mut surfaces)?;
         }
-        Ok(textures)
+        Ok(surfaces)
     }
 
-    /// GPU textures held back for reordering or buffering.
+    /// GPU surfaces held back for reordering or buffering.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the backend cannot release its held frames.
-    pub(crate) fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
-        let mut textures = Vec::new();
+    pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d12Error> {
+        let mut surfaces = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            self.texture_picture(&picture, &mut textures)?;
+            self.texture_picture(&picture, &mut surfaces)?;
         }
         if let Some(active) = self.active {
-            self.drain_live_texture(&active, &mut textures)?;
+            self.drain_live_texture(&active, &mut surfaces)?;
         }
-        Ok(textures)
+        Ok(surfaces)
     }
 }
 
@@ -793,6 +908,30 @@ impl Decoder for H264Decoder<'_> {
             self.drain_live(&active, &mut frames)?;
         }
         Ok(frames)
+    }
+}
+
+/// Surface layout for pool `slot` under `active`.
+#[cfg(target_os = "windows")]
+fn surface_layout(active: &Active, slot: u8) -> Result<SurfaceLayout, D3d12Error> {
+    let coded = PictureSize::new(active.width, active.height)
+        .ok_or(D3d12Error::Parse(ParseReason::EmptyCodedSize))?;
+    let origin = active.crop.map_or((0, 0), |crop| (crop.left, crop.top));
+    Ok(SurfaceLayout::new(
+        active.visible,
+        coded,
+        origin,
+        u32::from(slot),
+    ))
+}
+
+/// NT-handle export for pool `slot`, honoring the session crop.
+#[cfg(target_os = "windows")]
+fn session_surface_export(session: &DecodeSession, slot: u8) -> Option<SharedExport> {
+    if session.cropped() {
+        session.shared_handle_crop(slot)
+    } else {
+        session.shared_handle(slot)
     }
 }
 

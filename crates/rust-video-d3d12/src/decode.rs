@@ -26,6 +26,7 @@ use crate::dxva::{
 use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::Crop;
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
+use crate::texture::SurfaceWait;
 
 use windows::core::Interface;
 use windows::core::PCWSTR;
@@ -316,13 +317,16 @@ pub(crate) trait PictureSubmission {
     /// driver refuses the picture.
     fn submit(&self, session: &mut DecodeSession) -> Result<Vec<u8>, D3d12Error>;
 
-    /// Output texture behind the arguments decode, without readback.
+    /// Output texture plus its completion wait behind the arguments decode.
     ///
     /// # Errors
     ///
     /// Returns `Err` past the bitstream buffer or when the driver refuses
     /// the picture.
-    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error>;
+    fn submit_texture(
+        &self,
+        session: &mut DecodeSession,
+    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error>;
 }
 
 impl PictureSubmission for HevcSubmission {
@@ -330,7 +334,10 @@ impl PictureSubmission for HevcSubmission {
         session.decode_hevc(self)
     }
 
-    fn submit_texture(&self, session: &mut DecodeSession) -> Result<ID3D12Resource, D3d12Error> {
+    fn submit_texture(
+        &self,
+        session: &mut DecodeSession,
+    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error> {
         session.decode_texture_hevc(self)
     }
 }
@@ -717,6 +724,26 @@ impl DecodeSession {
         self.video_fence.wait(ticket)
     }
 
+    /// Video decode queue behind submissions.
+    pub(crate) fn video_queue(&self) -> &ID3D12CommandQueue {
+        &self.video_queue
+    }
+
+    /// Direct queue behind downloads.
+    pub(crate) fn copy_queue(&self) -> &ID3D12CommandQueue {
+        &self.copy_queue
+    }
+
+    /// Completion wait behind a video `ticket`.
+    pub(crate) fn video_wait(&self, ticket: Ticket) -> SurfaceWait {
+        SurfaceWait::new(self.video_fence.handle(), ticket.value())
+    }
+
+    /// Completion wait behind a copy `ticket`.
+    pub(crate) fn copy_wait(&self, ticket: Ticket) -> SurfaceWait {
+        SurfaceWait::new(self.copy_fence.handle(), ticket.value())
+    }
+
     /// NV12 bytes for pool `slot` cropped to the visible rectangle.
     ///
     /// # Errors
@@ -832,15 +859,24 @@ impl DecodeSession {
         if crop_plan(self.width, self.height, self.crop).is_some() {
             return None;
         }
-        let resource = self.outputs.get(usize::from(slot))?.clone();
+        let resource = self.outputs.get(usize::from(slot))?;
+        Self::share_resource(&self.device, resource)
+    }
+
+    /// NT-handle export for crop `slot`, absent without a crop target or refused.
+    pub(crate) fn shared_handle_crop(&self, slot: u8) -> Option<SharedExport> {
+        let resource = self.crops.get(usize::from(slot))?;
+        Self::share_resource(&self.device, resource)
+    }
+
+    /// NT-handle export for `resource`, absent when the driver declines sharing.
+    fn share_resource(device: &ID3D12Device, resource: &ID3D12Resource) -> Option<SharedExport> {
         // Sound: the resource is live; every resource exposes the device-child face.
         let child: ID3D12DeviceChild = resource.cast().ok()?;
         // Sound: the device and resource are live; default security, unnamed.
-        let handle = unsafe {
-            self.device
-                .CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
-        }
-        .ok()?;
+        let handle =
+            unsafe { device.CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null()) }
+                .ok()?;
         (!handle.is_invalid()).then(|| SharedExport {
             handle: handle.0 as isize,
         })
@@ -858,19 +894,6 @@ impl DecodeSession {
             .ok_or(D3d12Error::BrokenReference(
                 BrokenReferenceReason::SlotOutsidePool,
             ))
-    }
-
-    /// Pool `slot` cropped to the visible rectangle on the GPU.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for a slot outside the pool or when the copy fails.
-    pub(crate) fn texture_cropped(&mut self, slot: u8) -> Result<ID3D12Resource, D3d12Error> {
-        if self.crops.is_empty() {
-            return self.texture(slot);
-        }
-        let ticket = self.start_crop(slot)?;
-        self.finish_crop(slot, ticket)
     }
 
     /// True with per-slot crop targets behind the session.
@@ -1022,14 +1045,20 @@ impl DecodeSession {
         self.download(0)
     }
 
-    /// Output texture behind `submission` decode, without readback.
+    /// Output texture plus its completion wait behind `submission` decode.
     pub(crate) fn decode_texture_hevc(
         &mut self,
         submission: &HevcSubmission,
-    ) -> Result<ID3D12Resource, D3d12Error> {
-        let ticket = self.submit_hevc(submission)?;
-        self.wait_video(ticket)?;
-        self.texture_cropped(0)
+    ) -> Result<(ID3D12Resource, SurfaceWait), D3d12Error> {
+        let video = self.submit_hevc(submission)?;
+        self.wait_video(video)?;
+        if !self.cropped() {
+            let wait = self.video_wait(video);
+            return Ok((self.texture(0)?, wait));
+        }
+        let copy = self.start_crop(0)?;
+        let resource = self.finish_crop(0, copy)?;
+        Ok((resource, self.copy_wait(copy)))
     }
 
     /// `submission` through the video queue into pool slot zero.
@@ -1431,6 +1460,11 @@ mod tests {
         ingest.ingest_packet(data).expect("ingest")
     }
 
+    /// Empty pin table behind buffer tests.
+    fn pins() -> std::sync::Arc<crate::pins::SlotPins> {
+        std::sync::Arc::new(crate::pins::SlotPins::new())
+    }
+
     #[test]
     fn submission_carries_params_and_start_codes() {
         let data = packet(&[
@@ -1442,7 +1476,7 @@ mod tests {
         assert_eq!(pictures.len(), 1);
         let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
         let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         assert!(decoded.outputs.is_empty());
         assert_eq!(decoded.submission.slot, 0);
@@ -1479,7 +1513,7 @@ mod tests {
         assert_eq!(header.first_mb, 0);
         assert!(header.slice_type.is_intra());
         assert_eq!(header.qp_delta, -11);
-        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(picture, &sps, &pps).expect("submission");
         let params = &decoded.submission.params;
         assert_eq!(params.frame_width_in_mbs_minus1, 19);
@@ -1519,7 +1553,7 @@ mod tests {
         assert!(!pps.entropy());
         assert_eq!(pps.pic_init_qp, -3);
         assert_eq!(pps.second_chroma_qp, 0);
-        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         let params = &decoded.submission.params;
         assert_eq!(params.bit_fields, 0xBD50);
@@ -1557,7 +1591,7 @@ mod tests {
         assert_eq!(idr.len(), 1);
         let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
         let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        let mut dpb = crate::dpb::Dpb::new(&sps);
+        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         dpb.decode(&idr[0], &sps, &pps).expect("idr");
         let pictures = live.ingest_packet(&next).expect("p");
         assert_eq!(pictures.len(), 1);

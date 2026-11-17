@@ -6,7 +6,7 @@ use crate::encoder::D3d12Encoder;
 use crate::error::{D3d12Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::scale::Scaler;
-use crate::texture::GpuTexture;
+use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
@@ -26,19 +26,19 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
-    /// GPU textures decoded from `packet`, possibly none.
-    fn decode_texture(&mut self, packet: &Packet) -> Result<Vec<GpuTexture>, D3d12Error> {
+    /// GPU surfaces decoded from `packet`, possibly none.
+    fn decode_texture(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d12Error> {
         match self {
-            Self::H264(decoder) => decoder.decode_texture(packet),
-            Self::Hevc(decoder) => decoder.decode_texture(packet),
+            Self::H264(decoder) => decoder.decode_surface(packet),
+            Self::Hevc(decoder) => decoder.decode_surface(packet),
         }
     }
 
-    /// GPU textures held back for reordering or buffering.
-    fn flush_texture(&mut self) -> Result<Vec<GpuTexture>, D3d12Error> {
+    /// GPU surfaces held back for reordering or buffering.
+    fn flush_texture(&mut self) -> Result<Vec<GpuSurface>, D3d12Error> {
         match self {
-            Self::H264(decoder) => decoder.flush_texture(),
-            Self::Hevc(decoder) => decoder.flush_texture(),
+            Self::H264(decoder) => decoder.flush_surface(),
+            Self::Hevc(decoder) => decoder.flush_surface(),
         }
     }
 }
@@ -163,48 +163,48 @@ impl<'a> Transcoder<'a> {
         }
     }
 
-    /// Packets transcoded from `packet` through GPU textures.
+    /// Packets transcoded from `packet` through GPU surfaces.
     fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, D3d12Error> {
-        let textures = self.source.decode_texture(packet)?;
-        let packets = self.encode_textures(&textures)?;
+        let surfaces = self.source.decode_texture(packet)?;
+        let packets = self.encode_textures(&surfaces)?;
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Drained packets through GPU textures.
+    /// Drained packets through GPU surfaces.
     fn flush_gpu(&mut self) -> Result<Outcome, D3d12Error> {
-        let textures = self.source.flush_texture()?;
-        let mut packets = self.encode_textures(&textures)?;
+        let surfaces = self.source.flush_texture()?;
+        let mut packets = self.encode_textures(&surfaces)?;
         packets.append(&mut self.encoder.flush()?);
         Ok(Outcome::new(packets, self.plan))
     }
 
-    /// Packets coded from GPU `textures`.
-    fn encode_textures(&mut self, textures: &[GpuTexture]) -> Result<Vec<Packet>, D3d12Error> {
+    /// Packets coded from GPU `surfaces`.
+    fn encode_textures(&mut self, surfaces: &[GpuSurface]) -> Result<Vec<Packet>, D3d12Error> {
         let mut packets = Vec::new();
-        for texture in textures {
+        for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
                 return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
                     cause,
                 }));
             }
             let scaled;
-            let input = if let Some(cause) = self.scale.miss(texture.size()) {
-                scaled = self.scaled_or_miss(texture, cause)?;
+            let input = if let Some(cause) = self.scale.miss(surface.size()) {
+                scaled = self.scaled_or_miss(surface, cause)?;
                 &scaled
             } else {
-                texture
+                surface
             };
             packets.append(&mut self.encoder.encode_texture(input)?);
         }
         Ok(packets)
     }
 
-    /// Scaled `texture` for a `cause` miss, or the loud miss itself.
+    /// Scaled `surface` for a `cause` miss, or the loud miss itself.
     fn scaled_or_miss(
         &mut self,
-        texture: &GpuTexture,
+        surface: &GpuSurface,
         cause: FallbackCause,
-    ) -> Result<GpuTexture, D3d12Error> {
+    ) -> Result<GpuSurface, D3d12Error> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
             return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
                 cause,
@@ -226,7 +226,7 @@ impl<'a> Transcoder<'a> {
             }
         }
         let scaler = self.scaler.as_mut().ok_or(D3d12Error::NoSession)?;
-        scaler.scale(texture).inspect_err(|_| {
+        scaler.scale(surface).inspect_err(|_| {
             self.scaler = None;
         })
     }

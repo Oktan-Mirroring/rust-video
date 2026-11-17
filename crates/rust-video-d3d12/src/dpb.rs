@@ -3,6 +3,8 @@
 //! The accelerator parses slice headers from the bitstream; reference
 //! lists travel in the picture parameters only.
 
+use std::sync::Arc;
+
 use crate::decode::H264Submission;
 use crate::dxva::{
     PicEntryH264, PicParamsH264, QmatrixH264, SliceShortH264, BITS_CHROMA_420,
@@ -12,6 +14,7 @@ use crate::dxva::{
 };
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
 use crate::h264::{Marking, Mmco, Picture, PocType, Pps, SlicePoc, Sps};
+use crate::pins::SlotPins;
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -76,11 +79,15 @@ pub(crate) struct Dpb {
     max_decoded_poc: Option<i32>,
     /// Driver-echoed picture serial.
     feedback: u32,
+    /// Live-surface pin counts over the decoder pool.
+    pins: Arc<SlotPins>,
+    /// Sequence guarantees display order matches decode order.
+    reorder_free: bool,
 }
 
 impl Dpb {
-    /// Empty buffer for `sps`.
-    pub(crate) fn new(sps: &Sps) -> Self {
+    /// Empty buffer for `sps` over the `pins` pool table.
+    pub(crate) fn new(sps: &Sps, pins: Arc<SlotPins>) -> Self {
         Self {
             slots: core::array::from_fn(|_| None),
             max_refs: sps.max_num_ref_frames,
@@ -94,6 +101,8 @@ impl Dpb {
             has_prev_ref: false,
             max_decoded_poc: None,
             feedback: 1,
+            pins,
+            reorder_free: sps.num_reorder_frames == Some(0),
         }
     }
 
@@ -106,6 +115,9 @@ impl Dpb {
     ) -> Result<Decoded, D3d12Error> {
         if picture.slices.is_empty() {
             return Err(D3d12Error::Parse(ParseReason::PictureWithoutSlices));
+        }
+        if matches!(self.alloc(), Err(D3d12Error::NoFreeSlot)) {
+            return Err(D3d12Error::NoFreeSlot);
         }
         let frame_num = picture.frame_num();
         if frame_num >= self.max_frame_num {
@@ -436,12 +448,23 @@ impl Dpb {
         }
     }
 
-    /// First free slot.
+    /// First free slot no live surface pins.
     fn alloc(&self) -> Result<usize, D3d12Error> {
-        self.slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or(D3d12Error::DpbFull)
+        let mut pinned = false;
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.is_none() {
+                if self.pins.pinned(slot_u8(index)?) {
+                    pinned = true;
+                } else {
+                    return Ok(index);
+                }
+            }
+        }
+        if pinned {
+            Err(D3d12Error::NoFreeSlot)
+        } else {
+            Err(D3d12Error::DpbFull)
+        }
     }
 
     /// Wrapped frame number for the current picture.
@@ -619,15 +642,22 @@ impl Dpb {
     }
 
     /// Undisplayed pictures below the decoded maximum, in POC order.
+    ///
+    /// Reorder-free sequences emit every undisplayed picture instead.
     fn bump(&mut self, emits: &mut Vec<(i32, usize)>) {
-        let Some(max) = self.max_decoded_poc else {
-            return;
+        let ceiling = if self.reorder_free {
+            None
+        } else {
+            let Some(max) = self.max_decoded_poc else {
+                return;
+            };
+            Some(max)
         };
         loop {
             let mut next: Option<(i32, usize)> = None;
             for (index, slot) in self.slots.iter().enumerate() {
                 if let Some(occupant) = slot {
-                    if !occupant.displayed && occupant.poc < max {
+                    if !occupant.displayed && ceiling.is_none_or(|max| occupant.poc < max) {
                         let candidate = (occupant.poc, index);
                         if next.is_none_or(|best| candidate < best) {
                             next = Some(candidate);
@@ -890,6 +920,7 @@ mod tests {
             height_in_mbs_minus1: 67,
             direct_8x8: true,
             crop: None,
+            num_reorder_frames: None,
         }
     }
 
@@ -984,9 +1015,14 @@ mod tests {
         outputs.iter().map(|output| output.slot).collect()
     }
 
+    /// Empty pin table behind buffer tests.
+    fn pins() -> std::sync::Arc<crate::pins::SlotPins> {
+        std::sync::Arc::new(crate::pins::SlotPins::new())
+    }
+
     #[test]
     fn idr_occupies_slot_zero() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         let decoded = dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         assert!(decoded.outputs.is_empty());
         assert_eq!(decoded.submission.slot, 0);
@@ -1004,7 +1040,7 @@ mod tests {
 
     #[test]
     fn p_references_idr() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         let decoded = dpb.decode(&p(1, 2), &sps(), &pps()).expect("p");
         assert_eq!(slots(&decoded.outputs), vec![0]);
@@ -1024,7 +1060,7 @@ mod tests {
 
     #[test]
     fn b_displays_before_p() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         dpb.decode(&p(1, 4), &sps(), &pps()).expect("p");
         let b = picture(false, 0, 2, SlicePoc::Lsb(2), Marking::Silent, SliceType::B);
@@ -1034,8 +1070,57 @@ mod tests {
     }
 
     #[test]
+    fn reorder_free_emits_every_picture() {
+        let sequence = Sps {
+            num_reorder_frames: Some(0),
+            ..sps()
+        };
+        let mut dpb = Dpb::new(&sequence, pins());
+        let decoded = dpb.decode(&idr(0, 0), &sequence, &pps()).expect("idr");
+        assert_eq!(slots(&decoded.outputs), vec![0]);
+        let decoded = dpb.decode(&p(1, 2), &sequence, &pps()).expect("p");
+        assert_eq!(slots(&decoded.outputs), vec![1]);
+        assert!(dpb.drain().is_empty());
+    }
+
+    #[test]
+    fn reorder_ceiling_above_zero_holds_back() {
+        let sequence = Sps {
+            num_reorder_frames: Some(2),
+            ..sps()
+        };
+        let mut dpb = Dpb::new(&sequence, pins());
+        let decoded = dpb.decode(&idr(0, 0), &sequence, &pps()).expect("idr");
+        assert!(decoded.outputs.is_empty());
+    }
+
+    #[test]
+    fn pinned_out_buffer_fails_loud() {
+        let table = pins();
+        let mut dpb = Dpb::new(&sps(), table.clone());
+        let held: Vec<_> = (0..16).map(|slot| table.pin(slot)).collect();
+        let error = dpb.decode(&idr(0, 0), &sps(), &pps()).unwrap_err();
+        assert!(matches!(error, crate::error::D3d12Error::NoFreeSlot));
+        assert_eq!(error.to_string(), "no free surface slot");
+        drop(held);
+        let decoded = dpb.decode(&idr(0, 0), &sps(), &pps()).expect("unpinned");
+        assert_eq!(decoded.submission.slot, 0);
+    }
+
+    #[test]
+    fn alloc_skips_pinned_slots() {
+        let table = pins();
+        let mut dpb = Dpb::new(&sps(), table.clone());
+        let held: Vec<_> = (1..16).map(|slot| table.pin(slot)).collect();
+        let decoded = dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
+        assert_eq!(decoded.submission.slot, 0);
+        assert!(decoded.outputs.is_empty());
+        drop(held);
+    }
+
+    #[test]
     fn mmco5_resets_poc() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         dpb.decode(&p(1, 2), &sps(), &pps()).expect("p1");
         let reset = picture(
@@ -1062,12 +1147,12 @@ mod tests {
             gaps_allowed: true,
             ..sps()
         };
-        let mut dpb = Dpb::new(&allowed);
+        let mut dpb = Dpb::new(&allowed, pins());
         dpb.decode(&idr(0, 0), &allowed, &pps()).expect("idr");
         let error = dpb.decode(&p(2, 2), &allowed, &pps()).unwrap_err();
         assert!(matches!(error, crate::error::D3d12Error::Unsupported(_)));
 
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         let error = dpb.decode(&p(2, 2), &sps(), &pps()).unwrap_err();
         assert!(matches!(error, crate::error::D3d12Error::Parse(_)));
@@ -1077,7 +1162,7 @@ mod tests {
     fn sliding_window_keeps_evicted_surface() {
         let mut sequence = sps();
         sequence.max_num_ref_frames = 1;
-        let mut dpb = Dpb::new(&sequence);
+        let mut dpb = Dpb::new(&sequence, pins());
         dpb.decode(&idr(0, 0), &sequence, &pps()).expect("idr");
         let decoded = dpb.decode(&p(1, 2), &sequence, &pps()).expect("p");
         assert_eq!(decoded.submission.slot, 1);
@@ -1088,7 +1173,7 @@ mod tests {
 
     #[test]
     fn submission_carries_bitstream_and_matrices() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         let decoded = dpb.decode(&p(1, 2), &sps(), &pps()).expect("p");
         let submission = &decoded.submission;
@@ -1109,7 +1194,7 @@ mod tests {
 
     #[test]
     fn drain_breaks_poc_ties_by_slot() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         for frame_num in 1..=2 {
             let non_ref = picture(
@@ -1127,7 +1212,7 @@ mod tests {
 
     #[test]
     fn dpb_full_without_output() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         for frame_num in 1..16 {
             let non_ref = picture(
@@ -1147,7 +1232,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_pictures() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         let picture = Picture {
             slices: Vec::new(),
             idr: true,
@@ -1159,7 +1244,7 @@ mod tests {
     fn poc_type2_doubles_frame_num() {
         let mut sequence = sps();
         sequence.poc_type = PocType::FrameNum;
-        let mut dpb = Dpb::new(&sequence);
+        let mut dpb = Dpb::new(&sequence, pins());
         let idr = picture(
             true,
             2,
@@ -1185,7 +1270,7 @@ mod tests {
         sequence.cycle = 1;
         sequence.cycle_offsets[0] = 2;
         sequence.expected_delta = 2;
-        let mut dpb = Dpb::new(&sequence);
+        let mut dpb = Dpb::new(&sequence, pins());
         let idr = picture(
             true,
             2,
@@ -1214,7 +1299,7 @@ mod tests {
 
     #[test]
     fn frame_num_wraps_without_gap() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         let frames = [(14, 0), (15, 2), (0, 4), (1, 6)];
         let expected_slots: [&[u8]; 4] = [&[], &[0], &[1], &[2]];
         let expected_poc = [0, 2, 4, 6];
@@ -1247,7 +1332,7 @@ mod tests {
 
     #[test]
     fn idr_no_output_discards() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         dpb.decode(&p(1, 4), &sps(), &pps()).expect("p");
         let second = picture(
@@ -1272,7 +1357,7 @@ mod tests {
             level_idc: 41,
             ..sps()
         };
-        let mut dpb = Dpb::new(&high);
+        let mut dpb = Dpb::new(&high, pins());
         dpb.decode(&idr(0, 0), &high, &pps()).expect("idr");
         let decoded = dpb.decode(&p(1, 2), &high, &pps()).expect("p");
         assert_eq!(
@@ -1287,7 +1372,7 @@ mod tests {
 
     #[test]
     fn long_term_names_index() {
-        let mut dpb = Dpb::new(&sps());
+        let mut dpb = Dpb::new(&sps(), pins());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         let promote = picture(
             false,

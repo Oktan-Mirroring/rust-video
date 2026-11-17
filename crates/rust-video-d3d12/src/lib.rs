@@ -22,6 +22,8 @@ mod h264;
 #[cfg(target_os = "windows")]
 mod hevc;
 #[cfg(target_os = "windows")]
+mod pins;
+#[cfg(target_os = "windows")]
 mod scale;
 #[cfg(target_os = "windows")]
 mod submit;
@@ -38,6 +40,8 @@ pub use device::D3d12Device;
 pub use encoder::D3d12Encoder;
 pub use error::{BrokenReferenceReason, D3d12Error, ParseReason, SkipReason, UnsupportedReason};
 pub use guid::{Codec, Profile};
+#[cfg(target_os = "windows")]
+pub use texture::GpuSurface;
 #[cfg(target_os = "windows")]
 pub use transcode::Transcoder;
 

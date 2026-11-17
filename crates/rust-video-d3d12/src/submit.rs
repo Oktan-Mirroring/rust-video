@@ -696,20 +696,44 @@ impl Fence {
         Ok(Ticket { value })
     }
 
+    /// Owned fence handle behind surface waits.
+    pub(crate) fn handle(&self) -> ID3D12Fence {
+        self.inner.clone()
+    }
+
     /// `ticket` completion through the fence event, outside any lock.
     pub(crate) fn wait(&self, ticket: Ticket) -> Result<(), D3d12Error> {
         if self.poll(ticket) {
             return Ok(());
         }
+        Self::signal_and_wait(&self.inner, ticket.value(), self.event)
+    }
+
+    /// `value` completion on `fence` through a transient event.
+    pub(crate) fn wait_on(fence: &ID3D12Fence, value: u64) -> Result<(), D3d12Error> {
+        // Sound: default security, auto-reset, unnamed.
+        let event =
+            unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(|error| {
+                D3d12Error::Call {
+                    call: "CreateEvent",
+                    hresult: error.code().0,
+                }
+            })?;
+        let outcome = Self::signal_and_wait(fence, value, event);
+        // Sound: the event is live; the close owns no further state.
+        let _ = unsafe { CloseHandle(event) };
+        outcome
+    }
+
+    /// `value` completion on `fence` through `event`.
+    fn signal_and_wait(fence: &ID3D12Fence, value: u64, event: HANDLE) -> Result<(), D3d12Error> {
         // Sound: the fence and event are live.
-        unsafe { self.inner.SetEventOnCompletion(ticket.value(), self.event) }.map_err(
-            |error| D3d12Error::Call {
-                call: "SetEventOnCompletion",
-                hresult: error.code().0,
-            },
-        )?;
+        unsafe { fence.SetEventOnCompletion(value, event) }.map_err(|error| D3d12Error::Call {
+            call: "SetEventOnCompletion",
+            hresult: error.code().0,
+        })?;
         // Sound: the event is live with a bounded wait.
-        let outcome = unsafe { WaitForSingleObject(self.event, Self::WAIT_MS) };
+        let outcome = unsafe { WaitForSingleObject(event, Self::WAIT_MS) };
         if outcome == WAIT_OBJECT_0 {
             return Ok(());
         }

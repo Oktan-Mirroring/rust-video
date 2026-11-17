@@ -143,6 +143,11 @@ const TABLE: &[(Codec, windows::core::GUID, &str)] = &[
 ];
 
 /// D3D12 device with enumerated decoder profiles.
+///
+/// Threading: a single thread needs nothing. The device and command queues
+/// are free-threaded, and decode sessions borrow exclusively, so threads
+/// sharing one device need no extra serialization; concurrent sessions
+/// submit through their own queues.
 pub struct D3d12Device {
     /// Logical device.
     #[cfg(target_os = "windows")]
@@ -324,14 +329,14 @@ impl D3d12Device {
     /// Logical device behind the tier.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn device(&self) -> &ID3D12Device {
+    pub fn device(&self) -> &ID3D12Device {
         &self.device
     }
 
     /// Video device behind decode and encode queries.
     #[cfg(target_os = "windows")]
     #[must_use]
-    pub(crate) fn video(&self) -> &ID3D12VideoDevice {
+    pub fn video(&self) -> &ID3D12VideoDevice {
         &self.video
     }
 

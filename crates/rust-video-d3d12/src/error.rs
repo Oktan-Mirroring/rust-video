@@ -52,6 +52,9 @@ pub enum D3d12Error {
     /// Picture buffer has no free slot for the next picture.
     #[error("dpb full")]
     DpbFull,
+    /// Live surfaces pin every free slot of the decoder pool.
+    #[error("no free surface slot")]
+    NoFreeSlot,
     /// Frame over the VRAM budget.
     #[error("frame over budget: {0}")]
     OverBudget(#[from] rust_video_caps::traits::OverBudget),
@@ -494,6 +497,7 @@ mod tests {
             "broken reference list: slot outside pool"
         );
         assert_eq!(D3d12Error::DpbFull.to_string(), "dpb full");
+        assert_eq!(D3d12Error::NoFreeSlot.to_string(), "no free surface slot");
         assert_eq!(D3d12Error::NoSession.to_string(), "picture before session");
     }
 

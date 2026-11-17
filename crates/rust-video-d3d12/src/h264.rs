@@ -185,6 +185,8 @@ pub(crate) struct Sps {
     pub(crate) direct_8x8: bool,
     /// Visible rectangle, absent when uncropped.
     pub(crate) crop: Option<Crop>,
+    /// VUI reorder ceiling, absent without a bitstream restriction.
+    pub(crate) num_reorder_frames: Option<u32>,
 }
 
 impl Sps {
@@ -261,6 +263,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d12Error> {
     }
     let direct_8x8 = reader.read_bit("direct_8x8_inference_flag")?;
     let crop = parse_crop(&mut reader, width_in_mbs_minus1, height_in_mbs_minus1)?;
+    let num_reorder_frames = parse_reorder_ceiling(&mut reader)?;
     Ok(Sps {
         level_idc,
         seq_parameter_set_id: sps_id,
@@ -280,6 +283,7 @@ pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d12Error> {
         height_in_mbs_minus1,
         direct_8x8,
         crop,
+        num_reorder_frames,
     })
 }
 
@@ -494,6 +498,87 @@ fn parse_crop(
         })),
         _ => Err(D3d12Error::Parse(ParseReason::FrameCropOutsideCodedSize)),
     }
+}
+
+/// VUI reorder ceiling, absent without a bitstream restriction.
+fn parse_reorder_ceiling(reader: &mut BitReader) -> Result<Option<u32>, D3d12Error> {
+    if !reader.more_data() {
+        return Ok(None);
+    }
+    if !reader.read_bit("vui_parameters_present_flag")? {
+        return Ok(None);
+    }
+    parse_vui_restriction(reader)
+}
+
+/// Bitstream restriction reorder ceiling inside the VUI, H.264 E.1.1.
+fn parse_vui_restriction(reader: &mut BitReader) -> Result<Option<u32>, D3d12Error> {
+    if reader.read_bit("aspect_ratio_info_present_flag")?
+        && reader.read_bits(8, "aspect_ratio_idc")? == 255
+    {
+        reader.read_bits(16, "sar_width")?;
+        reader.read_bits(16, "sar_height")?;
+    }
+    if reader.read_bit("overscan_info_present_flag")? {
+        reader.read_bit("overscan_appropriate_flag")?;
+    }
+    if reader.read_bit("video_signal_type_present_flag")? {
+        reader.read_bits(3, "video_format")?;
+        reader.read_bit("video_full_range_flag")?;
+        if reader.read_bit("colour_description_present_flag")? {
+            reader.read_bits(8, "colour_primaries")?;
+            reader.read_bits(8, "transfer_characteristics")?;
+            reader.read_bits(8, "matrix_coefficients")?;
+        }
+    }
+    if reader.read_bit("chroma_loc_info_present_flag")? {
+        reader.read_ue("chroma_sample_loc_type_top_field")?;
+        reader.read_ue("chroma_sample_loc_type_bottom_field")?;
+    }
+    if reader.read_bit("timing_info_present_flag")? {
+        reader.read_bits(32, "num_units_in_tick")?;
+        reader.read_bits(32, "time_scale")?;
+        reader.read_bit("fixed_frame_rate_flag")?;
+    }
+    let mut hrd = false;
+    if reader.read_bit("nal_hrd_parameters_present_flag")? {
+        parse_hrd(reader)?;
+        hrd = true;
+    }
+    if reader.read_bit("vcl_hrd_parameters_present_flag")? {
+        parse_hrd(reader)?;
+        hrd = true;
+    }
+    if hrd {
+        reader.read_bit("low_delay_hrd_flag")?;
+    }
+    reader.read_bit("pic_struct_present_flag")?;
+    if !reader.read_bit("bitstream_restriction_flag")? {
+        return Ok(None);
+    }
+    reader.read_bit("motion_vectors_over_pic_boundaries_flag")?;
+    reader.read_ue("max_bytes_per_pic_denom")?;
+    reader.read_ue("max_bits_per_mb_denom")?;
+    reader.read_ue("log2_max_mv_length_horizontal")?;
+    reader.read_ue("log2_max_mv_length_vertical")?;
+    Ok(Some(reader.read_ue("num_reorder_frames")?))
+}
+
+/// Hypothetical reference decoder parameters, H.264 E.1.2.
+fn parse_hrd(reader: &mut BitReader) -> Result<(), D3d12Error> {
+    let count = reader.read_ue("cpb_cnt_minus1")?;
+    reader.read_bits(4, "bit_rate_scale")?;
+    reader.read_bits(4, "cpb_size_scale")?;
+    for _ in 0..=count {
+        reader.read_ue("bit_rate_value_minus1")?;
+        reader.read_ue("cpb_size_value_minus1")?;
+        reader.read_bit("cbr_flag")?;
+    }
+    reader.read_bits(5, "initial_cpb_removal_delay_length_minus1")?;
+    reader.read_bits(5, "cpb_removal_delay_length_minus1")?;
+    reader.read_bits(5, "dpb_output_delay_length_minus1")?;
+    reader.read_bits(5, "time_offset_length")?;
+    Ok(())
 }
 
 /// CABAC entropy coding flag bit.
@@ -1615,6 +1700,13 @@ mod tests {
     /// Baseline 1920x1088 sequence set body.
     fn sps_body() -> Vec<u8> {
         let mut writer = BitWriter::new();
+        sps_prologue(&mut writer);
+        writer.bit(false);
+        writer.finish_ebsp()
+    }
+
+    /// Baseline prologue through the crop flag.
+    fn sps_prologue(writer: &mut BitWriter) {
         writer.bits(66, 8);
         writer.bits(0, 8);
         writer.bits(30, 8);
@@ -1629,7 +1721,33 @@ mod tests {
         writer.bit(true);
         writer.bit(true);
         writer.bit(false);
+    }
+
+    /// Baseline 1920x1088 sequence set body with VUI carrying `restriction`.
+    fn sps_body_vui(restriction: Option<u32>) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        sps_prologue(&mut writer);
+        writer.bit(true);
         writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        writer.bit(false);
+        let Some(reorder) = restriction else {
+            writer.bit(false);
+            return writer.finish_ebsp();
+        };
+        writer.bit(true);
+        writer.bit(true);
+        writer.ue(0);
+        writer.ue(0);
+        writer.ue(0);
+        writer.ue(0);
+        writer.ue(reorder);
+        writer.ue(0);
         writer.finish_ebsp()
     }
 
@@ -1718,6 +1836,27 @@ mod tests {
         assert_eq!(sps.visible_height(), 1088);
         assert_eq!(sps.scaling.four[0][0], 16);
         assert_eq!(sps.scaling.four[0][1], 16);
+    }
+
+    #[test]
+    fn sps_without_vui_has_no_reorder_ceiling() {
+        assert_eq!(sps().num_reorder_frames, None);
+    }
+
+    #[test]
+    fn sps_vui_without_restriction_has_no_ceiling() {
+        let body = sps_body_vui(None);
+        let sps = parse_sps(&crate::bits::rbsp(&body)).expect("vui sps");
+        assert_eq!(sps.num_reorder_frames, None);
+    }
+
+    #[test]
+    fn sps_restriction_reports_reorder_ceiling() {
+        for reorder in [0, 2] {
+            let body = sps_body_vui(Some(reorder));
+            let sps = parse_sps(&crate::bits::rbsp(&body)).expect("restricted sps");
+            assert_eq!(sps.num_reorder_frames, Some(reorder));
+        }
     }
 
     #[test]

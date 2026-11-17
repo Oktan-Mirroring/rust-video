@@ -86,20 +86,20 @@ impl<'a> D3d12Encoder<'a> {
         self.session.as_mut().ok_or(D3d12Error::NoSession)
     }
 
-    /// Packets coded from `texture`, possibly none.
+    /// Packets coded from `surface`, possibly none.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the texture misses the session extent or the
+    /// Returns `Err` when the surface misses the session extent or the
     /// backend cannot encode it.
     pub(crate) fn encode_texture(
         &mut self,
-        texture: &crate::texture::GpuTexture,
+        surface: &crate::texture::GpuSurface,
     ) -> Result<Vec<Packet>, D3d12Error> {
-        let size = texture.size();
+        let size = surface.size();
         let (width, height) = (size.width(), size.height());
         let session = self.ensure_session(width, height)?;
-        let outcome = session.encode_texture(texture.resource(), width, height);
+        let outcome = session.encode_texture(surface.texture(), width, height);
         match outcome {
             Ok(bitstream) => Ok(vec![Packet::new(Bytes::from(bitstream))]),
             Err(error) => {
