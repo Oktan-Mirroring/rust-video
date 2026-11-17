@@ -1114,6 +1114,20 @@ impl Sps {
         self.conformance
     }
 
+    /// Crop left and top in luma samples, zero without a window.
+    #[must_use]
+    pub fn crop_origin(&self) -> (u32, u32) {
+        let Some(window) = self.conformance else {
+            return (0, 0);
+        };
+        let sub_width = if self.chroma_format_idc == 3 { 1 } else { 2 };
+        let sub_height = if self.chroma_format_idc <= 1 { 2 } else { 1 };
+        (
+            window[0].saturating_mul(sub_width),
+            window[2].saturating_mul(sub_height),
+        )
+    }
+
     /// Sub-layer ordering info present.
     #[must_use]
     pub fn ordering_info_present(&self) -> bool {

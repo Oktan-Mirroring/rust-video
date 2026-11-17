@@ -1264,7 +1264,10 @@ impl EncodeSession {
             }
             None => (None, None, 0, None),
         };
-        let setup_slot = self.slots.claim(self.next_id.next())?;
+        let setup_slot = self
+            .slots
+            .claim(self.next_id.next())
+            .map_err(|_| VulkanError::NoFreeSlot)?;
         Ok(EncodePlan {
             setup_slot,
             ref_slot,

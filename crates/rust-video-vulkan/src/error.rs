@@ -136,6 +136,9 @@ pub enum VulkanError {
     /// Picture arrived before any parameter set built a session.
     #[error("picture before session")]
     NoSession,
+    /// Every decoder surface slot is pinned by a live frame.
+    #[error("no free surface slot")]
+    NoFreeSlot,
     /// Encoder input outside the NV12 contract.
     #[error("encoder wants NV12 input, got {format:?}")]
     UnsupportedInput {
@@ -300,6 +303,7 @@ mod tests {
         let error = VulkanError::OverCaps { what: "dpb slots" };
         assert_eq!(error.to_string(), "stream dpb slots above adapter caps");
         assert_eq!(VulkanError::NoSession.to_string(), "picture before session");
+        assert_eq!(VulkanError::NoFreeSlot.to_string(), "no free surface slot");
     }
 
     #[test]

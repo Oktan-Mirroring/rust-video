@@ -14,6 +14,14 @@ use rust_video_caps::transcode::ShareMechanism;
 /// `Send` plus `Sync`: the instance plus device live behind one `Arc`,
 /// every other handle is an owned ash clone or an immutable fact, and
 /// queue submission serializes on the queue mutex.
+///
+/// Threading: one thread needs nothing; threads sharing one device hold
+/// [`queue_lock`](Self::queue_lock) across their own submits on
+/// [`queue`](Self::queue), the same lock every crate submission takes.
+///
+/// Lifetime: the device owns its instance and logical device, borrowed
+/// for the decoders' lives; GPU frames keep them alive through shared
+/// ownership past the decoder, never by borrow.
 pub struct VulkanDevice {
     /// Owned instance plus logical device, shared with escaped frames.
     owned: Arc<OwnedDevice>,
@@ -114,19 +122,25 @@ impl VulkanDevice {
 
     /// Queue family the device opened.
     #[must_use]
-    pub(crate) fn queue_family(&self) -> u32 {
+    pub fn queue_family(&self) -> u32 {
         self.queue_family
     }
 
     /// Video queue at index zero.
+    ///
+    /// Borrowed, never owned: external threads hold
+    /// [`queue_lock`](Self::queue_lock) across their own submits on it.
     #[must_use]
-    pub(crate) fn queue(&self) -> ash::vk::Queue {
+    pub fn queue(&self) -> ash::vk::Queue {
         self.queue
     }
 
     /// Queue submission mutex; every submit holds it.
+    ///
+    /// Threads sharing one device serialize their own queue calls on
+    /// this lock together with every crate submission.
     #[must_use]
-    pub(crate) fn queue_lock(&self) -> &Arc<Mutex<()>> {
+    pub fn queue_lock(&self) -> &Arc<Mutex<()>> {
         &self.queue_lock
     }
 

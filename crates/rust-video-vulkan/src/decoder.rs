@@ -18,6 +18,7 @@ use crate::parse::au::AuSplitter;
 use crate::parse::nal::NaluSplitter;
 use crate::parse::refs::{
     H264Context, H264Instruction, Picture, RefPicture, ReferenceId, ReorderBuffer, RpsEcho,
+    SlotBook,
 };
 use crate::raw::{DeviceExport, ExportPair, OwnedDevice};
 use crate::session::decode::{
@@ -30,9 +31,84 @@ use crate::session::params::{
 use crate::session::slots::SubmitStats;
 use crate::session::std_h264::{fill_picture, fill_reference, H264Tables};
 
-/// Decoded frame: NV12 bytes with identity and a budget lease.
+/// Native NV12 planes behind one GPU surface: images plus allocations.
 ///
-/// `Send` plus `Sync`: shared bytes plus an atomic budget lease.
+/// Borrowed from the frame through [`VulkanFrame::planes`]: the handles
+/// stay valid while the frame lives and die with it. No ownership moves;
+/// external readers must neither destroy nor free them. Sync needs no
+/// semaphore: collection waits the submit fence, so [`VulkanFrame::wait`]
+/// observes a completed decode.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VulkanPlanes {
+    /// Luma image.
+    y_image: vk::Image,
+    /// Chroma image.
+    uv_image: vk::Image,
+    /// Luma backing allocation.
+    y_memory: vk::DeviceMemory,
+    /// Chroma backing allocation.
+    uv_memory: vk::DeviceMemory,
+}
+
+impl VulkanPlanes {
+    /// Luma image.
+    #[must_use]
+    pub fn y_image(&self) -> vk::Image {
+        self.y_image
+    }
+
+    /// Chroma image.
+    #[must_use]
+    pub fn uv_image(&self) -> vk::Image {
+        self.uv_image
+    }
+
+    /// Luma backing allocation.
+    #[must_use]
+    pub fn y_memory(&self) -> vk::DeviceMemory {
+        self.y_memory
+    }
+
+    /// Chroma backing allocation.
+    #[must_use]
+    pub fn uv_memory(&self) -> vk::DeviceMemory {
+        self.uv_memory
+    }
+}
+
+/// DPB placement of one staged surface.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SurfaceLayout {
+    /// DPB array layer the picture decoded into.
+    slice: u32,
+    /// Full texture extent in luma samples.
+    coded: PictureSize,
+    /// Crop left and top in luma samples.
+    origin: (u32, u32),
+}
+
+impl SurfaceLayout {
+    /// Layout over `slice`, `coded`, and `origin`.
+    pub(crate) fn new(slice: u32, coded: PictureSize, origin: (u32, u32)) -> Self {
+        Self {
+            slice,
+            coded,
+            origin,
+        }
+    }
+}
+
+/// Decoded surface: NV12 bytes or native planes, with identity and a lease.
+///
+/// Threading: the decoders stay on their creating thread while queue
+/// submission serializes on the device queue lock; a frame itself is
+/// `Send` plus `Sync`, so threads share frames freely and hold
+/// [`VulkanDevice::queue_lock`] across their own submits on
+/// [`VulkanDevice::queue`].
+///
+/// Lifetime: the frame owns its pixels or planes plus its budget lease
+/// and borrows nothing. A GPU frame pins its export slot until dropped;
+/// native handles from [`planes`](Self::planes) die with the frame.
 pub struct VulkanFrame {
     /// Frame identity: size, format, generation.
     identity: GpuFrame,
@@ -42,6 +118,10 @@ pub struct VulkanFrame {
     lease: Lease,
     /// Device export behind the frame, absent without one.
     device: Option<DeviceExport>,
+    /// DPB placement of the surface.
+    layout: SurfaceLayout,
+    /// Native planes behind a GPU frame, absent on the readback path.
+    planes: Option<VulkanPlanes>,
 }
 
 impl VulkanFrame {
@@ -49,6 +129,55 @@ impl VulkanFrame {
     #[must_use]
     pub fn identity(&self) -> GpuFrame {
         self.identity
+    }
+
+    /// Visible picture size in luma samples.
+    #[must_use]
+    pub fn size(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Pixel layout of the frame.
+    #[must_use]
+    pub fn format(&self) -> PixelFormat {
+        self.identity.format()
+    }
+
+    /// DPB array layer the picture decoded into.
+    #[must_use]
+    pub fn slice(&self) -> u32 {
+        self.layout.slice
+    }
+
+    /// Full texture extent in luma samples.
+    #[must_use]
+    pub fn coded(&self) -> PictureSize {
+        self.layout.coded
+    }
+
+    /// Crop left and top in luma samples.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        self.layout.origin
+    }
+
+    /// Native planes behind a GPU frame, absent on the readback path.
+    #[must_use]
+    pub fn planes(&self) -> Option<&VulkanPlanes> {
+        self.planes.as_ref()
+    }
+
+    /// Block until the surface's decode completes.
+    ///
+    /// Collection waits the submit fence before staging, so every
+    /// emitted surface is already complete and this returns at once;
+    /// it is the external-reader sync point, never a second wait.
+    pub fn wait(&self) {}
+
+    /// DPB placement of the surface.
+    #[must_use]
+    pub(crate) fn layout(&self) -> SurfaceLayout {
+        self.layout
     }
 
     /// NV12 frame bytes in row-major order.
@@ -295,8 +424,9 @@ impl FrameSink {
         poc: i32,
         resets: bool,
         lease: ExportLease,
+        layout: SurfaceLayout,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage_export(session, lease)?;
+        let frame = self.stage_export(session, lease, layout)?;
         self.generation += 1;
         Ok(self.reorder.push_flushing_on_reset(resets, poc, frame))
     }
@@ -311,8 +441,9 @@ impl FrameSink {
         session: &Session,
         poc: i32,
         lease: ExportLease,
+        layout: SurfaceLayout,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage_export(session, lease)?;
+        let frame = self.stage_export(session, lease, layout)?;
         self.generation += 1;
         Ok(self.reorder.push(poc, frame))
     }
@@ -328,8 +459,9 @@ impl FrameSink {
         buffer: BytesMut,
         poc: i32,
         resets: bool,
+        layout: SurfaceLayout,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage_readback(size, buffer)?;
+        let frame = self.stage_readback(size, buffer, layout)?;
         self.generation += 1;
         Ok(self.reorder.push_flushing_on_reset(resets, poc, frame))
     }
@@ -344,8 +476,9 @@ impl FrameSink {
         size: PictureSize,
         buffer: BytesMut,
         poc: i32,
+        layout: SurfaceLayout,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let frame = self.stage_readback(size, buffer)?;
+        let frame = self.stage_readback(size, buffer, layout)?;
         self.generation += 1;
         Ok(self.reorder.push(poc, frame))
     }
@@ -361,11 +494,18 @@ impl FrameSink {
         cpu: Option<&Bytes>,
         gpu: Option<&Arc<ExportPair>>,
         poc: i32,
+        layout: SurfaceLayout,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let identity = GpuFrame::new(size, PixelFormat::Nv12, self.generation);
         let data = cpu.cloned().unwrap_or_default();
         let lease = self.shared.try_acquire(data.len() as u64)?;
         let device = gpu.map(|pair| DeviceExport::new((*pair).clone()));
+        let planes = gpu.map(|pair| VulkanPlanes {
+            y_image: pair.y_image(),
+            uv_image: pair.uv_image(),
+            y_memory: pair.y_memory(),
+            uv_memory: pair.uv_memory(),
+        });
         self.generation += 1;
         Ok(self.reorder.push(
             poc,
@@ -374,6 +514,8 @@ impl FrameSink {
                 data,
                 lease,
                 device,
+                layout,
+                planes,
             },
         ))
     }
@@ -387,6 +529,7 @@ impl FrameSink {
         &mut self,
         session: &Session,
         lease: ExportLease,
+        layout: SurfaceLayout,
     ) -> Result<VulkanFrame, VulkanError> {
         let (display_width, display_height) = session.geometry().display();
         let size =
@@ -397,11 +540,19 @@ impl FrameSink {
         let identity = GpuFrame::new(size, PixelFormat::Nv12, self.generation);
         self.mark_export_used(&lease);
         let held = self.shared.try_acquire(0)?;
+        let planes = Some(VulkanPlanes {
+            y_image: lease.pair().y_image(),
+            uv_image: lease.pair().uv_image(),
+            y_memory: lease.pair().y_memory(),
+            uv_memory: lease.pair().uv_memory(),
+        });
         Ok(VulkanFrame {
             identity,
             data: Bytes::new(),
             lease: held,
             device: Some(DeviceExport::new(lease.pair)),
+            layout,
+            planes,
         })
     }
 
@@ -414,6 +565,7 @@ impl FrameSink {
         &mut self,
         size: PictureSize,
         buffer: BytesMut,
+        layout: SurfaceLayout,
     ) -> Result<VulkanFrame, VulkanError> {
         let bytes = buffer.freeze();
         let lease = self.shared.try_acquire(bytes.len() as u64)?;
@@ -423,6 +575,8 @@ impl FrameSink {
             data: bytes,
             lease,
             device: None,
+            layout,
+            planes: None,
         })
     }
 }
@@ -591,7 +745,7 @@ impl<'a> H264Decoder<'a> {
         };
         retire_slots(session, sink, picture);
         let setup_id = picture.id().unwrap_or_else(|| scratch.next());
-        let setup_slot = session.slots_mut().claim(setup_id)?;
+        let setup_slot = claim_slot(session.slots_mut(), setup_id)?;
         let extent = {
             let (width, height) = session.geometry().coded();
             vk::Extent2D { width, height }
@@ -728,12 +882,20 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Decode raw Annex-B bytes, returning display-ready frames.
+    ///
+    /// Streams with zero reorder depth emit each picture on the call
+    /// carrying its last byte; deeper streams buffer the trailing unit
+    /// across calls exactly as before.
     fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         for raw in self.splitter.push(bytes) {
-            let parsed = self.parser.parse(&raw)?;
-            let nalu = crate::parse::h264::Nalu::new(parsed);
-            if let Some(unit) = self.aus.put(nalu) {
+            out.extend(self.run_nal(&raw, gpu)?);
+        }
+        if self.sink.reorder().capacity() == 0 {
+            for raw in self.splitter.flush() {
+                out.extend(self.run_nal(&raw, gpu)?);
+            }
+            if let Some(unit) = self.aus.flush() {
                 out.extend(self.run_unit(unit, gpu)?);
             }
         }
@@ -744,6 +906,21 @@ impl<'a> H264Decoder<'a> {
             &mut self.stats,
         )?;
         out.extend(drained);
+        Ok(out)
+    }
+
+    /// One NAL unit through parse, access-unit cut, and submit.
+    fn run_nal(
+        &mut self,
+        raw: &crate::parse::nal::Nalu,
+        gpu: bool,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        let parsed = self.parser.parse(raw)?;
+        let nalu = crate::parse::h264::Nalu::new(parsed);
+        if let Some(unit) = self.aus.put(nalu) {
+            out.extend(self.run_unit(unit, gpu)?);
+        }
         Ok(out)
     }
 
@@ -1027,6 +1204,8 @@ struct SubmitPlan<'a, 'b, 'c> {
 struct PendingPicture {
     /// Submitted decode behind the picture.
     pending: PendingDecode,
+    /// DPB slot the picture decoded into.
+    setup_slot: usize,
     /// Picture order count.
     poc: i32,
     /// Picture starts a DPB reset.
@@ -1084,6 +1263,7 @@ fn plan_submit(
     }
     Ok(PendingPicture {
         pending,
+        setup_slot: plan.setup_slot,
         poc: body.poc(),
         resets: body.resets_dpb(),
         flush_on_reset: plan.flush_on_reset,
@@ -1102,30 +1282,39 @@ fn collect_pending(
     sink: &mut FrameSink,
     picture: PendingPicture,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
-    if let Some(lease) = picture.lease {
-        session.collect_gpu(picture.pending)?;
-        if picture.flush_on_reset {
-            return sink.emit(session, picture.poc, picture.resets, lease);
-        }
-        return sink.emit_queued(session, picture.poc, lease);
-    }
-    let (display_width, display_height) = session.geometry().display();
-    let size = PictureSize::new(display_width, display_height).ok_or(VulkanError::BadExtent {
-        width: display_width,
-        height: display_height,
+    let slice = u32::try_from(picture.setup_slot).map_err(|_| ParseError::OutOfRange {
+        syntax: "setup slot",
     })?;
     let (coded_width, coded_height) = session.geometry().coded();
     let coded = PictureSize::new(coded_width, coded_height).ok_or(VulkanError::BadExtent {
         width: coded_width,
         height: coded_height,
     })?;
+    let layout = SurfaceLayout::new(slice, coded, session.geometry().origin());
+    if let Some(lease) = picture.lease {
+        session.collect_gpu(picture.pending)?;
+        if picture.flush_on_reset {
+            return sink.emit(session, picture.poc, picture.resets, lease, layout);
+        }
+        return sink.emit_queued(session, picture.poc, lease, layout);
+    }
+    let (display_width, display_height) = session.geometry().display();
+    let size = PictureSize::new(display_width, display_height).ok_or(VulkanError::BadExtent {
+        width: display_width,
+        height: display_height,
+    })?;
     let mut buffer = sink.pooled(size, coded);
     session.collect_into(picture.pending, &mut buffer)?;
     if picture.flush_on_reset {
-        sink.emit_readback(size, buffer, picture.poc, picture.resets)
+        sink.emit_readback(size, buffer, picture.poc, picture.resets, layout)
     } else {
-        sink.emit_readback_queued(size, buffer, picture.poc)
+        sink.emit_readback_queued(size, buffer, picture.poc, layout)
     }
+}
+
+/// DPB slot for `id`, or `NoFreeSlot` when every slot is pinned.
+fn claim_slot(slots: &mut SlotBook, id: ReferenceId) -> Result<usize, VulkanError> {
+    slots.claim(id).map_err(|_| VulkanError::NoFreeSlot)
 }
 
 /// Collect every submitted picture into display frames.
@@ -1417,7 +1606,7 @@ impl<'a> H265Decoder<'a> {
         };
         retire_slots(session, sink, body);
         let setup_id = body.id().unwrap_or_else(|| scratch.next());
-        let setup_slot = session.slots_mut().claim(setup_id)?;
+        let setup_slot = claim_slot(session.slots_mut(), setup_id)?;
         let extent = {
             let (width, height) = session.geometry().coded();
             vk::Extent2D { width, height }
@@ -1585,12 +1774,20 @@ impl<'a> H265Decoder<'a> {
     }
 
     /// Decode raw Annex-B bytes, returning display-ready frames.
+    ///
+    /// Streams with zero reorder depth emit each picture on the call
+    /// carrying its last byte; deeper streams buffer the trailing unit
+    /// across calls exactly as before.
     fn run_bytes(&mut self, bytes: &[u8], gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
         for raw in self.splitter.push(bytes) {
-            let parsed = self.parser.parse(&raw)?;
-            let nalu = crate::parse::h265::Nalu::new(parsed);
-            if let Some(unit) = self.aus.put(nalu) {
+            out.extend(self.run_nal(&raw, gpu)?);
+        }
+        if self.sink.reorder().capacity() == 0 {
+            for raw in self.splitter.flush() {
+                out.extend(self.run_nal(&raw, gpu)?);
+            }
+            if let Some(unit) = self.aus.flush() {
                 out.extend(self.run_unit(unit, gpu)?);
             }
         }
@@ -1601,6 +1798,21 @@ impl<'a> H265Decoder<'a> {
             &mut self.stats,
         )?;
         out.extend(drained);
+        Ok(out)
+    }
+
+    /// One NAL unit through parse, access-unit cut, and submit.
+    fn run_nal(
+        &mut self,
+        raw: &crate::parse::nal::Nalu,
+        gpu: bool,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        let parsed = self.parser.parse(raw)?;
+        let nalu = crate::parse::h265::Nalu::new(parsed);
+        if let Some(unit) = self.aus.put(nalu) {
+            out.extend(self.run_unit(unit, gpu)?);
+        }
         Ok(out)
     }
 
@@ -1671,6 +1883,8 @@ struct StoredFrame {
     cpu: Option<Bytes>,
     /// Exportable planes on the GPU path, absent on the CPU path.
     gpu: Option<Arc<ExportPair>>,
+    /// DPB placement of the surface.
+    layout: SurfaceLayout,
 }
 
 /// Display frames retained for show-existing displays.
@@ -1694,9 +1908,18 @@ impl ShowStore {
         size: PictureSize,
         cpu: Option<Bytes>,
         gpu: Option<Arc<ExportPair>>,
+        layout: SurfaceLayout,
     ) {
         self.entries.retain(|entry| entry.0 != id);
-        self.entries.push((id, StoredFrame { size, cpu, gpu }));
+        self.entries.push((
+            id,
+            StoredFrame {
+                size,
+                cpu,
+                gpu,
+                layout,
+            },
+        ));
     }
 
     /// Retained frame of `id`, if any.
@@ -1940,7 +2163,7 @@ impl<'a> Av1Decoder<'a> {
         let header = picture.header();
         release_ids(session, picture.pre());
         let setup_id = body.id().unwrap_or_else(|| scratch.next());
-        let setup_slot = session.slots_mut().claim(setup_id)?;
+        let setup_slot = claim_slot(session.slots_mut(), setup_id)?;
         let extent = {
             let (width, height) = session.geometry().coded();
             vk::Extent2D { width, height }
@@ -2063,6 +2286,7 @@ impl<'a> Av1Decoder<'a> {
                         stored.cpu.as_ref(),
                         stored.gpu.as_ref(),
                         poc,
+                        stored.layout,
                     )?);
                 }
             }
@@ -2090,8 +2314,13 @@ impl<'a> Av1Decoder<'a> {
                         .device_export()
                         .is_none()
                         .then(|| frame.bytes().clone());
-                    self.shown
-                        .insert(id, frame.identity().size(), cpu, pair.clone());
+                    self.shown.insert(
+                        id,
+                        frame.identity().size(),
+                        cpu,
+                        pair.clone(),
+                        frame.layout(),
+                    );
                 }
             }
             if emit {
@@ -2308,7 +2537,8 @@ mod tests {
     use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
     use rust_video_caps::traits::SharedDevice;
 
-    use super::VulkanFrame;
+    use super::{SurfaceLayout, VulkanFrame};
+    use crate::error::VulkanError;
 
     /// AV1 hardware decode against software decode, or a loud decline.
     ///
@@ -2429,6 +2659,8 @@ mod tests {
             data: bytes,
             lease,
             device: None,
+            layout: SurfaceLayout::new(0, size, (0, 0)),
+            planes: None,
         }
     }
 
@@ -2495,5 +2727,117 @@ mod tests {
         let shared = SharedDevice::new("vulkan", 100);
         let held = frame(&shared, 4, 2, vec![0; 11]);
         assert!(held.to_cpu().is_none());
+    }
+
+    #[test]
+    fn surface_contract_reads_layout() {
+        let shared = SharedDevice::new("vulkan", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        let size = PictureSize::new(4, 2).expect("nonzero extent");
+        assert_eq!(held.size(), size);
+        assert_eq!(held.format(), PixelFormat::Nv12);
+        assert_eq!(held.slice(), 0);
+        assert_eq!(held.coded(), size);
+        assert_eq!(held.origin(), (0, 0));
+        assert!(held.planes().is_none());
+        held.wait();
+    }
+
+    /// Kind tag of one instruction, asserting a zero reorder depth on sets.
+    fn tag(instruction: &crate::parse::refs::H264Instruction) -> &'static str {
+        use crate::parse::refs::H264Instruction;
+        match instruction {
+            H264Instruction::Sps(sps) => {
+                assert_eq!(sps.max_num_reorder_frames(), 0);
+                assert_eq!(sps.coded_size(), (64, 64));
+                assert_eq!(sps.display_size(), (64, 64));
+                "sps"
+            }
+            H264Instruction::Pps(_) => "pps",
+            H264Instruction::Picture(_) => "pic",
+        }
+    }
+
+    /// Instruction tags out of one packet, trailing unit completed.
+    fn feed_packet(
+        splitter: &mut crate::parse::nal::NaluSplitter,
+        parser: &mut crate::parse::h264::H264Parser,
+        aus: &mut crate::parse::au::AuSplitter<crate::parse::h264::Nalu>,
+        context: &mut crate::parse::refs::H264Context,
+        bytes: &[u8],
+    ) -> Vec<&'static str> {
+        let mut tags = Vec::new();
+        let mut run_nal = |raw: crate::parse::nal::Nalu| {
+            let parsed = parser.parse(&raw).expect("synth parses");
+            let nalu = crate::parse::h264::Nalu::new(parsed);
+            if let Some(unit) = aus.put(nalu) {
+                for instruction in context.compile(unit) {
+                    tags.push(tag(&instruction));
+                }
+            }
+        };
+        for raw in splitter.push(bytes) {
+            run_nal(raw);
+        }
+        for raw in splitter.flush() {
+            run_nal(raw);
+        }
+        if let Some(unit) = aus.flush() {
+            for instruction in context.compile(unit) {
+                tags.push(tag(&instruction));
+            }
+        }
+        tags
+    }
+
+    #[test]
+    fn synth_packets_complete_one_picture_per_call_without_reorder() {
+        use rust_video_harness::H264Synth;
+
+        use crate::parse::au::AuSplitter;
+        use crate::parse::h264::H264Parser;
+        use crate::parse::nal::NaluSplitter;
+        use crate::parse::refs::H264Context;
+
+        let packets = H264Synth::annex_b_packets();
+        assert_eq!(packets.len(), 2);
+        let mut splitter = NaluSplitter::new();
+        let mut parser = H264Parser::new();
+        let mut aus = AuSplitter::new();
+        let mut context = H264Context::new();
+        assert_eq!(
+            feed_packet(
+                &mut splitter,
+                &mut parser,
+                &mut aus,
+                &mut context,
+                &packets[0]
+            ),
+            vec!["sps", "pps", "pic"]
+        );
+        assert_eq!(
+            feed_packet(
+                &mut splitter,
+                &mut parser,
+                &mut aus,
+                &mut context,
+                &packets[1]
+            ),
+            vec!["pic"]
+        );
+        assert!(aus.flush().is_none());
+    }
+
+    #[test]
+    fn slot_exhaustion_is_no_free_slot() {
+        use crate::parse::refs::{ReferenceId, SlotBook};
+        let mut book = SlotBook::with_slots(1);
+        assert_eq!(
+            super::claim_slot(&mut book, ReferenceId(0)).expect("slot"),
+            0
+        );
+        let error = super::claim_slot(&mut book, ReferenceId(1)).unwrap_err();
+        assert!(matches!(error, VulkanError::NoFreeSlot));
+        assert_eq!(error.to_string(), "no free surface slot");
     }
 }

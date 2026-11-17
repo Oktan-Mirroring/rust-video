@@ -211,6 +211,8 @@ pub(crate) struct SessionGeometry {
     coded: (u32, u32),
     /// Display picture size in luma samples.
     display: (u32, u32),
+    /// Crop left and top in luma samples.
+    origin: (u32, u32),
     /// DPB slot budget.
     dpb_slots: u32,
     /// Active reference picture budget.
@@ -230,6 +232,7 @@ impl std::fmt::Debug for SessionGeometry {
             .field("profile", &self.profile)
             .field("coded", &self.coded)
             .field("display", &self.display)
+            .field("origin", &self.origin)
             .field("dpb_slots", &self.dpb_slots)
             .field("active_refs", &self.active_refs)
             .field("format", &self.format.as_raw())
@@ -250,6 +253,12 @@ impl SessionGeometry {
     #[must_use]
     pub fn display(&self) -> (u32, u32) {
         self.display
+    }
+
+    /// Crop left and top in luma samples.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        self.origin
     }
 
     /// DPB slot budget.
@@ -316,6 +325,7 @@ impl SessionGeometry {
             SessionProfile::H264 { profile, level },
             sps.coded_size(),
             sps.display_size(),
+            sps.crop_origin(),
             sps.dpb_slots(),
             caps,
             formats,
@@ -362,6 +372,7 @@ impl SessionGeometry {
             SessionProfile::H265 { profile, level },
             sps.coded_size(),
             sps.display_size(),
+            sps.crop_origin(),
             sps.dpb_slots(),
             caps,
             formats,
@@ -428,6 +439,7 @@ impl SessionGeometry {
             SessionProfile::Av1 { profile, level },
             coded,
             display,
+            (0, 0),
             crate::parse::av1::DPB_SLOTS,
             caps,
             formats,
@@ -435,11 +447,13 @@ impl SessionGeometry {
     }
 
     /// Geometry from validated sizes against the caps.
+    #[allow(clippy::too_many_arguments)]
     fn sized(
         op: CodecOp,
         profile: SessionProfile,
         coded: (u32, u32),
         display: (u32, u32),
+        origin: (u32, u32),
         dpb_slots: u32,
         caps: &DecodeFacts,
         formats: &[vk::VideoFormatPropertiesKHR<'_>],
@@ -466,6 +480,7 @@ impl SessionGeometry {
             profile,
             coded,
             display,
+            origin,
             dpb_slots,
             active_refs: caps.active_refs.min(dpb_slots),
             format,

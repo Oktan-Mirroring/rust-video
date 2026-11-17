@@ -104,6 +104,12 @@ impl<T> ReorderBuffer<T> {
         }
     }
 
+    /// Pictures held back before the earliest releases.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Push one picture; earliest pictures past the depth release.
     pub fn push(&mut self, poc: i32, item: T) -> Vec<T> {
         self.held.push((poc, item));
@@ -1963,6 +1969,14 @@ mod tests {
         let mut buffer = ReorderBuffer::with_capacity(4);
         buffer.push(2, "a");
         buffer.drop_held();
+        assert_eq!(buffer.flush(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn reorder_zero_capacity_releases_each_push() {
+        let mut buffer = ReorderBuffer::with_capacity(0);
+        assert_eq!(buffer.push(2, "a"), vec!["a"]);
+        assert_eq!(buffer.push(1, "b"), vec!["b"]);
         assert_eq!(buffer.flush(), [] as [&str; 0]);
     }
 

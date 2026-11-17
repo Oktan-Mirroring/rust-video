@@ -486,6 +486,19 @@ impl Sps {
         self.crop
     }
 
+    /// Crop left and top in luma samples, zero without a window.
+    #[must_use]
+    pub fn crop_origin(&self) -> (u32, u32) {
+        if !self.frame_cropping {
+            return (0, 0);
+        }
+        let (unit_x, unit_y) = self.crop_unit();
+        (
+            self.crop[0].saturating_mul(unit_x),
+            self.crop[2].saturating_mul(unit_y),
+        )
+    }
+
     /// Picture width in macroblocks minus 1.
     #[must_use]
     pub fn pic_width_in_mbs_minus1(&self) -> u16 {

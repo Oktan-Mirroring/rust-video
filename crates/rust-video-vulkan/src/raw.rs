@@ -1750,6 +1750,34 @@ impl ExportPair {
         self.uv.image()
     }
 
+    /// Luma backing allocation; null where export never builds.
+    #[must_use]
+    pub(crate) fn y_memory(&self) -> vk::DeviceMemory {
+        #[cfg(unix)]
+        {
+            self.y.memory.memory()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            vk::DeviceMemory::null()
+        }
+    }
+
+    /// Chroma backing allocation; null where export never builds.
+    #[must_use]
+    pub(crate) fn uv_memory(&self) -> vk::DeviceMemory {
+        #[cfg(unix)]
+        {
+            self.uv.memory.memory()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            vk::DeviceMemory::null()
+        }
+    }
+
     /// Platform export handle for the planes.
     ///
     /// DMA-BUF planes while both descriptors export; an opaque backend
