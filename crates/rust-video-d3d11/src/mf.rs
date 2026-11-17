@@ -38,17 +38,18 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes,
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
-    MFCreateAlignedMemoryBuffer, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMediaType, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint, MFStartup,
-    MFTEnumEx, MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_AV1, MFVideoFormat_H264,
-    MFVideoFormat_H265, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoFormat_VP90,
-    MFVideoInterlace_Progressive, MFASYNC_CALLBACK_QUEUE_MULTITHREADED,
-    MFASYNC_FAST_IO_PROCESSING_CALLBACK, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CODECAPI_AVEncCommonQualityVsSpeed, ICodecAPI, IMFActivate, IMFAsyncCallback,
+    IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes, IMFDXGIDeviceManager,
+    IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
+    METransformHaveOutput, METransformNeedInput, MFCreateAlignedMemoryBuffer,
+    MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx,
+    MFT_FRIENDLY_NAME_Attribute, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_H265,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoFormat_VP90, MFVideoInterlace_Progressive,
+    MFASYNC_CALLBACK_QUEUE_MULTITHREADED, MFASYNC_FAST_IO_PROCESSING_CALLBACK, MFSTARTUP_FULL,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_INPUT_STREAM_INFO, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_MESSAGE_TYPE,
     MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_TYPE, MF_E_NOTACCEPTING,
@@ -59,6 +60,9 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+};
+use windows::Win32::System::Variant::{
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4, VT_UI4,
 };
 
 /// Output frame rate in frames per second.
@@ -75,6 +79,9 @@ const MIN_BITRATE: u64 = 100_000;
 
 /// Bitrate ceiling in bits per second.
 const MAX_BITRATE: u64 = 50_000_000;
+
+/// Landed VP9 quality-vs-speed level; 0 favors speed.
+const VP9_QUALITY_VS_SPEED: u32 = 0;
 
 /// Catalog walk bound in entries.
 const AVAILABLE_TYPES: u32 = 64;
@@ -112,6 +119,8 @@ pub struct Session {
     subtype: GUID,
     /// Codec the session encodes.
     codec: Codec,
+    /// Applied VP9 speed tuning, absent off the VP9 path or without the property.
+    vp9_tuning: Option<Vp9Tuning>,
     /// Negotiated extent, absent before the first frame.
     size: Option<(u32, u32)>,
     /// Next input timestamp in 100ns units.
@@ -166,6 +175,7 @@ impl Session {
             standby,
             subtype,
             codec,
+            vp9_tuning: None,
             size: None,
             pts: 0,
             credits: 0,
@@ -184,6 +194,7 @@ impl Session {
         self.name = opened.name;
         self.input = opened.input;
         self.output = opened.output;
+        self.vp9_tuning = None;
         self.in_align = SAMPLE_ALIGN;
         self.credits = 0;
         self.spare_inputs.clear();
@@ -206,6 +217,12 @@ impl Session {
     #[must_use]
     pub fn mft_name(&self) -> &str {
         &self.name
+    }
+
+    /// Applied VP9 speed tuning, absent off the VP9 path or without the property.
+    #[must_use]
+    pub fn vp9_tuning(&self) -> Option<Vp9Tuning> {
+        self.vp9_tuning
     }
 
     /// Packets coded from one NV12 frame of `width` x `height`.
@@ -355,6 +372,7 @@ impl Session {
     fn configure_try(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
         self.set_output_type(width, height)?;
         self.set_input_type(width, height)?;
+        self.tune_vp9();
         let bound = self
             .gpu
             .as_ref()
@@ -412,6 +430,24 @@ impl Session {
             unsafe { self.transform.SetInputType(self.input, &input_type, 0) },
             "SetInputType",
         )
+    }
+
+    /// Fastest VP9 speed level through the codec API, best-effort.
+    fn tune_vp9(&mut self) {
+        self.vp9_tuning = None;
+        if self.codec != Codec::Vp9 {
+            return;
+        }
+        let Ok(codec) = self.codec_api() else {
+            return;
+        };
+        self.vp9_tuning = Vp9Tuning::apply(&codec);
+    }
+
+    /// Codec API behind the transform, absent without the interface.
+    fn codec_api(&self) -> Result<ICodecAPI, D3d11Error> {
+        // Sound: the transform is live.
+        call(self.transform.cast(), "QueryInterface")
     }
 
     /// Output buffer shape behind the current output type.
@@ -634,6 +670,64 @@ impl Session {
             dwStatus: 0,
             pEvents: ManuallyDrop::new(None),
         })
+    }
+}
+
+/// Applied VP9 encoder speed tuning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Vp9Tuning {
+    /// Quality-vs-speed level read back from the MFT.
+    quality_vs_speed: u32,
+}
+
+impl Vp9Tuning {
+    /// Fastest tuning through `codec`, absent without the speed property.
+    ///
+    /// 0 favors speed over quality per
+    /// [AVEncCommonQualityVsSpeed](https://learn.microsoft.com/en-us/windows/win32/directshow/avenccommonqualityvsspeed-property).
+    pub(crate) fn apply(codec: &ICodecAPI) -> Option<Self> {
+        let value = variant_u32(VP9_QUALITY_VS_SPEED);
+        // Sound: the codec and value are live for the set.
+        unsafe { codec.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &value) }.ok()?;
+        // Sound: the codec is live; the property was just set.
+        let current = unsafe { codec.GetValue(&CODECAPI_AVEncCommonQualityVsSpeed) }.ok()?;
+        read_u32(&current).map(|quality_vs_speed| Self { quality_vs_speed })
+    }
+
+    /// Quality-vs-speed level read back from the MFT.
+    #[must_use]
+    pub fn quality_vs_speed(&self) -> u32 {
+        self.quality_vs_speed
+    }
+}
+
+/// `VARIANT` holding `value` as `VT_UI4`.
+fn variant_u32(value: u32) -> VARIANT {
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { ulVal: value },
+            }),
+        },
+    }
+}
+
+/// `VT_UI4`/`VT_I4` payload of `variant`, absent for other types.
+fn read_u32(variant: &VARIANT) -> Option<u32> {
+    // Sound: the union reads match the stored type tag.
+    unsafe {
+        let inner = &variant.Anonymous.Anonymous;
+        if inner.vt == VT_UI4 {
+            Some(inner.Anonymous.ulVal)
+        } else if inner.vt == VT_I4 {
+            u32::try_from(inner.Anonymous.lVal).ok()
+        } else {
+            None
+        }
     }
 }
 

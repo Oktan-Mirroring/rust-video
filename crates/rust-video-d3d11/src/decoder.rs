@@ -1,6 +1,8 @@
 //! Hardware decode plus device-resident surfaces behind the caps `Decoder` trait.
 
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::device::D3d11Device;
 use crate::dpb::{Decoded, Dpb, Output};
@@ -8,12 +10,14 @@ use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 use crate::frame::{D3d11Frame, FrameExport};
 use crate::guid::Codec;
 use crate::h264::{Crop, Ingest, Picture};
+use crate::inflight::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
 use crate::pins::SlotPins;
 use crate::session::Session;
 use crate::session::SharedExport;
 use crate::submit::SurfaceFence;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::delivery::TrySendError;
 use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
@@ -183,12 +187,9 @@ impl ExportLayout {
     }
 }
 
-/// Pending outputs behind a mid-call consume.
-const PENDING_FLUSH: usize = 8;
-
 /// Active sequence behind the live session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Active {
+pub(crate) struct Active {
     /// Sequence set id.
     sps_id: u8,
     /// Coded width in luma samples.
@@ -203,7 +204,7 @@ struct Active {
 
 impl Active {
     /// Active sequence for `sps_id` at `width` x `height` with `crop` and visible extent.
-    fn new(
+    pub(crate) fn new(
         sps_id: u8,
         width: u32,
         height: u32,
@@ -241,8 +242,14 @@ pub struct H264Decoder<'a> {
     generation: u64,
     /// Stream resets after mid-picture failures.
     resets: u64,
-    /// Peak outputs queued before readback in one call.
-    inflight_max: usize,
+    /// Submitted outputs plus completed frames awaiting poll.
+    queue: FrameQueue<D3d11Frame>,
+    /// Phase capture switch.
+    capture: bool,
+    /// Recorded per-frame phases.
+    phases: Vec<FramePhases>,
+    /// Input ended; sends refuse, receives drain then end.
+    finished: bool,
 }
 
 impl<'a> H264Decoder<'a> {
@@ -258,7 +265,10 @@ impl<'a> H264Decoder<'a> {
             active: None,
             generation: 0,
             resets: 0,
-            inflight_max: 0,
+            queue: FrameQueue::new(),
+            capture: false,
+            phases: Vec::new(),
+            finished: false,
         }
     }
 
@@ -268,87 +278,72 @@ impl<'a> H264Decoder<'a> {
         self.resets
     }
 
-    /// Peak outputs queued before readback in one call.
+    /// Peak outputs submitted before completion read.
     #[must_use]
     pub fn max_inflight(&self) -> usize {
-        self.inflight_max
+        self.queue.max_observed()
     }
 
-    /// Decode `picture`, queueing its outputs for readback into `pending`.
-    fn submit_picture(
-        &mut self,
-        picture: &Picture,
-        pending: &mut Vec<(u8, Active)>,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
-        let active = self.sequence(picture)?;
-        if self.active != Some(active) {
-            self.consume_pending(pending, frames)?;
-            pending.clear();
-            self.reconfigure(active, frames)?;
-        }
-        let active = self.active.ok_or(D3d11Error::NoSession)?;
-        let decoded = self.decode_dpb(picture);
-        let decoded = match decoded {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                self.reset_stream();
-                return Err(error);
-            }
-        };
-        // Consume before submit when the submission reuses a slot with
-        // unread outputs, or when the queue exceeds the overlap window:
-        // staging lanes and the driver queue are both bounded.
-        let collision = pending
-            .iter()
-            .any(|(slot, _)| *slot == decoded.submission.slot);
-        if collision || pending.len() >= PENDING_FLUSH {
-            self.note_inflight(pending.len());
-            if let Err(error) = self.consume_pending(pending, frames) {
-                self.reset_stream();
-                return Err(error);
-            }
-            pending.clear();
-        }
-        let mut failed = None;
-        {
-            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
-            // Submit before any copy: outputs may name the submission slot.
-            if let Err(error) = session.submit(&decoded.submission) {
-                failed = Some(error);
-            } else {
-                for output in &decoded.outputs {
-                    if let Err(error) = session.copy_slot(output.slot()) {
-                        failed = Some(error);
-                        break;
-                    }
-                    pending.push((output.slot(), active));
-                }
-            }
-        }
-        if let Some(error) = failed {
-            self.reset_stream();
-            return Err(error);
+    /// Queue mechanics over the live session and queue.
+    fn parts(&mut self) -> SplitParts<'_> {
+        SplitParts::new(
+            self.session.as_ref(),
+            self.shared.as_ref(),
+            &mut self.queue,
+            &mut self.generation,
+            self.capture,
+            &mut self.phases,
+        )
+    }
+
+    /// Pictures of `packet` submitted, without waiting on completion.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        for picture in &pictures {
+            self.submit_picture_split(picture)?;
         }
         Ok(())
     }
 
-    /// Readback for queued `pending` outputs into `frames`.
-    fn consume_pending(
-        &mut self,
-        pending: &[(u8, Active)],
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
-        if pending.is_empty() {
-            return Ok(());
+    /// Decode `picture`, queueing its outputs for completion reads.
+    fn submit_picture_split(&mut self, picture: &Picture) -> Result<(), D3d11Error> {
+        let active = self.sequence(picture)?;
+        if self.active != Some(active) {
+            self.parts().drain_all()?;
+            self.reconfigure_split(active)?;
         }
-        let (Some(session), Some(shared)) = (self.session.as_ref(), self.shared.as_ref()) else {
-            return Err(D3d11Error::NoSession);
+        let active = self.active.ok_or(D3d11Error::NoSession)?;
+        let decoded = match self.decode_dpb(picture) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.reset_stream();
+                self.queue.clear_pending();
+                return Err(error);
+            }
         };
-        for (slot, active) in pending {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
+        self.parts().make_room(Some(decoded.submission.slot))?;
+        let submit_start = Instant::now();
+        let outcome = self.submit_ordered(&decoded);
+        let submit_end = Instant::now();
+        if let Err(error) = outcome {
+            self.reset_stream();
+            self.queue.clear_pending();
+            return Err(error);
+        }
+        for output in &decoded.outputs {
+            self.queue
+                .push(output.slot(), active, submit_start, submit_end);
+        }
+        Ok(())
+    }
+
+    /// `decoded` submitted plus its outputs copied, in H.264 order.
+    fn submit_ordered(&self, decoded: &Decoded) -> Result<(), D3d11Error> {
+        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+        // Submit before any copy: outputs may name the submission slot.
+        session.submit(&decoded.submission)?;
+        for output in &decoded.outputs {
+            session.copy_slot(output.slot())?;
         }
         Ok(())
     }
@@ -362,19 +357,12 @@ impl<'a> H264Decoder<'a> {
         self.resets = self.resets.wrapping_add(1);
     }
 
-    /// Peak outputs queued before readback against `depth`.
-    fn note_inflight(&mut self, depth: usize) {
-        self.inflight_max = self.inflight_max.max(depth);
-    }
-
-    /// Session for `active`, draining the previous sequence first.
-    fn reconfigure(
-        &mut self,
-        active: Active,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
+    /// Session for `active`, draining the previous sequence into ready first.
+    fn reconfigure_split(&mut self, active: Active) -> Result<(), D3d11Error> {
         if let Some(previous) = self.active {
-            self.drain_live(&previous, frames)?;
+            let mut drained = Vec::new();
+            self.drain_live(&previous, &mut drained)?;
+            self.queue.extend_ready(drained);
         }
         self.open_session(active)
     }
@@ -435,23 +423,13 @@ impl<'a> H264Decoder<'a> {
         active: &Active,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
-        let (Some(dpb), Some(session), Some(shared)) = (
-            self.dpb.as_mut(),
-            self.session.as_ref(),
-            self.shared.as_ref(),
-        ) else {
+        let Some(dpb) = self.dpb.as_mut() else {
             return Ok(());
         };
         let slots: Vec<u8> = dpb.drain().iter().map(Output::slot).collect();
-        for slot in &slots {
-            session.copy_slot(*slot)?;
-        }
-        for slot in &slots {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
-        }
-        self.note_inflight(slots.len());
+        let observed = slots.len();
+        self.parts().read_live(active, &slots, frames)?;
+        self.queue.observe(observed);
         Ok(())
     }
 
@@ -587,37 +565,34 @@ impl Decoder for H264Decoder<'_> {
     type Error = D3d11Error;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
-        for picture in &pictures {
-            if let Err(error) = self.submit_picture(picture, &mut pending, &mut frames) {
-                pending.clear();
-                return Err(error);
-            }
+        if let Err(error) = self.submit_packet_inner(packet) {
+            self.queue.clear();
+            return Err(error);
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         Ok(frames)
     }
 
     fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            if let Err(error) = self.submit_picture(&picture, &mut pending, &mut frames) {
-                pending.clear();
+            if let Err(error) = self.submit_picture_split(&picture) {
+                self.queue.clear();
                 return Err(error);
             }
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
@@ -625,8 +600,94 @@ impl Decoder for H264Decoder<'_> {
     }
 }
 
+impl SplitDecoder for H264Decoder<'_> {
+    type Frame = D3d11Frame;
+
+    fn submit_packet(&mut self, packet: Packet) -> Result<(), TrySendError<D3d11Error>> {
+        if self.finished {
+            return Err(TrySendError::Full { packet });
+        }
+        self.parts()
+            .sweep_ready()
+            .map_err(|error| TrySendError::Failed { error })?;
+        if !self.queue.admits() {
+            return Err(TrySendError::Full { packet });
+        }
+        self.submit_packet_inner(&packet)
+            .map_err(|error| TrySendError::Failed { error })
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        self.parts().sweep_ready()?;
+        Ok(self.queue.pop_ready())
+    }
+
+    fn wait_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        loop {
+            self.parts().sweep_ready()?;
+            if let Some(frame) = self.queue.pop_ready() {
+                return Ok(Some(frame));
+            }
+            if self.finished && self.queue.is_drained() {
+                return Ok(None);
+            }
+            if self.queue.front().is_some() {
+                self.parts().drain_oldest()?;
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_input(&mut self) -> Result<(), D3d11Error> {
+        if self.finished {
+            return Ok(());
+        }
+        if let Some(picture) = self.ingest.finish()? {
+            if let Err(error) = self.submit_picture_split(&picture) {
+                self.queue.clear_pending();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear_pending();
+            self.reset_stream();
+            return Err(error);
+        }
+        if let Some(active) = self.active {
+            let mut drained = Vec::new();
+            self.drain_live(&active, &mut drained)?;
+            self.queue.extend_ready(drained);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn depth(&self) -> usize {
+        self.queue.pending()
+    }
+
+    fn max_depth(&self) -> usize {
+        self.queue.max_observed()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+impl PhaseCapture for H264Decoder<'_> {
+    fn capture_phases(&mut self, on: bool) {
+        self.capture = on;
+    }
+
+    fn phases(&self) -> &[FramePhases] {
+        &self.phases
+    }
+}
+
 /// Frame for copied `slot`.
-fn emit_frame(
+pub(crate) fn emit_frame(
     session: &Session,
     shared: &SharedDevice,
     slot: u8,
@@ -690,8 +751,14 @@ pub struct HevcDecoder<'a> {
     generation: u64,
     /// Stream resets after mid-picture failures.
     resets: u64,
-    /// Peak outputs queued before readback in one call.
-    inflight_max: usize,
+    /// Submitted outputs plus completed frames awaiting poll.
+    queue: FrameQueue<D3d11Frame>,
+    /// Phase capture switch.
+    capture: bool,
+    /// Recorded per-frame phases.
+    phases: Vec<FramePhases>,
+    /// Input ended; sends refuse, receives drain then end.
+    finished: bool,
 }
 
 impl<'a> HevcDecoder<'a> {
@@ -707,7 +774,10 @@ impl<'a> HevcDecoder<'a> {
             active: None,
             generation: 0,
             resets: 0,
-            inflight_max: 0,
+            queue: FrameQueue::new(),
+            capture: false,
+            phases: Vec::new(),
+            finished: false,
         }
     }
 
@@ -717,105 +787,82 @@ impl<'a> HevcDecoder<'a> {
         self.resets
     }
 
-    /// Peak outputs queued before readback in one call.
+    /// Peak outputs submitted before completion read.
     #[must_use]
     pub fn max_inflight(&self) -> usize {
-        self.inflight_max
+        self.queue.max_observed()
     }
 
-    /// Decode `picture`, queueing its outputs for readback into `pending`.
-    fn submit_picture(
-        &mut self,
-        picture: &crate::h265::Picture,
-        pending: &mut Vec<(u8, Active)>,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
+    /// Queue mechanics over the live session and queue.
+    fn parts(&mut self) -> SplitParts<'_> {
+        SplitParts::new(
+            self.session.as_ref(),
+            self.shared.as_ref(),
+            &mut self.queue,
+            &mut self.generation,
+            self.capture,
+            &mut self.phases,
+        )
+    }
+
+    /// Pictures of `packet` submitted, without waiting on completion.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+        let pictures = self.ingest.ingest_packet(packet.data())?;
+        for picture in &pictures {
+            self.submit_picture_split(picture)?;
+        }
+        Ok(())
+    }
+
+    /// Decode `picture`, queueing its outputs for completion reads.
+    fn submit_picture_split(&mut self, picture: &crate::h265::Picture) -> Result<(), D3d11Error> {
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
-            self.consume_pending(pending, frames)?;
-            pending.clear();
-            self.reconfigure(active, frames)?;
+            self.parts().drain_all()?;
+            self.reconfigure_split(active)?;
         }
         let active = self.active.ok_or(D3d11Error::NoSession)?;
         let decoded = match self.decode_dpb(picture) {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
+                self.queue.clear_pending();
                 return Err(error);
             }
         };
-        // Consume before submit when the submission reuses a slot with
-        // unread outputs, or when the queue exceeds the overlap window:
-        // staging lanes and the driver queue are both bounded.
-        let collision = pending
-            .iter()
-            .any(|(slot, _)| *slot == decoded.submission.slot);
-        if collision || pending.len() >= PENDING_FLUSH {
-            self.note_inflight(pending.len());
-            if let Err(error) = self.consume_pending(pending, frames) {
-                self.reset_stream();
-                return Err(error);
-            }
-            pending.clear();
-        }
-        let mut failed = None;
-        {
-            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
-            // Priors precede the submit: it overwrites the submission
-            // slot, which evicted priors may still name. The current
-            // picture alone follows it.
-            for (index, output) in decoded.outputs.iter().enumerate() {
-                if Some(index) == decoded.current_index {
-                    continue;
-                }
-                if let Err(error) = session.copy_slot(output.slot()) {
-                    failed = Some(error);
-                    break;
-                }
-            }
-            if failed.is_none() {
-                if let Err(error) = session.submit_hevc(&decoded.submission) {
-                    failed = Some(error);
-                }
-            }
-            if failed.is_none() {
-                if let Some(index) = decoded.current_index {
-                    if let Some(output) = decoded.outputs.get(index) {
-                        if let Err(error) = session.copy_slot(output.slot()) {
-                            failed = Some(error);
-                        }
-                    }
-                }
-            }
-            if failed.is_none() {
-                for output in &decoded.outputs {
-                    pending.push((output.slot(), active));
-                }
-            }
-        }
-        if let Some(error) = failed {
+        self.parts().make_room(Some(decoded.submission.slot))?;
+        let submit_start = Instant::now();
+        let outcome = self.submit_ordered(&decoded);
+        let submit_end = Instant::now();
+        if let Err(error) = outcome {
             self.reset_stream();
+            self.queue.clear_pending();
             return Err(error);
+        }
+        for output in &decoded.outputs {
+            self.queue
+                .push(output.slot(), active, submit_start, submit_end);
         }
         Ok(())
     }
 
-    /// Readback for queued `pending` outputs into `frames`.
-    fn consume_pending(
-        &mut self,
-        pending: &[(u8, Active)],
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
-        if pending.is_empty() {
-            return Ok(());
+    /// `decoded` submitted plus its outputs copied, in HEVC order.
+    fn submit_ordered(&self, decoded: &crate::hevc_dpb::HevcDecoded) -> Result<(), D3d11Error> {
+        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+        // Priors precede the submit: it overwrites the submission
+        // slot, which evicted priors may still name. The current
+        // picture alone follows it.
+        for (index, output) in decoded.outputs.iter().enumerate() {
+            if Some(index) == decoded.current_index {
+                continue;
+            }
+            session.copy_slot(output.slot())?;
         }
-        let (Some(session), Some(shared)) = (self.session.as_ref(), self.shared.as_ref()) else {
-            return Err(D3d11Error::NoSession);
-        };
-        for (slot, active) in pending {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
+        session.submit_hevc(&decoded.submission)?;
+        if let Some(index) = decoded.current_index {
+            if let Some(output) = decoded.outputs.get(index) {
+                session.copy_slot(output.slot())?;
+            }
         }
         Ok(())
     }
@@ -829,19 +876,12 @@ impl<'a> HevcDecoder<'a> {
         self.resets = self.resets.wrapping_add(1);
     }
 
-    /// Peak outputs queued before readback against `depth`.
-    fn note_inflight(&mut self, depth: usize) {
-        self.inflight_max = self.inflight_max.max(depth);
-    }
-
-    /// Session for `active`, draining the previous sequence first.
-    fn reconfigure(
-        &mut self,
-        active: Active,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
+    /// Session for `active`, draining the previous sequence into ready first.
+    fn reconfigure_split(&mut self, active: Active) -> Result<(), D3d11Error> {
         if let Some(previous) = self.active {
-            self.drain_live(&previous, frames)?;
+            let mut drained = Vec::new();
+            self.drain_live(&previous, &mut drained)?;
+            self.queue.extend_ready(drained);
         }
         self.open_session(active)
     }
@@ -899,23 +939,13 @@ impl<'a> HevcDecoder<'a> {
         active: &Active,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
-        let (Some(dpb), Some(session), Some(shared)) = (
-            self.dpb.as_mut(),
-            self.session.as_ref(),
-            self.shared.as_ref(),
-        ) else {
+        let Some(dpb) = self.dpb.as_mut() else {
             return Ok(());
         };
         let slots: Vec<u8> = dpb.drain().iter().map(Output::slot).collect();
-        for slot in &slots {
-            session.copy_slot(*slot)?;
-        }
-        for slot in &slots {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
-        }
-        self.note_inflight(slots.len());
+        let observed = slots.len();
+        self.parts().read_live(active, &slots, frames)?;
+        self.queue.observe(observed);
         Ok(())
     }
 
@@ -1050,41 +1080,124 @@ impl Decoder for HevcDecoder<'_> {
     type Error = D3d11Error;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
-        for picture in &pictures {
-            if let Err(error) = self.submit_picture(picture, &mut pending, &mut frames) {
-                pending.clear();
-                return Err(error);
-            }
+        if let Err(error) = self.submit_packet_inner(packet) {
+            self.queue.clear();
+            return Err(error);
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         Ok(frames)
     }
 
     fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            if let Err(error) = self.submit_picture(&picture, &mut pending, &mut frames) {
-                pending.clear();
+            if let Err(error) = self.submit_picture_split(&picture) {
+                self.queue.clear();
                 return Err(error);
             }
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
         Ok(frames)
+    }
+}
+
+impl SplitDecoder for HevcDecoder<'_> {
+    type Frame = D3d11Frame;
+
+    fn submit_packet(&mut self, packet: Packet) -> Result<(), TrySendError<D3d11Error>> {
+        if self.finished {
+            return Err(TrySendError::Full { packet });
+        }
+        self.parts()
+            .sweep_ready()
+            .map_err(|error| TrySendError::Failed { error })?;
+        if !self.queue.admits() {
+            return Err(TrySendError::Full { packet });
+        }
+        self.submit_packet_inner(&packet)
+            .map_err(|error| TrySendError::Failed { error })
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        self.parts().sweep_ready()?;
+        Ok(self.queue.pop_ready())
+    }
+
+    fn wait_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        loop {
+            self.parts().sweep_ready()?;
+            if let Some(frame) = self.queue.pop_ready() {
+                return Ok(Some(frame));
+            }
+            if self.finished && self.queue.is_drained() {
+                return Ok(None);
+            }
+            if self.queue.front().is_some() {
+                self.parts().drain_oldest()?;
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_input(&mut self) -> Result<(), D3d11Error> {
+        if self.finished {
+            return Ok(());
+        }
+        if let Some(picture) = self.ingest.finish()? {
+            if let Err(error) = self.submit_picture_split(&picture) {
+                self.queue.clear_pending();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear_pending();
+            self.reset_stream();
+            return Err(error);
+        }
+        if let Some(active) = self.active {
+            let mut drained = Vec::new();
+            self.drain_live(&active, &mut drained)?;
+            self.queue.extend_ready(drained);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn depth(&self) -> usize {
+        self.queue.pending()
+    }
+
+    fn max_depth(&self) -> usize {
+        self.queue.max_observed()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+impl PhaseCapture for HevcDecoder<'_> {
+    fn capture_phases(&mut self, on: bool) {
+        self.capture = on;
+    }
+
+    fn phases(&self) -> &[FramePhases] {
+        &self.phases
     }
 }
 
@@ -1106,8 +1219,14 @@ pub struct Av1Decoder<'a> {
     generation: u64,
     /// Stream resets after mid-frame failures.
     resets: u64,
-    /// Peak outputs queued before readback in one call.
-    inflight_max: usize,
+    /// Submitted outputs plus completed frames awaiting poll.
+    queue: FrameQueue<D3d11Frame>,
+    /// Phase capture switch.
+    capture: bool,
+    /// Recorded per-frame phases.
+    phases: Vec<FramePhases>,
+    /// Input ended; sends refuse, receives drain then end.
+    finished: bool,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -1123,7 +1242,10 @@ impl<'a> Av1Decoder<'a> {
             active: None,
             generation: 0,
             resets: 0,
-            inflight_max: 0,
+            queue: FrameQueue::new(),
+            capture: false,
+            phases: Vec::new(),
+            finished: false,
         }
     }
 
@@ -1133,25 +1255,47 @@ impl<'a> Av1Decoder<'a> {
         self.resets
     }
 
-    /// Peak outputs queued before readback in one call.
+    /// Peak outputs submitted before completion read.
     #[must_use]
     pub fn max_inflight(&self) -> usize {
-        self.inflight_max
+        self.queue.max_observed()
     }
 
-    /// Decode `frame`, queueing its outputs for readback into `pending`.
-    fn submit_frame(
-        &mut self,
-        frame: &crate::av1::Frame,
-        pending: &mut Vec<(u8, Active)>,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
+    /// Queue mechanics over the live session and queue.
+    fn parts(&mut self) -> SplitParts<'_> {
+        SplitParts::new(
+            self.session.as_ref(),
+            self.shared.as_ref(),
+            &mut self.queue,
+            &mut self.generation,
+            self.capture,
+            &mut self.phases,
+        )
+    }
+
+    /// Frames of `packet` submitted, without waiting on completion.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+        let frames_in = match self.ingest.ingest_packet(packet.data()) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.reset_stream();
+                self.queue.clear_pending();
+                return Err(error);
+            }
+        };
+        for frame in &frames_in {
+            self.submit_frame_split(frame)?;
+        }
+        Ok(())
+    }
+
+    /// Decode `frame`, queueing its outputs for completion reads.
+    fn submit_frame_split(&mut self, frame: &crate::av1::Frame) -> Result<(), D3d11Error> {
         let active = self.frame_active(frame)?;
         let live = self.active;
         if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
-            self.consume_pending(pending, frames)?;
-            pending.clear();
-            self.reconfigure(active, frames)?;
+            self.parts().drain_all()?;
+            self.reconfigure_split(active)?;
         } else if live != Some(active) {
             self.active = Some(active);
         }
@@ -1160,84 +1304,49 @@ impl<'a> Av1Decoder<'a> {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
+                self.queue.clear_pending();
                 return Err(error);
             }
         };
-        // Consume before submit when the submission reuses a view with
-        // unread outputs, or when the queue exceeds the overlap window:
-        // staging lanes and the driver queue are both bounded.
-        let collision = decoded
+        let slot = decoded
             .submission
             .as_ref()
-            .is_some_and(|submission| pending.iter().any(|(slot, _)| *slot == submission.slot));
-        if collision || pending.len() >= PENDING_FLUSH {
-            self.note_inflight(pending.len());
-            if let Err(error) = self.consume_pending(pending, frames) {
-                self.reset_stream();
-                return Err(error);
-            }
-            pending.clear();
-        }
-        let mut failed = None;
-        {
-            let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
-            // Priors precede the submit: it overwrites the submission
-            // view, which evicted priors may still name. The current
-            // frame alone follows it.
-            for (index, output) in decoded.outputs.iter().enumerate() {
-                if Some(index) == decoded.current_index {
-                    continue;
-                }
-                if let Err(error) = session.copy_slot(output.slot()) {
-                    failed = Some(error);
-                    break;
-                }
-            }
-            if failed.is_none() {
-                if let Some(submission) = decoded.submission.as_ref() {
-                    if let Err(error) = session.submit_av1(submission) {
-                        failed = Some(error);
-                    }
-                }
-            }
-            if failed.is_none() {
-                if let Some(index) = decoded.current_index {
-                    if let Some(output) = decoded.outputs.get(index) {
-                        if let Err(error) = session.copy_slot(output.slot()) {
-                            failed = Some(error);
-                        }
-                    }
-                }
-            }
-            if failed.is_none() {
-                for output in &decoded.outputs {
-                    pending.push((output.slot(), active));
-                }
-            }
-        }
-        if let Some(error) = failed {
+            .map(|submission| submission.slot);
+        self.parts().make_room(slot)?;
+        let submit_start = Instant::now();
+        let outcome = self.submit_ordered(&decoded);
+        let submit_end = Instant::now();
+        if let Err(error) = outcome {
             self.reset_stream();
+            self.queue.clear_pending();
             return Err(error);
+        }
+        for output in &decoded.outputs {
+            self.queue
+                .push(output.slot(), active, submit_start, submit_end);
         }
         Ok(())
     }
 
-    /// Readback for queued `pending` outputs into `frames`.
-    fn consume_pending(
-        &mut self,
-        pending: &[(u8, Active)],
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
-        if pending.is_empty() {
-            return Ok(());
+    /// `decoded` submitted plus its outputs copied, in AV1 order.
+    fn submit_ordered(&self, decoded: &crate::av1_dpb::Av1Decoded) -> Result<(), D3d11Error> {
+        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
+        // Priors precede the submit: it overwrites the submission
+        // view, which evicted priors may still name. The current
+        // frame alone follows it.
+        for (index, output) in decoded.outputs.iter().enumerate() {
+            if Some(index) == decoded.current_index {
+                continue;
+            }
+            session.copy_slot(output.slot())?;
         }
-        let (Some(session), Some(shared)) = (self.session.as_ref(), self.shared.as_ref()) else {
-            return Err(D3d11Error::NoSession);
-        };
-        for (slot, active) in pending {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
+        if let Some(submission) = decoded.submission.as_ref() {
+            session.submit_av1(submission)?;
+        }
+        if let Some(index) = decoded.current_index {
+            if let Some(output) = decoded.outputs.get(index) {
+                session.copy_slot(output.slot())?;
+            }
         }
         Ok(())
     }
@@ -1252,19 +1361,12 @@ impl<'a> Av1Decoder<'a> {
         self.resets = self.resets.wrapping_add(1);
     }
 
-    /// Peak outputs queued before readback against `depth`.
-    fn note_inflight(&mut self, depth: usize) {
-        self.inflight_max = self.inflight_max.max(depth);
-    }
-
-    /// Session for `active`, draining the previous sequence first.
-    fn reconfigure(
-        &mut self,
-        active: Active,
-        frames: &mut Vec<D3d11Frame>,
-    ) -> Result<(), D3d11Error> {
+    /// Session for `active`, draining the previous sequence into ready first.
+    fn reconfigure_split(&mut self, active: Active) -> Result<(), D3d11Error> {
         if let Some(previous) = self.active {
-            self.drain_live(&previous, frames)?;
+            let mut drained = Vec::new();
+            self.drain_live(&previous, &mut drained)?;
+            self.queue.extend_ready(drained);
         }
         self.open_session(active)
     }
@@ -1331,22 +1433,13 @@ impl<'a> Av1Decoder<'a> {
         active: &Active,
         frames: &mut Vec<D3d11Frame>,
     ) -> Result<(), D3d11Error> {
-        let (Some(session), Some(shared)) = (self.session.as_ref(), self.shared.as_ref()) else {
-            return Ok(());
-        };
         let slots: Vec<u8> = crate::av1_dpb::Av1Dpb::drain()
             .iter()
             .map(Output::slot)
             .collect();
-        for slot in &slots {
-            session.copy_slot(*slot)?;
-        }
-        for slot in &slots {
-            let frame = emit_frame(session, shared, *slot, active, self.generation)?;
-            self.generation = self.generation.wrapping_add(1);
-            frames.push(frame);
-        }
-        self.note_inflight(slots.len());
+        let observed = slots.len();
+        self.parts().read_live(active, &slots, frames)?;
+        self.queue.observe(observed);
         Ok(())
     }
 
@@ -1500,54 +1593,140 @@ impl Decoder for Av1Decoder<'_> {
     type Error = D3d11Error;
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        let frames_in = match self.ingest.ingest_packet(packet.data()) {
-            Ok(frames) => frames,
-            Err(error) => {
-                self.reset_stream();
-                return Err(error);
-            }
-        };
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
-        for frame in &frames_in {
-            if let Err(error) = self.submit_frame(frame, &mut pending, &mut frames) {
-                pending.clear();
-                return Err(error);
-            }
+        if let Err(error) = self.submit_packet_inner(packet) {
+            self.queue.clear();
+            return Err(error);
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         Ok(frames)
     }
 
     fn flush(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
-        let mut pending = Vec::new();
         let trailing = match self.ingest.finish() {
             Ok(trailing) => trailing,
             Err(error) => {
                 self.reset_stream();
+                self.queue.clear();
                 return Err(error);
             }
         };
         if let Some(frame) = trailing {
-            if let Err(error) = self.submit_frame(&frame, &mut pending, &mut frames) {
-                pending.clear();
+            if let Err(error) = self.submit_frame_split(&frame) {
+                self.queue.clear();
                 return Err(error);
             }
         }
-        self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear();
             self.reset_stream();
             return Err(error);
         }
+        self.parts().take_ready(&mut frames);
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
         Ok(frames)
+    }
+}
+
+impl SplitDecoder for Av1Decoder<'_> {
+    type Frame = D3d11Frame;
+
+    fn submit_packet(&mut self, packet: Packet) -> Result<(), TrySendError<D3d11Error>> {
+        if self.finished {
+            return Err(TrySendError::Full { packet });
+        }
+        self.parts()
+            .sweep_ready()
+            .map_err(|error| TrySendError::Failed { error })?;
+        if !self.queue.admits() {
+            return Err(TrySendError::Full { packet });
+        }
+        self.submit_packet_inner(&packet)
+            .map_err(|error| TrySendError::Failed { error })
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        self.parts().sweep_ready()?;
+        Ok(self.queue.pop_ready())
+    }
+
+    fn wait_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+        loop {
+            self.parts().sweep_ready()?;
+            if let Some(frame) = self.queue.pop_ready() {
+                return Ok(Some(frame));
+            }
+            if self.finished && self.queue.is_drained() {
+                return Ok(None);
+            }
+            if self.queue.front().is_some() {
+                self.parts().drain_oldest()?;
+                continue;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_input(&mut self) -> Result<(), D3d11Error> {
+        if self.finished {
+            return Ok(());
+        }
+        let trailing = match self.ingest.finish() {
+            Ok(trailing) => trailing,
+            Err(error) => {
+                self.reset_stream();
+                self.queue.clear_pending();
+                return Err(error);
+            }
+        };
+        if let Some(frame) = trailing {
+            if let Err(error) = self.submit_frame_split(&frame) {
+                self.queue.clear_pending();
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.parts().drain_all() {
+            self.queue.clear_pending();
+            self.reset_stream();
+            return Err(error);
+        }
+        if let Some(active) = self.active {
+            let mut drained = Vec::new();
+            self.drain_live(&active, &mut drained)?;
+            self.queue.extend_ready(drained);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn depth(&self) -> usize {
+        self.queue.pending()
+    }
+
+    fn max_depth(&self) -> usize {
+        self.queue.max_observed()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+}
+
+impl PhaseCapture for Av1Decoder<'_> {
+    fn capture_phases(&mut self, on: bool) {
+        self.capture = on;
+    }
+
+    fn phases(&self) -> &[FramePhases] {
+        &self.phases
     }
 }
 

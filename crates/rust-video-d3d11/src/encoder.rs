@@ -4,7 +4,7 @@ use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
 use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
-use crate::mf::Session;
+use crate::mf::{Session, Vp9Tuning};
 use crate::scale::ScaledSurface;
 
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
@@ -52,6 +52,12 @@ impl D3d11Encoder {
     #[must_use]
     pub fn mft_name(&self) -> &str {
         self.session.mft_name()
+    }
+
+    /// Applied VP9 speed tuning, absent off the VP9 path or without the property.
+    #[must_use]
+    pub fn vp9_tuning(&self) -> Option<Vp9Tuning> {
+        self.session.vp9_tuning()
     }
 
     /// True when the session encodes from GPU textures.

@@ -183,6 +183,19 @@ impl CopySlot {
         wait_for_query(context, &self.signal)
     }
 
+    /// True once the GPU passes the last list marker, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the GPU reports failure.
+    pub(crate) fn signaled(&self, context: &ID3D11DeviceContext) -> Result<bool, D3d11Error> {
+        query_signaled(
+            context,
+            &self.signal,
+            flag_word(D3D11_ASYNC_GETDATA_DONOTFLUSH.0),
+        )
+    }
+
     /// Completion marker behind the last submit to this lane.
     pub(crate) fn mark(&self, context: &ID3D11DeviceContext) {
         // Sound: the query is live; the caller holds the submit lock.

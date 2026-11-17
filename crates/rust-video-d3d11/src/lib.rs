@@ -33,6 +33,8 @@ mod h265;
 #[cfg(target_os = "windows")]
 mod hevc_dpb;
 #[cfg(target_os = "windows")]
+mod inflight;
+#[cfg(target_os = "windows")]
 mod mf;
 #[cfg(target_os = "windows")]
 mod pins;
@@ -59,6 +61,10 @@ pub use encoder::D3d11Encoder;
 pub use error::{BrokenReferenceReason, D3d11Error, ParseReason, SkipReason, UnsupportedReason};
 pub use frame::D3d11Frame;
 pub use guid::{Codec, Profile};
+#[cfg(target_os = "windows")]
+pub use inflight::{FramePhases, OverlappedPump, PhaseCapture, SplitDecoder};
+#[cfg(target_os = "windows")]
+pub use mf::Vp9Tuning;
 pub use shell::{Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
 pub use submit::SubmitLock;

@@ -327,13 +327,57 @@ impl Session {
     /// Returns `Err` for a slot outside the views, when the copy
     /// misses its completion budget, or when the map fails.
     pub fn read_slot(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+        self.wait_slot(slot)?;
+        self.read_mapped(slot, crop)
+    }
+
+    /// True once the last copy to `slot` completed, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views or when the GPU
+    /// reports failure.
+    pub fn poll_slot(&self, slot: u8) -> Result<bool, D3d11Error> {
         let lane = self
             .slots
             .get(usize::from(slot))
             .ok_or(D3d11Error::BrokenReference(
                 BrokenReferenceReason::SlotOutsideViews,
             ))?;
-        lane.wait(&self.context)?;
+        lane.signaled(&self.context)
+    }
+
+    /// Completion of the last copy to `slot`, outside the submit lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views or when the copy
+    /// misses its completion budget.
+    pub fn wait_slot(&self, slot: u8) -> Result<(), D3d11Error> {
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
+        lane.wait(&self.context)
+    }
+
+    /// NV12 bytes for `slot` cropped to the visible rectangle, without waiting.
+    ///
+    /// Call after [`poll_slot`](Self::poll_slot) or [`wait_slot`](Self::wait_slot);
+    /// mapping an incomplete copy reads torn bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views or when the map fails.
+    pub fn read_mapped(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
         lane.read(&self.context, crop)
     }
 
