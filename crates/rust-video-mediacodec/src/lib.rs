@@ -4,6 +4,7 @@
 mod android;
 mod bridge;
 mod decoder;
+mod delivery;
 mod device;
 mod encoder;
 mod error;
@@ -14,6 +15,7 @@ mod surface;
 
 pub use bridge::{CodecEvent, EventQueue, PendingInputs};
 pub use decoder::{ranged_bytes, DecodeState, MediaCodecDecoder, OutputLayout};
+pub use delivery::DecoderPump;
 pub use device::MediaCodecDevice;
 pub use encoder::{EncodeSpec, EncodeState, InputLayout, MediaCodecEncoder};
 pub use error::MediaCodecError;
