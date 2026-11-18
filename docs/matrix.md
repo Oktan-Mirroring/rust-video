@@ -56,8 +56,12 @@ implementation. No software politics apply: the driver is the fast path.
 
 Live now: Vulkan decodes H.264/H.265/AV1, encodes H.264/H.265, and
 transcodes on the GPU from all three decode codecs; VA-API decodes
-H.264/H.265/AV1 (hardware fps pending), encodes H.264/H.265, and
+H.264/H.265/VP9/AV1 (hardware fps pending), encodes H.264/H.265, and
 transcodes from H.264; D3D11 decodes H.264/H.265/AV1 (8-bit 4:2:0 NV12) and
 encodes H.264/H.265/VP9/AV1 over Media Foundation MFTs; D3D12 decodes H.264 plus IDR-only H.265 and
 encodes both; MediaCodec decodes all five codecs and encodes H.264/H.265/AV1. The README matrix
 names every cell.
+
+## Measured numbers
+
+Per-box vendored throughput with method, versions, and comparability notes lives in `docs/perf/`, one file per run environment: [linux 32c, RTX 5080 + Radeon](perf/linux-32c-rtx5080-radeon.md).

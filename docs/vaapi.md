@@ -1,9 +1,9 @@
 # VA-API tier
 
-H.264, H.265, and AV1 decode, H.264/H.265 encode, and GPU
+H.264, H.265, VP9, and AV1 decode, H.264/H.265 encode, and GPU
 transcode over DRM render nodes behind the facade shapes:
-`crates/rust-video-vaapi`. VP8 and VP9 decode carry staged
-frontends: parser sources on disk with typed decline until each is
+`crates/rust-video-vaapi`. VP8 decode carries a staged
+frontend: parser sources on disk with typed decline until it is
 wired. The libva binding is a minimal hand rebind; syntax and
 parameters meet in a portable layer. The crate builds on every
 platform and runs on Linux where a render node offers the matching
@@ -17,7 +17,7 @@ profile into NV12.
 | `device.rs` | `VaApiDevice`, first capable render node, entrypoint/config/export probes |
 | `backend.rs` | config, context, surface pool, pipelined submit, NV12 readback with crop |
 | `decoder.rs` | `H264Decoder`: ingest → begin → submit → commit → readback; `VaApiFrame` with lazy DMA-BUF export |
-| `encoder.rs` | `VaApiEncoder`: all-intra CQP sessions, hand-written packed headers |
+| `encoder.rs` | `VaApiEncoder`: CQP sessions (all-intra or low-delay IPPP), hand-written packed headers, one-deep upload/encode pipeline |
 | `scale.rs` | `Scaler`: on-device VPP scale |
 | `transcode.rs` | `Transcoder`: decode surface to encoder input, typed decline on probe miss |
 | `frontend.rs` | Annex B into ordered `Picture`s over DPB slots, POC, reference lists |
@@ -31,11 +31,11 @@ profile into NV12.
 | `h264.rs` + `h264/` | wired H.264 syntax: `nalu`, `parser`, `dpb`, `picture` |
 | `h265.rs` + `h265/` | wired H.265 syntax: `decoder`, `parser`, `frontend`, `params`, `dpb`, `picture` |
 | `vp8.rs` + `vp8/` | staged VP8 syntax: `parser`, `bool_decoder`, `probs` (dormant) |
-| `vp9.rs` + `vp9/` | staged VP9 syntax: `parser`, `lookups` (dormant) |
+| `vp9.rs` + `vp9/` | wired VP9 syntax: `decoder`, `parser`, `lookups`, `frontend`, `params` |
 | `av1.rs` + `av1/` | wired AV1 syntax: `decoder`, `parser`, `reader`, `frontend`, `params`, `helpers` |
 
 Dormant means the subdirectory files are not declared with `mod` and
-do not join the build; the sibling shim (`vp8.rs`, `vp9.rs`)
+do not join the build; the sibling shim (`vp8.rs`)
 exports the decoder handle whose `decode` declines every packet
 with typed `Unsupported`, covered by unit tests. Off Linux the
 public API vanishes while the portable syntax modules still
@@ -48,7 +48,7 @@ compile: only the OS modules are Linux-gated at the crate root.
 | H.264 | fully wired: Annex B parse, POC (8.2.1), first-VCL (7.4.1.2.4), list modification (8.2.4.3), marking (8.2.5.1), DPB, VA-API submit, NV12 readback | interlaced, FMO, separate planes, non-4:2:0, high bit depth stay typed `Unsupported` (no H.264 VLD profile covers them) |
 | H.265 | wired: Annex B parse, reference sets (8.3.2/8.3.4), DPB, VA-API submit, NV12 readback, e2e against ffmpeg oracle | multilayer, interlaced, high bit depth, range and screen-content extensions stay typed `Unsupported` |
 | VP8 | parser + boolean decoder + probability tables staged with attribution; shell declines typed | restore `position` on `BitReader`, wire parser `mod`, frontend, params, e2e |
-| VP9 | parser + lookup tables staged with attribution; shell declines typed | restore `position` and `read_bits_signed` on `BitReader`, wire parser `mod`, frontend, params, e2e |
+| VP9 | wired: superframe/chunk parse, eight reference slots, show-existing frames, VA-API submit, NV12 readback, 600-frame e2e against ffmpeg oracle | profiles 1-3, high bit depth, non-4:2:0 stay typed `Unsupported` |
 | AV1 | wired: OBU parse, reference slots, film-grain display slot, VA-API submit, NV12 readback | large-scale tiles, high bit depth, monochrome, non-4:2:0, scalable stay typed `Unsupported` |
 
 The missing `BitReader` surface (`position`, `read_bits_aligned`,
@@ -65,7 +65,9 @@ Syntax sources: `cros-codecs` 0.0.6, BSD-3-Clause, Copyright
 keeps its upstream copyright header. No `cros-codecs` dependency.
 The H.264 tree is restructured from upstream (grouped parameter
 structs, safe index math where the workspace denies `unsafe_code`);
-the staged trees are byte-close to upstream pending their wiring.
+the VP9 tree likewise groups its header flags beside the AV1
+idiom and reads segment feature magnitudes with `read_bits`.
+The staged VP8 tree stays byte-close to upstream pending its wiring.
 
 Slice tail order follows ITU-T H.264 (01/2012) 7.3.3: list
 modification, weight table, marking, cabac init, qp delta. A
@@ -174,10 +176,12 @@ driver refuses.
 
 Encode sessions open `EntrypointEncSlice` for H.264 High and H.265
 Main with CQP rate control and sequence/picture/slice packed
-headers, all probed before the config. Every picture is an IDR at
-CQP 26: no reference management, no reorder delay, every packet a
-keyframe. The picture header packs once per quantization and the
-upload image is created once per session. The headers are
+headers, all probed before the config. Pictures are all-intra IDRs
+or a low-delay P chain by GOP shape at CQP 26, with one picture in
+flight: the next upload writes the free slot while the previous
+picture encodes. The picture header packs once per quantization;
+each upload image derives its surface where the driver allows and
+falls back to a created image plus blit. The headers are
 hand-written and verified three ways: the H.264 writer round-trips
 through this crate's own parser, the H.265 writer pins its layout
 byte offsets, and both streams decode under ffmpeg. Transcode keeps decode
