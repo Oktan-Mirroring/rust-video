@@ -26,7 +26,7 @@ const HOPS: u32 = 30;
 const BAR: f64 = 60.0;
 
 /// Sustained overlap bar: quiet median minus 20% headroom, 2026-11-18.
-const SUSTAINED_H264_BAR: f64 = 490.0;
+const SUSTAINED_H264_BAR: f64 = 540.0;
 
 /// Serializes added benches sharing one adapter.
 static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
