@@ -16,3 +16,21 @@ Every file below decodes to null with exit 0.
 `H264Synth::annex_b_h264_packets_cropped_sized` builds 1080p
 vectors in code. Benches resolve this directory through
 `rust_video_harness::bench_dir`.
+
+## Inter-picture 1080p streams
+
+120 frames of `testsrc=size=1920x1080:rate=30:duration=4`,
+generated 2026-11-18 with the same ffmpeg build for sustained
+overlap benches (IDR-only content serializes the pumps; these
+carry P-frames). Every file below decodes to null with exit 0.
+
+| File | Command |
+|---|---|
+| `h264-1080p_ip.h264` | `ffmpeg -f lavfi -i TS -c:v libx264 -preset ultrafast -g 30 -pix_fmt yuv420p -f h264` |
+| `h265-1080p_ip.h265` | `ffmpeg -f lavfi -i TS -c:v libx265 -preset ultrafast -g 30 -pix_fmt yuv420p -f hevc` |
+| `av1-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p -f ivf` |
+| `vp9-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libvpx-vp9 -speed 8 -g 30 -pix_fmt yuv420p -f ivf` |
+
+`TS` is the testsrc above (4s, 120 frames). Throughput suites in
+every tier resolve these through `bench_dir`; no tier-local
+copies.
