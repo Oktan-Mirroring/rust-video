@@ -11,6 +11,8 @@
 use std::ffi::{c_char, CString};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::sync::Arc;
 
 use crate::error::{SkipReason, VulkanError};
@@ -219,7 +221,7 @@ impl AshBackend {
         &self.instance
     }
 
-    /// DMA-BUF export extensions, each present on `adapter` or none at all.
+    /// Platform export extensions, each present on `adapter` or none at all.
     fn export_extensions(&self, adapter: vk::PhysicalDevice) -> Vec<&'static std::ffi::CStr> {
         // SAFETY: enumeration writes into ash-owned storage.
         let list = unsafe { self.instance.enumerate_device_extension_properties(adapter) }
@@ -686,9 +688,45 @@ impl Backend for &AshBackend {
 pub(crate) struct RawDevice {
     /// Logical device handle.
     device: ash::Device,
-    /// DMA-BUF export extensions enabled.
+    /// Platform export extensions enabled.
     external: bool,
 }
+
+/// Platform external-memory functions behind exportable planes.
+#[cfg(unix)]
+pub(crate) type ExtDevice = khr::external_memory_fd::Device;
+
+/// Platform external-memory functions behind exportable planes.
+#[cfg(windows)]
+pub(crate) type ExtDevice = khr::external_memory_win32::Device;
+
+/// Platform external-memory functions behind exportable planes.
+#[cfg(not(any(unix, windows)))]
+pub(crate) type ExtDevice = khr::external_memory_fd::Device;
+
+/// Platform plane-export mechanism behind unsupported errors.
+#[cfg(unix)]
+pub(crate) const EXPORT_MECHANISM: &str = "dma-buf export";
+
+/// Platform plane-export mechanism behind unsupported errors.
+#[cfg(windows)]
+pub(crate) const EXPORT_MECHANISM: &str = "nt-handle export";
+
+/// Platform plane-export mechanism behind unsupported errors.
+#[cfg(not(any(unix, windows)))]
+pub(crate) const EXPORT_MECHANISM: &str = "platform export";
+
+/// Platform plane-import mechanism behind unsupported errors.
+#[cfg(unix)]
+pub(crate) const IMPORT_MECHANISM: &str = "dma-buf import";
+
+/// Platform plane-import mechanism behind unsupported errors.
+#[cfg(windows)]
+pub(crate) const IMPORT_MECHANISM: &str = "nt-handle import";
+
+/// Platform plane-import mechanism behind unsupported errors.
+#[cfg(not(any(unix, windows)))]
+pub(crate) const IMPORT_MECHANISM: &str = "platform import";
 
 /// DMA-BUF export extensions for this platform.
 #[cfg(unix)]
@@ -699,8 +737,17 @@ fn export_extension_names() -> Vec<&'static std::ffi::CStr> {
     ]
 }
 
-/// DMA-BUF export extensions for this platform.
-#[cfg(not(unix))]
+/// NT-handle export extensions for this platform.
+#[cfg(windows)]
+fn export_extension_names() -> Vec<&'static std::ffi::CStr> {
+    vec![
+        vk::KHR_EXTERNAL_MEMORY_NAME,
+        vk::KHR_EXTERNAL_MEMORY_WIN32_NAME,
+    ]
+}
+
+/// Export extensions for this platform.
+#[cfg(not(any(unix, windows)))]
 fn export_extension_names() -> Vec<&'static std::ffi::CStr> {
     Vec::new()
 }
@@ -714,8 +761,17 @@ pub(crate) fn external_memory_present(extensions: &[CString]) -> bool {
     present(vk::KHR_EXTERNAL_MEMORY_NAME) && present(vk::KHR_EXTERNAL_MEMORY_FD_NAME)
 }
 
-/// True when `extensions` carry the DMA-BUF export pair.
-#[cfg(not(unix))]
+/// True when `extensions` carry the NT-handle export pair.
+#[cfg(windows)]
+#[must_use]
+pub(crate) fn external_memory_present(extensions: &[CString]) -> bool {
+    use std::ffi::CStr;
+    let present = |want: &CStr| extensions.iter().any(|have| have.as_c_str() == want);
+    present(vk::KHR_EXTERNAL_MEMORY_NAME) && present(vk::KHR_EXTERNAL_MEMORY_WIN32_NAME)
+}
+
+/// True when `extensions` carry an export pair.
+#[cfg(not(any(unix, windows)))]
 #[must_use]
 pub(crate) fn external_memory_present(_extensions: &[CString]) -> bool {
     false
@@ -728,7 +784,7 @@ impl RawDevice {
         &self.device
     }
 
-    /// DMA-BUF export extensions enabled.
+    /// Platform export extensions enabled.
     #[must_use]
     pub(crate) fn external_memory(&self) -> bool {
         self.external
@@ -989,6 +1045,32 @@ impl GpuMemory {
     ) -> Result<Self, VulkanError> {
         let mut export = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(type_index)
+            .push_next(&mut export);
+        // SAFETY: plain descriptor; the memory is owned on success.
+        let memory = unsafe { device.allocate_memory(&info, None) }?;
+        Ok(Self {
+            device: device.clone(),
+            memory,
+            size,
+        })
+    }
+
+    /// Allocation of `size` bytes of `type_index`, exportable as an NT handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when allocation fails or the platform exports nothing.
+    #[cfg(windows)]
+    pub fn allocate_exportable(
+        device: &ash::Device,
+        size: vk::DeviceSize,
+        type_index: u32,
+    ) -> Result<Self, VulkanError> {
+        let mut export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
         let info = vk::MemoryAllocateInfo::default()
             .allocation_size(size)
             .memory_type_index(type_index)
@@ -1540,7 +1622,7 @@ pub(crate) fn two_plane_nv12(format: vk::Format) -> bool {
 /// One exportable linear plane: image plus exportable memory.
 pub(crate) struct ExportPlane {
     /// Device that destroys the image.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     device: ash::Device,
     /// Image handle.
     image: vk::Image,
@@ -1554,7 +1636,7 @@ pub(crate) struct ExportPlane {
     #[cfg(unix)]
     offset: u32,
     /// Instance plus device behind the image; drops last.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     keep: Arc<OwnedDevice>,
 }
 
@@ -1565,6 +1647,7 @@ impl ExportPlane {
     ///
     /// Returns `Err` when creation, type picking, binding, or the layout
     /// query fails, or the platform exports nothing.
+    #[cfg(not(windows))]
     fn create(
         device: &ash::Device,
         properties: &vk::PhysicalDeviceMemoryProperties,
@@ -1643,9 +1726,66 @@ impl ExportPlane {
         {
             let _ = (device, properties, format, extent, usage, keep);
             Err(VulkanError::Unsupported {
-                what: "dma-buf export".to_owned(),
+                what: EXPORT_MECHANISM.to_owned(),
             })
         }
+    }
+
+    /// Linear `format` plane at `extent` with `usage`, unbound.
+    ///
+    /// Binds through [`bind`](Self::bind) before first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when creation fails.
+    #[cfg(windows)]
+    fn create_unbound(
+        device: &ash::Device,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        usage: vk::ImageUsageFlags,
+        keep: Arc<OwnedDevice>,
+    ) -> Result<(Self, vk::MemoryRequirements), VulkanError> {
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        // SAFETY: plain descriptor; the image is owned on success.
+        let image = unsafe { device.create_image(&info, None) }?;
+        // SAFETY: the image is live and owned.
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        Ok((Self { image, keep }, requirements))
+    }
+
+    /// Bind the plane to `memory` at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the memory misses the requirements at `offset`.
+    #[cfg(windows)]
+    fn bind(
+        &self,
+        device: &ash::Device,
+        memory: vk::DeviceMemory,
+        offset: vk::DeviceSize,
+    ) -> Result<(), VulkanError> {
+        // SAFETY: the memory covers the requirements at the aligned offset.
+        unsafe { device.bind_image_memory(self.image, memory, offset) }?;
+        Ok(())
     }
 
     /// Image handle.
@@ -1683,9 +1823,9 @@ impl ExportPlane {
 
 impl Drop for ExportPlane {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let device = self.keep.device().device();
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let device = &self.device;
         // SAFETY: the image is live and owned by this device.
         unsafe { device.destroy_image(self.image, None) };
@@ -1693,6 +1833,9 @@ impl Drop for ExportPlane {
 }
 
 /// NV12 frame as two exportable linear planes: luma plus chroma.
+///
+/// Field order is the drop order: the planes destroy before the shared
+/// allocation frees, the handle closes, and the device drops last.
 pub(crate) struct ExportPair {
     /// DMA-BUF export functions.
     #[cfg(unix)]
@@ -1705,24 +1848,31 @@ pub(crate) struct ExportPair {
     extent: vk::Extent2D,
     /// Decoded picture format the planes were copied from.
     source: vk::Format,
+    /// Shared exportable allocation; drops after the planes above.
+    #[cfg(windows)]
+    memory: GpuMemory,
+    /// Exported NT handle; closes on drop.
+    #[cfg(windows)]
+    handle: OwnedHandle,
+    /// Instance plus device behind the pair; drops last.
+    #[cfg(windows)]
+    _keep: Arc<OwnedDevice>,
 }
 
 impl ExportPair {
-    /// NV12 pair at `extent` copied from `source`, exportable as DMA-BUF.
+    /// NV12 pair at `extent` copied from `source`, exportable through the platform handle.
     ///
     /// # Errors
     ///
     /// Returns `Err` on a degenerate extent or when creation fails.
     pub fn create(
         device: &ash::Device,
-        ext: &khr::external_memory_fd::Device,
+        ext: &ExtDevice,
         properties: &vk::PhysicalDeviceMemoryProperties,
         extent: (u32, u32),
         source: vk::Format,
         keep: Arc<OwnedDevice>,
     ) -> Result<Self, VulkanError> {
-        #[cfg(not(unix))]
-        let _ = ext;
         if extent.0 == 0
             || extent.1 == 0
             || !extent.0.is_multiple_of(2)
@@ -1742,30 +1892,107 @@ impl ExportPair {
             height: extent.1 / 2,
         };
         let usage = vk::ImageUsageFlags::TRANSFER_DST;
-        let y = ExportPlane::create(
-            device,
-            properties,
-            vk::Format::R8_UNORM,
-            luma,
-            usage,
-            keep.clone(),
-        )?;
-        let uv = ExportPlane::create(
-            device,
-            properties,
-            vk::Format::R8G8_UNORM,
-            chroma,
-            usage,
-            keep,
-        )?;
-        Ok(Self {
-            #[cfg(unix)]
-            ext: ext.clone(),
-            y,
-            uv,
-            extent: luma,
-            source,
-        })
+        #[cfg(unix)]
+        {
+            let y = ExportPlane::create(
+                device,
+                properties,
+                vk::Format::R8_UNORM,
+                luma,
+                usage,
+                keep.clone(),
+            )?;
+            let uv = ExportPlane::create(
+                device,
+                properties,
+                vk::Format::R8G8_UNORM,
+                chroma,
+                usage,
+                keep,
+            )?;
+            Ok(Self {
+                ext: ext.clone(),
+                y,
+                uv,
+                extent: luma,
+                source,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let (y, y_req) = ExportPlane::create_unbound(
+                device,
+                vk::Format::R8_UNORM,
+                luma,
+                usage,
+                keep.clone(),
+            )?;
+            let (uv, uv_req) = ExportPlane::create_unbound(
+                device,
+                vk::Format::R8G8_UNORM,
+                chroma,
+                usage,
+                keep.clone(),
+            )?;
+            let bits = y_req.memory_type_bits & uv_req.memory_type_bits;
+            let uv_offset = y_req.size.next_multiple_of(uv_req.alignment.max(1));
+            let combined = vk::MemoryRequirements {
+                size: uv_offset + uv_req.size,
+                alignment: y_req.alignment.max(uv_req.alignment),
+                memory_type_bits: bits,
+            };
+            let Some(type_index) = pick_memory_type_preferred(
+                combined,
+                properties,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            ) else {
+                return Err(VulkanError::NoMemoryType { bits });
+            };
+            let memory = GpuMemory::allocate_exportable(device, combined.size, type_index)?;
+            let (y, uv, memory, handle) =
+                Self::bind_and_export(memory, y, uv, device, ext, uv_offset)?;
+            Ok(Self {
+                y,
+                uv,
+                extent: luma,
+                source,
+                memory,
+                handle,
+                _keep: keep,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (device, ext, properties, luma, chroma, usage, source, keep);
+            Err(VulkanError::Unsupported {
+                what: EXPORT_MECHANISM.to_owned(),
+            })
+        }
+    }
+
+    /// Planes bound to `memory` plus its exported NT handle.
+    ///
+    /// Owns every handle: any failure destroys the planes before the
+    /// memory frees. Parameter order is the drop order, reversed.
+    #[cfg(windows)]
+    fn bind_and_export(
+        memory: GpuMemory,
+        y: ExportPlane,
+        uv: ExportPlane,
+        device: &ash::Device,
+        ext: &ExtDevice,
+        uv_offset: vk::DeviceSize,
+    ) -> Result<(ExportPlane, ExportPlane, GpuMemory, OwnedHandle), VulkanError> {
+        y.bind(device, memory.memory(), 0)?;
+        uv.bind(device, memory.memory(), uv_offset)?;
+        let info = vk::MemoryGetWin32HandleInfoKHR::default()
+            .memory(memory.memory())
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+        // SAFETY: the memory is live and owned; the handle is owned on success.
+        let raw = unsafe { ext.get_memory_win32_handle(&info) }?;
+        // SAFETY: the handle is freshly returned and owned.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        Ok((y, uv, memory, handle))
     }
 
     /// Frame extent in luma samples.
@@ -1799,7 +2026,11 @@ impl ExportPair {
         {
             self.y.memory.memory()
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.memory.memory()
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = self;
             vk::DeviceMemory::null()
@@ -1813,7 +2044,11 @@ impl ExportPair {
         {
             self.uv.memory.memory()
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.memory.memory()
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = self;
             vk::DeviceMemory::null()
@@ -1822,7 +2057,7 @@ impl ExportPair {
 
     /// Platform export handle for the planes.
     ///
-    /// DMA-BUF planes while both descriptors export; an opaque backend
+    /// Platform planes while both handles export; an opaque backend
     /// descriptor otherwise. Infallible by shape.
     #[must_use]
     pub fn export(&self) -> GpuExport {
@@ -1836,7 +2071,13 @@ impl ExportPair {
                 _ => GpuExport::Opaque { name: "vulkan" },
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            GpuExport::NtHandle {
+                handle: self.handle.as_raw_handle() as isize,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = self;
             GpuExport::Opaque { name: "vulkan" }
@@ -2001,14 +2242,14 @@ pub(crate) struct ImportPair {
 }
 
 impl ImportPair {
-    /// Pair importing `export` as DMA-BUF planes on `device`.
+    /// Pair importing `export` as platform planes on `device`.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a descriptor fails to export or import.
     pub fn import(
         device: &ash::Device,
-        ext: &khr::external_memory_fd::Device,
+        ext: &ExtDevice,
         properties: &vk::PhysicalDeviceMemoryProperties,
         export: &DeviceExport,
     ) -> Result<Self, VulkanError> {
@@ -2040,7 +2281,7 @@ impl ImportPair {
         {
             let _ = (device, ext, properties, export);
             Err(VulkanError::Unsupported {
-                what: "dma-buf import".to_owned(),
+                what: IMPORT_MECHANISM.to_owned(),
             })
         }
     }
@@ -2074,7 +2315,7 @@ impl ImportPair {
     }
 }
 
-/// True when `owned` exports linear planes as DMA-BUF descriptors.
+/// True when `owned` exports linear planes through platform handles.
 #[must_use]
 pub(crate) fn probe_export(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice) -> bool {
     #[cfg(unix)]
@@ -2083,7 +2324,7 @@ pub(crate) fn probe_export(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice
         let device = owned.device().device();
         // SAFETY: query writes into ash-owned storage.
         let properties = unsafe { instance.get_physical_device_memory_properties(adapter) };
-        let ext = khr::external_memory_fd::Device::new(instance, device);
+        let ext = ExtDevice::new(instance, device);
         let pair = ExportPair::create(
             device,
             &ext,
@@ -2097,14 +2338,34 @@ pub(crate) fn probe_export(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice
             Err(_) => false,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let instance = owned.backend().instance();
+        let device = owned.device().device();
+        // SAFETY: query writes into ash-owned storage.
+        let properties = unsafe { instance.get_physical_device_memory_properties(adapter) };
+        let ext = ExtDevice::new(instance, device);
+        let pair = ExportPair::create(
+            device,
+            &ext,
+            &properties,
+            (64, 64),
+            two_plane_format(),
+            owned.clone(),
+        );
+        match pair {
+            Ok(pair) => matches!(pair.export(), GpuExport::NtHandle { handle } if handle != 0),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (owned, adapter);
         false
     }
 }
 
-/// True when `owned` imports DMA-BUF planes it just exported.
+/// True when `owned` imports platform planes it just exported.
 #[must_use]
 pub(crate) fn probe_import(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice) -> bool {
     #[cfg(unix)]
@@ -2113,7 +2374,7 @@ pub(crate) fn probe_import(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice
         let device = owned.device().device();
         // SAFETY: query writes into ash-owned storage.
         let properties = unsafe { instance.get_physical_device_memory_properties(adapter) };
-        let ext = khr::external_memory_fd::Device::new(instance, device);
+        let ext = ExtDevice::new(instance, device);
         let pair = ExportPair::create(
             device,
             &ext,
@@ -2136,7 +2397,7 @@ pub(crate) fn probe_import(owned: &Arc<OwnedDevice>, adapter: vk::PhysicalDevice
 }
 
 /// Two-plane NV12 picture format behind export probes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn two_plane_format() -> vk::Format {
     vk::Format::G8_B8R8_2PLANE_420_UNORM
 }

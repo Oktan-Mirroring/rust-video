@@ -90,9 +90,9 @@ impl<'a> Transcoder<'a> {
         };
         let share = decode_device.share_mechanism();
         let decode_export = share.is_some()
-            && decode_device.dmabuf_export()
+            && decode_device.surface_export()
             && decode_two_plane(decode_device, decode_op);
-        let caps = GpuCaps::new(share, decode_export, encode_device.dmabuf_import());
+        let caps = GpuCaps::new(share, decode_export, encode_device.surface_import());
         let decode_adapter = decode_device.adapter_id();
         let encode_adapter = encode_device.adapter_id();
         let plan = if decode_adapter == encode_adapter {

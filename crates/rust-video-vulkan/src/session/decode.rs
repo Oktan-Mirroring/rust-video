@@ -5,13 +5,14 @@
 //! Per-frame command assembly is pure data over these resources; only the
 //! final record-and-submit touches the device.
 
-use ash::{khr, vk};
+use ash::vk;
 
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
 use crate::parse::refs::SlotBook;
 use crate::raw::{
-    DecodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView, SessionParameters, VideoSession,
+    DecodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView, SessionParameters,
+    VideoSession,
 };
 use crate::session::geometry::SessionGeometry;
 use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
@@ -80,8 +81,8 @@ pub(crate) struct Session {
     meta: Vec<Option<DpbMeta>>,
     /// Memory properties behind exportable-plane allocation.
     props: vk::PhysicalDeviceMemoryProperties,
-    /// DMA-BUF export functions, absent without the extensions.
-    ext: Option<khr::external_memory_fd::Device>,
+    /// Platform export functions, absent without the extensions.
+    ext: Option<ExtDevice>,
 }
 
 /// Head barriers plus layout commits of one submit.
@@ -182,7 +183,7 @@ impl Session {
             device.queue(),
             device.queue_lock().clone(),
         )?;
-        let ext = device.external_fd();
+        let ext = device.ext();
         Ok(Self {
             submit,
             device: raw.clone(),
@@ -244,12 +245,12 @@ impl Session {
         self.dpb_views.get(slot).map(GpuView::view)
     }
 
-    /// Handles behind exportable-plane allocation, absent without fd export.
+    /// Handles behind exportable-plane allocation, absent without platform export.
     pub(crate) fn export_alloc(
         &self,
     ) -> Option<(
         &ash::Device,
-        &khr::external_memory_fd::Device,
+        &ExtDevice,
         &vk::PhysicalDeviceMemoryProperties,
     )> {
         self.ext

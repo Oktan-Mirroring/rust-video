@@ -24,7 +24,7 @@ fn run(packet: &Packet) -> Result<usize, VulkanError> {
 
 ## Encode and transcode
 
-`H264Encoder` and `H265Encoder` open on width and height with a `Gop` cadence: an IDR every 30 pictures by default, all-intra available. Packets code keyframes on IDR pictures. `Transcoder` pairs one decoder with one encoder under a caps `Plan`, routing decode export to encoder import from H.264, H.265, or AV1 sources with the encoder opening on the first frame. GPU decode lands in leased NV12 images exported as DMA-BUF planes on Unix; `share_mechanism` reports `DmaBuf` where the adapter enables external memory FD and `None` otherwise.
+`H264Encoder` and `H265Encoder` open on width and height with a `Gop` cadence: an IDR every 30 pictures by default, all-intra available. Packets code keyframes on IDR pictures. `Transcoder` pairs one decoder with one encoder under a caps `Plan`, routing decode export to encoder import from H.264, H.265, or AV1 sources with the encoder opening on the first frame. GPU decode lands in leased NV12 images exported as DMA-BUF planes on Unix and as one NT handle on Windows; `share_mechanism` reports `DmaBuf` or `NtHandle` where the adapter enables the platform external memory pair and `None` otherwise.
 
 ## Docs
 

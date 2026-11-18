@@ -225,11 +225,9 @@ fn decode_surfaces(
 
 /// Held GPU surfaces pin distinct export slots; freed slots recycle.
 ///
-/// Needs DMA-BUF export behind the device; declines without it.
+/// Needs platform export behind the device; declines without it.
 #[test]
 fn gpu_surfaces_pin_export_slots() {
-    use rust_video_caps::transcode::ShareMechanism;
-
     let _guard = SERIAL.lock().unwrap();
     if !gated() {
         return;
@@ -237,8 +235,8 @@ fn gpu_surfaces_pin_export_slots() {
     let Some(device) = device_or_decline(CodecOp::H264Decode) else {
         return;
     };
-    if device.share_mechanism() != Some(ShareMechanism::DmaBuf) {
-        println!("declined: pinning proof needs dma-buf export");
+    if device.share_mechanism().is_none() {
+        println!("declined: pinning proof needs platform export");
         return;
     }
     let Some(mut decoder) = unwrap_or_oom(H264Decoder::open(&device), "engine starts", &device)

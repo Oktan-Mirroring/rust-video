@@ -21,7 +21,7 @@ use crate::parse::refs::{
     H264Context, H264Instruction, Picture, RefPicture, ReferenceId, ReorderBuffer, RpsEcho,
     SlotBook,
 };
-use crate::raw::{DeviceExport, ExportPair, OwnedDevice};
+use crate::raw::{DeviceExport, ExportPair, ExtDevice, OwnedDevice, EXPORT_MECHANISM};
 use crate::readback::Readback;
 use crate::session::decode::{
     picture_resource, reference_slot, DpbMeta, ExportTarget, PendingDecode, Session, Submission,
@@ -235,7 +235,7 @@ impl VulkanFrame {
 
     /// Platform export handle for the frame.
     ///
-    /// DMA-BUF planes while the device export lives; an opaque backend
+    /// Platform planes while the device export lives; an opaque backend
     /// descriptor without one. Infallible by shape, never `BackendAbsent`.
     #[must_use]
     pub fn export(&self) -> GpuExport {
@@ -379,7 +379,7 @@ impl FrameSink {
         &mut self,
         alloc: Option<(
             &ash::Device,
-            &ash::khr::external_memory_fd::Device,
+            &ExtDevice,
             &vk::PhysicalDeviceMemoryProperties,
         )>,
         format: vk::Format,
@@ -402,7 +402,7 @@ impl FrameSink {
         }
         let Some((device, ext, props)) = alloc else {
             return Err(VulkanError::Unsupported {
-                what: "dma-buf export".to_owned(),
+                what: EXPORT_MECHANISM.to_owned(),
             });
         };
         self.exports

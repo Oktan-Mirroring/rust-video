@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::VulkanError;
 use crate::ladder::{AdapterFingerprint, CodecOp, Ladder, LadderError, OpCaps};
-use crate::raw::{AshBackend, OwnedDevice, RawDevice};
+use crate::raw::{AshBackend, ExtDevice, OwnedDevice, RawDevice};
 
 use rust_video_caps::traits::{Device, SharedDevice};
 use rust_video_caps::transcode::ShareMechanism;
@@ -41,7 +41,7 @@ pub struct VulkanDevice {
     caps: OpCaps,
     /// Share mechanism the adapter exports, if any.
     share: Option<ShareMechanism>,
-    /// DMA-BUF export extensions enabled.
+    /// Platform export extensions enabled.
     external: bool,
     /// VRAM budget shared with decoders.
     shared: SharedDevice,
@@ -157,35 +157,35 @@ impl VulkanDevice {
         self.share
     }
 
-    /// DMA-BUF export extensions enabled.
+    /// Platform export extensions enabled.
     #[must_use]
     pub(crate) fn external_memory(&self) -> bool {
         self.external && self.owned.device().external_memory()
     }
 
-    /// True when the device exports linear planes as DMA-BUF descriptors.
+    /// True when the device exports linear planes through platform handles.
     #[must_use]
-    pub(crate) fn dmabuf_export(&self) -> bool {
+    pub(crate) fn surface_export(&self) -> bool {
         if !self.external_memory() {
             return false;
         }
         crate::raw::probe_export(&self.owned, self.adapter)
     }
 
-    /// True when the device imports DMA-BUF planes it just exported.
+    /// True when the device imports platform planes it just exported.
     #[must_use]
-    pub(crate) fn dmabuf_import(&self) -> bool {
+    pub(crate) fn surface_import(&self) -> bool {
         if !self.external_memory() {
             return false;
         }
         crate::raw::probe_import(&self.owned, self.adapter)
     }
 
-    /// DMA-BUF fd functions over the logical device, absent without the extensions.
+    /// Platform external-memory functions, absent without the extensions.
     #[must_use]
-    pub(crate) fn external_fd(&self) -> Option<ash::khr::external_memory_fd::Device> {
+    pub(crate) fn ext(&self) -> Option<ExtDevice> {
         self.external_memory().then(|| {
-            ash::khr::external_memory_fd::Device::new(
+            ExtDevice::new(
                 self.owned.backend().instance(),
                 self.owned.device().device(),
             )
@@ -274,6 +274,10 @@ fn share_of(extensions: &[std::ffi::CString]) -> Option<ShareMechanism> {
     if present(ash::vk::KHR_EXTERNAL_MEMORY_FD_NAME) {
         return Some(ShareMechanism::DmaBuf);
     }
+    #[cfg(windows)]
+    if present(ash::vk::KHR_EXTERNAL_MEMORY_WIN32_NAME) {
+        return Some(ShareMechanism::NtHandle);
+    }
     None
 }
 
@@ -312,12 +316,12 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            use rust_video_caps::transcode::{FallbackCause, GpuCaps, Plan};
+            use rust_video_caps::transcode::{FallbackCause, GpuCaps, Plan, ShareMechanism};
             let win32 = CString::from(ash::vk::KHR_EXTERNAL_MEMORY_WIN32_NAME);
             let share = super::share_of(&[base, win32]);
-            assert!(share.is_none());
-            let plan = Plan::for_caps(&GpuCaps::new(share, true, true));
-            assert_eq!(plan.cause(), Some(FallbackCause::ShareUnsupported));
+            assert_eq!(share, Some(ShareMechanism::NtHandle));
+            let plan = Plan::for_caps(&GpuCaps::new(share, true, false));
+            assert_eq!(plan.cause(), Some(FallbackCause::EncoderCpuOnly));
         }
     }
 

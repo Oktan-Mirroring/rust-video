@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use ash::vk;
 use ash::vk::native::{
     __BindgenBitfieldUnit, StdVideoH264CabacInitIdc_STD_VIDEO_H264_CABAC_INIT_IDC_0,
     StdVideoH264ChromaFormatIdc_STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
@@ -25,14 +26,13 @@ use ash::vk::native::{
     StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
     StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P, StdVideoH265VideoParameterSet,
 };
-use ash::{khr, vk};
 
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
 use crate::parse::refs::{ReferenceId, SlotBook};
 use crate::raw::{
-    DeviceExport, EncodeFeedback, EncodeQueue, ExportPair, GpuBuffer, GpuImage, GpuView,
-    ImportPair, SessionParameters, VideoSession,
+    DeviceExport, EncodeFeedback, EncodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView,
+    ImportPair, SessionParameters, VideoSession, IMPORT_MECHANISM,
 };
 use crate::session::decode::{
     follow_barrier, layout_barrier, narrow_u32, nv12_copy_regions, picture_resource, plane_copy,
@@ -889,10 +889,10 @@ pub(crate) struct EncodeSession {
     extent: vk::Extent2D,
     /// Source picture format.
     format: vk::Format,
-    /// Memory properties behind DMA-BUF import.
+    /// Memory properties behind plane import.
     props: vk::PhysicalDeviceMemoryProperties,
-    /// DMA-BUF import functions, absent without the extensions.
-    ext: Option<khr::external_memory_fd::Device>,
+    /// Platform import functions, absent without the extensions.
+    ext: Option<ExtDevice>,
     /// Import of the last encode, reused while the pair holds.
     import: Option<(Arc<ExportPair>, ImportPair)>,
     /// Source image view; drops before `input` below.
@@ -1038,7 +1038,7 @@ impl EncodeSession {
             extent,
             format,
             props: properties,
-            ext: device.external_fd(),
+            ext: device.ext(),
             import: None,
             input_view: resources.input_view,
             input: resources.input,
@@ -1405,7 +1405,7 @@ impl EncodeSession {
         if !reuse {
             let Some(ext) = self.ext.clone() else {
                 return Err(VulkanError::Unsupported {
-                    what: "dma-buf import".to_owned(),
+                    what: IMPORT_MECHANISM.to_owned(),
                 });
             };
             let import = ImportPair::import(&self.device, &ext, &self.props, export)?;
@@ -1413,7 +1413,7 @@ impl EncodeSession {
         }
         let Some((_, import)) = self.import.as_ref() else {
             return Err(VulkanError::Unsupported {
-                what: "dma-buf import".to_owned(),
+                what: IMPORT_MECHANISM.to_owned(),
             });
         };
         let (y, uv) = (import.y_image(), import.uv_image());
