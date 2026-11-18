@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -48,8 +48,26 @@ pub struct Backend {
     height: u32,
     /// Pool size.
     count: usize,
+    /// Cached NV12 image format for the created-image transfer.
+    nv12: Cell<Option<ffi::VaImageFormat>>,
     /// Thread contract: `Send` without `Sync`.
     _thread: PhantomData<UnsafeCell<()>>,
+}
+
+/// CPU copy matching the image memory behind the transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyMethod {
+    /// Non-temporal loads for derived video memory.
+    Streaming,
+    /// Plain copy for created CPU-local images.
+    Cached,
+}
+
+impl CopyMethod {
+    /// True when the method issues streaming loads needing a fence.
+    fn needs_fence(self) -> bool {
+        self == Self::Streaming
+    }
 }
 
 impl Backend {
@@ -170,6 +188,7 @@ impl Backend {
             width,
             height,
             count,
+            nv12: Cell::new(None),
             _thread: PhantomData,
         })
     }
@@ -306,11 +325,12 @@ impl Backend {
         VaApiError::Unsupported("dimensions outside driver range".to_owned())
     }
 
-    /// Cropped NV12 copy of a derived image.
+    /// Cropped NV12 copy of an image.
     fn copy_nv12(
         &self,
         image: &ffi::VaImage,
         crop: (u32, u32, u32, u32),
+        method: CopyMethod,
     ) -> Result<Vec<u8>, VaApiError> {
         if image.format.fourcc != ffi::VA_FOURCC_NV12 || image.num_planes < 2 {
             return Err(VaApiError::Unsupported("driver image not nv12".to_owned()));
@@ -325,6 +345,7 @@ impl Backend {
             image.pitches,
             image.offsets,
             (x, y, width, height),
+            method,
         );
         // Sound: the buffer was mapped above.
         unsafe {
@@ -340,6 +361,7 @@ impl Backend {
         pitches: [u32; 3],
         offsets: [u32; 3],
         crop: (u32, u32, u32, u32),
+        method: CopyMethod,
     ) -> Result<Vec<u8>, VaApiError> {
         let bad = || VaApiError::Unsupported("driver image layout".to_owned());
         let (x, y, width, height) = crop;
@@ -364,7 +386,7 @@ impl Backend {
         let mut out = Vec::with_capacity(bytes);
         let dst_base = out.as_mut_ptr();
         if x == 0 && width > 0 && width == pitches[0] && width == pitches[1] {
-            Self::copy_whole_planes(data, pitches, offsets, crop, dst_base)?;
+            Self::copy_whole_planes(data, pitches, offsets, crop, dst_base, method)?;
             // SAFETY: `copy_whole_planes` initialized all `bytes` elements (`luma + chroma`).
             unsafe {
                 out.set_len(bytes);
@@ -382,7 +404,7 @@ impl Backend {
                         + u64::from(x),
                 )
                 .map_err(|_| bad())?;
-                Self::copy_uswc(data.add(offset), dst_base.add(written), width_usize);
+                Self::copy_span(data.add(offset), dst_base.add(written), width_usize, method);
                 written += width_usize;
             }
             for row in 0..chroma_height {
@@ -392,23 +414,26 @@ impl Backend {
                         + u64::from(x),
                 )
                 .map_err(|_| bad())?;
-                Self::copy_uswc(data.add(offset), dst_base.add(written), width_usize);
+                Self::copy_span(data.add(offset), dst_base.add(written), width_usize, method);
                 written += width_usize;
             }
-            Self::fence_uswc();
+            if method.needs_fence() {
+                Self::fence_uswc();
+            }
             debug_assert_eq!(written, bytes);
             out.set_len(bytes);
         }
         Ok(out)
     }
 
-    /// Full-width planes in two streaming copies; rows are contiguous by pitch match.
+    /// Full-width planes in two copies; rows are contiguous by pitch match.
     fn copy_whole_planes(
         data: *const u8,
         pitches: [u32; 3],
         offsets: [u32; 3],
         crop: (u32, u32, u32, u32),
         dst: *mut u8,
+        method: CopyMethod,
     ) -> Result<(), VaApiError> {
         let bad = || VaApiError::Unsupported("driver image layout".to_owned());
         let (_, y, width, height) = crop;
@@ -423,20 +448,29 @@ impl Backend {
                 .map_err(|_| bad())?;
         // SAFETY: both spans were bounds-checked against `len` and `dst` capacity by caller.
         unsafe {
-            Self::copy_uswc(data.add(y_offset), dst, luma);
-            Self::copy_uswc(data.add(uv_offset), dst.add(luma), chroma);
-            Self::fence_uswc();
+            Self::copy_span(data.add(y_offset), dst, luma, method);
+            Self::copy_span(data.add(uv_offset), dst.add(luma), chroma, method);
+            if method.needs_fence() {
+                Self::fence_uswc();
+            }
         }
         Ok(())
     }
 
-    /// Streaming copy of `len` bytes from write-combined GPU mapping `src` to cached `dst`.
+    /// Copy of `len` bytes from mapped image memory `src` to cached `dst`.
     ///
     /// # Safety
     ///
     /// `src` and `dst` must be valid, non-overlapping regions of `len` bytes.
     #[inline]
-    unsafe fn copy_uswc(src: *const u8, dst: *mut u8, len: usize) {
+    unsafe fn copy_span(src: *const u8, dst: *mut u8, len: usize, method: CopyMethod) {
+        if method == CopyMethod::Cached {
+            // SAFETY: pointer invariants upheld by caller.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, dst, len);
+            }
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("sse4.1") {
@@ -545,7 +579,7 @@ impl Backend {
         if derived == ffi::VA_STATUS_SUCCESS {
             // SAFETY: `vaDeriveImage` succeeded, initializing `image`.
             let image = unsafe { image.assume_init() };
-            let outcome = self.copy_nv12(&image, crop);
+            let outcome = self.copy_nv12(&image, crop, CopyMethod::Streaming);
             // SAFETY: `image` was derived above.
             unsafe {
                 sys::vaDestroyImage(self.pool.display, image.image_id);
@@ -592,7 +626,8 @@ impl Backend {
                 image.image_id,
             )
         });
-        let outcome = got.and_then(|()| self.copy_nv12(&image, (0, 0, width, height)));
+        let outcome =
+            got.and_then(|()| self.copy_nv12(&image, (0, 0, width, height), CopyMethod::Cached));
         // SAFETY: `image` was created above.
         unsafe {
             sys::vaDestroyImage(self.pool.display, image.image_id);
@@ -602,6 +637,16 @@ impl Backend {
 
     /// NV12 image format supported by the display.
     fn nv12_format(&self) -> Result<ffi::VaImageFormat, VaApiError> {
+        if let Some(format) = self.nv12.get() {
+            return Ok(format);
+        }
+        let format = self.query_nv12_format()?;
+        self.nv12.set(Some(format));
+        Ok(format)
+    }
+
+    /// NV12 image format probed from the driver.
+    fn query_nv12_format(&self) -> Result<ffi::VaImageFormat, VaApiError> {
         let display = self.pool.display;
         // SAFETY: `formats` is sized to the driver's reported capacity.
         unsafe {
@@ -1069,7 +1114,7 @@ impl SubmitStats {
 
 #[cfg(test)]
 mod tests {
-    use super::Backend;
+    use super::{Backend, CopyMethod};
 
     #[test]
     fn copy_planes_crops_rows_from_pitches() {
@@ -1078,36 +1123,52 @@ mod tests {
         let mut image = Vec::new();
         image.extend_from_slice(&y);
         image.extend_from_slice(&uv);
-        let out = Backend::copy_planes(
-            image.as_ptr(),
-            image.len() as u64,
-            [4, 4, 0],
-            [0, 8, 0],
-            (0, 0, 4, 2),
-        )
-        .expect("in-bounds crop");
-        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        for method in [CopyMethod::Streaming, CopyMethod::Cached] {
+            let out = Backend::copy_planes(
+                image.as_ptr(),
+                image.len() as u64,
+                [4, 4, 0],
+                [0, 8, 0],
+                (0, 0, 4, 2),
+                method,
+            )
+            .expect("in-bounds crop");
+            assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
-        let cropped = Backend::copy_planes(
-            image.as_ptr(),
-            image.len() as u64,
-            [4, 4, 0],
-            [0, 8, 0],
-            (2, 0, 2, 2),
-        )
-        .expect("offset crop");
-        assert_eq!(cropped, vec![3, 4, 7, 8, 11, 12]);
+            let cropped = Backend::copy_planes(
+                image.as_ptr(),
+                image.len() as u64,
+                [4, 4, 0],
+                [0, 8, 0],
+                (2, 0, 2, 2),
+                method,
+            )
+            .expect("offset crop");
+            assert_eq!(cropped, vec![3, 4, 7, 8, 11, 12]);
+        }
     }
 
     #[test]
     fn copy_planes_rejects_overruns() {
         let image = [0u8; 12];
-        assert!(
-            Backend::copy_planes(image.as_ptr(), 12, [4, 4, 0], [0, 8, 0], (0, 0, 8, 2)).is_err()
-        );
-        assert!(
-            Backend::copy_planes(image.as_ptr(), 12, [4, 4, 0], [0, 40, 0], (0, 0, 4, 2)).is_err()
-        );
+        assert!(Backend::copy_planes(
+            image.as_ptr(),
+            12,
+            [4, 4, 0],
+            [0, 8, 0],
+            (0, 0, 8, 2),
+            CopyMethod::Streaming,
+        )
+        .is_err());
+        assert!(Backend::copy_planes(
+            image.as_ptr(),
+            12,
+            [4, 4, 0],
+            [0, 40, 0],
+            (0, 0, 4, 2),
+            CopyMethod::Cached,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1115,11 +1176,27 @@ mod tests {
         let mut image = Vec::new();
         image.extend_from_slice(&[1u8, 2, 3, 4, 5, 6]);
         image.extend_from_slice(&[7u8, 8, 9]);
-        let whole = Backend::copy_planes(image.as_ptr(), 9, [3, 3, 0], [0, 6, 0], (0, 0, 3, 2))
+        for method in [CopyMethod::Streaming, CopyMethod::Cached] {
+            let whole = Backend::copy_planes(
+                image.as_ptr(),
+                9,
+                [3, 3, 0],
+                [0, 6, 0],
+                (0, 0, 3, 2),
+                method,
+            )
             .expect("whole planes");
-        assert_eq!(whole, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        let offset = Backend::copy_planes(image.as_ptr(), 9, [3, 3, 0], [0, 6, 0], (0, 1, 3, 1))
+            assert_eq!(whole, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+            let offset = Backend::copy_planes(
+                image.as_ptr(),
+                9,
+                [3, 3, 0],
+                [0, 6, 0],
+                (0, 1, 3, 1),
+                method,
+            )
             .expect("offset crop");
-        assert_eq!(offset, vec![4, 5, 6]);
+            assert_eq!(offset, vec![4, 5, 6]);
+        }
     }
 }
