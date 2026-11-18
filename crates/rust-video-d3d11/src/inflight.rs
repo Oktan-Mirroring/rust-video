@@ -600,12 +600,10 @@ impl<'s> SplitParts<'s> {
             debug_assert!(false, "landed copy without pending output");
             return Ok(());
         };
-        let (bytes, release, copy_us) = done.into_parts();
+        let (bytes, release, copy) = done.into_parts();
         let unmap_start = Instant::now();
         release.unmap();
-        let read_end = output.signaled_at.unwrap_or(unmap_start)
-            + Duration::from_micros(copy_us)
-            + unmap_start.elapsed();
+        let read_end = output.signaled_at.unwrap_or(unmap_start) + copy + unmap_start.elapsed();
         let frame = emit_frame_bytes(session, shared, &output.active, output.generation, bytes?)?;
         if self.capture {
             self.phases.push(FramePhases::new(

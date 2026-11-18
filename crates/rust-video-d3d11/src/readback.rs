@@ -10,7 +10,7 @@
 use std::marker::PhantomData;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use windows::Win32::Graphics::Direct3D11::{
@@ -23,14 +23,17 @@ use crate::h264::Crop;
 /// Queued copies before a launch waits.
 const DEPTH: usize = 8;
 
+/// Copies below this size run inline on the submit thread.
+const INLINE_COPY_BYTES: usize = 256 * 1024;
+
 /// One copied transfer.
 pub(crate) struct Done {
     /// Copied bytes or the copy failure.
     bytes: Result<Bytes, D3d11Error>,
     /// Mapping behind the copy, released by the submit thread.
     release: Release,
-    /// Copy microseconds.
-    copy_us: u64,
+    /// Copy time.
+    copy: Duration,
 }
 
 /// Mapping release: unmap on the submit thread.
@@ -101,7 +104,7 @@ impl Readback {
                     let done = Done {
                         bytes,
                         release: job.transfer.release,
-                        copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        copy: started.elapsed(),
                     };
                     if done_tx.send(done).is_err() {
                         return;
@@ -118,7 +121,7 @@ impl Readback {
 
     /// Queue the copy of `mapped`, oldest-first behind earlier jobs.
     ///
-    /// Returns the completed copy inline without a worker.
+    /// Small copies complete inline, as does every copy without a worker.
     pub(crate) fn launch(&self, mapped: Mapped) -> Option<Done> {
         let started = Instant::now();
         let copy_inline = |mapped: Mapped| {
@@ -127,9 +130,12 @@ impl Readback {
             Done {
                 bytes,
                 release: mapped.release,
-                copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                copy: started.elapsed(),
             }
         };
+        if mapped.bytes() < INLINE_COPY_BYTES {
+            return Some(copy_inline(mapped));
+        }
         let Some(tx) = self.tx.as_ref() else {
             return Some(copy_inline(mapped));
         };
@@ -204,11 +210,22 @@ impl Mapped {
             _send: PhantomData,
         }
     }
+
+    /// Readback bytes behind the map.
+    fn bytes(&self) -> usize {
+        let (mut width, mut height) = (u64::from(self.width), u64::from(self.height));
+        if let Some(crop) = self.crop {
+            width = width.saturating_sub(u64::from(crop.left) + u64::from(crop.right));
+            height = height.saturating_sub(u64::from(crop.top) + u64::from(crop.bottom));
+        }
+        let bytes = width.saturating_mul(height).saturating_mul(3) / 2;
+        usize::try_from(bytes).unwrap_or(usize::MAX)
+    }
 }
 
 impl Done {
-    /// Copied bytes, mapping release, and copy microseconds.
-    pub(crate) fn into_parts(self) -> (Result<Bytes, D3d11Error>, Release, u64) {
-        (self.bytes, self.release, self.copy_us)
+    /// Copied bytes, mapping release, and copy time.
+    pub(crate) fn into_parts(self) -> (Result<Bytes, D3d11Error>, Release, Duration) {
+        (self.bytes, self.release, self.copy)
     }
 }
