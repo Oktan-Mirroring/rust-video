@@ -42,13 +42,13 @@ Gold runs testsrc IP; rv runs flat synth IDR (h264) to 271 KB intra (av1). Shape
 | vulkan h264 sustained | 1806 | 2047 | +13.4% |
 | vulkan h265 sustained | 1623 | 1744 | +7.5% |
 | vulkan av1 sustained | 1671 | 1502 | -10.1% |
-| d3d11 h264 sustained | 1806 resident / 723 downloaded | 1086 | between the shapes |
-| d3d11 hevc sustained | 1623 resident | 957 | shape mismatched, no percent |
-| d3d11 av1 sustained | 1671 resident | 1108 | shape mismatched, no percent |
-| d3d11 vp9 sustained | 1269 resident | 883 | shape mismatched, no percent |
-| d3d12 h264 sustained | 1806 resident | 677 | shape mismatched, no percent |
+| d3d11 h264 sustained | 1806 | 1086 | -39.9% |
+| d3d11 hevc sustained | 1623 | 957 | -41.0% |
+| d3d11 av1 sustained | 1671 | 1108 | -33.7% |
+| d3d11 vp9 sustained | 1269 | 883 | -30.4% |
+| d3d12 h264 sustained | 1806 | 677 | -62.5% |
 
-Vulkan legs share gold's exact bytes (committed IP vectors) with CPU readback included, so +13.4% beats NVDEC doing less work. d3d11 h264 on identical bytes sits between downloaded gold (723, includes a 373 MB file write) and resident gold. Downloaded gold exists for h264 only; the readback path is codec-independent NV12, so one leg represents it.
+All legs share gold's exact bytes (committed IP vectors). Gold excludes the CPU readback our legs include, so every percent below favors gold; d3d11 h264 also sits above downloaded gold (723, includes a 373 MB file write). Downloaded gold exists for h264 only; the readback path is codec-independent NV12, so one leg represents it.
 
 ## Decode sync, fps, rv legs with gold alongside
 
