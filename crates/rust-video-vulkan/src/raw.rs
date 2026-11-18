@@ -1045,6 +1045,12 @@ impl GpuMemory {
         self.memory
     }
 
+    /// Device behind the allocation.
+    #[must_use]
+    pub fn device(&self) -> ash::Device {
+        self.device.clone()
+    }
+
     /// Copy `bytes` into the allocation at offset zero.
     ///
     /// Maps `bytes.len`, never the allocation size.

@@ -78,5 +78,5 @@ fn probe_transcode() {
             transcoder.plan().cause(),
         ),
         Err(error) => println!("transcode: open failed ({error})"),
-    }
+    };
 }

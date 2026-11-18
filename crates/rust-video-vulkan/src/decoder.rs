@@ -1,6 +1,6 @@
 //! Decode behind the caps `Decoder` trait.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use crate::parse::refs::{
     SlotBook,
 };
 use crate::raw::{DeviceExport, ExportPair, OwnedDevice};
+use crate::readback::Readback;
 use crate::session::decode::{
     picture_resource, reference_slot, DpbMeta, ExportTarget, PendingDecode, Session, Submission,
 };
@@ -317,6 +318,10 @@ pub(crate) struct FrameSink {
     exports: Vec<ExportEntry>,
     /// Owned instance plus device, shared with pooled planes.
     keep: Arc<OwnedDevice>,
+    /// Copy worker behind launches.
+    readback: Readback,
+    /// Launched but unharvested pictures, oldest first.
+    launched: VecDeque<LaunchedPicture>,
 }
 
 impl FrameSink {
@@ -330,6 +335,8 @@ impl FrameSink {
             pool: None,
             exports: Vec::new(),
             keep,
+            readback: Readback::spawn(),
+            launched: VecDeque::new(),
         }
     }
 
@@ -754,6 +761,12 @@ pub struct H264Decoder<'a> {
     stats: SubmitStats,
     /// Armed fault for the next submit, applied once a session runs.
     fault: bool,
+}
+
+impl Drop for H264Decoder<'_> {
+    fn drop(&mut self) {
+        self.sink.readback.shutdown();
+    }
 }
 
 impl<'a> H264Decoder<'a> {
@@ -1458,6 +1471,22 @@ pub(crate) enum DrainMode {
     Overlap,
 }
 
+/// Copy launched on the worker, awaiting harvest.
+struct LaunchedPicture {
+    /// Waited picture behind the copy.
+    picture: PendingPicture,
+    /// Engine-wait phase behind the picture.
+    engine_wait: Duration,
+    /// Display size in luma samples.
+    size: PictureSize,
+    /// Coded size behind pool buffers.
+    coded: PictureSize,
+    /// Surface layout behind the frame.
+    layout: SurfaceLayout,
+    /// Live mapping behind a queued copy, for rescue unmaps.
+    release: Option<crate::readback::Release>,
+}
+
 /// Submitted but uncollected picture.
 struct PendingPicture {
     /// Submitted decode behind the picture.
@@ -1539,27 +1568,17 @@ fn plan_submit(
     })
 }
 
-/// Collect one submitted picture into display frames plus its phase timing.
+/// Launch the copy of waited `picture`, or emit it inline without one.
 ///
-/// Always reads the picture back: callers drop unshown frames after
-/// retaining their bytes, never before.
-fn collect_pending(
+/// Lease pictures emit without a copy; readback pictures map and queue,
+/// landing on a later harvest. Returns inline frames, if any.
+fn launch_waited(
     session: &mut Session,
     sink: &mut FrameSink,
-    picture: PendingPicture,
-) -> Result<(Vec<VulkanFrame>, PhaseTiming), VulkanError> {
-    let start = Instant::now();
-    session.wait_pending(picture.pending)?;
-    stage_waited(session, sink, picture, start.elapsed())
-}
-
-/// Stage a waited picture into display frames plus its phase timing.
-fn stage_waited(
-    session: &mut Session,
-    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
     picture: PendingPicture,
     engine_wait: Duration,
-) -> Result<(Vec<VulkanFrame>, PhaseTiming), VulkanError> {
+) -> Result<Vec<VulkanFrame>, VulkanError> {
     let slice = u32::try_from(picture.setup_slot).map_err(|_| ParseError::OutOfRange {
         syntax: "setup slot",
     })?;
@@ -1569,36 +1588,168 @@ fn stage_waited(
         height: coded_height,
     })?;
     let layout = SurfaceLayout::new(slice, coded, session.geometry().origin());
-    let timing_of = |copy: Duration| PhaseTiming {
-        submit: picture.submit,
-        engine_wait,
-        copy,
-        submitted_at: picture.submitted_at,
-        collected_at: Instant::now(),
-    };
     if let Some(lease) = picture.lease {
         let frames = if picture.flush_on_reset {
             sink.emit(session, picture.poc, picture.resets, lease, layout)?
         } else {
             sink.emit_queued(session, picture.poc, lease, layout)?
         };
-        return Ok((frames, timing_of(Duration::ZERO)));
+        fold_collection(
+            session,
+            sink,
+            stats,
+            PhaseTiming {
+                submit: picture.submit,
+                engine_wait,
+                copy: Duration::ZERO,
+                submitted_at: picture.submitted_at,
+                collected_at: Instant::now(),
+            },
+        );
+        return Ok(frames);
     }
     let (display_width, display_height) = session.geometry().display();
     let size = PictureSize::new(display_width, display_height).ok_or(VulkanError::BadExtent {
         width: display_width,
         height: display_height,
     })?;
-    let mut buffer = sink.pooled(size, coded);
-    let copy_start = Instant::now();
-    session.copy_pending_into(picture.pending, &mut buffer)?;
-    let copy = copy_start.elapsed();
+    let buffer = sink.pooled(size, coded);
+    let (data, len, release) = session.map_pending(picture.pending)?;
+    let mapped = crate::readback::Mapped::new(buffer, data, len, release.clone());
+    if let Some(done) = sink.readback.launch(mapped) {
+        let (bytes, release, copy_us) = done.into_parts();
+        release.unmap();
+        return land_launched(
+            session,
+            sink,
+            stats,
+            LaunchedPicture {
+                picture,
+                engine_wait,
+                size,
+                coded,
+                layout,
+                release: None,
+            },
+            bytes,
+            Duration::from_micros(copy_us),
+        );
+    }
+    sink.launched.push_back(LaunchedPicture {
+        picture,
+        engine_wait,
+        size,
+        coded,
+        layout,
+        release: Some(release),
+    });
+    Ok(Vec::new())
+}
+
+/// Land one launched copy into display frames.
+fn land_launched(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
+    launched: LaunchedPicture,
+    buffer: BytesMut,
+    copy: Duration,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let picture = launched.picture;
     let frames = if picture.flush_on_reset {
-        sink.emit_readback(size, buffer, picture.poc, picture.resets, layout)?
+        sink.emit_readback(
+            launched.size,
+            buffer,
+            picture.poc,
+            picture.resets,
+            launched.layout,
+        )?
     } else {
-        sink.emit_readback_queued(size, buffer, picture.poc, layout)?
+        sink.emit_readback_queued(launched.size, buffer, picture.poc, launched.layout)?
     };
-    Ok((frames, timing_of(copy)))
+    fold_collection(
+        session,
+        sink,
+        stats,
+        PhaseTiming {
+            submit: picture.submit,
+            engine_wait: launched.engine_wait,
+            copy,
+            submitted_at: picture.submitted_at,
+            collected_at: Instant::now(),
+        },
+    );
+    Ok(frames)
+}
+
+/// Landed worker copies into display frames, without waiting.
+fn harvest_landed(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let mut out = Vec::new();
+    while let Some(done) = sink.readback.harvest() {
+        let Some(launched) = sink.launched.pop_front() else {
+            debug_assert!(false, "landed copy without launched picture");
+            break;
+        };
+        let (bytes, release, copy_us) = done.into_parts();
+        release.unmap();
+        out.extend(land_launched(
+            session,
+            sink,
+            stats,
+            launched,
+            bytes,
+            Duration::from_micros(copy_us),
+        )?);
+    }
+    Ok(out)
+}
+
+/// Oldest launched copy into display frames, waiting for it.
+///
+/// Falls back to a synchronous read without a worker.
+fn collect_launched(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    let Some(launched) = sink.launched.pop_front() else {
+        return Ok(Vec::new());
+    };
+    match sink.readback.collect() {
+        Some(done) => {
+            let (bytes, release, copy_us) = done.into_parts();
+            release.unmap();
+            land_launched(
+                session,
+                sink,
+                stats,
+                launched,
+                bytes,
+                Duration::from_micros(copy_us),
+            )
+        }
+        None => rescue_launched(session, sink, stats, launched),
+    }
+}
+
+/// Oldest launched copy read synchronously, rescuing a lost worker.
+fn rescue_launched(
+    session: &mut Session,
+    sink: &mut FrameSink,
+    stats: &mut SubmitStats,
+    mut launched: LaunchedPicture,
+) -> Result<Vec<VulkanFrame>, VulkanError> {
+    if let Some(release) = launched.release.take() {
+        release.unmap();
+    }
+    let mut buffer = sink.pooled(launched.size, launched.coded);
+    let copy_start = Instant::now();
+    session.copy_pending_into(launched.picture.pending, &mut buffer)?;
+    land_launched(session, sink, stats, launched, buffer, copy_start.elapsed())
 }
 
 /// Fold one collection into the sink log plus the submit gauges.
@@ -1623,16 +1774,34 @@ fn collect_oldest(
     pending: &mut Vec<PendingPicture>,
     stats: &mut SubmitStats,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
-    if pending.is_empty() {
+    if pending.is_empty() && sink.launched.is_empty() {
         return Ok(Vec::new());
     }
     let Some(session) = session.as_mut() else {
         return Err(VulkanError::NoSession);
     };
+    let mut out = harvest_landed(session, sink, stats)?;
+    if pending.is_empty() {
+        if !out.is_empty() || sink.launched.is_empty() {
+            return Ok(out);
+        }
+        out.extend(collect_launched(session, sink, stats)?);
+        return Ok(out);
+    }
     let picture = pending.remove(0);
-    let (frames, timing) = collect_pending(session, sink, picture)?;
-    fold_collection(session, sink, stats, timing);
-    Ok(frames)
+    let start = Instant::now();
+    session.wait_pending(picture.pending)?;
+    out.extend(launch_waited(
+        session,
+        sink,
+        stats,
+        picture,
+        start.elapsed(),
+    )?);
+    if out.is_empty() && !sink.launched.is_empty() {
+        out.extend(collect_launched(session, sink, stats)?);
+    }
+    Ok(out)
 }
 
 /// Collect the oldest submitted picture, waiting up to `timeout` for it.
@@ -1649,19 +1818,51 @@ fn collect_oldest_timeout(
     if pending.is_empty() {
         return Ok(Some(Vec::new()));
     }
+    if pending.is_empty() && sink.launched.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
     let Some(session) = session.as_mut() else {
         return Err(VulkanError::NoSession);
     };
+    let mut out = harvest_landed(session, sink, stats)?;
+    if pending.is_empty() {
+        return Ok(Some(out));
+    }
     let picture = pending.remove(0);
     let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
     let start = Instant::now();
     if !session.wait_pending_timeout(picture.pending, budget)? {
         pending.insert(0, picture);
-        return Ok(None);
+        return Ok(if out.is_empty() { None } else { Some(out) });
     }
-    let (frames, timing) = stage_waited(session, sink, picture, start.elapsed())?;
-    fold_collection(session, sink, stats, timing);
-    Ok(Some(frames))
+    out.extend(launch_waited(
+        session,
+        sink,
+        stats,
+        picture,
+        start.elapsed(),
+    )?);
+    if out.is_empty() {
+        let elapsed = start.elapsed();
+        let remaining = timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+        if let Some(done) = sink.readback.collect_timeout(remaining) {
+            let Some(launched) = sink.launched.pop_front() else {
+                debug_assert!(false, "landed copy without launched picture");
+                return Ok(Some(out));
+            };
+            let (bytes, release, copy_us) = done.into_parts();
+            release.unmap();
+            out.extend(land_launched(
+                session,
+                sink,
+                stats,
+                launched,
+                bytes,
+                Duration::from_micros(copy_us),
+            )?);
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Collect signaled pictures in order, stopping at the first pending one.
@@ -1680,7 +1881,24 @@ fn collect_ready(
         if !ready {
             break;
         }
-        out.extend(collect_oldest(session, sink, pending, stats)?);
+        let Some(session) = session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
+        let picture = pending.remove(0);
+        let start = Instant::now();
+        session.wait_pending(picture.pending)?;
+        out.extend(launch_waited(
+            session,
+            sink,
+            stats,
+            picture,
+            start.elapsed(),
+        )?);
+    }
+    if !sink.launched.is_empty() {
+        if let Some(session) = session.as_mut() {
+            out.extend(harvest_landed(session, sink, stats)?);
+        }
     }
     Ok(out)
 }
@@ -1712,7 +1930,7 @@ fn drain_pending(
     stats: &mut SubmitStats,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
     let mut out = Vec::new();
-    while !pending.is_empty() {
+    while !pending.is_empty() || !sink.launched.is_empty() {
         out.extend(collect_oldest(session, sink, pending, stats)?);
     }
     Ok(out)
@@ -1847,6 +2065,12 @@ pub struct H265Decoder<'a> {
     stats: SubmitStats,
     /// Armed fault for the next submit, applied once a session runs.
     fault: bool,
+}
+
+impl Drop for H265Decoder<'_> {
+    fn drop(&mut self) {
+        self.sink.readback.shutdown();
+    }
 }
 
 impl<'a> H265Decoder<'a> {
@@ -2482,6 +2706,12 @@ pub struct Av1Decoder<'a> {
     fault: bool,
 }
 
+impl Drop for Av1Decoder<'_> {
+    fn drop(&mut self) {
+        self.sink.readback.shutdown();
+    }
+}
+
 /// Resolved reference state of one AV1 picture submit.
 struct Av1RefState {
     /// Stored order hint per reference name.
@@ -2856,17 +3086,113 @@ impl<'a> Av1Decoder<'a> {
     ///
     /// Empty when nothing is submitted.
     fn collect_one(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.sink.launched.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(frames) = self.harvest_one()? {
+            return Ok(frames);
         }
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
         };
+        if self.pending.is_empty() {
+            return self.collect_launched_one();
+        }
         let picture = self.pending.remove(0);
+        let start = Instant::now();
+        session.wait_pending(picture.pending)?;
+        let engine_wait = start.elapsed();
+        let frames = launch_waited(
+            session,
+            &mut self.sink,
+            &mut self.stats,
+            picture,
+            engine_wait,
+        )?;
+        if !frames.is_empty() || self.sink.launched.is_empty() {
+            return Ok(frames);
+        }
+        let mut out = frames;
+        out.extend(self.collect_launched_one()?);
+        Ok(out)
+    }
+
+    /// Oldest landed copy into display frames, if any arrived.
+    fn harvest_one(&mut self) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        if self.session.is_none() {
+            return Err(VulkanError::NoSession);
+        }
+        let Some(done) = self.sink.readback.harvest() else {
+            return Ok(None);
+        };
+        let Some(launched) = self.sink.launched.pop_front() else {
+            debug_assert!(false, "landed copy without launched picture");
+            return Ok(None);
+        };
+        let (bytes, release, copy_us) = done.into_parts();
+        release.unmap();
+        self.land_retained(launched, bytes, Duration::from_micros(copy_us))
+            .map(Some)
+    }
+
+    /// Oldest launched copy into display frames, waiting for it.
+    fn collect_launched_one(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let Some(launched) = self.sink.launched.pop_front() else {
+            return Ok(Vec::new());
+        };
+        if let Some(done) = self.sink.readback.collect() {
+            let (bytes, release, copy_us) = done.into_parts();
+            release.unmap();
+            return self.land_retained(launched, bytes, Duration::from_micros(copy_us));
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
+        let mut launched = launched;
+        if let Some(release) = launched.release.take() {
+            release.unmap();
+        }
+        let mut buffer = self.sink.pooled(launched.size, launched.coded);
+        let copy_start = Instant::now();
+        session.copy_pending_into(launched.picture.pending, &mut buffer)?;
+        self.land_retained(launched, buffer, copy_start.elapsed())
+    }
+
+    /// Land one launched copy, retaining reference frames.
+    fn land_retained(
+        &mut self,
+        launched: LaunchedPicture,
+        buffer: BytesMut,
+        copy: Duration,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let LaunchedPicture {
+            picture,
+            engine_wait,
+            size,
+            coded: _,
+            layout,
+            release: _,
+        } = launched;
         let emit = picture.emit;
         let show_id = picture.show_id;
         let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
-        let (frames, timing) = collect_pending(session, &mut self.sink, picture)?;
+        let frames = if picture.flush_on_reset {
+            self.sink
+                .emit_readback(size, buffer, picture.poc, picture.resets, layout)?
+        } else {
+            self.sink
+                .emit_readback_queued(size, buffer, picture.poc, layout)?
+        };
+        let timing = PhaseTiming {
+            submit: picture.submit,
+            engine_wait,
+            copy,
+            submitted_at: picture.submitted_at,
+            collected_at: Instant::now(),
+        };
+        let Some(session) = self.session.as_mut() else {
+            return Err(VulkanError::NoSession);
+        };
         fold_collection(session, &mut self.sink, &mut self.stats, timing);
         Ok(self.finish_retained(emit, show_id, pair.as_ref(), frames))
     }
@@ -2879,6 +3205,12 @@ impl<'a> Av1Decoder<'a> {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        if self.pending.is_empty() && self.sink.launched.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if let Some(frames) = self.harvest_one()? {
+            return Ok(Some(frames));
+        }
         if self.pending.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -2886,23 +3218,39 @@ impl<'a> Av1Decoder<'a> {
             return Err(VulkanError::NoSession);
         };
         let picture = self.pending.remove(0);
-        let emit = picture.emit;
-        let show_id = picture.show_id;
-        let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
         let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         let start = Instant::now();
         if !session.wait_pending_timeout(picture.pending, budget)? {
             self.pending.insert(0, picture);
             return Ok(None);
         }
-        let (frames, timing) = stage_waited(session, &mut self.sink, picture, start.elapsed())?;
-        fold_collection(session, &mut self.sink, &mut self.stats, timing);
-        Ok(Some(self.finish_retained(
-            emit,
-            show_id,
-            pair.as_ref(),
-            frames,
-        )))
+        let engine_wait = start.elapsed();
+        let frames = launch_waited(
+            session,
+            &mut self.sink,
+            &mut self.stats,
+            picture,
+            engine_wait,
+        )?;
+        if !frames.is_empty() {
+            return Ok(Some(frames));
+        }
+        let elapsed = start.elapsed();
+        let remaining = timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO);
+        let Some(done) = self.sink.readback.collect_timeout(remaining) else {
+            return Ok(Some(Vec::new()));
+        };
+        let Some(launched) = self.sink.launched.pop_front() else {
+            debug_assert!(false, "landed copy without launched picture");
+            return Ok(Some(Vec::new()));
+        };
+        let (bytes, release, copy_us) = done.into_parts();
+        release.unmap();
+        Ok(Some(self.land_retained(
+            launched,
+            bytes,
+            Duration::from_micros(copy_us),
+        )?))
     }
 
     /// Collect signaled pictures in order, stopping at the first pending one.
@@ -2924,7 +3272,7 @@ impl<'a> Av1Decoder<'a> {
     /// Collect every submitted picture, retaining reference frames.
     fn drain(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
-        while !self.pending.is_empty() {
+        while !self.pending.is_empty() || !self.sink.launched.is_empty() {
             out.extend(self.collect_one()?);
         }
         Ok(out)

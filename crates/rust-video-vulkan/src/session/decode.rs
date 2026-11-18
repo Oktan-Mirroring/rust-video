@@ -383,6 +383,30 @@ impl Session {
         self.readbacks[pending.slot].memory().read_to_buf(out, len)
     }
 
+    /// Mapped readback behind `pending` for a worker copy.
+    ///
+    /// Call only after the slot's fence signaled; the caller releases
+    /// the mapping after its copy lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when sizing overflows or the map fails.
+    pub(crate) fn map_pending(
+        &self,
+        pending: PendingDecode,
+    ) -> Result<(*const u8, usize, crate::readback::Release), VulkanError> {
+        use crate::readback::Release;
+        let display = as_extent(self.geometry.display());
+        let len = usize::try_from(nv12_bytes(display)).map_err(|_| {
+            crate::error::ParseError::OutOfRange {
+                syntax: "readback size",
+            }
+        })?;
+        let memory = self.readbacks[pending.slot].memory();
+        let data = memory.map_prefix(len)?;
+        Ok((data, len, Release::new(memory.device(), memory.memory())))
+    }
+
     /// Submit-core gauges snapshot.
     #[must_use]
     pub(crate) fn submit_stats(&self) -> SubmitStats {

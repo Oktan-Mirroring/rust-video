@@ -9,6 +9,7 @@ mod inflight;
 mod ladder;
 mod parse;
 mod raw;
+mod readback;
 mod session;
 mod transcode;
 
