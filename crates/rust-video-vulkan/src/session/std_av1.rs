@@ -394,12 +394,12 @@ fn fill_segmentation(header: &FrameHeader) -> StdVideoAV1Segmentation {
     let seg = header.segmentation();
     let mut enabled = [0_u8; 8];
     let mut data = [[0_i16; 8]; 8];
-    for segment in 0..8 {
-        for level in 0..8 {
-            if seg.feature_enabled[segment][level] {
-                enabled[segment] |= 1 << level;
+    for (segment, (seg_enabled, seg_data)) in enabled.iter_mut().zip(data.iter_mut()).enumerate() {
+        *seg_data = seg.feature_value[segment];
+        for (level, &flag) in seg.feature_enabled[segment].iter().enumerate() {
+            if flag {
+                *seg_enabled |= 1 << level;
             }
-            data[segment][level] = seg.feature_value[segment][level];
         }
     }
     StdVideoAV1Segmentation {

@@ -40,6 +40,11 @@ impl Gop {
         Self { interval: 1 }
     }
 
+    /// Frames between IDR pictures.
+    pub(crate) fn period(self) -> u32 {
+        self.interval
+    }
+
     /// True when picture `index` codes as IDR.
     fn is_idr(self, index: u64) -> bool {
         index.is_multiple_of(u64::from(self.interval))
@@ -96,7 +101,7 @@ impl Engine {
         if device.op() != op {
             return Err(VulkanError::OverCaps { what: "codec op" });
         }
-        let session = EncodeSession::open(device, codec, width, height)?;
+        let session = EncodeSession::open(device, codec, width, height, gop.period())?;
         let gop = if session.supports_p_frames() {
             gop
         } else {

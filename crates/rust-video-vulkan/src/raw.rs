@@ -186,6 +186,10 @@ impl AshBackend {
         let h265_encode = self.h265_encode_caps(adapter, &names);
         Ok(AdapterFacts {
             handle: adapter,
+            name: properties
+                .device_name_as_c_str()?
+                .to_string_lossy()
+                .into_owned(),
             fingerprint: AdapterFingerprint {
                 vendor: properties.vendor_id,
                 device: properties.device_id,

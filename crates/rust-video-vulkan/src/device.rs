@@ -90,6 +90,13 @@ impl VulkanDevice {
                 Err(LadderError::Hard(error)) => return Err(error),
             }
         };
+        log::info!(
+            "negotiated {:?} on {} ({:04x}:{:04x})",
+            op,
+            won.facts.name,
+            won.facts.fingerprint.vendor,
+            won.facts.fingerprint.device
+        );
         let queue_family = won.queue_family;
         let caps = won.caps;
         let facts = won.facts;

@@ -190,6 +190,8 @@ impl AdapterFingerprint {
 pub(crate) struct AdapterFacts<A> {
     /// Backend handle for device creation.
     pub handle: A,
+    /// Device name from properties.
+    pub name: String,
     /// Identity stable across instances.
     pub fingerprint: AdapterFingerprint,
     /// Packed device API version.
@@ -601,6 +603,7 @@ mod tests {
     fn green_for(op: CodecOp) -> AdapterFacts<usize> {
         AdapterFacts {
             handle: 0,
+            name: "fake".to_owned(),
             fingerprint: AdapterFingerprint {
                 vendor: 0,
                 device: 0,

@@ -50,7 +50,7 @@ use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
 
 /// Rate-control frame rate numerator in frames per second.
-const RC_FPS: u32 = 30;
+const RC_FPS: u32 = 60;
 
 /// Rate-control frame rate denominator.
 const RC_FPS_DENOM: u32 = 1;
@@ -130,7 +130,7 @@ impl RateControl {
     #[must_use]
     pub fn cbr_for(extent: vk::Extent2D) -> Self {
         let frame_bits = u64::from(extent.width) * u64::from(extent.height) * 3 / 2 * 8;
-        let average = (frame_bits * u64::from(RC_FPS) / 10).max(64_000);
+        let average = (frame_bits * u64::from(RC_FPS) / 20).max(64_000);
         Self {
             average_bitrate: average,
             max_bitrate: average,
@@ -531,11 +531,14 @@ const VIRTUAL_BUFFER_MS: u32 = 1_000;
 /// Initial virtual buffer fullness in milliseconds behind CBR control.
 const INITIAL_BUFFER_MS: u32 = 500;
 
-/// CBR control over `layer`.
+/// Encode-rate-control bit of the coding control flags.
 ///
-/// Every begin carries the control: drivers read rate control state
-/// from the begin chain, and the preconfigured control path fails
-/// on them.
+/// ash 0.38 omits the bit; value from `VkVideoCodingControlFlagBitsKHR`.
+/// <https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkVideoCodingControlFlagBitsKHR.html>
+const ENCODE_RATE_CONTROL: vk::VideoCodingControlFlagsKHR =
+    vk::VideoCodingControlFlagsKHR::from_raw(0x0000_0002);
+
+/// CBR control over `layer`.
 fn rc_control<'a>(
     layer: &'a vk::VideoEncodeRateControlLayerInfoKHR<'_>,
 ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
@@ -920,6 +923,10 @@ pub(crate) struct EncodeSession {
     feedback: EncodeFeedback,
     /// CBR rate control.
     rate: RateControl,
+    /// Rate control configured on the session.
+    rc_configured: bool,
+    /// Frames between IDR pictures.
+    idr_period: u32,
     /// Driver-encoded parameter sets prepended to keyframe packets.
     headers: Vec<u8>,
 }
@@ -943,6 +950,8 @@ struct EncodePlan {
 impl EncodeSession {
     /// Session over `device` for `codec` at `width`x`height`.
     ///
+    /// `idr_period` counts frames between IDR pictures; 0 clamps to 1.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the device negotiated decode, the extent
@@ -952,6 +961,7 @@ impl EncodeSession {
         codec: EncodeCodec,
         width: u32,
         height: u32,
+        idr_period: u32,
     ) -> Result<Self, VulkanError> {
         let crate::ladder::OpCaps::Encode(facts) = device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
@@ -985,6 +995,7 @@ impl EncodeSession {
         let format = crate::raw::pick_video_format(&formats).ok_or(VulkanError::NoVideoFormat)?;
         let p_capable = facts.dpb_slots >= ENCODE_DPB_SLOTS && facts.active_refs >= 1;
         let dpb_count = if p_capable { ENCODE_DPB_SLOTS } else { 1 };
+        let idr_period = if p_capable { idr_period.max(1) } else { 1 };
         let resources =
             Self::open_resources(device, &properties, format, extent, &profile, dpb_count)?;
         let desc = crate::raw::VideoSessionDesc {
@@ -1043,6 +1054,8 @@ impl EncodeSession {
             bitstream: resources.bitstream,
             feedback: resources.feedback,
             rate: RateControl::cbr_for(extent),
+            rc_configured: false,
+            idr_period,
             headers,
         })
     }
@@ -1233,6 +1246,7 @@ impl EncodeSession {
         self.dpb_layouts.fill(vk::ImageLayout::UNDEFINED);
         self.slots.release_all();
         self.meta.fill(None);
+        self.rc_configured = false;
     }
 
     /// Claimed setup slot and live reference for `stamp`.
@@ -1603,13 +1617,71 @@ impl EncodeSession {
             recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&head));
         }
         recorder.reset_queries(self.feedback.pool(), query, 1);
-        let layer = rc_layer(&self.rate);
-        let mut control = rc_control(&layer);
+        let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default();
+        let mut h265_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default();
+        let mut layer = rc_layer(&self.rate);
         match self.codec {
-            EncodeCodec::H264 => self.record_h264(cmd, query, stamp, plan, &mut control)?,
-            EncodeCodec::H265 => self.record_h265(cmd, query, stamp, plan, &mut control)?,
+            EncodeCodec::H264 => {
+                layer.p_next = std::ptr::from_mut(&mut h264_layer).cast();
+            }
+            EncodeCodec::H265 => {
+                layer.p_next = std::ptr::from_mut(&mut h265_layer).cast();
+            }
         }
+        let mut control = rc_control(&layer);
+        let mut h264_rc = vk::VideoEncodeH264RateControlInfoKHR {
+            gop_frame_count: self.idr_period,
+            idr_period: self.idr_period,
+            consecutive_b_frame_count: 0,
+            temporal_layer_count: 1,
+            ..Default::default()
+        };
+        let mut h265_rc = vk::VideoEncodeH265RateControlInfoKHR {
+            gop_frame_count: self.idr_period,
+            idr_period: self.idr_period,
+            consecutive_b_frame_count: 0,
+            sub_layer_count: 1,
+            ..Default::default()
+        };
+        match self.codec {
+            EncodeCodec::H264 => {
+                control.p_next = std::ptr::from_mut(&mut h264_rc).cast();
+            }
+            EncodeCodec::H265 => {
+                control.p_next = std::ptr::from_mut(&mut h265_rc).cast();
+            }
+        }
+        let first = !self.rc_configured;
+        match self.codec {
+            EncodeCodec::H264 => self.record_h264(cmd, query, stamp, plan, &mut control, first)?,
+            EncodeCodec::H265 => self.record_h265(cmd, query, stamp, plan, &mut control, first)?,
+        }
+        self.rc_configured = true;
         Ok(())
+    }
+
+    /// Begin one coding scope, configuring rate control on the first.
+    ///
+    /// The first begin carries no rate control; the control command
+    /// configures it. Later begins declare it to match session state.
+    /// VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254.
+    fn begin_scope(
+        &self,
+        cmd: vk::CommandBuffer,
+        begin: vk::VideoBeginCodingInfoKHR<'_>,
+        control: &mut vk::VideoEncodeRateControlInfoKHR<'_>,
+        first: bool,
+    ) {
+        if first {
+            self.video.begin_coding(cmd, &begin);
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(vk::VideoCodingControlFlagsKHR::RESET | ENCODE_RATE_CONTROL)
+                .push_next(control);
+            self.video.control_coding(cmd, &control_info);
+        } else {
+            let begin = begin.push_next(control);
+            self.video.begin_coding(cmd, &begin);
+        }
     }
 
     /// Record one H.264 IDR or P encode.
@@ -1620,6 +1692,7 @@ impl EncodeSession {
         stamp: PictureStamp,
         plan: &EncodePlan,
         control: &mut vk::VideoEncodeRateControlInfoKHR<'_>,
+        first: bool,
     ) -> Result<(), VulkanError> {
         let recorder = self.submit.pool().recorder(cmd);
         let idr = plan.coded_idr;
@@ -1675,8 +1748,7 @@ impl EncodeSession {
             p_reference_slots: begin_list.as_ptr(),
             ..Default::default()
         };
-        let begin = begin.push_next(control);
-        self.video.begin_coding(cmd, &begin);
+        self.begin_scope(cmd, begin, control, first);
         recorder.begin_query(self.feedback.pool(), query);
         let ref_lists = plan_ref_slot(plan)?.map(h264_ref_lists);
         let std_picture = h264_encode_picture(
@@ -1717,6 +1789,7 @@ impl EncodeSession {
         stamp: PictureStamp,
         plan: &EncodePlan,
         control: &mut vk::VideoEncodeRateControlInfoKHR<'_>,
+        first: bool,
     ) -> Result<(), VulkanError> {
         let recorder = self.submit.pool().recorder(cmd);
         let idr = plan.coded_idr;
@@ -1770,8 +1843,7 @@ impl EncodeSession {
             p_reference_slots: begin_list.as_ptr(),
             ..Default::default()
         };
-        let begin = begin.push_next(control);
-        self.video.begin_coding(cmd, &begin);
+        self.begin_scope(cmd, begin, control, first);
         recorder.begin_query(self.feedback.pool(), query);
         let ref_lists = plan_ref_slot(plan)?.map(h265_ref_lists);
         let rps = h265_rps(plan.rps_delta_minus1);
@@ -1928,7 +2000,7 @@ mod tests {
         };
         let rate = RateControl::cbr_for(extent);
         let frame_bits = 320 * 240 * 3 / 2 * 8;
-        assert_eq!(rate.average_bitrate, frame_bits * 30 / 10);
+        assert_eq!(rate.average_bitrate, frame_bits * 60 / 20);
         assert_eq!(rate.max_bitrate, rate.average_bitrate);
     }
 }
