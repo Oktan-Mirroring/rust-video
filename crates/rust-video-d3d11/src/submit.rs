@@ -222,6 +222,21 @@ impl CopySlot {
         context: &ID3D11DeviceContext,
         crop: Option<Crop>,
     ) -> Result<Bytes, D3d11Error> {
+        let mapped = self.map(context)?;
+        let bytes = copy_nv12(&mapped, self.width, self.height, crop);
+        self.unmap(context);
+        bytes
+    }
+
+    /// Mapped staging texture for CPU reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the map fails.
+    pub(crate) fn map(
+        &self,
+        context: &ID3D11DeviceContext,
+    ) -> Result<D3D11_MAPPED_SUBRESOURCE, D3d11Error> {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // Sound: the staging texture is live with read access.
         unsafe {
@@ -237,12 +252,15 @@ impl CopySlot {
             call: "Map",
             hresult: error.code().0,
         })?;
-        let bytes = copy_nv12(&mapped, self.width, self.height, crop);
+        Ok(mapped)
+    }
+
+    /// Release a mapping from [`map`](Self::map).
+    pub(crate) fn unmap(&self, context: &ID3D11DeviceContext) {
         // Sound: the staging texture mapped above.
         unsafe {
             context.Unmap(&self.staging, 0);
         }
-        bytes
     }
 }
 
