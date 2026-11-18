@@ -47,11 +47,11 @@ instance and compared unequal on the same GPU.
 
 `VulkanFrame` holds NV12 bytes from CPU decode and a device export
 on the GPU path, where `export()` returns DMA-BUF planes on Unix
-and `nv12` is empty; without a DMA-BUF export it is
-`Opaque { name: "vulkan" }`. `VulkanDevice::share_mechanism` reports
-`DmaBuf` where the adapter enables external-memory FD, `None`
-otherwise; no Windows share path exists. A surface frame
-keeps its device alive until dropped.
+and one NT handle on Windows while `nv12` stays empty; without a
+platform export it is `Opaque { name: "vulkan" }`.
+`VulkanDevice::share_mechanism` reports `DmaBuf` or `NtHandle`
+where the adapter enables the platform external-memory pair, `None`
+otherwise. A surface frame keeps its device alive until dropped.
 
 ## Performance notes
 
