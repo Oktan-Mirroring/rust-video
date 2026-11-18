@@ -30,7 +30,7 @@ const ITERS: u32 = 30;
 const BAR: f64 = 60.0;
 
 /// Sustained overlap bars: quiet medians minus 20% headroom, 2026-11-18.
-const SUSTAINED_H264_BAR: f64 = 1630.0;
+const SUSTAINED_H264_BAR: f64 = 2310.0;
 const SUSTAINED_H265_BAR: f64 = 1390.0;
 const SUSTAINED_AV1_BAR: f64 = 1200.0;
 
