@@ -74,12 +74,11 @@ commit-lint-gate:
     {{python}} .agents/hooks/commit-lint-gate.py
 
 # MSRV gate: check and test on the pinned 1.87.0 toolchain. sw/openh264
-# stays out: its transitive safe_arch/wide need rustc 1.89.
+# stays out: its transitive safe_arch/wide need rustc 1.89. Throughput
+# legs run before the full suites, on a cool box.
 msrv:
     cargo +1.87.0 clippy --workspace --exclude rust-video-sw --all-targets --all-features -- -D warnings
     cargo +1.87.0 clippy -p rust-video-sw --all-targets -- -D warnings
-    cargo +1.87.0 test --workspace
-    cargo +1.87.0 test --workspace --no-default-features
     cargo +1.87.0 test -p rust-video-d3d11 --test throughput
     cargo +1.87.0 test -p rust-video-d3d11 --test throughput -- --ignored --exact encode_vp9_1080p_measures_realtime
     cargo +1.87.0 test -p rust-video-d3d12 --test throughput
@@ -87,4 +86,6 @@ msrv:
     cargo +1.87.0 test -p rust-video-vaapi --test throughput
     cargo +1.87.0 test -p rust-video-mediacodec --test throughput
     cargo +1.87.0 test -p rust-video-sw --test throughput
+    cargo +1.87.0 test --workspace
+    cargo +1.87.0 test --workspace --no-default-features
     cargo +1.87.0 test -p rust-video-livepack --test throughput
