@@ -1616,7 +1616,9 @@ fn launch_waited(
     let buffer = sink.pooled(size, coded);
     let (data, len, release) = session.map_pending(picture.pending)?;
     let mapped = crate::readback::Mapped::new(buffer, data, len, release.clone());
-    if let Some(done) = sink.readback.launch(mapped) {
+    // References land deferred: show-existing reads them after release.
+    let inline = picture.show_id.is_none();
+    if let Some(done) = sink.readback.launch(mapped, inline) {
         let (bytes, release, copy) = done.into_parts();
         release.unmap();
         return land_launched(
