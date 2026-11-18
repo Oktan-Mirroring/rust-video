@@ -25,6 +25,9 @@ const HOPS: u32 = 30;
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
+/// Sustained overlap bar: quiet median minus 20% headroom, 2026-11-18.
+const SUSTAINED_H264_BAR: f64 = 490.0;
+
 /// Serializes added benches sharing one adapter.
 static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -515,9 +518,7 @@ fn decode_av1_surface_1080p_measures_realtime() {
     );
 }
 
-/// Sustained 1080p H.264 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p H.264 overlap throughput against its bar.
 #[test]
 fn sustained_h264_1080p_measures_realtime() {
     let _guard = BENCH_LOCK.lock().expect("bench lock");
@@ -566,10 +567,10 @@ fn sustained_h264_1080p_measures_realtime() {
     let depth = pump.max_depth();
     let total = u32::try_from(frames.len()).expect("frame count fits");
     let measured = f64::from(total) / wall.as_secs_f64();
-    println!("d3d12 h264 sustained overlap 1080p: {measured:.1}fps over {} frames, depth {depth}, bar {BAR:.0}fps", frames.len());
+    println!("d3d12 h264 sustained overlap 1080p: {measured:.1}fps over {} frames, depth {depth}, bar {SUSTAINED_H264_BAR:.0}fps", frames.len());
     assert_eq!(frames.len(), raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_H264_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
     );
 }

@@ -29,6 +29,11 @@ const ITERS: u32 = 30;
 /// Tier realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
+/// Sustained overlap bars: quiet medians minus 20% headroom, 2026-11-18.
+const SUSTAINED_H264_BAR: f64 = 1630.0;
+const SUSTAINED_H265_BAR: f64 = 1390.0;
+const SUSTAINED_AV1_BAR: f64 = 1200.0;
+
 /// Device for `op`, skipping loud when the tier declines.
 fn device_or_skip(op: CodecOp) -> Option<VulkanDevice> {
     match VulkanDevice::open(op) {
@@ -466,9 +471,7 @@ fn sustained_fps<D: OverlappedDecode>(decoder: D, raws: &[Vec<u8>]) -> (f64, usi
     (f64::from(total) / wall.as_secs_f64(), frames.len())
 }
 
-/// Sustained 1080p H.264 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p H.264 overlap throughput against its bar.
 #[test]
 fn sustained_h264_1080p_measures_realtime() {
     let _guard = SERIAL.lock().expect("bench lock");
@@ -486,17 +489,15 @@ fn sustained_h264_1080p_measures_realtime() {
         AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let (measured, count) = sustained_fps(decoder, &raws);
-    println!("vulkan h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps");
+    println!("vulkan h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_H264_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_H264_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
     );
 }
 
-/// Sustained 1080p H.265 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p H.265 overlap throughput against its bar.
 #[test]
 fn sustained_h265_1080p_measures_realtime() {
     let _guard = SERIAL.lock().expect("bench lock");
@@ -514,17 +515,15 @@ fn sustained_h265_1080p_measures_realtime() {
         AnnexB::picture_packets(&bench_dir().join("h265-1080p_ip.h265"), AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let (measured, count) = sustained_fps(decoder, &raws);
-    println!("vulkan h265 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps");
+    println!("vulkan h265 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_H265_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_H265_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_H265_BAR:.0}fps"
     );
 }
 
-/// Sustained 1080p AV1 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p AV1 overlap throughput against its bar.
 #[test]
 fn sustained_av1_1080p_measures_realtime() {
     let _guard = SERIAL.lock().expect("bench lock");
@@ -542,11 +541,11 @@ fn sustained_av1_1080p_measures_realtime() {
     assert!(!raws.is_empty(), "bench vector holds frames");
     let (measured, count) = sustained_fps(decoder, &raws);
     println!(
-        "vulkan av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps"
+        "vulkan av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_AV1_BAR:.0}fps"
     );
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_AV1_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_AV1_BAR:.0}fps"
     );
 }

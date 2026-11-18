@@ -23,6 +23,12 @@ const HOPS: u32 = 30;
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
+/// Sustained overlap bars: quiet medians minus 20% headroom, 2026-11-18.
+const SUSTAINED_H264_BAR: f64 = 860.0;
+const SUSTAINED_HEVC_BAR: f64 = 760.0;
+const SUSTAINED_AV1_BAR: f64 = 880.0;
+const SUSTAINED_VP9_BAR: f64 = 700.0;
+
 /// Warmup frames ahead of the timed loop.
 const WARMUP: u64 = 4;
 
@@ -799,9 +805,7 @@ where
     (f64::from(total) / wall.as_secs_f64(), frames.len(), depth)
 }
 
-/// Sustained 1080p H.264 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p H.264 overlap throughput against its bar.
 #[test]
 fn sustained_h264_1080p_measures_realtime() {
     let _serial = measure();
@@ -821,17 +825,15 @@ fn sustained_h264_1080p_measures_realtime() {
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let decoder = H264Decoder::open(&device);
     let (measured, count, depth) = sustained_fps(decoder, &raws);
-    println!("d3d11 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    println!("d3d11 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_H264_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_H264_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
     );
 }
 
-/// Sustained 1080p HEVC overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p HEVC overlap throughput against its bar.
 #[test]
 fn sustained_hevc_1080p_measures_realtime() {
     let _serial = measure();
@@ -851,17 +853,15 @@ fn sustained_hevc_1080p_measures_realtime() {
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let decoder = HevcDecoder::open(&device);
     let (measured, count, depth) = sustained_fps(decoder, &raws);
-    println!("d3d11 hevc sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    println!("d3d11 hevc sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_HEVC_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_HEVC_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_HEVC_BAR:.0}fps"
     );
 }
 
-/// Sustained 1080p AV1 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p AV1 overlap throughput against its bar.
 #[test]
 fn sustained_av1_1080p_measures_realtime() {
     let _serial = measure();
@@ -880,17 +880,15 @@ fn sustained_av1_1080p_measures_realtime() {
     assert!(!raws.is_empty(), "bench vector holds frames");
     let decoder = Av1Decoder::open(&device);
     let (measured, count, depth) = sustained_fps(decoder, &raws);
-    println!("d3d11 av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    println!("d3d11 av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_AV1_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_AV1_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_AV1_BAR:.0}fps"
     );
 }
 
-/// Sustained 1080p VP9 overlap throughput against the realtime bar.
-///
-/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+/// Sustained 1080p VP9 overlap throughput against its bar.
 #[test]
 fn sustained_vp9_1080p_measures_realtime() {
     let _serial = measure();
@@ -909,10 +907,10 @@ fn sustained_vp9_1080p_measures_realtime() {
     assert!(!raws.is_empty(), "bench vector holds frames");
     let decoder = Vp9Decoder::open(&device);
     let (measured, count, depth) = sustained_fps(decoder, &raws);
-    println!("d3d11 vp9 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    println!("d3d11 vp9 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_VP9_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
-        measured >= BAR,
-        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+        measured >= SUSTAINED_VP9_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_VP9_BAR:.0}fps"
     );
 }
