@@ -407,6 +407,37 @@ impl Session {
         lane.read(&self.context, crop)
     }
 
+    /// Mapped staging of `slot` for a worker copy.
+    ///
+    /// Call after [`poll_slot`](Self::poll_slot) or [`wait_slot`](Self::wait_slot);
+    /// mapping an incomplete copy reads torn bytes. The caller releases
+    /// the mapping after its copy lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views or when the map fails.
+    pub fn map_slot(
+        &self,
+        slot: u8,
+        crop: Option<Crop>,
+    ) -> Result<crate::readback::Mapped, D3d11Error> {
+        use crate::readback::{Mapped, Release};
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or(D3d11Error::BrokenReference(
+                BrokenReferenceReason::SlotOutsideViews,
+            ))?;
+        let mapped = lane.map(&self.context)?;
+        Ok(Mapped::new(
+            mapped,
+            self.width,
+            self.height,
+            crop,
+            Release::new(self.context.clone(), lane.staging()),
+        ))
+    }
+
     /// Decode `submission` onto its surface slot.
     fn submit_windows(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);

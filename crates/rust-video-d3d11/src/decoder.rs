@@ -12,10 +12,12 @@ use crate::guid::Codec;
 use crate::h264::{Crop, Ingest, Picture};
 use crate::inflight::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
 use crate::pins::SlotPins;
+use crate::readback::Readback;
 use crate::session::Session;
 use crate::session::SharedExport;
 use crate::submit::SurfaceFence;
 
+use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::delivery::TrySendError;
 use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
@@ -222,6 +224,11 @@ impl Active {
             visible,
         })
     }
+
+    /// Visible rectangle, absent when uncropped.
+    pub(crate) fn crop(&self) -> Option<Crop> {
+        self.crop
+    }
 }
 
 /// H.264 decoder over a D3D11 device.
@@ -250,6 +257,14 @@ pub struct H264Decoder<'a> {
     phases: Vec<FramePhases>,
     /// Input ended; sends refuse, receives drain then end.
     finished: bool,
+    /// Copy worker behind launches.
+    readback: Readback,
+}
+
+impl Drop for H264Decoder<'_> {
+    fn drop(&mut self) {
+        self.readback.shutdown();
+    }
 }
 
 impl<'a> H264Decoder<'a> {
@@ -269,6 +284,7 @@ impl<'a> H264Decoder<'a> {
             capture: false,
             phases: Vec::new(),
             finished: false,
+            readback: Readback::spawn(),
         }
     }
 
@@ -293,6 +309,7 @@ impl<'a> H264Decoder<'a> {
             &mut self.generation,
             self.capture,
             &mut self.phases,
+            &self.readback,
         )
     }
 
@@ -697,6 +714,17 @@ pub(crate) fn emit_frame(
     generation: u64,
 ) -> Result<D3d11Frame, D3d11Error> {
     let data = session.read_slot(slot, active.crop)?;
+    emit_frame_bytes(session, shared, active, generation, data)
+}
+
+/// Frame over already-read `data`.
+pub(crate) fn emit_frame_bytes(
+    session: &Session,
+    shared: &SharedDevice,
+    active: &Active,
+    generation: u64,
+    data: Bytes,
+) -> Result<D3d11Frame, D3d11Error> {
     let lease = shared.try_acquire(data.len() as u64)?;
     let export = session.export().map(|shared| {
         let export: Box<dyn FrameExport> = Box::new(shared);
@@ -761,6 +789,14 @@ pub struct HevcDecoder<'a> {
     phases: Vec<FramePhases>,
     /// Input ended; sends refuse, receives drain then end.
     finished: bool,
+    /// Copy worker behind launches.
+    readback: Readback,
+}
+
+impl Drop for HevcDecoder<'_> {
+    fn drop(&mut self) {
+        self.readback.shutdown();
+    }
 }
 
 impl<'a> HevcDecoder<'a> {
@@ -780,6 +816,7 @@ impl<'a> HevcDecoder<'a> {
             capture: false,
             phases: Vec::new(),
             finished: false,
+            readback: Readback::spawn(),
         }
     }
 
@@ -804,6 +841,7 @@ impl<'a> HevcDecoder<'a> {
             &mut self.generation,
             self.capture,
             &mut self.phases,
+            &self.readback,
         )
     }
 
@@ -1231,6 +1269,14 @@ pub struct Av1Decoder<'a> {
     phases: Vec<FramePhases>,
     /// Input ended; sends refuse, receives drain then end.
     finished: bool,
+    /// Copy worker behind launches.
+    readback: Readback,
+}
+
+impl Drop for Av1Decoder<'_> {
+    fn drop(&mut self) {
+        self.readback.shutdown();
+    }
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -1250,6 +1296,7 @@ impl<'a> Av1Decoder<'a> {
             capture: false,
             phases: Vec::new(),
             finished: false,
+            readback: Readback::spawn(),
         }
     }
 
@@ -1274,6 +1321,7 @@ impl<'a> Av1Decoder<'a> {
             &mut self.generation,
             self.capture,
             &mut self.phases,
+            &self.readback,
         )
     }
 
@@ -1762,6 +1810,14 @@ pub struct Vp9Decoder<'a> {
     phases: Vec<FramePhases>,
     /// Input ended; sends refuse, receives drain then end.
     finished: bool,
+    /// Copy worker behind launches.
+    readback: Readback,
+}
+
+impl Drop for Vp9Decoder<'_> {
+    fn drop(&mut self) {
+        self.readback.shutdown();
+    }
 }
 
 impl<'a> Vp9Decoder<'a> {
@@ -1781,6 +1837,7 @@ impl<'a> Vp9Decoder<'a> {
             capture: false,
             phases: Vec::new(),
             finished: false,
+            readback: Readback::spawn(),
         }
     }
 
@@ -1805,6 +1862,7 @@ impl<'a> Vp9Decoder<'a> {
             &mut self.generation,
             self.capture,
             &mut self.phases,
+            &self.readback,
         )
     }
 

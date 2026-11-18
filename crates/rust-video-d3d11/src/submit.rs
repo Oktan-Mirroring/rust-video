@@ -262,6 +262,11 @@ impl CopySlot {
             context.Unmap(&self.staging, 0);
         }
     }
+
+    /// Staging texture behind maps.
+    pub(crate) fn staging(&self) -> ID3D11Texture2D {
+        self.staging.clone()
+    }
 }
 
 /// Completion fence behind one decode surface.
@@ -378,7 +383,7 @@ fn create_staging(
 }
 
 /// NV12 bytes from a mapped staging texture under `crop`.
-fn copy_nv12(
+pub(crate) fn copy_nv12(
     mapped: &D3D11_MAPPED_SUBRESOURCE,
     width: u32,
     height: u32,

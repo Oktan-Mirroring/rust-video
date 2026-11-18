@@ -7,9 +7,11 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::decoder::emit_frame;
+use crate::decoder::emit_frame_bytes;
 use crate::decoder::Active;
 use crate::error::D3d11Error;
 use crate::frame::D3d11Frame;
+use crate::readback::Readback;
 use crate::session::Session;
 
 use rust_video_caps::delivery::{
@@ -259,6 +261,11 @@ impl<F> FrameQueue<F> {
         self.pending.front()
     }
 
+    /// Oldest pending output, mutably.
+    pub(crate) fn front_mut(&mut self) -> Option<&mut PendingOutput> {
+        self.pending.front_mut()
+    }
+
     /// `slot` submitted under `active` across the submit span.
     pub(crate) fn push(
         &mut self,
@@ -442,6 +449,12 @@ pub(crate) struct PendingOutput {
     submit_start: Instant,
     /// Submit plus copy issue end.
     submit_end: Instant,
+    /// Copy launched on the worker.
+    launched: bool,
+    /// First observed completion.
+    signaled_at: Option<Instant>,
+    /// Frame generation number.
+    generation: u64,
 }
 
 impl PendingOutput {
@@ -457,27 +470,15 @@ impl PendingOutput {
             active,
             submit_start,
             submit_end,
+            launched: false,
+            signaled_at: None,
+            generation: 0,
         }
     }
 
     /// Decode slot behind the output.
     pub(crate) fn slot(&self) -> u8 {
         self.slot
-    }
-
-    /// Sequence behind the submit.
-    pub(crate) fn active(&self) -> Active {
-        self.active
-    }
-
-    /// Submit plus copy issue start.
-    pub(crate) fn submit_start(&self) -> Instant {
-        self.submit_start
-    }
-
-    /// Submit plus copy issue end.
-    pub(crate) fn submit_end(&self) -> Instant {
-        self.submit_end
     }
 }
 
@@ -495,6 +496,8 @@ pub(crate) struct SplitParts<'s> {
     capture: bool,
     /// Recorded per-frame phases.
     phases: &'s mut Vec<FramePhases>,
+    /// Copy worker behind launches.
+    readback: &'s Readback,
 }
 
 impl<'s> SplitParts<'s> {
@@ -506,6 +509,7 @@ impl<'s> SplitParts<'s> {
         generation: &'s mut u64,
         capture: bool,
         phases: &'s mut Vec<FramePhases>,
+        readback: &'s Readback,
     ) -> Self {
         Self {
             session,
@@ -514,20 +518,28 @@ impl<'s> SplitParts<'s> {
             generation,
             capture,
             phases,
+            readback,
         }
     }
 
     /// Completed oldest outputs into ready, without waiting.
     pub(crate) fn sweep_ready(&mut self) -> Result<(), D3d11Error> {
+        self.harvest()?;
         let (Some(session), _) = (self.session, self.shared) else {
             return Ok(());
         };
-        while let Some(output) = self.queue.front() {
-            if !session.poll_slot(output.slot())? {
-                return Ok(());
+        loop {
+            let launch = match self.queue.front() {
+                Some(front) if !front.launched => Some((front.slot, front.active)),
+                _ => None,
+            };
+            let Some((slot, active)) = launch else {
+                break;
+            };
+            if !session.poll_slot(slot)? {
+                break;
             }
-            let signaled_at = Instant::now();
-            self.complete(signaled_at)?;
+            self.launch_front(slot, active)?;
         }
         Ok(())
     }
@@ -539,12 +551,93 @@ impl<'s> SplitParts<'s> {
         let (Some(session), _) = (self.session, self.shared) else {
             return Ok(());
         };
-        let Some(output) = self.queue.front() else {
+        let launch = match self.queue.front() {
+            Some(front) if !front.launched => Some((front.slot, front.active)),
+            Some(_) => None,
+            None => return Ok(()),
+        };
+        if let Some((slot, active)) = launch {
+            session.wait_slot(slot)?;
+            self.launch_front(slot, active)?;
+        }
+        self.collect_oldest()
+    }
+
+    /// Front copy launched on the worker, signaled just now.
+    fn launch_front(&mut self, slot: u8, active: Active) -> Result<(), D3d11Error> {
+        let (Some(session), _) = (self.session, self.shared) else {
             return Ok(());
         };
-        session.wait_slot(output.slot())?;
         let signaled_at = Instant::now();
-        self.complete(signaled_at)
+        let mapped = session.map_slot(slot, active.crop())?;
+        let generation = *self.generation;
+        *self.generation = self.generation.wrapping_add(1);
+        if let Some(front) = self.queue.front_mut() {
+            front.launched = true;
+            front.signaled_at = Some(signaled_at);
+            front.generation = generation;
+        }
+        if let Some(done) = self.readback.launch(mapped) {
+            self.land(done)?;
+        }
+        Ok(())
+    }
+
+    /// Landed worker copies into ready, without waiting.
+    fn harvest(&mut self) -> Result<(), D3d11Error> {
+        while let Some(done) = self.readback.harvest() {
+            self.land(done)?;
+        }
+        Ok(())
+    }
+
+    /// Oldest launched copy into ready.
+    fn land(&mut self, done: crate::readback::Done) -> Result<(), D3d11Error> {
+        let (Some(session), Some(shared)) = (self.session, self.shared) else {
+            return Ok(());
+        };
+        let Some(output) = self.queue.pop_pending() else {
+            debug_assert!(false, "landed copy without pending output");
+            return Ok(());
+        };
+        let (bytes, release, copy_us) = done.into_parts();
+        let unmap_start = Instant::now();
+        release.unmap();
+        let read_end = output.signaled_at.unwrap_or(unmap_start)
+            + Duration::from_micros(copy_us)
+            + unmap_start.elapsed();
+        let frame = emit_frame_bytes(session, shared, &output.active, output.generation, bytes?)?;
+        if self.capture {
+            self.phases.push(FramePhases::new(
+                output.generation,
+                output.slot,
+                output.submit_start,
+                output.submit_end,
+                output.signaled_at.unwrap_or(unmap_start),
+                read_end,
+            ));
+        }
+        self.queue.push_ready(frame);
+        Ok(())
+    }
+
+    /// Oldest pending output read synchronously, rescuing a lost worker.
+    fn rescue(&mut self) -> Result<(), D3d11Error> {
+        let (Some(session), Some(shared)) = (self.session, self.shared) else {
+            return Ok(());
+        };
+        let Some(output) = self.queue.pop_pending() else {
+            return Ok(());
+        };
+        let frame = emit_frame(
+            session,
+            shared,
+            output.slot,
+            &output.active,
+            output.generation,
+        )?;
+        self.queue.push_ready(frame);
+        Ok(())
     }
 
     /// Every pending output into ready, oldest first.
@@ -614,35 +707,18 @@ impl<'s> SplitParts<'s> {
         Ok(())
     }
 
-    /// Oldest pending output read into ready, completed at `signaled_at`.
-    fn complete(&mut self, signaled_at: Instant) -> Result<(), D3d11Error> {
-        let (Some(session), Some(shared)) = (self.session, self.shared) else {
+    /// Oldest launched copy into ready, waiting for it.
+    ///
+    /// No-op when nothing is launched.
+    fn collect_oldest(&mut self) -> Result<(), D3d11Error> {
+        let launched = matches!(self.queue.front(), Some(front) if front.launched);
+        if !launched {
             return Ok(());
-        };
-        let Some(output) = self.queue.pop_pending() else {
-            return Ok(());
-        };
-        let frame = emit_frame(
-            session,
-            shared,
-            output.slot(),
-            &output.active(),
-            *self.generation,
-        )?;
-        let read_end = Instant::now();
-        if self.capture {
-            self.phases.push(FramePhases::new(
-                *self.generation,
-                output.slot(),
-                output.submit_start(),
-                output.submit_end(),
-                signaled_at,
-                read_end,
-            ));
         }
-        *self.generation = self.generation.wrapping_add(1);
-        self.queue.push_ready(frame);
-        Ok(())
+        match self.readback.collect() {
+            Some(done) => self.land(done),
+            None => self.rescue(),
+        }
     }
 }
 
