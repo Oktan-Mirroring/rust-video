@@ -8,6 +8,7 @@
 #![allow(unsafe_code)]
 
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -82,6 +83,8 @@ pub(crate) struct Readback {
     rx: Option<std::sync::mpsc::Receiver<Done>>,
     /// Worker thread, absent after shutdown or a spawn failure.
     worker: Option<JoinHandle<()>>,
+    /// Queued copies not yet received.
+    inflight: AtomicUsize,
 }
 
 impl Readback {
@@ -116,6 +119,7 @@ impl Readback {
             tx: worker.is_some().then_some(tx),
             rx: worker.is_some().then_some(done_rx),
             worker,
+            inflight: AtomicUsize::new(0),
         }
     }
 
@@ -133,28 +137,40 @@ impl Readback {
                 copy: started.elapsed(),
             }
         };
-        if mapped.bytes() < INLINE_COPY_BYTES {
+        if mapped.bytes() < INLINE_COPY_BYTES && self.inflight() == 0 {
             return Some(copy_inline(mapped));
         }
         let Some(tx) = self.tx.as_ref() else {
             return Some(copy_inline(mapped));
         };
         match tx.send(Job { transfer: mapped }) {
-            Ok(()) => None,
+            Ok(()) => {
+                self.inflight.fetch_add(1, Ordering::Relaxed);
+                None
+            }
             Err(returned) => Some(copy_inline(returned.0.transfer)),
         }
+    }
+
+    /// Queued copies not yet received.
+    fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
     }
 
     /// Oldest landed copy, if any arrived.
     pub(crate) fn harvest(&self) -> Option<Done> {
         let rx = self.rx.as_ref()?;
-        rx.try_recv().ok()
+        let done = rx.try_recv().ok()?;
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+        Some(done)
     }
 
     /// Oldest landed copy, waiting for it.
     pub(crate) fn collect(&self) -> Option<Done> {
         let rx = self.rx.as_ref()?;
-        rx.recv().ok()
+        let done = rx.recv().ok()?;
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+        Some(done)
     }
 
     /// Queued copies drain, the worker joins, orphaned maps release.
