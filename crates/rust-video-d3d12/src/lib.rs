@@ -41,6 +41,8 @@ mod os_stub;
 #[cfg(target_os = "windows")]
 mod pins;
 #[cfg(target_os = "windows")]
+mod readback;
+#[cfg(target_os = "windows")]
 mod scale;
 mod seam;
 #[cfg(target_os = "windows")]

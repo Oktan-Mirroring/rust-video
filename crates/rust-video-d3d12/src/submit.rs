@@ -605,6 +605,41 @@ impl DeviceResources {
         }
         out
     }
+
+    /// `len`-byte mapping pointer behind `readback`, released separately.
+    pub(crate) fn map_readback(
+        readback: &ID3D12Resource,
+        len: usize,
+    ) -> Result<*const u8, D3d12Error> {
+        let range = D3D12_RANGE { Begin: 0, End: len };
+        let mut read: *mut c_void = std::ptr::null_mut();
+        // Sound: the caller releases the mapping after its copy lands.
+        unsafe {
+            readback.Map(
+                0,
+                Some(std::ptr::addr_of!(range)),
+                Some(std::ptr::addr_of_mut!(read)),
+            )
+        }
+        .map_err(|error| D3d12Error::Call {
+            call: "Map",
+            hresult: error.code().0,
+        })?;
+        if read.is_null() {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::ReadbackMapReturnedNull,
+            ));
+        }
+        Ok(read.cast_const().cast::<u8>())
+    }
+
+    /// Release a mapping from [`map_readback`](Self::map_readback).
+    pub(crate) fn unmap_readback(readback: &ID3D12Resource) {
+        // Sound: the mapping is live; the copy already landed.
+        unsafe {
+            readback.Unmap(0, None);
+        }
+    }
 }
 
 /// Completion ticket behind one queue submission.

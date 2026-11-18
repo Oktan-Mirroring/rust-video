@@ -745,23 +745,6 @@ impl DecodeSession {
         self.readback(slot)
     }
 
-    /// Tight NV12 bytes for a started `slot` when `ticket` signaled, absent while the copy runs.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` for a slot outside the pool, or when
-    /// staging falls short of the layout.
-    pub(crate) fn poll_download(
-        &self,
-        slot: u8,
-        ticket: Ticket,
-    ) -> Result<Option<Vec<u8>>, D3d12Error> {
-        if !self.copy_fence.poll(ticket) {
-            return Ok(None);
-        }
-        self.readback(slot).map(Some)
-    }
-
     /// Tight NV12 bytes mapped from the staging buffer behind `slot`.
     ///
     /// # Errors
@@ -780,6 +763,34 @@ impl DecodeSession {
             self.layout
                 .tighten(mapped, self.width, self.height, self.crop)
         })
+    }
+
+    /// Mapped staging of `slot` for a worker copy.
+    ///
+    /// Call once the copy fence signaled; the caller releases the
+    /// mapping after its copy lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool or when the map fails.
+    pub(crate) fn map_slot(&self, slot: u8) -> Result<crate::readback::Mapped, D3d12Error> {
+        use crate::readback::{Mapped, Release};
+        let index = usize::from(slot);
+        let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
+            BrokenReferenceReason::SlotOutsidePool,
+        ))?;
+        let total = usize::try_from(self.layout.total)
+            .unwrap_or(usize::MAX)
+            .min(isize::MAX as usize);
+        let data = DeviceResources::map_readback(staging, total)?;
+        Ok(Mapped::new(
+            slot,
+            data,
+            total,
+            self.layout,
+            (self.width, self.height, self.crop),
+            Release::new(staging.clone()),
+        ))
     }
 
     /// Prior copy ticket on `index` completion.

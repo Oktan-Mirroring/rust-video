@@ -18,6 +18,7 @@ use crate::hevc::{Ingest as HevcIngest, Picture as HevcPicture};
 use crate::hevc_dpb::{HevcDecoded, HevcDpb};
 use crate::os::FrameOs;
 use crate::pins::{SlotPin, SlotPins};
+use crate::readback::{Done, Readback};
 use crate::submit::Ticket;
 use crate::texture::{GpuSurface, SurfaceLayout};
 
@@ -1485,6 +1486,14 @@ pub struct OverlappedH264Pump<'a> {
     wake_rx: Receiver<()>,
     /// Live-surface pin counts over the decoder pool.
     pins: Arc<SlotPins>,
+    /// Copy worker behind launches.
+    readback: Readback,
+}
+
+impl Drop for OverlappedH264Pump<'_> {
+    fn drop(&mut self) {
+        self.readback.shutdown();
+    }
 }
 
 impl<'a> OverlappedH264Pump<'a> {
@@ -1518,6 +1527,7 @@ impl<'a> OverlappedH264Pump<'a> {
             wake_tx,
             wake_rx,
             pins: Arc::new(SlotPins::new()),
+            readback: Readback::spawn(),
         }
     }
 
@@ -1616,6 +1626,7 @@ impl<'a> OverlappedH264Pump<'a> {
                 generation,
                 video_submit,
                 submit_cpu,
+                launched: false,
             });
         }
         self.pictures.push_back(InflightPicture {
@@ -1676,7 +1687,7 @@ impl<'a> OverlappedH264Pump<'a> {
         Ok(())
     }
 
-    /// Oldest output into the ready queue when its copy signaled.
+    /// Oldest output into the ready queue when its copy landed.
     ///
     /// # Returns
     ///
@@ -1696,41 +1707,122 @@ impl<'a> OverlappedH264Pump<'a> {
         } else {
             return Ok(false);
         }
+        if let Some(done) = self.readback.harvest() {
+            self.land_front(done)?;
+            return Ok(true);
+        }
+        let launch = match self
+            .pictures
+            .front()
+            .and_then(|front| front.outputs.front())
+        {
+            Some(output) if !output.launched => Some((output.pin.slot(), output.copy)),
+            _ => None,
+        };
+        let Some((slot, copy)) = launch else {
+            return Ok(false);
+        };
+        if !session.copy_signaled(copy) {
+            return Ok(false);
+        }
+        let mapped = session.map_slot(slot)?;
+        if let Some(output) = self
+            .pictures
+            .front_mut()
+            .and_then(|front| front.outputs.front_mut())
+        {
+            output.launched = true;
+        }
+        if let Some(done) = self.readback.launch(mapped) {
+            self.land_front(done)?;
+        }
+        Ok(true)
+    }
+
+    /// Front output plus `done` into the ready queue.
+    fn land_front(&mut self, done: Done) -> Result<(), D3d12Error> {
+        let (slot, bytes, release, _copy_us) = done.into_parts();
         let output = self
             .pictures
             .front_mut()
             .and_then(|front| front.outputs.pop_front());
         let Some(output) = output else {
-            return Ok(false);
+            debug_assert!(false, "landed copy without pending output");
+            return Ok(());
         };
-        match session.poll_download(output.pin.slot(), output.copy)? {
-            None => {
-                if let Some(front) = self.pictures.front_mut() {
-                    front.outputs.push_front(output);
-                }
-                Ok(false)
-            }
-            Some(nv12) => {
-                let signaled = Instant::now();
-                let video = self
-                    .pictures
-                    .front()
-                    .and_then(|front| front.video_signaled)
-                    .unwrap_or(signaled);
-                self.timings
-                    .push(PhaseTiming::new(&output, video, signaled, signaled));
-                let export = session.shared_handle(output.pin.slot());
-                let frame = emit_frame(
-                    &self.shared,
-                    nv12,
-                    export,
-                    &output.active,
-                    output.generation,
-                )?;
-                self.ready.push_back(frame);
-                Ok(true)
-            }
+        debug_assert_eq!(slot, output.pin.slot());
+        release.unmap();
+        let signaled = Instant::now();
+        let video = self
+            .pictures
+            .front()
+            .and_then(|front| front.video_signaled)
+            .unwrap_or(signaled);
+        self.timings
+            .push(PhaseTiming::new(&output, video, signaled, signaled));
+        let export = self
+            .session
+            .as_ref()
+            .and_then(|session| session.shared_handle(output.pin.slot()));
+        let frame = emit_frame(
+            &self.shared,
+            bytes?,
+            export,
+            &output.active,
+            output.generation,
+        )?;
+        self.ready.push_back(frame);
+        Ok(())
+    }
+
+    /// Oldest launched copy into ready, waiting for it.
+    fn collect_front(&mut self) -> Result<(), D3d12Error> {
+        let launched = matches!(
+            self.pictures
+                .front()
+                .and_then(|front| front.outputs.front()),
+            Some(output) if output.launched
+        );
+        if !launched {
+            return Ok(());
         }
+        match self.readback.collect() {
+            Some(done) => self.land_front(done),
+            None => self.rescue_front(),
+        }
+    }
+
+    /// Front output read synchronously, rescuing a lost worker.
+    fn rescue_front(&mut self) -> Result<(), D3d12Error> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(D3d12Error::NoSession);
+        };
+        let output = self
+            .pictures
+            .front_mut()
+            .and_then(|front| front.outputs.pop_front());
+        let Some(output) = output else {
+            return Ok(());
+        };
+        let nv12 = session.finish_download(output.pin.slot(), output.copy)?;
+        let export = session.shared_handle(output.pin.slot());
+        let signaled = Instant::now();
+        let video = self
+            .pictures
+            .front()
+            .and_then(|front| front.video_signaled)
+            .unwrap_or(signaled);
+        self.timings
+            .push(PhaseTiming::new(&output, video, signaled, signaled));
+        let frame = emit_frame(
+            &self.shared,
+            nv12,
+            export,
+            &output.active,
+            output.generation,
+        )?;
+        self.ready.push_back(frame);
+        Ok(())
     }
 
     /// Oldest completed frame, harvesting first.
@@ -1749,7 +1841,17 @@ impl<'a> OverlappedH264Pump<'a> {
         if !self.ready.is_empty() || self.pictures.is_empty() {
             return Ok(());
         }
-        self.wait_front()?;
+        let launched = matches!(
+            self.pictures
+                .front()
+                .and_then(|front| front.outputs.front()),
+            Some(output) if output.launched
+        );
+        if launched {
+            self.collect_front()?;
+        } else {
+            self.wait_front()?;
+        }
         self.harvest_poll()
     }
 
@@ -1859,6 +1961,22 @@ impl<'a> OverlappedH264Pump<'a> {
 
     /// Drop the live session, buffer, sequence, and in-flight pictures after a failure.
     fn reset_stream(&mut self) {
+        let mut launched = self
+            .pictures
+            .iter()
+            .flat_map(|picture| picture.outputs.iter())
+            .filter(|output| output.launched)
+            .count();
+        while launched > 0 {
+            launched -= 1;
+            match self.readback.collect() {
+                Some(done) => {
+                    let (_, _, release, _) = done.into_parts();
+                    release.unmap();
+                }
+                None => break,
+            }
+        }
         self.dpb = None;
         self.session = None;
         self.active = None;
@@ -2042,6 +2160,8 @@ struct PendingOutput {
     pin: SlotPin,
     /// Copy queue ticket behind the download.
     copy: Ticket,
+    /// Copy launched on the worker.
+    launched: bool,
     /// Copy submit time.
     copy_submit: Instant,
     /// Sequence geometry behind the frame.
