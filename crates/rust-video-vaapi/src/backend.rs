@@ -2,12 +2,11 @@
 
 #![allow(unsafe_code)]
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::c_int;
-use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -17,6 +16,7 @@ use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::ffi::{VaBufferId, VaConfigId, VaContextId};
+use crate::readback::{Readback, Reader};
 use crate::seam::{ContextId, SurfaceId, VaSeam};
 use crate::sys;
 
@@ -40,6 +40,8 @@ pub struct Backend {
     last: Vec<Option<SurfaceId>>,
     /// Submit gauges, shared with exported frames syncing outside.
     gauges: Arc<StatsInner>,
+    /// Readback handle joining submits with copies.
+    readback: Readback,
     /// Scratch render list, reused across submits.
     render: Vec<VaBufferId>,
     /// Coded width in luma samples.
@@ -48,26 +50,8 @@ pub struct Backend {
     height: u32,
     /// Pool size.
     count: usize,
-    /// Cached NV12 image format for the created-image transfer.
-    nv12: Cell<Option<ffi::VaImageFormat>>,
     /// Thread contract: `Send` without `Sync`.
     _thread: PhantomData<UnsafeCell<()>>,
-}
-
-/// CPU copy matching the image memory behind the transfer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CopyMethod {
-    /// Non-temporal loads for derived video memory.
-    Streaming,
-    /// Plain copy for created CPU-local images.
-    Cached,
-}
-
-impl CopyMethod {
-    /// True when the method issues streaming loads needing a fence.
-    fn needs_fence(self) -> bool {
-        self == Self::Streaming
-    }
 }
 
 impl Backend {
@@ -88,6 +72,42 @@ impl Backend {
         count: usize,
     ) -> Result<Self, VaApiError> {
         let display = device.display();
+        let pool = Self::open_pool(display, profile, width, height, count)?;
+        let gauges = Arc::new(StatsInner::default());
+        let sets = match Self::open_sets(display, pool.context, &gauges) {
+            Ok(sets) => sets,
+            Err(error) => {
+                drop(pool);
+                return Err(error);
+            }
+        };
+        let pool = Arc::new(pool);
+        let readback = Readback::spawn(&pool, &gauges, width, height);
+        Ok(Self {
+            pool,
+            profile,
+            guards: (0..count).map(|_| Arc::new(())).collect(),
+            sets,
+            next: 0,
+            last: vec![None; Self::ASYNC_DEPTH],
+            gauges,
+            readback,
+            render: Vec::new(),
+            width,
+            height,
+            count,
+            _thread: PhantomData,
+        })
+    }
+
+    /// Config, surfaces, and context for `profile` at `width` x `height`.
+    fn open_pool(
+        display: ffi::VaDisplay,
+        profile: c_int,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> Result<Pool, VaApiError> {
         let width_c = c_int::try_from(width).map_err(|_| Self::range())?;
         let height_c = c_int::try_from(height).map_err(|_| Self::range())?;
         let count_c = c_int::try_from(count).map_err(|_| Self::range())?;
@@ -152,45 +172,26 @@ impl Backend {
             }
             return Err(error);
         }
-        let gauges = Arc::new(StatsInner::default());
-        let mut sets = Vec::with_capacity(Self::ASYNC_DEPTH);
-        for _ in 0..Self::ASYNC_DEPTH {
-            match BufferSet::open(display, context, &gauges) {
-                Ok(set) => sets.push(set),
-                Err(error) => {
-                    drop(sets);
-                    // Sound: the context, surfaces, and config were created above.
-                    unsafe {
-                        sys::vaDestroyContext(display, context);
-                        sys::vaDestroySurfaces(display, surfaces.as_mut_ptr(), count_c);
-                        sys::vaDestroyConfig(display, config);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        let pool = Pool {
+        Ok(Pool {
             display,
             config,
             context,
             surfaces,
             count_c,
-        };
-        Ok(Self {
-            pool: Arc::new(pool),
-            profile,
-            guards: (0..count).map(|_| Arc::new(())).collect(),
-            sets,
-            next: 0,
-            last: vec![None; Self::ASYNC_DEPTH],
-            gauges,
-            render: Vec::new(),
-            width,
-            height,
-            count,
-            nv12: Cell::new(None),
-            _thread: PhantomData,
         })
+    }
+
+    /// Reusable parameter-buffer ring over `context`.
+    fn open_sets(
+        display: ffi::VaDisplay,
+        context: VaContextId,
+        gauges: &StatsInner,
+    ) -> Result<Vec<BufferSet>, VaApiError> {
+        let mut sets = Vec::with_capacity(Self::ASYNC_DEPTH);
+        for _ in 0..Self::ASYNC_DEPTH {
+            sets.push(BufferSet::open(display, context, gauges)?);
+        }
+        Ok(sets)
     }
 
     /// Native decode-context handle behind the backend.
@@ -224,6 +225,31 @@ impl Backend {
     #[must_use]
     pub(crate) fn pool(&self) -> Arc<Pool> {
         Arc::clone(&self.pool)
+    }
+
+    /// Stage the transfer of `surface` cropped to `crop`, answered under `generation`.
+    pub(crate) fn launch_read(
+        &self,
+        generation: u64,
+        surface: SurfaceId,
+        crop: (u32, u32, u32, u32),
+    ) {
+        self.readback.launch(generation, surface, crop);
+    }
+
+    /// Map staged transfers down to `depth - 1` awaiting, oldest first.
+    pub(crate) fn map_ready(&self, depth: usize) {
+        self.readback.map_ready(depth);
+    }
+
+    /// Bytes queued under `generation`, blocking until the transfer lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver image is not NV12, when its
+    /// layout overruns its bytes, or when any call fails.
+    pub(crate) fn collect_read(&self, generation: u64) -> Result<Vec<u8>, VaApiError> {
+        self.readback.collect(generation)
     }
 
     /// Pipelined submit over byte-level parameter accessors.
@@ -324,348 +350,6 @@ impl Backend {
     fn range() -> VaApiError {
         VaApiError::Unsupported("dimensions outside driver range".to_owned())
     }
-
-    /// Cropped NV12 copy of an image.
-    fn copy_nv12(
-        &self,
-        image: &ffi::VaImage,
-        crop: (u32, u32, u32, u32),
-        method: CopyMethod,
-    ) -> Result<Vec<u8>, VaApiError> {
-        if image.format.fourcc != ffi::VA_FOURCC_NV12 || image.num_planes < 2 {
-            return Err(VaApiError::Unsupported("driver image not nv12".to_owned()));
-        }
-        let (x, y, width, height) = crop;
-        // Sound: the image buffer is live until `vaDestroyImage`.
-        let mut data: *mut c_void = std::ptr::null_mut();
-        sys::status(unsafe { sys::vaMapBuffer(self.pool.display, image.buf, &raw mut data) })?;
-        let outcome = Self::copy_planes(
-            data as *const u8,
-            u64::from(image.data_size),
-            image.pitches,
-            image.offsets,
-            (x, y, width, height),
-            method,
-        );
-        // Sound: the buffer was mapped above.
-        unsafe {
-            sys::vaUnmapBuffer(self.pool.display, image.buf);
-        }
-        outcome
-    }
-
-    /// Plane rows for the crop rectangle.
-    fn copy_planes(
-        data: *const u8,
-        len: u64,
-        pitches: [u32; 3],
-        offsets: [u32; 3],
-        crop: (u32, u32, u32, u32),
-        method: CopyMethod,
-    ) -> Result<Vec<u8>, VaApiError> {
-        let bad = || VaApiError::Unsupported("driver image layout".to_owned());
-        let (x, y, width, height) = crop;
-        let chroma_height = height / 2;
-        let row_end = u64::from(x).checked_add(u64::from(width)).ok_or_else(bad)?;
-        if row_end > u64::from(pitches[0]) || row_end > u64::from(pitches[1]) {
-            return Err(bad());
-        }
-        let end_y = u64::from(offsets[0])
-            .checked_add(u64::from(pitches[0]) * u64::from(y.saturating_add(height)))
-            .ok_or_else(bad)?;
-        let end_uv = u64::from(offsets[1])
-            .checked_add(u64::from(pitches[1]) * u64::from(y / 2 + chroma_height))
-            .ok_or_else(bad)?;
-        if end_y > len || end_uv > len {
-            return Err(bad());
-        }
-        let bytes = usize::try_from(
-            u64::from(width) * u64::from(height) + u64::from(width) * u64::from(chroma_height),
-        )
-        .map_err(|_| bad())?;
-        let mut out = Vec::with_capacity(bytes);
-        let dst_base = out.as_mut_ptr();
-        if x == 0 && width > 0 && width == pitches[0] && width == pitches[1] {
-            Self::copy_whole_planes(data, pitches, offsets, crop, dst_base, method)?;
-            // SAFETY: `copy_whole_planes` initialized all `bytes` elements (`luma + chroma`).
-            unsafe {
-                out.set_len(bytes);
-            }
-            return Ok(out);
-        }
-        let width_usize = usize::try_from(width).map_err(|_| bad())?;
-        let mut written = 0usize;
-        // SAFETY: every row span was bounds-checked against `len` and `bytes` above.
-        unsafe {
-            for row in 0..height {
-                let offset = usize::try_from(
-                    u64::from(offsets[0])
-                        + u64::from(pitches[0]) * u64::from(y + row)
-                        + u64::from(x),
-                )
-                .map_err(|_| bad())?;
-                Self::copy_span(data.add(offset), dst_base.add(written), width_usize, method);
-                written += width_usize;
-            }
-            for row in 0..chroma_height {
-                let offset = usize::try_from(
-                    u64::from(offsets[1])
-                        + u64::from(pitches[1]) * u64::from(y / 2 + row)
-                        + u64::from(x),
-                )
-                .map_err(|_| bad())?;
-                Self::copy_span(data.add(offset), dst_base.add(written), width_usize, method);
-                written += width_usize;
-            }
-            if method.needs_fence() {
-                Self::fence_uswc();
-            }
-            debug_assert_eq!(written, bytes);
-            out.set_len(bytes);
-        }
-        Ok(out)
-    }
-
-    /// Full-width planes in two copies; rows are contiguous by pitch match.
-    fn copy_whole_planes(
-        data: *const u8,
-        pitches: [u32; 3],
-        offsets: [u32; 3],
-        crop: (u32, u32, u32, u32),
-        dst: *mut u8,
-        method: CopyMethod,
-    ) -> Result<(), VaApiError> {
-        let bad = || VaApiError::Unsupported("driver image layout".to_owned());
-        let (_, y, width, height) = crop;
-        let luma = usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| bad())?;
-        let chroma =
-            usize::try_from(u64::from(width) * u64::from(height / 2)).map_err(|_| bad())?;
-        let y_offset =
-            usize::try_from(u64::from(offsets[0]) + u64::from(pitches[0]) * u64::from(y))
-                .map_err(|_| bad())?;
-        let uv_offset =
-            usize::try_from(u64::from(offsets[1]) + u64::from(pitches[1]) * u64::from(y / 2))
-                .map_err(|_| bad())?;
-        // SAFETY: both spans were bounds-checked against `len` and `dst` capacity by caller.
-        unsafe {
-            Self::copy_span(data.add(y_offset), dst, luma, method);
-            Self::copy_span(data.add(uv_offset), dst.add(luma), chroma, method);
-            if method.needs_fence() {
-                Self::fence_uswc();
-            }
-        }
-        Ok(())
-    }
-
-    /// Copy of `len` bytes from mapped image memory `src` to cached `dst`.
-    ///
-    /// # Safety
-    ///
-    /// `src` and `dst` must be valid, non-overlapping regions of `len` bytes.
-    #[inline]
-    unsafe fn copy_span(src: *const u8, dst: *mut u8, len: usize, method: CopyMethod) {
-        if method == CopyMethod::Cached {
-            // SAFETY: pointer invariants upheld by caller.
-            unsafe {
-                std::ptr::copy_nonoverlapping(src, dst, len);
-            }
-            return;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("sse4.1") {
-                // SAFETY: SSE4.1 verified above; pointer invariants upheld by caller.
-                unsafe {
-                    Self::copy_uswc_sse41(src, dst, len);
-                }
-                return;
-            }
-        }
-        // SAFETY: pointer invariants upheld by caller.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, len);
-        }
-    }
-
-    /// SSE4.1 `MOVNTDQA` streaming load loop for USWC readback memory.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure SSE4.1 is available and `src`/`dst` span `len` non-overlapping bytes.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "sse4.1")]
-    unsafe fn copy_uswc_sse41(src: *const u8, dst: *mut u8, len: usize) {
-        use std::arch::x86_64::{__m128i, _mm_stream_load_si128};
-
-        // SAFETY: caller guarantees `len` valid bytes at `src`.
-        let src_bytes = unsafe { std::slice::from_raw_parts(src, len) };
-        let (head, vectors, tail) = src_bytes.align_to::<__m128i>();
-        // SAFETY: caller guarantees `len` valid bytes at `dst`; the three spans partition it.
-        unsafe {
-            std::ptr::copy_nonoverlapping(head.as_ptr(), dst, head.len());
-        }
-        let mut out = head.len();
-        let mut chunks = vectors.chunks_exact(4);
-        for chunk in &mut chunks {
-            // SAFETY: `chunk` holds four aligned vectors; `dst[out..out + 64]` is valid.
-            unsafe {
-                let base = chunk.as_ptr();
-                let v0 = _mm_stream_load_si128(base);
-                let v1 = _mm_stream_load_si128(base.add(1));
-                let v2 = _mm_stream_load_si128(base.add(2));
-                let v3 = _mm_stream_load_si128(base.add(3));
-                let slot = dst.add(out);
-                Self::store_vector(slot, v0);
-                Self::store_vector(slot.add(16), v1);
-                Self::store_vector(slot.add(32), v2);
-                Self::store_vector(slot.add(48), v3);
-            }
-            out += 64;
-        }
-        for vector in chunks.remainder() {
-            // SAFETY: `vector` is one aligned vector; `dst[out..out + 16]` is valid.
-            unsafe {
-                let loaded = _mm_stream_load_si128(std::ptr::from_ref(vector));
-                Self::store_vector(dst.add(out), loaded);
-            }
-            out += 16;
-        }
-        // SAFETY: consumed spans plus `tail` equal `len` bytes inside both regions.
-        unsafe {
-            std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(out), tail.len());
-        }
-    }
-
-    /// Cached store of one streamed vector as bytes.
-    ///
-    /// # Safety
-    ///
-    /// `dst` must span 16 valid bytes.
-    #[cfg(target_arch = "x86_64")]
-    #[inline]
-    unsafe fn store_vector(dst: *mut u8, vector: std::arch::x86_64::__m128i) {
-        // SAFETY: `__m128i` is 16 bytes; `dst` spans 16 bytes; `[u8; 16]` needs no alignment.
-        unsafe {
-            let bytes = std::mem::transmute::<std::arch::x86_64::__m128i, [u8; 16]>(vector);
-            dst.cast::<[u8; 16]>().write_unaligned(bytes);
-        }
-    }
-
-    /// Memory fence serializing non-temporal streaming loads.
-    #[inline]
-    unsafe fn fence_uswc() {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: `mfence` is baseline x86_64 SSE2.
-        unsafe {
-            std::arch::x86_64::_mm_mfence();
-        }
-    }
-
-    /// NV12 bytes of `surface` cropped to `crop`, after its sync.
-    fn read_image(
-        &self,
-        surface: SurfaceId,
-        crop: (u32, u32, u32, u32),
-    ) -> Result<Vec<u8>, VaApiError> {
-        let (x, y, width, height) = crop;
-        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
-            return Err(VaApiError::Unsupported(
-                "crop outside coded size".to_owned(),
-            ));
-        }
-        // SAFETY: the display and surface are live.
-        let mut image = MaybeUninit::<ffi::VaImage>::uninit();
-        let derived = unsafe { sys::vaDeriveImage(self.pool.display, surface, image.as_mut_ptr()) };
-        if derived == ffi::VA_STATUS_SUCCESS {
-            // SAFETY: `vaDeriveImage` succeeded, initializing `image`.
-            let image = unsafe { image.assume_init() };
-            let outcome = self.copy_nv12(&image, crop, CopyMethod::Streaming);
-            // SAFETY: `image` was derived above.
-            unsafe {
-                sys::vaDestroyImage(self.pool.display, image.image_id);
-            }
-            return outcome;
-        }
-        self.read_get_image(surface, crop)
-    }
-
-    /// Fallback NV12 readback via `vaCreateImage` + `vaGetImage` when `vaDeriveImage` refuses.
-    fn read_get_image(
-        &self,
-        surface: SurfaceId,
-        crop: (u32, u32, u32, u32),
-    ) -> Result<Vec<u8>, VaApiError> {
-        let (x, y, width, height) = crop;
-        let width_c = c_int::try_from(width).map_err(|_| Self::range())?;
-        let height_c = c_int::try_from(height).map_err(|_| Self::range())?;
-        let x_c = c_int::try_from(x).map_err(|_| Self::range())?;
-        let y_c = c_int::try_from(y).map_err(|_| Self::range())?;
-        let mut format = self.nv12_format()?;
-        let mut image = MaybeUninit::<ffi::VaImage>::uninit();
-        // SAFETY: display is initialized; `format` and `image` are valid for the call.
-        sys::status(unsafe {
-            sys::vaCreateImage(
-                self.pool.display,
-                &raw mut format,
-                width_c,
-                height_c,
-                image.as_mut_ptr(),
-            )
-        })?;
-        // SAFETY: `vaCreateImage` succeeded, initializing `image`.
-        let image = unsafe { image.assume_init() };
-        // SAFETY: `surface` and `image.image_id` are live; crop fits within `self.width` x `self.height`.
-        let got = sys::status(unsafe {
-            sys::vaGetImage(
-                self.pool.display,
-                surface,
-                x_c,
-                y_c,
-                width,
-                height,
-                image.image_id,
-            )
-        });
-        let outcome =
-            got.and_then(|()| self.copy_nv12(&image, (0, 0, width, height), CopyMethod::Cached));
-        // SAFETY: `image` was created above.
-        unsafe {
-            sys::vaDestroyImage(self.pool.display, image.image_id);
-        }
-        outcome
-    }
-
-    /// NV12 image format supported by the display.
-    fn nv12_format(&self) -> Result<ffi::VaImageFormat, VaApiError> {
-        if let Some(format) = self.nv12.get() {
-            return Ok(format);
-        }
-        let format = self.query_nv12_format()?;
-        self.nv12.set(Some(format));
-        Ok(format)
-    }
-
-    /// NV12 image format probed from the driver.
-    fn query_nv12_format(&self) -> Result<ffi::VaImageFormat, VaApiError> {
-        let display = self.pool.display;
-        // SAFETY: `formats` is sized to the driver's reported capacity.
-        unsafe {
-            let capacity = usize::try_from(sys::vaMaxNumImageFormats(display)).unwrap_or(0);
-            let mut formats = vec![ffi::VaImageFormat::default(); capacity];
-            let mut count = 0;
-            sys::status(sys::vaQueryImageFormats(
-                display,
-                formats.as_mut_ptr(),
-                &raw mut count,
-            ))?;
-            let reported = usize::try_from(count).unwrap_or(0).min(formats.len());
-            formats[..reported]
-                .iter()
-                .find(|format| format.fourcc == ffi::VA_FOURCC_NV12)
-                .copied()
-                .ok_or_else(|| VaApiError::Unsupported("nv12 image format absent".to_owned()))
-        }
-    }
 }
 
 impl VaSeam for Backend {
@@ -695,31 +379,17 @@ impl VaSeam for Backend {
         surface: SurfaceId,
         crop: (u32, u32, u32, u32),
     ) -> Result<Vec<u8>, VaApiError> {
-        let wait_start = Instant::now();
-        let ready = self.poll(surface);
-        self.sync(surface)?;
-        let waited = wait_start.elapsed();
-        let copy_start = Instant::now();
-        let outcome = self.read_image(surface, crop);
-        self.gauges
-            .note_read(surface, ready, waited, copy_start.elapsed());
-        outcome
+        self.readback.read_sync(surface, crop)
     }
 
     fn sync(&self, surface: SurfaceId) -> Result<(), VaApiError> {
-        // Sound: the surface belongs to the pool.
-        let outcome = sys::status(unsafe { sys::vaSyncSurface(self.pool.display, surface) });
+        let outcome = Reader::sync_surface(self.pool.display(), surface);
         self.gauges.note_synced();
         outcome
     }
 
     fn poll(&self, surface: SurfaceId) -> bool {
-        let mut status = 0;
-        // Sound: the surface belongs to the pool; the status outlives the call.
-        let outcome =
-            unsafe { sys::vaQuerySurfaceStatus(self.pool.display, surface, &raw mut status) };
-        outcome == ffi::VA_STATUS_SUCCESS
-            && (status == ffi::VA_SURFACE_READY || status == ffi::VA_SURFACE_SKIPPED)
+        Reader::poll_surface(self.pool.display(), surface)
     }
 
     fn surfaces(&self) -> &[SurfaceId] {
@@ -851,6 +521,14 @@ pub(crate) struct Pool {
     surfaces: Vec<SurfaceId>,
     /// Pool size as the driver takes it.
     count_c: c_int,
+}
+
+impl Pool {
+    /// Initialized display behind the pool.
+    #[must_use]
+    pub(crate) fn display(&self) -> ffi::VaDisplay {
+        self.display
+    }
 }
 
 impl Drop for Pool {
@@ -1109,94 +787,5 @@ impl SubmitStats {
     #[must_use]
     pub const fn buffer_creates(&self) -> u64 {
         self.buffer_creates
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Backend, CopyMethod};
-
-    #[test]
-    fn copy_planes_crops_rows_from_pitches() {
-        let y = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let uv = [9u8, 10, 11, 12];
-        let mut image = Vec::new();
-        image.extend_from_slice(&y);
-        image.extend_from_slice(&uv);
-        for method in [CopyMethod::Streaming, CopyMethod::Cached] {
-            let out = Backend::copy_planes(
-                image.as_ptr(),
-                image.len() as u64,
-                [4, 4, 0],
-                [0, 8, 0],
-                (0, 0, 4, 2),
-                method,
-            )
-            .expect("in-bounds crop");
-            assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-
-            let cropped = Backend::copy_planes(
-                image.as_ptr(),
-                image.len() as u64,
-                [4, 4, 0],
-                [0, 8, 0],
-                (2, 0, 2, 2),
-                method,
-            )
-            .expect("offset crop");
-            assert_eq!(cropped, vec![3, 4, 7, 8, 11, 12]);
-        }
-    }
-
-    #[test]
-    fn copy_planes_rejects_overruns() {
-        let image = [0u8; 12];
-        assert!(Backend::copy_planes(
-            image.as_ptr(),
-            12,
-            [4, 4, 0],
-            [0, 8, 0],
-            (0, 0, 8, 2),
-            CopyMethod::Streaming,
-        )
-        .is_err());
-        assert!(Backend::copy_planes(
-            image.as_ptr(),
-            12,
-            [4, 4, 0],
-            [0, 40, 0],
-            (0, 0, 4, 2),
-            CopyMethod::Cached,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn whole_plane_path_matches_row_path() {
-        let mut image = Vec::new();
-        image.extend_from_slice(&[1u8, 2, 3, 4, 5, 6]);
-        image.extend_from_slice(&[7u8, 8, 9]);
-        for method in [CopyMethod::Streaming, CopyMethod::Cached] {
-            let whole = Backend::copy_planes(
-                image.as_ptr(),
-                9,
-                [3, 3, 0],
-                [0, 6, 0],
-                (0, 0, 3, 2),
-                method,
-            )
-            .expect("whole planes");
-            assert_eq!(whole, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-            let offset = Backend::copy_planes(
-                image.as_ptr(),
-                9,
-                [3, 3, 0],
-                [0, 6, 0],
-                (0, 1, 3, 1),
-                method,
-            )
-            .expect("offset crop");
-            assert_eq!(offset, vec![4, 5, 6]);
-        }
     }
 }

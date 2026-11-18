@@ -31,7 +31,7 @@ impl PendingQueue {
     pub(crate) const MAX_DEPTH: usize = 4;
 
     /// Default submits ahead of a sync.
-    pub(crate) const DEFAULT_DEPTH: usize = 3;
+    pub(crate) const DEFAULT_DEPTH: usize = 4;
 
     /// Empty queue holding back `depth - 1` slots; depth clamps to 1..=4.
     pub(crate) fn new(depth: usize) -> Self {
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(PendingQueue::new(0).depth(), PendingQueue::MIN_DEPTH);
         assert_eq!(PendingQueue::new(99).depth(), PendingQueue::MAX_DEPTH);
         let mut queue = PendingQueue::new(PendingQueue::DEFAULT_DEPTH);
-        assert_eq!(queue.depth(), 3);
+        assert_eq!(queue.depth(), 4);
         queue.set_depth(0);
         assert_eq!(queue.depth(), 1);
         queue.set_depth(99);

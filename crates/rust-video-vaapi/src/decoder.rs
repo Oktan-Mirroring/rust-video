@@ -14,6 +14,7 @@ use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
 use crate::h264::parser::{SliceHeader, SliceType};
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::params::Params;
+use crate::readback::Reader;
 use crate::seam::{SurfaceId, VaSeam};
 use crate::sys;
 
@@ -289,23 +290,41 @@ impl<'a> H264Decoder<'a> {
         size: (u32, u32),
         crop: (u32, u32, u32, u32),
     ) -> Result<(), VaApiError> {
-        let guards = {
+        let staged = {
             let (backend, _) = self.active()?;
             slots
-                .iter()
+                .into_iter()
                 .map(|slot| {
-                    backend.surface_guard(slot.index()).ok_or_else(|| {
+                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
                         VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })
+                    })?;
+                    let surface = backend
+                        .surfaces()
+                        .get(slot.index() as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            VaApiError::BrokenReference(format!(
+                                "slot {} outside pool",
+                                slot.index()
+                            ))
+                        })?;
+                    Ok((slot, guard, surface))
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, VaApiError>>()?
         };
-        for (slot, guard) in slots.into_iter().zip(guards) {
+        let mut launched = Vec::with_capacity(staged.len());
+        for (slot, guard, surface) in staged {
             let generation = self.generation;
             self.generation = self.generation.wrapping_add(1);
+            launched.push((generation, surface));
             self.pending
                 .push(PendingSlot::new(slot, size, crop, generation, guard));
         }
+        let (backend, _) = self.active()?;
+        for (generation, surface) in launched {
+            backend.launch_read(generation, surface, crop);
+        }
+        backend.map_ready(self.pending.depth());
         Ok(())
     }
 
@@ -340,11 +359,13 @@ impl<'a> H264Decoder<'a> {
         frames: &mut Vec<VaApiFrame>,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        VaApiFrame::emit_into(
-            self.device,
+        let bytes = backend.collect_read(staged.generation())?;
+        VaApiFrame::emit_collected(
             backend,
             shared,
-            Emit::new(vec![staged.slot()], staged.size(), staged.crop(), true),
+            staged.size(),
+            staged.crop(),
+            bytes,
             frames,
             staged.generation(),
         )?;
@@ -606,17 +627,7 @@ impl VaApiFrame {
         frames: &mut Vec<Self>,
         generation: u64,
     ) -> Result<u64, VaApiError> {
-        let frame_size =
-            PictureSize::new(emit.size.0, emit.size.1).ok_or(VaApiError::BadExtent {
-                width: emit.size.0,
-                height: emit.size.1,
-            })?;
-        let (coded_width, coded_height) = backend.coded_size();
-        let coded = PictureSize::new(coded_width, coded_height).ok_or(VaApiError::BadExtent {
-            width: coded_width,
-            height: coded_height,
-        })?;
-        let origin = (emit.crop.0, emit.crop.1);
+        let (frame_size, coded, origin) = Self::geometry(backend, emit.size, emit.crop)?;
         frames.reserve(emit.slots.len());
         let mut generation = generation;
         for slot in emit.slots {
@@ -646,17 +657,82 @@ impl VaApiFrame {
                     )
                 })
             };
-            frames.push(Self {
-                identity: GpuFrame::new(frame_size, PixelFormat::Nv12, generation),
+            generation = Self::push_frame(
+                frames,
+                (frame_size, coded, origin),
+                generation,
                 data,
                 lease,
                 device,
-                coded,
-                origin,
-            });
-            generation = generation.wrapping_add(1);
+            );
         }
         Ok(generation)
+    }
+
+    /// Output frame for collected `bytes`, returning the next generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the size is empty or the budget refuses the bytes.
+    pub(crate) fn emit_collected(
+        backend: &Backend,
+        shared: &SharedDevice,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+        bytes: Vec<u8>,
+        frames: &mut Vec<Self>,
+        generation: u64,
+    ) -> Result<u64, VaApiError> {
+        let (frame_size, coded, origin) = Self::geometry(backend, size, crop)?;
+        let data = Bytes::from(bytes);
+        let lease = shared.try_acquire(data.len() as u64)?;
+        Ok(Self::push_frame(
+            frames,
+            (frame_size, coded, origin),
+            generation,
+            data,
+            lease,
+            None,
+        ))
+    }
+
+    /// Frame size, coded size, and crop origin for `size` cropped to `crop`.
+    fn geometry(
+        backend: &Backend,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+    ) -> Result<(PictureSize, PictureSize, (u32, u32)), VaApiError> {
+        let frame_size = PictureSize::new(size.0, size.1).ok_or(VaApiError::BadExtent {
+            width: size.0,
+            height: size.1,
+        })?;
+        let (coded_width, coded_height) = backend.coded_size();
+        let coded = PictureSize::new(coded_width, coded_height).ok_or(VaApiError::BadExtent {
+            width: coded_width,
+            height: coded_height,
+        })?;
+        Ok((frame_size, coded, (crop.0, crop.1)))
+    }
+
+    /// Frame over `data` appended to `frames`, returning the next generation.
+    fn push_frame(
+        frames: &mut Vec<Self>,
+        geometry: (PictureSize, PictureSize, (u32, u32)),
+        generation: u64,
+        data: Bytes,
+        lease: Lease,
+        device: Option<DeviceSurface>,
+    ) -> u64 {
+        let (frame_size, coded, origin) = geometry;
+        frames.push(Self {
+            identity: GpuFrame::new(frame_size, PixelFormat::Nv12, generation),
+            data,
+            lease,
+            device,
+            coded,
+            origin,
+        });
+        generation.wrapping_add(1)
     }
 
     /// Frame identity.
@@ -823,16 +899,15 @@ impl DeviceSurface {
     /// Returns `Err` when the driver reports the surface failed.
     fn wait(&self) -> Result<(), VaApiError> {
         // Sound: the display and surface are live behind the pool lease.
-        let outcome = unsafe { sys::vaSyncSurface(self.display, self.surface) };
+        let outcome = Reader::sync_surface(self.display, self.surface);
         self.gauges.note_synced();
-        sys::status(outcome)
+        outcome
     }
 
     /// NV12 DMA-BUF planes for the surface, absent when the export fails.
     fn export(&self) -> Option<[DmaBufPlane; 2]> {
         // Sound: the display and surface are live behind the pool lease.
-        let synced = unsafe { sys::vaSyncSurface(self.display, self.surface) };
-        if synced != ffi::VA_STATUS_SUCCESS {
+        if Reader::sync_surface(self.display, self.surface).is_err() {
             return None;
         }
         self.gauges.note_synced();

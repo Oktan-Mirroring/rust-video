@@ -33,6 +33,8 @@ mod inflight;
 #[allow(dead_code)]
 mod params;
 #[cfg(target_os = "linux")]
+mod readback;
+#[cfg(target_os = "linux")]
 mod scale;
 #[allow(dead_code)]
 mod seam;

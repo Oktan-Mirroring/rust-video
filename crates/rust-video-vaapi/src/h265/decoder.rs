@@ -286,23 +286,41 @@ impl<'a> H265Decoder<'a> {
         size: (u32, u32),
         crop: (u32, u32, u32, u32),
     ) -> Result<(), VaApiError> {
-        let guards = {
+        let staged = {
             let (backend, _) = self.active()?;
             slots
-                .iter()
+                .into_iter()
                 .map(|slot| {
-                    backend.surface_guard(slot.index()).ok_or_else(|| {
+                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
                         VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })
+                    })?;
+                    let surface = backend
+                        .surfaces()
+                        .get(slot.index() as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            VaApiError::BrokenReference(format!(
+                                "slot {} outside pool",
+                                slot.index()
+                            ))
+                        })?;
+                    Ok((slot, guard, surface))
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, VaApiError>>()?
         };
-        for (slot, guard) in slots.into_iter().zip(guards) {
+        let mut launched = Vec::with_capacity(staged.len());
+        for (slot, guard, surface) in staged {
             let generation = self.generation;
             self.generation = self.generation.wrapping_add(1);
+            launched.push((generation, surface));
             self.pending
                 .push(PendingSlot::new(slot, size, crop, generation, guard));
         }
+        let (backend, _) = self.active()?;
+        for (generation, surface) in launched {
+            backend.launch_read(generation, surface, crop);
+        }
+        backend.map_ready(self.pending.depth());
         Ok(())
     }
 
@@ -337,11 +355,13 @@ impl<'a> H265Decoder<'a> {
         frames: &mut Vec<VaApiFrame>,
     ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
-        VaApiFrame::emit_into(
-            self.device,
+        let bytes = backend.collect_read(staged.generation())?;
+        VaApiFrame::emit_collected(
             backend,
             shared,
-            Emit::new(vec![staged.slot()], staged.size(), staged.crop(), true),
+            staged.size(),
+            staged.crop(),
+            bytes,
             frames,
             staged.generation(),
         )?;
