@@ -1,6 +1,6 @@
 # Windows throughput vs FFmpeg
 
-d3d11 h264 surface matches ffmpeg NVDEC frame for frame (1813 vs 1806 fps); vulkan sustained overlap beats it on identical bytes (2047 vs 1806). Sustained legs share gold bytes; sync and surface legs run legacy vectors against gold testsrc. Encode settings differ both sides: encode percents diagnose only.
+d3d11 h264 surface matches ffmpeg NVDEC frame for frame (1813 vs 1806 fps); vulkan sustained overlap beats it on identical bytes (2951 vs 1806). Sustained legs share gold bytes; sync and surface legs run legacy vectors against gold testsrc. Encode settings differ both sides: encode percents diagnose only.
 
 Debug test profile, ITERS=30 sync legs, 120-frame IP sustained legs, median of 3, quiet box, run 2026-11-18.
 
@@ -56,14 +56,14 @@ Sustained overlap, 120-frame IP both sides:
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| vulkan h264 sustained | 1806 | 2047 | +13.4% |
+| vulkan h264 sustained | 1806 | 2951 | +63.4% |
 | vulkan h265 sustained | 1623 | 1744 | +7.5% |
 | vulkan av1 sustained | 1671 | 1502 | -10.1% |
 | d3d11 h264 sustained | 1806 | 1086 | -39.9% |
 | d3d11 h265 sustained | 1623 | 957 | -41.0% |
 | d3d11 av1 sustained | 1671 | 1108 | -33.7% |
 | d3d11 vp9 sustained | 1269 | 883 | -30.4% |
-| d3d12 h264 sustained | 1806 | 677 | -62.5% |
+| d3d12 h264 sustained | 1806 | 1029 | -43.0% |
 
 Every leg shares gold's exact bytes; gold stays resident while rv legs hand CPU frames back: each percent favors gold. The downloaded h264 pair is the only shape-matched d3d leg: gold 723 with a 373 MB file write, rv 1086 with CPU frames in hand.
 
