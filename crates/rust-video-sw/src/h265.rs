@@ -74,9 +74,15 @@ impl H265Encoder {
         if keyint_frames == 0 {
             return Err(SwError::Init);
         }
-        FfmpegEncoder::open(c"libx265", width, height, bitrate_kbps, |ctx, bitrate| {
-            Self::configure(ctx, width, height, bitrate, threads, preset, keyint_frames)
-        })
+        FfmpegEncoder::open(
+            c"libx265",
+            width,
+            height,
+            bitrate_kbps,
+            move |ctx, bitrate| {
+                Self::configure(ctx, width, height, bitrate, threads, preset, keyint_frames)
+            },
+        )
         .map(|inner| Self { inner })
     }
 
@@ -93,9 +99,9 @@ impl H265Encoder {
         let Ok(size) = std::ffi::CString::new(format!("{width}x{height}")) else {
             return false;
         };
-        let Ok(x265_params) =
-            std::ffi::CString::new(format!("keyint={keyint_frames}:min-keyint={keyint_frames}"))
-        else {
+        let Ok(x265_params) = std::ffi::CString::new(format!(
+            "keyint={keyint_frames}:min-keyint={keyint_frames}:repeat-headers=1:log-level=error"
+        )) else {
             return false;
         };
         let Ok(preset) = std::ffi::CString::new(preset.as_str()) else {

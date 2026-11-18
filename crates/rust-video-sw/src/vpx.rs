@@ -13,12 +13,9 @@ use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 
-/// VP8 encoder over ffmpeg's `libvpx` wrapper.
-///
-/// # Performance
-///
-/// Throughput unmeasured; no 1080p fps figure until Linux CI runs it.
+/// Realtime VP8 encoder over ffmpeg's `libvpx` wrapper.
 pub struct Vp8Encoder {
+    /// Shared ffmpeg encode session.
     inner: FfmpegEncoder,
 }
 
@@ -37,9 +34,13 @@ impl Vp8Encoder {
     /// Returns `Err` when the system library drifts from the bound ABI or
     /// rejects the configuration.
     pub fn open(width: u32, height: u32, bitrate_kbps: u32, threads: u32) -> Result<Self, SwError> {
-        FfmpegEncoder::open(c"libvpx", width, height, bitrate_kbps, |ctx, bitrate| {
-            Self::configure(ctx, width, height, bitrate, threads)
-        })
+        FfmpegEncoder::open(
+            c"libvpx",
+            width,
+            height,
+            bitrate_kbps,
+            move |ctx, bitrate| Self::configure(ctx, width, height, bitrate, threads),
+        )
         .map(|inner| Self { inner })
     }
 
@@ -54,6 +55,7 @@ impl Vp8Encoder {
         let Ok(size) = std::ffi::CString::new(format!("{width}x{height}")) else {
             return false;
         };
+        let slices = i64::from(threads.clamp(1, 4));
         // SAFETY: context is live; option names are valid C strings.
         unsafe {
             sys::av_opt_set(
@@ -88,9 +90,21 @@ impl Vp8Encoder {
                     bitrate,
                     0,
                 ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"bufsize".as_ptr(),
+                    bitrate * 2,
+                    0,
+                ) == 0
                 && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"g".as_ptr(), Self::GOP, 0)
                     == 0
                 && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"bf".as_ptr(), 0, 0) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"slices".as_ptr(),
+                    slices,
+                    0,
+                ) == 0
                 && sys::av_opt_set_int(
                     ctx.cast::<std::ffi::c_void>(),
                     c"threads".as_ptr(),
@@ -133,6 +147,7 @@ impl Encoder for Vp8Encoder {
 
 /// Realtime VP9 encoder.
 pub struct Vp9Encoder {
+    /// Shared ffmpeg encode session.
     inner: FfmpegEncoder,
 }
 
@@ -156,7 +171,7 @@ impl Vp9Encoder {
             width,
             height,
             bitrate_kbps,
-            |ctx, bitrate| Self::configure(ctx, width, height, bitrate, threads),
+            move |ctx, bitrate| Self::configure(ctx, width, height, bitrate, threads),
         )
         .map(|inner| Self { inner })
     }
@@ -172,6 +187,7 @@ impl Vp9Encoder {
         let Ok(size) = std::ffi::CString::new(format!("{width}x{height}")) else {
             return false;
         };
+        let tile_cols = if width >= 512 && threads > 1 { 2 } else { 0 };
         // SAFETY: context is live; option names are valid C strings.
         unsafe {
             sys::av_opt_set(
@@ -206,6 +222,12 @@ impl Vp9Encoder {
                     bitrate,
                     0,
                 ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"bufsize".as_ptr(),
+                    bitrate * 2,
+                    0,
+                ) == 0
                 && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"g".as_ptr(), Self::GOP, 0)
                     == 0
                 && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"bf".as_ptr(), 0, 0) == 0
@@ -231,6 +253,18 @@ impl Vp9Encoder {
                     ctx.cast::<std::ffi::c_void>(),
                     c"lag-in-frames".as_ptr(),
                     0,
+                    sys::OPT_SEARCH_CHILDREN,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"row-mt".as_ptr(),
+                    1,
+                    sys::OPT_SEARCH_CHILDREN,
+                ) == 0
+                && sys::av_opt_set_int(
+                    ctx.cast::<std::ffi::c_void>(),
+                    c"tile-columns".as_ptr(),
+                    tile_cols,
                     sys::OPT_SEARCH_CHILDREN,
                 ) == 0
         }

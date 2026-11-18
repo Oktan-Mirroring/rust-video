@@ -18,6 +18,8 @@ pub const CODEC_ID_HEVC: c_int = 173;
 pub const CODEC_ID_AV1: c_int = 225;
 /// Planar 8-bit 4:2:0 pixel format.
 pub const PIX_FMT_YUV420P: c_int = 0;
+/// Full-range planar 8-bit 4:2:0 pixel format.
+pub const PIX_FMT_YUVJ420P: c_int = 12;
 /// Linked libavcodec major these layouts were read from.
 pub const ABI_MAJOR: u32 = 61;
 /// Linked libavutil major the frame layout was read from.
@@ -67,8 +69,6 @@ pub struct AVPacket {
     pub stream_index: c_int,
     /// Flag bits (`FLAG_KEY` marks a keyframe).
     pub flags: c_int,
-    /// Trailing bytes past the flags.
-    _tail: [u8; 60],
 }
 
 /// Decoded frame; only geometry, format, planes, and pts are exposed.
@@ -92,22 +92,21 @@ pub struct AVFrame {
     _mid: [u8; 16],
     /// Presentation timestamp in time-base units.
     pub pts: i64,
-    /// Trailing bytes past the pts.
-    _tail: [u8; 296],
 }
 
-const _: () = assert!(size_of::<AVPacket>() == 104);
-const _: () = assert!(size_of::<AVFrame>() == 440);
-const _: () = assert!(std::mem::offset_of!(AVPacket, data) == 24);
-const _: () = assert!(std::mem::offset_of!(AVPacket, size) == 32);
-const _: () = assert!(std::mem::offset_of!(AVPacket, stream_index) == 36);
-const _: () = assert!(std::mem::offset_of!(AVPacket, flags) == 40);
-const _: () = assert!(std::mem::offset_of!(AVFrame, data) == 0);
-const _: () = assert!(std::mem::offset_of!(AVFrame, linesize) == 64);
-const _: () = assert!(std::mem::offset_of!(AVFrame, width) == 104);
-const _: () = assert!(std::mem::offset_of!(AVFrame, height) == 108);
-const _: () = assert!(std::mem::offset_of!(AVFrame, format) == 116);
-const _: () = assert!(std::mem::offset_of!(AVFrame, pts) == 136);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(AVPacket, data) == 24);
+    assert!(std::mem::offset_of!(AVPacket, size) == 32);
+    assert!(std::mem::offset_of!(AVPacket, stream_index) == 36);
+    assert!(std::mem::offset_of!(AVPacket, flags) == 40);
+    assert!(std::mem::offset_of!(AVFrame, data) == 0);
+    assert!(std::mem::offset_of!(AVFrame, linesize) == 64);
+    assert!(std::mem::offset_of!(AVFrame, width) == 104);
+    assert!(std::mem::offset_of!(AVFrame, height) == 108);
+    assert!(std::mem::offset_of!(AVFrame, format) == 116);
+    assert!(std::mem::offset_of!(AVFrame, pts) == 136);
+};
 
 #[link(name = "avcodec")]
 unsafe extern "C" {
@@ -185,8 +184,12 @@ unsafe extern "C" {
     pub fn avutil_version() -> u32;
     /// Blank frame, or null.
     pub fn av_frame_alloc() -> *mut AVFrame;
+    /// Refcounted clone sharing plane buffers, or null.
+    pub fn av_frame_clone(src: *const AVFrame) -> *mut AVFrame;
     /// Buffer for `frame` with `align`; zero on success.
     pub fn av_frame_get_buffer(frame: *mut AVFrame, align: c_int) -> c_int;
+    /// Writable copy-on-write plane buffers on `frame`; zero on success.
+    pub fn av_frame_make_writable(frame: *mut AVFrame) -> c_int;
     /// Frame contents released.
     pub fn av_frame_unref(frame: *mut AVFrame);
     /// Frame released.

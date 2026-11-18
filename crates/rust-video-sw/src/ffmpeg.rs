@@ -6,17 +6,17 @@
 
 use std::ffi::c_int;
 use std::ptr;
-
-use bytes::Bytes;
-
-use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
-use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Decoder;
+use std::sync::Arc;
 
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
 use crate::pipeline::RawSource;
+
+use bytes::{Bytes, BytesMut};
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
+use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
 
 pub use crate::ffmpeg_sys::AVCodecContext;
 
@@ -108,11 +108,18 @@ impl Codec {
 /// picture the library has ready; any hold-back on reorder streams
 /// happens inside libavcodec.
 pub struct FfmpegDecoder {
+    /// Live libavcodec decode context.
     ctx: *mut sys::AVCodecContext,
+    /// Annex B splitter; null for framed codecs.
     parser: *mut sys::AVCodecParserContext,
+    /// Reusable decoded-frame slot.
     frame: *mut sys::AVFrame,
+    /// Reusable coded-packet slot.
     packet: *mut sys::AVPacket,
+    /// True when packets hold whole frames.
     framed: bool,
+    /// Parser-starved bytes awaiting the next packet.
+    pending: Vec<u8>,
 }
 
 // SAFETY: sole owner of its context, parser, frame, and packet; every
@@ -120,7 +127,18 @@ pub struct FfmpegDecoder {
 unsafe impl Send for FfmpegDecoder {}
 
 impl FfmpegDecoder {
-    /// Decoder for `codec` with `threads` worker threads; zero selects the library default.
+    /// Explicit worker count for `threads`; zero resolves to the machine width.
+    fn resolve_threads(threads: u32) -> u32 {
+        if threads != 0 {
+            return threads;
+        }
+        std::thread::available_parallelism()
+            .ok()
+            .and_then(|width| u32::try_from(width.get()).ok())
+            .unwrap_or(0)
+    }
+
+    /// Decoder for `codec` with `threads` worker threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -147,6 +165,7 @@ impl FfmpegDecoder {
         if ctx.is_null() {
             return Err(SwError::Init);
         }
+        let threads = Self::resolve_threads(threads);
         // SAFETY: context is live; option names are valid C strings.
         let err = unsafe {
             sys::av_opt_set_int(
@@ -204,15 +223,16 @@ impl FfmpegDecoder {
             frame,
             packet,
             framed: codec.framed(),
+            pending: Vec::new(),
         })
     }
 
     /// Native libavcodec context behind the decoder.
     ///
     /// Threading: a single thread needs nothing; threads sharing one
-    /// decoder serialize context calls with crate submissions —
-    /// sequence calls made through the pointer with `decode` and
-    /// `flush`, never overlapping them.
+    /// decoder serialize context calls with crate submissions, sequencing
+    /// calls made through the pointer with `decode` and `flush`, never
+    /// overlapping them.
     ///
     /// Lifetime: the pointer borrows the decoder and stays valid only
     /// while the decoder lives; using it after the decoder drops, or
@@ -328,7 +348,14 @@ impl FfmpegDecoder {
     ///
     /// Returns `Err` when the parser or the decoder rejects its input.
     fn parse(&mut self, bytes: &[u8], out: &mut impl PictureSink) -> Result<(), SwError> {
-        let mut rest = bytes;
+        let joined;
+        let mut rest = if self.pending.is_empty() {
+            bytes
+        } else {
+            joined = [self.pending.as_slice(), bytes].concat();
+            self.pending.clear();
+            joined.as_slice()
+        };
         while !rest.is_empty() {
             let size = std::ffi::c_int::try_from(rest.len()).map_err(|_| SwError::Rejected)?;
             let mut pout = ptr::null_mut();
@@ -361,6 +388,7 @@ impl FfmpegDecoder {
             let consumed = usize::try_from(consumed).map_err(|_| SwError::Rejected)?;
             if consumed == 0 {
                 if pout_size == 0 {
+                    self.pending.extend_from_slice(rest);
                     return Ok(());
                 }
                 continue;
@@ -413,6 +441,11 @@ impl FfmpegDecoder {
     /// * `out` - pictures staged, oldest first.
     fn flush_into(&mut self, out: &mut impl PictureSink) -> Result<(), SwError> {
         if !self.framed {
+            let booked = std::mem::take(&mut self.pending);
+            if !booked.is_empty() {
+                self.parse(&booked, out)?;
+                self.pending.clear();
+            }
             loop {
                 let mut pout = ptr::null_mut();
                 let mut pout_size = 0;
@@ -528,7 +561,7 @@ pub struct H264Decoder {
 }
 
 impl H264Decoder {
-    /// Decoder with `threads` worker threads; zero selects the library default.
+    /// Decoder with `threads` worker threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -592,7 +625,7 @@ pub struct H265Decoder {
 }
 
 impl H265Decoder {
-    /// Decoder with `threads` worker threads; zero selects the library default.
+    /// Decoder with `threads` worker threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -656,7 +689,7 @@ pub struct Vp8Decoder {
 }
 
 impl Vp8Decoder {
-    /// Decoder with `threads` decoder threads; zero selects the library default.
+    /// Decoder with `threads` decoder threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -720,7 +753,7 @@ pub struct Vp9Decoder {
 }
 
 impl Vp9Decoder {
-    /// Decoder with `threads` decoder threads; zero selects the library default.
+    /// Decoder with `threads` decoder threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -784,7 +817,7 @@ pub struct Av1Decoder {
 }
 
 impl Av1Decoder {
-    /// Decoder with `threads` worker threads; zero selects the library default.
+    /// Decoder with `threads` worker threads; zero uses every CPU.
     ///
     /// # Errors
     ///
@@ -861,7 +894,7 @@ impl PictureLayout {
     ///
     /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
     fn read(frame: &sys::AVFrame) -> Result<Self, SwError> {
-        if frame.format != sys::PIX_FMT_YUV420P {
+        if frame.format != sys::PIX_FMT_YUV420P && frame.format != sys::PIX_FMT_YUVJ420P {
             return Err(SwError::BadFrame);
         }
         let width = u32::try_from(frame.width).map_err(|_| SwError::BadFrame)?;
@@ -890,162 +923,231 @@ impl PictureLayout {
         })
     }
 
-    /// Plane bytes behind the frame; luma, chroma U, chroma V.
-    ///
-    /// # Safety
-    ///
-    /// `frame` planes span the layout spans; read the layout from `frame`.
-    unsafe fn planes<'a>(&self, frame: &'a sys::AVFrame) -> [&'a [u8]; 3] {
-        let height = self.size.height() as usize;
-        let chroma_height = self.size.height().div_ceil(2) as usize;
-        // SAFETY: planes span live decoder memory per the contract above.
-        let y = unsafe {
-            std::slice::from_raw_parts(frame.data[0].cast_const(), height * self.y_stride)
-        };
-        // SAFETY: planes span live decoder memory per the contract above.
-        let u = unsafe {
-            std::slice::from_raw_parts(frame.data[1].cast_const(), chroma_height * self.u_stride)
-        };
-        // SAFETY: planes span live decoder memory per the contract above.
-        let v = unsafe {
-            std::slice::from_raw_parts(frame.data[2].cast_const(), chroma_height * self.v_stride)
-        };
-        [y, u, v]
+    /// True when every plane stride equals its visible row width.
+    fn is_tight(&self) -> bool {
+        let width = self.size.width() as usize;
+        let chroma = self.size.width().div_ceil(2) as usize;
+        self.y_stride == width && self.u_stride == chroma && self.v_stride == chroma
     }
 }
 
-/// Owned strided copy of one decoded picture.
+/// Refcounted libavutil frame handle backing zero-copy plane views.
+struct OwnedAvFrame {
+    /// Cloned frame; freed once on drop.
+    raw: *mut sys::AVFrame,
+}
+
+// SAFETY: `raw` is an immutable cloned `AVFrame` whose `AVBuffer` refcounts
+// are atomic inside libavutil; no mutation occurs after `clone_from`.
+unsafe impl Send for OwnedAvFrame {}
+// SAFETY: Plane readers only form shared `&[u8]` slices over immutable bytes.
+unsafe impl Sync for OwnedAvFrame {}
+
+impl OwnedAvFrame {
+    /// Refcounted clone of `frame` sharing its underlying `AVBuffer` planes.
+    fn clone_from(frame: &sys::AVFrame) -> Result<Self, SwError> {
+        // SAFETY: `frame` is a live decoded frame; null return is checked.
+        let raw = unsafe { sys::av_frame_clone(ptr::from_ref(frame)) };
+        if raw.is_null() {
+            return Err(SwError::BadFrame);
+        }
+        Ok(Self { raw })
+    }
+
+    /// Borrowed view of the cloned frame.
+    fn frame(&self) -> &sys::AVFrame {
+        // SAFETY: `self.raw` is non-null and immutable for `self`'s lifetime.
+        unsafe { &*self.raw }
+    }
+}
+
+impl Drop for OwnedAvFrame {
+    fn drop(&mut self) {
+        let mut raw = self.raw;
+        // SAFETY: `self.raw` came from `av_frame_clone` and is freed once here.
+        unsafe { sys::av_frame_free(&raw mut raw) };
+    }
+}
+
+/// Immutable slice of one plane inside a refcounted `OwnedAvFrame`.
+struct AvPlaneBytes {
+    /// Shared frame owner keeping the plane buffer alive.
+    _owner: Arc<OwnedAvFrame>,
+    /// Plane start pointer.
+    ptr: *const u8,
+    /// Byte length of the tight plane.
+    len: usize,
+}
+
+// SAFETY: `_owner` keeps the immutable `AVBuffer` alive; `ptr` is read-only.
+unsafe impl Send for AvPlaneBytes {}
+// SAFETY: Shared access only yields `&[u8]` over immutable pixel bytes.
+unsafe impl Sync for AvPlaneBytes {}
+
+impl AsRef<[u8]> for AvPlaneBytes {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr..ptr + len` is a validated tight plane kept live by `_owner`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Refcounted decoded picture awaiting conversion or zero-copy handoff.
 pub struct RawPicture {
-    /// Visible extent.
-    size: PictureSize,
-    /// Luma bytes per row.
-    y_stride: usize,
-    /// Chroma U bytes per row.
-    u_stride: usize,
-    /// Chroma V bytes per row.
-    v_stride: usize,
-    /// Strided luma bytes.
-    y: Vec<u8>,
-    /// Strided chroma U bytes.
-    u: Vec<u8>,
-    /// Strided chroma V bytes.
-    v: Vec<u8>,
+    /// Cloned libavutil frame.
+    frame: OwnedAvFrame,
 }
 
 impl RawPicture {
-    /// Strided copy of a decoded frame.
+    /// Refcounted clone of a decoded frame without copying plane bytes.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
+    /// Returns `Err` when the frame is not 8-bit 4:2:0 or cloning fails.
     fn copy_from(frame: &sys::AVFrame) -> Result<Self, SwError> {
-        let layout = PictureLayout::read(frame)?;
-        // SAFETY: layout was read from this frame above.
-        let [y, u, v] = unsafe { layout.planes(frame) };
+        let _ = PictureLayout::read(frame)?;
         Ok(Self {
-            size: layout.size,
-            y_stride: layout.y_stride,
-            u_stride: layout.u_stride,
-            v_stride: layout.v_stride,
-            y: y.to_vec(),
-            u: u.to_vec(),
-            v: v.to_vec(),
+            frame: OwnedAvFrame::clone_from(frame)?,
         })
     }
 
-    /// CPU frame gathered from the strided copy.
+    /// CPU frame built from the retained picture, zero-copy when tight.
     ///
     /// # Errors
     ///
     /// Returns `Err` when the planes cannot form a frame.
     pub(crate) fn gather(self) -> Result<CpuFrame, SwError> {
-        let width = self.size.width() as usize;
-        let height = self.size.height() as usize;
-        let chroma_width = self.size.width().div_ceil(2) as usize;
-        let chroma_height = self.size.height().div_ceil(2) as usize;
-        let y = gather_plane(&self.y, self.y_stride, height, width);
-        let u = gather_plane(&self.u, self.u_stride, chroma_height, chroma_width);
-        let v = gather_plane(&self.v, self.v_stride, chroma_height, chroma_width);
-        pack_yuv420p(self.size, y, u, v)
+        let layout = PictureLayout::read(self.frame.frame())?;
+        if layout.is_tight() {
+            return zero_copy_frame(Arc::new(self.frame), &layout);
+        }
+        gather_strided(self.frame.frame(), &layout)
     }
 }
 
-/// CPU frame packed from tight planes.
-fn pack_yuv420p(
-    size: PictureSize,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-) -> Result<CpuFrame, SwError> {
-    let width = size.width();
+/// Zero-copy `CpuFrame` over a tight refcounted `OwnedAvFrame`.
+fn zero_copy_frame(owner: Arc<OwnedAvFrame>, layout: &PictureLayout) -> Result<CpuFrame, SwError> {
+    let data = owner.frame().data;
+    let width = layout.size.width();
+    let height = layout.size.height() as usize;
     let chroma_width = width.div_ceil(2);
-    let planes = [
-        Plane::new(Bytes::from(y), width),
-        Plane::new(Bytes::from(u), chroma_width),
-        Plane::new(Bytes::from(v), chroma_width),
-    ];
-    let [Some(y), Some(u), Some(v)] = planes else {
+    let chroma_height = layout.size.height().div_ceil(2) as usize;
+    let y_bytes = Bytes::from_owner(AvPlaneBytes {
+        _owner: Arc::clone(&owner),
+        ptr: data[0].cast_const(),
+        len: width as usize * height,
+    });
+    let u_bytes = Bytes::from_owner(AvPlaneBytes {
+        _owner: Arc::clone(&owner),
+        ptr: data[1].cast_const(),
+        len: chroma_width as usize * chroma_height,
+    });
+    let v_bytes = Bytes::from_owner(AvPlaneBytes {
+        _owner: owner,
+        ptr: data[2].cast_const(),
+        len: chroma_width as usize * chroma_height,
+    });
+    let [Some(y), Some(u), Some(v)] = [
+        Plane::new(y_bytes, width),
+        Plane::new(u_bytes, chroma_width),
+        Plane::new(v_bytes, chroma_width),
+    ] else {
         return Err(SwError::BadFrame);
     };
-    CpuFrame::new(size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
+    CpuFrame::new(layout.size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
 }
 
-/// CPU frame copied from a decoded frame.
+/// Single-allocation `CpuFrame` gathered row-by-row from a strided `AVFrame`.
+fn gather_strided(frame: &sys::AVFrame, layout: &PictureLayout) -> Result<CpuFrame, SwError> {
+    let width = layout.size.width() as usize;
+    let height = layout.size.height() as usize;
+    let chroma_width = layout.size.width().div_ceil(2) as usize;
+    let chroma_height = layout.size.height().div_ceil(2) as usize;
+    let y_len = width * height;
+    let uv_len = chroma_width * chroma_height;
+    let mut backing = BytesMut::with_capacity(y_len + uv_len * 2);
+    // SAFETY: each row copies only `cols` visible bytes within `frame`'s plane buffer.
+    unsafe {
+        copy_rows(
+            &mut backing,
+            frame.data[0].cast_const(),
+            layout.y_stride,
+            height,
+            width,
+        );
+        copy_rows(
+            &mut backing,
+            frame.data[1].cast_const(),
+            layout.u_stride,
+            chroma_height,
+            chroma_width,
+        );
+        copy_rows(
+            &mut backing,
+            frame.data[2].cast_const(),
+            layout.v_stride,
+            chroma_height,
+            chroma_width,
+        );
+    }
+    let y = backing.split_to(y_len).freeze();
+    let u = backing.split_to(uv_len).freeze();
+    let v = backing.freeze();
+    let stride_y = layout.size.width();
+    let stride_uv = stride_y.div_ceil(2);
+    let [Some(y), Some(u), Some(v)] = [
+        Plane::new(y, stride_y),
+        Plane::new(u, stride_uv),
+        Plane::new(v, stride_uv),
+    ] else {
+        return Err(SwError::BadFrame);
+    };
+    CpuFrame::new(layout.size, PixelFormat::Yuv420P, vec![y, u, v]).ok_or(SwError::BadFrame)
+}
+
+/// Append `rows` of `cols` visible bytes from `ptr` stepped by `stride`.
 ///
-/// # Performance
+/// # Safety
 ///
-/// One copy per plane.
+/// `ptr` must address `rows` valid rows of `cols` bytes separated by `stride`.
+unsafe fn copy_rows(out: &mut BytesMut, ptr: *const u8, stride: usize, rows: usize, cols: usize) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    if stride == cols {
+        // SAFETY: contiguous span of `rows * cols` bytes per caller contract.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, rows * cols) });
+    } else {
+        for row in 0..rows {
+            // SAFETY: row `row` has `cols` valid bytes at `row * stride`.
+            let line = unsafe { std::slice::from_raw_parts(ptr.add(row * stride), cols) };
+            out.extend_from_slice(line);
+        }
+    }
+}
+
+/// CPU frame from a decoded `AVFrame`, zero-copy when plane strides are tight.
 ///
 /// # Errors
 ///
 /// Returns `Err` when the frame is not 8-bit 4:2:0 or its geometry is unusable.
 fn convert(frame: &sys::AVFrame) -> Result<CpuFrame, SwError> {
     let layout = PictureLayout::read(frame)?;
-    // SAFETY: layout was read from this frame above.
-    let [y_source, u_source, v_source] = unsafe { layout.planes(frame) };
-    let width = layout.size.width() as usize;
-    let height = layout.size.height() as usize;
-    let chroma_width = layout.size.width().div_ceil(2) as usize;
-    let chroma_height = layout.size.height().div_ceil(2) as usize;
-    let y = gather_plane(y_source, layout.y_stride, height, width);
-    let u = gather_plane(u_source, layout.u_stride, chroma_height, chroma_width);
-    let v = gather_plane(v_source, layout.v_stride, chroma_height, chroma_width);
-    pack_yuv420p(layout.size, y, u, v)
-}
-
-/// Plane bytes gathered from stride-separated source rows.
-///
-/// # Performance
-///
-/// One copy per plane.
-///
-/// # Arguments
-///
-/// * `source` - source bytes; holds `rows` times `stride`.
-/// * `stride` - source bytes per row.
-/// * `rows` - row count.
-/// * `cols` - bytes gathered per row; at most `stride`.
-fn gather_plane(source: &[u8], stride: usize, rows: usize, cols: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rows * cols);
-    if stride == cols {
-        out.extend_from_slice(&source[..rows * cols]);
-    } else {
-        for chunk in source.chunks_exact(stride).take(rows) {
-            out.extend_from_slice(&chunk[..cols]);
-        }
+    if layout.is_tight() {
+        let owned = OwnedAvFrame::clone_from(frame)?;
+        return zero_copy_frame(Arc::new(owned), &layout);
     }
-    out
+    gather_strided(frame, &layout)
 }
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
 
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
 
     use super::{
-        gather_plane, Av1Decoder, Codec, FfmpegDecoder, H264Decoder, H265Decoder, Vp8Decoder,
+        copy_rows, Av1Decoder, Codec, FfmpegDecoder, H264Decoder, H265Decoder, Vp8Decoder,
         Vp9Decoder,
     };
 
@@ -1062,13 +1164,19 @@ mod tests {
     }
 
     #[test]
-    fn gather_plane_matches_row_by_row() {
+    fn copy_rows_matches_row_by_row() {
         let tight: Vec<u8> = (0..64).collect();
-        let mut strided = vec![0xFFu8; 2 * 40];
+        let mut strided = [0xFFu8; 2 * 40];
         strided[..32].copy_from_slice(&tight[..32]);
         strided[40..72].copy_from_slice(&tight[32..]);
-        assert_eq!(gather_plane(&tight, 32, 2, 32), tight);
-        assert_eq!(gather_plane(&strided, 40, 2, 32), tight);
+        let mut out_tight = BytesMut::with_capacity(64);
+        // SAFETY: `tight` holds 2 rows of 32 bytes.
+        unsafe { copy_rows(&mut out_tight, tight.as_ptr(), 32, 2, 32) };
+        assert_eq!(&out_tight[..], &tight[..]);
+        let mut out_strided = BytesMut::with_capacity(64);
+        // SAFETY: `strided` holds 2 rows of 32 visible bytes at stride 40.
+        unsafe { copy_rows(&mut out_strided, strided.as_ptr(), 40, 2, 32) };
+        assert_eq!(&out_strided[..], &tight[..]);
     }
 
     #[cfg(target_os = "linux")]
@@ -1099,6 +1207,19 @@ mod tests {
     fn open_accepts_thread_counts() {
         assert!(H264Decoder::open(0).is_ok());
         assert!(H264Decoder::open(4).is_ok());
+    }
+
+    #[test]
+    fn auto_resolves_to_machine_width() {
+        assert_eq!(FfmpegDecoder::resolve_threads(4), 4);
+        let expected = std::thread::available_parallelism()
+            .ok()
+            .and_then(|width| u32::try_from(width.get()).ok())
+            .unwrap_or(0);
+        assert_eq!(FfmpegDecoder::resolve_threads(0), expected);
+        if expected != 0 {
+            assert!(H265Decoder::open(0).is_ok());
+        }
     }
 
     #[test]
@@ -1176,5 +1297,44 @@ mod tests {
             assert_eq!(frame.size().width(), 64);
             assert_eq!(frame.size().height(), 64);
         }
+    }
+
+    #[test]
+    fn looped_packets_drain_fully() {
+        use rust_video_harness::H264Synth;
+
+        let raws = H264Synth::annex_b_packets();
+        let mut decoder = H264Decoder::open(4).expect("decoder");
+        let mut frames = 0;
+        for _ in 0..300 {
+            for raw in &raws {
+                let packet = Packet::new(Bytes::copy_from_slice(raw));
+                frames += decoder.decode(&packet).expect("decode").len();
+            }
+        }
+        frames += decoder.flush().expect("flush").len();
+        assert_eq!(frames, 600);
+    }
+
+    #[test]
+    fn split_packets_drain_fully() {
+        use rust_video_harness::H264Synth;
+
+        let mut halves = Vec::new();
+        for raw in H264Synth::annex_b_packets() {
+            let mid = raw.len() / 2;
+            halves.push(raw[..mid].to_vec());
+            halves.push(raw[mid..].to_vec());
+        }
+        let mut decoder = H264Decoder::open(4).expect("decoder");
+        let mut frames = 0;
+        for _ in 0..300 {
+            for raw in &halves {
+                let packet = Packet::new(Bytes::copy_from_slice(raw));
+                frames += decoder.decode(&packet).expect("decode").len();
+            }
+        }
+        frames += decoder.flush().expect("flush").len();
+        assert_eq!(frames, 600);
     }
 }

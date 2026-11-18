@@ -2,32 +2,43 @@
 #![allow(unsafe_code)]
 //! Shared ffmpeg encode session behind the software encoders.
 //!
-//! One live context plus a reusable frame and packet; the typed wrappers
-//! differ only by codec name and option preset.
+//! One live context plus a reusable frame and packet; typed wrappers
+//! supply codec candidates and option presets.
 
 use std::ffi::CStr;
 use std::ptr;
 
-use bytes::Bytes;
+use crate::error::SwError;
+use crate::ffmpeg_sys as sys;
 
+use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-
-use crate::error::SwError;
-use crate::ffmpeg_sys as sys;
 
 /// Live ffmpeg encode session: context plus reusable frame and packet.
 ///
 /// `Send`, never `Sync`: hand the session to another thread when idle,
 /// but run every call on one thread.
 pub(crate) struct FfmpegEncoder {
+    /// Active encoder context.
     ctx: *mut sys::AVCodecContext,
+    /// Reusable input frame with pooled plane backing.
     frame: *mut sys::AVFrame,
+    /// Reusable output packet slot.
     packet: *mut sys::AVPacket,
+    /// Factory recreating the context when `encode` follows `flush`.
+    reopen: Box<dyn FnMut() -> Result<*mut sys::AVCodecContext, SwError> + Send>,
+    /// Coded width in luma samples.
     width: u32,
+    /// Coded height in luma samples.
     height: u32,
+    /// Next presentation timestamp in frame units.
     next_pts: i64,
+    /// True once `frame` owns an allocated plane buffer.
+    allocated: bool,
+    /// True after `flush` sent end-of-stream to `ctx`.
+    draining: bool,
 }
 
 // SAFETY: sole owner of its context, frame, and packet; every FFI call
@@ -37,18 +48,40 @@ unsafe impl Send for FfmpegEncoder {}
 impl FfmpegEncoder {
     /// CBR encoder for `name` at `width`x`height` and `bitrate_kbps`.
     ///
-    /// `configure` applies codec options to the blank context; false rejects it.
-    ///
     /// # Errors
     ///
     /// Returns `Err` when the system library drifts from the bound ABI or
     /// rejects the configuration.
     pub(crate) fn open(
-        name: &CStr,
+        name: &'static CStr,
         width: u32,
         height: u32,
         bitrate_kbps: u32,
-        configure: impl FnOnce(*mut sys::AVCodecContext, i64) -> bool,
+        configure: impl Fn(*mut sys::AVCodecContext, i64) -> bool + Send + 'static,
+    ) -> Result<Self, SwError> {
+        Self::open_candidates(
+            vec![name],
+            width,
+            height,
+            bitrate_kbps,
+            move |candidate, ctx, bitrate| {
+                debug_assert_eq!(candidate, name);
+                configure(ctx, bitrate)
+            },
+        )
+    }
+
+    /// CBR encoder selecting the first available candidate in `names`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no candidate opens or the system library ABI drifts.
+    pub(crate) fn open_candidates(
+        names: Vec<&'static CStr>,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        configure: impl Fn(&'static CStr, *mut sys::AVCodecContext, i64) -> bool + Send + 'static,
     ) -> Result<Self, SwError> {
         // SAFETY: version queries take no arguments and touch no state.
         if unsafe { sys::avcodec_version() } >> 16 != sys::ABI_MAJOR
@@ -63,30 +96,39 @@ impl FfmpegEncoder {
         if bitrate <= 0 {
             return Err(SwError::Init);
         }
-        // SAFETY: name is a valid C string; null is checked.
-        let codec = unsafe { sys::avcodec_find_encoder_by_name(name.as_ptr()) };
-        if codec.is_null() {
-            return Err(SwError::Init);
-        }
-        // SAFETY: codec is live; null is checked.
-        let ctx = unsafe { sys::avcodec_alloc_context3(codec) };
-        if ctx.is_null() {
-            return Err(SwError::Init);
-        }
-        if !configure(ctx, bitrate) {
-            // SAFETY: context came from a successful alloc and is freed once.
-            unsafe { Self::release(ctx, ptr::null_mut(), ptr::null_mut()) };
-            return Err(SwError::Init);
-        }
-        // SAFETY: context and codec are live; null options select defaults.
-        let err = unsafe { sys::avcodec_open2(ctx, codec, ptr::null_mut()) };
-        if err != 0 {
-            // SAFETY: context came from a successful alloc and is freed once.
-            unsafe { Self::release(ctx, ptr::null_mut(), ptr::null_mut()) };
-            return Err(SwError::Native {
-                code: i64::from(err),
-            });
-        }
+        let build_ctx = move || -> Result<*mut sys::AVCodecContext, SwError> {
+            let mut last_err = SwError::Init;
+            for &name in &names {
+                // SAFETY: name is a valid static C string; null is checked.
+                let codec = unsafe { sys::avcodec_find_encoder_by_name(name.as_ptr()) };
+                if codec.is_null() {
+                    continue;
+                }
+                // SAFETY: codec is live; null is checked.
+                let mut ctx = unsafe { sys::avcodec_alloc_context3(codec) };
+                if ctx.is_null() {
+                    return Err(SwError::Init);
+                }
+                if !configure(name, ctx, bitrate) {
+                    // SAFETY: context came from a successful alloc and is freed once.
+                    unsafe { sys::avcodec_free_context(&raw mut ctx) };
+                    last_err = SwError::Init;
+                    continue;
+                }
+                // SAFETY: context and codec are live; null options select defaults.
+                let err = unsafe { sys::avcodec_open2(ctx, codec, ptr::null_mut()) };
+                if err == 0 {
+                    return Ok(ctx);
+                }
+                // SAFETY: context came from a successful alloc and is freed once.
+                unsafe { sys::avcodec_free_context(&raw mut ctx) };
+                last_err = SwError::Native {
+                    code: i64::from(err),
+                };
+            }
+            Err(last_err)
+        };
+        let ctx = build_ctx()?;
         // SAFETY: blank frame or null; null is checked.
         let frame = unsafe { sys::av_frame_alloc() };
         // SAFETY: blank packet or null; null is checked.
@@ -104,9 +146,12 @@ impl FfmpegEncoder {
             ctx,
             frame,
             packet,
+            reopen: Box::new(build_ctx),
             width,
             height,
             next_pts: 0,
+            allocated: false,
+            draining: false,
         })
     }
 
@@ -117,6 +162,15 @@ impl FfmpegEncoder {
     /// Returns `Err` when the frame is rejected or a ready packet is unusable.
     pub(crate) fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, SwError> {
         SwError::check_yuv420p(frame, self.width, self.height)?;
+        if self.draining {
+            let fresh = (self.reopen)()?;
+            let mut old = self.ctx;
+            // SAFETY: `old` is live and uniquely owned here.
+            unsafe { sys::avcodec_free_context(&raw mut old) };
+            self.ctx = fresh;
+            self.next_pts = 0;
+            self.draining = false;
+        }
         let mut out = Vec::new();
         self.send(frame, &mut out)?;
         self.receive(&mut out)?;
@@ -129,6 +183,9 @@ impl FfmpegEncoder {
     ///
     /// Returns `Err` when the flush signal or a trailing packet fails.
     pub(crate) fn flush(&mut self) -> Result<Vec<Packet>, SwError> {
+        if self.draining {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         // SAFETY: null frame signals end of stream.
         let err = unsafe { sys::avcodec_send_frame(self.ctx, ptr::null()) };
@@ -136,16 +193,17 @@ impl FfmpegEncoder {
             self.receive(&mut out)?;
             // SAFETY: queue drained above, so the signal fits now.
             let err = unsafe { sys::avcodec_send_frame(self.ctx, ptr::null()) };
-            if err != 0 {
+            if err != 0 && err != sys::EOF {
                 return Err(SwError::Native {
                     code: i64::from(err),
                 });
             }
-        } else if err != 0 {
+        } else if err != 0 && err != sys::EOF {
             return Err(SwError::Native {
                 code: i64::from(err),
             });
         }
+        self.draining = true;
         self.receive(&mut out)?;
         Ok(out)
     }
@@ -177,47 +235,58 @@ impl FfmpegEncoder {
         }
     }
 
-    /// Input frame queued from `frame`, packets drained into `out`.
-    ///
-    /// # Performance
-    ///
-    /// One copy per plane.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the frame is rejected or a ready packet is unusable.
-    fn send(&mut self, frame: &CpuFrame, out: &mut Vec<Packet>) -> Result<(), SwError> {
-        // SAFETY: frame is live; unref resets it for reuse.
-        unsafe { sys::av_frame_unref(self.frame) };
-        // SAFETY: geometry matches the open call; get_buffer fills the planes.
-        unsafe {
-            (*self.frame).width = self.width.cast_signed();
-            (*self.frame).height = self.height.cast_signed();
-            (*self.frame).format = sys::PIX_FMT_YUV420P;
+    /// Ensure `self.frame` holds writable plane buffers.
+    fn ensure_writable_frame(&mut self) -> Result<(), SwError> {
+        if !self.allocated {
+            // SAFETY: geometry matches the open call; get_buffer fills the planes.
+            unsafe {
+                (*self.frame).width = self.width.cast_signed();
+                (*self.frame).height = self.height.cast_signed();
+                (*self.frame).format = sys::PIX_FMT_YUV420P;
+            }
+            // SAFETY: dimensions and format are set; zero aligns by CPU.
+            let err = unsafe { sys::av_frame_get_buffer(self.frame, 0) };
+            if err != 0 {
+                return Err(SwError::Native {
+                    code: i64::from(err),
+                });
+            }
+            self.allocated = true;
         }
-        // SAFETY: dimensions and format are set; zero aligns by CPU.
-        let err = unsafe { sys::av_frame_get_buffer(self.frame, 0) };
+        // SAFETY: `self.frame` holds allocated refcounted buffers; COWs only if retained.
+        let err = unsafe { sys::av_frame_make_writable(self.frame) };
         if err != 0 {
             return Err(SwError::Native {
                 code: i64::from(err),
             });
         }
+        Ok(())
+    }
+
+    /// Input frame queued from `frame`, packets drained into `out`.
+    fn send(&mut self, frame: &CpuFrame, out: &mut Vec<Packet>) -> Result<(), SwError> {
+        self.ensure_writable_frame()?;
         // SAFETY: buffer is live and writable; rows are copied within strides.
         unsafe {
             for (slot, plane) in frame.planes().iter().enumerate() {
                 let stride =
                     usize::try_from((*self.frame).linesize[slot]).map_err(|_| SwError::Rejected)?;
                 let src_stride = plane.stride() as usize;
+                let cols = if slot == 0 {
+                    self.width as usize
+                } else {
+                    self.width.div_ceil(2) as usize
+                };
                 let rows = if slot == 0 {
                     self.height as usize
                 } else {
                     self.height as usize / 2
                 };
-                if stride < src_stride {
+                if stride < cols || src_stride < cols {
                     return Err(SwError::Rejected);
                 }
                 let dst = std::slice::from_raw_parts_mut((*self.frame).data[slot], rows * stride);
-                copy_plane(dst, stride, plane.data(), src_stride, rows, src_stride);
+                copy_plane(dst, stride, plane.data(), src_stride, rows, cols);
             }
             (*self.frame).pts = self.next_pts;
         }
@@ -242,14 +311,6 @@ impl FfmpegEncoder {
     }
 
     /// Packets ready now, copied out of the reusable slot.
-    ///
-    /// # Performance
-    ///
-    /// One copy per packet.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when a ready packet breaks mid-encode.
     fn receive(&mut self, out: &mut Vec<Packet>) -> Result<(), SwError> {
         loop {
             // SAFETY: packet is a valid output slot; success lends its bytes.
@@ -286,19 +347,6 @@ impl Drop for FfmpegEncoder {
 }
 
 /// Destination rows filled from source rows.
-///
-/// # Performance
-///
-/// One copy per plane.
-///
-/// # Arguments
-///
-/// * `dst` - destination bytes; holds `rows` times `dst_stride`.
-/// * `dst_stride` - destination bytes per row.
-/// * `src` - source bytes; holds `rows` times `src_stride`.
-/// * `src_stride` - source bytes per row.
-/// * `rows` - row count.
-/// * `cols` - bytes copied per row; at most both strides.
 fn copy_plane(
     dst: &mut [u8],
     dst_stride: usize,
@@ -307,8 +355,8 @@ fn copy_plane(
     rows: usize,
     cols: usize,
 ) {
-    if dst_stride == src_stride {
-        let len = rows * src_stride;
+    if dst_stride == src_stride && src_stride == cols {
+        let len = rows * cols;
         dst[..len].copy_from_slice(&src[..len]);
     } else {
         for (row, chunk) in src.chunks_exact(src_stride).take(rows).enumerate() {

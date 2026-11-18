@@ -3,26 +3,38 @@
 //! Encode only: `OpenH264` decode diverges from the reference on B-frame
 //! content (see `docs/sw-codecs.md`), so no decoder ships here.
 
+use crate::error::SwError;
+
 use bytes::Bytes;
 use openh264::encoder::{
-    BitRate, Complexity, EncodedBitStream, Encoder, EncoderConfig, FrameType, RateControlMode,
+    BitRate, Complexity, EncodedBitStream, Encoder, EncoderConfig, FrameRate, FrameType,
+    IntraFramePeriod, RateControlMode,
 };
 use openh264::formats::YUVSlices;
-
+use openh264::Timestamp;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder as CapsEncoder;
 
-use crate::error::SwError;
+/// Slice byte budget when multi-threaded; engages worker threads without tiny slice fragmentation.
+const MULTI_SLICE_BYTES: u32 = 16_384;
 
-/// Slice byte budget; several slices per frame engage all threads.
-const SLICE_BYTES: u32 = 3000;
+/// Nominal realtime frame rate in Hz for CBR rate control.
+const TARGET_FPS: f32 = 60.0;
+
+/// Keyframe cadence in pictures.
+const GOP_FRAMES: u32 = 60;
 
 /// Realtime H.264 encoder.
 pub struct H264Encoder {
+    /// `OpenH264` encoder instance.
     inner: Encoder,
+    /// Coded width in luma samples.
     width: u32,
+    /// Coded height in luma samples.
     height: u32,
+    /// Encoded frame counter driving monotonically increasing timestamps.
+    frame_index: u64,
 }
 
 impl H264Encoder {
@@ -36,15 +48,21 @@ impl H264Encoder {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(SwError::Init);
         }
-        let config = EncoderConfig::new()
+        let mut config = EncoderConfig::new()
+            .debug(false)
             .bitrate(BitRate::from_bps(bitrate_bps))
+            .max_frame_rate(FrameRate::from_hz(TARGET_FPS))
             .rate_control_mode(RateControlMode::Bitrate)
+            .skip_frames(false)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(GOP_FRAMES))
             .num_threads(threads)
-            .max_slice_len(SLICE_BYTES)
             .complexity(Complexity::Low)
             .scene_change_detect(false)
             .adaptive_quantization(false)
             .background_detection(false);
+        if threads > 1 {
+            config = config.max_slice_len(MULTI_SLICE_BYTES);
+        }
         let api = openh264::OpenH264API::from_source();
         let inner = Encoder::with_api_config(api, config).map_err(|error| SwError::Native {
             code: error.native_code(),
@@ -53,6 +71,7 @@ impl H264Encoder {
             inner,
             width,
             height,
+            frame_index: 0,
         })
     }
 
@@ -105,9 +124,11 @@ impl CapsEncoder for H264Encoder {
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         SwError::check_yuv420p(frame, self.width, self.height)?;
         let source = Self::view(frame);
+        let ts = Timestamp::from_millis(self.frame_index.saturating_mul(1_000) / 60);
+        self.frame_index = self.frame_index.saturating_add(1);
         let stream = self
             .inner
-            .encode(&source)
+            .encode_at(&source, ts)
             .map_err(|error| SwError::Native {
                 code: error.native_code(),
             })?;

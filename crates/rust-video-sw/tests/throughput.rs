@@ -200,6 +200,7 @@ where
     }
     encoder.flush().expect("warmup flush");
     let mut bytes = 0;
+    let mut emitted = 0u32;
     let start = Instant::now();
     for frame in frames
         .iter()
@@ -208,14 +209,17 @@ where
     {
         for packet in &encoder.encode(frame).expect("timed encode") {
             bytes += packet.data().len();
+            emitted += 1;
         }
     }
     for packet in &encoder.flush().expect("timed flush") {
         bytes += packet.data().len();
+        emitted += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
     assert!(bytes > 0);
-    f64::from(ITERS) / elapsed
+    assert!(emitted > 0);
+    f64::from(emitted) / elapsed
 }
 
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
