@@ -1119,6 +1119,21 @@ impl GpuMemory {
     ///
     /// Returns `Err` when `len` overruns the allocation or mapping fails.
     pub fn read_to_buf(&self, out: &mut bytes::BytesMut, len: usize) -> Result<(), VulkanError> {
+        let src = self.map_prefix(len)?;
+        // Sound: the mapping spans `len` bytes; unmap follows the copy.
+        unsafe {
+            Self::copy_mapped(out, src, len);
+        }
+        self.unmap();
+        Ok(())
+    }
+
+    /// Mapped prefix pointer behind `len` bytes, released separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `len` overruns the allocation or mapping fails.
+    pub fn map_prefix(&self, len: usize) -> Result<*const u8, VulkanError> {
         let want = u64::try_from(len).unwrap_or(u64::MAX);
         if want > self.size {
             return Err(VulkanError::OutOfBounds {
@@ -1126,26 +1141,43 @@ impl GpuMemory {
                 capacity: self.size,
             });
         }
+        // Sound: the memory is host-visible and owned.
+        let ptr = unsafe {
+            self.device
+                .map_memory(self.memory, 0, want, vk::MemoryMapFlags::empty())
+        }?;
+        Ok(ptr.cast_const().cast::<u8>())
+    }
+
+    /// Release a mapping from [`map_prefix`](Self::map_prefix).
+    pub fn unmap(&self) {
+        // Sound: a mapping from `map_prefix` is live.
+        unsafe {
+            self.device.unmap_memory(self.memory);
+        }
+    }
+
+    /// `len` mapped bytes into `out`, reusing it.
+    ///
+    /// # Safety
+    ///
+    /// `src` must span `len` readable bytes of a live mapping.
+    pub unsafe fn copy_mapped(out: &mut bytes::BytesMut, src: *const u8, len: usize) {
         out.clear();
         if len == 0 {
-            return Ok(());
+            return;
         }
         out.reserve(len);
-        // SAFETY: the memory is host-visible and owned; the copy lands in
-        // reserved spare capacity, and the length sets only after it.
+        // Sound: the copy lands in reserved spare capacity, and the
+        // length sets only after it.
         unsafe {
-            let ptr = self
-                .device
-                .map_memory(self.memory, 0, want, vk::MemoryMapFlags::empty())?;
             std::ptr::copy_nonoverlapping(
-                ptr.cast::<u8>(),
+                src,
                 out.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
                 len,
             );
-            self.device.unmap_memory(self.memory);
             out.set_len(len);
         }
-        Ok(())
     }
 
     /// Copy the allocation prefix of `len` bytes into `out`, reusing it.
