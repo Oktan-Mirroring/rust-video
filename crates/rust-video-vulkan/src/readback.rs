@@ -20,14 +20,17 @@ use crate::raw::GpuMemory;
 /// Queued copies before a launch waits.
 const DEPTH: usize = 8;
 
+/// Copies below this size run inline on the collect thread.
+const INLINE_COPY_BYTES: usize = 256 * 1024;
+
 /// One copied transfer.
 pub(crate) struct Done {
     /// Filled staging bytes.
     bytes: BytesMut,
     /// Mapping behind the copy, released by the collect thread.
     release: Release,
-    /// Copy microseconds.
-    copy_us: u64,
+    /// Copy time.
+    copy: Duration,
 }
 
 /// Mapping release: unmap on the collect thread.
@@ -96,7 +99,7 @@ impl Readback {
                     let done = Done {
                         bytes: out,
                         release: job.transfer.release,
-                        copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        copy: started.elapsed(),
                     };
                     if done_tx.send(done).is_err() {
                         return;
@@ -113,7 +116,7 @@ impl Readback {
 
     /// Queue the copy of `mapped`, oldest-first behind earlier jobs.
     ///
-    /// Returns the completed copy inline without a worker.
+    /// Small copies complete inline, as does every copy without a worker.
     pub(crate) fn launch(&self, mapped: Mapped) -> Option<Done> {
         let started = Instant::now();
         let copy_inline = |mapped: Mapped| {
@@ -125,9 +128,12 @@ impl Readback {
             Done {
                 bytes: out,
                 release: mapped.release,
-                copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                copy: started.elapsed(),
             }
         };
+        if mapped.len < INLINE_COPY_BYTES {
+            return Some(copy_inline(mapped));
+        }
         let Some(tx) = self.tx.as_ref() else {
             return Some(copy_inline(mapped));
         };
@@ -204,8 +210,8 @@ impl Mapped {
 }
 
 impl Done {
-    /// Filled bytes, mapping release, and copy microseconds.
-    pub(crate) fn into_parts(self) -> (BytesMut, Release, u64) {
-        (self.bytes, self.release, self.copy_us)
+    /// Filled bytes, mapping release, and copy time.
+    pub(crate) fn into_parts(self) -> (BytesMut, Release, Duration) {
+        (self.bytes, self.release, self.copy)
     }
 }

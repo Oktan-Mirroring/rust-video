@@ -1617,7 +1617,7 @@ fn launch_waited(
     let (data, len, release) = session.map_pending(picture.pending)?;
     let mapped = crate::readback::Mapped::new(buffer, data, len, release.clone());
     if let Some(done) = sink.readback.launch(mapped) {
-        let (bytes, release, copy_us) = done.into_parts();
+        let (bytes, release, copy) = done.into_parts();
         release.unmap();
         return land_launched(
             session,
@@ -1632,7 +1632,7 @@ fn launch_waited(
                 release: None,
             },
             bytes,
-            Duration::from_micros(copy_us),
+            copy,
         );
     }
     sink.launched.push_back(LaunchedPicture {
@@ -1694,16 +1694,9 @@ fn harvest_landed(
             debug_assert!(false, "landed copy without launched picture");
             break;
         };
-        let (bytes, release, copy_us) = done.into_parts();
+        let (bytes, release, copy) = done.into_parts();
         release.unmap();
-        out.extend(land_launched(
-            session,
-            sink,
-            stats,
-            launched,
-            bytes,
-            Duration::from_micros(copy_us),
-        )?);
+        out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
     }
     Ok(out)
 }
@@ -1721,16 +1714,9 @@ fn collect_launched(
     };
     match sink.readback.collect() {
         Some(done) => {
-            let (bytes, release, copy_us) = done.into_parts();
+            let (bytes, release, copy) = done.into_parts();
             release.unmap();
-            land_launched(
-                session,
-                sink,
-                stats,
-                launched,
-                bytes,
-                Duration::from_micros(copy_us),
-            )
+            land_launched(session, sink, stats, launched, bytes, copy)
         }
         None => rescue_launched(session, sink, stats, launched),
     }
@@ -1850,16 +1836,9 @@ fn collect_oldest_timeout(
                 debug_assert!(false, "landed copy without launched picture");
                 return Ok(Some(out));
             };
-            let (bytes, release, copy_us) = done.into_parts();
+            let (bytes, release, copy) = done.into_parts();
             release.unmap();
-            out.extend(land_launched(
-                session,
-                sink,
-                stats,
-                launched,
-                bytes,
-                Duration::from_micros(copy_us),
-            )?);
+            out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
         }
     }
     Ok(Some(out))
@@ -3129,10 +3108,9 @@ impl<'a> Av1Decoder<'a> {
             debug_assert!(false, "landed copy without launched picture");
             return Ok(None);
         };
-        let (bytes, release, copy_us) = done.into_parts();
+        let (bytes, release, copy) = done.into_parts();
         release.unmap();
-        self.land_retained(launched, bytes, Duration::from_micros(copy_us))
-            .map(Some)
+        self.land_retained(launched, bytes, copy).map(Some)
     }
 
     /// Oldest launched copy into display frames, waiting for it.
@@ -3141,9 +3119,9 @@ impl<'a> Av1Decoder<'a> {
             return Ok(Vec::new());
         };
         if let Some(done) = self.sink.readback.collect() {
-            let (bytes, release, copy_us) = done.into_parts();
+            let (bytes, release, copy) = done.into_parts();
             release.unmap();
-            return self.land_retained(launched, bytes, Duration::from_micros(copy_us));
+            return self.land_retained(launched, bytes, copy);
         }
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
@@ -3244,13 +3222,9 @@ impl<'a> Av1Decoder<'a> {
             debug_assert!(false, "landed copy without launched picture");
             return Ok(Some(Vec::new()));
         };
-        let (bytes, release, copy_us) = done.into_parts();
+        let (bytes, release, copy) = done.into_parts();
         release.unmap();
-        Ok(Some(self.land_retained(
-            launched,
-            bytes,
-            Duration::from_micros(copy_us),
-        )?))
+        Ok(Some(self.land_retained(launched, bytes, copy)?))
     }
 
     /// Collect signaled pictures in order, stopping at the first pending one.
