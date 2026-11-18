@@ -1,8 +1,8 @@
 # linux 32c, RTX 5080 + Radeon: golden throughput, 2026-11-18
 
-rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%. rv-vaapi took h264/h265/av1/vp9 surfaces (+2.9% to +88.6%), lost h264/h265 readback (-11.5%, -5.2%), and held encode at -4.7% h264 and +2.0% h265. Vulkan h264/h265 decode and both encodes have no ffmpeg number: TIMEOUT or nothing written, rv-only rows.
+rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%. rv-vaapi took h264/h265/av1/vp9 surfaces (+3.5% to +88.3%) and h264 readback (+2.9%, gap closed); h265 readback still trails (-5.2%). Encode held at -3.6% h264 and +3.7% h265. Vulkan h264/h265 decode and both encodes have no ffmpeg number: TIMEOUT or nothing written, rv-only rows.
 
-Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-11-18 on a 32-core LMDE 7 box; rv tree 031c1e3 plus the uncommitted vaapi readback fix, release build.
+Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-11-18 on a 32-core LMDE 7 box, release build.
 
 ## Environment
 
@@ -72,15 +72,15 @@ SVT legs match thread settings both sides: rv threads map to lp only (4t is lp4,
 | Leg | FFmpeg | rv-vaapi | Delta |
 |---|---|---|---|
 | h264 surface | 791.1 | 871.7 | +10.2% |
-| h264 readback | 745.0 | 659.1 | -11.5% |
+| h264 readback | 729.7 | 750.5 | +2.9% |
 | h265 surface | 573.9 | 590.8 | +2.9% |
-| h265 readback | 547.9 | 519.6 | -5.2% |
+| h265 readback | 541.4 | 513.3 | -5.2% |
 | av1 surface | 575.9 | 1086.3 | +88.6% |
-| av1 readback | 427.2 | 729.7 | +70.8% |
+| av1 readback | 423.8 | 673.7 | +59.0% |
 | vp9 surface | 538.0 | 567.3 | +5.4% |
-| vp9 readback | 484.8 | 495.0 | +2.1% |
+| vp9 readback | 464.3 | 543.8 | +17.1% |
 
-Readback before/after on the same golden content: h264 -0.5%, h265 -0.1%, av1 +1.1%, vp9 +0.3%. The fix touches the createImage-fallback copy pairing and format cache only; the derive path both benches measure is unchanged.
+Readback path: split-phase worker, DEFAULT_DEPTH 4. Same-content before/after: h264 +16.1%, vp9 +12.8%, h265 -0.9%, av1 -5.4% across 4 interleaved runs. Surface, encode, and transcode legs hold within 0.5%.
 
 ## VA-API encode, fps, 300f
 
