@@ -1,8 +1,8 @@
 # linux 32c, RTX 5080 + Radeon: golden throughput, 2026-11-18
 
-rv-sw decode beat ffmpeg on all 16 software decode legs, +4.3% to +81.3%. rv-vaapi took h264/h265/av1/vp9 surfaces (+2.8% to +90.0%), lost h264/h265 readback (-11.2%, -5.0%), and closed the encode gap to -4.5% h264 and +2.6% h265. Vulkan h264/h265 decode and both encodes have no ffmpeg number: TIMEOUT or nothing written, rv-only rows.
+rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%. rv-vaapi took h264/h265/av1/vp9 surfaces (+2.9% to +88.6%), lost h264/h265 readback (-11.5%, -5.2%), and held encode at -4.7% h264 and +2.0% h265. Vulkan h264/h265 decode and both encodes have no ffmpeg number: TIMEOUT or nothing written, rv-only rows.
 
-Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-11-18 on a 32-core LMDE 7 box; rv tree 017ab7b plus uncommitted changes, release build.
+Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-11-18 on a 32-core LMDE 7 box; rv tree 031c1e3 plus the uncommitted vaapi readback fix, release build.
 
 ## Environment
 
@@ -21,7 +21,7 @@ Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-
 
 - Decode legs run 600f actual; encode legs run 300f yuv420p at 5M nominal, fastest sane settings both sides.
 - fps divides actual output frames by wall both sides: ffmpeg parses `-progress frame=` per run, rv counts decoded frames over fed frames.
-- Median of 5 runs each side, no warmup either side; livepack is a single run, rv-only.
+- Median of 5 runs each side, no warmup either side, livepack included.
 - FFmpeg VA-API pins renderD128; rv-vaapi opens the first openable render node in readdir order (the same node on this box, logged).
 - rv-vulkan uses one negotiated device; ffmpeg vulkan legs run per device.
 - These numbers do not compare to `just benches`: debug test profile, ITERS=30, different corpus.
@@ -30,66 +30,70 @@ Golden throughput legs only: 600f decode streams, 300f encode streams. Run 2026-
 
 | Leg | FFmpeg | rv-sw | Delta |
 |---|---|---|---|
-| h264 IPB 1t | 596.2 | 630.8 | +5.8% |
-| h264 IPB 4t | 1702.7 | 2039.2 | +19.8% |
-| h264 IPB 8t | 2296.5 | 2823.3 | +22.9% |
-| h264 IPB auto | 3242.8 | 4998.8 | +54.2% |
-| h264 IP 4t | 1727.3 | 2109.9 | +22.2% |
-| h264 IP auto | 3027.2 | 5486.8 | +81.3% |
-| h265 IPB 4t | 1019.2 | 1067.5 | +4.7% |
-| h265 IPB auto | 1567.0 | 1973.1 | +25.9% |
-| av1 4t | 1340.4 | 1466.1 | +9.4% |
-| av1 auto | 1610.8 | 1902.1 | +18.1% |
-| vp9 1t | 671.4 | 700.5 | +4.3% |
-| vp9 4t | 1379.2 | 1524.1 | +10.5% |
-| vp9 8t | 1368.6 | 1668.2 | +21.9% |
-| vp9 auto | 1511.2 | 2626.0 | +73.8% |
-| vp8 4t | 1776.8 | 2011.8 | +13.2% |
-| vp8 auto | 2670.9 | 4276.1 | +60.1% |
+| h264 IPB 1t | 596.2 | 630.4 | +5.7% |
+| h264 IPB 4t | 1766.6 | 2033.8 | +15.1% |
+| h264 IPB 8t | 2308.4 | 2967.8 | +28.6% |
+| h264 IPB auto | 3231.5 | 4757.5 | +47.2% |
+| h264 IP 4t | 1710.2 | 2059.4 | +20.4% |
+| h264 IP auto | 2969.1 | 5367.7 | +80.8% |
+| h265 IPB 4t | 1003.0 | 1051.7 | +4.9% |
+| h265 IPB auto | 1499.0 | 1923.7 | +28.3% |
+| av1 4t | 1352.0 | 1496.8 | +10.7% |
+| av1 auto | 1611.4 | 1879.8 | +16.7% |
+| vp9 1t | 670.6 | 708.0 | +5.6% |
+| vp9 4t | 1349.5 | 1583.2 | +17.3% |
+| vp9 8t | 1364.9 | 1664.7 | +22.0% |
+| vp9 auto | 1549.7 | 2538.0 | +63.8% |
+| vp8 4t | 1774.7 | 2045.0 | +15.2% |
+| vp8 auto | 2741.3 | 4199.2 | +53.2% |
 
 ## Software encode, fps
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| x264 ultrafast zerolat 4t | 821.6 | 956.9 | +16.5% |
-| x264 ultrafast zerolat auto | 982.7 | 1242.6 | +26.4% |
-| x265 ultrafast zerolat 4t | 295.9 | 319.2 | +7.9% |
-| x265 ultrafast zerolat auto | 297.0 | 315.6 | +6.3% |
-| vpx-vp8 cpu8 4t | 156.5 | 160.4 | +2.5% |
-| vpx-vp8 cpu8 8t | 168.3 | 170.3 | +1.2% |
-| vpx-vp9 cpu8 4t | 386.6 | 482.3 | +24.8% |
-| vpx-vp9 cpu8 8t | 456.3 | 542.5 | +18.9% |
-| aom cpu8 8t | 174.8 | 171.4 | -1.9% |
+| x264 ultrafast zerolat 4t | 773.0 | 926.6 | +19.9% |
+| x264 ultrafast zerolat auto | 1055.5 | 1264.0 | +19.8% |
+| x265 ultrafast zerolat 4t | 298.3 | 317.6 | +6.5% |
+| x265 ultrafast zerolat auto | 294.3 | 321.7 | +9.3% |
+| vpx-vp8 cpu8 4t | 154.9 | 160.7 | +3.7% |
+| vpx-vp8 cpu8 8t | 166.5 | 170.5 | +2.4% |
+| vpx-vp9 cpu8 4t | 378.0 | 498.0 | +31.7% |
+| vpx-vp9 cpu8 8t | 420.1 | 530.3 | +26.2% |
+| aom cpu8 8t | 172.1 | 176.5 | +2.6% |
 | aom cpu10 8t | ERR, Numerical result out of range | no leg, crate pins cpu8 | uncomparable, ffmpeg ERR |
-| svt p13 la0, FF auto / rv 4t | 500.3 | 589.8 | +17.9%, threads differ |
-| svt p13 la0, FF auto / rv 8t | 500.3 | 882.3 | +76.4%, threads differ |
-| openh264 4t / 8t | no leg, encoder absent from build | 934.3 / 932.6 | rv-only |
+| svt p13 la0 lp4, matched | 424.8 | 572.1 | +34.7% |
+| svt p13 la0 lp6 vs rv 8t, matched | 484.0 | 873.2 | +80.4% |
+| openh264 4t / 8t | no leg, encoder absent from build | 857.6 / 846.7 | rv-only |
+
+SVT legs match thread settings both sides: rv threads map to lp only (4t is lp4, 8t clamps to lp6), ffmpeg `-threads` is inert for libsvtav1, so the ffmpeg legs use the same lp values. Superseded v3 rows compared ffmpeg auto 500.3 against rv 4t 589.8 (+17.9%) and rv 8t 882.3 (+76.4%) with threads differing.
 
 ## VA-API decode, fps, Radeon
 
 | Leg | FFmpeg | rv-vaapi | Delta |
 |---|---|---|---|
-| h264 surface | 791.9 | 872.0 | +10.1% |
-| h264 readback | 745.6 | 661.8 | -11.2% |
-| h265 surface | 573.7 | 589.5 | +2.8% |
-| h265 readback | 548.4 | 521.1 | -5.0% |
-| av1 surface | 575.9 | 1094.1 | +90.0% |
-| av1 readback | 427.0 | 734.4 | +72.0% |
-| vp9 surface | 536.2 | 567.7 | +5.9% |
-| vp9 readback | 483.1 | 494.7 | +2.4% |
+| h264 surface | 791.1 | 871.7 | +10.2% |
+| h264 readback | 745.0 | 659.1 | -11.5% |
+| h265 surface | 573.9 | 590.8 | +2.9% |
+| h265 readback | 547.9 | 519.6 | -5.2% |
+| av1 surface | 575.9 | 1086.3 | +88.6% |
+| av1 readback | 427.2 | 729.7 | +70.8% |
+| vp9 surface | 538.0 | 567.3 | +5.4% |
+| vp9 readback | 484.8 | 495.0 | +2.1% |
+
+Readback before/after on the same golden content: h264 -0.5%, h265 -0.1%, av1 +1.1%, vp9 +0.3%. The fix touches the createImage-fallback copy pairing and format cache only; the derive path both benches measure is unchanged.
 
 ## VA-API encode, fps, 300f
 
 | Leg | FFmpeg | rv-vaapi | Delta |
 |---|---|---|---|
-| h264 IP g60 | 316.3 | 302.1 | -4.5% |
-| h264 all-intra | 320.0 | 306.0 | -4.4% |
-| h265 IP g60 | 325.3 | 331.4 | +1.9% |
-| h265 all-intra | 324.5 | 332.8 | +2.6% |
-| h264 transcode, rv all-intra | 234.2 IP | 224.2 | -4.3%, GOP shape differs |
-| h264 transcode, rv IP g60 | 234.2 IP | 225.1 | -3.9%, same GOP |
-| h265 transcode, rv all-intra | 235.0 IP | 225.2 | -4.2%, GOP shape differs |
-| h265 transcode, rv IP g60 | 235.0 IP | 226.9 | -3.4%, same GOP |
+| h264 IP g60 | 316.1 | 301.2 | -4.7% |
+| h264 all-intra | 319.7 | 306.0 | -4.3% |
+| h265 IP g60 | 325.4 | 331.7 | +1.9% |
+| h265 all-intra | 326.2 | 332.8 | +2.0% |
+| h264 transcode, rv all-intra | 234.5 IP | 221.5 | -5.5%, GOP shape differs |
+| h264 transcode, rv IP g60 | 234.5 IP | 220.7 | -5.9%, same GOP |
+| h265 transcode, rv all-intra | 235.0 IP | 224.7 | -4.4%, GOP shape differs |
+| h265 transcode, rv IP g60 | 235.0 IP | 225.6 | -4.0%, same GOP |
 
 ## Vulkan, fps
 
@@ -97,28 +101,27 @@ One negotiated device rv-side against per-device ffmpeg legs; h264/h265 decode a
 
 | Leg | FFmpeg rtx5080 | FFmpeg radv | rv, one device |
 |---|---|---|---|
-| h264 decode surface | TIMEOUT | 583.1 | 2468.0 IPB |
-| h264 decode readback | TIMEOUT | 522.0 | 1917.4 IPB, 2653.8 IP |
-| h265 decode surface | TIMEOUT | TIMEOUT | 2098.0 |
-| h265 decode readback | TIMEOUT | 433.5 | 1722.0 |
-| av1 decode surface | 438.9 | 444.1 | 1692.4, +285.6% vs rtx5080 |
-| av1 decode readback | 426.7 | 370.5 | 1634.5, +283.1% vs rtx5080 |
-| h264 encode | ERR, nothing written | ERR, thread return code | 543.4, 77.6 Mbps actual vs 75 nominal |
-| h265 encode | ERR, nothing written | ERR, thread return code | 235.9, 83.1 Mbps actual vs 75 nominal |
+| h264 decode surface | TIMEOUT | 579.2 | 2481.9 IPB |
+| h264 decode readback | TIMEOUT | 524.6 | 1939.4 IPB, 2640.3 IP |
+| h265 decode surface | TIMEOUT | TIMEOUT | 2108.3 |
+| h265 decode readback | TIMEOUT | 432.5 | 1713.2 |
+| av1 decode surface | 446.3 | 443.0 | 1708.3, +282.8% vs rtx5080 |
+| av1 decode readback | 433.6 | 373.4 | 1638.1, +277.8% vs rtx5080 |
+| h264 encode | ERR, nothing written | ERR | 543.9, 77.6 Mbps actual vs 75 nominal |
+| h265 encode | ERR, nothing written | ERR | 236.8, 83.1 Mbps actual vs 75 nominal |
 
 ## One-sided reference
 
-- NVENC via ffmpeg, no rv tier: h264 504.2, h265 549.7, av1 542.8.
-- Livepack via rv, no ffmpeg counterpart: TsMux 1957486.7, TsDemux 1271411.1, FragMux 395920.9.
-- radv transcode via ffmpeg, no rv leg: h264 225.5, h265 ERR.
+- NVENC via ffmpeg, no rv tier: h264 499.2, h265 557.3, av1 511.5.
+- Livepack via rv, no ffmpeg counterpart, median of 5: TsMux 2039204.4, TsDemux 1552162.4, FragMux 428935.8.
+- radv transcode via ffmpeg, no rv leg: h264 226.6, h265 ERR.
 
 ## Comparability notes
 
 - Counting: fps uses actual output frames both sides. No nominal-divisor legs remain.
 - Warmup: none either side. Cold-start bias is symmetric; the median of 5 absorbs it.
-- Statistic: median of 5 each side except livepack, single run rv-only.
-- Threads: svt legs compare ffmpeg auto threads against rv 4t/8t; the percent carries that difference.
+- Statistic: median of 5 each side including livepack.
 - Devices: rv-vaapi picks the first openable render node (same node here, logged); ffmpeg pins renderD128. rv-vulkan uses one negotiated device; ffmpeg covers both GPUs.
 - Bitrate: vulkan encode nominal 75 Mbps; rv actual 77.6 h264 and 83.1 h265 on golden content. FFmpeg vulkan encode wrote nothing, so no encode comparison exists.
 - Gaps: aom cpu10 ffmpeg ERR Numerical-out-of-range with no rv cpu10 path; vulkan h264/h265 decode ffmpeg TIMEOUT; openh264 encoder absent from the ffmpeg build.
-- radv rows are FF-only, never percent: h264 surface 583.1 and readback 522.0, h265 readback 433.5 with surface TIMEOUT, av1 surface 444.1 and readback 370.5, both encodes ERR thread-abort. radv h264 surface and h265 transcode vary run to run with no ffmpeg-side code change.
+- radv rows are FF-only, never percent: h264 surface 579.2 and readback 524.6, h265 readback 432.5 with surface TIMEOUT, av1 surface 443.0 and readback 373.4, both encodes ERR. radv h264 surface and h265 transcode vary run to run with no ffmpeg-side code change.
