@@ -1741,7 +1741,7 @@ impl<'a> OverlappedH264Pump<'a> {
 
     /// Front output plus `done` into the ready queue.
     fn land_front(&mut self, done: Done) -> Result<(), D3d12Error> {
-        let (slot, bytes, release, _copy_us) = done.into_parts();
+        let (slot, bytes, release, _copy) = done.into_parts();
         let output = self
             .pictures
             .front_mut()

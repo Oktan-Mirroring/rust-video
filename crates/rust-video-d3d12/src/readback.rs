@@ -10,7 +10,7 @@
 use std::marker::PhantomData;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -21,6 +21,9 @@ use crate::submit::Nv12Layout;
 /// Queued copies before a launch waits.
 const DEPTH: usize = 8;
 
+/// Copies below this size run inline on the submit thread.
+const INLINE_COPY_BYTES: usize = 256 * 1024;
+
 /// One copied transfer.
 pub(crate) struct Done {
     /// Decode slot behind the output.
@@ -29,8 +32,8 @@ pub(crate) struct Done {
     bytes: Result<Vec<u8>, D3d12Error>,
     /// Mapping behind the copy, released by the submit thread.
     release: Release,
-    /// Copy microseconds.
-    copy_us: u64,
+    /// Copy time.
+    copy: Duration,
 }
 
 /// Mapping release: unmap on the submit thread.
@@ -109,7 +112,7 @@ impl Readback {
                         slot: job.transfer.slot,
                         bytes,
                         release: job.transfer.release,
-                        copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        copy: started.elapsed(),
                     };
                     if done_tx.send(done).is_err() {
                         return;
@@ -126,7 +129,7 @@ impl Readback {
 
     /// Queue the copy of `mapped`, oldest-first behind earlier jobs.
     ///
-    /// Returns the completed copy inline without a worker.
+    /// Small copies complete inline, as does every copy without a worker.
     pub(crate) fn launch(&self, mapped: Mapped) -> Option<Done> {
         let started = Instant::now();
         let copy_inline = |mapped: Mapped| {
@@ -139,9 +142,12 @@ impl Readback {
                 slot: mapped.slot,
                 bytes,
                 release: mapped.release,
-                copy_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                copy: started.elapsed(),
             }
         };
+        if mapped.len < INLINE_COPY_BYTES {
+            return Some(copy_inline(mapped));
+        }
         let Some(tx) = self.tx.as_ref() else {
             return Some(copy_inline(mapped));
         };
@@ -221,8 +227,8 @@ impl Mapped {
 }
 
 impl Done {
-    /// Slot, copied bytes, mapping release, and copy microseconds.
-    pub(crate) fn into_parts(self) -> (u8, Result<Vec<u8>, D3d12Error>, Release, u64) {
-        (self.slot, self.bytes, self.release, self.copy_us)
+    /// Slot, copied bytes, mapping release, and copy time.
+    pub(crate) fn into_parts(self) -> (u8, Result<Vec<u8>, D3d12Error>, Release, Duration) {
+        (self.slot, self.bytes, self.release, self.copy)
     }
 }
