@@ -1,13 +1,10 @@
 //! H.264, HEVC, and AV1 decode over live video sessions.
 
-use std::collections::VecDeque;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::av1::{Frame as Av1Frame, Ingest as Av1Ingest};
 use crate::av1_dpb::{Av1Decoded, Av1Dpb};
-use crate::decode::{DecodeQueues, DecodeSession, H264Submission, SharedExport};
+use crate::decode::{DecodeQueues, DecodeSession, SharedExport};
 use crate::decoder::D3d12Frame;
 use crate::device::D3d12Device;
 use crate::dpb::{Decoded, Dpb};
@@ -17,16 +14,12 @@ use crate::h264::{Crop, Ingest, Picture};
 use crate::hevc::{Ingest as HevcIngest, Picture as HevcPicture};
 use crate::hevc_dpb::{HevcDecoded, HevcDpb};
 use crate::os::FrameOs;
-use crate::pins::{SlotPin, SlotPins};
-use crate::readback::{Done, Readback};
+use crate::pins::SlotPins;
 use crate::submit::Ticket;
 use crate::texture::{GpuSurface, SurfaceLayout};
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::delivery::{
-    PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
-};
 use rust_video_caps::frame::{GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
@@ -34,7 +27,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 
 /// Active sequence behind the live session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Active {
+pub(crate) struct Active {
     /// Sequence set id.
     sps_id: u8,
     /// Coded width in luma samples.
@@ -45,6 +38,13 @@ struct Active {
     crop: Option<Crop>,
     /// Visible size in luma samples.
     visible: PictureSize,
+}
+
+impl Active {
+    /// True when `other` shares the coded extent.
+    pub(crate) fn same_extent(self, other: Active) -> bool {
+        self.width == other.width && self.height == other.height
+    }
 }
 
 /// HEVC decoder over a D3D12 device.
@@ -1432,858 +1432,6 @@ impl Decoder for H264Decoder<'_> {
     }
 }
 
-/// In-flight picture: submitted video plus queued downloads.
-struct InflightPicture {
-    /// Decode arguments behind the submit, dropped past the video ticket.
-    submission: Option<Box<H264Submission>>,
-    /// Pool pin behind the submission slot, steering the buffer past it.
-    pin: SlotPin,
-    /// Video queue ticket behind the decode.
-    video: Ticket,
-    /// Video signal time, stamped on poll.
-    video_signaled: Option<Instant>,
-    /// Queued downloads in output order.
-    outputs: VecDeque<PendingOutput>,
-}
-
-/// H.264 decode with pipelined multi-inflight submits behind the async traits.
-///
-/// Submits video work without blocking on completion. Downloads ride
-/// the copy queue behind GPU waits; copy N runs beside decode N+1.
-/// Completions surface in order through poll or blocking receive.
-pub struct OverlappedH264Pump<'a> {
-    /// Device owning the decode session.
-    device: &'a D3d12Device,
-    /// Annex B ingest: sets plus picture assembly.
-    ingest: Ingest,
-    /// Live picture buffer, created from the first sequence set.
-    dpb: Option<Dpb>,
-    /// Live decode session, created from the first sequence set.
-    session: Option<DecodeSession>,
-    /// VRAM budget sized to the adapter memory.
-    shared: SharedDevice,
-    /// Sequence behind the live session.
-    active: Option<Active>,
-    /// Next frame generation number.
-    generation: u64,
-    /// Stream resets after mid-picture failures.
-    resets: u64,
-    /// Pipelined picture ceiling behind sends.
-    bound: usize,
-    /// Submitted pictures with work outstanding, oldest first.
-    pictures: VecDeque<InflightPicture>,
-    /// Completed frames awaiting receive, oldest first.
-    ready: VecDeque<D3d12Frame>,
-    /// Input ended; sends refuse, receives drain then end.
-    finished: bool,
-    /// Peak pipelined pictures with incomplete GPU work.
-    max_depth: usize,
-    /// Phase-split timing per harvested frame, oldest first.
-    timings: Vec<PhaseTiming>,
-    /// Progress signal sender behind blocking receive.
-    wake_tx: Sender<()>,
-    /// Progress signal receiver behind blocking receive.
-    wake_rx: Receiver<()>,
-    /// Live-surface pin counts over the decoder pool.
-    pins: Arc<SlotPins>,
-    /// Copy worker behind launches.
-    readback: Readback,
-}
-
-impl Drop for OverlappedH264Pump<'_> {
-    fn drop(&mut self) {
-        self.readback.shutdown();
-    }
-}
-
-impl<'a> OverlappedH264Pump<'a> {
-    /// Pipelined picture ceiling, sized to the session bitstream ring.
-    pub const MAX_INFLIGHT: usize = 4;
-
-    /// Pump over `device` with `max_inflight` pipelined pictures.
-    ///
-    /// # Arguments
-    ///
-    /// * `device` - D3D12 device behind decode sessions.
-    /// * `max_inflight` - pipelined picture ceiling, clamped to 1..=`MAX_INFLIGHT`.
-    #[must_use]
-    pub fn open(device: &'a D3d12Device, max_inflight: usize) -> Self {
-        let (wake_tx, wake_rx) = channel();
-        Self {
-            device,
-            ingest: Ingest::new(),
-            dpb: None,
-            session: None,
-            shared: device.shared().clone(),
-            active: None,
-            generation: 0,
-            resets: 0,
-            bound: max_inflight.clamp(1, Self::MAX_INFLIGHT),
-            pictures: VecDeque::new(),
-            ready: VecDeque::new(),
-            finished: false,
-            max_depth: 0,
-            timings: Vec::new(),
-            wake_tx,
-            wake_rx,
-            pins: Arc::new(SlotPins::new()),
-            readback: Readback::spawn(),
-        }
-    }
-
-    /// Pipelined picture ceiling behind sends.
-    #[must_use]
-    pub fn bound(&self) -> usize {
-        self.bound
-    }
-
-    /// Peak pipelined pictures with incomplete GPU work.
-    #[must_use]
-    pub fn max_depth(&self) -> usize {
-        self.max_depth
-    }
-
-    /// Stream resets after mid-picture failures.
-    #[must_use]
-    pub fn resets(&self) -> u64 {
-        self.resets
-    }
-
-    /// Completed frames awaiting receive.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.ready.len()
-    }
-
-    /// True when no frame awaits receive.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.ready.is_empty()
-    }
-
-    /// True once input ended.
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    /// Phase-split timing per harvested frame, oldest first.
-    #[must_use]
-    pub fn timings(&self) -> &[PhaseTiming] {
-        &self.timings
-    }
-
-    /// Decode `picture` through a pipelined submit plus queued downloads.
-    fn submit_picture(&mut self, picture: &Picture) -> Result<(), D3d12Error> {
-        let active = sequence_of(&self.ingest, picture)?;
-        if self.active != Some(active) {
-            self.drain_pipeline()?;
-            self.reconfigure(active)?;
-        }
-        let dpb = self.dpb.as_mut().ok_or(D3d12Error::NoSession)?;
-        let decoded = match submit_dpb(&self.ingest, dpb, picture) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                if !matches!(error, D3d12Error::NoFreeSlot) {
-                    self.reset_stream();
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.quiesce_slot(decoded.submission.slot) {
-            self.reset_stream();
-            return Err(error);
-        }
-        if let Err(error) = self.submit_tracked(active, decoded) {
-            self.reset_stream();
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    /// `decoded` submission through the video queue plus queued downloads, tracked in flight.
-    fn submit_tracked(&mut self, active: Active, decoded: Decoded) -> Result<(), D3d12Error> {
-        // Boxed before submit: the recorded pointers name stable heap addresses.
-        let submission = Box::new(decoded.submission);
-        let pin = self.pins.pin(submission.slot);
-        let Some(session) = self.session.as_mut() else {
-            return Err(D3d12Error::NoSession);
-        };
-        let video_submit = Instant::now();
-        let ticket = session.submit(&submission)?;
-        let submit_cpu = video_submit.elapsed();
-        let mut pending = VecDeque::with_capacity(decoded.outputs.len());
-        for output in &decoded.outputs {
-            let copy_submit = Instant::now();
-            let copy = session.start_download_after(output.slot(), ticket)?;
-            let generation = self.generation;
-            self.generation = self.generation.wrapping_add(1);
-            pending.push_back(PendingOutput {
-                pin: self.pins.pin(output.slot()),
-                copy,
-                copy_submit,
-                active,
-                generation,
-                video_submit,
-                submit_cpu,
-                launched: false,
-            });
-        }
-        self.pictures.push_back(InflightPicture {
-            submission: Some(submission),
-            pin,
-            video: ticket,
-            video_signaled: None,
-            outputs: pending,
-        });
-        self.note_depth();
-        Ok(())
-    }
-
-    /// In-flight tickets behind `slot` completion.
-    fn quiesce_slot(&mut self, slot: u8) -> Result<(), D3d12Error> {
-        let mut videos = Vec::new();
-        let mut copies = Vec::new();
-        for picture in &self.pictures {
-            if picture.pin.slot() == slot {
-                videos.push(picture.video);
-            }
-            for output in &picture.outputs {
-                if output.pin.slot() == slot {
-                    copies.push(output.copy);
-                }
-            }
-        }
-        if videos.is_empty() && copies.is_empty() {
-            return Ok(());
-        }
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        for ticket in videos {
-            session.wait_video(ticket)?;
-        }
-        for ticket in copies {
-            session.wait_copy(ticket)?;
-        }
-        self.harvest_poll()
-    }
-
-    /// Completed front outputs into the ready queue, in order.
-    fn harvest_poll(&mut self) -> Result<(), D3d12Error> {
-        if self.pictures.is_empty() {
-            return Ok(());
-        }
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        for picture in &mut self.pictures {
-            if picture.video_signaled.is_none() && session.video_signaled(picture.video) {
-                picture.video_signaled = Some(Instant::now());
-                picture.submission = None;
-            }
-        }
-        while self.harvest_front()? {}
-        Ok(())
-    }
-
-    /// Oldest output into the ready queue when its copy landed.
-    ///
-    /// # Returns
-    ///
-    /// True on progress, false while the front output runs.
-    fn harvest_front(&mut self) -> Result<bool, D3d12Error> {
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        if let Some(front) = self.pictures.front() {
-            if front.outputs.is_empty() {
-                if front.video_signaled.is_none() {
-                    return Ok(false);
-                }
-                self.pictures.pop_front();
-                return Ok(true);
-            }
-        } else {
-            return Ok(false);
-        }
-        if let Some(done) = self.readback.harvest() {
-            self.land_front(done)?;
-            return Ok(true);
-        }
-        let launch = match self
-            .pictures
-            .front()
-            .and_then(|front| front.outputs.front())
-        {
-            Some(output) if !output.launched => Some((output.pin.slot(), output.copy)),
-            _ => None,
-        };
-        let Some((slot, copy)) = launch else {
-            return Ok(false);
-        };
-        if !session.copy_signaled(copy) {
-            return Ok(false);
-        }
-        let mapped = session.map_slot(slot)?;
-        if let Some(output) = self
-            .pictures
-            .front_mut()
-            .and_then(|front| front.outputs.front_mut())
-        {
-            output.launched = true;
-        }
-        if let Some(done) = self.readback.launch(mapped) {
-            self.land_front(done)?;
-        }
-        Ok(true)
-    }
-
-    /// Front output plus `done` into the ready queue.
-    fn land_front(&mut self, done: Done) -> Result<(), D3d12Error> {
-        let (slot, bytes, release, _copy) = done.into_parts();
-        let output = self
-            .pictures
-            .front_mut()
-            .and_then(|front| front.outputs.pop_front());
-        let Some(output) = output else {
-            debug_assert!(false, "landed copy without pending output");
-            return Ok(());
-        };
-        debug_assert_eq!(slot, output.pin.slot());
-        release.unmap();
-        let signaled = Instant::now();
-        let video = self
-            .pictures
-            .front()
-            .and_then(|front| front.video_signaled)
-            .unwrap_or(signaled);
-        self.timings
-            .push(PhaseTiming::new(&output, video, signaled, signaled));
-        let export = self
-            .session
-            .as_ref()
-            .and_then(|session| session.shared_handle(output.pin.slot()));
-        let frame = emit_frame(
-            &self.shared,
-            bytes?,
-            export,
-            &output.active,
-            output.generation,
-        )?;
-        self.ready.push_back(frame);
-        Ok(())
-    }
-
-    /// Oldest launched copy into ready, waiting for it.
-    fn collect_front(&mut self) -> Result<(), D3d12Error> {
-        let launched = matches!(
-            self.pictures
-                .front()
-                .and_then(|front| front.outputs.front()),
-            Some(output) if output.launched
-        );
-        if !launched {
-            return Ok(());
-        }
-        match self.readback.collect() {
-            Some(done) => self.land_front(done),
-            None => self.rescue_front(),
-        }
-    }
-
-    /// Front output read synchronously, rescuing a lost worker.
-    fn rescue_front(&mut self) -> Result<(), D3d12Error> {
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        let output = self
-            .pictures
-            .front_mut()
-            .and_then(|front| front.outputs.pop_front());
-        let Some(output) = output else {
-            return Ok(());
-        };
-        let nv12 = session.finish_download(output.pin.slot(), output.copy)?;
-        let export = session.shared_handle(output.pin.slot());
-        let signaled = Instant::now();
-        let video = self
-            .pictures
-            .front()
-            .and_then(|front| front.video_signaled)
-            .unwrap_or(signaled);
-        self.timings
-            .push(PhaseTiming::new(&output, video, signaled, signaled));
-        let frame = emit_frame(
-            &self.shared,
-            nv12,
-            export,
-            &output.active,
-            output.generation,
-        )?;
-        self.ready.push_back(frame);
-        Ok(())
-    }
-
-    /// Oldest completed frame, harvesting first.
-    ///
-    /// # Returns
-    ///
-    /// `None` while no submitted output completed.
-    fn poll_ready(&mut self) -> Result<Option<D3d12Frame>, D3d12Error> {
-        self.harvest_poll()?;
-        Ok(self.ready.pop_front())
-    }
-
-    /// Oldest pending ticket completion, then harvest.
-    fn pump_progress(&mut self) -> Result<(), D3d12Error> {
-        self.harvest_poll()?;
-        if !self.ready.is_empty() || self.pictures.is_empty() {
-            return Ok(());
-        }
-        let launched = matches!(
-            self.pictures
-                .front()
-                .and_then(|front| front.outputs.front()),
-            Some(output) if output.launched
-        );
-        if launched {
-            self.collect_front()?;
-        } else {
-            self.wait_front()?;
-        }
-        self.harvest_poll()
-    }
-
-    /// Front ticket completion, blocking.
-    fn wait_front(&self) -> Result<(), D3d12Error> {
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        if let Some(output) = self
-            .pictures
-            .front()
-            .and_then(|front| front.outputs.front())
-        {
-            session.wait_copy(output.copy)
-        } else if let Some(front) = self.pictures.front() {
-            session.wait_video(front.video)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Front ticket completion before `deadline`, through the fence event.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` without a live session, or when the event call fails.
-    ///
-    /// # Arguments
-    ///
-    /// * `deadline` - signal budget, absent for none.
-    ///
-    /// # Returns
-    ///
-    /// True when the ticket signaled, false past the deadline.
-    fn wait_front_before(&self, deadline: Option<Instant>) -> Result<bool, D3d12Error> {
-        let Some(session) = self.session.as_ref() else {
-            return Err(D3d12Error::NoSession);
-        };
-        let Some(front) = self.pictures.front() else {
-            return Ok(true);
-        };
-        let video = front.video;
-        let copy = front.outputs.front().map(|output| output.copy);
-        let Some(timeout) = deadline.map(|at| at.saturating_duration_since(Instant::now())) else {
-            return match copy {
-                Some(ticket) => session.wait_copy(ticket),
-                None => session.wait_video(video),
-            }
-            .map(|()| true);
-        };
-        match copy {
-            Some(ticket) => session.wait_copy_timeout(ticket, timeout),
-            None => session.wait_video_timeout(video, timeout),
-        }
-    }
-
-    /// Every in-flight picture into the ready queue, waiting.
-    fn drain_pipeline(&mut self) -> Result<(), D3d12Error> {
-        while !self.pictures.is_empty() {
-            self.pump_progress()?;
-        }
-        Ok(())
-    }
-
-    /// Live DPB outputs for `previous` into the ready queue.
-    fn drain_previous(&mut self, previous: &Active) -> Result<(), D3d12Error> {
-        let (Some(dpb), Some(session)) = (self.dpb.as_mut(), self.session.as_mut()) else {
-            return Ok(());
-        };
-        let outputs = dpb.drain();
-        let mut pending = Vec::with_capacity(outputs.len());
-        for output in &outputs {
-            pending.push((output.slot(), session.start_download(output.slot())?));
-        }
-        for (slot, ticket) in pending {
-            let nv12 = session.finish_download(slot, ticket)?;
-            let export = session.shared_handle(slot);
-            eprintln!("TRACE drain-push slot={slot}");
-            let generation = self.generation;
-            self.generation = self.generation.wrapping_add(1);
-            self.ready.push_back(emit_frame(
-                &self.shared,
-                nv12,
-                export,
-                previous,
-                generation,
-            )?);
-        }
-        Ok(())
-    }
-
-    /// Session for `active`, draining the previous sequence first.
-    fn reconfigure(&mut self, active: Active) -> Result<(), D3d12Error> {
-        if let Some(previous) = self.active {
-            self.drain_previous(&previous)?;
-        }
-        let queues = self.session.take().map(DecodeSession::into_queues);
-        let pins = Arc::new(SlotPins::new());
-        let (session, dpb) =
-            open_sequence(self.device, &self.ingest, Arc::clone(&pins), queues, active)?;
-        self.session = Some(session);
-        self.pins = pins;
-        self.dpb = Some(dpb);
-        self.active = Some(active);
-        Ok(())
-    }
-
-    /// Drop the live session, buffer, sequence, and in-flight pictures after a failure.
-    fn reset_stream(&mut self) {
-        let mut launched = self
-            .pictures
-            .iter()
-            .flat_map(|picture| picture.outputs.iter())
-            .filter(|output| output.launched)
-            .count();
-        while launched > 0 {
-            launched -= 1;
-            match self.readback.collect() {
-                Some(done) => {
-                    let (_, _, release, _) = done.into_parts();
-                    release.unmap();
-                }
-                None => break,
-            }
-        }
-        self.dpb = None;
-        self.session = None;
-        self.active = None;
-        self.pictures.clear();
-        self.resets = self.resets.wrapping_add(1);
-    }
-
-    /// `error` after dropping the failed stream.
-    fn fail(&mut self, error: D3d12Error) -> D3d12Error {
-        self.reset_stream();
-        error
-    }
-
-    /// Peak pipelined pictures outstanding against the current depth.
-    fn note_depth(&mut self) {
-        self.max_depth = self.max_depth.max(self.outstanding());
-    }
-
-    /// Pipelined pictures with incomplete GPU work, freshly polled.
-    fn outstanding(&self) -> usize {
-        let Some(session) = self.session.as_ref() else {
-            return self.pictures.len();
-        };
-        self.pictures
-            .iter()
-            .filter(|picture| {
-                !session.video_signaled(picture.video)
-                    || picture
-                        .outputs
-                        .iter()
-                        .any(|output| !session.copy_signaled(output.copy))
-            })
-            .count()
-    }
-
-    /// Wake blocking receivers past new progress.
-    fn signal(&self) {
-        let _dropped = self.wake_tx.send(());
-    }
-}
-
-impl SendPackets for OverlappedH264Pump<'_> {
-    type Error = D3d12Error;
-
-    fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
-        if self.finished {
-            return Err(TrySendError::Full { packet });
-        }
-        if !self.device.supports(Codec::H264) {
-            return Err(TrySendError::Failed {
-                error: SkipReason::ProfileUnsupported { codec: Codec::H264 }.into(),
-            });
-        }
-        if self.pictures.len() >= self.bound {
-            return Err(TrySendError::Full { packet });
-        }
-        let pictures = self
-            .ingest
-            .ingest_packet(packet.data())
-            .map_err(|error| TrySendError::Failed { error })?;
-        let ready_len = self.ready.len();
-        for picture in &pictures {
-            while self.pictures.len() >= self.bound {
-                if let Err(error) = self.pump_progress() {
-                    self.ready.truncate(ready_len);
-                    return Err(TrySendError::Failed {
-                        error: self.fail(error),
-                    });
-                }
-            }
-            if let Err(error) = self.submit_picture(picture) {
-                self.ready.truncate(ready_len);
-                self.signal();
-                return Err(TrySendError::Failed { error });
-            }
-        }
-        if let Err(error) = self.harvest_poll() {
-            self.ready.truncate(ready_len);
-            self.signal();
-            return Err(TrySendError::Failed {
-                error: self.fail(error),
-            });
-        }
-        self.signal();
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<(), Self::Error> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        if let Some(picture) = self.ingest.finish()? {
-            while self.pictures.len() >= self.bound {
-                if let Err(error) = self.pump_progress() {
-                    return Err(self.fail(error));
-                }
-            }
-            self.submit_picture(&picture)?;
-        }
-        if let Err(error) = self.drain_pipeline() {
-            return Err(self.fail(error));
-        }
-        if let Some(previous) = self.active {
-            self.drain_previous(&previous)?;
-        }
-        self.signal();
-        Ok(())
-    }
-}
-
-impl PollFrames for OverlappedH264Pump<'_> {
-    type Frame = D3d12Frame;
-    type Error = D3d12Error;
-
-    fn try_receive(&mut self) -> Result<Option<Self::Frame>, Self::Error> {
-        self.poll_ready()
-    }
-}
-
-impl ReceiveFrames for OverlappedH264Pump<'_> {
-    type Frame = D3d12Frame;
-    type Error = D3d12Error;
-
-    fn receive(&mut self) -> Result<Option<Self::Frame>, Self::Error> {
-        loop {
-            let next = self.poll_ready().map_err(|error| self.fail(error))?;
-            if let Some(frame) = next {
-                return Ok(Some(frame));
-            }
-            if self.pictures.is_empty() {
-                if self.finished {
-                    return Ok(None);
-                }
-                let _woke = self.wake_rx.recv();
-            } else {
-                self.pump_progress().map_err(|error| self.fail(error))?;
-            }
-        }
-    }
-
-    fn receive_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<Self::Frame>, ReceiveError<Self::Error>> {
-        let deadline = Instant::now().checked_add(timeout);
-        loop {
-            let next = self.poll_ready().map_err(|error| ReceiveError::Failed {
-                error: self.fail(error),
-            })?;
-            if let Some(frame) = next {
-                return Ok(Some(frame));
-            }
-            if self.pictures.is_empty() {
-                if self.finished {
-                    return Ok(None);
-                }
-                let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-                let arrived = match remaining {
-                    None => self.wake_rx.recv().is_ok(),
-                    Some(budget) => self.wake_rx.recv_timeout(budget).is_ok(),
-                };
-                if !arrived {
-                    return Err(ReceiveError::Timeout);
-                }
-            } else if !self
-                .wait_front_before(deadline)
-                .map_err(|error| ReceiveError::Failed {
-                    error: self.fail(error),
-                })?
-            {
-                return Err(ReceiveError::Timeout);
-            }
-        }
-    }
-}
-
-/// Queued download behind one display-order output.
-struct PendingOutput {
-    /// Pool pin behind the output slot, steering the buffer past it.
-    pin: SlotPin,
-    /// Copy queue ticket behind the download.
-    copy: Ticket,
-    /// Copy launched on the worker.
-    launched: bool,
-    /// Copy submit time.
-    copy_submit: Instant,
-    /// Sequence geometry behind the frame.
-    active: Active,
-    /// Frame generation number.
-    generation: u64,
-    /// Video submit time behind the picture.
-    video_submit: Instant,
-    /// CPU time behind the video submit.
-    submit_cpu: Duration,
-}
-
-/// Phase-split timing behind one overlapped frame.
-#[derive(Clone, Copy, Debug)]
-pub struct PhaseTiming {
-    /// Frame generation number.
-    generation: u64,
-    /// CPU microseconds behind the video submit.
-    submit_us: u64,
-    /// Video submit time.
-    video_submit: Instant,
-    /// Video signal time, polled.
-    video_signaled: Instant,
-    /// Copy submit time.
-    copy_submit: Instant,
-    /// Copy signal time, polled.
-    copy_signaled: Instant,
-    /// Frame harvest time.
-    harvested: Instant,
-}
-
-impl PhaseTiming {
-    /// Timing behind `output` with observed signal times.
-    fn new(
-        output: &PendingOutput,
-        video_signaled: Instant,
-        copy_signaled: Instant,
-        harvested: Instant,
-    ) -> Self {
-        Self {
-            generation: output.generation,
-            submit_us: Self::micros(output.submit_cpu),
-            video_submit: output.video_submit,
-            video_signaled,
-            copy_submit: output.copy_submit,
-            copy_signaled,
-            harvested,
-        }
-    }
-
-    /// Whole microseconds behind `duration`, saturating.
-    fn micros(duration: Duration) -> u64 {
-        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-    }
-
-    /// Frame generation number.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// CPU microseconds behind the video submit.
-    #[must_use]
-    pub fn submit_us(&self) -> u64 {
-        self.submit_us
-    }
-
-    /// Video submit time.
-    #[must_use]
-    pub fn video_submit(&self) -> Instant {
-        self.video_submit
-    }
-
-    /// Video signal time, polled.
-    #[must_use]
-    pub fn video_signaled(&self) -> Instant {
-        self.video_signaled
-    }
-
-    /// Copy submit time.
-    #[must_use]
-    pub fn copy_submit(&self) -> Instant {
-        self.copy_submit
-    }
-
-    /// Copy signal time, polled.
-    #[must_use]
-    pub fn copy_signaled(&self) -> Instant {
-        self.copy_signaled
-    }
-
-    /// Frame harvest time.
-    #[must_use]
-    pub fn harvested(&self) -> Instant {
-        self.harvested
-    }
-
-    /// Engine microseconds, video submit to signal.
-    #[must_use]
-    pub fn engine_us(&self) -> u64 {
-        Self::micros(
-            self.video_signaled
-                .saturating_duration_since(self.video_submit),
-        )
-    }
-
-    /// Copy microseconds, copy submit to signal.
-    #[must_use]
-    pub fn copy_us(&self) -> u64 {
-        Self::micros(
-            self.copy_signaled
-                .saturating_duration_since(self.copy_submit),
-        )
-    }
-
-    /// Frame latency microseconds, video submit to harvest.
-    #[must_use]
-    pub fn latency_us(&self) -> u64 {
-        Self::micros(self.harvested.saturating_duration_since(self.video_submit))
-    }
-}
-
 /// Surface layout for pool `slot` under `active`.
 fn surface_layout(active: &Active, slot: u8) -> Result<SurfaceLayout, D3d12Error> {
     let coded = PictureSize::new(active.width, active.height)
@@ -2315,7 +1463,7 @@ fn session_surface_export(session: &DecodeSession, slot: u8) -> Option<SharedExp
 ///
 /// Returns `Err` past the picture cap, or when `nv12` falls short of
 /// the coded extent.
-fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
+pub(crate) fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
     let too_large = || D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge);
     let short = || D3d12Error::Unsupported(UnsupportedReason::ReadbackShortOfExtent);
     let visible_width = usize::try_from(active.visible.width()).map_err(|_| too_large())?;
@@ -2342,7 +1490,7 @@ fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
 }
 
 /// Frame for NV12 `nv12` at `generation`.
-fn emit_frame(
+pub(crate) fn emit_frame(
     budget: &SharedDevice,
     nv12: Vec<u8>,
     export: Option<SharedExport>,
@@ -2382,7 +1530,7 @@ fn emit_frame(
 /// * `pins` - live-surface pin counts over the decoder pool.
 /// * `queues` - submit queues from the dropped session, absent on first open.
 /// * `next` - sequence behind the session.
-fn open_sequence(
+pub(crate) fn open_sequence(
     device: &D3d12Device,
     ingest: &Ingest,
     pins: Arc<SlotPins>,
@@ -2407,7 +1555,7 @@ fn open_sequence(
 ///
 /// Returns `Err` without the picture sets, or when the crop empties
 /// the picture.
-fn sequence_of(ingest: &Ingest, picture: &Picture) -> Result<Active, D3d12Error> {
+pub(crate) fn sequence_of(ingest: &Ingest, picture: &Picture) -> Result<Active, D3d12Error> {
     let pps = ingest.pps(picture.pps_id()).ok_or(D3d12Error::NoSession)?;
     let sps = ingest
         .sps(pps.seq_parameter_set_id)
@@ -2429,7 +1577,11 @@ fn sequence_of(ingest: &Ingest, picture: &Picture) -> Result<Active, D3d12Error>
 ///
 /// Returns `Err` without the picture sets, or when the picture
 /// buffer rejects `picture`.
-fn submit_dpb(ingest: &Ingest, dpb: &mut Dpb, picture: &Picture) -> Result<Decoded, D3d12Error> {
+pub(crate) fn submit_dpb(
+    ingest: &Ingest,
+    dpb: &mut Dpb,
+    picture: &Picture,
+) -> Result<Decoded, D3d12Error> {
     let pps = ingest.pps(picture.pps_id()).ok_or(D3d12Error::NoSession)?;
     let sps = ingest
         .sps(pps.seq_parameter_set_id)
@@ -2451,7 +1603,7 @@ fn submit_dpb(ingest: &Ingest, dpb: &mut Dpb, picture: &Picture) -> Result<Decod
 /// * `pins` - live-surface pin counts over the decoder pool.
 /// * `queues` - submit queues from the dropped session, absent on first open.
 /// * `next` - sequence behind the session.
-fn open_sequence_hevc(
+pub(crate) fn open_sequence_hevc(
     device: &D3d12Device,
     ingest: &HevcIngest,
     pins: Arc<SlotPins>,
@@ -2476,7 +1628,10 @@ fn open_sequence_hevc(
 ///
 /// Returns `Err` without the picture sets, or when the crop empties
 /// the picture.
-fn sequence_of_hevc(ingest: &HevcIngest, picture: &HevcPicture) -> Result<Active, D3d12Error> {
+pub(crate) fn sequence_of_hevc(
+    ingest: &HevcIngest,
+    picture: &HevcPicture,
+) -> Result<Active, D3d12Error> {
     let pps = ingest.pps(picture.pps_id()).ok_or(D3d12Error::NoSession)?;
     let sps = ingest
         .sps(pps.seq_parameter_set_id)
@@ -2498,7 +1653,7 @@ fn sequence_of_hevc(ingest: &HevcIngest, picture: &HevcPicture) -> Result<Active
 ///
 /// Returns `Err` without the picture sets, or when the picture
 /// buffer rejects `picture`.
-fn submit_hevc_dpb(
+pub(crate) fn submit_hevc_dpb(
     ingest: &HevcIngest,
     dpb: &mut HevcDpb,
     picture: &HevcPicture,
@@ -2525,7 +1680,7 @@ fn submit_hevc_dpb(
 /// * `queues` - submit queues from the dropped session, absent on first open.
 /// * `next` - sequence behind the session; the session opens uncropped at its
 ///   maximum, frames below it crop per output.
-fn open_sequence_av1(
+pub(crate) fn open_sequence_av1(
     device: &D3d12Device,
     ingest: &Av1Ingest,
     pins: Arc<SlotPins>,
@@ -2545,7 +1700,7 @@ fn open_sequence_av1(
 ///
 /// Returns `Err` without the sequence header, past the sequence
 /// maximum, on odd extents, or when the frame empties the picture.
-fn frame_active_av1(
+pub(crate) fn frame_active_av1(
     ingest: &Av1Ingest,
     frame: &Av1Frame,
     current: Option<Active>,
@@ -2595,7 +1750,7 @@ fn frame_active_av1(
 ///
 /// Returns `Err` without the sequence header, or when the
 /// reference slots reject `frame`.
-fn submit_av1_dpb(
+pub(crate) fn submit_av1_dpb(
     ingest: &Av1Ingest,
     dpb: &mut Av1Dpb,
     frame: &Av1Frame,

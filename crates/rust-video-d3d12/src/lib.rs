@@ -39,6 +39,8 @@ mod os;
 #[cfg(not(target_os = "windows"))]
 mod os_stub;
 #[cfg(target_os = "windows")]
+mod overlap;
+#[cfg(target_os = "windows")]
 mod pins;
 #[cfg(target_os = "windows")]
 mod readback;
@@ -56,7 +58,7 @@ mod transcode;
 pub use decoder::Av1Decoder;
 pub use decoder::{D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 #[cfg(target_os = "windows")]
-pub use decoder_os::{Av1Decoder, H264Decoder, HevcDecoder, OverlappedH264Pump, PhaseTiming};
+pub use decoder_os::{Av1Decoder, H264Decoder, HevcDecoder};
 #[cfg(target_os = "windows")]
 pub use delivery::DecoderPump;
 pub use device::D3d12Device;
@@ -68,6 +70,11 @@ pub use guid::{Codec, Profile};
 pub(crate) use os::DeviceOs;
 #[cfg(not(target_os = "windows"))]
 pub(crate) use os_stub::DeviceOs;
+#[cfg(target_os = "windows")]
+pub use overlap::{
+    Av1Front, H264Front, HevcFront, OverlapPump, OverlappedAv1Pump, OverlappedH264Pump,
+    OverlappedHevcPump, PhaseTiming,
+};
 #[cfg(target_os = "windows")]
 pub use texture::GpuSurface;
 #[cfg(target_os = "windows")]

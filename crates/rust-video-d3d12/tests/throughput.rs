@@ -14,10 +14,10 @@ use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
 use rust_video_d3d12::{
     Av1Decoder, D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
-    OverlappedH264Pump,
+    OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump,
 };
 use rust_video_harness::H264Synth;
-use rust_video_harness::{bench_dir, AnnexB, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Ivf, Synth};
 
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
@@ -25,8 +25,14 @@ const HOPS: u32 = 30;
 /// Tier1 realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
-/// Sustained overlap bar: quiet median minus 20% headroom, 2026-11-18.
-const SUSTAINED_H264_BAR: f64 = 580.0;
+/// Sustained overlap bar: quiet median minus 20% headroom, 2026-11-19.
+const SUSTAINED_H264_BAR: f64 = 840.0;
+
+/// Sustained HEVC overlap bar: quiet median minus 20% headroom, 2026-11-19.
+const SUSTAINED_HEVC_BAR: f64 = 770.0;
+
+/// Sustained AV1 overlap bar: quiet median minus 20% headroom, 2026-11-19.
+const SUSTAINED_AV1_BAR: f64 = 580.0;
 
 /// Serializes added benches sharing one adapter.
 static BENCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -572,5 +578,118 @@ fn sustained_h264_1080p_measures_realtime() {
     assert!(
         measured >= SUSTAINED_H264_BAR,
         "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p HEVC overlap throughput against its bar.
+#[test]
+fn sustained_hevc_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("SKIP: no hevc decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("h265-1080p_ip.h265")).expect("vector readable");
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let mut pump = OverlappedHevcPump::open(&device, OverlappedHevcPump::MAX_INFLIGHT);
+    let mut frames = Vec::new();
+    let start = std::time::Instant::now();
+    for packet in packets(&raws) {
+        let mut pending = packet;
+        loop {
+            match pump.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet }) => {
+                    pending = packet;
+                    let frame = pump
+                        .receive()
+                        .expect("in-flight frame completes")
+                        .expect("input unfinished");
+                    frames.push(frame);
+                }
+                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
+            }
+        }
+    }
+    while let Some(frame) = pump.try_receive().expect("overlap poll") {
+        frames.push(frame);
+    }
+    pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("drain") {
+        frames.push(frame);
+    }
+    let wall = start.elapsed();
+    let depth = pump.max_depth();
+    let total = u32::try_from(frames.len()).expect("frame count fits");
+    let measured = f64::from(total) / wall.as_secs_f64();
+    println!("d3d12 hevc sustained overlap 1080p: {measured:.1}fps over {} frames, depth {depth}, bar {SUSTAINED_HEVC_BAR:.0}fps", frames.len());
+    assert_eq!(frames.len(), raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= SUSTAINED_HEVC_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_HEVC_BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p AV1 overlap throughput against its bar.
+#[test]
+fn sustained_av1_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return;
+    }
+    let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let mut pump = OverlappedAv1Pump::open(&device, OverlappedAv1Pump::MAX_INFLIGHT);
+    let mut frames = Vec::new();
+    let start = std::time::Instant::now();
+    for packet in packets(&raws) {
+        let mut pending = packet;
+        loop {
+            match pump.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet }) => {
+                    pending = packet;
+                    let frame = pump
+                        .receive()
+                        .expect("in-flight frame completes")
+                        .expect("input unfinished");
+                    frames.push(frame);
+                }
+                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
+            }
+        }
+    }
+    while let Some(frame) = pump.try_receive().expect("overlap poll") {
+        frames.push(frame);
+    }
+    pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("drain") {
+        frames.push(frame);
+    }
+    let wall = start.elapsed();
+    let depth = pump.max_depth();
+    let total = u32::try_from(frames.len()).expect("frame count fits");
+    let measured = f64::from(total) / wall.as_secs_f64();
+    println!("d3d12 av1 sustained overlap 1080p: {measured:.1}fps over {} frames, depth {depth}, bar {SUSTAINED_AV1_BAR:.0}fps", frames.len());
+    assert_eq!(frames.len(), raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= SUSTAINED_AV1_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_AV1_BAR:.0}fps"
     );
 }

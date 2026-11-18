@@ -4,9 +4,16 @@
 
 #![cfg(target_os = "windows")]
 
+#[path = "../examples/common/av1.rs"]
+mod av1;
+
 use std::time::Duration;
 
-use rust_video_d3d12::{Codec, D3d12Device, H264Decoder, OverlappedH264Pump, PhaseTiming};
+use av1::tu_packets;
+use rust_video_d3d12::{
+    Av1Decoder, Codec, D3d12Device, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
+    OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump, PhaseTiming,
+};
 
 use bytes::Bytes;
 use rust_video_caps::delivery::{
@@ -18,6 +25,9 @@ use rust_video_harness::{AnnexB, H264Synth};
 
 /// Pictures in the committed vector.
 const PICTURES: usize = 15;
+
+/// Temporal units in the committed AV1 vector.
+const AV1_PACKETS: usize = 16;
 
 /// Warmup pictures ahead of the depth probe.
 const WARMUP_PICTURES: usize = 4;
@@ -64,6 +74,38 @@ fn h264_packets() -> Vec<Packet> {
         packets.len(),
         PICTURES,
         "vector holds one packet per picture"
+    );
+    packets
+}
+
+/// Committed HEVC inter vector, one packet per picture in order.
+fn hevc_packets() -> Vec<Packet> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors/inter_320x240.hevc");
+    let data = std::fs::read(path).expect("vector readable");
+    let packets: Vec<Packet> = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
+        .iter()
+        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+        .collect();
+    assert_eq!(
+        packets.len(),
+        PICTURES,
+        "vector holds one packet per picture"
+    );
+    packets
+}
+
+/// Committed AV1 vector, one packet per temporal unit in order.
+fn av1_packets() -> Vec<Packet> {
+    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let packets: Vec<Packet> = tu_packets(&data)
+        .iter()
+        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+        .collect();
+    assert_eq!(
+        packets.len(),
+        AV1_PACKETS,
+        "vector holds one packet per unit"
     );
     packets
 }
@@ -199,6 +241,64 @@ fn drive_overlapped(device: &D3d12Device, bound: usize, packets: &[Packet]) -> O
         resets,
         total_us,
     }
+}
+
+/// Sync NV12 bytes for `packets` through `decoder`.
+fn drive_sync_with(
+    decoder: &mut impl Decoder<Frame = D3d12Frame, Error = D3d12Error>,
+    packets: &[Packet],
+) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for (index, packet) in packets.iter().enumerate() {
+        frames.extend(
+            decoder
+                .decode(packet)
+                .unwrap_or_else(|error| panic!("sync packet {index}: {error}")),
+        );
+    }
+    frames.extend(decoder.flush().expect("sync flush drains"));
+    frames
+        .into_iter()
+        .map(|frame| frame.nv12().to_vec())
+        .collect()
+}
+
+/// Overlapped NV12 bytes for `packets` through `pump`.
+fn drive_pump_with(
+    pump: &mut (impl SendPackets<Error = D3d12Error>
+              + PollFrames<Frame = D3d12Frame, Error = D3d12Error>
+              + ReceiveFrames<Frame = D3d12Frame, Error = D3d12Error>),
+    packets: &[Packet],
+) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    for (index, packet) in packets.iter().enumerate() {
+        let mut packet = packet.clone();
+        loop {
+            match pump.try_send(packet) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet: back }) => {
+                    let frame = pump
+                        .receive_timeout(Duration::from_secs(5))
+                        .unwrap_or_else(|error| panic!("bound drain {index}: {error}"))
+                        .expect("bound drain completes");
+                    frames.push(frame);
+                    packet = back;
+                }
+                Err(TrySendError::Failed { error }) => panic!("overlap packet {index}: {error}"),
+            }
+        }
+    }
+    while let Some(frame) = pump.try_receive().expect("overlap poll") {
+        frames.push(frame);
+    }
+    pump.finish().expect("overlap finish drains");
+    while let Some(frame) = pump.receive().expect("overlap tail") {
+        frames.push(frame);
+    }
+    frames
+        .into_iter()
+        .map(|frame| frame.nv12().to_vec())
+        .collect()
 }
 
 /// Phase-split table behind `name` over `timings`.
@@ -400,4 +500,70 @@ fn overlap_receive_endpoints() {
         panic!("send after finish refuses");
     };
     assert_eq!(packet.data(), packets[0].data());
+}
+
+/// Same HEVC inter bytes through sync and overlapped decode match exactly.
+#[test]
+fn overlap_hevc_matches_sync_bytes() {
+    let _guard = overlap_guard();
+    let Some(device) = device() else {
+        return;
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("SKIP: no hevc decoder profile");
+        return;
+    }
+    assert_eq!(OverlappedHevcPump::open(&device, 0).bound(), 1);
+    assert_eq!(
+        OverlappedHevcPump::open(&device, 99).bound(),
+        OverlappedHevcPump::MAX_INFLIGHT
+    );
+    let packets = hevc_packets();
+    let mut decoder = HevcDecoder::open(&device);
+    let sync = drive_sync_with(&mut decoder, &packets);
+    let mut pump = OverlappedHevcPump::open(&device, OverlappedHevcPump::MAX_INFLIGHT);
+    let overlapped = drive_pump_with(&mut pump, &packets);
+    println!(
+        "parity: {} frames byte-exact across sync/overlap, depth {}",
+        PICTURES,
+        pump.max_depth()
+    );
+    assert_eq!(sync.len(), PICTURES, "sync yields every picture");
+    assert_eq!(overlapped.len(), PICTURES, "overlap yields every picture");
+    assert_eq!(overlapped, sync, "overlap bytes match sync");
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+    assert_eq!(pump.resets(), 0);
+}
+
+/// Same AV1 bytes through sync and overlapped decode match exactly.
+#[test]
+fn overlap_av1_matches_sync_bytes() {
+    let _guard = overlap_guard();
+    let Some(device) = device() else {
+        return;
+    };
+    if !device.supports(Codec::Av1) {
+        println!("SKIP: no av1 decoder profile");
+        return;
+    }
+    assert_eq!(OverlappedAv1Pump::open(&device, 0).bound(), 1);
+    assert_eq!(
+        OverlappedAv1Pump::open(&device, 99).bound(),
+        OverlappedAv1Pump::MAX_INFLIGHT
+    );
+    let packets = av1_packets();
+    let mut decoder = Av1Decoder::open(&device);
+    let sync = drive_sync_with(&mut decoder, &packets);
+    let mut pump = OverlappedAv1Pump::open(&device, OverlappedAv1Pump::MAX_INFLIGHT);
+    let overlapped = drive_pump_with(&mut pump, &packets);
+    println!(
+        "parity: {} frames byte-exact across sync/overlap, depth {}",
+        PICTURES,
+        pump.max_depth()
+    );
+    assert_eq!(sync.len(), PICTURES, "sync yields every frame");
+    assert_eq!(overlapped.len(), PICTURES, "overlap yields every frame");
+    assert_eq!(overlapped, sync, "overlap bytes match sync");
+    assert_eq!(decoder.resets(), 0, "clean vector never resets");
+    assert_eq!(pump.resets(), 0);
 }
