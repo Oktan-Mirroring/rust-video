@@ -2,18 +2,23 @@
 //!
 //! Skips without hardware; a hardware run fails below the bar.
 
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rust_video_vulkan::{
-    Av1Decoder, CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, ParseError,
-    VulkanDevice, VulkanError, VulkanFrame,
+    Av1Decoder, CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, OverlapPump,
+    OverlappedDecode, ParseError, VulkanDevice, VulkanError, VulkanFrame,
 };
 
 use bytes::Bytes;
+use rust_video_caps::delivery::{
+    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets, TrySendError,
+};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Synth};
+use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf, Synth};
 
 // Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -394,6 +399,152 @@ fn encode_h265_1080p_measures_realtime() {
     let frames: Vec<CpuFrame> = (0..4).map(|seed| Synth::noise(1920, 1080, seed)).collect();
     let measured = encode_fps(&mut encoder, &frames);
     println!("vulkan h265 encode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Bound of `capacity` frames under `policy`.
+fn overlap_config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
+    ChannelConfig::new(
+        NonZeroUsize::new(capacity).expect("nonzero capacity"),
+        policy,
+    )
+}
+
+/// Send `packet`, retaining every frame surfacing under backpressure.
+fn overlap_send<D: OverlappedDecode>(
+    pump: &mut OverlapPump<D>,
+    packet: Packet,
+    frames: &mut Vec<VulkanFrame>,
+) {
+    let mut pending = packet;
+    loop {
+        match pump.try_send(pending) {
+            Ok(()) => return,
+            Err(TrySendError::Full { packet }) => {
+                pending = packet;
+                while let Some(frame) = pump.try_receive().expect("poll") {
+                    frames.push(frame);
+                }
+                if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
+                    match pump.receive_timeout(Duration::from_secs(10)) {
+                        Ok(frame) => frames.extend(frame),
+                        Err(error) => panic!("completions stall: {error:?}"),
+                    }
+                }
+            }
+            Err(TrySendError::Failed { error }) => panic!("submit runs: {error}"),
+        }
+    }
+}
+
+/// Finish `pump`, draining every trailing frame through blocking receive.
+fn overlap_drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
+    pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("drain") {
+        frames.push(frame);
+    }
+}
+
+/// Measured fps of one sustained overlap pass of `raws`, plus the frame count.
+fn sustained_fps<D: OverlappedDecode>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize) {
+    let mut pump = OverlapPump::open(
+        decoder,
+        overlap_config(raws.len() + 16, DropPolicy::DropOldest),
+    );
+    let mut frames = Vec::new();
+    let start = Instant::now();
+    for packet in packets(raws) {
+        overlap_send(&mut pump, packet, &mut frames);
+    }
+    overlap_drain(&mut pump, &mut frames);
+    let wall = start.elapsed();
+    assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
+    let total = u32::try_from(frames.len()).expect("frame count fits");
+    (f64::from(total) / wall.as_secs_f64(), frames.len())
+}
+
+/// Sustained 1080p H.264 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_h264_1080p_measures_realtime() {
+    let _guard = SERIAL.lock().expect("bench lock");
+    let Some(device) = device_or_skip(CodecOp::H264Decode) else {
+        return;
+    };
+    let decoder = match H264Decoder::open(&device) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("vulkan skipped: h264 decode open failed: {error}");
+            return;
+        }
+    };
+    let raws =
+        AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let (measured, count) = sustained_fps(decoder, &raws);
+    println!("vulkan h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p H.265 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_h265_1080p_measures_realtime() {
+    let _guard = SERIAL.lock().expect("bench lock");
+    let Some(device) = device_or_skip(CodecOp::H265Decode) else {
+        return;
+    };
+    let decoder = match H265Decoder::open(&device) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("vulkan skipped: h265 decode open failed: {error}");
+            return;
+        }
+    };
+    let raws =
+        AnnexB::picture_packets(&bench_dir().join("h265-1080p_ip.h265"), AnnexB::is_hevc_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let (measured, count) = sustained_fps(decoder, &raws);
+    println!("vulkan h265 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p AV1 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_av1_1080p_measures_realtime() {
+    let _guard = SERIAL.lock().expect("bench lock");
+    let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
+        return;
+    };
+    let decoder = match Av1Decoder::open(&device) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            println!("vulkan skipped: av1 decode open failed: {error}");
+            return;
+        }
+    };
+    let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let (measured, count) = sustained_fps(decoder, &raws);
+    println!(
+        "vulkan av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {BAR:.0}fps"
+    );
+    assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
