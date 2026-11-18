@@ -64,4 +64,4 @@ names every cell.
 
 ## Measured numbers
 
-Per-box vendored throughput with method, versions, and comparability notes lives in `docs/perf/`, one file per run environment: [linux 32c, RTX 5080 + Radeon](perf/linux-32c-rtx5080-radeon.md).
+Per-box vendored throughput with method, versions, and comparability notes lives in `docs/perf/`, one file per OS: [Linux](perf/throughput-linux.md), [Windows](perf/throughput-windows.md).
