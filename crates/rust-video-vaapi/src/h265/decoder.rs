@@ -200,7 +200,7 @@ impl<'a> H265Decoder<'a> {
             .sps()
             .cloned()
             .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
-        let profile = Params::profile(sps.profile_tier_level.general_profile_idc)?;
+        let profile = Params::sps_profile(&sps)?;
         let (width, height) = self
             .frontend
             .coded_size()
@@ -221,7 +221,7 @@ impl<'a> H265Decoder<'a> {
             .frontend
             .sps()
             .cloned()
-            .and_then(|sps| Params::profile(sps.profile_tier_level.general_profile_idc).ok())
+            .and_then(|sps| Params::sps_profile(&sps).ok())
             .is_some_and(|profile| {
                 profile == backend.profile()
                     && self.frontend.coded_size() == Some(backend.coded_size())

@@ -59,6 +59,19 @@ impl<'a> Params<'a> {
         }
     }
 
+    /// VA-API profile for `sps`, honoring Main compatibility flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `sps` neither names nor declares compatibility with Main.
+    pub fn sps_profile(sps: &Sps) -> Result<c_int, VaApiError> {
+        let ptl = &sps.profile_tier_level;
+        if ptl.general_profile_compatibility_flag[1] || ptl.general_profile_compatibility_flag[3] {
+            return Ok(crate::ffi::VA_PROFILE_HEVC_MAIN);
+        }
+        Self::profile(ptl.general_profile_idc)
+    }
+
     /// Picture-parameter buffer for `pic` on `surface`.
     ///
     /// # Errors

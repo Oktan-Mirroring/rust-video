@@ -132,9 +132,19 @@ impl Scaler {
             self.settled[slot] = true;
         }
         self.next = (self.next + 1) % Self::OUTPUTS;
+        let src_rect = ffi::VaRectangle {
+            x: 0,
+            y: 0,
+            width: u16::try_from(self.from.width()).map_err(|_| {
+                VaApiError::Unsupported("dimensions outside driver range".to_owned())
+            })?,
+            height: u16::try_from(self.from.height()).map_err(|_| {
+                VaApiError::Unsupported("dimensions outside driver range".to_owned())
+            })?,
+        };
         let params = ffi::VaProcPipelineParameterBuffer {
             surface,
-            surface_region: std::ptr::null(),
+            surface_region: (&raw const src_rect).cast(),
             surface_color_standard: ffi::VA_PROC_COLOR_STANDARD_NONE,
             output_region: std::ptr::null(),
             output_background_color: 0,
@@ -160,7 +170,7 @@ impl Scaler {
             output_hdr_metadata: std::ptr::null_mut(),
             va_reserved: [0; 16],
         };
-        self.pipeline.rewrite(bytes_of(&params))?;
+        self.pipeline.rewrite_uninit(bytes_of(&params))?;
         let display = self.session.inner.display;
         let context = self.session.inner.context;
         let mut id = self.pipeline.id();

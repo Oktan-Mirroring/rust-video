@@ -2,6 +2,7 @@
 
 #![allow(unsafe_code)]
 
+use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_void};
 
 use crate::error::VaApiError;
@@ -38,6 +39,41 @@ impl VaBuffer {
         let len = u32::try_from(data.len())
             .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
         // Sound: the context is live; `data` holds `len` bytes.
+        sys::status(unsafe {
+            sys::vaCreateBuffer(
+                display,
+                context,
+                buffer_type,
+                len,
+                1,
+                data.as_ptr().cast_mut().cast(),
+                &raw mut id,
+            )
+        })?;
+        Ok(Self {
+            display,
+            context,
+            id,
+            buffer_type,
+            len: data.len(),
+        })
+    }
+
+    /// Buffer of `buffer_type` holding a copy of raw parameter bytes `data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the buffer.
+    pub(crate) fn create_uninit(
+        display: ffi::VaDisplay,
+        context: ffi::VaContextId,
+        buffer_type: c_int,
+        data: &[MaybeUninit<u8>],
+    ) -> Result<Self, VaApiError> {
+        let mut id = 0;
+        let len = u32::try_from(data.len())
+            .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
+        // SAFETY: the context is live; `data` spans `len` bytes of driver-layout storage.
         sys::status(unsafe {
             sys::vaCreateBuffer(
                 display,
@@ -126,6 +162,34 @@ impl VaBuffer {
         sys::status(unsafe { sys::vaUnmapBuffer(self.display, self.id) })?;
         Ok(false)
     }
+
+    /// Rewrite the buffer from raw parameter bytes `data`, recreating on overflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses the map or the recreation.
+    pub(crate) fn rewrite_uninit(&mut self, data: &[MaybeUninit<u8>]) -> Result<bool, VaApiError> {
+        if data.len() > self.len {
+            *self = Self::create_uninit(self.display, self.context, self.buffer_type, data)?;
+            return Ok(true);
+        }
+        // SAFETY: the buffer is live until the context drops.
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        sys::status(unsafe { sys::vaMapBuffer(self.display, self.id, &raw mut mapped) })?;
+        if !data.is_empty() {
+            // SAFETY: the mapping spans at least `data.len()` bytes; `MaybeUninit<u8>` preserves padding soundness.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    mapped.cast::<MaybeUninit<u8>>(),
+                    data.len(),
+                );
+            }
+        }
+        // SAFETY: the buffer was mapped above.
+        sys::status(unsafe { sys::vaUnmapBuffer(self.display, self.id) })?;
+        Ok(false)
+    }
 }
 
 impl Drop for VaBuffer {
@@ -137,8 +201,8 @@ impl Drop for VaBuffer {
     }
 }
 
-/// Byte view of a plain parameter struct.
-pub(crate) fn bytes_of<T>(value: &T) -> &[u8] {
-    // Sound: every parameter struct is `#[repr(C)]` plain data.
+/// Raw byte view of a `#[repr(C)]` parameter struct, preserving padding soundness.
+pub(crate) fn bytes_of<T>(value: &T) -> &[MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has alignment 1 and permits any initialized or padding byte in `T`.
     unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast(), size_of_val(value)) }
 }

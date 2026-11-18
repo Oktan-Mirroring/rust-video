@@ -2,7 +2,7 @@
 
 use crate::decoder::{H264Decoder, VaApiFrame};
 use crate::device::VaApiDevice;
-use crate::encoder::{EncodeCodec, VaApiEncoder};
+use crate::encoder::{EncodeCodec, GopShape, VaApiEncoder};
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::scale::{ScaledSurface, Scaler};
@@ -18,14 +18,16 @@ use rust_video_caps::transcode::{
 /// GPU transcode from H.264 decode to encoder input.
 ///
 /// The encoder opens lazily on the first picture, when the decode
-/// size is known, and re-opens when a reconfig changes it; every
-/// coded picture stays an IDR, so the stream stays valid across the
+/// size is known, and re-opens when a reconfig changes it; the fresh
+/// session starts on an IDR, so the stream stays valid across the
 /// swap. Stays on its thread with the decoder it owns.
 pub struct Transcoder<'a> {
     /// H.264 decoder; the only wired frontend.
     decoder: H264Decoder<'a>,
     /// Codec the transcode writes.
     encode_codec: EncodeCodec,
+    /// GOP shape the transcode writes.
+    gop: GopShape,
     /// Encoder behind device surfaces, opened on first picture.
     encoder: Option<VaApiEncoder>,
     /// Per-hop capabilities.
@@ -55,6 +57,7 @@ impl<'a> Transcoder<'a> {
         Self {
             decoder: H264Decoder::open(device),
             encode_codec: encode,
+            gop: GopShape::AllIntra,
             encoder: None,
             caps,
             scale: Scale::passthrough(),
@@ -84,6 +87,13 @@ impl<'a> Transcoder<'a> {
     #[must_use]
     pub fn with_target_format(mut self, format: PixelFormat) -> Self {
         self.convert = Convert::to(format);
+        self
+    }
+
+    /// Transcoder writing `gop` instead of all-intra.
+    #[must_use]
+    pub fn with_gop(mut self, gop: GopShape) -> Self {
+        self.gop = gop;
         self
     }
 
@@ -237,7 +247,9 @@ impl<'a> Transcoder<'a> {
             .as_ref()
             .is_none_or(|encoder| encoder.size() != size)
         {
-            self.encoder = Some(VaApiEncoder::open(self.device, self.encode_codec, size)?);
+            let encoder =
+                VaApiEncoder::open(self.device, self.encode_codec, size)?.with_gop(self.gop);
+            self.encoder = Some(encoder);
         }
         match self.encoder.as_mut() {
             Some(encoder) => Ok(encoder),
@@ -263,6 +275,7 @@ mod tests {
         super::Transcoder {
             decoder: crate::decoder::H264Decoder::open(device),
             encode_codec: crate::encoder::EncodeCodec::H264,
+            gop: crate::encoder::GopShape::AllIntra,
             encoder: None,
             caps,
             scale: Scale::passthrough(),

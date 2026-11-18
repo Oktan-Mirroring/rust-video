@@ -66,6 +66,8 @@ pub const VA_PROGRESSIVE: c_int = 0x1;
 pub const VA_PROFILE_HEVC_MAIN: c_int = 17;
 /// AV1 Profile 0.
 pub const VA_PROFILE_AV1_PROFILE0: c_int = 32;
+/// VP9 Profile 0: 8-bit 4:2:0.
+pub const VA_PROFILE_VP9_PROFILE0: c_int = 19;
 /// No profile, for video processing configs.
 pub const VA_PROFILE_NONE: c_int = -1;
 /// Slice-level encode entrypoint.
@@ -412,6 +414,58 @@ pub const AV1_WARP_TRANSLATION: c_int = 1;
 pub const AV1_WARP_ROTZOOM: c_int = 2;
 /// AV1 affine warp transform.
 pub const AV1_WARP_AFFINE: c_int = 3;
+
+/// `pic_fields` bit shifts inside `VADecPictureParameterBufferVP9`.
+pub const VP9_SUBSAMPLING_X: u32 = 0;
+/// Vertical subsampling bit shift.
+pub const VP9_SUBSAMPLING_Y: u32 = 1;
+/// Frame-type bit shift.
+pub const VP9_FRAME_TYPE: u32 = 2;
+/// Show-frame bit shift.
+pub const VP9_SHOW_FRAME: u32 = 3;
+/// Error-resilient-mode bit shift.
+pub const VP9_ERROR_RESILIENT_MODE: u32 = 4;
+/// Intra-only bit shift.
+pub const VP9_INTRA_ONLY: u32 = 5;
+/// High-precision-motion-vector bit shift.
+pub const VP9_ALLOW_HIGH_PRECISION_MV: u32 = 6;
+/// Motion-compensation filter-type bit shift.
+pub const VP9_MCOMP_FILTER_TYPE: u32 = 7;
+/// Frame-parallel-decoding bit shift.
+pub const VP9_FRAME_PARALLEL_DECODING_MODE: u32 = 10;
+/// Reset-frame-context bit shift.
+pub const VP9_RESET_FRAME_CONTEXT: u32 = 11;
+/// Refresh-frame-context bit shift.
+pub const VP9_REFRESH_FRAME_CONTEXT: u32 = 13;
+/// Frame-context-index bit shift.
+pub const VP9_FRAME_CONTEXT_IDX: u32 = 14;
+/// Segmentation-enabled bit shift.
+pub const VP9_SEGMENTATION_ENABLED: u32 = 16;
+/// Segmentation-temporal-update bit shift.
+pub const VP9_SEGMENTATION_TEMPORAL_UPDATE: u32 = 17;
+/// Segmentation-update-map bit shift.
+pub const VP9_SEGMENTATION_UPDATE_MAP: u32 = 18;
+/// Last-reference-frame bit shift.
+pub const VP9_LAST_REF_FRAME: u32 = 19;
+/// Last-reference sign-bias bit shift.
+pub const VP9_LAST_REF_FRAME_SIGN_BIAS: u32 = 22;
+/// Golden-reference-frame bit shift.
+pub const VP9_GOLDEN_REF_FRAME: u32 = 23;
+/// Golden-reference sign-bias bit shift.
+pub const VP9_GOLDEN_REF_FRAME_SIGN_BIAS: u32 = 26;
+/// Altref-reference-frame bit shift.
+pub const VP9_ALT_REF_FRAME: u32 = 27;
+/// Altref-reference sign-bias bit shift.
+pub const VP9_ALT_REF_FRAME_SIGN_BIAS: u32 = 30;
+/// Lossless-flag bit shift.
+pub const VP9_LOSSLESS_FLAG: u32 = 31;
+
+/// `segment_flags` bit shifts inside `VASegmentParameterVP9`.
+pub const VP9_SEG_REFERENCE_ENABLED: u32 = 0;
+/// Segment-reference bit shift.
+pub const VP9_SEG_REFERENCE: u32 = 1;
+/// Segment-skip bit shift.
+pub const VP9_SEG_REFERENCE_SKIPPED: u32 = 3;
 
 /// H.264 reference picture descriptor.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1007,6 +1061,78 @@ pub struct VaSliceParameterBufferAv1 {
     pub va_reserved: [u32; 4],
 }
 
+/// VP9 decode picture-parameter buffer, one per frame.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaDecPictureParameterBufferVp9 {
+    /// Frame width in luma samples.
+    pub frame_width: u16,
+    /// Frame height in luma samples.
+    pub frame_height: u16,
+    /// Reference surfaces by slot; `VA_INVALID_ID` when empty.
+    pub reference_frames: [VaSurfaceId; 8],
+    /// Packed picture flags; see `VP9_*`.
+    pub pic_fields: u32,
+    /// Loop-filter level.
+    pub filter_level: u8,
+    /// Loop-filter sharpness.
+    pub sharpness_level: u8,
+    /// Tile rows as `1 << log2_tile_rows`.
+    pub log2_tile_rows: u8,
+    /// Tile columns as `1 << log2_tile_columns`.
+    pub log2_tile_columns: u8,
+    /// Uncompressed-header bytes from the buffer start.
+    pub frame_header_length_in_bytes: u8,
+    /// Compressed-header bytes; `first_partition_size` in the spec.
+    pub first_partition_size: u16,
+    /// Segment-tree probabilities.
+    pub mb_segment_tree_probs: [u8; 7],
+    /// Segment-prediction probabilities.
+    pub segment_pred_probs: [u8; 3],
+    /// Bitstream profile, 0..=3.
+    pub profile: u8,
+    /// Bit depth per sample.
+    pub bit_depth: u8,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 8],
+}
+
+/// VP9 per-segment decode parameters.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaSegmentParameterVp9 {
+    /// Packed segment flags; see `VP9_SEG_*`.
+    pub segment_flags: u16,
+    /// Loop-filter levels by reference, then mode.
+    pub filter_level: [[u8; 2]; 4],
+    /// Luma-AC dequant scale.
+    pub luma_ac_quant_scale: i16,
+    /// Luma-DC dequant scale.
+    pub luma_dc_quant_scale: i16,
+    /// Chroma-AC dequant scale.
+    pub chroma_ac_quant_scale: i16,
+    /// Chroma-DC dequant scale.
+    pub chroma_dc_quant_scale: i16,
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
+/// VP9 slice-parameter buffer, one per frame.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VaSliceParameterBufferVp9 {
+    /// Frame bytes in the slice-data buffer.
+    pub slice_data_size: u32,
+    /// Byte offset of the frame in the slice-data buffer.
+    pub slice_data_offset: u32,
+    /// `VA_SLICE_DATA_FLAG_*` flags.
+    pub slice_data_flag: u32,
+    /// Per-segment parameters; entry zero only without segmentation.
+    pub seg_param: [VaSegmentParameterVp9; 8],
+    /// Reserved, zero.
+    pub va_reserved: [u32; 4],
+}
+
 /// H.264 encode sequence-parameter buffer.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1467,6 +1593,20 @@ pub struct VaProcColorProperties {
     pub reserved: [u8; 3],
 }
 
+/// Rectangular surface region (`VARectangle`).
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct VaRectangle {
+    /// Horizontal origin in luma samples.
+    pub x: i16,
+    /// Vertical origin in luma samples.
+    pub y: i16,
+    /// Width in luma samples.
+    pub width: u16,
+    /// Height in luma samples.
+    pub height: u16,
+}
+
 /// Video-processing pipeline-parameter buffer.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1588,6 +1728,20 @@ mod tests {
         assert_eq!(align_of::<VaDecPictureParameterBufferAv1>(), 8);
         assert_eq!(size_of::<VaSliceParameterBufferAv1>(), 40);
         assert_eq!(align_of::<VaSliceParameterBufferAv1>(), 4);
+    }
+
+    #[test]
+    fn vp9_decode_layouts_match_libva() {
+        use super::{
+            VaDecPictureParameterBufferVp9, VaSegmentParameterVp9, VaSliceParameterBufferVp9,
+        };
+
+        assert_eq!(size_of::<VaDecPictureParameterBufferVp9>(), 92);
+        assert_eq!(align_of::<VaDecPictureParameterBufferVp9>(), 4);
+        assert_eq!(size_of::<VaSegmentParameterVp9>(), 36);
+        assert_eq!(align_of::<VaSegmentParameterVp9>(), 4);
+        assert_eq!(size_of::<VaSliceParameterBufferVp9>(), 316);
+        assert_eq!(align_of::<VaSliceParameterBufferVp9>(), 4);
     }
 
     #[test]

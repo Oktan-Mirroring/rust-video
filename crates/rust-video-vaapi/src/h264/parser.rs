@@ -732,6 +732,11 @@ pub struct Sps {
 }
 
 impl Sps {
+    /// `constraint_set1_flag`: Constrained Baseline indicator, A.2.1.1.
+    fn constraint_set1(&self) -> bool {
+        self.constraints[1]
+    }
+
     /// `constraint_set3_flag`: gates level-1b inference, Table A.1.
     fn constraint_set3(&self) -> bool {
         self.constraints[3]
@@ -867,6 +872,9 @@ impl Sps {
         }
 
         let profile = self.profile_idc;
+        if profile == Profile::Baseline as u8 || self.constraint_set1() {
+            return 0;
+        }
         if (profile == 44
             || profile == 86
             || profile == 100

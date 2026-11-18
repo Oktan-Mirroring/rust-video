@@ -1,5 +1,6 @@
 //! Decode-context seam: submit, read, wait, and pool access.
 
+use std::mem::MaybeUninit;
 use std::os::raw::c_int;
 use std::sync::Arc;
 
@@ -53,8 +54,8 @@ pub trait VaSeam {
     fn submit_slices<'d, T, F>(
         &mut self,
         target: SurfaceId,
-        picture: &[u8],
-        matrix: Option<&[u8]>,
+        picture: &[MaybeUninit<u8>],
+        matrix: Option<&[MaybeUninit<u8>]>,
         slices: &'d [T],
         data: F,
     ) -> Result<(), VaApiError>

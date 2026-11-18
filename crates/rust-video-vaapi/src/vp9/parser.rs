@@ -260,31 +260,33 @@ pub struct QuantizationParams {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SegmentationParams {
-    ///  If set, indicates that this frame makes use of the segmentation tool.
-    ///  If unset, indicates that the frame does not use segmentation.
+pub struct SegmentationMap {
+    /// If set, the frame makes use of the segmentation tool.
     pub enabled: bool,
-    /// If set, indicates that the segmentation map should be updated during
-    /// the decoding of this frame. If unset, means that the segmentation map
-    /// from the previous frame is used.
+    /// If set, the segmentation map updates during this frame.
     pub update_map: bool,
+    /// If set, map updates code relative to the existing map.
+    pub temporal_update: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentationState {
+    /// If set, new parameters follow for each segment.
+    pub update_data: bool,
+    /// If set, parameters are absolute values, else adjustments.
+    pub abs_or_delta_update: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentationParams {
+    /// Segmentation map updates.
+    pub map: SegmentationMap,
+    /// Segmentation data state.
+    pub state: SegmentationState,
     /// Specify the probability values to be used when decoding `segment_id`.
     pub tree_probs: [u8; SEG_TREE_PROBS],
     /// Specify the probability values to be used when decoding `seg_id_predicted`.
     pub pred_probs: [u8; PREDICTION_PROBS],
-    /// If set, indicates that the updates to the segmentation map are coded
-    /// relative to the existing segmentation map. If unset,
-    /// indicates that the new segmentation map is coded without
-    /// reference to the existing segmentation map.
-    pub temporal_update: bool,
-    /// If set, indicates that new parameters are about to be specified for each
-    /// segment. If unset, indicates that the segmentation parameters should
-    /// keep their existing values.
-    pub update_data: bool,
-    /// If unset, indicates that the segmentation parameters represent
-    /// adjustments relative to the standard values. If set, indicates that the
-    /// segmentation parameters represent the actual values to be used.
-    pub abs_or_delta_update: bool,
     /// If unset, indicates that the corresponding feature is unused and has
     /// value equal to 0. if set, indicates that the feature value is coded in
     /// the bitstream.
@@ -301,7 +303,7 @@ impl SegmentationParams {
 
     /// An implementation of `seg_feature_active` as per "6.4.9 Segmentation feature active syntax"
     fn is_feature_active(&self, segment_id: u8, feature: SegLvl) -> bool {
-        self.enabled && self.is_feature_enabled(segment_id, feature)
+        self.map.enabled && self.is_feature_enabled(segment_id, feature)
     }
 
     /// Returns the data for `feature` on `segment_id`.
@@ -350,7 +352,7 @@ impl Segmentation {
 
                 // 8.8.1 Loop filter frame init process
                 if hdr.seg.is_feature_active(segment_id, SegLvl::AltL) {
-                    if seg.abs_or_delta_update {
+                    if seg.state.abs_or_delta_update {
                         lvl_seg = i32::from(seg.feature_data(segment_id, SegLvl::AltL));
                     } else {
                         lvl_seg += i32::from(seg.feature_data(segment_id, SegLvl::AltL));
@@ -422,17 +424,6 @@ pub struct Frame<'a> {
     size: usize,
 }
 
-impl<'a> Frame<'a> {
-    pub fn new(bitstream: &'a [u8], header: Header, offset: usize, size: usize) -> Self {
-        Self {
-            bitstream,
-            header,
-            offset,
-            size,
-        }
-    }
-}
-
 impl AsRef<[u8]> for Frame<'_> {
     fn as_ref(&self) -> &[u8] {
         let data = self.bitstream;
@@ -440,49 +431,72 @@ impl AsRef<[u8]> for Frame<'_> {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShowFlags {
+    /// If set, the frame indexed by `frame_to_show_map_idx` displays.
+    pub show_existing_frame: bool,
+    /// If set, this frame displays once decoded.
+    pub show_frame: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResilienceFlags {
+    /// If set, error resilient mode is enabled.
+    pub error_resilient_mode: bool,
+    /// If set, frame probabilities store for future frames.
+    pub refresh_frame_context: bool,
+    /// If set, parallel decoding mode is enabled.
+    pub frame_parallel_decoding_mode: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModeFlags {
+    /// If set, the frame is intra-only.
+    pub intra_only: bool,
+    /// If set, motion vectors use eighth-pel precision.
+    pub allow_high_precision_mv: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ColorConfig {
+    /// Horizontal chroma subsampling.
+    pub subsampling_x: bool,
+    /// Vertical chroma subsampling.
+    pub subsampling_y: bool,
+    /// Color space of the stream.
+    pub color_space: ColorSpace,
+    /// Black level and range of the luma and chroma signals.
+    pub color_range: ColorRange,
+    /// Bit depth of the frame.
+    pub bit_depth: BitDepth,
+}
+
 /// A VP9 frame header.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Header {
     /// A subset of syntax, semantics and algorithms defined in a part.
     pub profile: Profile,
-    /// The bit depth of the frame.
-    pub bit_depth: BitDepth,
-    /// Specifies the chroma subsampling format.
-    pub subsampling_x: bool,
-    /// Specifies the chroma subsampling format.
-    pub subsampling_y: bool,
-    /// Specifies the color space of the stream.
-    pub color_space: ColorSpace,
-    /// Specifies the black level and range of the luma and chroma signals as
-    /// specified in Rec. ITU-R BT.709-6 and Rec. ITU-R BT.2020-2
-    pub color_range: ColorRange,
-    /// Indicates the frame indexed by `frame_to_show_map_idx` is to be displayed.
-    /// If unset, indicates that further processing is required.
-    pub show_existing_frame: bool,
+    /// Display flags.
+    pub show: ShowFlags,
+    /// Error-resilience and context flags.
+    pub resilience: ResilienceFlags,
+    /// Prediction-mode flags.
+    pub mode: ModeFlags,
+    /// Color description.
+    pub color: ColorConfig,
     /// Specifies the frame to be displayed. It is only available if
     /// `show_existing_frame` is set.
     pub frame_to_show_map_idx: u8,
     /// Indicates whether a frame is a key frame.
     pub frame_type: FrameType,
-    /// Whether this frame should be displayed.
-    pub show_frame: bool,
-    /// Whether error resilient mode is enabled.
-    pub error_resilient_mode: bool,
     /// The width of the frame in pixels.
     pub width: u32,
     /// The height of the frame in pixels.
     pub height: u32,
-    /// If unset, means that the render width and height are inferred from the
-    /// frame width and height. If set, means that the render width and height
-    /// are explicitly coded in the bitstream.
-    pub render_and_frame_size_different: bool,
     /// The render width of the frame in pixels.
     pub render_width: u32,
     /// The render height of the frame in pixels.
     pub render_height: u32,
-    /// If set, indicates that this frame is an intra-only frame. If unset,
-    /// indicates that this frame is a inter frame.
-    pub intra_only: bool,
     /// Specifies whether the frame context should be reset to default values.
     pub reset_frame_context: u8,
     /// Contains a bitmask that specifies which reference frame slots will be
@@ -498,19 +512,8 @@ pub struct Header {
     /// frame is a backwards reference; a sign bias equal to 1 indicates that
     /// the reference frame is a forwards reference
     pub ref_frame_sign_bias: [u8; 4],
-    /// If unset, specifies that motion vectors are specified to quarter pel
-    /// precision. If set, specifies that motion vectors are specified to eighth
-    /// pel precision.
-    pub allow_high_precision_mv: bool,
     /// The interpolation filter parameters.
     pub interpolation_filter: InterpolationFilter,
-    /// If set, indicates that the probabilities computed for this frame (after
-    /// adapting to the observed frequencies if adaption is enabled) should be
-    /// stored for reference by future frames. If unset, indicates that the
-    /// probabilities should be discarded at the end of the frame.
-    pub refresh_frame_context: bool,
-    /// Whether parallel decoding mode is enabled.
-    pub frame_parallel_decoding_mode: bool,
     /// Indicates the frame context to use.
     pub frame_context_idx: u8,
     /// The loop filter parameters
@@ -544,7 +547,7 @@ impl Header {
         if self.seg.is_feature_active(segment_id, SegLvl::AltQ) {
             let mut data = i32::from(self.seg.feature_data(segment_id, SegLvl::AltQ));
 
-            if !self.seg.abs_or_delta_update {
+            if !self.seg.state.abs_or_delta_update {
                 data += i32::from(base_q_idx);
             }
 
@@ -565,7 +568,7 @@ impl Header {
         let q_table_idx =
             u8::try_from((i32::from(qindex) + delta_q_dc).clamp(0, 255)).unwrap_or(u8::MAX);
 
-        let table = match self.bit_depth {
+        let table = match self.color.bit_depth {
             BitDepth::Depth8 => &DC_QLOOKUP,
             BitDepth::Depth10 => &DC_QLOOKUP_10,
             BitDepth::Depth12 => &DC_QLOOKUP_12,
@@ -581,7 +584,7 @@ impl Header {
         let q_table_idx =
             u8::try_from((i32::from(qindex) + delta_q_ac).clamp(0, 255)).unwrap_or(u8::MAX);
 
-        let table = match self.bit_depth {
+        let table = match self.color.bit_depth {
             BitDepth::Depth8 => &AC_QLOOKUP,
             BitDepth::Depth10 => &AC_QLOOKUP_10,
             BitDepth::Depth12 => &AC_QLOOKUP_12,
@@ -741,22 +744,22 @@ impl Parser {
         if matches!(hdr.profile, Profile::Profile2 | Profile::Profile3) {
             let ten_or_twelve_bit = r.read_bit()?;
             if ten_or_twelve_bit {
-                hdr.bit_depth = BitDepth::Depth12;
+                hdr.color.bit_depth = BitDepth::Depth12;
             } else {
-                hdr.bit_depth = BitDepth::Depth10;
+                hdr.color.bit_depth = BitDepth::Depth10;
             }
         } else {
-            hdr.bit_depth = BitDepth::Depth8;
+            hdr.color.bit_depth = BitDepth::Depth8;
         }
 
         let color_space = r.read_bits::<u32>(3)?;
-        hdr.color_space = ColorSpace::try_from(color_space)?;
+        hdr.color.color_space = ColorSpace::try_from(color_space)?;
 
-        if matches!(hdr.color_space, ColorSpace::CsSrgb) {
-            hdr.color_range = ColorRange::FullSwing;
+        if matches!(hdr.color.color_space, ColorSpace::CsSrgb) {
+            hdr.color.color_range = ColorRange::FullSwing;
             if matches!(hdr.profile, Profile::Profile1 | Profile::Profile3) {
-                hdr.subsampling_x = false;
-                hdr.subsampling_y = false;
+                hdr.color.subsampling_x = false;
+                hdr.color.subsampling_y = false;
 
                 // Skip the reserved bit
                 let _ = r.read_bit()?;
@@ -764,25 +767,25 @@ impl Parser {
         } else {
             let color_range = r.read_bits::<u32>(1)?;
 
-            hdr.color_range = ColorRange::try_from(color_range)?;
+            hdr.color.color_range = ColorRange::try_from(color_range)?;
 
             if matches!(hdr.profile, Profile::Profile1 | Profile::Profile3) {
-                hdr.subsampling_x = r.read_bit()?;
-                hdr.subsampling_y = r.read_bit()?;
+                hdr.color.subsampling_x = r.read_bit()?;
+                hdr.color.subsampling_y = r.read_bit()?;
 
                 // Skip the reserved bit
                 let _ = r.read_bit()?;
             } else {
-                hdr.subsampling_x = true;
-                hdr.subsampling_y = true;
+                hdr.color.subsampling_x = true;
+                hdr.color.subsampling_y = true;
             }
         }
 
-        self.bit_depth = hdr.bit_depth;
-        self.color_space = hdr.color_space;
-        self.subsampling_x = hdr.subsampling_x;
-        self.subsampling_y = hdr.subsampling_y;
-        self.color_range = hdr.color_range;
+        self.bit_depth = hdr.color.bit_depth;
+        self.color_space = hdr.color.color_space;
+        self.subsampling_x = hdr.color.subsampling_x;
+        self.subsampling_y = hdr.color.subsampling_y;
+        self.color_range = hdr.color.color_range;
 
         Ok(())
     }
@@ -802,8 +805,7 @@ impl Parser {
     }
 
     fn parse_render_size(r: &mut BitReader, hdr: &mut Header) -> Result<(), String> {
-        hdr.render_and_frame_size_different = r.read_bit()?;
-        if hdr.render_and_frame_size_different {
+        if r.read_bit()? {
             hdr.render_width = r.read_bits::<u32>(16)? + 1;
             hdr.render_height = r.read_bits::<u32>(16)? + 1;
         } else {
@@ -862,7 +864,7 @@ impl Parser {
     fn setup_past_independence(&mut self, hdr: &mut Header) {
         self.seg.feature_enabled = Default::default();
         self.seg.feature_data = Default::default();
-        self.seg.abs_or_delta_update = false;
+        self.seg.state.abs_or_delta_update = false;
 
         self.lf.delta_enabled = true;
         self.lf.ref_deltas[ReferenceFrameType::Intra as usize] = 1;
@@ -952,26 +954,26 @@ impl Parser {
         const SEGMENTATION_FEATURE_BITS: [u8; SEG_LVL_MAX] = [8, 6, 2, 0];
         const SEGMENTATION_FEATURE_SIGNED: [bool; SEG_LVL_MAX] = [true, true, false, false];
 
-        seg.update_map = false;
-        seg.update_data = false;
+        seg.map.update_map = false;
+        seg.state.update_data = false;
 
-        seg.enabled = r.read_bit()?;
+        seg.map.enabled = r.read_bit()?;
 
-        if !seg.enabled {
+        if !seg.map.enabled {
             return Ok(());
         }
 
-        seg.update_map = r.read_bit()?;
+        seg.map.update_map = r.read_bit()?;
 
-        if seg.update_map {
+        if seg.map.update_map {
             for i in 0..SEG_TREE_PROBS {
                 seg.tree_probs[i] = Self::read_prob(r)?;
             }
 
-            seg.temporal_update = r.read_bit()?;
+            seg.map.temporal_update = r.read_bit()?;
 
             for i in 0..PREDICTION_PROBS {
-                seg.pred_probs[i] = if seg.temporal_update {
+                seg.pred_probs[i] = if seg.map.temporal_update {
                     Self::read_prob(r)?
                 } else {
                     255
@@ -979,16 +981,16 @@ impl Parser {
             }
         }
 
-        seg.update_data = r.read_bit()?;
+        seg.state.update_data = r.read_bit()?;
 
-        if seg.update_data {
-            seg.abs_or_delta_update = r.read_bit()?;
+        if seg.state.update_data {
+            seg.state.abs_or_delta_update = r.read_bit()?;
             for i in 0..MAX_SEGMENTS {
                 for j in 0..SEG_LVL_MAX {
                     seg.feature_enabled[i][j] = r.read_bit()?;
                     if seg.feature_enabled[i][j] {
                         let bits_to_read = SEGMENTATION_FEATURE_BITS[j];
-                        let mut feature_value = r.read_bits_signed::<i16>(bits_to_read as usize)?;
+                        let mut feature_value = r.read_bits::<i16>(bits_to_read as usize)?;
 
                         if SEGMENTATION_FEATURE_SIGNED[j] {
                             let feature_sign = r.read_bit()?;
@@ -1064,17 +1066,17 @@ impl Parser {
         Self::parse_frame_marker(&mut r)?;
         hdr.profile = Self::parse_profile(&mut r)?;
 
-        hdr.show_existing_frame = r.read_bit()?;
+        hdr.show.show_existing_frame = r.read_bit()?;
 
-        if hdr.show_existing_frame {
+        if hdr.show.show_existing_frame {
             hdr.frame_to_show_map_idx = r.read_bits::<u8>(3)?;
             return Ok(hdr);
         }
 
         hdr.frame_type = FrameType::try_from(r.read_bits::<u8>(1)?)?;
 
-        hdr.show_frame = r.read_bit()?;
-        hdr.error_resilient_mode = r.read_bit()?;
+        hdr.show.show_frame = r.read_bit()?;
+        hdr.resilience.error_resilient_mode = r.read_bit()?;
 
         let frame_is_intra;
 
@@ -1086,31 +1088,31 @@ impl Parser {
             hdr.refresh_frame_flags = 0xff;
             frame_is_intra = true;
         } else {
-            if !hdr.show_frame {
-                hdr.intra_only = r.read_bit()?;
+            if !hdr.show.show_frame {
+                hdr.mode.intra_only = r.read_bit()?;
             }
 
-            frame_is_intra = hdr.intra_only;
+            frame_is_intra = hdr.mode.intra_only;
 
-            if hdr.error_resilient_mode {
+            if hdr.resilience.error_resilient_mode {
                 hdr.reset_frame_context = 0;
             } else {
                 hdr.reset_frame_context = r.read_bits::<u8>(2)?;
             }
 
-            if hdr.intra_only {
+            if hdr.mode.intra_only {
                 Self::parse_frame_sync_code(&mut r)?;
 
                 if matches!(hdr.profile, Profile::Profile0) {
-                    hdr.color_space = ColorSpace::Bt601;
-                    hdr.subsampling_x = true;
-                    hdr.subsampling_y = true;
-                    hdr.bit_depth = BitDepth::Depth8;
+                    hdr.color.color_space = ColorSpace::Bt601;
+                    hdr.color.subsampling_x = true;
+                    hdr.color.subsampling_y = true;
+                    hdr.color.bit_depth = BitDepth::Depth8;
 
-                    self.color_space = hdr.color_space;
-                    self.subsampling_x = hdr.subsampling_x;
-                    self.subsampling_y = hdr.subsampling_y;
-                    self.bit_depth = hdr.bit_depth;
+                    self.color_space = hdr.color.color_space;
+                    self.subsampling_x = hdr.color.subsampling_x;
+                    self.subsampling_y = hdr.color.subsampling_y;
+                    self.bit_depth = hdr.color.bit_depth;
                 } else {
                     self.parse_color_config(&mut r, &mut hdr)?;
                 }
@@ -1120,11 +1122,11 @@ impl Parser {
                 Self::parse_render_size(&mut r, &mut hdr)?;
             } else {
                 // Copy from our cached version
-                hdr.color_space = self.color_space;
-                hdr.color_range = self.color_range;
-                hdr.subsampling_x = self.subsampling_x;
-                hdr.subsampling_y = self.subsampling_y;
-                hdr.bit_depth = self.bit_depth;
+                hdr.color.color_space = self.color_space;
+                hdr.color.color_range = self.color_range;
+                hdr.color.subsampling_x = self.subsampling_x;
+                hdr.color.subsampling_y = self.subsampling_y;
+                hdr.color.bit_depth = self.bit_depth;
 
                 hdr.refresh_frame_flags = r.read_bits::<u8>(8)?;
 
@@ -1135,22 +1137,22 @@ impl Parser {
                 }
 
                 self.parse_frame_size_with_refs(&mut r, &mut hdr)?;
-                hdr.allow_high_precision_mv = r.read_bit()?;
+                hdr.mode.allow_high_precision_mv = r.read_bit()?;
                 hdr.interpolation_filter = Self::read_interpolation_filter(&mut r)?;
             }
         }
 
-        if hdr.error_resilient_mode {
-            hdr.refresh_frame_context = false;
-            hdr.frame_parallel_decoding_mode = true;
+        if hdr.resilience.error_resilient_mode {
+            hdr.resilience.refresh_frame_context = false;
+            hdr.resilience.frame_parallel_decoding_mode = true;
         } else {
-            hdr.refresh_frame_context = r.read_bit()?;
-            hdr.frame_parallel_decoding_mode = r.read_bit()?;
+            hdr.resilience.refresh_frame_context = r.read_bit()?;
+            hdr.resilience.frame_parallel_decoding_mode = r.read_bit()?;
         }
 
         hdr.frame_context_idx = r.read_bits::<u8>(2)?;
 
-        if frame_is_intra || hdr.error_resilient_mode {
+        if frame_is_intra || hdr.resilience.error_resilient_mode {
             self.setup_past_independence(&mut hdr);
         }
 

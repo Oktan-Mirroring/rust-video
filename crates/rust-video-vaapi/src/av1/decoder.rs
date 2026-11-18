@@ -392,8 +392,7 @@ impl<'a> Av1Decoder<'a> {
                 payloads.push(&group.data()[offset..offset + size]);
                 self.slice_params.push(Params::slice(
                     tile,
-                    u32::try_from(offset)
-                        .map_err(|_| VaApiError::Parse("tile offset range".to_owned()))?,
+                    0,
                     u32::try_from(size)
                         .map_err(|_| VaApiError::Parse("tile size range".to_owned()))?,
                 )?);

@@ -121,6 +121,17 @@ unsafe extern "C" {
     ) -> VaStatus;
     /// Image view over `surface`.
     pub fn vaDeriveImage(dpy: VaDisplay, surface: VaSurfaceId, image: *mut VaImage) -> VaStatus;
+    /// Copy rectangle `(x, y, width, height)` of `surface` into `image`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vaGetImage(
+        dpy: VaDisplay,
+        surface: VaSurfaceId,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+        image: VaImageId,
+    ) -> VaStatus;
     /// Release `image`.
     pub fn vaDestroyImage(dpy: VaDisplay, image: VaImageId) -> VaStatus;
     /// Map `buffer` into client memory.

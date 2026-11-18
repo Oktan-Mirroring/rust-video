@@ -113,24 +113,26 @@ fn surface_fps(decoder: &mut impl SurfaceDecode, packets: &[Packet]) -> f64 {
 
 /// Measured fps of `ITERS` passes of `frames` through `encoder`.
 fn encode_fps(encoder: &mut impl Encoder<Error = VaApiError>, frames: &[CpuFrame]) -> f64 {
+    let mut warm = 0;
     for frame in frames {
-        assert!(
-            !encoder.encode(frame).expect("warmup encode").is_empty(),
-            "warmup frame codes"
-        );
+        warm += encoder.encode(frame).expect("warmup encode").len();
     }
+    warm += encoder.flush().expect("warmup flush").len();
+    assert_eq!(warm, frames.len(), "warmup frames code");
     let mut coded = 0_u32;
     let start = std::time::Instant::now();
     for _ in 0..ITERS {
         for frame in frames {
-            assert!(
-                !encoder.encode(frame).expect("timed encode").is_empty(),
-                "every frame codes"
-            );
-            coded += 1;
+            coded += u32::try_from(encoder.encode(frame).expect("timed encode").len())
+                .expect("packet count fits");
         }
     }
-    encoder.flush().expect("timed flush");
+    coded += u32::try_from(encoder.flush().expect("timed flush").len()).expect("drain fits");
+    assert_eq!(
+        coded,
+        ITERS * u32::try_from(frames.len()).expect("frame count fits"),
+        "every frame codes"
+    );
     let elapsed = start.elapsed().as_secs_f64();
     f64::from(coded) / elapsed
 }

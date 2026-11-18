@@ -56,7 +56,7 @@ pub use delivery::DecoderPump;
 #[cfg(target_os = "linux")]
 pub use device::{DisplayHandle, VaApiDevice};
 #[cfg(target_os = "linux")]
-pub use encoder::{EncodeCodec, VaApiEncoder};
+pub use encoder::{EncodeCodec, GopShape, VaApiEncoder};
 #[cfg(target_os = "linux")]
 pub use error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]

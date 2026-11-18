@@ -1,8 +1,7 @@
-//! VA-API encode: all-intra CQP sessions for H.264 and H.265.
+//! VA-API encode: CQP sessions for H.264 and H.265.
 //!
-//! Every picture is an IDR: no reference management, no reorder delay,
-//! every packet a keyframe. CQP keeps constant quality without a
-//! bitrate model.
+//! All-intra or low-delay IPPP over a one-frame sliding window. CQP
+//! keeps constant quality without a bitrate model.
 
 #![allow(unsafe_code)]
 
@@ -64,6 +63,19 @@ impl fmt::Display for EncodeCodec {
     }
 }
 
+/// GOP shape an encoder session writes.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum GopShape {
+    /// Every picture an IDR.
+    #[default]
+    AllIntra,
+    /// IDR every period, P between; no reorder delay.
+    LowDelay {
+        /// Pictures per IDR; 0 behaves as 1.
+        intra_period: u32,
+    },
+}
+
 /// VA-API hardware encoder over one display.
 ///
 /// `Send`, never `Sync`: hand the session to another thread when idle,
@@ -72,6 +84,10 @@ impl fmt::Display for EncodeCodec {
 pub struct VaApiEncoder {
     /// Codec the session writes.
     codec: EncodeCodec,
+    /// GOP shape the session writes.
+    gop: GopShape,
+    /// Previous picture as next P reference, if any.
+    prev: Option<Reference>,
     /// Visible size in luma samples.
     visible: PictureSize,
     /// Coded size in luma samples, block-aligned.
@@ -90,8 +106,12 @@ pub struct VaApiEncoder {
     creates: u64,
     /// Next reconstruction surface.
     next_recon: usize,
-    /// Coded-bitstream buffer, rewritten every picture.
-    coded_buf: VaBuffer,
+    /// Next pipeline slot.
+    next_slot: usize,
+    /// Submitted picture awaiting harvest, if any.
+    pending: Option<PendingJob>,
+    /// Coded-bitstream buffers, one per pipeline slot.
+    coded_buf: [VaBuffer; 2],
     /// Sequence-parameter buffer, rewritten every picture.
     seq: VaBuffer,
     /// Picture-parameter buffer, rewritten every picture.
@@ -106,8 +126,10 @@ pub struct VaApiEncoder {
     pps: PackedPair,
     /// Packed slice header, rewritten every picture.
     slice_packed: PackedPair,
-    /// NV12 upload image, reused across pictures.
-    upload: ffi::VaImage,
+    /// NV12 upload images, one per pipeline slot.
+    upload: [ffi::VaImage; 2],
+    /// True per slot when its image derives the surface, needing no blit.
+    derived: [bool; 2],
     /// Header bit writer, reused across pictures.
     writer: BitWriter,
     /// Scratch render list, reused across pictures.
@@ -123,10 +145,10 @@ impl VaApiEncoder {
     const DEFAULT_QP: u8 = 26;
     /// Maximum quantization.
     const MAX_QP: u8 = 51;
-    /// Upload surface index.
-    const UPLOAD: usize = 0;
+    /// Upload surface count; slots alternate across pictures.
+    const UPLOADS: usize = 2;
     /// First reconstruction surface index.
-    const RECON: usize = 1;
+    const RECON: usize = 2;
     /// Reconstruction surface count.
     const RECONS: usize = 2;
 
@@ -164,6 +186,21 @@ impl VaApiEncoder {
     const H265_PIC_LOOP_TILES: u32 = 15;
     /// H.265 last-slice shift.
     const H265_SLICE_LAST: u32 = 0;
+    /// H.264 VUI restriction shift.
+    const H264_VUI_RESTRICTION: u32 = 2;
+    /// H.264 VUI horizontal-MV-length shift.
+    const H264_VUI_MV_H: u32 = 3;
+    /// H.264 VUI vertical-MV-length shift.
+    const H264_VUI_MV_V: u32 = 8;
+    /// H.264 VUI cross-boundary-MV shift.
+    const H264_VUI_MV_OVER: u32 = 15;
+    /// VUI motion-vector length on both axes.
+    const VUI_MV_LEN: u32 = 10;
+    /// H.264 VUI word matching the packed VUI.
+    const H264_VUI_FIELDS: u32 = (1 << Self::H264_VUI_RESTRICTION)
+        | (Self::VUI_MV_LEN << Self::H264_VUI_MV_H)
+        | (Self::VUI_MV_LEN << Self::H264_VUI_MV_V)
+        | (1 << Self::H264_VUI_MV_OVER);
 
     /// Encoder over `device` for `codec` at `visible` size.
     ///
@@ -227,16 +264,19 @@ impl VaApiEncoder {
         let session = Session::open(device, profile, coded_size)?;
         let display = device.display();
         let context = session.context;
-        let upload = Self::upload_image(display, &mut image_format, coded_size)?;
+        let ([first, second], [first_derived, second_derived]) =
+            Self::upload_images(display, &session.surfaces, &mut image_format, coded_size)?;
         let words = Words::new(codec);
         let level = Self::level(codec, coded_size);
         let visible_pair = (visible.width(), visible.height());
         let (vps, sps, mut creates) =
             Self::pack_session_headers(codec, coded_size, visible_pair, level, display, context)?;
-        // coded, sequence, picture, slice singles plus pps and slice packed pairs below.
-        creates += 8;
+        // Two coded buffers plus sequence, picture, slice singles plus pps and slice packed pairs below.
+        creates += 9;
         Ok(Self {
             codec,
+            gop: GopShape::AllIntra,
+            prev: None,
             visible,
             coded: coded_size,
             qp: Self::DEFAULT_QP,
@@ -246,12 +286,9 @@ impl VaApiEncoder {
             count: 0,
             creates,
             next_recon: 0,
-            coded_buf: VaBuffer::empty(
-                display,
-                context,
-                ffi::VA_ENC_CODED_BUFFER_TYPE,
-                Self::coded_len(coded_size)?,
-            )?,
+            next_slot: 0,
+            pending: None,
+            coded_buf: Self::coded_buffers(display, context, coded_size)?,
             seq: VaBuffer::empty(
                 display,
                 context,
@@ -269,7 +306,8 @@ impl VaApiEncoder {
             sps,
             pps: PackedPair::empty(display, context)?,
             slice_packed: PackedPair::empty(display, context)?,
-            upload,
+            upload: [first, second],
+            derived: [first_derived, second_derived],
             writer: BitWriter::default(),
             render: Vec::new(),
             session,
@@ -281,6 +319,13 @@ impl VaApiEncoder {
     #[must_use]
     pub fn with_qp(mut self, qp: u8) -> Self {
         self.qp = qp.min(Self::MAX_QP);
+        self
+    }
+
+    /// Encoder writing `gop` instead of all-intra.
+    #[must_use]
+    pub fn with_gop(mut self, gop: GopShape) -> Self {
+        self.gop = gop;
         self
     }
 
@@ -389,11 +434,27 @@ impl VaApiEncoder {
 
     /// Packets coded from `source`, possibly none.
     fn encode_inner(&mut self, source: ffi::VaSurfaceId) -> Result<Vec<Packet>, VaApiError> {
+        let mut packets = self.drain_pending()?;
+        // The drain freed every slot, so the inline job takes slot zero.
+        let job = self.submit_job(source, 0)?;
+        packets.push(self.harvest_job(&job)?);
+        Ok(packets)
+    }
+
+    /// Submit `source` on `slot`, returning the pending harvest.
+    fn submit_job(
+        &mut self,
+        source: ffi::VaSurfaceId,
+        slot: usize,
+    ) -> Result<PendingJob, VaApiError> {
         let recon = self.session.surfaces[Self::RECON + self.next_recon];
         self.next_recon = (self.next_recon + 1) % Self::RECONS;
+        let coded = self.coded_buf[slot].id();
+        let numbers = Self::numbers(self.gop, self.count)?;
+        let reference = self.prev;
         match self.codec {
-            EncodeCodec::H264 => self.render_h264(recon)?,
-            EncodeCodec::H265 => self.render_h265(recon)?,
+            EncodeCodec::H264 => self.render_h264(recon, &numbers, reference, coded)?,
+            EncodeCodec::H265 => self.render_h265(recon, &numbers, reference, coded)?,
         }
         let display = self.session.display;
         let context = self.session.context;
@@ -405,15 +466,74 @@ impl VaApiEncoder {
         let end = unsafe { sys::vaEndPicture(display, context) };
         sys::status(rendered)?;
         sys::status(end)?;
-        // Sound: the surface was just submitted.
-        sys::status(unsafe { sys::vaSyncSurface(display, source) })?;
-        let bytes = self.harvest()?;
+        self.prev = Some(Reference {
+            surface: recon,
+            frame_num: numbers.frame_num,
+            poc: numbers.poc,
+        });
         self.count += 1;
-        Ok(vec![Packet::new(Bytes::from(bytes)).mark_keyframe()])
+        Ok(PendingJob {
+            source,
+            coded,
+            idr: numbers.idr,
+        })
     }
 
-    /// NV12 frame bytes onto the upload surface.
-    fn upload(&mut self, frame: &CpuFrame) -> Result<ffi::VaSurfaceId, VaApiError> {
+    /// Packet harvested from a submitted `job`.
+    fn harvest_job(&mut self, job: &PendingJob) -> Result<Packet, VaApiError> {
+        let display = self.session.display;
+        // Sound: the surface was just submitted.
+        sys::status(unsafe { sys::vaSyncSurface(display, job.source) })?;
+        let bytes = self.harvest(job.coded)?;
+        let packet = Packet::new(Bytes::from(bytes));
+        Ok(if job.idr {
+            packet.mark_keyframe()
+        } else {
+            packet
+        })
+    }
+
+    /// Packet held back for the in-flight picture, if any.
+    fn drain_pending(&mut self) -> Result<Vec<Packet>, VaApiError> {
+        match self.pending.take() {
+            Some(job) => Ok(vec![self.harvest_job(&job)?]),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Pictures per IDR under `gop`.
+    fn intra_period(&self) -> u32 {
+        match self.gop {
+            GopShape::AllIntra => 1,
+            GopShape::LowDelay { intra_period } => intra_period.max(1),
+        }
+    }
+
+    /// Numbers for the `count`-th picture under `gop`.
+    fn numbers(gop: GopShape, count: u64) -> Result<Numbers, VaApiError> {
+        match gop {
+            GopShape::AllIntra => Ok(Numbers {
+                idr: true,
+                frame_num: u16::try_from(count % 16).map_err(|_| Self::range())?,
+                idr_pic_id: u16::try_from(count % 65_535).map_err(|_| Self::range())?,
+                poc: u16::try_from(count.wrapping_mul(2) % 64).map_err(|_| Self::range())?,
+            }),
+            GopShape::LowDelay { intra_period } => {
+                let period = u64::from(intra_period.max(1));
+                let pos = count % period;
+                Ok(Numbers {
+                    idr: pos == 0,
+                    frame_num: u16::try_from(pos % 16).map_err(|_| Self::range())?,
+                    idr_pic_id: u16::try_from(count / period % 65_535)
+                        .map_err(|_| Self::range())?,
+                    poc: u16::try_from(pos.wrapping_mul(2) % 64).map_err(|_| Self::range())?,
+                })
+            }
+        }
+    }
+
+    /// NV12 frame bytes onto the `slot` upload surface.
+    fn upload(&mut self, frame: &CpuFrame, slot: usize) -> Result<ffi::VaSurfaceId, VaApiError> {
         if frame.format() != PixelFormat::Nv12 || frame.size() != self.visible {
             return Err(VaApiError::Unsupported(format!(
                 "{} encode needs nv12 at {}x{}",
@@ -423,25 +543,83 @@ impl VaApiEncoder {
             )));
         }
         let display = self.session.display;
-        let surface = self.session.surfaces[Self::UPLOAD];
-        self.copy_into(&self.upload, frame)?;
-        // Sound: the surface and image are live; the rectangles fit both.
-        sys::status(unsafe {
-            sys::vaPutImage(
-                display,
-                surface,
-                self.upload.image_id,
-                0,
-                0,
-                self.visible.width(),
-                self.visible.height(),
-                0,
-                0,
-                self.visible.width(),
-                self.visible.height(),
-            )
-        })?;
+        let surface = self.session.surfaces[slot];
+        self.copy_into(&self.upload[slot], frame)?;
+        if !self.derived[slot] {
+            // Sound: the surface and image are live; the rectangles fit both.
+            sys::status(unsafe {
+                sys::vaPutImage(
+                    display,
+                    surface,
+                    self.upload[slot].image_id,
+                    0,
+                    0,
+                    self.visible.width(),
+                    self.visible.height(),
+                    0,
+                    0,
+                    self.visible.width(),
+                    self.visible.height(),
+                )
+            })?;
+        }
         Ok(surface)
+    }
+
+    /// Coded-bitstream buffers for both slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses a coded buffer.
+    fn coded_buffers(
+        display: ffi::VaDisplay,
+        context: ffi::VaContextId,
+        coded: (u32, u32),
+    ) -> Result<[VaBuffer; 2], VaApiError> {
+        let len = Self::coded_len(coded)?;
+        Ok([
+            VaBuffer::empty(display, context, ffi::VA_ENC_CODED_BUFFER_TYPE, len)?,
+            VaBuffer::empty(display, context, ffi::VA_ENC_CODED_BUFFER_TYPE, len)?,
+        ])
+    }
+
+    /// Upload images for both slots, derived where the driver allows.
+    ///
+    /// Each image pairs with its upload surface; the flags report the
+    /// derived slots, which skip the blit.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses both the derive and the
+    /// NV12 upload for a slot.
+    fn upload_images(
+        display: ffi::VaDisplay,
+        surfaces: &[ffi::VaSurfaceId],
+        format: &mut ffi::VaImageFormat,
+        coded: (u32, u32),
+    ) -> Result<([ffi::VaImage; 2], [bool; 2]), VaApiError> {
+        let mut slot = |index: usize| -> Result<(ffi::VaImage, bool), VaApiError> {
+            let surface = surfaces[index];
+            match Self::derive_image(display, surface) {
+                Ok(image) => Ok((image, true)),
+                Err(_) => Ok((Self::upload_image(display, format, coded)?, false)),
+            }
+        };
+        let (first, first_derived) = slot(0)?;
+        let (second, second_derived) = slot(1)?;
+        Ok(([first, second], [first_derived, second_derived]))
+    }
+
+    /// NV12 image derived from `surface`, zero-copy when the driver allows.
+    fn derive_image(
+        display: ffi::VaDisplay,
+        surface: ffi::VaSurfaceId,
+    ) -> Result<ffi::VaImage, VaApiError> {
+        let mut image = std::mem::MaybeUninit::<ffi::VaImage>::uninit();
+        // Sound: the display and surface are live; the image outlives the call.
+        sys::status(unsafe { sys::vaDeriveImage(display, surface, image.as_mut_ptr()) })?;
+        // Sound: `vaDeriveImage` succeeded, so the image is initialized.
+        Ok(unsafe { image.assume_init() })
     }
 
     /// NV12 upload image at the coded size.
@@ -523,11 +701,11 @@ impl VaApiEncoder {
     }
 
     /// Coded bytes harvested from the coded buffer.
-    fn harvest(&self) -> Result<Vec<u8>, VaApiError> {
+    fn harvest(&self, coded: ffi::VaBufferId) -> Result<Vec<u8>, VaApiError> {
         let display = self.session.display;
         // Sound: the coded buffer is live until the session drops.
         let mut mapped: *mut c_void = std::ptr::null_mut();
-        sys::status(unsafe { sys::vaMapBuffer(display, self.coded_buf.id(), &raw mut mapped) })?;
+        sys::status(unsafe { sys::vaMapBuffer(display, coded, &raw mut mapped) })?;
         let mut out = Vec::with_capacity(1 << 16);
         let mut segment = mapped.cast_const().cast::<ffi::VaCodedBufferSegment>();
         let mut failed = false;
@@ -553,7 +731,7 @@ impl VaApiEncoder {
                     .cast_const()
                     .cast::<ffi::VaCodedBufferSegment>();
             }
-            sys::vaUnmapBuffer(display, self.coded_buf.id());
+            sys::vaUnmapBuffer(display, coded);
         }
         if failed {
             return Err(VaApiError::Unsupported(
@@ -589,17 +767,28 @@ impl VaApiEncoder {
         Ok(())
     }
 
-    /// Render list for one H.264 IDR picture on `recon`.
-    fn render_h264(&mut self, recon: ffi::VaSurfaceId) -> Result<(), VaApiError> {
-        let frame = self.count;
+    /// Render list for one H.264 picture on `recon`.
+    fn render_h264(
+        &mut self,
+        recon: ffi::VaSurfaceId,
+        numbers: &Numbers,
+        reference: Option<Reference>,
+        coded: ffi::VaBufferId,
+    ) -> Result<(), VaApiError> {
         let mbw = self.coded.0 / 16;
         let mbh = self.coded.1 / 16;
-        let frame_num = u16::try_from(frame % 16).map_err(|_| Self::range())?;
-        let idr_pic_id = u16::try_from(frame % 65_535).map_err(|_| Self::range())?;
-        let poc = u16::try_from(frame.wrapping_mul(2) % 64).map_err(|_| Self::range())?;
         let qp = self.qp;
         self.pack_pps(qp)?;
-        Self::h264_slice(frame_num, idr_pic_id, poc, &mut self.writer);
+        if numbers.idr {
+            Self::h264_slice(
+                numbers.frame_num,
+                numbers.idr_pic_id,
+                numbers.poc,
+                &mut self.writer,
+            );
+        } else {
+            Self::h264_p_slice(numbers.frame_num, numbers.poc, &mut self.writer);
+        }
         let slice_bits = self.writer.bit_len();
         let recreated = self.slice_packed.pack(
             ffi::VA_ENC_PACKED_HEADER_TYPE_SLICE,
@@ -608,68 +797,50 @@ impl VaApiEncoder {
         )?;
         self.creates += recreated;
         self.writer.clear();
-        let crop = self.coded != (self.visible.width(), self.visible.height());
-        let seq = ffi::VaEncSequenceParameterBufferH264 {
-            seq_parameter_set_id: 0,
-            level_idc: self.level,
-            intra_period: 1,
-            intra_idr_period: 1,
-            ip_period: 1,
-            bits_per_second: 0,
-            max_num_ref_frames: 1,
-            picture_width_in_mbs: u16::try_from(mbw).map_err(|_| Self::range())?,
-            picture_height_in_mbs: u16::try_from(mbh).map_err(|_| Self::range())?,
-            seq_fields: self.words.seq,
-            bit_depth_luma_minus8: 0,
-            bit_depth_chroma_minus8: 0,
-            num_ref_frames_in_pic_order_cnt_cycle: 0,
-            offset_for_non_ref_pic: 0,
-            offset_for_top_to_bottom_field: 0,
-            offset_for_ref_frame: [0; 256],
-            frame_cropping_flag: u8::from(crop),
-            frame_crop_left_offset: 0,
-            frame_crop_right_offset: (self.coded.0 - self.visible.width()) / 2,
-            frame_crop_top_offset: 0,
-            frame_crop_bottom_offset: (self.coded.1 - self.visible.height()) / 2,
-            vui_parameters_present_flag: 0,
-            vui_fields: 0,
-            aspect_ratio_idc: 0,
-            sar_width: 0,
-            sar_height: 0,
-            num_units_in_tick: 0,
-            time_scale: 0,
-            va_reserved: [0; 4],
+        let seq = self.h264_seq(mbw, mbh)?;
+        self.creates += u64::from(self.seq.rewrite_uninit(bytes_of(&seq))?);
+        let mut dpb = [Self::h264_invalid(); 16];
+        if let Some(prev) = reference.filter(|_| !numbers.idr) {
+            dpb[0] = Self::h264_ref(prev);
+        }
+        let pic_fields = if numbers.idr {
+            self.words.pic_idr
+        } else {
+            self.words.pic_p
         };
-        self.creates += u64::from(self.seq.rewrite(bytes_of(&seq))?);
         let pic = ffi::VaEncPictureParameterBufferH264 {
             curr_pic: ffi::VaPictureH264 {
                 picture_id: recon,
-                frame_idx: u32::from(frame_num),
+                frame_idx: u32::from(numbers.frame_num),
                 flags: ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-                top_field_order_cnt: i32::from(poc),
-                bottom_field_order_cnt: i32::from(poc),
+                top_field_order_cnt: i32::from(numbers.poc),
+                bottom_field_order_cnt: i32::from(numbers.poc),
                 ..Default::default()
             },
-            reference_frames: [Self::h264_invalid(); 16],
-            coded_buf: self.coded_buf.id(),
-            frame_num,
+            reference_frames: dpb,
+            coded_buf: coded,
+            frame_num: numbers.frame_num,
             pic_init_qp: qp,
-            pic_fields: self.words.pic,
+            pic_fields,
             ..Default::default()
         };
-        self.creates += u64::from(self.slice_pic.rewrite(bytes_of(&pic))?);
+        self.creates += u64::from(self.slice_pic.rewrite_uninit(bytes_of(&pic))?);
         let mbs = u64::from(mbw) * u64::from(mbh);
+        let mut list0 = [Self::h264_invalid(); 32];
+        if let Some(prev) = reference.filter(|_| !numbers.idr) {
+            list0[0] = Self::h264_ref(prev);
+        }
         let slice = ffi::VaEncSliceParameterBufferH264 {
             num_macroblocks: u32::try_from(mbs).map_err(|_| Self::range())?,
             macroblock_info: ffi::VA_INVALID_ID,
-            slice_type: 2,
-            idr_pic_id,
-            pic_order_cnt_lsb: poc,
-            ref_pic_list0: [Self::h264_invalid(); 32],
+            slice_type: if numbers.idr { 2 } else { 0 },
+            idr_pic_id: if numbers.idr { numbers.idr_pic_id } else { 0 },
+            pic_order_cnt_lsb: numbers.poc,
+            ref_pic_list0: list0,
             ref_pic_list1: [Self::h264_invalid(); 32],
             ..Default::default()
         };
-        self.creates += u64::from(self.slice.rewrite(bytes_of(&slice))?);
+        self.creates += u64::from(self.slice.rewrite_uninit(bytes_of(&slice))?);
         self.render.clear();
         self.render.extend([
             self.seq.id(),
@@ -685,15 +856,25 @@ impl VaApiEncoder {
         Ok(())
     }
 
-    /// Render list for one H.265 IDR picture on `recon`.
-    fn render_h265(&mut self, recon: ffi::VaSurfaceId) -> Result<(), VaApiError> {
+    /// Render list for one H.265 picture on `recon`.
+    fn render_h265(
+        &mut self,
+        recon: ffi::VaSurfaceId,
+        numbers: &Numbers,
+        reference: Option<Reference>,
+        coded: ffi::VaBufferId,
+    ) -> Result<(), VaApiError> {
         let ctus_w = self.coded.0.div_ceil(64);
         let ctus_h = self.coded.1.div_ceil(64);
         let ctus =
             u32::try_from(u64::from(ctus_w) * u64::from(ctus_h)).map_err(|_| Self::range())?;
         let qp = self.qp;
         self.pack_pps(qp)?;
-        Self::hevc_slice(&mut self.writer);
+        if numbers.idr {
+            Self::hevc_slice(&mut self.writer);
+        } else {
+            Self::hevc_p_slice(numbers.poc, &mut self.writer);
+        }
         let slice_bits = self.writer.bit_len();
         let recreated = self.slice_packed.pack(
             ffi::VA_ENC_PACKED_HEADER_TYPE_SLICE,
@@ -702,11 +883,12 @@ impl VaApiEncoder {
         )?;
         self.creates += recreated;
         self.writer.clear();
+        let period = self.intra_period();
         let seq = ffi::VaEncSequenceParameterBufferHevc {
             general_profile_idc: 1,
             general_level_idc: self.level,
-            intra_period: 1,
-            intra_idr_period: 1,
+            intra_period: period,
+            intra_idr_period: period,
             ip_period: 1,
             pic_width_in_luma_samples: u16::try_from(self.coded.0).map_err(|_| Self::range())?,
             pic_height_in_luma_samples: u16::try_from(self.coded.1).map_err(|_| Self::range())?,
@@ -717,31 +899,45 @@ impl VaApiEncoder {
             max_transform_hierarchy_depth_intra: 2,
             ..Default::default()
         };
-        self.creates += u64::from(self.seq.rewrite(bytes_of(&seq))?);
+        self.creates += u64::from(self.seq.rewrite_uninit(bytes_of(&seq))?);
+        let mut dpb = [Self::hevc_invalid(); 15];
+        if let Some(prev) = reference.filter(|_| !numbers.idr) {
+            dpb[0] = Self::hevc_ref(prev);
+        }
+        let pic_fields = if numbers.idr {
+            self.words.pic_idr
+        } else {
+            self.words.pic_p
+        };
         let pic = ffi::VaEncPictureParameterBufferHevc {
             decoded_curr_pic: ffi::VaPictureHevc {
                 picture_id: recon,
+                pic_order_cnt: i32::from(numbers.poc),
                 ..Default::default()
             },
-            reference_frames: [Self::hevc_invalid(); 15],
-            coded_buf: self.coded_buf.id(),
+            reference_frames: dpb,
+            coded_buf: coded,
             collocated_ref_pic_index: 0xFF,
             pic_init_qp: qp,
-            nal_unit_type: 19,
-            pic_fields: self.words.pic,
+            nal_unit_type: if numbers.idr { 19 } else { 1 },
+            pic_fields,
             ..Default::default()
         };
-        self.creates += u64::from(self.slice_pic.rewrite(bytes_of(&pic))?);
+        self.creates += u64::from(self.slice_pic.rewrite_uninit(bytes_of(&pic))?);
+        let mut list0 = [Self::hevc_invalid(); 15];
+        if let Some(prev) = reference.filter(|_| !numbers.idr) {
+            list0[0] = Self::hevc_ref(prev);
+        }
         let slice = ffi::VaEncSliceParameterBufferHevc {
             num_ctu_in_slice: ctus,
-            slice_type: 2,
-            ref_pic_list0: [Self::hevc_invalid(); 15],
+            slice_type: if numbers.idr { 2 } else { 1 },
+            ref_pic_list0: list0,
             ref_pic_list1: [Self::hevc_invalid(); 15],
             max_num_merge_cand: 5,
             slice_fields: self.words.slice,
             ..Default::default()
         };
-        self.creates += u64::from(self.slice.rewrite(bytes_of(&slice))?);
+        self.creates += u64::from(self.slice.rewrite_uninit(bytes_of(&slice))?);
         self.render.clear();
         if let Some(vps) = &self.vps {
             self.render.push(vps.param.id());
@@ -773,12 +969,75 @@ impl VaApiEncoder {
         }
     }
 
+    /// H.264 sequence parameters at `mbw` by `mbh` macroblocks.
+    fn h264_seq(
+        &self,
+        mbw: u32,
+        mbh: u32,
+    ) -> Result<ffi::VaEncSequenceParameterBufferH264, VaApiError> {
+        let crop = self.coded != (self.visible.width(), self.visible.height());
+        let period = self.intra_period();
+        Ok(ffi::VaEncSequenceParameterBufferH264 {
+            seq_parameter_set_id: 0,
+            level_idc: self.level,
+            intra_period: period,
+            intra_idr_period: period,
+            ip_period: 1,
+            bits_per_second: 0,
+            max_num_ref_frames: 1,
+            picture_width_in_mbs: u16::try_from(mbw).map_err(|_| Self::range())?,
+            picture_height_in_mbs: u16::try_from(mbh).map_err(|_| Self::range())?,
+            seq_fields: self.words.seq,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            num_ref_frames_in_pic_order_cnt_cycle: 0,
+            offset_for_non_ref_pic: 0,
+            offset_for_top_to_bottom_field: 0,
+            offset_for_ref_frame: [0; 256],
+            frame_cropping_flag: u8::from(crop),
+            frame_crop_left_offset: 0,
+            frame_crop_right_offset: (self.coded.0 - self.visible.width()) / 2,
+            frame_crop_top_offset: 0,
+            frame_crop_bottom_offset: (self.coded.1 - self.visible.height()) / 2,
+            vui_parameters_present_flag: 1,
+            vui_fields: Self::H264_VUI_FIELDS,
+            aspect_ratio_idc: 0,
+            sar_width: 0,
+            sar_height: 0,
+            num_units_in_tick: 0,
+            time_scale: 0,
+            va_reserved: [0; 4],
+        })
+    }
+
+    /// H.264 short-term reference from `prev`.
+    fn h264_ref(prev: Reference) -> ffi::VaPictureH264 {
+        ffi::VaPictureH264 {
+            picture_id: prev.surface,
+            frame_idx: u32::from(prev.frame_num),
+            flags: ffi::VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+            top_field_order_cnt: i32::from(prev.poc),
+            bottom_field_order_cnt: i32::from(prev.poc),
+            reserved: [0; 4],
+        }
+    }
+
     /// Invalid HEVC reference picture marker.
     fn hevc_invalid() -> ffi::VaPictureHevc {
         ffi::VaPictureHevc {
             picture_id: ffi::VA_INVALID_ID,
             pic_order_cnt: 0,
             flags: ffi::VA_PICTURE_HEVC_INVALID,
+            reserved: [0; 4],
+        }
+    }
+
+    /// HEVC short-term reference from `prev`.
+    fn hevc_ref(prev: Reference) -> ffi::VaPictureHevc {
+        ffi::VaPictureHevc {
+            picture_id: prev.surface,
+            pic_order_cnt: i32::from(prev.poc),
+            flags: ffi::VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE,
             reserved: [0; 4],
         }
     }
@@ -812,8 +1071,29 @@ impl VaApiEncoder {
             writer.ue(0);
             writer.ue((coded.1 - visible.1) / 2);
         }
-        writer.bits(0, 1);
+        writer.bits(1, 1);
+        Self::h264_vui(writer);
         writer.rbsp_trailing();
+    }
+
+    /// H.264 low-delay VUI: no reorder, two frame buffers.
+    fn h264_vui(writer: &mut BitWriter) {
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(1, 1);
+        writer.bits(1, 1);
+        writer.ue(0);
+        writer.ue(0);
+        writer.ue(Self::VUI_MV_LEN);
+        writer.ue(Self::VUI_MV_LEN);
+        writer.ue(0);
+        writer.ue(2);
     }
 
     /// H.264 picture header for `qp`.
@@ -851,6 +1131,22 @@ impl VaApiEncoder {
         writer.bits(u32::from(poc_lsb), 6);
         writer.bits(0, 1);
         writer.bits(0, 1);
+        writer.se(0);
+        writer.align_zero();
+    }
+
+    /// H.264 P slice header with default sliding-window marking.
+    fn h264_p_slice(frame_num: u16, poc_lsb: u16, writer: &mut BitWriter) {
+        writer.start_code(0x41);
+        writer.ue(0);
+        writer.ue(0);
+        writer.ue(0);
+        writer.bits(u32::from(frame_num), 4);
+        writer.bits(u32::from(poc_lsb), 6);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.bits(0, 1);
+        writer.ue(0);
         writer.se(0);
         writer.align_zero();
     }
@@ -914,7 +1210,7 @@ impl VaApiEncoder {
         writer.ue(0);
         writer.ue(2);
         writer.bits(0, 1);
-        writer.ue(0);
+        writer.ue(1);
         writer.ue(0);
         writer.ue(0);
         writer.ue(0);
@@ -927,7 +1223,11 @@ impl VaApiEncoder {
         writer.bits(1, 1);
         writer.bits(0, 1);
         writer.bits(0, 1);
+        writer.ue(1);
+        writer.ue(1);
         writer.ue(0);
+        writer.ue(1);
+        writer.bits(1, 1);
         writer.bits(0, 1);
         writer.bits(0, 1);
         writer.bits(1, 1);
@@ -964,6 +1264,7 @@ impl VaApiEncoder {
         writer.bits(0, 1);
         writer.bits(0, 1);
         writer.bits(0, 1);
+        writer.ue(0);
         writer.bits(0, 1);
         writer.bits(0, 1);
         writer.rbsp_trailing();
@@ -978,6 +1279,20 @@ impl VaApiEncoder {
         writer.ue(2);
         writer.se(0);
         writer.se(0);
+        writer.se(0);
+        writer.align_zero();
+    }
+
+    /// H.265 single-slice P header over the SPS reference set.
+    fn hevc_p_slice(poc_lsb: u16, writer: &mut BitWriter) {
+        writer.start_code16(1);
+        writer.bits(1, 1);
+        writer.ue(0);
+        writer.ue(1);
+        writer.bits(u32::from(poc_lsb), 6);
+        writer.bits(1, 1);
+        writer.bits(0, 1);
+        writer.ue(0);
         writer.se(0);
         writer.align_zero();
     }
@@ -1065,12 +1380,16 @@ impl Encoder for VaApiEncoder {
     type Error = VaApiError;
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, VaApiError> {
-        let surface = self.upload(frame)?;
-        self.encode_inner(surface)
+        let slot = self.next_slot;
+        self.next_slot = (self.next_slot + 1) % Self::UPLOADS;
+        let surface = self.upload(frame, slot)?;
+        let packets = self.drain_pending()?;
+        self.pending = Some(self.submit_job(surface, slot)?);
+        Ok(packets)
     }
 
     fn flush(&mut self) -> Result<Vec<Packet>, VaApiError> {
-        Ok(Vec::new())
+        self.drain_pending()
     }
 }
 
@@ -1124,7 +1443,7 @@ impl Session {
                 &raw mut config,
             )
         })?;
-        let count = 1 + VaApiEncoder::RECONS;
+        let count = VaApiEncoder::UPLOADS + VaApiEncoder::RECONS;
         let mut surfaces = vec![0; count];
         // Sound: the surface array holds `count` live entries.
         let status = unsafe {
@@ -1199,10 +1518,12 @@ unsafe impl Send for VaApiEncoder {}
 
 impl Drop for VaApiEncoder {
     fn drop(&mut self) {
-        // Sound: the image was created in `open`; the session outlives
+        // Sound: the images were created in `open`; the session outlives
         // this drop, so the display is still initialized.
         unsafe {
-            sys::vaDestroyImage(self.session.display, self.upload.image_id);
+            for image in &self.upload {
+                sys::vaDestroyImage(self.session.display, image.image_id);
+            }
         }
     }
 }
@@ -1211,8 +1532,10 @@ impl Drop for VaApiEncoder {
 struct Words {
     /// Packed sequence flags.
     seq: u32,
-    /// Packed picture flags.
-    pic: u32,
+    /// Packed IDR picture flags.
+    pic_idr: u32,
+    /// Packed P picture flags.
+    pic_p: u32,
     /// Packed slice flags.
     slice: u32,
 }
@@ -1226,8 +1549,11 @@ impl Words {
                     | (1u32 << VaApiEncoder::H264_SEQ_MBS_ONLY)
                     | (1u32 << VaApiEncoder::H264_SEQ_DIRECT_8X8)
                     | (2u32 << VaApiEncoder::H264_SEQ_LOG2_POC_LSB),
-                pic: (1u32 << VaApiEncoder::H264_PIC_IDR)
+                pic_idr: (1u32 << VaApiEncoder::H264_PIC_IDR)
                     | (1u32 << VaApiEncoder::H264_PIC_REFERENCE)
+                    | (1u32 << VaApiEncoder::H264_PIC_ENTROPY)
+                    | (1u32 << VaApiEncoder::H264_PIC_TRANSFORM_8X8),
+                pic_p: (1u32 << VaApiEncoder::H264_PIC_REFERENCE)
                     | (1u32 << VaApiEncoder::H264_PIC_ENTROPY)
                     | (1u32 << VaApiEncoder::H264_PIC_TRANSFORM_8X8),
                 slice: 0,
@@ -1236,8 +1562,12 @@ impl Words {
                 seq: (1u32 << VaApiEncoder::H265_SEQ_CHROMA)
                     | (1u32 << VaApiEncoder::H265_SEQ_STRONG_INTRA)
                     | (1u32 << VaApiEncoder::H265_SEQ_AMP),
-                pic: (1u32 << VaApiEncoder::H265_PIC_IDR)
+                pic_idr: (1u32 << VaApiEncoder::H265_PIC_IDR)
                     | (1u32 << VaApiEncoder::H265_PIC_CODING_TYPE)
+                    | (1u32 << VaApiEncoder::H265_PIC_REFERENCE)
+                    | (1u32 << VaApiEncoder::H265_PIC_SIGN_DATA)
+                    | (1u32 << VaApiEncoder::H265_PIC_LOOP_TILES),
+                pic_p: (2u32 << VaApiEncoder::H265_PIC_CODING_TYPE)
                     | (1u32 << VaApiEncoder::H265_PIC_REFERENCE)
                     | (1u32 << VaApiEncoder::H265_PIC_SIGN_DATA)
                     | (1u32 << VaApiEncoder::H265_PIC_LOOP_TILES),
@@ -1245,6 +1575,39 @@ impl Words {
             },
         }
     }
+}
+
+/// Numbers for one picture in coding order.
+struct Numbers {
+    /// Picture starts a new GOP.
+    idr: bool,
+    /// Frame number modulo the sequence range.
+    frame_num: u16,
+    /// IDR identifier, counting IDRs.
+    idr_pic_id: u16,
+    /// Order count modulo the lsb range.
+    poc: u16,
+}
+
+/// Previous picture as next P reference.
+#[derive(Clone, Copy)]
+struct Reference {
+    /// Reconstruction surface holding the picture.
+    surface: ffi::VaSurfaceId,
+    /// Frame number of the picture.
+    frame_num: u16,
+    /// Order count of the picture.
+    poc: u16,
+}
+
+/// Submitted picture awaiting harvest.
+struct PendingJob {
+    /// Input surface the sync waits on.
+    source: ffi::VaSurfaceId,
+    /// Coded buffer the harvest maps.
+    coded: ffi::VaBufferId,
+    /// Picture starts a new GOP.
+    idr: bool,
 }
 
 /// Packed header parameter and data buffers.
@@ -1284,7 +1647,7 @@ impl PackedPair {
             has_emulation_bytes: 0,
             va_reserved: [0; 4],
         };
-        let mut recreated = u64::from(self.param.rewrite(bytes_of(&param))?);
+        let mut recreated = u64::from(self.param.rewrite_uninit(bytes_of(&param))?);
         recreated += u64::from(self.data.rewrite(bytes)?);
         Ok(recreated)
     }
@@ -1417,8 +1780,9 @@ impl BitWriter {
 mod tests {
     use std::io::Cursor;
 
-    use super::{BitWriter, EncodeCodec, VaApiEncoder, Words};
+    use super::{BitWriter, EncodeCodec, GopShape, VaApiEncoder, Words};
     use crate::h264::parser::{Nalu, Parser, SliceType};
+    use crate::h265::parser::{Nalu as Nalu265, Parser as Parser265, SliceType as SliceType265};
 
     #[test]
     fn writer_packs_bits_msb_first() {
@@ -1461,12 +1825,41 @@ mod tests {
     fn words_pin_packed_shifts() {
         let h264 = Words::new(EncodeCodec::H264);
         assert_eq!(h264.seq, 8229);
-        assert_eq!(h264.pic, 267);
+        assert_eq!(h264.pic_idr, 267);
+        assert_eq!(h264.pic_p, 266);
         assert_eq!(h264.slice, 0);
         let h265 = Words::new(EncodeCodec::H265);
         assert_eq!(h265.seq, 3073);
-        assert_eq!(h265.pic, 32_851);
+        assert_eq!(h265.pic_idr, 32_851);
+        assert_eq!(h265.pic_p, 32_852);
         assert_eq!(h265.slice, 1);
+        assert_eq!(VaApiEncoder::H264_VUI_FIELDS, 35_412);
+    }
+
+    #[test]
+    fn numbers_shape_gop_periods() {
+        let idr = |count| VaApiEncoder::numbers(GopShape::AllIntra, count).expect("small count");
+        assert!(idr(0).idr);
+        assert_eq!((idr(17).frame_num, idr(17).poc), (1, 34));
+        assert_eq!(idr(65_535).idr_pic_id, 0);
+        let low = |count| {
+            VaApiEncoder::numbers(GopShape::LowDelay { intra_period: 60 }, count)
+                .expect("small count")
+        };
+        let first = low(0);
+        assert!(first.idr);
+        assert_eq!((first.frame_num, first.idr_pic_id, first.poc), (0, 0, 0));
+        let second = low(1);
+        assert!(!second.idr);
+        assert_eq!((second.frame_num, second.poc), (1, 2));
+        assert!(!low(59).idr);
+        let next = low(60);
+        assert!(next.idr);
+        assert_eq!((next.frame_num, next.idr_pic_id, next.poc), (0, 1, 0));
+        assert!(!low(61).idr);
+        let degenerate =
+            VaApiEncoder::numbers(GopShape::LowDelay { intra_period: 0 }, 7).expect("small count");
+        assert!(degenerate.idr);
     }
 
     #[test]
@@ -1482,6 +1875,12 @@ mod tests {
     fn first(bytes: &[u8]) -> Nalu<'_> {
         let mut cursor = Cursor::new(bytes);
         Nalu::next(&mut cursor).expect("annex b unit")
+    }
+
+    /// First H.265 NAL unit of Annex B `bytes`.
+    fn first265(bytes: &[u8]) -> Nalu265<'_> {
+        let mut cursor = Cursor::new(bytes);
+        Nalu265::next(&mut cursor).expect("annex b unit")
     }
 
     /// Raw header bytes with emulation prevention inserted for the parser.
@@ -1517,6 +1916,13 @@ mod tests {
         assert_eq!(sps.pic_order_cnt_type, 0);
         assert_eq!(sps.log2_max_frame_num_minus4, 0);
         assert!(sps.frame_field.frame_mbs_only);
+        let restriction = sps
+            .vui
+            .as_ref()
+            .and_then(|vui| vui.restriction)
+            .expect("low-delay vui");
+        assert_eq!(restriction.max_num_reorder_frames, 0);
+        assert_eq!(restriction.max_dec_frame_buffering, 2);
 
         VaApiEncoder::h264_pps(26, &mut writer);
         let (pps_bytes, _) = writer.take();
@@ -1535,6 +1941,30 @@ mod tests {
         assert_eq!(slice.header.slice_type, SliceType::I);
         assert_eq!(slice.header.frame_num, 3);
         assert_eq!(slice.header.idr_pic_id, 7);
+        assert_eq!(slice.header.pic_order_cnt_lsb, 6);
+        assert!(usize::try_from(slice_bits).expect("small header") < slice_bytes.len() * 8);
+    }
+
+    #[test]
+    fn h264_p_slice_round_trips_through_parser() {
+        let mut writer = BitWriter::default();
+        VaApiEncoder::h264_sps((320, 240), (320, 240), 22, &mut writer);
+        let (sps_bytes, _) = writer.take();
+        VaApiEncoder::h264_pps(26, &mut writer);
+        let (pps_bytes, _) = writer.take();
+        VaApiEncoder::h264_p_slice(3, 6, &mut writer);
+        let (slice_bytes, slice_bits) = writer.take();
+        let sps_bytes = annexed(&sps_bytes);
+        let pps_bytes = annexed(&pps_bytes);
+        let slice_bytes = annexed(&slice_bytes);
+        let mut parser = Parser::default();
+        parser.parse_sps(&first(&sps_bytes)).expect("sps");
+        parser.parse_pps(&first(&pps_bytes)).expect("pps");
+        let slice = parser
+            .parse_slice_header(first(&slice_bytes))
+            .expect("p slice");
+        assert_eq!(slice.header.slice_type, SliceType::P);
+        assert_eq!(slice.header.frame_num, 3);
         assert_eq!(slice.header.pic_order_cnt_lsb, 6);
         assert!(usize::try_from(slice_bits).expect("small header") < slice_bytes.len() * 8);
     }
@@ -1568,9 +1998,62 @@ mod tests {
         assert_eq!(sps[17], 120);
         VaApiEncoder::hevc_pps(26, &mut writer);
         let (pps, _) = writer.take();
-        assert_eq!(&pps[..], &[0, 0, 1, 68, 1, 0xC1, 0x71, 0x80, 0x04]);
+        assert_eq!(&pps[..], &[0, 0, 1, 68, 1, 0xC1, 0x71, 0x80, 0x12]);
         VaApiEncoder::hevc_slice(&mut writer);
         let (slice, _) = writer.take();
         assert_eq!(&slice[..], &[0, 0, 1, 38, 1, 0xAF, 0x80]);
+    }
+
+    #[test]
+    fn hevc_headers_round_trip_through_parser() {
+        let mut writer = BitWriter::default();
+        VaApiEncoder::hevc_vps(120, &mut writer);
+        let (vps_bytes, _) = writer.take();
+        VaApiEncoder::hevc_sps((320, 240), (320, 240), 120, &mut writer);
+        let (sps_bytes, _) = writer.take();
+        VaApiEncoder::hevc_pps(26, &mut writer);
+        let (pps_bytes, _) = writer.take();
+        VaApiEncoder::hevc_slice(&mut writer);
+        let (idr_bytes, _) = writer.take();
+        VaApiEncoder::hevc_p_slice(6, &mut writer);
+        let (p_bytes, p_bits) = writer.take();
+        let vps_bytes = annexed(&vps_bytes);
+        let sps_bytes = annexed(&sps_bytes);
+        let pps_bytes = annexed(&pps_bytes);
+        let idr_bytes = annexed(&idr_bytes);
+        let p_bytes = annexed(&p_bytes);
+        let mut parser = Parser265::default();
+        parser.parse_vps(&first265(&vps_bytes)).expect("vps");
+        let sps = parser
+            .parse_sps(&first265(&sps_bytes))
+            .expect("sps")
+            .clone();
+        assert_eq!(
+            (
+                sps.pic_width_in_luma_samples,
+                sps.pic_height_in_luma_samples
+            ),
+            (320, 240)
+        );
+        assert_eq!(sps.num_short_term_ref_pic_sets, 1);
+        assert_eq!(sps.max_dec_pic_buffering_minus1[0], 1);
+        assert_eq!(sps.max_num_reorder_pics[0], 0);
+        let rps = &sps.short_term_ref_pic_set[0];
+        assert_eq!((rps.num_negative_pics, rps.num_positive_pics), (1, 0));
+        assert_eq!(rps.delta_poc_s0[0], -2);
+        assert!(rps.used_by_curr_pic_s0[0]);
+        let pps = parser.parse_pps(&first265(&pps_bytes)).expect("pps");
+        assert_eq!(pps.init_qp_minus26, 0);
+        let idr = parser
+            .parse_slice_header(first265(&idr_bytes))
+            .expect("idr slice");
+        assert_eq!(idr.header.type_, SliceType265::I);
+        let p = parser
+            .parse_slice_header(first265(&p_bytes))
+            .expect("p slice");
+        assert_eq!(p.header.type_, SliceType265::P);
+        assert_eq!(p.header.pic_order_cnt_lsb, 6);
+        assert_eq!(p.header.short_term_ref_pic_set_idx, 0);
+        assert!(usize::try_from(p_bits).expect("small header") < p_bytes.len() * 8);
     }
 }

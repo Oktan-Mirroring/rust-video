@@ -1,4 +1,4 @@
-﻿//! H.265 access-unit assembly, reference sets, and DPB orchestration.
+//! H.265 access-unit assembly, reference sets, and DPB orchestration.
 //!
 //! Portable: parses Annex B, groups slices per first-slice flags,
 //! derives reference sets per 8.3.2, builds reference lists per 8.3.4,
@@ -61,6 +61,17 @@ pub struct PendingPicture {
 /// Reference lists of one slice: list 0 and list 1 as DPB indices.
 #[cfg(test)]
 type RefLists = (Vec<Option<usize>>, Vec<Option<usize>>);
+
+/// Pre-bump reference handles retained across DPB pruning.
+#[derive(Default)]
+struct KeptRps {
+    /// Short-term before handles in RPS order.
+    st_curr_before: Vec<Option<Rc<RefCell<PictureData>>>>,
+    /// Short-term after handles in RPS order.
+    st_curr_after: Vec<Option<Rc<RefCell<PictureData>>>>,
+    /// Long-term current handles in RPS order.
+    lt_curr: Vec<Option<Rc<RefCell<PictureData>>>>,
+}
 
 /// Reference sets of one picture as DPB indices, per 8.3.2.
 #[derive(Clone, Debug, Default)]
@@ -652,8 +663,9 @@ impl Frontend {
         } else if pic.nalu_type.is_rasl() && self.irap_no_rasl {
             return Ok(None);
         }
-        let rps = self.decode_rps(&first.header, &pending.sps, &pic);
+        let kept = self.mark_rps(&first.header, &pending.sps, &pic);
         let bumped = self.update_before_decoding(&pic, &pending.sps);
+        let rps = self.locate_rps(&kept);
         Ok(Some((
             Picture {
                 pic,
@@ -692,41 +704,65 @@ impl Frontend {
         Ok(outputs)
     }
 
-    /// Reference sets for `header`, marking the DPB per 8.3.3.
-    fn decode_rps(&mut self, header: &SliceHeader, sps: &Sps, pic: &PictureData) -> Rps {
+    /// Mark DPB reference states for `header` per 8.3.3, returning active handles.
+    fn mark_rps(&mut self, header: &SliceHeader, sps: &Sps, pic: &PictureData) -> KeptRps {
         if pic.nalu_type.is_irap() && pic.output.no_rasl_output_flag {
             self.dpb.mark_all_as_unused_for_ref();
         }
-        let mut rps = Rps::default();
         if pic.nalu_type.is_idr() {
-            return rps;
+            return KeptRps::default();
         }
         let set = Self::short_term_set(header, sps);
         let (st_before, st_after, st_foll) = short_term_pocs(set, pic.pic_order_cnt_val);
         let (lt_curr, lt_curr_masked, lt_foll, lt_foll_masked) =
             long_term_pocs(header, pic.pic_order_cnt_val, self.max_poc_lsb);
-        rps.st_curr_before = self.resolve_short(&st_before);
-        rps.st_curr_after = self.resolve_short(&st_after);
-        rps.lt_curr = self.resolve_long(&lt_curr, &lt_curr_masked);
+        let st_curr_before = self.resolve_short(&st_before);
+        let st_curr_after = self.resolve_short(&st_after);
+        let lt_curr_pics = self.resolve_long(&lt_curr, &lt_curr_masked);
         let foll_short = self.resolve_short(&st_foll);
         let foll_long = self.resolve_long(&lt_foll, &lt_foll_masked);
-        for index in rps.lt_curr.iter().chain(foll_long.iter()).flatten() {
-            if let Some(entry) = self.dpb.entries().get(*index) {
-                entry.0.borrow_mut().set_reference(Reference::LongTerm);
-            }
+        for pic_rc in lt_curr_pics.iter().chain(foll_long.iter()).flatten() {
+            pic_rc.borrow_mut().set_reference(Reference::LongTerm);
         }
-        let mut kept = Vec::new();
-        kept.extend(rps.st_curr_before.iter().flatten());
-        kept.extend(rps.st_curr_after.iter().flatten());
-        kept.extend(rps.lt_curr.iter().flatten());
-        kept.extend(foll_short.iter().flatten());
-        kept.extend(foll_long.iter().flatten());
-        for (index, entry) in self.dpb.entries().iter().enumerate() {
-            if !kept.contains(&index) {
+        let mut all_kept = Vec::new();
+        all_kept.extend(st_curr_before.iter().flatten().cloned());
+        all_kept.extend(st_curr_after.iter().flatten().cloned());
+        all_kept.extend(lt_curr_pics.iter().flatten().cloned());
+        all_kept.extend(foll_short.into_iter().flatten());
+        all_kept.extend(foll_long.into_iter().flatten());
+        for entry in self.dpb.entries() {
+            if !all_kept.iter().any(|kept| Rc::ptr_eq(&entry.0, kept)) {
                 entry.0.borrow_mut().set_reference(Reference::None);
             }
         }
-        rps
+        KeptRps {
+            st_curr_before,
+            st_curr_after,
+            lt_curr: lt_curr_pics,
+        }
+    }
+
+    /// Post-bump DPB indices for `kept`.
+    fn locate_rps(&self, kept: &KeptRps) -> Rps {
+        Rps {
+            st_curr_before: self.locate_list(&kept.st_curr_before),
+            st_curr_after: self.locate_list(&kept.st_curr_after),
+            lt_curr: self.locate_list(&kept.lt_curr),
+        }
+    }
+
+    /// Post-bump DPB positions for `list`.
+    fn locate_list(&self, list: &[Option<Rc<RefCell<PictureData>>>]) -> Vec<Option<usize>> {
+        list.iter()
+            .map(|entry| {
+                entry.as_ref().and_then(|target| {
+                    self.dpb
+                        .entries()
+                        .iter()
+                        .position(|stored| Rc::ptr_eq(&stored.0, target))
+                })
+            })
+            .collect()
     }
 
     /// Short-term set the header selects, inline or from the SPS.
@@ -738,22 +774,19 @@ impl Frontend {
         }
     }
 
-    /// DPB indices of short-term `pocs`, `None` where absent.
-    fn resolve_short(&self, pocs: &[i32]) -> Vec<Option<usize>> {
+    /// DPB picture handles of short-term `pocs`, `None` where absent.
+    fn resolve_short(&self, pocs: &[i32]) -> Vec<Option<Rc<RefCell<PictureData>>>> {
         pocs.iter()
             .map(|poc| {
-                self.dpb.find_short_term_ref_by_poc(*poc).and_then(|entry| {
-                    self.dpb
-                        .entries()
-                        .iter()
-                        .position(|stored| Rc::ptr_eq(&stored.0, &entry.0))
-                })
+                self.dpb
+                    .find_short_term_ref_by_poc(*poc)
+                    .map(|entry| entry.0)
             })
             .collect()
     }
 
-    /// DPB indices of long-term `pocs`, masked where `masks` holds.
-    fn resolve_long(&self, pocs: &[i32], masks: &[bool]) -> Vec<Option<usize>> {
+    /// DPB picture handles of long-term `pocs`, masked where `masks` holds.
+    fn resolve_long(&self, pocs: &[i32], masks: &[bool]) -> Vec<Option<Rc<RefCell<PictureData>>>> {
         pocs.iter()
             .zip(masks.iter())
             .map(|(poc, masked)| {
@@ -762,12 +795,7 @@ impl Frontend {
                 } else {
                     self.dpb.find_ref_by_poc(*poc)
                 };
-                entry.and_then(|entry| {
-                    self.dpb
-                        .entries()
-                        .iter()
-                        .position(|stored| Rc::ptr_eq(&stored.0, &entry.0))
-                })
+                entry.map(|entry| entry.0)
             })
             .collect()
     }
@@ -795,8 +823,11 @@ impl Frontend {
 
     /// Reject streams outside Main 8-bit 4:2:0 without extensions.
     fn check_supported(sps: &Sps, pps: &Pps) -> Result<(), VaApiError> {
-        let profile = sps.profile_tier_level.general_profile_idc;
-        if profile != 1 && profile != 3 {
+        let ptl = &sps.profile_tier_level;
+        let profile = ptl.general_profile_idc;
+        let compat =
+            ptl.general_profile_compatibility_flag[1] || ptl.general_profile_compatibility_flag[3];
+        if profile != 1 && profile != 3 && !compat {
             return Err(VaApiError::Unsupported(format!("h265 profile {profile}")));
         }
         if sps.chroma_format_idc != 1 {
@@ -1170,9 +1201,19 @@ mod tests {
         let sps = frontend.sps().expect("active set").clone();
         let pps = frontend.parser.get_pps(0).expect("parsed set").clone();
         let mut bad = (*sps).clone();
-        bad.profile_tier_level.general_profile_idc = 2;
+        bad.profile_tier_level.general_profile_idc = 4;
+        bad.profile_tier_level.general_profile_compatibility_flag = [false; 32];
         assert!(matches!(
             Frontend::check_supported(&bad, &pps),
+            Err(VaApiError::Unsupported(_))
+        ));
+        let mut compat = (*sps).clone();
+        compat.profile_tier_level.general_profile_idc = 2;
+        compat.profile_tier_level.general_profile_compatibility_flag[1] = true;
+        assert!(Frontend::check_supported(&compat, &pps).is_ok());
+        compat.bit_depth_luma_minus8 = 2;
+        assert!(matches!(
+            Frontend::check_supported(&compat, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut bad = (*sps).clone();
