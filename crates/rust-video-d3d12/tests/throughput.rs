@@ -7,12 +7,14 @@
 use rust_video_d3d12::{Codec, D3d12Device, Transcoder};
 
 use bytes::Bytes;
+use rust_video_caps::delivery::{PollFrames, ReceiveFrames, SendPackets, TrySendError};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
 use rust_video_d3d12::{
     Av1Decoder, D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
+    OverlappedH264Pump,
 };
 use rust_video_harness::H264Synth;
 use rust_video_harness::{bench_dir, AnnexB, Synth};
@@ -507,6 +509,65 @@ fn decode_av1_surface_1080p_measures_realtime() {
         Err(error) => panic!("warmup decode: {error}"),
     };
     println!("d3d12 av1 surface 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p H.264 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_h264_1080p_measures_realtime() {
+    let _guard = BENCH_LOCK.lock().expect("bench lock");
+    let device = match D3d12Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("SKIP: no d3d12 device ({error})");
+            return;
+        }
+    };
+    if !device.supports(Codec::H264) {
+        println!("SKIP: no h264 decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("h264-1080p_ip.h264")).expect("vector readable");
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let mut pump = OverlappedH264Pump::open(&device, OverlappedH264Pump::MAX_INFLIGHT);
+    let mut frames = Vec::new();
+    let start = std::time::Instant::now();
+    for packet in packets(&raws) {
+        let mut pending = packet;
+        loop {
+            match pump.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet }) => {
+                    pending = packet;
+                    let frame = pump
+                        .receive()
+                        .expect("in-flight frame completes")
+                        .expect("input unfinished");
+                    frames.push(frame);
+                }
+                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
+            }
+        }
+    }
+    while let Some(frame) = pump.try_receive().expect("overlap poll") {
+        frames.push(frame);
+    }
+    pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("drain") {
+        frames.push(frame);
+    }
+    let wall = start.elapsed();
+    let depth = pump.max_depth();
+    let total = u32::try_from(frames.len()).expect("frame count fits");
+    let measured = f64::from(total) / wall.as_secs_f64();
+    println!("d3d12 h264 sustained overlap 1080p: {measured:.1}fps over {} frames, depth {depth}, bar {BAR:.0}fps", frames.len());
+    assert_eq!(frames.len(), raws.len(), "every picture yields its frame");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
