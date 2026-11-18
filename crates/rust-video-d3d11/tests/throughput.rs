@@ -6,10 +6,11 @@
 
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, GpuSurface, H264Decoder,
-    HevcDecoder, Transcoder, Vp9Decoder,
+    HevcDecoder, OverlappedPump, SplitDecoder, Transcoder, Vp9Decoder,
 };
 
 use bytes::Bytes;
+use rust_video_caps::delivery::{ReceiveFrames, SendPackets, TrySendError};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
@@ -756,6 +757,160 @@ fn encode_surface_av1_1080p_measures_realtime() {
     }
     let measured = encode_surface_fps(&mut encoder, &surface);
     println!("d3d11 av1 surface encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Measured fps of one sustained overlap pass of `raws`, plus frame count and peak depth.
+fn sustained_fps<D>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize, usize)
+where
+    D: SplitDecoder<Frame = D3d11Frame>,
+{
+    let packets = packets(raws);
+    let mut pump = OverlappedPump::open(decoder);
+    let mut frames = Vec::new();
+    let start = std::time::Instant::now();
+    for packet in packets {
+        let mut pending = packet;
+        loop {
+            match pump.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet }) => {
+                    pending = packet;
+                    let frame = pump
+                        .receive()
+                        .expect("in-flight frame completes")
+                        .expect("input unfinished");
+                    frames.push(frame);
+                }
+                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
+            }
+        }
+    }
+    pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("drain") {
+        frames.push(frame);
+    }
+    let wall = start.elapsed();
+    let depth = pump.max_depth();
+    let total = u32::try_from(frames.len()).expect("frame count fits");
+    (f64::from(total) / wall.as_secs_f64(), frames.len(), depth)
+}
+
+/// Sustained 1080p H.264 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_h264_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::H264) {
+        println!("d3d11 skipped: no h264 decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("h264-1080p_ip.h264")).expect("vector readable");
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let decoder = H264Decoder::open(&device);
+    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    println!("d3d11 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p HEVC overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_hevc_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Hevc) {
+        println!("d3d11 skipped: no hevc decoder profile");
+        return;
+    }
+    let data = std::fs::read(bench_dir().join("h265-1080p_ip.h265")).expect("vector readable");
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
+    assert!(!raws.is_empty(), "bench vector holds pictures");
+    let decoder = HevcDecoder::open(&device);
+    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    println!("d3d11 hevc sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p AV1 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_av1_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Av1) {
+        println!("d3d11 skipped: no av1 decoder profile");
+        return;
+    }
+    let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let decoder = Av1Decoder::open(&device);
+    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    println!("d3d11 av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
+    assert!(
+        measured >= BAR,
+        "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
+    );
+}
+
+/// Sustained 1080p VP9 overlap throughput against the realtime bar.
+///
+/// Provisional bar: re-bar from quiet medians once the box is unloaded.
+#[test]
+fn sustained_vp9_1080p_measures_realtime() {
+    let _serial = measure();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    if !device.supports(Codec::Vp9) {
+        println!("d3d11 skipped: no vp9 decoder profile");
+        return;
+    }
+    let raws = Ivf::read(&bench_dir().join("vp9-1080p_ip.ivf")).frames;
+    assert!(!raws.is_empty(), "bench vector holds frames");
+    let decoder = Vp9Decoder::open(&device);
+    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    println!("d3d11 vp9 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {BAR:.0}fps");
+    assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
