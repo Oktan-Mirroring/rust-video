@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// Committed 320x240 VP9 vector path.
 pub fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.ivf")
+    rust_video_harness::decode_dir().join("valid_320x240.ivf")
 }
 
 /// Frame payloads of `data` in file order, without IVF headers.

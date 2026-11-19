@@ -15,9 +15,9 @@ use rust_video_caps::traits::Decoder;
 use rust_video_d3d12::{
     Codec, D3d12Device, D3d12Error, D3d12Frame, DecoderPump, H264Decoder, HevcDecoder,
 };
-use rust_video_harness::AnnexB;
+use rust_video_harness::{decode_dir, AnnexB};
 
-/// Pictures in each committed vector.
+/// Pictures in each shared vector.
 const PICTURES: usize = 15;
 
 /// Open device, loud skip without hardware.
@@ -39,10 +39,9 @@ fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
     )
 }
 
-/// Committed H.264 vector, one packet per picture in order.
+/// Shared H.264 vector, one packet per picture in order.
 fn h264_packets() -> Vec<Packet> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/valid_320x240.h264");
+    let path = decode_dir().join("valid_320x240.h264");
     let packets: Vec<Packet> = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl)
         .iter()
         .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
@@ -55,10 +54,9 @@ fn h264_packets() -> Vec<Packet> {
     packets
 }
 
-/// Committed HEVC vector, one packet per picture in order.
+/// Shared HEVC intra vector, one packet per picture in order.
 fn hevc_packets() -> Vec<Packet> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/valid_320x240.hevc");
+    let path = decode_dir().join("intra_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
     let packets: Vec<Packet> = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
         .iter()

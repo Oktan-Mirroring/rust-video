@@ -5,6 +5,7 @@
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
+#[allow(dead_code)]
 mod av1;
 #[path = "../examples/common/hevc.rs"]
 mod hevc;
@@ -18,7 +19,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::{GpuExport, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
-use rust_video_harness::{AnnexB, H264Synth};
+use rust_video_harness::{decode_dir, AnnexB, H264Synth};
 
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d12Device> {
@@ -34,9 +35,9 @@ fn device() -> Option<D3d12Device> {
     }
 }
 
-/// Committed vector path.
+/// Shared vector path.
 fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    decode_dir().join("valid_320x240.h264")
 }
 
 /// No-reorder vector emits one frame per decode call.
@@ -202,7 +203,7 @@ fn av1_reorder_holds_back_unchanged() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
@@ -226,7 +227,7 @@ fn av1_surfaces_match_frames() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);

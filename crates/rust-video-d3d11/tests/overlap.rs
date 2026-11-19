@@ -8,7 +8,11 @@
 #[allow(dead_code)]
 mod av1;
 #[path = "../examples/common/hevc.rs"]
+#[allow(dead_code)]
 mod hevc;
+#[path = "../examples/common/vp9.rs"]
+#[allow(dead_code)]
+mod vp9;
 
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -20,9 +24,9 @@ use rust_video_caps::delivery::{
 use rust_video_caps::packet::Packet;
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Frame, DecoderPump, H264Decoder, HevcDecoder,
-    OverlappedPump, PhaseCapture, SplitDecoder,
+    OverlappedPump, PhaseCapture, SplitDecoder, Vp9Decoder,
 };
-use rust_video_harness::AnnexB;
+use rust_video_harness::{decode_dir, AnnexB};
 
 /// Pictures in the committed H.264 vector.
 const PICTURES: usize = 15;
@@ -65,9 +69,9 @@ fn device_for(codec: Codec) -> Option<D3d11Device> {
     Some(device)
 }
 
-/// Committed H.264 vector path.
+/// Shared H.264 vector path.
 fn h264_vector() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    decode_dir().join("valid_320x240.h264")
 }
 
 /// Bound of `capacity` frames under `policy`.
@@ -88,7 +92,7 @@ fn h264_packets() -> Vec<Packet> {
 
 /// One packet per HEVC picture in order.
 fn hevc_packets() -> Vec<Packet> {
-    let data = std::fs::read(hevc::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
     hevc::picture_packets(&data)
         .iter()
         .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
@@ -97,8 +101,17 @@ fn hevc_packets() -> Vec<Packet> {
 
 /// One packet per AV1 temporal unit in order.
 fn av1_packets() -> Vec<Packet> {
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     av1::tu_packets(&data)
+        .iter()
+        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+        .collect()
+}
+
+/// One packet per VP9 frame in order.
+fn vp9_packets() -> Vec<Packet> {
+    let data = std::fs::read(decode_dir().join("valid_320x240.ivf")).expect("vector readable");
+    vp9::frame_packets(&data)
         .iter()
         .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
         .collect()
@@ -336,6 +349,46 @@ fn av1_byte_parity_sync_vs_overlapped() {
         sync_frames.push(frame);
     }
     let mut overlapped = OverlappedPump::open(Av1Decoder::open(&device));
+    let mut overlapped_frames = Vec::new();
+    send_all(&mut overlapped, &packets, &mut overlapped_frames);
+    drain_all(&mut overlapped, &mut overlapped_frames);
+    check_frames(&sync_frames, PICTURES, "sync");
+    check_frames(&overlapped_frames, PICTURES, "overlapped");
+    for (index, (left, right)) in sync_frames.iter().zip(overlapped_frames.iter()).enumerate() {
+        assert_eq!(
+            left.nv12(),
+            right.nv12(),
+            "frame {index} bytes match across paths"
+        );
+    }
+    println!("parity: {PICTURES} frames, {FRAME_BYTES} bytes each, 0 mismatches");
+}
+
+/// Same VP9 bytes through sync and overlapped decode.
+#[test]
+fn vp9_byte_parity_sync_vs_overlapped() {
+    let _serial = measure();
+    let Some(device) = device_for(Codec::Vp9) else {
+        return;
+    };
+    let packets = vp9_packets();
+    assert_eq!(packets.len(), PICTURES, "vector holds one packet per frame");
+    let mut sync = DecoderPump::open(
+        Vp9Decoder::open(&device),
+        config(32, DropPolicy::DropOldest),
+    );
+    for packet in &packets {
+        sync.try_send(packet.clone()).expect("queue room");
+    }
+    let mut sync_frames = Vec::new();
+    while let Some(frame) = sync.try_receive().expect("poll") {
+        sync_frames.push(frame);
+    }
+    sync.finish().expect("finish drains");
+    while let Some(frame) = sync.receive().expect("drained") {
+        sync_frames.push(frame);
+    }
+    let mut overlapped = OverlappedPump::open(Vp9Decoder::open(&device));
     let mut overlapped_frames = Vec::new();
     send_all(&mut overlapped, &packets, &mut overlapped_frames);
     drain_all(&mut overlapped, &mut overlapped_frames);

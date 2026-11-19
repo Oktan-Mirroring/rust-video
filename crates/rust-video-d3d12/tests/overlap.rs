@@ -5,6 +5,7 @@
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
+#[allow(dead_code)]
 mod av1;
 
 use std::time::Duration;
@@ -21,12 +22,12 @@ use rust_video_caps::delivery::{
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{AnnexB, H264Synth};
+use rust_video_harness::{decode_dir, AnnexB, H264Synth};
 
-/// Pictures in the committed vector.
+/// Pictures in the shared vector.
 const PICTURES: usize = 15;
 
-/// Temporal units in the committed AV1 vector.
+/// Temporal units in the shared AV1 vector.
 const AV1_PACKETS: usize = 16;
 
 /// Warmup pictures ahead of the depth probe.
@@ -62,10 +63,9 @@ fn device() -> Option<D3d12Device> {
     }
 }
 
-/// Committed H.264 vector, one packet per picture in order.
+/// Shared H.264 vector, one packet per picture in order.
 fn h264_packets() -> Vec<Packet> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/valid_320x240.h264");
+    let path = decode_dir().join("valid_320x240.h264");
     let packets: Vec<Packet> = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl)
         .iter()
         .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
@@ -78,10 +78,9 @@ fn h264_packets() -> Vec<Packet> {
     packets
 }
 
-/// Committed HEVC inter vector, one packet per picture in order.
+/// Shared HEVC inter vector, one packet per picture in order.
 fn hevc_packets() -> Vec<Packet> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/inter_320x240.hevc");
+    let path = decode_dir().join("inter_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
     let packets: Vec<Packet> = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
         .iter()
@@ -95,9 +94,9 @@ fn hevc_packets() -> Vec<Packet> {
     packets
 }
 
-/// Committed AV1 vector, one packet per temporal unit in order.
+/// Shared AV1 vector, one packet per temporal unit in order.
 fn av1_packets() -> Vec<Packet> {
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let packets: Vec<Packet> = tu_packets(&data)
         .iter()
         .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))

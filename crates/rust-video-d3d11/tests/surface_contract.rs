@@ -8,6 +8,7 @@
 #[allow(dead_code)]
 mod av1;
 #[path = "../examples/common/hevc.rs"]
+#[allow(dead_code)]
 mod hevc;
 
 use bytes::Bytes;
@@ -17,7 +18,7 @@ use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, GpuSurface, H264Decoder, HevcDecoder,
 };
-use rust_video_harness::{AnnexB, H264Synth, Synth};
+use rust_video_harness::{decode_dir, AnnexB, H264Synth, Synth};
 
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d11Device> {
@@ -40,9 +41,9 @@ fn device_for(codec: Codec) -> Option<D3d11Device> {
     Some(device)
 }
 
-/// Committed H.264 vector path.
+/// Shared H.264 vector path.
 fn h264_vector() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    decode_dir().join("valid_320x240.h264")
 }
 
 /// Contract metadata on a `width` x `height` surface.
@@ -157,7 +158,7 @@ fn hevc_reorder_holds_back_unchanged() {
     let Some(device) = device_for(Codec::Hevc) else {
         return;
     };
-    let data = std::fs::read(hevc::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
     let raws = hevc::picture_packets(&data);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
@@ -182,7 +183,7 @@ fn av1_reorder_holds_back_unchanged() {
     let Some(device) = device_for(Codec::Av1) else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = av1::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
@@ -240,7 +241,7 @@ fn hevc_surfaces_match_frames() {
     let Some(device) = device_for(Codec::Hevc) else {
         return;
     };
-    let data = std::fs::read(hevc::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
     let raws = hevc::picture_packets(&data);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
@@ -269,7 +270,7 @@ fn av1_surfaces_match_frames() {
     let Some(device) = device_for(Codec::Av1) else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = av1::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);

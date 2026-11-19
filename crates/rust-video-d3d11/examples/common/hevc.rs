@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Committed 320x240 HEVC vector path.
 pub fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.hevc")
+    rust_video_harness::decode_dir().join("inter_320x240.hevc")
 }
 
 /// Start code offsets in `data`.

@@ -32,4 +32,4 @@ pub use oracle::Oracle;
 pub use report::{Outcome, Report};
 pub use suite::{Case, Suite};
 pub use synth::Synth;
-pub use vectors::bench_dir;
+pub use vectors::{bench_dir, decode_dir};

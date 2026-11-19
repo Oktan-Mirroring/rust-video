@@ -1,24 +1,32 @@
 //! HEVC end to end on the D3D11 tier: file vector through decode
 //! overlap and reset recovery.
 //!
-//! Vector `tests/vectors/valid_320x240.hevc` holds 15 ffmpeg
+//! Shared vector `inter_320x240.hevc` holds 15 ffmpeg
 //! testsrc2 pictures (320x240, IDR at 0 and CRA at 8 with B
-//! reordering); `examples/common/hevc.rs` loads and splits it.
-//! `tests/vectors/mslice_320x240.hevc` and
-//! `tests/vectors/sl_320x240.hevc` cover multi-slice pictures
-//! and scaling lists through parity.
+//! reordering); `examples/common/hevc.rs` splits it.
+//! `mslice_320x240.hevc` and `sl_320x240.hevc` cover
+//! multi-slice pictures and scaling lists through parity.
 
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/hevc.rs"]
+#[allow(dead_code)]
 mod hevc;
 
-use hevc::{picture_packets, vector};
+use std::path::PathBuf;
+
+use hevc::picture_packets;
 use rust_video_d3d11::{Codec, D3d11Device, HevcDecoder};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
+use rust_video_harness::decode_dir;
+
+/// Shared vector path.
+fn vector() -> PathBuf {
+    decode_dir().join("inter_320x240.hevc")
+}
 
 /// Pictures in the committed vector.
 const PICTURES: usize = 15;
@@ -161,8 +169,7 @@ fn multislice_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/mslice_320x240.hevc");
+    let path = decode_dir().join("mslice_320x240.hevc");
     let data = std::fs::read(&path).expect("vector readable");
     let mut decoder = HevcDecoder::open(&device);
     let packet = Packet::new(Bytes::from(data));
@@ -179,8 +186,7 @@ fn scaling_lists_match_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/sl_320x240.hevc");
+    let path = decode_dir().join("sl_320x240.hevc");
     let data = std::fs::read(&path).expect("vector readable");
     let mut decoder = HevcDecoder::open(&device);
     let packet = Packet::new(Bytes::from(data));

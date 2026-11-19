@@ -11,7 +11,7 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_d3d11::{D3d11Device, H264Decoder};
-use rust_video_harness::{AnnexB, CountingAlloc};
+use rust_video_harness::{decode_dir, AnnexB, CountingAlloc};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -46,8 +46,7 @@ fn seam_box_cost_is_negligible_per_frame() {
             return;
         }
     };
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/valid_320x240.h264");
+    let path = decode_dir().join("valid_320x240.h264");
     let raws = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let packets: Vec<Packet> = raws

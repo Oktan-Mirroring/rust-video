@@ -1,24 +1,32 @@
 //! AV1 end to end on the D3D11 tier: file vector through decode
 //! overlap and reset recovery.
 //!
-//! Vector `tests/vectors/valid_320x240.obu` holds 15 ffmpeg
+//! Shared vector `valid_320x240.obu` holds 15 ffmpeg
 //! testsrc2 frames (320x240, reordered with show-existing
-//! display); `examples/common/av1.rs` loads and splits it.
-//! `tests/vectors/tiled_320x240.obu` and
-//! `tests/vectors/grain_320x240.obu` cover tiled frames and
-//! film grain through parity.
+//! display); `examples/common/av1.rs` splits it.
+//! `tiled_320x240.obu` and `grain_320x240.obu` cover tiled
+//! frames and film grain through parity.
 
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
+#[allow(dead_code)]
 mod av1;
 
-use av1::{split_obus, tu_packets, vector};
+use std::path::PathBuf;
+
+use av1::{split_obus, tu_packets};
 use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
+use rust_video_harness::decode_dir;
+
+/// Shared vector path.
+fn vector() -> PathBuf {
+    decode_dir().join("valid_320x240.obu")
+}
 
 /// Frames in the committed vector.
 const FRAMES: usize = 15;
@@ -171,8 +179,7 @@ fn tiled_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/tiled_320x240.obu");
+    let path = decode_dir().join("tiled_320x240.obu");
     let data = std::fs::read(&path).expect("vector readable");
     let mut decoder = Av1Decoder::open(&device);
     let packet = Packet::new(Bytes::from(data));
@@ -189,8 +196,7 @@ fn film_grain_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/grain_320x240.obu");
+    let path = decode_dir().join("grain_320x240.obu");
     let data = std::fs::read(&path).expect("vector readable");
     let mut decoder = Av1Decoder::open(&device);
     let packet = Packet::new(Bytes::from(data));

@@ -1066,6 +1066,7 @@ mod tests {
     use super::Ingest;
     use super::FH_SEG_UPDATE_DATA;
     use crate::error::{D3d11Error, ParseReason};
+    use rust_video_harness::decode_dir;
 
     /// Bit writer behind synthetic headers.
     struct Writer {
@@ -1525,8 +1526,7 @@ mod tests {
 
     /// IVF payloads of the committed vector in file order.
     fn vector_payloads() -> Vec<Vec<u8>> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/vectors/valid_320x240.ivf");
+        let path = decode_dir().join("valid_320x240.ivf");
         let data = std::fs::read(&path).expect("vector readable");
         assert!(data.len() >= 32 && &data[..4] == b"DKIF", "vector is IVF");
         let head = usize::from(u16::from_le_bytes([data[6], data[7]]).max(32));

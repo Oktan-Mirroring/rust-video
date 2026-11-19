@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// Committed 320x240 AV1 vector path.
 pub fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.obu")
+    rust_video_harness::decode_dir().join("valid_320x240.obu")
 }
 
 /// OBU header with its total length in bytes.

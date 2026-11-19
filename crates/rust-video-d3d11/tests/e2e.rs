@@ -1,7 +1,7 @@
 //! D3D11 end to end: file vectors through decode overlap, GPU
 //! transcode, and reset recovery.
 //!
-//! Vector `tests/vectors/valid_320x240.h264` holds 15 ffmpeg
+//! Shared vector `valid_320x240.h264` holds 15 ffmpeg
 //! testsrc2 pictures (320x240 constrained baseline, IDR at 0 and
 //! 8); harness `AnnexB` splits it per picture.
 
@@ -15,7 +15,7 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::AnnexB;
+use rust_video_harness::{decode_dir, AnnexB};
 
 /// Pictures in the committed vector.
 const PICTURES: usize = 15;
@@ -48,9 +48,9 @@ fn decode_all(decoder: &mut H264Decoder<'_>, raws: &[Vec<u8>]) -> usize {
     total
 }
 
-/// Committed vector path.
+/// Shared vector path.
 fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    decode_dir().join("valid_320x240.h264")
 }
 
 /// Whole-file packet queues submits before the first wait.
@@ -95,6 +95,28 @@ fn steady_state_never_resets() {
     );
     assert_eq!(total, PICTURES, "steady vector yields every picture");
     assert_eq!(decoder.resets(), 0, "steady vector never resets");
+}
+
+/// B-frame pictures decode with no reset.
+#[test]
+fn bframes_decode_never_resets() {
+    let Some(device) = device() else {
+        return;
+    };
+    let raws = AnnexB::picture_packets(
+        &decode_dir().join("bframes_320x240.h264"),
+        AnnexB::is_h264_vcl,
+    );
+    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
+    let mut decoder = H264Decoder::open(&device);
+    let total = decode_all(&mut decoder, &raws);
+    println!(
+        "bframes: {total} frames, resets={} max_inflight={}",
+        decoder.resets(),
+        decoder.max_inflight()
+    );
+    assert_eq!(total, PICTURES, "bframe vector yields every picture");
+    assert_eq!(decoder.resets(), 0, "bframe vector never resets");
 }
 
 /// Skipped picture fails once, then the stream recovers clean.

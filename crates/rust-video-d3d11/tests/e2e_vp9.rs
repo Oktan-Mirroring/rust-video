@@ -1,21 +1,30 @@
 //! VP9 end to end on the D3D11 tier: file vector through decode
 //! overlap and reset recovery.
 //!
-//! Vector `tests/vectors/valid_320x240.ivf` holds 15 ffmpeg
+//! Shared vector `valid_320x240.ivf` holds 15 ffmpeg
 //! testsrc2 frames (320x240, single tile); `examples/common/vp9.rs`
-//! loads and splits it.
+//! splits it.
 
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/vp9.rs"]
+#[allow(dead_code)]
 mod vp9;
 
+use std::path::PathBuf;
+
 use rust_video_d3d11::{Codec, D3d11Device, Vp9Decoder};
-use vp9::{frame_packets, vector};
+use vp9::frame_packets;
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
+use rust_video_harness::decode_dir;
+
+/// Shared vector path.
+fn vector() -> PathBuf {
+    decode_dir().join("valid_320x240.ivf")
+}
 
 /// Frames in the committed vector.
 const FRAMES: usize = 15;

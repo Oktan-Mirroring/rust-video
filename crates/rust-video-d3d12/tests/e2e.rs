@@ -1,20 +1,21 @@
 //! D3D12 end to end: file vectors through decode overlap, GPU
 //! transcode, and reset recovery.
 //!
-//! Vector `tests/vectors/valid_320x240.h264` holds 15 ffmpeg
+//! Shared vector `valid_320x240.h264` holds 15 ffmpeg
 //! testsrc2 pictures (320x240 constrained baseline, IDR at 0 and
-//! 8); harness `AnnexB` splits it per picture. Vector
-//! `tests/vectors/valid_320x240.hevc` holds 15 ffmpeg testsrc2
-//! pictures (320x240 main profile, every picture an IDR). Vector
-//! `tests/vectors/inter_320x240.hevc` holds 15 ffmpeg testsrc2
-//! pictures (320x240 main profile, IDR at 0 and CRA at 8 with B
-//! reordering). Vector `tests/vectors/valid_320x240.obu` holds 15
+//! 8); harness `AnnexB` splits it per picture. Shared vector
+//! `intra_320x240.hevc` holds 15 ffmpeg testsrc2 pictures
+//! (320x240 main profile, every picture an IDR). Shared vector
+//! `inter_320x240.hevc` holds 15 ffmpeg testsrc2 pictures
+//! (320x240 main profile, IDR at 0 and CRA at 8 with B
+//! reordering). Shared vector `valid_320x240.obu` holds 15
 //! ffmpeg testsrc2 frames (320x240, reordered with show-existing
-//! display); `examples/common/av1.rs` loads and splits it.
+//! display); `examples/common/av1.rs` splits it.
 
 #![cfg(target_os = "windows")]
 
 #[path = "../examples/common/av1.rs"]
+#[allow(dead_code)]
 mod av1;
 
 use std::path::PathBuf;
@@ -28,9 +29,9 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{bench_dir, AnnexB};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB};
 
-/// Pictures in the committed vector.
+/// Pictures in the shared vector.
 const PICTURES: usize = 15;
 
 /// Open device, loud skip without hardware.
@@ -61,9 +62,9 @@ fn decode_all(decoder: &mut impl Decoder, raws: &[Vec<u8>]) -> usize {
     total
 }
 
-/// Committed vector path.
+/// Shared vector path.
 fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    decode_dir().join("valid_320x240.h264")
 }
 
 /// Whole-file packet queues submits before the first wait.
@@ -108,6 +109,28 @@ fn steady_state_never_resets() {
     );
     assert_eq!(total, PICTURES, "steady vector yields every picture");
     assert_eq!(decoder.resets(), 0, "steady vector never resets");
+}
+
+/// B-frame pictures decode with no reset.
+#[test]
+fn bframes_decode_never_resets() {
+    let Some(device) = device() else {
+        return;
+    };
+    let raws = AnnexB::picture_packets(
+        &decode_dir().join("bframes_320x240.h264"),
+        AnnexB::is_h264_vcl,
+    );
+    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
+    let mut decoder = H264Decoder::open(&device);
+    let total = decode_all(&mut decoder, &raws);
+    println!(
+        "bframes: {total} frames, resets={} max_inflight={}",
+        decoder.resets(),
+        decoder.max_inflight()
+    );
+    assert_eq!(total, PICTURES, "bframe vector yields every picture");
+    assert_eq!(decoder.resets(), 0, "bframe vector never resets");
 }
 
 /// Skipped picture fails once, then the stream recovers clean.
@@ -177,7 +200,7 @@ fn av1_vector_decodes_on_gpu() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
@@ -197,7 +220,7 @@ fn av1_overlap_queues_before_first_wait() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let raw = std::fs::read(av1::vector()).expect("vector readable");
+    let raw = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let mut decoder = Av1Decoder::open(&device);
     let packet = Packet::new(Bytes::from(raw));
     let mut frames = decoder.decode(&packet).expect("whole-file decode");
@@ -222,7 +245,7 @@ fn av1_reset_after_failure_recovers() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let data = std::fs::read(av1::vector()).expect("vector readable");
+    let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let raws = tu_packets(&data);
     let obus = split_obus(&data);
     let mut decoder = Av1Decoder::open(&device);
@@ -262,7 +285,7 @@ fn av1_hardware_matches_software_oracle() {
     let Some(device) = device_for_av1() else {
         return;
     };
-    let path = av1::vector();
+    let path = decode_dir().join("valid_320x240.obu");
     let data = std::fs::read(&path).expect("vector readable");
     let raws = tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
@@ -325,7 +348,7 @@ fn hevc_hardware_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.hevc");
+    let path = decode_dir().join("intra_320x240.hevc");
     let data = std::fs::read(&path).expect("vector readable");
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
@@ -375,7 +398,7 @@ fn hevc_inter_matches_software_oracle() {
     let Some(device) = device() else {
         return;
     };
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/inter_320x240.hevc");
+    let path = decode_dir().join("inter_320x240.hevc");
     let data = std::fs::read(&path).expect("vector readable");
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
@@ -493,35 +516,33 @@ fn gpu_transcode_hevc_stays_ffmpeg_clean() {
 
 /// HEVC vector bytes grouped into one packet per picture.
 ///
-/// Vector `tests/vectors/valid_320x240.hevc` holds 15 ffmpeg
+/// Shared vector `intra_320x240.hevc` holds 15 ffmpeg
 /// testsrc2 pictures (320x240 main profile, every picture an
 /// IDR), generated by:
 /// `ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=0.5
 /// -c:v libx265 -pix_fmt yuv420p -x265-params
 /// keyint=1:min-keyint=1:repeat-headers=1 -f hevc
-/// valid_320x240.hevc`, then relabeled Main: the x265 output
+/// intra_320x240.hevc`, then relabeled Main: the x265 output
 /// tags 8-bit 4:2:0 as Rext (profile 4), so each VPS patches
 /// body+4 04->01 and body+5 08->60, each SPS body+1 and
 /// body+2 the same, 30 sites asserted. An unpatched regen
 /// fails loud with profile outside main.
 fn picture_packets_hevc() -> Vec<Vec<u8>> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/valid_320x240.hevc");
+    let path = decode_dir().join("intra_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
     AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
 }
 
 /// HEVC inter vector bytes grouped into one packet per picture.
 ///
-/// Vector `tests/vectors/inter_320x240.hevc` holds 15 ffmpeg
+/// Shared vector `inter_320x240.hevc` holds 15 ffmpeg
 /// testsrc2 pictures (320x240 main profile, IDR at 0 and CRA at
 /// 8 with B reordering), generated by:
 /// `ffmpeg -f lavfi -i testsrc2=size=320x240:rate=30:duration=0.5
 /// -c:v libx265 -pix_fmt yuv420p -g 8 -x265-params
 /// repeat-headers=1 -f hevc inter_320x240.hevc`.
 fn inter_packets_hevc() -> Vec<Vec<u8>> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/vectors/inter_320x240.hevc");
+    let path = decode_dir().join("inter_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
     AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
 }

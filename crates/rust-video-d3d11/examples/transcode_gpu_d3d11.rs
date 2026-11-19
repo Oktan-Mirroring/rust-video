@@ -127,7 +127,7 @@ fn bytes_of(outcome: &Outcome) -> usize {
 /// Committed vector path.
 #[cfg(target_os = "windows")]
 fn vector() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/valid_320x240.h264")
+    rust_video_harness::decode_dir().join("valid_320x240.h264")
 }
 
 #[cfg(not(target_os = "windows"))]
