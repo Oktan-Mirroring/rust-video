@@ -153,7 +153,7 @@ impl Nv12Layout {
         staged: &[u8],
         width: u32,
         height: u32,
-        crop: Option<crate::h264::Crop>,
+        crop: Option<crate::h264::frontend::Crop>,
     ) -> Result<Vec<u8>, D3d12Error> {
         let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
         let y_len = usize::try_from(u64::from(visible_width) * u64::from(visible_height))
@@ -223,7 +223,11 @@ impl Nv12Layout {
 }
 
 /// Visible rectangle in luma samples under `crop`.
-fn visible_rect(width: u32, height: u32, crop: Option<crate::h264::Crop>) -> (u32, u32, u32, u32) {
+fn visible_rect(
+    width: u32,
+    height: u32,
+    crop: Option<crate::h264::frontend::Crop>,
+) -> (u32, u32, u32, u32) {
     crop.map_or((0, 0, width, height), |crop| {
         (
             crop.left,
@@ -980,7 +984,7 @@ mod tests {
         let staged = vec![
             1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0, 9, 10, 11, 12, 0, 0, 0, 0,
         ];
-        let crop = crate::h264::Crop {
+        let crop = crate::h264::frontend::Crop {
             left: 2,
             right: 0,
             top: 0,

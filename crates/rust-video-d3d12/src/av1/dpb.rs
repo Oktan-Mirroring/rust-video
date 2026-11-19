@@ -4,13 +4,11 @@
 
 use std::sync::Arc;
 
-use crate::av1::{
+use super::frontend::{
     Frame, FrameHeader, FrameType, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES, REFS_PER_FRAME,
     SEG_LEVELS,
 };
-use crate::decode::Av1Submission;
-use crate::dpb::Output;
-use crate::dxva::{
+use super::params::{
     PicEntryAv1, PicParamsAv1, TileAv1, AV1_CDEF_BITS_SHIFT, AV1_CDEF_DAMPING_SHIFT,
     AV1_CDEF_SECONDARY_SHIFT, AV1_CODING_CDEF, AV1_CODING_DUAL_FILTER, AV1_CODING_FILM_GRAIN,
     AV1_CODING_FILTER_INTRA, AV1_CODING_HIGH_PRECISION_MV, AV1_CODING_INTEGER_MV,
@@ -28,6 +26,8 @@ use crate::dxva::{
     AV1_MOTION_INVALID, AV1_MOTION_TYPE_SHIFT, AV1_Q_DELTA_PRESENT, AV1_Q_DELTA_RES_SHIFT,
     AV1_SEG_ENABLED, AV1_SEG_TEMPORAL_UPDATE, AV1_SEG_UPDATE_DATA, AV1_SEG_UPDATE_MAP,
 };
+use super::picture::Av1Submission;
+use crate::decode::Output;
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason};
 use crate::pins::SlotPins;
 
@@ -553,11 +553,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::Av1Dpb;
-    use crate::av1::{
+    use crate::av1::frontend::{
         FilmGrain, Frame, FrameHeader, FrameType, GlobalMotion, SequenceHeader, TileData,
         FH_SHOW_FRAME, SEQ_CDEF, SEQ_ORDER_HINT, SEQ_SUBSAMPLING_X, SEQ_SUBSAMPLING_Y,
     };
-    use crate::dpb::Output;
+    use crate::decode::Output;
 
     /// Empty pin table behind buffer tests.
     fn pins() -> Arc<crate::pins::SlotPins> {
@@ -648,7 +648,7 @@ mod tests {
             frame_to_show_map_idx: slot,
             ..FrameHeader::default()
         };
-        header.flags |= crate::av1::FH_SHOW_EXISTING;
+        header.flags |= crate::av1::frontend::FH_SHOW_EXISTING;
         Frame {
             header,
             tiles: Vec::new(),
@@ -777,7 +777,7 @@ mod tests {
     fn film_grain_fill_copies_points() {
         let mut dpb = Av1Dpb::new(pins());
         let mut grain = FilmGrain {
-            flags: crate::av1::FG_APPLY | crate::av1::FG_OVERLAP,
+            flags: crate::av1::frontend::FG_APPLY | crate::av1::frontend::FG_OVERLAP,
             grain_seed: 42,
             num_y_points: 1,
             num_cb_points: 1,

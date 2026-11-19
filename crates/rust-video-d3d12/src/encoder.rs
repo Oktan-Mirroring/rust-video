@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(caps.share().is_some(), caps.encode_import());
         assert!(!caps.decode_export());
         assert!(caps.encode_import());
-        let mut decoder = crate::decoder_os::H264Decoder::open(&device);
+        let mut decoder = crate::h264::decoder::H264Decoder::open(&device);
         let mut surfaces = Vec::new();
         for raw in H264Synth::annex_b_h264_packets() {
             let packet = Packet::new(Bytes::from(raw));

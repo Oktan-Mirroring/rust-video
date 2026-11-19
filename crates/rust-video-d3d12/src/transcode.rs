@@ -1,10 +1,11 @@
 //! GPU transcode: decode texture to encoder texture without readback.
 
-use crate::decoder_os::{H264Decoder, HevcDecoder};
 use crate::device::D3d12Device;
 use crate::encoder::D3d12Encoder;
 use crate::error::{D3d12Error, UnsupportedReason};
 use crate::guid::Codec;
+use crate::h264::decoder::H264Decoder;
+use crate::h265::decoder::HevcDecoder;
 use crate::scale::Scaler;
 use crate::texture::GpuSurface;
 
@@ -254,7 +255,7 @@ mod tests {
     ) -> Option<super::Transcoder<'_>> {
         let encoder = crate::encoder::D3d12Encoder::open(device, crate::guid::Codec::H264).ok()?;
         Some(super::Transcoder {
-            source: super::Source::H264(Box::new(crate::decoder_os::H264Decoder::open(device))),
+            source: super::Source::H264(Box::new(crate::h264::decoder::H264Decoder::open(device))),
             encoder,
             caps,
             scale: Scale::passthrough(),

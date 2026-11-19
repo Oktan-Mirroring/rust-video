@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::decode::{start_coded_bitstream, HevcSubmission};
-use crate::dpb::{outputs_sorted, slot_u8, Output};
-use crate::dxva::{
+use super::frontend::{Picture, Pps, ShortTermRps, Sps};
+use super::params::{
     PicEntryHevc, PicParamsHevc, QmatrixHevc, SliceShortHevc, HEVC_CHROMA_420, HEVC_IDR_PIC,
     HEVC_INTRA_PIC, HEVC_IRAP_PIC, HEVC_POC_LSB_SHIFT, HEVC_PROP_CHROMA_QP_OFFSETS,
     HEVC_PROP_CONSTRAINED_INTRA, HEVC_PROP_CU_QP_DELTA, HEVC_PROP_DEBLOCK_DISABLED,
@@ -15,8 +14,9 @@ use crate::dxva::{
     HEVC_TOOL_EXTRA_BITS_SHIFT, HEVC_TOOL_OUTPUT_FLAG, HEVC_TOOL_SAO, HEVC_TOOL_SIGN_HIDING,
     HEVC_TOOL_STRONG_INTRA, HEVC_TOOL_TEMPORAL_MVP,
 };
+use super::picture::HevcSubmission;
+use crate::decode::{outputs_sorted, slot_u8, start_coded_bitstream, Output};
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
-use crate::hevc::{Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
@@ -624,12 +624,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::HevcDpb;
-    use crate::dpb::Output;
-    use crate::dxva::{HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC};
-    use crate::hevc::{
+    use crate::decode::Output;
+    use crate::h265::frontend::{
         ConstraintFlags, PendingSlice, Picture, Pps, ProfileTierLevel, RpsBits, ScalingLists,
         ShortTermRps, SliceHeader, SliceType, SourceFlags, Sps, SPS_SAO, SPS_TEMPORAL_MVP,
     };
+    use crate::h265::params::{HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC};
     use crate::pins::SlotPins;
 
     /// Sequence set with POC width 16 and reorder depth two.

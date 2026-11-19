@@ -5,15 +5,16 @@
 
 use std::sync::Arc;
 
-use crate::decode::H264Submission;
-use crate::dxva::{
+use super::frontend::{Marking, Mmco, Picture, PocType, Pps, SlicePoc, Sps};
+use super::params::{
     PicEntryH264, PicParamsH264, QmatrixH264, SliceShortH264, BITS_CHROMA_420,
     BITS_CONSTRAINED_INTRA, BITS_FRAME_MBS_ONLY, BITS_INTRA_PIC, BITS_MBS_CONSECUTIVE,
     BITS_MIN_LUMA_BIPRED_8X8, BITS_REF_PIC, BITS_TRANSFORM_8X8, BITS_WEIGHTED_BIPRED_SHIFT,
     BITS_WEIGHTED_PRED,
 };
+use super::picture::H264Submission;
+use crate::decode::{outputs_sorted, slot_u8, Output};
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
-use crate::h264::{Marking, Mmco, Picture, PocType, Pps, SlicePoc, Sps};
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
@@ -683,39 +684,6 @@ fn index_u8(index: u32) -> Result<u8, D3d12Error> {
     })
 }
 
-/// Slot number as a byte.
-pub(crate) fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
-    u8::try_from(slot).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "slot" }))
-}
-
-/// Outputs for `emits` in display order.
-pub(crate) fn outputs_sorted(mut emits: Vec<(i32, usize)>) -> Vec<Output> {
-    emits.sort_unstable();
-    emits
-        .into_iter()
-        .filter_map(|(_, slot)| slot_u8(slot).ok().map(|slot| Output { slot }))
-        .collect()
-}
-
-/// Picture ready for display from `slot`.
-#[derive(Debug)]
-pub(crate) struct Output {
-    /// Output surface slot.
-    slot: u8,
-}
-
-impl Output {
-    /// Output naming `slot`.
-    pub(crate) const fn from_slot(slot: u8) -> Self {
-        Self { slot }
-    }
-
-    /// Output surface slot.
-    pub(crate) const fn slot(&self) -> u8 {
-        self.slot
-    }
-}
-
 /// Submission plus display-order outputs.
 #[derive(Debug)]
 pub(crate) struct Decoded {
@@ -727,14 +695,15 @@ pub(crate) struct Decoded {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dpb, Output};
-    use crate::dxva::{
-        BITS_CHROMA_420, BITS_FRAME_MBS_ONLY, BITS_MBS_CONSECUTIVE, BITS_MIN_LUMA_BIPRED_8X8,
-        BITS_REF_PIC,
-    };
-    use crate::h264::{
+    use super::Dpb;
+    use crate::decode::Output;
+    use crate::h264::frontend::{
         FidelityRange, Marking, Mmco, PendingSlice, Picture, PocType, Pps, ScalingSets,
         SliceHeader, SlicePoc, SliceType, Sps, VuiParams, Weights, PPS_DEBLOCKING,
+    };
+    use crate::h264::params::{
+        BITS_CHROMA_420, BITS_FRAME_MBS_ONLY, BITS_MBS_CONSECUTIVE, BITS_MIN_LUMA_BIPRED_8X8,
+        BITS_REF_PIC,
     };
 
     /// Sequence set with type 0 POC and four references.

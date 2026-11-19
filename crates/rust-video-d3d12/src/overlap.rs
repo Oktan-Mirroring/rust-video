@@ -5,22 +5,24 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::av1::{Frame as Av1Frame, Ingest as Av1Ingest};
-use crate::av1_dpb::Av1Dpb;
-use crate::decode::{Av1Submission, DecodeQueues, DecodeSession, H264Submission, HevcSubmission};
+use crate::av1::decoder::{frame_active_av1, open_sequence_av1, submit_av1_dpb};
+use crate::av1::dpb::Av1Dpb;
+use crate::av1::frontend::{Frame as Av1Frame, Ingest as Av1Ingest};
+use crate::av1::picture::Av1Submission;
+use crate::decode::{DecodeQueues, DecodeSession, Output};
 use crate::decoder::D3d12Frame;
-use crate::decoder_os::{
-    emit_frame, frame_active_av1, open_sequence, open_sequence_av1, open_sequence_hevc,
-    sequence_of, sequence_of_hevc, submit_av1_dpb, submit_dpb, submit_hevc_dpb, visible_nv12,
-    Active,
-};
+use crate::decoder_os::{emit_frame, visible_nv12, Active};
 use crate::device::D3d12Device;
-use crate::dpb::{Dpb, Output};
 use crate::error::{D3d12Error, SkipReason};
 use crate::guid::Codec;
-use crate::h264::{Ingest, Picture};
-use crate::hevc::{Ingest as HevcIngest, Picture as HevcPicture};
-use crate::hevc_dpb::HevcDpb;
+use crate::h264::decoder::{open_sequence, sequence_of, submit_dpb};
+use crate::h264::dpb::Dpb;
+use crate::h264::frontend::{Ingest, Picture};
+use crate::h264::picture::H264Submission;
+use crate::h265::decoder::{open_sequence_hevc, sequence_of_hevc, submit_hevc_dpb};
+use crate::h265::dpb::HevcDpb;
+use crate::h265::frontend::{Ingest as HevcIngest, Picture as HevcPicture};
+use crate::h265::picture::HevcSubmission;
 use crate::pins::{SlotPin, SlotPins};
 use crate::readback::{Done, Readback};
 use crate::submit::Ticket;

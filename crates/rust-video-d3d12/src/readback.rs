@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::error::D3d12Error;
-use crate::h264::Crop;
+use crate::h264::frontend::Crop;
 use crate::submit::Nv12Layout;
 
 /// Queued copies before a launch waits.

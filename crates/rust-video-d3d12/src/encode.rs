@@ -134,7 +134,7 @@ fn pad_grid(visible: u32) -> Result<u32, D3d12Error> {
 fn pad_crop(
     coded: (u32, u32),
     visible: (u32, u32),
-) -> Result<Option<crate::h264::Crop>, D3d12Error> {
+) -> Result<Option<crate::h264::frontend::Crop>, D3d12Error> {
     let right = coded.0.saturating_sub(visible.0);
     let bottom = coded.1.saturating_sub(visible.1);
     if right == 0 && bottom == 0 {
@@ -143,7 +143,7 @@ fn pad_crop(
     if !right.is_multiple_of(2) || !bottom.is_multiple_of(2) {
         return Err(D3d12Error::Unsupported(UnsupportedReason::OddVisibleExtent));
     }
-    Ok(Some(crate::h264::Crop {
+    Ok(Some(crate::h264::frontend::Crop {
         left: 0,
         right,
         top: 0,
@@ -224,7 +224,7 @@ fn sps_body(
     width_mbs_minus1: u32,
     height_mbs_minus1: u32,
     level_idc: u8,
-    crop: Option<crate::h264::Crop>,
+    crop: Option<crate::h264::frontend::Crop>,
 ) -> Vec<u8> {
     let mut writer = BitWriter::new();
     writer.bits(u32::from(PROFILE_IDC), 8);
@@ -354,7 +354,7 @@ fn hevc_sps_body(
     width: u32,
     height: u32,
     level_idc: u8,
-    crop: Option<crate::h264::Crop>,
+    crop: Option<crate::h264::frontend::Crop>,
 ) -> Vec<u8> {
     let mut writer = BitWriter::new();
     writer.bits(0, 4);
@@ -1847,8 +1847,8 @@ impl EncodeSession {
 mod tests {
     use super::{pad_nv12, H264Headers, HevcHeaders};
 
-    use crate::h264::{parse_pps, parse_sps, rbsp, split_nals};
-    use crate::hevc;
+    use crate::h264::frontend::{parse_pps, parse_sps, rbsp, split_nals};
+    use crate::h265::frontend as hevc;
 
     #[test]
     fn headers_round_trip_through_parser() {

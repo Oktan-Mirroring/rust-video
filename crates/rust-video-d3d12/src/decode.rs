@@ -12,12 +12,12 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::time::Duration;
 
-use crate::dxva::{
-    PicParamsAv1, PicParamsH264, PicParamsHevc, QmatrixH264, QmatrixHevc, SliceShortH264,
-    SliceShortHevc, TileAv1,
-};
-use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
-use crate::h264::Crop;
+use crate::av1::params::{PicParamsAv1, TileAv1};
+use crate::av1::picture::Av1Submission;
+use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
+use crate::h264::frontend::Crop;
+use crate::h264::picture::H264Submission;
+use crate::h265::picture::HevcSubmission;
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 use crate::texture::SurfaceWait;
 
@@ -51,21 +51,6 @@ const BITSTREAM_SLOTS: usize = 4;
 
 /// Output texture pool behind the DPB slots.
 const POOL: usize = 16;
-
-/// H.264 picture arguments for one `DecodeFrame` call.
-#[derive(Debug)]
-pub(crate) struct H264Submission {
-    /// Picture parameters.
-    pub(crate) params: PicParamsH264,
-    /// Inverse quantization matrices.
-    pub(crate) qmatrix: QmatrixH264,
-    /// Slice control entries.
-    pub(crate) slices: Vec<SliceShortH264>,
-    /// Start-coded slices padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output texture slot.
-    pub(crate) slot: u8,
-}
 
 /// Span table plus the padded bitstream over NAL units.
 type CodedBitstream = (Vec<(u32, u32)>, Vec<u8>);
@@ -112,34 +97,6 @@ pub(crate) fn start_coded_bitstream(nals: &[&[u8]]) -> Result<CodedBitstream, D3
     Ok((spans, bitstream))
 }
 
-/// H.265 picture arguments for one `DecodeFrame` call.
-#[derive(Debug)]
-pub(crate) struct HevcSubmission {
-    /// Picture parameters.
-    pub(crate) params: PicParamsHevc,
-    /// Inverse quantization matrices.
-    pub(crate) qmatrix: QmatrixHevc,
-    /// Slice control entries.
-    pub(crate) slices: Vec<SliceShortHevc>,
-    /// Start-coded slices padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output texture slot.
-    pub(crate) slot: u8,
-}
-
-/// AV1 picture arguments for one `DecodeFrame` call.
-#[derive(Debug)]
-pub(crate) struct Av1Submission {
-    /// Picture parameters.
-    pub(crate) params: PicParamsAv1,
-    /// Tile control entries.
-    pub(crate) tiles: Vec<TileAv1>,
-    /// Concatenated tile payloads padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output texture slot.
-    pub(crate) slot: u8,
-}
-
 /// Pool texture tables behind one decode call.
 struct RefTables {
     /// Pool textures in slot order.
@@ -149,7 +106,7 @@ struct RefTables {
 }
 
 /// Picture arguments behind one `DecodeFrame` call.
-trait Submission {
+pub(crate) trait Submission {
     /// Picture parameters type.
     type Params;
     /// Inverse quantization matrix type.
@@ -166,47 +123,36 @@ trait Submission {
     fn bitstream_len(&self) -> usize;
 }
 
-impl Submission for H264Submission {
-    type Params = PicParamsH264;
-    type Matrix = QmatrixH264;
-    type Slice = SliceShortH264;
-
-    fn params(&self) -> &Self::Params {
-        &self.params
-    }
-
-    fn matrix(&self) -> &Self::Matrix {
-        &self.qmatrix
-    }
-
-    fn slices(&self) -> &[Self::Slice] {
-        &self.slices
-    }
-
-    fn bitstream_len(&self) -> usize {
-        self.bitstream.len()
-    }
+/// Slot number as a byte.
+pub(crate) fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
+    u8::try_from(slot).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "slot" }))
 }
 
-impl Submission for HevcSubmission {
-    type Params = PicParamsHevc;
-    type Matrix = QmatrixHevc;
-    type Slice = SliceShortHevc;
+/// Outputs for `emits` in display order.
+pub(crate) fn outputs_sorted(mut emits: Vec<(i32, usize)>) -> Vec<Output> {
+    emits.sort_unstable();
+    emits
+        .into_iter()
+        .filter_map(|(_, slot)| slot_u8(slot).ok().map(|slot| Output { slot }))
+        .collect()
+}
 
-    fn params(&self) -> &Self::Params {
-        &self.params
+/// Picture ready for display from `slot`.
+#[derive(Debug)]
+pub(crate) struct Output {
+    /// Output surface slot.
+    pub(crate) slot: u8,
+}
+
+impl Output {
+    /// Output naming `slot`.
+    pub(crate) const fn from_slot(slot: u8) -> Self {
+        Self { slot }
     }
 
-    fn matrix(&self) -> &Self::Matrix {
-        &self.qmatrix
-    }
-
-    fn slices(&self) -> &[Self::Slice] {
-        &self.slices
-    }
-
-    fn bitstream_len(&self) -> usize {
-        self.bitstream.len()
+    /// Output surface slot.
+    pub(crate) const fn slot(&self) -> u8 {
+        self.slot
     }
 }
 
@@ -1250,8 +1196,8 @@ impl DecodeSession {
 
 #[cfg(test)]
 mod tests {
-    use crate::h264::Crop;
-    use crate::h264::{parse_pps, parse_sps, Ingest};
+    use crate::h264::frontend::Crop;
+    use crate::h264::frontend::{parse_pps, parse_sps, Ingest};
 
     use rust_video_harness::Bits;
 
@@ -1405,7 +1351,7 @@ mod tests {
     }
 
     /// Ingested pictures from one packet.
-    fn ingest(data: &[u8]) -> Vec<crate::h264::Picture> {
+    fn ingest(data: &[u8]) -> Vec<crate::h264::frontend::Picture> {
         let mut ingest = Ingest::new();
         ingest.ingest_packet(data).expect("ingest")
     }
@@ -1424,9 +1370,14 @@ mod tests {
         ]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
+        let sps =
+            parse_sps(&crate::h264::frontend::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(
+            &crate::h264::frontend::rbsp(&nal(8, 3, &pps_body()))[1..],
+            &sps,
+        )
+        .expect("pps");
+        let mut dpb = crate::h264::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         assert!(decoded.outputs.is_empty());
         assert_eq!(decoded.submission.slot, 0);
@@ -1451,8 +1402,8 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::frontend::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::frontend::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert_eq!(pps.pic_init_qp, -3);
         let picture = &pictures[0];
@@ -1463,7 +1414,7 @@ mod tests {
         assert_eq!(header.first_mb, 0);
         assert!(header.slice_type.is_intra());
         assert_eq!(header.qp_delta, -11);
-        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
+        let mut dpb = crate::h264::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(picture, &sps, &pps).expect("submission");
         let params = &decoded.submission.params;
         assert_eq!(params.frame_width_in_mbs_minus1, 19);
@@ -1496,14 +1447,14 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::frontend::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::frontend::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert!(pps.transform_8x8());
         assert!(!pps.entropy());
         assert_eq!(pps.pic_init_qp, -3);
         assert_eq!(pps.second_chroma_qp, 0);
-        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
+        let mut dpb = crate::h264::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         let params = &decoded.submission.params;
         assert_eq!(params.bit_fields, 0xBD50);
@@ -1539,9 +1490,14 @@ mod tests {
         let mut live = Ingest::new();
         let idr = live.ingest_packet(&idr).expect("idr");
         assert_eq!(idr.len(), 1);
-        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
-        let mut dpb = crate::dpb::Dpb::new(&sps, pins());
+        let sps =
+            parse_sps(&crate::h264::frontend::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(
+            &crate::h264::frontend::rbsp(&nal(8, 3, &pps_body()))[1..],
+            &sps,
+        )
+        .expect("pps");
+        let mut dpb = crate::h264::dpb::Dpb::new(&sps, pins());
         dpb.decode(&idr[0], &sps, &pps).expect("idr");
         let pictures = live.ingest_packet(&next).expect("p");
         assert_eq!(pictures.len(), 1);
