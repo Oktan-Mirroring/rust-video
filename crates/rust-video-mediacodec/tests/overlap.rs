@@ -13,7 +13,6 @@ use rust_video_caps::traits::Decoder;
 use rust_video_harness::{AnnexB, Drive, H264Synth};
 use rust_video_mediacodec::{
     FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, PipelineLedger,
-    SubmitOutcome,
 };
 
 /// True when the device gate env requests on-device cases.
@@ -134,15 +133,11 @@ fn pipelined_bytes(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize,
     let mut bytes = Vec::new();
     let mut count = 0;
     for packet in coded {
-        loop {
-            let (outcome, surfaces) = decoder.submit_nowait(packet).expect("queue attempt");
-            count += surfaces.len();
-            push_bytes(&mut bytes, &surfaces);
-            if outcome == SubmitOutcome::Queued {
-                break;
-            }
-            count += drain_bytes(decoder, &mut bytes);
-        }
+        let surfaces = decoder
+            .submit_wait(packet)
+            .expect("queue within drain budget");
+        count += surfaces.len();
+        push_bytes(&mut bytes, &surfaces);
     }
     count += drain_bytes(decoder, &mut bytes);
     let tail = decoder.flush().expect("pipelined drain");

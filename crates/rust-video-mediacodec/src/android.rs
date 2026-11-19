@@ -663,6 +663,29 @@ impl MediaCodecDecoder {
         self.submit_packet_nowait(packet)
     }
 
+    /// One packet queued, draining between starved attempts; bounded.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, when live surfaces hold
+    /// every slot (`NoFreeSlot`), or when `packet` still starves after
+    /// the drain budget (`QueueStalled`).
+    ///
+    /// # Returns
+    ///
+    /// Surfaces freed along the way; `packet` queued on `Ok`.
+    pub fn submit_wait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.submit_packet_wait(packet)
+    }
+
     /// Surfaces decoded so far, draining every available output.
     ///
     /// # Errors

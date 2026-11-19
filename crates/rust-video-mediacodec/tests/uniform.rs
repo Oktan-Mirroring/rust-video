@@ -13,9 +13,7 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, decode_dir, AnnexB, Drive, Ivf};
-use rust_video_mediacodec::{
-    FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, SubmitOutcome,
-};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface};
 
 /// Pictures in each shared vector.
 const PICTURES: usize = 15;
@@ -153,15 +151,11 @@ fn pipelined_run(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, V
     let mut bytes = Vec::new();
     let mut count = 0;
     for packet in coded {
-        loop {
-            let (outcome, surfaces) = decoder.submit_nowait(packet).expect("queue attempt");
-            count += surfaces.len();
-            push_bytes(&mut bytes, &surfaces);
-            if outcome == SubmitOutcome::Queued {
-                break;
-            }
-            count += drain_bytes(decoder, &mut bytes);
-        }
+        let surfaces = decoder
+            .submit_wait(packet)
+            .expect("queue within drain budget");
+        count += surfaces.len();
+        push_bytes(&mut bytes, &surfaces);
     }
     count += drain_bytes(decoder, &mut bytes);
     let tail = decoder.flush().expect("pipelined drain");

@@ -91,6 +91,14 @@ pub enum MediaCodecError {
     /// No input buffer inside the queue budget.
     #[error("no input buffer inside the queue budget")]
     InputStarved,
+    /// No queue inside the drain budget.
+    #[error("still starved after {attempts} drain attempts ({in_flight} in flight)")]
+    QueueStalled {
+        /// Starved attempts before the stall.
+        attempts: u32,
+        /// Inputs awaiting outputs at the stall.
+        in_flight: usize,
+    },
     /// Packet overflows its input buffer.
     #[error("packet of {len} bytes exceeds input capacity {capacity}")]
     InputTooLarge {
@@ -225,6 +233,14 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "frame of 2000 bytes exceeds input capacity 512"
+        );
+        let error = MediaCodecError::QueueStalled {
+            attempts: 200,
+            in_flight: 4,
+        };
+        assert_eq!(
+            error.to_string(),
+            "still starved after 200 drain attempts (4 in flight)"
         );
     }
 

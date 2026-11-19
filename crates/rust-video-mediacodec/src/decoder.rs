@@ -1,6 +1,6 @@
 //! Byte-buffer decode behind the caps `Decoder` trait.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
@@ -138,6 +138,19 @@ pub struct MediaCodecDecoder {
 // Constructors and directors run only behind the Android module.
 #[allow(dead_code)]
 impl MediaCodecDecoder {
+    /// Starved retries per packet before `QueueStalled`.
+    ///
+    /// 200 retries over 10ms backoffs bound one packet near 2s; a
+    /// 60fps codec frees an input within a few frame times, while a
+    /// wedged codec fails here instead of spinning the drain forever.
+    const WAIT_ATTEMPTS: u32 = 200;
+
+    /// Sleep after a starved retry whose drain freed nothing.
+    ///
+    /// Matches the 10ms blocking-dequeue quantum; retries that free
+    /// outputs skip the sleep and requeue at full speed.
+    const WAIT_BACKOFF: Duration = Duration::from_millis(10);
+
     /// Decoder in `state` with `output` layout, `slots` pool, and `backend` session.
     pub(crate) fn from_backend(
         state: DecodeState,
@@ -239,6 +252,45 @@ impl MediaCodecDecoder {
                 .note_submitted(pts, PipelineLedger::elapsed_us(start));
         }
         Ok((outcome, self.surfaces(items)?))
+    }
+
+    /// Surfaces freed while queueing `packet`, draining between starved attempts.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, when live surfaces hold
+    /// every slot (`NoFreeSlot`), or when `packet` still starves after
+    /// the drain budget (`QueueStalled`).
+    ///
+    /// # Returns
+    ///
+    /// Surfaces freed along the way; `packet` queued on `Ok`.
+    pub(crate) fn submit_packet_wait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        let mut surfaces = Vec::new();
+        for _ in 0..Self::WAIT_ATTEMPTS {
+            let (outcome, freed) = self.submit_packet_nowait(packet)?;
+            surfaces.extend(freed);
+            if outcome == SubmitOutcome::Queued {
+                return Ok(surfaces);
+            }
+            let drained = self.poll_surfaces()?;
+            if drained.is_empty() {
+                std::thread::sleep(Self::WAIT_BACKOFF);
+            }
+            surfaces.extend(drained);
+        }
+        Err(MediaCodecError::QueueStalled {
+            attempts: Self::WAIT_ATTEMPTS,
+            in_flight: self.ledger.in_flight(),
+        })
     }
 
     /// Surfaces decoded so far, draining every available output.
@@ -980,20 +1032,40 @@ mod tests {
         ));
         let mut pipe_surfaces = Vec::new();
         for packet in &packets {
-            loop {
-                let (outcome, surfaces) = pipelined.submit_packet_nowait(packet).expect("queue");
-                pipe_surfaces.extend(surfaces);
-                if outcome == SubmitOutcome::Queued {
-                    break;
-                }
-                pipe_surfaces.extend(drain_all(&mut pipelined));
-            }
+            pipe_surfaces.extend(pipelined.submit_packet_wait(packet).expect("queue"));
         }
         pipe_surfaces.extend(drain_all(&mut pipelined));
 
         assert_eq!(pipe_surfaces.len(), sync_surfaces.len());
         assert_eq!(surface_bytes(&pipe_surfaces), surface_bytes(&sync_surfaces));
         assert!(pipelined.ledger().overlap_observed());
+    }
+
+    #[test]
+    fn wait_fails_stalled_past_the_drain_budget() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 0, Duration::ZERO));
+        let packets = script_packets(1);
+        let start = Instant::now();
+        assert!(matches!(
+            decoder.submit_packet_wait(&packets[0]),
+            Err(MediaCodecError::QueueStalled { attempts, in_flight })
+                if attempts == MediaCodecDecoder::WAIT_ATTEMPTS && in_flight == 0
+        ));
+        let floor = MediaCodecDecoder::WAIT_BACKOFF * MediaCodecDecoder::WAIT_ATTEMPTS / 2;
+        assert!(start.elapsed() >= floor, "empty drains back off");
+        let attempts = usize::try_from(MediaCodecDecoder::WAIT_ATTEMPTS).expect("small budget");
+        let log = log.borrow();
+        assert_eq!(
+            log.iter()
+                .filter(|call| **call == Call::SubmitNowait)
+                .count(),
+            attempts
+        );
+        assert_eq!(
+            log.iter().filter(|call| **call == Call::Read).count(),
+            attempts
+        );
     }
 
     #[test]
