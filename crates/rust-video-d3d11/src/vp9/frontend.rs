@@ -1,6 +1,6 @@
 //! VP9 ingest over the shared grammar, mapped onto tier errors.
 //!
-//! Grammar in `rust-video-vp9`; submit builders in `vp9_dpb`.
+//! Grammar in `rust-video-vp9`; submit builders in `dpb`.
 
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 
@@ -132,7 +132,7 @@ mod tests {
         let bytes = tiled_4096x16();
         let frames = Ingest::new().ingest_packet(&bytes).expect("tiled");
         assert_eq!(frames.len(), 1);
-        let mut dpb = crate::vp9_dpb::Vp9Dpb::new();
+        let mut dpb = crate::vp9::dpb::Vp9Dpb::new();
         let decoded = dpb.decode(&frames[0]).expect("dpb accepts key");
         let submission = decoded.submission.expect("submission");
         assert_eq!(submission.slices.len(), frames[0].tiles.len());

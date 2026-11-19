@@ -6,8 +6,6 @@
 #[cfg(target_os = "windows")]
 mod av1;
 #[cfg(target_os = "windows")]
-mod av1_dpb;
-#[cfg(target_os = "windows")]
 mod decoder;
 #[cfg(target_os = "windows")]
 mod device;
@@ -27,8 +25,6 @@ mod h264;
 #[cfg(target_os = "windows")]
 mod h265;
 #[cfg(target_os = "windows")]
-mod hevc_dpb;
-#[cfg(target_os = "windows")]
 mod mf;
 #[cfg(target_os = "windows")]
 mod overlap;
@@ -47,8 +43,6 @@ mod submit;
 mod transcode;
 #[cfg(target_os = "windows")]
 mod vp9;
-#[cfg(target_os = "windows")]
-mod vp9_dpb;
 
 #[cfg(target_os = "windows")]
 pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder, Vp9Decoder};

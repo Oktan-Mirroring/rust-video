@@ -20,17 +20,17 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC}
 use windows::Win32::Graphics::Dxgi::IDXGIResource;
 use windows::Win32::Media::DirectShow::DXVA_NoEncrypt;
 
-use crate::av1_dpb::SubmittedAv1;
+use crate::av1::SubmittedAv1;
 use crate::device::D3d11Device;
-use crate::dpb::SubmittedPicture;
 use crate::error::{BrokenReferenceReason, D3d11Error, SkipReason, UnsupportedReason};
 use crate::frame::FrameExport;
 use crate::guid::Codec;
 use crate::h264::Crop;
-use crate::hevc_dpb::SubmittedHevc;
+use crate::h264::SubmittedPicture;
+use crate::h265::SubmittedHevc;
 use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock, SurfaceFence};
-use crate::vp9_dpb::SubmittedVp9;
+use crate::vp9::SubmittedVp9;
 
 use bytes::Bytes;
 use rust_video_caps::frame::GpuExport;
