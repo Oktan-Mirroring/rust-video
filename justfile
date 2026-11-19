@@ -83,6 +83,11 @@ e2e:
 goldens *args:
     cargo run -p rust-video-harness --bin golden_gen -- {{args}}
 
+# Cargo for an Android target; resolves the NDK linker from the
+# environment (API 29 floor: ndk-sys cannot link 28). Needs --target.
+android *args:
+    {{python}} scripts/android-env.py {{args}}
+
 # Commit gate hook entry point; wiring lives in .agents/hooks/README.md.
 commit-lint-gate:
     {{python}} .agents/hooks/commit-lint-gate.py
