@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::h265::parser::NaluType;
-use crate::h265::parser::Slice;
+use crate::h265::{is_bla, is_cra, is_idr, is_irap, is_radl, is_rasl, is_slnr, SliceHeader};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Reference {
@@ -35,7 +34,7 @@ pub struct PictureState {
 pub struct PictureData {
     // Fields extracted from the slice header. These are the CamelCase
     // variables, unless noted otherwise.
-    pub nalu_type: NaluType,
+    pub nalu_type: u8,
     pub output: PictureOutput,
     pub state: PictureState,
     pub slice_pic_order_cnt_lsb: i32,
@@ -49,28 +48,28 @@ pub struct PictureData {
 }
 
 impl PictureData {
-    /// Instantiates a new `PictureData` from a slice.
+    /// Instantiates a new `PictureData` for a coded picture.
     ///
     /// See 8.1.3 Decoding process for a coded picture with `nuh_layer_id` equal
-    /// to 0.
-    ///
-    /// This will also call the picture order count process (clause 8.3.1) to
-    /// correctly initialize the POC values.
+    /// to 0. Runs the picture order count process (clause 8.3.1) to initialize
+    /// the POC values.
     pub fn new_from_slice(
-        slice: &Slice,
+        header: &SliceHeader,
+        nalu_type: u8,
+        temporal_id: u8,
         first_picture_in_bitstream: bool,
         first_picture_after_eos: bool,
         prev_tid0_pic: Option<&PictureData>,
         max_pic_order_cnt_lsb: i32,
     ) -> Self {
-        let hdr = &slice.header;
-        let nalu_type = slice.nalu.header.type_;
-
         // We assume HandleCraAsBlafFLag == 0, as it is only set through
         // external means, which we do not provide.
 
         let mut pic_order_cnt_msb = 0;
-        let slice_pic_order_cnt_lsb: i32 = hdr.pic_order_cnt_lsb.into();
+        let slice_pic_order_cnt_lsb: i32 = header.poc_lsb.unwrap_or(0).cast_signed();
+        let pic_output_flag = header.pic_output;
+        let no_output_of_prior_pics_flag = header.no_output_prior;
+        let st_rps_bits = header.rps_bits.map_or(0, |bits| bits.bits);
 
         // Compute the output flags:
         // The value of NoRaslOutputFlag is equal to 1 for each IDR access
@@ -78,20 +77,20 @@ impl PictureData {
         // first access unit in the bitstream in decoding order, is the first
         // access unit that follows an end of sequence NAL unit in decoding
         // order, or has HandleCraAsBlaFlag equal to 1.
-        let no_rasl_output_flag = nalu_type.is_idr()
-            || nalu_type.is_bla()
-            || (nalu_type.is_cra() && first_picture_in_bitstream)
+        let no_rasl_output_flag = is_idr(nalu_type)
+            || is_bla(nalu_type)
+            || (is_cra(nalu_type) && first_picture_in_bitstream)
             || first_picture_after_eos;
 
-        let pic_output_flag = if slice.nalu.header.type_.is_rasl() && no_rasl_output_flag {
+        let pic_output_flag = if is_rasl(nalu_type) && no_rasl_output_flag {
             false
         } else {
-            hdr.output.pic_output_flag
+            pic_output_flag
         };
 
         // Compute the Picture Order Count. See 8.3.1 Decoding Process for
         // Picture Order Count
-        if !(nalu_type.is_irap() && no_rasl_output_flag) {
+        if !(is_irap(nalu_type) && no_rasl_output_flag) {
             if let Some(prev_tid0_pic) = prev_tid0_pic {
                 // Equation (8-1)
                 let prev_pic_order_cnt_lsb = prev_tid0_pic.slice_pic_order_cnt_lsb;
@@ -118,14 +117,12 @@ impl PictureData {
         //
         // Use this flag to correctly set up the field in the decoder during
         // `finish_picture`.
-        let valid_for_prev_tid0_pic = slice.nalu.header.nuh_temporal_id() == 0
-            && !nalu_type.is_radl()
-            && !nalu_type.is_rasl()
-            && !nalu_type.is_slnr();
+        let valid_for_prev_tid0_pic =
+            temporal_id == 0 && !is_radl(nalu_type) && !is_rasl(nalu_type) && !is_slnr(nalu_type);
 
         let no_output_of_prior_pics_flag =
-            if nalu_type.is_irap() && no_rasl_output_flag && !first_picture_in_bitstream {
-                nalu_type.is_cra() || hdr.output.no_output_of_prior_pics_flag
+            if is_irap(nalu_type) && no_rasl_output_flag && !first_picture_in_bitstream {
+                is_cra(nalu_type) || no_output_of_prior_pics_flag
             } else {
                 false
             };
@@ -148,7 +145,7 @@ impl PictureData {
             pic_order_cnt_val: pic_order_cnt_msb + slice_pic_order_cnt_lsb,
             reference: Reference::default(),
             pic_latency_cnt: 0,
-            short_term_ref_pic_set_size_bits: hdr.st_rps_bits,
+            short_term_ref_pic_set_size_bits: u32::from(st_rps_bits),
         }
     }
 

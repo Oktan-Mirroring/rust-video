@@ -5,18 +5,19 @@
 //! and marks the DPB per 8.3.3 and C.5.2. A VA-API backend submits
 //! finished pictures.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
-use std::io::Cursor;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
 use crate::frontend::SurfaceSlot;
-use crate::h265::dpb::Dpb;
-use crate::h265::parser::{
-    Nalu, NaluHeader, NaluType, Parser, Pps, ShortTermRefPicSet, Slice, SliceHeader, Sps,
+use crate::h265::{
+    is_idr, is_irap, is_rasl, parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest,
+    parse_slice_tail, parse_sps, parse_vps, rbsp, split_nals, BitReader, Gate, LtSpec, Pps,
+    ShortTermRps, SliceHeader, SliceTail, Sps,
 };
-use crate::h265::picture::{PictureData, Reference};
+use crate::h265_dpb::Dpb;
+use crate::h265_picture::{PictureData, Reference};
 
 use bytes::Bytes;
 
@@ -25,12 +26,16 @@ use bytes::Bytes;
 pub struct PendingSlice {
     /// Parsed slice header.
     header: SliceHeader,
+    /// Parsed slice tail.
+    tail: SliceTail,
     /// NAL unit type of the backing NAL.
-    nalu_type: NaluType,
+    nalu_type: u8,
     /// Temporal id of the backing NAL.
     temporal_id: u8,
     /// NAL bytes past the start code, header bytes included.
     data: Bytes,
+    /// Emulation prevention bytes inside the slice header.
+    epb: u32,
 }
 
 impl PendingSlice {
@@ -40,10 +45,46 @@ impl PendingSlice {
         &self.header
     }
 
+    /// Parsed slice tail.
+    #[must_use]
+    pub fn tail(&self) -> &SliceTail {
+        &self.tail
+    }
+
     /// NAL bytes past the start code, header bytes included.
     #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Slice header size in bits, NAL header included.
+    #[must_use]
+    pub fn bit_size(&self) -> usize {
+        self.tail.bit_size
+    }
+
+    /// Emulation prevention bytes inside the slice header.
+    #[must_use]
+    pub fn epb(&self) -> u32 {
+        self.epb
+    }
+
+    /// Assembled slice for mapping tests.
+    #[cfg(test)]
+    pub(crate) fn assembled(
+        header: SliceHeader,
+        tail: SliceTail,
+        data_len: usize,
+        epb: u32,
+    ) -> Self {
+        Self {
+            header,
+            tail,
+            nalu_type: 1,
+            temporal_id: 0,
+            data: bytes::Bytes::from(vec![0xAA; data_len]),
+            epb,
+        }
     }
 }
 
@@ -126,11 +167,11 @@ impl Rps {
     /// Returns `Err` when a modification entry points outside the
     /// temporary list.
     #[cfg(test)]
-    pub fn lists(&self, header: &SliceHeader) -> Result<RefLists, VaApiError> {
+    pub fn lists(&self, header: &SliceHeader, tail: &SliceTail) -> Result<RefLists, VaApiError> {
         let mut list0 = Vec::new();
         let mut list1 = Vec::new();
         let mut temp = Vec::new();
-        self.lists_into(header, &mut list0, &mut list1, &mut temp)?;
+        self.lists_into(header, tail, &mut list0, &mut list1, &mut temp)?;
         Ok((list0, list1))
     }
 
@@ -145,44 +186,53 @@ impl Rps {
     pub fn lists_into(
         &self,
         header: &SliceHeader,
+        tail: &SliceTail,
         list0: &mut Vec<Option<usize>>,
         list1: &mut Vec<Option<usize>>,
         temp: &mut Vec<Option<usize>>,
     ) -> Result<(), VaApiError> {
-        if header.type_.is_i() {
+        if header.slice_type.is_intra() {
             list0.clear();
             list1.clear();
             return Ok(());
         }
-        self.temp_list0_into(header, temp);
+        let total_curr = Self::total_curr(header, tail);
+        self.temp_list0_into(tail.num_ref_l0, total_curr, temp);
         Self::modified_into(
             temp,
-            header.ref_pic_list_modification.modification_flag_l0,
-            &header.ref_pic_list_modification.list_entry_l0,
-            header.num_ref_idx_l0_active_minus1,
+            tail.mod_flag_l0,
+            &tail.mod_entries_l0,
+            tail.num_ref_l0,
             list0,
         )?;
-        if !header.type_.is_b() {
+        if !header.slice_type.is_b() {
             list1.clear();
             return Ok(());
         }
-        self.temp_list1_into(header, temp);
+        self.temp_list1_into(tail.num_ref_l1, total_curr, temp);
         Self::modified_into(
             temp,
-            header.ref_pic_list_modification.modification_flag_l1,
-            &header.ref_pic_list_modification.list_entry_l1,
-            header.num_ref_idx_l1_active_minus1,
+            tail.mod_flag_l1,
+            &tail.mod_entries_l1,
+            tail.num_ref_l1,
             list1,
         )
     }
 
+    /// Current-picture reference count: used short-term plus used long-term.
+    fn total_curr(header: &SliceHeader, tail: &SliceTail) -> u32 {
+        let short = header
+            .rps
+            .as_ref()
+            .map_or(0, |set| set.used_negative() + set.used_positive());
+        let long = tail.lt.iter().filter(|pic| pic.used).count();
+        u32::try_from(short + long).unwrap_or(u32::MAX)
+    }
+
     /// Temporary list 0 per 8-8, rebuilt in `out`.
-    fn temp_list0_into(&self, header: &SliceHeader, out: &mut Vec<Option<usize>>) {
+    fn temp_list0_into(&self, active_minus1: u8, total_curr: u32, out: &mut Vec<Option<usize>>) {
         out.clear();
-        let end = Self::temp_len(
-            header.num_ref_idx_l0_active_minus1,
-            header.num_pic_total_curr,
-        );
+        let end = Self::temp_len(active_minus1, total_curr);
         while out.len() < end {
             let before = out.len();
             out.extend(self.st_curr_before.iter().copied().take(end - out.len()));
@@ -195,12 +245,9 @@ impl Rps {
     }
 
     /// Temporary list 1 per 8-10, rebuilt in `out`.
-    fn temp_list1_into(&self, header: &SliceHeader, out: &mut Vec<Option<usize>>) {
+    fn temp_list1_into(&self, active_minus1: u8, total_curr: u32, out: &mut Vec<Option<usize>>) {
         out.clear();
-        let end = Self::temp_len(
-            header.num_ref_idx_l1_active_minus1,
-            header.num_pic_total_curr,
-        );
+        let end = Self::temp_len(active_minus1, total_curr);
         while out.len() < end {
             let before = out.len();
             out.extend(self.st_curr_after.iter().copied().take(end - out.len()));
@@ -337,8 +384,10 @@ impl Ingest {
 
 /// H.265 frontend: Annex B in, ordered pictures out.
 pub struct Frontend {
-    /// Bitstream parser with the active parameter sets.
-    parser: Parser,
+    /// Stored sequence sets by id.
+    sps_store: BTreeMap<u8, Rc<Sps>>,
+    /// Stored picture sets by id.
+    pps_store: BTreeMap<u8, Rc<Pps>>,
     /// Active sequence set.
     sps: Option<Rc<Sps>>,
     /// Decoded-picture buffer over surface slots.
@@ -347,8 +396,6 @@ pub struct Frontend {
     pending: Vec<PendingSlice>,
     /// Sets of the open picture.
     pending_sets: Option<(Rc<Sps>, Rc<Pps>)>,
-    /// Last independent slice header, for dependent slices.
-    last_independent: Option<SliceHeader>,
     /// Previous temporal-zero picture, for order counts.
     prev_tid0: Option<PictureData>,
     /// True before the first picture of the stream.
@@ -360,7 +407,7 @@ pub struct Frontend {
     /// Order-count lsb range of the active sequence.
     max_poc_lsb: i32,
     /// Picture sets waiting on their sequence set.
-    pending_pps: Vec<Nalu<'static>>,
+    pending_pps: Vec<Vec<u8>>,
 }
 
 impl Frontend {
@@ -368,12 +415,12 @@ impl Frontend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            parser: Parser::default(),
+            sps_store: BTreeMap::new(),
+            pps_store: BTreeMap::new(),
             sps: None,
             dpb: Dpb::default(),
             pending: Vec::new(),
             pending_sets: None,
-            last_independent: None,
             prev_tid0: None,
             first_in_bitstream: true,
             first_after_eos: true,
@@ -392,23 +439,13 @@ impl Frontend {
     /// Coded picture size in luma samples, if a sequence is active.
     #[must_use]
     pub fn coded_size(&self) -> Option<(u32, u32)> {
-        self.sps
-            .as_ref()
-            .map(|sps| (u32::from(sps.width()), u32::from(sps.height())))
+        self.sps.as_ref().map(|sps| (sps.width, sps.height))
     }
 
     /// Visible rectangle as `(x, y, width, height)`, if a sequence is active.
     #[must_use]
     pub fn visible_rect(&self) -> Option<(u32, u32, u32, u32)> {
-        self.sps.as_ref().map(|sps| {
-            let rect = sps.visible_rectangle();
-            (
-                rect.min.x,
-                rect.min.y,
-                rect.max.x - rect.min.x,
-                rect.max.y - rect.min.y,
-            )
-        })
+        self.sps.as_ref().map(|sps| Self::visible_rect_of(sps))
     }
 
     /// Active sequence set.
@@ -420,7 +457,59 @@ impl Frontend {
     /// DPB frame capacity for the active sequence.
     #[must_use]
     pub fn max_dpb_frames(&self) -> Option<usize> {
-        self.sps.as_ref().map(|sps| sps.max_dpb_size().min(16))
+        self.sps
+            .as_ref()
+            .map(|sps| Self::max_dpb_size_of(sps).min(16))
+    }
+
+    /// Picture set `id`, if stored.
+    #[cfg(test)]
+    pub(crate) fn pps(&self, id: u8) -> Option<&Rc<Pps>> {
+        self.pps_store.get(&id)
+    }
+
+    /// Visible rectangle of `sps` as `(x, y, width, height)`.
+    fn visible_rect_of(sps: &Sps) -> (u32, u32, u32, u32) {
+        let Some(crop) = sps.crop else {
+            return (0, 0, sps.width, sps.height);
+        };
+        (
+            crop.left,
+            crop.top,
+            sps.width - crop.left - crop.right,
+            sps.height - crop.top - crop.bottom,
+        )
+    }
+
+    /// DPB picture capacity for `sps`, H.265 A.4.2 equation A-2.
+    fn max_dpb_size_of(sps: &Sps) -> usize {
+        // Table A.8 luma-sample ceilings by level.
+        let max_luma_ps: u32 = match sps.level_idc {
+            30 => 36_864,
+            60 => 122_880,
+            63 => 245_760,
+            90 => 552_960,
+            93 => 983_040,
+            120 | 123 => 2_228_224,
+            150 | 153 | 156 => 8_912_896,
+            _ => 35_651_584,
+        };
+        let max_dpb_pic_buf: u32 = if (1..=5).contains(&sps.ptl.profile_idc) {
+            6
+        } else {
+            7
+        };
+        let samples = sps.width.saturating_mul(sps.height);
+        let max = if samples <= max_luma_ps >> 2 {
+            std::cmp::min(4 * max_dpb_pic_buf, 16)
+        } else if samples <= max_luma_ps >> 1 {
+            std::cmp::min(2 * max_dpb_pic_buf, 16)
+        } else if samples <= (3 * max_luma_ps) >> 2 {
+            std::cmp::min(4 * max_dpb_pic_buf / 3, 16)
+        } else {
+            max_dpb_pic_buf
+        };
+        usize::try_from(max).unwrap_or(usize::MAX)
     }
 
     /// True when `index` backs a live DPB entry.
@@ -448,53 +537,36 @@ impl Frontend {
             drained_size: None,
             drained_crop: None,
         };
-        let mut cursor = Cursor::new(bytes.as_ref());
-        loop {
-            let Ok(nalu) = Nalu::next(&mut cursor) else {
-                if Self::start_code_ahead(&cursor) {
-                    return Err(VaApiError::Parse("broken nal unit".to_owned()));
-                }
-                break;
+        for nal in split_nals(bytes.as_ref()) {
+            let Some(header) = nal.get(0..2) else {
+                continue;
             };
-            match nalu.header.type_ {
-                NaluType::VpsNut => {
-                    self.parser.parse_vps(&nalu).map_err(VaApiError::Parse)?;
+            let body = &nal[2..];
+            match (header[0] >> 1) & 0x3F {
+                32 => {
+                    let rbsp = rbsp(body);
+                    parse_vps::<VaApiError>(&rbsp)?;
                 }
-                NaluType::SpsNut => {
-                    if self.adopt_sps(&nalu, &mut out)? {
+                33 => {
+                    if self.adopt_sps(body, &mut out)? {
                         out.reconfigured = true;
                     }
                 }
-                NaluType::PpsNut => {
-                    if self.parser.parse_pps(&nalu).is_err() {
-                        self.pending_pps.push(nalu.into_owned());
+                34 => {
+                    if self.adopt_pps(body).is_err() {
+                        self.pending_pps.push(nal.to_vec());
                     }
                 }
-                NaluType::BlaWLp
-                | NaluType::BlaWRadl
-                | NaluType::BlaNLp
-                | NaluType::IdrWRadl
-                | NaluType::IdrNLp
-                | NaluType::TrailN
-                | NaluType::TrailR
-                | NaluType::TsaN
-                | NaluType::TsaR
-                | NaluType::StsaN
-                | NaluType::StsaR
-                | NaluType::RadlN
-                | NaluType::RadlR
-                | NaluType::RaslN
-                | NaluType::RaslR
-                | NaluType::CraNut => {
-                    self.ingest_slice(nalu, bytes, &mut out.pictures)?;
+                0..=9 | 16..=21 => {
+                    self.ingest_slice(nal, body, header, bytes, &mut out.pictures)?;
                 }
-                NaluType::EosNut => {
+                36 => {
                     self.first_after_eos = true;
                     if let Some(picture) = self.take_pending() {
                         out.pictures.push(picture);
                     }
                 }
-                NaluType::EobNut => {
+                37 => {
                     self.first_in_bitstream = true;
                     if let Some(picture) = self.take_pending() {
                         out.pictures.push(picture);
@@ -521,24 +593,27 @@ impl Frontend {
         self.dpb.drain().into_iter().map(|entry| entry.1).collect()
     }
 
-    /// Adopt `nalu` as the active sequence set.
+    /// Adopt RBSP `body` as the active sequence set.
     ///
     /// A changed set finishes the open picture, drains the DPB, and
     /// resets decode state; the return reports the change.
-    fn adopt_sps(&mut self, nalu: &Nalu, out: &mut Ingest) -> Result<bool, VaApiError> {
-        let id = self
-            .parser
-            .parse_sps(nalu)
-            .map_err(VaApiError::Parse)?
-            .seq_parameter_set_id;
-        let sps = self
-            .parser
-            .get_sps(id)
-            .cloned()
-            .ok_or_else(|| VaApiError::Parse("sequence set vanished".to_owned()))?;
-        self.max_poc_lsb = 1 << (u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4);
+    fn adopt_sps(&mut self, body: &[u8], out: &mut Ingest) -> Result<bool, VaApiError> {
+        let rbsp = rbsp(body);
+        let parsed = parse_sps::<VaApiError, Gate>(&rbsp)?;
+        let id = parsed.id;
+        if self.sps_store.keys().len() >= 16 {
+            return Err(VaApiError::Parse(
+                "Broken data: Number of active SPSs > MAX_SPS_COUNT".to_owned(),
+            ));
+        }
+        let sps = Rc::new(parsed);
+        self.sps_store.insert(id, Rc::clone(&sps));
+        self.max_poc_lsb = 1 << (u32::from(sps.log2_max_poc_lsb_minus4) + 4);
         for pps in std::mem::take(&mut self.pending_pps) {
-            if self.parser.parse_pps(&pps).is_err() {
+            let Some(body) = pps.get(2..) else {
+                continue;
+            };
+            if self.adopt_pps(body).is_err() {
                 self.pending_pps.push(pps);
             }
         }
@@ -552,50 +627,80 @@ impl Frontend {
         out.drained_crop = self.visible_rect();
         out.drained.extend(self.drain());
         self.dpb = Dpb::default();
-        self.dpb.set_max_num_pics(sps.max_dpb_size().min(16));
+        self.dpb
+            .set_max_num_pics(Self::max_dpb_size_of(&sps).min(16));
         self.prev_tid0 = None;
         self.sps = Some(sps);
         Ok(true)
     }
 
+    /// Store the picture set in RBSP `body`.
+    fn adopt_pps(&mut self, body: &[u8]) -> Result<(), VaApiError> {
+        let rbsp = rbsp(body);
+        let (pps_id, sps_id) = parse_pps_ids::<VaApiError>(&rbsp)?;
+        if pps_id > 63 {
+            return Err(VaApiError::Parse(format!(
+                "Value out of bounds: expected 0 - 63, got {pps_id}"
+            )));
+        }
+        if sps_id > 15 {
+            return Err(VaApiError::Parse(format!(
+                "Value out of bounds: expected 0 - 15, got {sps_id}"
+            )));
+        }
+        let sps = self.sps_store.get(&sps_id).ok_or_else(|| {
+            VaApiError::Parse(format!(
+                "Could not get SPS for seq_parameter_set_id {sps_id}"
+            ))
+        })?;
+        let parsed = parse_pps::<VaApiError, Gate>(&rbsp, Some(sps))?;
+        let id = parsed.id;
+        if self.pps_store.keys().len() >= 64 {
+            return Err(VaApiError::Parse(
+                "Broken data: Number of active PPSs > MAX_PPS_COUNT".to_owned(),
+            ));
+        }
+        self.pps_store.insert(id, Rc::new(parsed));
+        Ok(())
+    }
+
     /// Append one slice NAL to the open picture.
     fn ingest_slice(
         &mut self,
-        nalu: Nalu<'_>,
+        nal: &[u8],
+        body: &[u8],
+        header: &[u8],
         bytes: &Bytes,
         pictures: &mut Vec<PendingPicture>,
     ) -> Result<(), VaApiError> {
-        if nalu.header.nuh_layer_id != 0 {
+        let layer_id = (u16::from(header[0] & 1) << 5) | (u16::from(header[1]) >> 3);
+        if layer_id != 0 {
             return Err(VaApiError::Unsupported("multilayer".to_owned()));
         }
-        let nalu_type = nalu.header.type_;
-        let temporal_id = nalu.header.nuh_temporal_id();
-        let mut slice = self
-            .parser
-            .parse_slice_header(nalu)
-            .map_err(VaApiError::Parse)?;
-        if slice.header.position.dependent_slice_segment_flag {
-            let independent = self.last_independent.clone().ok_or_else(|| {
-                VaApiError::Parse("dependent slice without independent".to_owned())
-            })?;
-            slice
-                .replace_header(independent)
-                .map_err(VaApiError::Parse)?;
-        } else {
-            self.last_independent = Some(slice.header.clone());
-        }
-        let pps = self
-            .parser
-            .get_pps(slice.header.pic_parameter_set_id)
-            .cloned()
-            .ok_or_else(|| VaApiError::Parse("slice names unknown picture set".to_owned()))?;
-        let sps = pps.sps.clone();
+        let nalu_type = (header[0] >> 1) & 0x3F;
+        let temporal_id = (header[1] & 7).saturating_sub(1);
+        let rbsp = rbsp(body);
+        let mut reader = BitReader::new(&rbsp);
+        let prefix = parse_slice_prefix::<VaApiError>(&mut reader, nalu_type)?;
+        let pps_id = prefix.2;
+        let pps = self.pps_store.get(&pps_id).cloned().ok_or_else(|| {
+            VaApiError::Parse(format!(
+                "Could not get PPS for pic_parameter_set_id {pps_id}"
+            ))
+        })?;
+        let sps = self.sps_store.get(&pps.sps_id).cloned().ok_or_else(|| {
+            VaApiError::Parse(format!(
+                "Could not get PPS for pic_parameter_set_id {pps_id}"
+            ))
+        })?;
+        let parsed = parse_slice_rest::<VaApiError>(&mut reader, prefix, nalu_type, &sps, &pps)?;
+        let tail = parse_slice_tail::<VaApiError>(&rbsp, nalu_type, &sps, &pps)?;
         if self.sps.as_ref() != Some(&sps) {
             return Err(VaApiError::Parse(
                 "slice names inactive sequence set".to_owned(),
             ));
         }
-        if !self.pending.is_empty() && slice.header.position.first_slice_segment_in_pic_flag {
+        if !self.pending.is_empty() && parsed.first {
             if let Some(picture) = self.take_pending() {
                 pictures.push(picture);
             }
@@ -603,18 +708,44 @@ impl Frontend {
         if self.pending.is_empty() {
             self.pending_sets = Some((sps, pps));
         }
-        let payload = slice.nalu.as_ref();
+        let mut payload = nal;
+        while payload.last().is_some_and(|byte| *byte == 0) {
+            payload = &payload[..payload.len() - 1];
+        }
         let base = bytes.as_ptr() as usize;
         let offset = payload.as_ptr() as usize - base;
         debug_assert!(offset + payload.len() <= bytes.len());
         let data = bytes.slice(offset..offset + payload.len());
+        let epb = Self::count_epb(body, tail.bit_size.saturating_sub(16));
         self.pending.push(PendingSlice {
-            header: slice.header,
+            header: parsed,
+            tail,
             nalu_type,
             temporal_id,
             data,
+            epb,
         });
         Ok(())
+    }
+
+    /// Emulation prevention bytes in `body` below `rbsp_bits` of header.
+    fn count_epb(body: &[u8], rbsp_bits: usize) -> u32 {
+        let mut epb = 0u32;
+        let mut zeros = 0;
+        let mut bits = 0;
+        for byte in body {
+            if bits >= rbsp_bits {
+                break;
+            }
+            if zeros == 2 && *byte == 3 {
+                epb += 1;
+                zeros = 0;
+                continue;
+            }
+            bits += 8;
+            zeros = if *byte == 0 { zeros + 1 } else { 0 };
+        }
+        epb
     }
 
     /// Order `pending` against the DPB: counts, sets, marking, bumps.
@@ -635,22 +766,10 @@ impl Frontend {
             .first()
             .ok_or_else(|| VaApiError::Parse("picture without slices".to_owned()))?;
         Self::check_supported(&pending.sps, &pending.pps)?;
-        // `new_from_slice` reads only the NAL header below.
-        let probe = Slice {
-            header: first.header.clone(),
-            nalu: Nalu {
-                header: NaluHeader {
-                    type_: first.nalu_type,
-                    nuh_layer_id: 0,
-                    nuh_temporal_id_plus1: first.temporal_id.saturating_add(1),
-                },
-                data: Cow::Borrowed(&[]),
-                size: 0,
-                offset: 0,
-            },
-        };
         let pic = PictureData::new_from_slice(
-            &probe,
+            &first.header,
+            first.nalu_type,
+            first.temporal_id,
             self.first_in_bitstream,
             self.first_after_eos,
             self.prev_tid0.as_ref(),
@@ -658,12 +777,12 @@ impl Frontend {
         );
         self.first_in_bitstream = false;
         self.first_after_eos = false;
-        if pic.nalu_type.is_irap() {
+        if is_irap(pic.nalu_type) {
             self.irap_no_rasl = pic.output.no_rasl_output_flag;
-        } else if pic.nalu_type.is_rasl() && self.irap_no_rasl {
+        } else if is_rasl(pic.nalu_type) && self.irap_no_rasl {
             return Ok(None);
         }
-        let kept = self.mark_rps(&first.header, &pending.sps, &pic);
+        let kept = self.mark_rps(&first.header, &first.tail, &pic);
         let bumped = self.update_before_decoding(&pic, &pending.sps);
         let rps = self.locate_rps(&kept);
         Ok(Some((
@@ -705,17 +824,19 @@ impl Frontend {
     }
 
     /// Mark DPB reference states for `header` per 8.3.3, returning active handles.
-    fn mark_rps(&mut self, header: &SliceHeader, sps: &Sps, pic: &PictureData) -> KeptRps {
-        if pic.nalu_type.is_irap() && pic.output.no_rasl_output_flag {
+    fn mark_rps(&mut self, header: &SliceHeader, tail: &SliceTail, pic: &PictureData) -> KeptRps {
+        if is_irap(pic.nalu_type) && pic.output.no_rasl_output_flag {
             self.dpb.mark_all_as_unused_for_ref();
         }
-        if pic.nalu_type.is_idr() {
+        if is_idr(pic.nalu_type) {
             return KeptRps::default();
         }
-        let set = Self::short_term_set(header, sps);
+        let Some(set) = header.rps.as_ref() else {
+            return KeptRps::default();
+        };
         let (st_before, st_after, st_foll) = short_term_pocs(set, pic.pic_order_cnt_val);
         let (lt_curr, lt_curr_masked, lt_foll, lt_foll_masked) =
-            long_term_pocs(header, pic.pic_order_cnt_val, self.max_poc_lsb);
+            long_term_pocs(&tail.lt, pic.pic_order_cnt_val, self.max_poc_lsb);
         let st_curr_before = self.resolve_short(&st_before);
         let st_curr_after = self.resolve_short(&st_after);
         let lt_curr_pics = self.resolve_long(&lt_curr, &lt_curr_masked);
@@ -765,15 +886,6 @@ impl Frontend {
             .collect()
     }
 
-    /// Short-term set the header selects, inline or from the SPS.
-    fn short_term_set<'a>(header: &'a SliceHeader, sps: &'a Sps) -> &'a ShortTermRefPicSet {
-        if header.curr_rps_idx == sps.num_short_term_ref_pic_sets {
-            &header.short_term_ref_pic_set
-        } else {
-            &sps.short_term_ref_pic_set[usize::from(header.curr_rps_idx)]
-        }
-    }
-
     /// DPB picture handles of short-term `pocs`, `None` where absent.
     fn resolve_short(&self, pocs: &[i32]) -> Vec<Option<Rc<RefCell<PictureData>>>> {
         pocs.iter()
@@ -803,7 +915,7 @@ impl Frontend {
     /// Bump or clear the DPB ahead of decoding `pic`.
     fn update_before_decoding(&mut self, pic: &PictureData, sps: &Sps) -> Vec<SurfaceSlot> {
         let mut outputs = Vec::new();
-        if pic.nalu_type.is_irap() && pic.output.no_rasl_output_flag {
+        if is_irap(pic.nalu_type) && pic.output.no_rasl_output_flag {
             if pic.output.no_output_of_prior_pics_flag {
                 self.dpb.clear();
             } else {
@@ -823,44 +935,34 @@ impl Frontend {
 
     /// Reject streams outside Main 8-bit 4:2:0 without extensions.
     fn check_supported(sps: &Sps, pps: &Pps) -> Result<(), VaApiError> {
-        let ptl = &sps.profile_tier_level;
-        let profile = ptl.general_profile_idc;
-        let compat =
-            ptl.general_profile_compatibility_flag[1] || ptl.general_profile_compatibility_flag[3];
+        let profile = sps.ptl.profile_idc;
+        // Compatibility flags pack into bits 31..0 for profiles 0..32.
+        let compat = sps.ptl.compat & (1u32 << 30) != 0 || sps.ptl.compat & (1u32 << 28) != 0;
         if profile != 1 && profile != 3 && !compat {
             return Err(VaApiError::Unsupported(format!("h265 profile {profile}")));
         }
-        if sps.chroma_format_idc != 1 {
+        if sps.chroma_format != 1 {
             return Err(VaApiError::Unsupported(format!(
                 "chroma {}",
-                sps.chroma_format_idc
+                sps.chroma_format
             )));
         }
-        if sps.format.separate_colour_plane_flag {
+        if sps.separate_colour_plane {
             return Err(VaApiError::Unsupported("separate colour planes".to_owned()));
         }
-        if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+        if sps.bit_depth_luma != 0 || sps.bit_depth_chroma != 0 {
             return Err(VaApiError::Unsupported("high bit depth".to_owned()));
         }
-        if sps.extensions.range_extension_flag || pps.extensions.range_extension_flag {
+        if sps.sps_extension_flags[0] || pps.pps_extension_flags[0] {
             return Err(VaApiError::Unsupported("range extension".to_owned()));
         }
-        if sps.extensions.scc_extension_flag || pps.extensions.scc_extension_flag {
+        if sps.sps_extension_flags[3] || pps.pps_extension_flags[3] {
             return Err(VaApiError::Unsupported("screen content coding".to_owned()));
         }
-        if sps.features.vui_parameters_present_flag && sps.vui_parameters.structure.field_seq_flag {
+        if sps.vui.as_ref().is_some_and(|vui| vui.field_seq) {
             return Err(VaApiError::Unsupported("interlaced".to_owned()));
         }
         Ok(())
-    }
-
-    /// True when a start code remains in `cursor`.
-    fn start_code_ahead(cursor: &Cursor<&[u8]>) -> bool {
-        let position = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
-        cursor
-            .get_ref()
-            .get(position..)
-            .is_some_and(|tail| tail.windows(3).any(|window| window == [0x00, 0x00, 0x01]))
     }
 }
 
@@ -871,17 +973,17 @@ impl Default for Frontend {
 }
 
 /// Short-term POCs of `set` against `poc`: before, after, following.
-fn short_term_pocs(set: &ShortTermRefPicSet, poc: i32) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+fn short_term_pocs(set: &ShortTermRps, poc: i32) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let mut before = Vec::new();
     let mut after = Vec::new();
     let mut foll = Vec::new();
     for (index, used) in set
-        .used_by_curr_pic_s0
+        .negative_used
         .iter()
         .enumerate()
-        .take(usize::from(set.num_negative_pics))
+        .take(usize::from(set.negative_count))
     {
-        let Some(delta) = set.delta_poc_s0.get(index) else {
+        let Some(delta) = set.negative.get(index) else {
             break;
         };
         let entry = poc.saturating_add(*delta);
@@ -892,12 +994,12 @@ fn short_term_pocs(set: &ShortTermRefPicSet, poc: i32) -> (Vec<i32>, Vec<i32>, V
         }
     }
     for (index, used) in set
-        .used_by_curr_pic_s1
+        .positive_used
         .iter()
         .enumerate()
-        .take(usize::from(set.num_positive_pics))
+        .take(usize::from(set.positive_count))
     {
-        let Some(delta) = set.delta_poc_s1.get(index) else {
+        let Some(delta) = set.positive.get(index) else {
             break;
         };
         let entry = poc.saturating_add(*delta);
@@ -910,9 +1012,9 @@ fn short_term_pocs(set: &ShortTermRefPicSet, poc: i32) -> (Vec<i32>, Vec<i32>, V
     (before, after, foll)
 }
 
-/// Long-term POCs of `header` against `poc`: current, masked, following, masked.
+/// Long-term POCs of `lt` against `poc`: current, masked, following, masked.
 fn long_term_pocs(
-    header: &SliceHeader,
+    lt: &[LtSpec],
     poc: i32,
     max_lsb: i32,
 ) -> (Vec<i32>, Vec<bool>, Vec<i32>, Vec<bool>) {
@@ -920,33 +1022,20 @@ fn long_term_pocs(
     let mut curr_masked = Vec::new();
     let mut foll = Vec::new();
     let mut foll_masked = Vec::new();
-    let count = usize::from(
-        header
-            .num_long_term_sps
-            .saturating_add(header.num_long_term_pics),
-    );
-    for index in 0..count {
-        let (Some(lsb), Some(used), Some(msb), Some(cycle)) = (
-            header.poc_lsb_lt.get(index),
-            header.used_by_curr_pic_lt.get(index),
-            header.delta_poc_msb_present_flag.get(index),
-            header.delta_poc_msb_cycle_lt.get(index),
-        ) else {
-            break;
-        };
-        let mut entry = i64::from(*lsb);
-        if *msb {
+    for pic in lt {
+        let mut entry = i64::from(pic.poc_lsb);
+        if pic.msb_present {
             entry += i64::from(poc);
-            entry -= i64::from(*cycle) * i64::from(max_lsb);
+            entry -= i64::from(pic.msb_cycle) * i64::from(max_lsb);
             entry -= i64::from(poc & (max_lsb - 1));
         }
         let entry = i32::try_from(entry).unwrap_or(i32::MAX);
-        if *used {
+        if pic.used {
             curr.push(entry);
-            curr_masked.push(!msb);
+            curr_masked.push(!pic.msb_present);
         } else {
             foll.push(entry);
-            foll_masked.push(!msb);
+            foll_masked.push(!pic.msb_present);
         }
     }
     (curr, curr_masked, foll, foll_masked)
@@ -954,20 +1043,23 @@ fn long_term_pocs(
 
 #[cfg(test)]
 mod tests {
+    use rust_video_h265::HevcGate;
+
     use super::{long_term_pocs, short_term_pocs, Frontend};
     use crate::error::VaApiError;
-    use crate::h265::fixture::{idr_payload, nal, p_payload, pps_payload, sps_payload, Writer};
-    use crate::h265::parser::{
-        NaluType, RefPicListModification, ShortTermRefPicSet, SliceHeader, SliceType,
+    use crate::h265::{
+        parse_pps, parse_slice_tail, parse_sps, rbsp, Gate, LtSpec, ShortTermRps, SliceHeader,
+        SliceTail, SliceType,
     };
+    use crate::h265_fixture::{idr_payload, nal, p_payload, pps_payload, sps_payload, Writer};
 
     use bytes::Bytes;
 
     /// Frontend that ingested the sequence and picture sets.
     fn sequenced() -> Frontend {
         let mut frontend = Frontend::new();
-        let mut stream = nal(NaluType::SpsNut, &sps_payload());
-        stream.extend(nal(NaluType::PpsNut, &pps_payload()));
+        let mut stream = nal(33, &sps_payload());
+        stream.extend(nal(34, &pps_payload()));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("sets parse");
         assert_eq!(ingest.pictures(), []);
@@ -978,24 +1070,24 @@ mod tests {
     #[test]
     fn ingest_groups_slices_into_pictures() {
         let mut frontend = sequenced();
-        let mut stream = nal(NaluType::IdrWRadl, &idr_payload());
-        stream.extend(nal(NaluType::TrailR, &p_payload(2, 1)));
+        let mut stream = nal(19, &idr_payload());
+        stream.extend(nal(1, &p_payload(2, 1)));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("slices parse");
         let pictures = ingest.pictures();
         assert_eq!(pictures.len(), 1);
         assert_eq!(pictures[0].slices.len(), 1);
-        assert!(pictures[0].slices[0].header.type_.is_i());
+        assert!(pictures[0].slices[0].header.slice_type.is_intra());
         let pending = frontend.take_pending().expect("open p picture");
-        assert!(pending.slices[0].header.type_.is_p());
+        assert!(matches!(pending.slices[0].header.slice_type, SliceType::P));
         assert!(frontend.take_pending().is_none());
     }
 
     #[test]
     fn begin_orders_pocs_and_resolves_references() {
         let mut frontend = sequenced();
-        let mut stream = nal(NaluType::IdrWRadl, &idr_payload());
-        stream.extend(nal(NaluType::TrailR, &p_payload(2, 1)));
+        let mut stream = nal(19, &idr_payload());
+        stream.extend(nal(1, &p_payload(2, 1)));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("slices parse");
         let idr = ingest.pictures().pop().expect("idr picture");
@@ -1014,7 +1106,7 @@ mod tests {
         assert_eq!(picture.rps().st_curr_before(), &[Some(0)]);
         let (list0, list1) = picture
             .rps()
-            .lists(picture.slices()[0].header())
+            .lists(picture.slices()[0].header(), picture.slices()[0].tail())
             .expect("p lists");
         assert_eq!(list0, vec![Some(0)]);
         assert_eq!(list1, []);
@@ -1028,8 +1120,8 @@ mod tests {
     #[test]
     fn begin_drops_rasl_after_irap() {
         let mut frontend = sequenced();
-        let mut stream = nal(NaluType::IdrWRadl, &idr_payload());
-        stream.extend(nal(NaluType::RaslR, &p_payload(1, 0)));
+        let mut stream = nal(19, &idr_payload());
+        stream.extend(nal(9, &p_payload(1, 0)));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("slices parse");
         let idr = ingest.pictures().pop().expect("idr picture");
@@ -1044,9 +1136,9 @@ mod tests {
     #[test]
     fn picture_set_before_sequence_set_recovers() {
         let mut frontend = Frontend::new();
-        let mut stream = nal(NaluType::PpsNut, &pps_payload());
-        stream.extend(nal(NaluType::SpsNut, &sps_payload()));
-        stream.extend(nal(NaluType::IdrWRadl, &idr_payload()));
+        let mut stream = nal(34, &pps_payload());
+        stream.extend(nal(33, &sps_payload()));
+        stream.extend(nal(19, &idr_payload()));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("early pps recovers");
         assert_eq!(ingest.pictures().len(), 0);
@@ -1056,7 +1148,7 @@ mod tests {
     #[test]
     fn layered_slice_declines_typed() {
         let mut frontend = sequenced();
-        let mut slice = vec![0, 0, 0, 1, (NaluType::TrailR as u8) << 1, 0x09];
+        let mut slice = vec![0, 0, 0, 1, 1u8 << 1, 0x09];
         slice.extend(p_payload(2, 1));
         let bytes = Bytes::from(slice);
         let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
@@ -1068,7 +1160,7 @@ mod tests {
     #[test]
     fn dependent_slice_without_independent_fails() {
         let mut frontend = Frontend::new();
-        let mut stream = nal(NaluType::SpsNut, &sps_payload());
+        let mut stream = nal(33, &sps_payload());
         let mut pps = Writer::new();
         pps.ue(0);
         pps.ue(0);
@@ -1098,15 +1190,15 @@ mod tests {
         pps.ue(0);
         pps.bit(false);
         pps.bit(false);
-        stream.extend(nal(NaluType::PpsNut, &pps.bytes()));
+        stream.extend(nal(34, &pps.bytes()));
         let mut slice = Writer::new();
         slice.bit(false);
         slice.ue(0);
         slice.bit(true);
         slice.se(0);
-        stream.extend(nal(NaluType::TrailR, &slice.bytes()));
+        stream.extend(nal(1, &slice.bytes()));
         let bytes = Bytes::from(stream);
-        let Err(VaApiError::Parse(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
             panic!("orphan dependent slice fails");
         };
         assert!(message.contains("dependent"));
@@ -1115,7 +1207,7 @@ mod tests {
     #[test]
     fn garbage_sequence_set_fails() {
         let mut frontend = Frontend::new();
-        let stream = nal(NaluType::SpsNut, &[0x00]);
+        let stream = nal(33, &[0x00]);
         let bytes = Bytes::from(stream);
         assert!(matches!(frontend.ingest(&bytes), Err(VaApiError::Parse(_))));
     }
@@ -1123,7 +1215,7 @@ mod tests {
     #[test]
     fn sequence_change_drains_and_reconfigures() {
         let mut frontend = sequenced();
-        let stream = nal(NaluType::IdrWRadl, &idr_payload());
+        let stream = nal(19, &idr_payload());
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("idr parses");
         assert_eq!(ingest.pictures(), []);
@@ -1132,8 +1224,8 @@ mod tests {
         frontend
             .commit(picture, crate::frontend::SurfaceSlot::new(3))
             .expect("commits");
-        let mut stream = nal(NaluType::SpsNut, &sps_payload());
-        stream.extend(nal(NaluType::PpsNut, &pps_payload()));
+        let mut stream = nal(33, &sps_payload());
+        stream.extend(nal(34, &pps_payload()));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("same sets parse");
         assert!(!ingest.reconfigured());
@@ -1184,7 +1276,7 @@ mod tests {
         writer.bit(false);
         writer.bit(false);
         writer.bit(false);
-        let stream = nal(NaluType::SpsNut, &writer.bytes());
+        let stream = nal(33, &writer.bytes());
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("new set parses");
         assert!(ingest.reconfigured());
@@ -1199,43 +1291,43 @@ mod tests {
     fn check_supported_declines_foreign_streams() {
         let frontend = sequenced();
         let sps = frontend.sps().expect("active set").clone();
-        let pps = frontend.parser.get_pps(0).expect("parsed set").clone();
+        let pps = frontend.pps(0).expect("parsed set").clone();
         let mut bad = (*sps).clone();
-        bad.profile_tier_level.general_profile_idc = 4;
-        bad.profile_tier_level.general_profile_compatibility_flag = [false; 32];
+        bad.ptl.profile_idc = 4;
+        bad.ptl.compat = 0;
         assert!(matches!(
             Frontend::check_supported(&bad, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut compat = (*sps).clone();
-        compat.profile_tier_level.general_profile_idc = 2;
-        compat.profile_tier_level.general_profile_compatibility_flag[1] = true;
+        compat.ptl.profile_idc = 2;
+        compat.ptl.compat |= 1u32 << 30;
         assert!(Frontend::check_supported(&compat, &pps).is_ok());
-        compat.bit_depth_luma_minus8 = 2;
+        compat.bit_depth_luma = 2;
         assert!(matches!(
             Frontend::check_supported(&compat, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut bad = (*sps).clone();
-        bad.chroma_format_idc = 0;
+        bad.chroma_format = 0;
         assert!(matches!(
             Frontend::check_supported(&bad, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut bad = (*sps).clone();
-        bad.bit_depth_luma_minus8 = 2;
+        bad.bit_depth_luma = 2;
         assert!(matches!(
             Frontend::check_supported(&bad, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut bad = (*sps).clone();
-        bad.extensions.scc_extension_flag = true;
+        bad.sps_extension_flags[3] = true;
         assert!(matches!(
             Frontend::check_supported(&bad, &pps),
             Err(VaApiError::Unsupported(_))
         ));
         let mut bad = (*pps).clone();
-        bad.extensions.range_extension_flag = true;
+        bad.pps_extension_flags[0] = true;
         assert!(matches!(
             Frontend::check_supported(&sps, &bad),
             Err(VaApiError::Unsupported(_))
@@ -1243,19 +1335,44 @@ mod tests {
         assert!(Frontend::check_supported(&sps, &pps).is_ok());
     }
 
+    /// Slice header with three used short-term pictures.
+    fn list_header(slice_type: SliceType) -> SliceHeader {
+        let mut set = ShortTermRps {
+            negative_count: 2,
+            positive_count: 1,
+            ..ShortTermRps::default()
+        };
+        set.negative_used[0] = true;
+        set.negative_used[1] = true;
+        set.positive_used[0] = true;
+        SliceHeader {
+            first: true,
+            address: 0,
+            slice_type,
+            pic_output: true,
+            no_output_prior: false,
+            poc_lsb: Some(0),
+            rps: Some(set),
+            rps_bits: None,
+            lt: Vec::new(),
+            entry_count: 0,
+            extension_length: 0,
+        }
+    }
+
     #[test]
     fn short_term_pocs_split_current_and_following() {
-        let mut set = ShortTermRefPicSet {
-            num_negative_pics: 2,
-            num_positive_pics: 1,
-            ..ShortTermRefPicSet::default()
+        let mut set = ShortTermRps {
+            negative_count: 2,
+            positive_count: 1,
+            ..ShortTermRps::default()
         };
-        set.delta_poc_s0[0] = -1;
-        set.delta_poc_s0[1] = -3;
-        set.delta_poc_s1[0] = 2;
-        set.used_by_curr_pic_s0[0] = true;
-        set.used_by_curr_pic_s0[1] = false;
-        set.used_by_curr_pic_s1[0] = true;
+        set.negative[0] = -1;
+        set.negative[1] = -3;
+        set.positive[0] = 2;
+        set.negative_used[0] = true;
+        set.negative_used[1] = false;
+        set.positive_used[0] = true;
         let (before, after, foll) = short_term_pocs(&set, 10);
         assert_eq!(before, vec![9]);
         assert_eq!(after, vec![12]);
@@ -1264,17 +1381,21 @@ mod tests {
 
     #[test]
     fn long_term_poc_applies_msb_cycle() {
-        let mut header = SliceHeader {
-            num_long_term_pics: 2,
-            ..SliceHeader::default()
-        };
-        header.poc_lsb_lt[0] = 4;
-        header.poc_lsb_lt[1] = 9;
-        header.used_by_curr_pic_lt[0] = true;
-        header.used_by_curr_pic_lt[1] = true;
-        header.delta_poc_msb_present_flag[0] = true;
-        header.delta_poc_msb_cycle_lt[0] = 1;
-        let (curr, masked, foll, _) = long_term_pocs(&header, 260, 256);
+        let lt = vec![
+            LtSpec {
+                poc_lsb: 4,
+                used: true,
+                msb_present: true,
+                msb_cycle: 1,
+            },
+            LtSpec {
+                poc_lsb: 9,
+                used: true,
+                msb_present: false,
+                msb_cycle: 0,
+            },
+        ];
+        let (curr, masked, foll, _) = long_term_pocs(&lt, 260, 256);
         assert_eq!(curr, vec![4, 9]);
         assert_eq!(masked, vec![false, true]);
         assert_eq!(foll, []);
@@ -1289,24 +1410,40 @@ mod tests {
             st_curr_after: vec![Some(1)],
             lt_curr: vec![Some(2)],
         };
-        let mut header = SliceHeader {
-            type_: SliceType::P,
-            num_ref_idx_l0_active_minus1: 2,
-            num_pic_total_curr: 3,
-            ..SliceHeader::default()
+        let mut header = list_header(SliceType::P);
+        let mut tail = SliceTail {
+            num_ref_l0: 2,
+            ..SliceTail::default()
         };
-        let (list0, list1) = rps.lists(&header).expect("p lists");
+        let (list0, list1) = rps.lists(&header, &tail).expect("p lists");
         assert_eq!(list0, vec![Some(0), Some(1), Some(2)]);
         assert_eq!(list1, []);
-        header.type_ = SliceType::B;
-        header.num_ref_idx_l1_active_minus1 = 2;
-        let (list0, list1) = rps.lists(&header).expect("b lists");
+        header.slice_type = SliceType::B;
+        tail.num_ref_l1 = 2;
+        let (list0, list1) = rps.lists(&header, &tail).expect("b lists");
         assert_eq!(list0, vec![Some(0), Some(1), Some(2)]);
         assert_eq!(list1, vec![Some(1), Some(0), Some(2)]);
-        header.type_ = SliceType::I;
-        let (list0, list1) = rps.lists(&header).expect("i lists");
+        header.slice_type = SliceType::I;
+        let (list0, list1) = rps.lists(&header, &tail).expect("i lists");
         assert_eq!(list0, []);
         assert_eq!(list1, []);
+    }
+
+    #[test]
+    fn malformed_video_set_fails_ingest() {
+        let mut frontend = Frontend::new();
+        let bytes = Bytes::from(nal(32, &[0xFF, 0xFF]));
+        assert!(matches!(frontend.ingest(&bytes), Err(VaApiError::Parse(_))));
+    }
+
+    #[test]
+    fn slice_carries_bit_size_and_epb() {
+        let mut frontend = sequenced();
+        let bytes = Bytes::from(nal(19, &idr_payload()));
+        frontend.ingest(&bytes).expect("idr parses");
+        let pending = frontend.take_pending().expect("open picture");
+        assert!(pending.slices[0].bit_size() > 16);
+        assert_eq!(pending.slices[0].epb(), 0);
     }
 
     #[test]
@@ -1318,23 +1455,96 @@ mod tests {
             st_curr_after: vec![],
             lt_curr: vec![Some(2)],
         };
-        let mut header = SliceHeader {
-            type_: SliceType::P,
-            num_ref_idx_l0_active_minus1: 1,
-            num_pic_total_curr: 3,
-            ref_pic_list_modification: RefPicListModification {
-                modification_flag_l0: true,
-                list_entry_l0: vec![2, 0],
-                ..RefPicListModification::default()
-            },
-            ..SliceHeader::default()
+        let header = list_header(SliceType::P);
+        let mut tail = SliceTail {
+            num_ref_l0: 1,
+            mod_flag_l0: true,
+            mod_entries_l0: vec![2, 0],
+            ..SliceTail::default()
         };
-        let (list0, _) = rps.lists(&header).expect("modified lists");
+        let (list0, _) = rps.lists(&header, &tail).expect("modified lists");
         assert_eq!(list0, vec![Some(2), Some(0)]);
-        header.ref_pic_list_modification.list_entry_l0 = vec![9, 0];
+        tail.mod_entries_l0 = vec![9, 0];
         assert!(matches!(
-            rps.lists(&header),
+            rps.lists(&header, &tail),
             Err(VaApiError::BrokenReference(_))
+        ));
+    }
+
+    /// Parsed fixture sequence and picture sets.
+    fn sets() -> (rust_video_h265::Sps, rust_video_h265::Pps) {
+        let seq_raw = sps_payload();
+        let pic_raw = pps_payload();
+        let seq = parse_sps::<VaApiError, Gate>(&rbsp(&seq_raw)).expect("sps");
+        let pic = parse_pps::<VaApiError, Gate>(&rbsp(&pic_raw), Some(&seq)).expect("pps");
+        (seq, pic)
+    }
+
+    #[test]
+    fn tail_carries_p_slice_submit_fields() {
+        let (seq, pic) = sets();
+        let raw = p_payload(2, 1);
+        let slice_rbsp = rbsp(&raw);
+        let tail = parse_slice_tail::<VaApiError>(&slice_rbsp, 1, &seq, &pic).expect("tail");
+        assert_eq!((tail.num_ref_l0, tail.num_ref_l1), (0, 0));
+        assert!(!tail.mod_flag_l0 && !tail.mod_flag_l1);
+        assert!(tail.mod_entries_l0.is_empty() && tail.mod_entries_l1.is_empty());
+        assert!(!tail.temporal_mvp);
+        assert!(!tail.sao_luma && !tail.sao_chroma);
+        assert!(!tail.mvd_l1_zero && !tail.cabac_init);
+        assert!(tail.collocated_from_l0);
+        assert_eq!(tail.collocated_ref_idx, 0);
+        assert_eq!(tail.weights.luma_denom, 0);
+        assert!(tail.weights.l0.is_empty() && tail.weights.l1.is_empty());
+        assert_eq!(tail.merge_cand_minus5, 0);
+        assert_eq!(
+            (tail.qp_delta, tail.cb_qp_offset, tail.cr_qp_offset),
+            (0, 0, 0)
+        );
+        assert!(!tail.deblocking_disabled);
+        assert_eq!((tail.beta_offset, tail.tc_offset), (0, 0));
+        assert!(!pic.loop_across_slices());
+        assert!(!tail.loop_filter_across);
+        assert_eq!(tail.lt, []);
+        assert!(tail.bit_size > 16);
+    }
+
+    #[test]
+    fn tail_defaults_on_idr_slices() {
+        let (seq, pic) = sets();
+        let raw = idr_payload();
+        let slice_rbsp = rbsp(&raw);
+        let tail = parse_slice_tail::<VaApiError>(&slice_rbsp, 19, &seq, &pic).expect("tail");
+        assert_eq!((tail.num_ref_l0, tail.num_ref_l1), (0, 0));
+        assert_eq!(tail.merge_cand_minus5, 0);
+        assert_eq!(tail.qp_delta, 0);
+        assert_eq!(tail.colour_plane, 0);
+        assert_eq!(tail.lt, []);
+        assert!(tail.bit_size > 16);
+    }
+
+    #[test]
+    fn gate_bounds_picture_qp_and_counts() {
+        let (seq, _) = sets();
+        let pic_raw = pps_payload();
+        let base = parse_pps::<VaApiError, Gate>(&rbsp(&pic_raw), Some(&seq)).expect("pps");
+        let mut pic = base.clone();
+        pic.pic_init_qp_minus26 = 26;
+        assert!(matches!(
+            Gate::check_pps(&pic, Some(&seq)),
+            Err(VaApiError::Parse(_))
+        ));
+        let mut pic = base.clone();
+        pic.cb_qp_offset = 13;
+        assert!(matches!(
+            Gate::check_pps(&pic, Some(&seq)),
+            Err(VaApiError::Parse(_))
+        ));
+        let mut pic = base;
+        pic.num_ref_l0 = 15;
+        assert!(matches!(
+            Gate::check_pps(&pic, Some(&seq)),
+            Err(VaApiError::Parse(_))
         ));
     }
 }

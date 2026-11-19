@@ -6,9 +6,8 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use crate::h264::parser::MaxLongTermFrameIdx;
-use crate::h264::parser::RefPicMarking;
-use crate::h264::parser::SliceType;
+use crate::h264::Marking;
+use crate::h264_dpb::MaxLongTermFrameIdx;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Field {
@@ -46,7 +45,6 @@ pub enum IsIdr {
     },
 }
 
-#[derive(Default)]
 pub struct PictureData {
     pub pic_order_cnt_type: u8,
     pub top_field_order_cnt: i32,
@@ -65,15 +63,9 @@ pub struct PictureData {
     pub frame_num_wrap: i32,
     pub long_term_frame_idx: u32,
 
-    pub coded_resolution: Resolution,
-    pub display_resolution: Resolution,
-
-    pub type_: SliceType,
     pub nal_ref_idc: u8,
     pub is_idr: IsIdr,
     reference: Reference,
-    pub ref_pic_list_modification_flag_l0: i32,
-    pub abs_diff_pic_num_minus1: i32,
 
     // Does memory management op 5 needs to be executed after this
     // picture has finished decoding?
@@ -87,10 +79,40 @@ pub struct PictureData {
 
     // Values from slice_hdr to be used during reference marking and
     // memory management after finishing this picture.
-    pub ref_pic_marking: RefPicMarking,
+    pub ref_pic_marking: Marking,
 
     /// Presentation timestamp of the picture.
     pub timestamp: u64,
+}
+
+impl Default for PictureData {
+    fn default() -> Self {
+        Self {
+            pic_order_cnt_type: 0,
+            top_field_order_cnt: 0,
+            bottom_field_order_cnt: 0,
+            pic_order_cnt: 0,
+            pic_order_cnt_msb: 0,
+            pic_order_cnt_lsb: 0,
+            delta_pic_order_cnt_bottom: 0,
+            delta_pic_order_cnt0: 0,
+            delta_pic_order_cnt1: 0,
+            pic_num: 0,
+            long_term_pic_num: 0,
+            frame_num: 0,
+            frame_num_offset: 0,
+            frame_num_wrap: 0,
+            long_term_frame_idx: 0,
+            nal_ref_idc: 0,
+            is_idr: IsIdr::No,
+            reference: Reference::None,
+            has_mmco_5: false,
+            nonexisting: false,
+            field: Field::Frame,
+            ref_pic_marking: Marking::Silent,
+            timestamp: 0,
+        }
+    }
 }
 
 /// A `PictureData` within a `Rc<RefCell>`.
@@ -104,68 +126,6 @@ impl Deref for RcPictureData {
 
     fn deref(&self) -> &Self::Target {
         &self.pic
-    }
-}
-
-/// Rounding modes for `Resolution`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ResolutionRoundMode {
-    /// Rounds component-wise to the next even value.
-    Even,
-}
-
-/// A frame resolution in pixels.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Resolution {
-    /// Width in luma samples.
-    pub width: u32,
-    /// Height in luma samples.
-    pub height: u32,
-}
-
-impl Resolution {
-    /// Whether `self` can contain `other`.
-    pub fn can_contain(self, other: Self) -> bool {
-        self.width >= other.width && self.height >= other.height
-    }
-
-    /// Rounds `self` according to `rnd_mode`.
-    #[must_use]
-    pub fn round(mut self, rnd_mode: ResolutionRoundMode) -> Self {
-        match rnd_mode {
-            ResolutionRoundMode::Even => {
-                if !self.width.is_multiple_of(2) {
-                    self.width += 1;
-                }
-
-                if !self.height.is_multiple_of(2) {
-                    self.height += 1;
-                }
-            }
-        }
-
-        self
-    }
-
-    /// Luma-sample count of the frame.
-    #[must_use]
-    pub fn area(self) -> usize {
-        (self.width as usize) * (self.height as usize)
-    }
-}
-
-impl From<(u32, u32)> for Resolution {
-    fn from(value: (u32, u32)) -> Self {
-        Self {
-            width: value.0,
-            height: value.1,
-        }
-    }
-}
-
-impl From<Resolution> for (u32, u32) {
-    fn from(value: Resolution) -> Self {
-        (value.width, value.height)
     }
 }
 
@@ -244,17 +204,9 @@ impl std::fmt::Debug for PictureData {
             .field("frame_num_offset", &self.frame_num_offset)
             .field("frame_num_wrap", &self.frame_num_wrap)
             .field("long_term_frame_idx", &self.long_term_frame_idx)
-            .field("coded_resolution", &self.coded_resolution)
-            .field("display_resolution", &self.display_resolution)
-            .field("type_", &self.type_)
             .field("nal_ref_idc", &self.nal_ref_idc)
             .field("is_idr", &self.is_idr)
             .field("reference", &self.reference)
-            .field(
-                "ref_pic_list_modification_flag_l0",
-                &self.ref_pic_list_modification_flag_l0,
-            )
-            .field("abs_diff_pic_num_minus1", &self.abs_diff_pic_num_minus1)
             .field("has_mmco_5", &self.has_mmco_5)
             .field("nonexisting", &self.nonexisting)
             .field("field", &self.field)

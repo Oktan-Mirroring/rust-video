@@ -1,7 +1,5 @@
 //! Synthetic H.265 NAL payloads for unit tests.
 
-use crate::h265::parser::NaluType;
-
 /// Bit writer for synthetic NAL payloads.
 #[derive(Default)]
 pub(crate) struct Writer {
@@ -74,8 +72,8 @@ impl Writer {
 }
 
 /// Annex B NAL of `type_` with `payload`, start code included.
-pub(crate) fn nal(type_: NaluType, payload: &[u8]) -> Vec<u8> {
-    let mut nal = vec![0, 0, 0, 1, (type_ as u8) << 1, 1];
+pub(crate) fn nal(type_: u8, payload: &[u8]) -> Vec<u8> {
+    let mut nal = vec![0, 0, 0, 1, type_ << 1, 1];
     nal.extend_from_slice(payload);
     nal
 }

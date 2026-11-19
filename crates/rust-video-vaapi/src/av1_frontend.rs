@@ -1,14 +1,16 @@
 //! AV1 OBU assembly, reference slots, and output orchestration.
 //!
-//! Portable: parses OBU streams (Annex B or low overhead), groups tile
-//! groups under frame headers, tracks the eight reference slots, and
-//! resolves show-existing frames. A VA-API backend submits finished frames.
+//! Portable: parses low-overhead OBU streams, groups tile groups under
+//! frame headers, tracks the eight reference slots, and resolves
+//! show-existing frames. A VA-API backend submits finished frames.
 
 use std::rc::Rc;
 
-use crate::av1::parser::{
-    BitDepth, FrameHeaderObu, Obu, ObuAction, ObuType, ParsedObu, Parser, Profile,
-    SequenceHeaderObu, Tile,
+use crate::av1::{
+    frame_obu_tile_offset, parse_frame_header, parse_sequence_header, refresh_refs,
+    show_existing_refs, split_obus, split_tiles, tile_group_range, FrameHeader, RefInfo,
+    SequenceHeader, NUM_REF_FRAMES, OBU_FRAME, OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER,
+    OBU_TILE_GROUP, OBU_TILE_LIST,
 };
 use crate::error::VaApiError;
 use crate::frontend::SurfaceSlot;
@@ -17,6 +19,19 @@ use bytes::Bytes;
 
 /// Number of AV1 reference slots.
 pub const NUM_SLOTS: usize = 8;
+
+/// One coded tile: byte span plus grid position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tile {
+    /// Byte offset inside the group payload.
+    pub offset: u32,
+    /// Byte size inside the group payload.
+    pub size: u32,
+    /// Tile row in the grid.
+    pub row: u32,
+    /// Tile column in the grid.
+    pub col: u32,
+}
 
 /// One tile group: payload bytes plus the parsed tiles within.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,9 +72,9 @@ pub enum PendingKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingFrame {
     /// Active sequence header.
-    seq: Rc<SequenceHeaderObu>,
+    seq: Rc<SequenceHeader>,
     /// Parsed frame header.
-    header: FrameHeaderObu,
+    header: FrameHeader,
     /// Frame body.
     kind: PendingKind,
 }
@@ -67,9 +82,9 @@ pub struct PendingFrame {
 /// Coded frame with reference slots resolved.
 pub struct Picture {
     /// Active sequence header.
-    seq: Rc<SequenceHeaderObu>,
+    seq: Rc<SequenceHeader>,
     /// Parsed frame header.
-    header: FrameHeaderObu,
+    header: FrameHeader,
     /// Tile groups in bitstream order.
     groups: Vec<PendingTileGroup>,
     /// Reference slots with render sizes.
@@ -79,13 +94,13 @@ pub struct Picture {
 impl Picture {
     /// Active sequence header.
     #[must_use]
-    pub fn seq(&self) -> &Rc<SequenceHeaderObu> {
+    pub fn seq(&self) -> &Rc<SequenceHeader> {
         &self.seq
     }
 
     /// Parsed frame header.
     #[must_use]
-    pub fn header(&self) -> &FrameHeaderObu {
+    pub fn header(&self) -> &FrameHeader {
         &self.header
     }
 
@@ -138,14 +153,14 @@ impl Ingest {
 
 /// AV1 frontend: OBU stream in, ordered frames out.
 pub struct Frontend {
-    /// Bitstream parser with the active sequence.
-    parser: Parser,
+    /// Reference slots behind header parsing.
+    parse_refs: [RefInfo; NUM_REF_FRAMES],
     /// Active sequence header.
-    seq: Option<Rc<SequenceHeaderObu>>,
+    seq: Option<Rc<SequenceHeader>>,
     /// Reference slots with render sizes.
     refs: [Option<(SurfaceSlot, (u32, u32))>; NUM_SLOTS],
     /// Header of the open frame.
-    open: Option<(Rc<SequenceHeaderObu>, FrameHeaderObu)>,
+    open: Option<(Rc<SequenceHeader>, FrameHeader)>,
     /// Tile groups of the open frame.
     groups: Vec<PendingTileGroup>,
 }
@@ -155,7 +170,7 @@ impl Frontend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            parser: Parser::default(),
+            parse_refs: core::array::from_fn(|_| RefInfo::default()),
             seq: None,
             refs: Default::default(),
             open: None,
@@ -168,15 +183,15 @@ impl Frontend {
     pub fn coded_size(&self) -> Option<(u32, u32)> {
         self.seq.as_ref().map(|seq| {
             (
-                u32::from(seq.max_frame_width_minus_1) + 1,
-                u32::from(seq.max_frame_height_minus_1) + 1,
+                seq.max_frame_width_minus1 + 1,
+                seq.max_frame_height_minus1 + 1,
             )
         })
     }
 
     /// Active sequence header.
     #[must_use]
-    pub fn seq(&self) -> Option<&Rc<SequenceHeaderObu>> {
+    pub fn seq(&self) -> Option<&Rc<SequenceHeader>> {
         self.seq.as_ref()
     }
 
@@ -202,26 +217,18 @@ impl Frontend {
             frames: Vec::new(),
             reconfigured: false,
         };
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let action = self
-                .parser
-                .read_obu(&bytes[offset..])
-                .map_err(VaApiError::Parse)?;
-            match action {
-                ObuAction::Drop(len) => {
-                    let advance = usize::try_from(len)
-                        .map_err(|_| VaApiError::Parse("obu drop range".to_owned()))?;
-                    offset += advance;
+        for obu in split_obus::<VaApiError>(bytes.as_ref())? {
+            match obu.unit_type {
+                OBU_SEQUENCE_HEADER => {
+                    self.finish_open(&mut out)?;
+                    self.parse_refs = core::array::from_fn(|_| RefInfo::default());
                 }
-                ObuAction::Process(obu) => {
-                    let end = offset + obu.bytes_used;
-                    let full = bytes.slice(offset..end);
-                    let payload = full.slice(obu.bytes_used - obu.as_ref().len()..);
-                    offset = end;
-                    self.ingest_obu(obu, &payload, &mut out)?;
+                OBU_FRAME_HEADER | OBU_FRAME => {
+                    self.finish_open(&mut out)?;
                 }
+                _ => {}
             }
+            self.ingest_obu(&obu, bytes, &mut out)?;
         }
         Ok(out)
     }
@@ -241,9 +248,7 @@ impl Frontend {
             return Ok(None);
         };
         let groups = std::mem::take(&mut self.groups);
-        self.parser
-            .ref_frame_update(&header)
-            .map_err(VaApiError::Parse)?;
+        refresh_refs::<VaApiError>(&mut self.parse_refs, &header)?;
         Ok(Some(PendingFrame {
             seq,
             header,
@@ -254,7 +259,7 @@ impl Frontend {
     /// Store `picture` on `slot`, refreshing reference slots.
     pub fn commit(&mut self, picture: &Picture, slot: SurfaceSlot) {
         let size = (picture.header.render_width, picture.header.render_height);
-        self.refresh(slot, size, picture.header.refresh_frame_flags);
+        self.refresh(slot, size, u32::from(picture.header.refresh_frame_flags));
     }
 
     /// Order `pending` against the reference slots.
@@ -274,7 +279,7 @@ impl Frontend {
                 let (slot, size) = self.refs.get(index).copied().flatten().ok_or_else(|| {
                     VaApiError::BrokenReference("no reference picture to display".to_owned())
                 })?;
-                self.refresh(slot, size, pending.header.refresh_frame_flags);
+                self.refresh(slot, size, u32::from(pending.header.refresh_frame_flags));
                 Ok(Begun::Existing { slot, size })
             }
             PendingKind::Regular { groups } => Ok(Begun::Picture(Box::new(Picture {
@@ -300,97 +305,129 @@ impl Frontend {
     /// Route one OBU into the open frame or the finished list.
     fn ingest_obu(
         &mut self,
-        obu: Obu,
-        payload: &Bytes,
+        obu: &rust_video_av1::Obu<'_>,
+        bytes: &Bytes,
         out: &mut Ingest,
     ) -> Result<(), VaApiError> {
-        match obu.header.obu_type {
-            ObuType::SequenceHeader => {
-                self.finish_open(out)?;
-                self.parser = Parser::default();
-            }
-            ObuType::FrameHeader | ObuType::Frame => {
-                self.finish_open(out)?;
-            }
-            _ => {}
-        }
-        match self.parser.parse_obu(obu).map_err(VaApiError::Parse)? {
-            ParsedObu::SequenceHeader(seq) => {
+        match obu.unit_type {
+            OBU_SEQUENCE_HEADER => {
+                let seq = Rc::new(parse_sequence_header::<VaApiError>(obu.payload)?);
                 self.adopt_seq(seq, out);
-                Ok(())
             }
-            ParsedObu::FrameHeader(header) => {
-                self.finish_open(out)?;
-                if header.show.show_existing_frame {
-                    let seq = self.active_seq()?;
-                    self.parser
-                        .ref_frame_update(&header)
-                        .map_err(VaApiError::Parse)?;
+            OBU_FRAME_HEADER => {
+                let seq = self.active_seq()?;
+                let (header, _) = parse_frame_header::<VaApiError>(
+                    obu.payload,
+                    &seq,
+                    &mut self.parse_refs,
+                    obu.temporal_id,
+                    obu.spatial_id,
+                )?;
+                if header.show_existing_frame() {
+                    show_existing_refs(&mut self.parse_refs, &header);
                     out.frames.push(PendingFrame {
                         seq,
                         header,
                         kind: PendingKind::Existing,
                     });
                 } else {
-                    let seq = self.active_seq()?;
                     self.open = Some((seq, header));
                 }
-                Ok(())
             }
-            ParsedObu::TileGroup(group) => {
-                if self.open.is_none() {
+            OBU_TILE_GROUP => {
+                let Some((_, header)) = self.open.clone() else {
                     return Err(VaApiError::Parse(
                         "tile group without frame header".to_owned(),
                     ));
-                }
-                self.groups.push(PendingTileGroup {
-                    data: payload.clone(),
-                    tiles: group.tiles,
-                });
-                Ok(())
-            }
-            ParsedObu::Frame(frame) => {
-                self.finish_open(out)?;
-                let seq = self.active_seq()?;
-                if frame.header.header_bytes > payload.len() {
-                    return Err(VaApiError::Parse("frame header overruns obu".to_owned()));
-                }
-                let group = PendingTileGroup {
-                    data: payload.slice(frame.header.header_bytes..),
-                    tiles: frame.tile_group.tiles,
                 };
-                self.parser
-                    .ref_frame_update(&frame.header)
-                    .map_err(VaApiError::Parse)?;
-                if frame.header.show.show_existing_frame {
-                    if group.tiles.iter().any(|tile| tile.size > 0) {
+                self.groups
+                    .push(Self::split_group(obu.payload, bytes, &header)?);
+            }
+            OBU_FRAME => {
+                let seq = self.active_seq()?;
+                let (header, consumed) = parse_frame_header::<VaApiError>(
+                    obu.payload,
+                    &seq,
+                    &mut self.parse_refs,
+                    obu.temporal_id,
+                    obu.spatial_id,
+                )?;
+                let start = frame_obu_tile_offset::<VaApiError>(obu.payload, consumed)?;
+                let rest = obu
+                    .payload
+                    .get(start..)
+                    .ok_or_else(|| VaApiError::Parse("frame header overruns obu".to_owned()))?;
+                if header.show_existing_frame() {
+                    show_existing_refs(&mut self.parse_refs, &header);
+                    if !rest.is_empty() {
                         return Err(VaApiError::Parse(
                             "tiles after show-existing frame".to_owned(),
                         ));
                     }
                     out.frames.push(PendingFrame {
                         seq,
-                        header: frame.header,
+                        header,
                         kind: PendingKind::Existing,
                     });
                 } else {
+                    let group = Self::split_group(rest, bytes, &header)?;
+                    refresh_refs::<VaApiError>(&mut self.parse_refs, &header)?;
                     out.frames.push(PendingFrame {
                         seq,
-                        header: frame.header,
+                        header,
                         kind: PendingKind::Regular {
                             groups: vec![group],
                         },
                     });
                 }
-                Ok(())
             }
-            ParsedObu::TileList => Err(VaApiError::Unsupported("large-scale tiles".to_owned())),
-            _ => Ok(()),
+            OBU_TILE_LIST => {
+                return Err(VaApiError::Unsupported("large-scale tiles".to_owned()));
+            }
+            _ => {}
         }
+        Ok(())
+    }
+
+    /// Tile spans of `payload` sub-sliced from `bytes` under `header`.
+    fn split_group(
+        payload: &[u8],
+        bytes: &Bytes,
+        header: &FrameHeader,
+    ) -> Result<PendingTileGroup, VaApiError> {
+        let range = |what: &str| VaApiError::Parse(format!("tile {what} range"));
+        let count = usize::from(header.tile_cols).saturating_mul(usize::from(header.tile_rows));
+        let head = tile_group_range::<VaApiError>(
+            payload,
+            count,
+            header.tile_cols_log2,
+            header.tile_rows_log2,
+        )?;
+        let base = payload.len() - head.data.len();
+        let ranges =
+            split_tiles::<VaApiError>(head.data, head.start, head.end, header.tile_size_bytes)?;
+        let mut tiles = Vec::with_capacity(ranges.len());
+        let cols = u32::from(header.tile_cols);
+        for (offset, (payload_offset, size)) in ranges.iter().enumerate() {
+            let tile_num = u32::try_from(head.start + offset).map_err(|_| range("index"))?;
+            tiles.push(Tile {
+                offset: u32::try_from(base + payload_offset).map_err(|_| range("offset"))?,
+                size: u32::try_from(*size).map_err(|_| range("size"))?,
+                row: tile_num / cols,
+                col: tile_num % cols,
+            });
+        }
+        let base_ptr = bytes.as_ptr() as usize;
+        let offset = payload.as_ptr() as usize - base_ptr;
+        debug_assert!(offset + payload.len() <= bytes.len());
+        Ok(PendingTileGroup {
+            data: bytes.slice(offset..offset + payload.len()),
+            tiles,
+        })
     }
 
     /// Active sequence header or a parse error.
-    fn active_seq(&self) -> Result<Rc<SequenceHeaderObu>, VaApiError> {
+    fn active_seq(&self) -> Result<Rc<SequenceHeader>, VaApiError> {
         self.seq
             .clone()
             .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))
@@ -405,7 +442,7 @@ impl Frontend {
     }
 
     /// Adopt the freshly parsed sequence header.
-    fn adopt_seq(&mut self, seq: Rc<SequenceHeaderObu>, out: &mut Ingest) {
+    fn adopt_seq(&mut self, seq: Rc<SequenceHeader>, out: &mut Ingest) {
         if self.seq.as_ref().is_some_and(|active| **active == *seq) {
             return;
         }
@@ -415,23 +452,23 @@ impl Frontend {
     }
 
     /// Reject streams outside Profile 0 8-bit 4:2:0 without scalability.
-    fn check_supported(seq: &SequenceHeaderObu) -> Result<(), VaApiError> {
-        if seq.seq_profile != Profile::Profile0 {
+    fn check_supported(seq: &SequenceHeader) -> Result<(), VaApiError> {
+        if seq.profile != 0 {
             return Err(VaApiError::Unsupported(format!(
                 "av1 profile {}",
-                seq.seq_profile as u8
+                seq.profile
             )));
         }
-        if seq.bit_depth != BitDepth::Depth8 {
+        if seq.bit_depth() != 8 {
             return Err(VaApiError::Unsupported("high bit depth".to_owned()));
         }
-        if seq.color_config.format.mono_chrome {
+        if seq.mono_chrome() {
             return Err(VaApiError::Unsupported("monochrome".to_owned()));
         }
-        if !seq.color_config.format.subsampling_x || !seq.color_config.format.subsampling_y {
+        if !seq.subsampling_x() || !seq.subsampling_y() {
             return Err(VaApiError::Unsupported("chroma subsampling".to_owned()));
         }
-        if seq.operating_points_cnt_minus_1 > 0 {
+        if seq.operating.len() > 1 {
             return Err(VaApiError::Unsupported("scalable".to_owned()));
         }
         Ok(())
@@ -447,20 +484,21 @@ impl Default for Frontend {
 #[cfg(test)]
 mod tests {
     use super::{Begun, Frontend, PendingFrame, PendingKind};
-    use crate::av1::fixture::{
+    use crate::av1::{FrameHeader, FrameType};
+    use crate::av1_fixture::{
         keyframe_hidden_payload, keyframe_payload, keyframe_wide_payload, obu, pframe_payload,
         seq_payload, seq_payload_sized, show_existing_payload, tile_group_2_payload,
         tile_group_payload,
     };
-    use crate::av1::parser::{BitDepth, FrameType, ObuType, Profile};
     use crate::error::VaApiError;
+    use crate::frontend::SurfaceSlot;
 
     use bytes::Bytes;
 
     /// Frontend that ingested the 64x64 sequence header.
     fn sequenced() -> Frontend {
         let mut frontend = Frontend::new();
-        let stream = obu(ObuType::SequenceHeader, &seq_payload());
+        let stream = obu(1, &seq_payload());
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("sequence parses");
         assert_eq!(ingest.frames(), []);
@@ -471,16 +509,16 @@ mod tests {
     #[test]
     fn ingest_groups_obus_into_frames() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[9, 9, 9, 9])));
-        stream.extend(obu(ObuType::FrameHeader, &pframe_payload()));
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[8])));
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[9, 9, 9, 9])));
+        stream.extend(obu(3, &pframe_payload()));
+        stream.extend(obu(4, &tile_group_payload(&[8])));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("frames parse");
         let frames = ingest.frames();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].header.frame_type, FrameType::Key);
-        assert!(frames[0].header.show.show_frame);
+        assert!(frames[0].header.show_frame());
         assert_eq!(frames[0].header.upscaled_width, 64);
         let PendingKind::Regular { groups } = &frames[0].kind else {
             panic!("regular frame");
@@ -503,7 +541,7 @@ mod tests {
         let mut frontend = sequenced();
         let mut payload = keyframe_payload();
         payload.extend(tile_group_payload(&[7, 7]));
-        let stream = obu(ObuType::Frame, &payload);
+        let stream = obu(6, &payload);
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("frame parses");
         let frames = ingest.frames();
@@ -519,8 +557,8 @@ mod tests {
     #[test]
     fn begin_resolves_reference_slots() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[1])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("key parses");
         let pending = frontend.take_pending().expect("take").expect("key frame");
@@ -533,8 +571,8 @@ mod tests {
             .refs
             .iter()
             .all(|entry| entry.is_some_and(|(slot, size)| slot.index() == 0 && size == (64, 64))));
-        let mut stream = obu(ObuType::FrameHeader, &pframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[2])));
+        let mut stream = obu(3, &pframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[2])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("p parses");
         let pending = frontend.take_pending().expect("take").expect("p frame");
@@ -551,8 +589,8 @@ mod tests {
     #[test]
     fn show_existing_outputs_past_slot() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[1])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("key parses");
         let pending = frontend.take_pending().expect("take").expect("key frame");
@@ -560,9 +598,9 @@ mod tests {
             panic!("regular picture");
         };
         frontend.commit(&picture, crate::frontend::SurfaceSlot::new(0));
-        let mut stream = obu(ObuType::FrameHeader, &pframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[2])));
-        stream.extend(obu(ObuType::FrameHeader, &show_existing_payload(0)));
+        let mut stream = obu(3, &pframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[2])));
+        stream.extend(obu(3, &show_existing_payload(0)));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("p parses");
         let frames = ingest.frames();
@@ -585,18 +623,18 @@ mod tests {
     #[test]
     fn show_existing_keyframe_refreshes_all() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_hidden_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+        let mut stream = obu(3, &keyframe_hidden_payload());
+        stream.extend(obu(4, &tile_group_payload(&[1])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("key parses");
         let pending = frontend.take_pending().expect("take").expect("key frame");
-        assert!(!pending.header.show.show_frame);
+        assert!(!pending.header.show_frame());
         let Begun::Picture(picture) = frontend.begin(pending).expect("begins") else {
             panic!("regular picture");
         };
         frontend.commit(&picture, crate::frontend::SurfaceSlot::new(5));
-        let mut stream = obu(ObuType::FrameHeader, &pframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[2])));
+        let mut stream = obu(3, &pframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[2])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("p parses");
         let pending = frontend.take_pending().expect("take").expect("p frame");
@@ -605,7 +643,7 @@ mod tests {
         };
         frontend.commit(&picture, crate::frontend::SurfaceSlot::new(6));
         assert_eq!(frontend.refs[0].map(|(slot, _)| slot.index()), Some(6));
-        let stream = obu(ObuType::FrameHeader, &show_existing_payload(1));
+        let stream = obu(3, &show_existing_payload(1));
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("existing parses");
         let frames = ingest.frames();
@@ -627,9 +665,9 @@ mod tests {
     fn show_existing_without_reference_fails() {
         let frontend = sequenced();
         let seq = frontend.seq().expect("active sequence").clone();
-        let header = crate::av1::parser::FrameHeaderObu {
+        let header = FrameHeader {
             frame_to_show_map_idx: 3,
-            ..crate::av1::parser::FrameHeaderObu::default()
+            ..FrameHeader::default()
         };
         let mut frontend = sequenced();
         let pending = PendingFrame {
@@ -646,7 +684,7 @@ mod tests {
     #[test]
     fn tile_group_without_header_fails() {
         let mut frontend = sequenced();
-        let stream = obu(ObuType::TileGroup, &tile_group_payload(&[1]));
+        let stream = obu(4, &tile_group_payload(&[1]));
         let bytes = Bytes::from(stream);
         assert!(matches!(frontend.ingest(&bytes), Err(VaApiError::Parse(_))));
     }
@@ -654,7 +692,7 @@ mod tests {
     #[test]
     fn tile_list_declines_typed() {
         let mut frontend = sequenced();
-        let stream = obu(ObuType::TileList, &[0]);
+        let stream = obu(8, &[0]);
         let bytes = Bytes::from(stream);
         let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
             panic!("tile list declines");
@@ -665,13 +703,13 @@ mod tests {
     #[test]
     fn check_supported_declines_foreign_streams() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[1])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("key parses");
         let pending = frontend.take_pending().expect("take").expect("key frame");
         let mut bad = (*pending.seq).clone();
-        bad.seq_profile = Profile::Profile1;
+        bad.profile = 1;
         let frame = PendingFrame {
             seq: std::rc::Rc::new(bad),
             header: pending.header.clone(),
@@ -682,14 +720,14 @@ mod tests {
             Err(VaApiError::Unsupported(_))
         ));
         let pending = {
-            let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-            stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+            let mut stream = obu(3, &keyframe_payload());
+            stream.extend(obu(4, &tile_group_payload(&[1])));
             let bytes = Bytes::from(stream);
             frontend.ingest(&bytes).expect("key parses");
             frontend.take_pending().expect("take").expect("key frame")
         };
         let mut bad = (*pending.seq).clone();
-        bad.bit_depth = BitDepth::Depth10;
+        bad.flags |= rust_video_av1::SEQ_HIGH_BITDEPTH;
         let frame = PendingFrame {
             seq: std::rc::Rc::new(bad),
             header: pending.header.clone(),
@@ -705,8 +743,8 @@ mod tests {
     #[test]
     fn sequence_change_reconfigures() {
         let mut frontend = sequenced();
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_payload());
-        stream.extend(obu(ObuType::TileGroup, &tile_group_payload(&[1])));
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[1])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("key parses");
         let pending = frontend.take_pending().expect("take").expect("key frame");
@@ -715,7 +753,7 @@ mod tests {
         };
         frontend.commit(&picture, crate::frontend::SurfaceSlot::new(0));
         assert!(frontend.refs[0].is_some());
-        let stream = obu(ObuType::SequenceHeader, &seq_payload_sized(128, 64));
+        let stream = obu(1, &seq_payload_sized(128, 64));
         let bytes = Bytes::from(stream);
         let ingest = frontend.ingest(&bytes).expect("new sequence parses");
         assert!(ingest.reconfigured());
@@ -724,16 +762,73 @@ mod tests {
     }
 
     #[test]
+    fn show_existing_frame_with_tiles_fails() {
+        let mut frontend = sequenced();
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[9])));
+        let bytes = Bytes::from(stream);
+        frontend.ingest(&bytes).expect("key parses");
+        let pending = frontend.take_pending().expect("take").expect("key frame");
+        let Begun::Picture(picture) = frontend.begin(pending).expect("begun") else {
+            panic!("regular picture");
+        };
+        frontend.commit(&picture, SurfaceSlot::new(4));
+        let mut payload = show_existing_payload(0);
+        payload.push(9);
+        let bytes = Bytes::from(obu(6, &payload));
+        let Err(VaApiError::Parse(message)) = frontend.ingest(&bytes) else {
+            panic!("tiled show-existing fails");
+        };
+        assert_eq!(message, "tiles after show-existing frame");
+    }
+
+    #[test]
+    fn redundant_and_reserved_obus_ignored() {
+        let mut frontend = sequenced();
+        let mut stream = obu(7, &[0]);
+        stream.extend(obu(9, &[0]));
+        stream.extend(obu(0, &[0]));
+        let bytes = Bytes::from(stream);
+        let mut ingest = frontend.ingest(&bytes).expect("obus ignored");
+        assert_eq!(ingest.frames().len(), 0);
+        assert!(frontend.take_pending().expect("take").is_none());
+    }
+
+    #[test]
+    fn show_existing_frame_obu_outputs() {
+        let mut frontend = sequenced();
+        let mut stream = obu(3, &keyframe_payload());
+        stream.extend(obu(4, &tile_group_payload(&[9])));
+        let bytes = Bytes::from(stream);
+        frontend.ingest(&bytes).expect("key parses");
+        let pending = frontend.take_pending().expect("take").expect("key frame");
+        let Begun::Picture(picture) = frontend.begin(pending).expect("begun") else {
+            panic!("regular picture");
+        };
+        frontend.commit(&picture, SurfaceSlot::new(4));
+        let bytes = Bytes::from(obu(6, &show_existing_payload(0)));
+        let mut ingest = frontend.ingest(&bytes).expect("show-existing parses");
+        let frames = ingest.frames();
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(frames[0].kind, PendingKind::Existing));
+        let Begun::Existing { slot, size } = frontend
+            .begin(frames.into_iter().next().expect("frame"))
+            .expect("begun")
+        else {
+            panic!("existing output");
+        };
+        assert_eq!(slot.index(), 4);
+        assert_eq!(size, (64, 64));
+    }
+
+    #[test]
     fn two_tiles_cover_the_frame() {
         let mut frontend = Frontend::new();
-        let stream = obu(ObuType::SequenceHeader, &seq_payload_sized(128, 64));
+        let stream = obu(1, &seq_payload_sized(128, 64));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("sequence parses");
-        let mut stream = obu(ObuType::FrameHeader, &keyframe_wide_payload());
-        stream.extend(obu(
-            ObuType::TileGroup,
-            &tile_group_2_payload(&[1, 2, 3, 4], &[5, 6]),
-        ));
+        let mut stream = obu(3, &keyframe_wide_payload());
+        stream.extend(obu(4, &tile_group_2_payload(&[1, 2, 3, 4], &[5, 6])));
         let bytes = Bytes::from(stream);
         frontend.ingest(&bytes).expect("frame parses");
         let pending = frontend.take_pending().expect("take").expect("wide frame");

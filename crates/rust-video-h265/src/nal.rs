@@ -181,6 +181,30 @@ pub fn is_cra_bla(nal_type: u8) -> bool {
     matches!(nal_type, 16..=18 | NAL_CRA)
 }
 
+/// True for BLA NAL types.
+#[must_use]
+pub fn is_bla(nal_type: u8) -> bool {
+    (16..=18).contains(&nal_type)
+}
+
+/// True for the CRA NAL type.
+#[must_use]
+pub fn is_cra(nal_type: u8) -> bool {
+    nal_type == NAL_CRA
+}
+
+/// True for RADL NAL types.
+#[must_use]
+pub fn is_radl(nal_type: u8) -> bool {
+    matches!(nal_type, 6 | 7)
+}
+
+/// True for sub-layer non-reference NAL types.
+#[must_use]
+pub fn is_slnr(nal_type: u8) -> bool {
+    matches!(nal_type, 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14)
+}
+
 /// Visible rectangle in luma samples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Crop {

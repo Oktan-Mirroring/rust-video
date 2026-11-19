@@ -1,33 +1,30 @@
-//! AV1 decode behind the caps `Decoder` trait.
+//! H.265 decode behind the caps `Decoder` trait.
 
-use crate::av1::frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
-use crate::av1::params::Params;
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
 use crate::decoder::{Emit, VaApiFrame};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
-use crate::ffi::VaSliceParameterBufferAv1;
+use crate::ffi::VaSliceParameterBufferHevc;
 use crate::frontend::SurfaceSlot;
+use crate::h265_frontend::{Frontend, PendingPicture, Picture};
+use crate::h265_params::Params;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
 
-/// Surface pool size: eight reference slots plus decode margin.
-const POOL_SIZE: usize = NUM_SLOTS + 4;
-
-/// AV1 decoder over a VA-API display.
+/// H.265 decoder over a VA-API display.
 ///
 /// Stays on its thread: the borrowed display is `Send` without
 /// `Sync`, so the borrow keeps the decoder off other threads.
-pub struct Av1Decoder<'a> {
+pub struct H265Decoder<'a> {
     /// Display owning the decode context.
     device: &'a VaApiDevice,
-    /// OBU frontend: frames ordered against the reference slots.
+    /// Annex B frontend: pictures ordered against the DPB.
     frontend: Frontend,
-    /// Live decode context, created from the first sequence header.
+    /// Live decode context, created from the first sequence set.
     backend: Option<Backend>,
     /// VRAM budget sized to the surface pool.
     shared: Option<SharedDevice>,
@@ -36,11 +33,17 @@ pub struct Av1Decoder<'a> {
     /// Decoded surfaces awaiting sync plus copy.
     pending: PendingQueue,
     /// Scratch slice parameters, reused across pictures.
-    slice_params: Vec<VaSliceParameterBufferAv1>,
+    slice_params: Vec<VaSliceParameterBufferHevc>,
+    /// Scratch list-zero indices, reused across slices.
+    list0: Vec<Option<usize>>,
+    /// Scratch list-one indices, reused across slices.
+    list1: Vec<Option<usize>>,
+    /// Scratch temporary list, reused across slices.
+    temp: Vec<Option<usize>>,
 }
 
-impl<'a> Av1Decoder<'a> {
-    /// Decoder over `device`; the context starts on the first sequence header.
+impl<'a> H265Decoder<'a> {
+    /// Decoder over `device`; the context starts on the first sequence set.
     #[must_use]
     pub fn open(device: &'a VaApiDevice) -> Self {
         Self {
@@ -51,6 +54,9 @@ impl<'a> Av1Decoder<'a> {
             generation: 0,
             pending: PendingQueue::new(PendingQueue::DEFAULT_DEPTH),
             slice_params: Vec::new(),
+            list0: Vec::new(),
+            list1: Vec::new(),
+            temp: Vec::new(),
         }
     }
 
@@ -76,7 +82,7 @@ impl<'a> Av1Decoder<'a> {
         self.device
     }
 
-    /// Live decode context, absent before the first sequence header.
+    /// Live decode context, absent before the first sequence set.
     ///
     /// The borrow ties the context to the decoder; see
     /// [`Backend`](crate::Backend) for the native handles behind it.
@@ -94,13 +100,13 @@ impl<'a> Av1Decoder<'a> {
         self.flush_inner(false)
     }
 
-    /// Submit gauges of the live context, absent before the first sequence header.
+    /// Submit gauges of the live context, absent before the first sequence set.
     #[must_use]
     pub fn submit_stats(&self) -> Option<crate::backend::SubmitStats> {
         self.backend.as_ref().map(Backend::stats)
     }
 
-    /// Phase timings of the live context, absent before the first sequence header.
+    /// Phase timings of the live context, absent before the first sequence set.
     #[must_use]
     pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
         self.backend.as_ref().map(Backend::phase_stats)
@@ -131,11 +137,23 @@ impl<'a> Av1Decoder<'a> {
         let mut ingest = self.frontend.ingest(&owned)?;
         let mut frames = Vec::new();
         if ingest.reconfigured() {
-            self.emit_all(&mut frames)?;
+            let drained = ingest.drained();
+            match (ingest.drained_size(), ingest.drained_crop()) {
+                (Some(size), Some(crop)) => {
+                    self.emit_all(&mut frames)?;
+                    self.read_immediate(drained, &mut frames, size, crop, readback)?;
+                }
+                _ if drained.is_empty() => {}
+                _ => {
+                    return Err(VaApiError::Parse(
+                        "reconfig dropped decoded pictures".to_owned(),
+                    ));
+                }
+            }
             self.maybe_drop_backend();
         }
-        for pending in ingest.frames() {
-            self.decode_frame(pending, &mut frames, readback)?;
+        for pending in ingest.pictures() {
+            self.decode_picture(pending, &mut frames, readback)?;
         }
         Ok(frames)
     }
@@ -143,64 +161,52 @@ impl<'a> Av1Decoder<'a> {
     /// Flush held frames, reading back pixels when `readback` holds.
     fn flush_inner(&mut self, readback: bool) -> Result<Vec<VaApiFrame>, VaApiError> {
         let mut frames = Vec::new();
-        if let Some(pending) = self.frontend.take_pending()? {
-            self.decode_frame(pending, &mut frames, readback)?;
+        if let Some(pending) = self.frontend.take_pending() {
+            self.decode_picture(pending, &mut frames, readback)?;
+        }
+        let drained = self.frontend.drain();
+        if !drained.is_empty() {
+            self.read_slots(drained, &mut frames, readback)?;
         }
         self.emit_all(&mut frames)?;
         Ok(frames)
     }
 
     /// Decode `pending` into `frames`.
-    fn decode_frame(
+    fn decode_picture(
         &mut self,
-        pending: PendingFrame,
+        pending: PendingPicture,
         frames: &mut Vec<VaApiFrame>,
         readback: bool,
     ) -> Result<(), VaApiError> {
         self.ensure_backend()?;
-        match self.frontend.begin(pending)? {
-            Begun::Existing { slot, size } => {
-                self.read_slots(vec![slot], frames, size, readback)?;
-            }
-            Begun::Picture(picture) => {
-                let picture = picture.as_ref();
-                let slot = self.acquire_pipelined(frames, None)?;
-                let display = if picture.header().film_grain_params.apply.apply_grain {
-                    Some(self.acquire_pipelined(frames, Some(slot.index()))?)
-                } else {
-                    None
-                };
-                self.submit_picture(picture, slot, display)?;
-                let size = (
-                    picture.header().render_width,
-                    picture.header().render_height,
-                );
-                let shown = picture.header().show.show_frame;
-                self.frontend.commit(picture, slot);
-                if shown {
-                    self.read_slots(vec![display.unwrap_or(slot)], frames, size, readback)?;
-                }
-            }
-        }
-        Ok(())
+        let Some((picture, bumped)) = self.frontend.begin(pending)? else {
+            return Ok(());
+        };
+        self.read_slots(bumped, frames, readback)?;
+        let slot = self.acquire_pipelined(frames)?;
+        self.submit_picture(&picture, slot)?;
+        let outputs = self.frontend.commit(picture, slot)?;
+        self.read_slots(outputs, frames, readback)
     }
 
-    /// Live context, creating it from the active sequence header.
+    /// Live context, creating it from the active sequence set.
     fn ensure_backend(&mut self) -> Result<(), VaApiError> {
         if self.backend.is_some() {
             return Ok(());
         }
-        let seq = self
+        let sps = self
             .frontend
-            .seq()
+            .sps()
             .cloned()
-            .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))?;
-        let profile = Params::profile(seq.seq_profile)?;
+            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+        let profile = Params::sps_profile(&sps)?;
         let (width, height) = self
             .frontend
             .coded_size()
-            .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))?;
-        let backend = Backend::open(self.device, profile, width, height, POOL_SIZE)?;
+            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+        let count = self.frontend.max_dpb_frames().unwrap_or(16) + 4;
+        let backend = Backend::open(self.device, profile, width, height, count)?;
         self.shared = Some(SharedDevice::new("vaapi", u64::MAX));
         self.backend = Some(backend);
         Ok(())
@@ -213,13 +219,13 @@ impl<'a> Av1Decoder<'a> {
         };
         let reuse = self
             .frontend
-            .seq()
+            .sps()
             .cloned()
-            .and_then(|seq| Params::profile(seq.seq_profile).ok())
+            .and_then(|sps| Params::sps_profile(&sps).ok())
             .is_some_and(|profile| {
                 profile == backend.profile()
                     && self.frontend.coded_size() == Some(backend.coded_size())
-                    && POOL_SIZE == backend.pool_size()
+                    && self.frontend.max_dpb_frames().unwrap_or(16) + 4 == backend.pool_size()
             });
         if reuse {
             log::debug!("va-api: reconfig reuses the surface pool");
@@ -229,17 +235,17 @@ impl<'a> Av1Decoder<'a> {
         }
     }
 
-    /// Free pool slot: neither reference-backed, nor `except`, nor leased.
+    /// Free pool slot: neither DPB-backed nor leased to a live frame.
     ///
-    /// `NoFreeSlot` when live frames pin every reference-free slot;
-    /// `DpbFull` when no slot is reference-free.
-    fn acquire_slot(&self, except: Option<u32>) -> Result<SurfaceSlot, VaApiError> {
+    /// `NoFreeSlot` when live frames pin every DPB-free slot;
+    /// `DpbFull` when no slot is DPB-free.
+    fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
         let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
         let mut pinned = false;
         for index in 0..end {
             let slot = SurfaceSlot::new(index);
-            if Some(slot.index()) == except || self.frontend.slot_in_use(slot.index()) {
+            if self.frontend.slot_in_use(slot.index()) {
                 continue;
             }
             if self
@@ -259,14 +265,13 @@ impl<'a> Av1Decoder<'a> {
         })
     }
 
-    /// Free pool slot past `except`, emitting staged reads when pinned.
+    /// Free pool slot, emitting staged reads when the pool is pinned.
     fn acquire_pipelined(
         &mut self,
         frames: &mut Vec<VaApiFrame>,
-        except: Option<u32>,
     ) -> Result<SurfaceSlot, VaApiError> {
         loop {
-            match self.acquire_slot(except) {
+            match self.acquire_slot() {
                 Ok(slot) => return Ok(slot),
                 Err(error) if self.pending.is_empty() => return Err(error),
                 Err(_) => self.emit_oldest(frames)?,
@@ -363,113 +368,125 @@ impl<'a> Av1Decoder<'a> {
         Ok(())
     }
 
-    /// Submit `picture` on `slot`, graining into `display` when present.
-    fn submit_picture(
-        &mut self,
-        picture: &Picture,
-        slot: SurfaceSlot,
-        display: Option<SurfaceSlot>,
-    ) -> Result<(), VaApiError> {
-        let backend = self
+    /// Submit `picture` on `slot`.
+    fn submit_picture(&mut self, picture: &Picture, slot: SurfaceSlot) -> Result<(), VaApiError> {
+        let surface = self
             .backend
             .as_ref()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence header".to_owned()))?;
-        let surface = backend
-            .surfaces()
-            .get(slot.index() as usize)
-            .copied()
+            .and_then(|backend| backend.surfaces().get(slot.index() as usize).copied())
             .ok_or_else(|| {
                 VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
             })?;
-        let shown = display.map_or(Ok(surface), |slot| {
-            backend
-                .surfaces()
-                .get(slot.index() as usize)
-                .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })
-        })?;
-        let params = Params::new(backend.surfaces());
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
+        let params = Params::new(self.frontend.dpb(), backend.surfaces());
         let picture_params = params.picture(
-            picture.seq(),
-            picture.header(),
-            picture.refs(),
+            picture.sps(),
+            picture.pps(),
+            picture.pic(),
+            picture.rps(),
             surface,
-            shown,
         )?;
+        let matrix = Params::matrix(picture.sps(), picture.pps());
         self.slice_params.clear();
-        let mut payloads: Vec<&[u8]> = Vec::new();
-        for group in picture.groups() {
-            for tile in group.tiles() {
-                let offset = usize::try_from(tile.offset)
-                    .map_err(|_| VaApiError::Parse("tile offset range".to_owned()))?;
-                let size = usize::try_from(tile.size)
-                    .map_err(|_| VaApiError::Parse("tile size range".to_owned()))?;
-                if offset + size > group.data().len() {
-                    return Err(VaApiError::Parse("tile outside payload".to_owned()));
-                }
-                payloads.push(&group.data()[offset..offset + size]);
-                self.slice_params.push(Params::slice(
-                    tile,
-                    0,
-                    u32::try_from(size)
-                        .map_err(|_| VaApiError::Parse("tile size range".to_owned()))?,
-                )?);
-            }
+        let slices = picture.slices();
+        for (index, slice) in slices.iter().enumerate() {
+            picture.rps().lists_into(
+                slice.header(),
+                slice.tail(),
+                &mut self.list0,
+                &mut self.list1,
+                &mut self.temp,
+            )?;
+            self.slice_params.push(params.slice(
+                slice,
+                &self.list0,
+                &self.list1,
+                index + 1 == slices.len(),
+            )?);
         }
-        if self.slice_params.is_empty() {
-            return Err(VaApiError::Parse("frame without tiles".to_owned()));
-        }
+        debug_assert_eq!(self.slice_params.len(), slices.len());
         let backend = self
             .backend
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
         backend.submit_slices(
             surface,
             bytes_of(&picture_params),
-            None,
+            matrix.as_ref().map(bytes_of),
             &self.slice_params,
-            |index| payloads[index],
+            |index| picture.slices()[index].data(),
         )
     }
 
-    /// Output frames for `slots` at `size` in order.
+    /// Output frames for `slots` in order.
     fn read_slots(
         &mut self,
         slots: Vec<SurfaceSlot>,
         frames: &mut Vec<VaApiFrame>,
+        readback: bool,
+    ) -> Result<(), VaApiError> {
+        let crop = self.crop()?;
+        let (_, _, width, height) = crop;
+        self.read_cropped(slots, frames, (width, height), crop, readback)
+    }
+
+    /// Output frames for `slots` under an explicit crop rectangle.
+    fn read_cropped(
+        &mut self,
+        slots: Vec<SurfaceSlot>,
+        frames: &mut Vec<VaApiFrame>,
         size: (u32, u32),
+        crop: (u32, u32, u32, u32),
         readback: bool,
     ) -> Result<(), VaApiError> {
         if readback && !slots.is_empty() {
-            self.stage_emit(slots, size, (0, 0, size.0, size.1))?;
+            self.stage_emit(slots, size, crop)?;
             return self.emit_ready(frames);
         }
+        self.read_immediate(slots, frames, size, crop, readback)
+    }
+
+    /// Output frames for `slots` now, syncing before the next submit.
+    fn read_immediate(
+        &mut self,
+        slots: Vec<SurfaceSlot>,
+        frames: &mut Vec<VaApiFrame>,
+        size: (u32, u32),
+        crop: (u32, u32, u32, u32),
+        readback: bool,
+    ) -> Result<(), VaApiError> {
         let (backend, shared) = self.active()?;
         self.generation = VaApiFrame::emit_into(
             self.device,
             backend,
             shared,
-            Emit::new(slots, size, (0, 0, size.0, size.1), readback),
+            Emit::new(slots, size, crop, readback),
             frames,
             self.generation,
         )?;
         Ok(())
     }
 
+    /// Visible rectangle of the active sequence.
+    fn crop(&self) -> Result<(u32, u32, u32, u32), VaApiError> {
+        self.frontend
+            .visible_rect()
+            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))
+    }
+
     /// Live context and budget.
     fn active(&self) -> Result<(&Backend, &SharedDevice), VaApiError> {
         match (self.backend.as_ref(), self.shared.as_ref()) {
             (Some(backend), Some(shared)) => Ok((backend, shared)),
-            _ => Err(VaApiError::Parse(
-                "decode before sequence header".to_owned(),
-            )),
+            _ => Err(VaApiError::Parse("decode before sequence set".to_owned())),
         }
     }
 }
 
-impl Decoder for Av1Decoder<'_> {
+impl Decoder for H265Decoder<'_> {
     type Frame = VaApiFrame;
     type Error = VaApiError;
 

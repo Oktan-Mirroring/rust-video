@@ -4,13 +4,16 @@
 //! counts per 8.2.1, builds and modifies reference lists per 8.2.4, and
 //! marks the DPB per 8.2.5. A VA-API backend submits finished pictures.
 
-use std::io::Cursor;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
-use crate::h264::dpb::{Dpb, ReferencePicLists};
-use crate::h264::parser::{MaxLongTermFrameIdx, Nalu, NaluType, Parser, Pps, SliceHeader, Sps};
-use crate::h264::picture::{Field, IsIdr, PictureData, Reference};
+use crate::h264::{
+    parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, split_nals,
+    BitReader, Gate, Marking, Mmco, PocType, Pps, RefMod, SliceHeader, SlicePoc, Sps,
+};
+use crate::h264_dpb::{Dpb, MaxLongTermFrameIdx, ReferencePicLists};
+use crate::h264_picture::{Field, IsIdr, PictureData, Reference};
 
 use bytes::Bytes;
 
@@ -42,6 +45,8 @@ pub struct PendingSlice {
     header: SliceHeader,
     /// NAL bytes past the start code, header byte included.
     data: Bytes,
+    /// Slice header size in bits, NAL header byte included.
+    bit_size: usize,
 }
 
 impl PendingSlice {
@@ -55,6 +60,22 @@ impl PendingSlice {
     #[must_use]
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Slice header size in bits, NAL header byte included.
+    #[must_use]
+    pub fn bit_size(&self) -> usize {
+        self.bit_size
+    }
+
+    /// Assembled slice for mapping tests.
+    #[cfg(test)]
+    pub(crate) fn assembled(header: SliceHeader, data_len: usize, bit_size: usize) -> Self {
+        Self {
+            header,
+            data: Bytes::from(vec![0xAA; data_len]),
+            bit_size,
+        }
     }
 }
 
@@ -164,8 +185,10 @@ impl Ingest {
 
 /// H.264 frontend: Annex B in, ordered pictures out.
 pub struct Frontend {
-    /// Bitstream parser with the active parameter sets.
-    parser: Parser,
+    /// Stored sequence sets by id.
+    sps_store: BTreeMap<u8, Rc<Sps>>,
+    /// Stored picture sets by id.
+    pps_store: BTreeMap<u8, Rc<Pps>>,
     /// Active sequence set.
     sps: Option<Rc<Sps>>,
     /// Decoded-picture buffer over surface slots.
@@ -193,7 +216,8 @@ impl Frontend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            parser: Parser::default(),
+            sps_store: BTreeMap::new(),
+            pps_store: BTreeMap::new(),
             sps: None,
             dpb: Dpb::default(),
             poc: PocTracker::default(),
@@ -222,15 +246,7 @@ impl Frontend {
     /// Visible rectangle as `(x, y, width, height)`, if a sequence is active.
     #[must_use]
     pub fn visible_rect(&self) -> Option<(u32, u32, u32, u32)> {
-        self.sps.as_ref().map(|sps| {
-            let rect = sps.visible_rectangle();
-            (
-                rect.min.x,
-                rect.min.y,
-                rect.max.x - rect.min.x,
-                rect.max.y - rect.min.y,
-            )
-        })
+        self.sps.as_ref().map(|sps| Self::visible_rect_of(sps))
     }
 
     /// Active sequence set.
@@ -242,7 +258,71 @@ impl Frontend {
     /// DPB frame capacity for the active sequence.
     #[must_use]
     pub fn max_dpb_frames(&self) -> Option<usize> {
-        self.sps.as_ref().map(|sps| sps.max_dpb_frames())
+        self.sps.as_ref().map(|sps| Self::max_dpb_frames_of(sps))
+    }
+
+    /// Visible rectangle of `sps` as `(x, y, width, height)`.
+    fn visible_rect_of(sps: &Sps) -> (u32, u32, u32, u32) {
+        let Some(crop) = sps.crop else {
+            return (0, 0, sps.width(), sps.height());
+        };
+        (
+            crop.left,
+            crop.top,
+            sps.width() - crop.left - crop.right,
+            sps.height() - crop.top - crop.bottom,
+        )
+    }
+
+    /// DPB frame capacity for `sps`, H.264 A.3.
+    fn max_dpb_frames_of(sps: &Sps) -> usize {
+        // Level 1b for Baseline and Main when level 1.1 carries constraint 3.
+        let level_1b = sps.level_idc == 11
+            && (sps.profile_idc == 66 || sps.profile_idc == 77)
+            && sps.constraints & 0x10 != 0;
+        // Table A.1 macroblock ceilings by level.
+        let max_dpb_mbs = if level_1b {
+            396
+        } else {
+            match sps.level_idc {
+                9 | 10 => 396,
+                11 => 900,
+                12 | 13 | 20 => 2376,
+                21 => 4752,
+                22 | 30 => 8100,
+                31 => 18000,
+                32 => 20480,
+                40 | 41 => 32768,
+                42 => 34816,
+                50 => 110_400,
+                51 | 52 => 184_320,
+                _ => 696_320,
+            }
+        };
+        let width_mb = sps.width() / 16;
+        let height_mb = sps.height() / 16;
+        let frames = std::cmp::min(max_dpb_mbs / (width_mb * height_mb), 16) as usize;
+        let mut frames = std::cmp::max(frames, sps.max_num_ref_frames as usize);
+        if let Some(buffering) = sps.vui.as_ref().and_then(|vui| vui.max_dec_frame_buffering) {
+            frames = std::cmp::max(1, buffering as usize);
+        }
+        frames
+    }
+
+    /// Reorder depth for `sps`: VUI value, else profile inference.
+    fn max_num_order_frames_of(sps: &Sps) -> u32 {
+        if let Some(reorder) = sps.vui.as_ref().and_then(|vui| vui.max_num_reorder_frames) {
+            return reorder;
+        }
+        if sps.profile_idc == 66 || sps.constraints & 0x40 != 0 {
+            return 0;
+        }
+        if matches!(sps.profile_idc, 44 | 86 | 100 | 110 | 122 | 244) && sps.constraints & 0x10 != 0
+        {
+            0
+        } else {
+            u32::try_from(Self::max_dpb_frames_of(sps)).unwrap_or(u32::MAX)
+        }
     }
 
     /// True when `index` backs a live DPB entry.
@@ -270,37 +350,30 @@ impl Frontend {
             drained_size: None,
             drained_crop: None,
         };
-        let mut cursor = Cursor::new(bytes.as_ref());
-        loop {
-            let Ok(nalu) = Nalu::next(&mut cursor) else {
-                if Self::start_code_ahead(&cursor) {
-                    return Err(VaApiError::Parse("broken nal unit".to_owned()));
-                }
-                break;
+        for nal in split_nals(bytes.as_ref()) {
+            let Some(&header) = nal.first() else {
+                continue;
             };
-            match nalu.header.type_ {
-                NaluType::Sps => {
-                    if self.adopt_sps(&nalu, &mut out)? {
+            let body = &nal[1..];
+            match header & 0x1F {
+                7 => {
+                    if self.adopt_sps(body, &mut out)? {
                         out.reconfigured = true;
                     }
                 }
-                NaluType::Pps => {
-                    self.parser.parse_pps(&nalu).map_err(VaApiError::Parse)?;
+                8 => {
+                    self.adopt_pps(body)?;
                 }
-                NaluType::Slice | NaluType::SliceIdr => {
-                    self.ingest_slice(nalu, bytes, &mut out.pictures)?;
+                1 | 5 => {
+                    self.ingest_slice(nal, body, header, bytes, &mut out.pictures)?;
                 }
-                NaluType::SliceDpa | NaluType::SliceDpb | NaluType::SliceDpc => {
+                2..=4 => {
                     return Err(VaApiError::Unsupported("slice partitions".to_owned()));
                 }
-                NaluType::SliceAux
-                | NaluType::SliceExt
-                | NaluType::SliceDepth
-                | NaluType::PrefixUnit
-                | NaluType::SubsetSps => {
+                14..=15 | 19..=21 => {
                     return Err(VaApiError::Unsupported("scalable/multiview nal".to_owned()));
                 }
-                NaluType::SeqEnd | NaluType::StreamEnd => {
+                10..=11 => {
                     if let Some(picture) = self.take_pending() {
                         out.pictures.push(picture);
                     }
@@ -334,16 +407,21 @@ impl Frontend {
         self.dpb.drain()
     }
 
-    /// Adopt `nalu` as the active sequence set.
+    /// Adopt RBSP `body` as the active sequence set.
     ///
     /// A changed set finishes the open picture, drains the DPB, and
     /// resets decode state; the return reports the change.
-    fn adopt_sps(&mut self, nalu: &Nalu, out: &mut Ingest) -> Result<bool, VaApiError> {
-        let sps = self
-            .parser
-            .parse_sps(nalu)
-            .map_err(VaApiError::Parse)?
-            .clone();
+    fn adopt_sps(&mut self, body: &[u8], out: &mut Ingest) -> Result<bool, VaApiError> {
+        let rbsp = rbsp(body);
+        let parsed = parse_sps::<VaApiError, Gate>(&rbsp)?;
+        let id = parsed.seq_parameter_set_id;
+        if self.sps_store.keys().len() >= 32 {
+            return Err(VaApiError::Parse(
+                "Broken data: Number of active SPSs > MAX_SPS_COUNT".to_owned(),
+            ));
+        }
+        let sps = Rc::new(parsed);
+        self.sps_store.insert(id, Rc::clone(&sps));
         if self.sps.as_ref().is_some_and(|active| **active == *sps) {
             return Ok(false);
         }
@@ -357,38 +435,85 @@ impl Frontend {
         self.poc = PocTracker::default();
         self.max_long_term_frame_idx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
         self.prev_ref_frame_num = None;
-        self.dpb
-            .set_limits(sps.max_dpb_frames(), sps.max_num_order_frames() as usize);
+        self.dpb.set_limits(
+            Self::max_dpb_frames_of(&sps),
+            Self::max_num_order_frames_of(&sps) as usize,
+        );
         self.sps = Some(sps);
         Ok(true)
+    }
+
+    /// Store the picture set in RBSP `body`.
+    fn adopt_pps(&mut self, body: &[u8]) -> Result<(), VaApiError> {
+        let rbsp = rbsp(body);
+        let (_, sps_id) = parse_pps_ids::<VaApiError>(&rbsp)?;
+        if sps_id > 31 {
+            return Err(VaApiError::Parse(format!(
+                "Value out of bounds: expected 0 - 31, got {sps_id}"
+            )));
+        }
+        let sps = self.sps_store.get(&sps_id).ok_or_else(|| {
+            VaApiError::Parse(format!(
+                "Could not get SPS for seq_parameter_set_id {sps_id}"
+            ))
+        })?;
+        let parsed = parse_pps::<VaApiError, Gate>(&rbsp, Some(sps))?;
+        let id = parsed.pic_parameter_set_id;
+        if self.pps_store.keys().len() >= 256 {
+            return Err(VaApiError::Parse(
+                "Broken Data: number of active PPSs > MAX_PPS_COUNT".to_owned(),
+            ));
+        }
+        self.pps_store.insert(id, Rc::new(parsed));
+        Ok(())
     }
 
     /// Append one slice NAL to the open picture.
     fn ingest_slice(
         &mut self,
-        nalu: Nalu<'_>,
+        nal: &[u8],
+        body: &[u8],
+        header: u8,
         bytes: &Bytes,
         pictures: &mut Vec<PendingPicture>,
     ) -> Result<(), VaApiError> {
-        let ref_idc = nalu.header.ref_idc;
-        let is_idr = nalu.header.idr_pic_flag;
-        let slice = self
-            .parser
-            .parse_slice_header(nalu)
-            .map_err(VaApiError::Parse)?;
-        if slice.header.redundant_pic_cnt > 0 {
+        let ref_idc = (header >> 5) & 3;
+        let is_idr = header & 0x1F == 5;
+        let rbsp = rbsp(body);
+        let mut reader = BitReader::new(&rbsp);
+        let prefix = parse_slice_prefix::<VaApiError>(&mut reader)?;
+        let pps_id = prefix.3;
+        let pps = self.pps_store.get(&pps_id).cloned().ok_or_else(|| {
+            VaApiError::Parse(format!(
+                "Could not get PPS for pic_parameter_set_id {pps_id}"
+            ))
+        })?;
+        let sps_cited = self.sps_store.get(&pps.seq_parameter_set_id);
+        let Some(sps_cited) = sps_cited else {
+            return Err(VaApiError::Parse(format!(
+                "Could not get PPS for pic_parameter_set_id {pps_id}"
+            )));
+        };
+        let parsed = parse_slice_rest::<VaApiError, Gate>(
+            &mut reader,
+            prefix,
+            is_idr,
+            ref_idc,
+            sps_cited,
+            &pps,
+        )?;
+        let header_bits = reader.position();
+        if parsed.num_ref_l0(&pps) > 15 || parsed.num_ref_l1(&pps) > 15 {
+            return Err(VaApiError::Parse("Broken Data".to_owned()));
+        }
+        if parsed.redundant_pic_cnt > 0 {
             return Ok(());
         }
         let sps = self
             .sps
             .clone()
             .ok_or_else(|| VaApiError::Parse("slice before sequence set".to_owned()))?;
-        let pps = self
-            .parser
-            .get_pps(slice.header.pic_parameter_set_id)
-            .cloned()
-            .ok_or_else(|| VaApiError::Parse("slice names unknown picture set".to_owned()))?;
-        let key = SliceKey::new(&slice.header, &sps, ref_idc, is_idr);
+        let key = SliceKey::new(&parsed, ref_idc, is_idr);
         if self
             .pending_key
             .as_ref()
@@ -403,14 +528,18 @@ impl Frontend {
             self.pending_sets = Some((sps, pps));
             self.pending_flags = Some((ref_idc, is_idr));
         }
-        let payload = slice.nalu.as_ref();
+        let mut payload = nal;
+        while payload.last().is_some_and(|byte| *byte == 0) {
+            payload = &payload[..payload.len() - 1];
+        }
         let base = bytes.as_ptr() as usize;
         let offset = payload.as_ptr() as usize - base;
         debug_assert!(offset + payload.len() <= bytes.len());
         let data = bytes.slice(offset..offset + payload.len());
         self.pending.push(PendingSlice {
-            header: slice.header,
+            header: parsed,
             data,
+            bit_size: header_bits + 8,
         });
         Ok(())
     }
@@ -421,27 +550,26 @@ impl Frontend {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the picture is interlaced, uses FMO, leaves
-    /// 8-bit 4:2:0, opens a frame-number gap the stream forbids, or
-    /// carries an unknown order-count type.
+    /// Returns `Err` when the picture leaves 8-bit 4:2:0, opens a
+    /// frame-number gap the stream forbids, or carries an unknown
+    /// order-count type.
     pub fn begin(
         &mut self,
         pending: PendingPicture,
     ) -> Result<(Picture, Vec<SurfaceSlot>), VaApiError> {
-        let mut pending = pending;
         let first = pending
             .slices
             .first()
             .ok_or_else(|| VaApiError::Parse("picture without slices".to_owned()))?;
-        Self::check_progressive(&pending.sps, &pending.pps, &first.header)?;
+        Self::check_progressive(&pending.sps)?;
         let mut pic = PictureData::default();
-        pic.pic_order_cnt_type = pending.sps.pic_order_cnt_type;
-        pic.pic_num = i32::from(first.header.frame_num);
-        pic.frame_num = u32::from(first.header.frame_num);
+        pic.pic_order_cnt_type = pending.sps.poc_type.id();
+        pic.pic_num = first.header.frame_num.cast_signed();
+        pic.frame_num = first.header.frame_num;
         pic.nal_ref_idc = pending.nal_ref_idc;
         pic.is_idr = if pending.is_idr {
             IsIdr::Yes {
-                idr_pic_id: first.header.idr_pic_id,
+                idr_pic_id: first.header.idr_pic_id.unwrap_or(0),
             }
         } else {
             IsIdr::No
@@ -452,21 +580,21 @@ impl Frontend {
         } else {
             Reference::ShortTerm
         });
-        match pending.sps.pic_order_cnt_type {
-            0 => {
-                pic.pic_order_cnt_lsb = i32::from(first.header.pic_order_cnt_lsb);
-                pic.delta_pic_order_cnt_bottom = first.header.delta_pic_order_cnt_bottom;
+        match first.header.poc {
+            SlicePoc::Lsb(lsb, bottom) => {
+                pic.pic_order_cnt_lsb = lsb.cast_signed();
+                pic.delta_pic_order_cnt_bottom = bottom;
             }
-            1 => {
-                pic.delta_pic_order_cnt0 = first.header.delta_pic_order_cnt[0];
-                pic.delta_pic_order_cnt1 = first.header.delta_pic_order_cnt[1];
+            SlicePoc::Deltas(first, second) => {
+                pic.delta_pic_order_cnt0 = first;
+                pic.delta_pic_order_cnt1 = second.unwrap_or(0);
             }
-            _ => {}
+            SlicePoc::None => {}
         }
-        pic.ref_pic_marking = std::mem::take(&mut pending.slices[0].header.dec_ref_pic_marking);
+        pic.ref_pic_marking = pending.slices[0].header.marking.clone();
         self.dpb.set_limits(
-            pending.sps.max_dpb_frames(),
-            pending.sps.max_num_order_frames() as usize,
+            Self::max_dpb_frames_of(&pending.sps),
+            Self::max_num_order_frames_of(&pending.sps) as usize,
         );
         let bumped = self.bridge_gap(&pending.sps, &pic)?;
         self.poc.derive(&mut pic, &pending.sps)?;
@@ -485,46 +613,41 @@ impl Frontend {
         ))
     }
 
-    /// Reference lists for one slice, rebuilt in `out` without allocating.
+    /// Reference list for one slice, rebuilt in `list` without allocating.
+    ///
+    /// `list` enters holding the initial list and leaves holding the
+    /// modified one.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a modification command names a picture the
-    /// DPB cannot supply, or uses multiview commands.
+    /// DPB cannot supply.
     pub fn modify_into(
         &self,
         header: &SliceHeader,
-        initial: &[usize],
+        pps: &Pps,
         second: bool,
         curr_pic_num: i32,
         max_pic_num: i32,
-        out: &mut Vec<usize>,
+        list: &mut Vec<usize>,
     ) -> Result<(), VaApiError> {
-        let (flag, active, mods) = if second {
-            (
-                header.list_modification.l1,
-                header.num_ref_idx_l1_active_minus1,
-                &header.ref_pic_list_modification_l1,
-            )
+        let (active, mods) = if second {
+            (header.num_ref_l1(pps), &header.ref_mod_l1)
         } else {
-            (
-                header.list_modification.l0,
-                header.num_ref_idx_l0_active_minus1,
-                &header.ref_pic_list_modification_l0,
-            )
+            (header.num_ref_l0(pps), &header.ref_mod_l0)
         };
-        out.clear();
-        out.extend(initial.iter().copied().take(active as usize + 1));
-        if !flag {
+        list.truncate(active as usize + 1);
+        if mods.is_empty() {
             return Ok(());
         }
         let mut pred = curr_pic_num;
         let mut ref_idx = 0usize;
         for modification in mods {
-            match modification.modification_of_pic_nums_idc {
-                0 | 1 => {
-                    let step = i64::from(modification.abs_diff_pic_num_minus1) + 1;
-                    let nowrap = if modification.modification_of_pic_nums_idc == 0 {
+            match *modification {
+                RefMod::ShortBelow(diff) | RefMod::ShortAbove(diff) => {
+                    let below = matches!(*modification, RefMod::ShortBelow(_));
+                    let step = i64::from(diff) + 1;
+                    let nowrap = if below {
                         let raw = i64::from(pred) - step;
                         if raw < 0 {
                             raw + i64::from(max_pic_num)
@@ -559,7 +682,7 @@ impl Frontend {
                         .ok_or_else(|| {
                             VaApiError::BrokenReference(format!("short-term {num} absent"))
                         })?;
-                    Self::shift_insert(out, ref_idx, position, active, |index| {
+                    Self::shift_insert(list, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
                             .pic
                             .borrow()
@@ -568,8 +691,7 @@ impl Frontend {
                     })?;
                     ref_idx += 1;
                 }
-                2 => {
-                    let num = modification.long_term_pic_num;
+                RefMod::Long(num) => {
                     let position = self
                         .dpb
                         .entries()
@@ -583,7 +705,7 @@ impl Frontend {
                             VaApiError::BrokenReference(format!("long-term {num} absent"))
                         })?;
                     let cap = self.max_long_term_frame_idx;
-                    Self::shift_insert(out, ref_idx, position, active, |index| {
+                    Self::shift_insert(list, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
                             .pic
                             .borrow()
@@ -592,13 +714,9 @@ impl Frontend {
                     })?;
                     ref_idx += 1;
                 }
-                3 => break,
-                idc => {
-                    return Err(VaApiError::Unsupported(format!("list modification {idc}")));
-                }
             }
         }
-        out.truncate(active as usize + 1);
+        list.truncate(active as usize + 1);
         Ok(())
     }
 
@@ -621,13 +739,20 @@ impl Frontend {
         let mut outputs = Vec::new();
         let is_idr = matches!(pic.is_idr, IsIdr::Yes { .. });
         if is_idr {
-            if pic.ref_pic_marking.no_output_of_prior_pics_flag {
+            let (no_output, long_term) = match pic.ref_pic_marking {
+                Marking::Idr {
+                    no_output,
+                    long_term,
+                } => (no_output, long_term),
+                _ => (false, false),
+            };
+            if no_output {
                 self.dpb.clear();
             } else {
                 outputs.extend(self.drain());
             }
             self.dpb.mark_all_as_unused_for_ref();
-            if pic.ref_pic_marking.long_term_reference_flag {
+            if long_term {
                 pic.set_reference(Reference::LongTerm);
                 pic.long_term_frame_idx = 0;
                 self.max_long_term_frame_idx = MaxLongTermFrameIdx::Idx(0);
@@ -636,40 +761,36 @@ impl Frontend {
                 self.max_long_term_frame_idx = MaxLongTermFrameIdx::NoLongTermFrameIndices;
             }
         } else if pic.nal_ref_idc != 0 {
-            if pic.ref_pic_marking.adaptive_ref_pic_marking_mode_flag {
-                let markings = std::mem::take(&mut pic.ref_pic_marking);
-                for marking in &markings.inner {
-                    match marking.memory_management_control_operation {
-                        0 => break,
-                        1 => self
-                            .dpb
-                            .mmco_op_1(&pic, marking)
-                            .map_err(|error| Self::broken(&error))?,
-                        2 => self
-                            .dpb
-                            .mmco_op_2(marking)
-                            .map_err(|error| Self::broken(&error))?,
-                        3 => self
-                            .dpb
-                            .mmco_op_3(&pic, marking)
-                            .map_err(|error| Self::broken(&error))?,
-                        4 => {
-                            self.max_long_term_frame_idx = self.dpb.mmco_op_4(marking);
-                        }
-                        5 => {
-                            self.max_long_term_frame_idx = self.dpb.mmco_op_5(&mut pic);
-                        }
-                        6 => self.dpb.mmco_op_6(&mut pic, marking),
-                        operation => {
-                            return Err(VaApiError::BrokenReference(format!(
-                                "unknown mmco {operation}"
-                            )));
+            match std::mem::replace(&mut pic.ref_pic_marking, Marking::Silent) {
+                Marking::Adaptive(ops) => {
+                    for op in &ops {
+                        match *op {
+                            Mmco::ForgetShort(diff) => self
+                                .dpb
+                                .mmco_op_1(&pic, diff)
+                                .map_err(|error| Self::broken(&error))?,
+                            Mmco::ForgetLong(num) => self
+                                .dpb
+                                .mmco_op_2(num)
+                                .map_err(|error| Self::broken(&error))?,
+                            Mmco::ShortToLong(diff, idx) => self
+                                .dpb
+                                .mmco_op_3(&pic, diff, idx)
+                                .map_err(|error| Self::broken(&error))?,
+                            Mmco::SetMaxLong(plus1) => {
+                                self.max_long_term_frame_idx = self.dpb.mmco_op_4(plus1);
+                            }
+                            Mmco::MarkAllUnused => {
+                                self.max_long_term_frame_idx = self.dpb.mmco_op_5(&mut pic);
+                            }
+                            Mmco::CurrentToLong(idx) => self.dpb.mmco_op_6(&mut pic, idx),
                         }
                     }
+                    pic.ref_pic_marking = Marking::Adaptive(ops);
                 }
-                pic.ref_pic_marking = markings;
-            } else {
-                self.dpb.sliding_window_marking(&picture.sps);
+                _ => {
+                    self.dpb.sliding_window_marking(&picture.sps);
+                }
             }
             if !matches!(pic.reference(), Reference::LongTerm) {
                 pic.set_reference(Reference::ShortTerm);
@@ -692,7 +813,7 @@ impl Frontend {
         } else {
             outputs.push(slot);
         }
-        if picture.sps.max_num_order_frames() == 0 {
+        if Self::max_num_order_frames_of(&picture.sps) == 0 {
             // No-reorder stream: output order matches decode order,
             // and every earlier commit drained its ready pictures,
             // so the just-stored picture emits now, in order.
@@ -718,7 +839,7 @@ impl Frontend {
         if pic.frame_num == previous || pic.frame_num == expected {
             return Ok(bumped);
         }
-        if !sps.gaps_in_frame_num_value_allowed_flag {
+        if !sps.gaps_allowed {
             return Err(VaApiError::Unsupported(format!(
                 "frame_num gap {} -> {}",
                 previous, pic.frame_num
@@ -727,7 +848,7 @@ impl Frontend {
         let mut unused = expected;
         while unused != pic.frame_num {
             let mut gap = PictureData::new_non_existing(unused, self.stamp());
-            if sps.pic_order_cnt_type != 0 {
+            if !matches!(sps.poc_type, PocType::Lsb) {
                 self.poc.derive(&mut gap, sps)?;
             }
             self.dpb.update_pic_nums(unused, max_frame_num, &gap);
@@ -763,24 +884,18 @@ impl Frontend {
         stamp
     }
 
-    /// Reject streams outside progressive 8-bit 4:2:0 without FMO.
-    fn check_progressive(sps: &Sps, pps: &Pps, header: &SliceHeader) -> Result<(), VaApiError> {
-        if header.field != Field::Frame {
-            return Err(VaApiError::Unsupported("interlaced".to_owned()));
-        }
-        if pps.num_slice_groups_minus1 > 0 {
-            return Err(VaApiError::Unsupported("fmo".to_owned()));
-        }
-        if sps.chroma.separate_plane {
-            return Err(VaApiError::Unsupported("separate colour planes".to_owned()));
-        }
-        if sps.chroma.idc != 1 {
+    /// Reject streams outside 8-bit 4:2:0.
+    ///
+    /// Interlaced, FMO, and separate-plane streams never reach here:
+    /// the grammar and the gate decline them at ingest.
+    fn check_progressive(sps: &Sps) -> Result<(), VaApiError> {
+        if sps.fidelity.chroma_format_idc != 1 {
             return Err(VaApiError::Unsupported(format!(
                 "chroma {}",
-                sps.chroma.idc
+                sps.fidelity.chroma_format_idc
             )));
         }
-        if sps.bit_depth.luma_minus8 != 0 || sps.bit_depth.chroma_minus8 != 0 {
+        if sps.fidelity.bit_depth_luma_minus8 != 0 || sps.fidelity.bit_depth_chroma_minus8 != 0 {
             return Err(VaApiError::Unsupported("high bit depth".to_owned()));
         }
         Ok(())
@@ -816,17 +931,8 @@ impl Frontend {
     }
 
     /// Marking failure as a broken reference list.
-    fn broken(error: &crate::h264::dpb::MmcoError) -> VaApiError {
+    fn broken(error: &crate::h264_dpb::MmcoError) -> VaApiError {
         VaApiError::BrokenReference(error.to_string())
-    }
-
-    /// True when a start code remains in `cursor`.
-    fn start_code_ahead(cursor: &Cursor<&[u8]>) -> bool {
-        let position = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
-        cursor
-            .get_ref()
-            .get(position..)
-            .is_some_and(|tail| tail.windows(3).any(|window| window == [0x00, 0x00, 0x01]))
     }
 }
 
@@ -840,41 +946,29 @@ impl Default for Frontend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SliceKey {
     /// Slice frame number.
-    frame_num: u16,
+    frame_num: u32,
     /// Picture set id.
     pps_id: u8,
-    /// Coded field.
-    field: Field,
     /// Whether the NAL reference flag is zero.
     nal_ref_zero: bool,
-    /// Order-count lsb.
-    pic_order_cnt_lsb: u16,
-    /// Bottom-field order delta.
-    delta_pic_order_cnt_bottom: i32,
-    /// Order-count deltas.
-    delta_pic_order_cnt: [i32; 2],
+    /// Picture order count syntax.
+    poc: SlicePoc,
     /// IDR flag.
     idr: bool,
-    /// IDR id.
-    idr_pic_id: u16,
-    /// Order-count type.
-    pic_order_cnt_type: u8,
+    /// IDR id, present on IDR slices.
+    idr_pic_id: Option<u16>,
 }
 
 impl SliceKey {
-    /// Key for `header` under `sps`.
-    fn new(header: &SliceHeader, sps: &Sps, nal_ref_idc: u8, idr: bool) -> Self {
+    /// Key for `header` with its NAL flags.
+    fn new(header: &SliceHeader, nal_ref_idc: u8, idr: bool) -> Self {
         Self {
             frame_num: header.frame_num,
-            pps_id: header.pic_parameter_set_id,
-            field: header.field,
+            pps_id: header.pps_id,
             nal_ref_zero: nal_ref_idc == 0,
-            pic_order_cnt_lsb: header.pic_order_cnt_lsb,
-            delta_pic_order_cnt_bottom: header.delta_pic_order_cnt_bottom,
-            delta_pic_order_cnt: header.delta_pic_order_cnt,
+            poc: header.poc,
             idr,
             idr_pic_id: header.idr_pic_id,
-            pic_order_cnt_type: sps.pic_order_cnt_type,
         }
     }
 
@@ -882,17 +976,10 @@ impl SliceKey {
     fn opens_new_picture(&self, other: &Self) -> bool {
         self.frame_num != other.frame_num
             || self.pps_id != other.pps_id
-            || self.field != other.field
             || self.nal_ref_zero != other.nal_ref_zero
-            || (self.pic_order_cnt_type == 0
-                && other.pic_order_cnt_type == 0
-                && (self.pic_order_cnt_lsb != other.pic_order_cnt_lsb
-                    || self.delta_pic_order_cnt_bottom != other.delta_pic_order_cnt_bottom))
-            || (self.pic_order_cnt_type == 1
-                && other.pic_order_cnt_type == 1
-                && self.delta_pic_order_cnt != other.delta_pic_order_cnt)
+            || self.poc != other.poc
             || self.idr != other.idr
-            || (self.idr && other.idr && self.idr_pic_id != other.idr_pic_id)
+            || self.idr_pic_id != other.idr_pic_id
     }
 }
 
@@ -957,7 +1044,7 @@ impl PocTracker {
     /// Type-0 counts per 8.2.1.1.
     fn derive_type0(&self, pic: &mut PictureData, sps: &Sps, is_idr: bool) {
         let base = self.type0_base(is_idr);
-        let max_lsb = 1 << (u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4);
+        let max_lsb = 1 << (u32::from(sps.log2_max_poc_lsb_minus4) + 4);
         let lsb = pic.pic_order_cnt_lsb;
         pic.pic_order_cnt_msb = if lsb < base.1 && base.1 - lsb >= max_lsb / 2 {
             base.0 + max_lsb
@@ -978,7 +1065,7 @@ impl PocTracker {
         is_idr: bool,
     ) -> Result<(), VaApiError> {
         pic.frame_num_offset = self.frame_num_offset(pic, sps, is_idr);
-        let cycle = u64::from(sps.num_ref_frames_in_pic_order_cnt_cycle);
+        let cycle = u64::from(sps.cycle);
         let mut absolute = if cycle == 0 {
             0
         } else {
@@ -995,19 +1082,19 @@ impl PocTracker {
             let in_cycle = usize::try_from((absolute - 1) % cycle).unwrap_or(0);
             let cycles = i64::try_from((absolute - 1) / cycle)
                 .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
-            expected = cycles * i64::from(sps.expected_delta_per_pic_order_cnt_cycle);
-            for offset in sps.offset_for_ref_frame.iter().take(in_cycle + 1) {
+            expected = cycles * i64::from(sps.expected_delta);
+            for offset in sps.cycle_offsets.iter().take(in_cycle + 1) {
                 expected += i64::from(*offset);
             }
         }
         if pic.nal_ref_idc == 0 {
-            expected += i64::from(sps.offset_for_non_ref_pic);
+            expected += i64::from(sps.offset_non_ref);
         }
         pic.top_field_order_cnt = i32::try_from(expected + i64::from(pic.delta_pic_order_cnt0))
             .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
         pic.bottom_field_order_cnt = i32::try_from(
             i64::from(pic.top_field_order_cnt)
-                + i64::from(sps.offset_for_top_to_bottom_field)
+                + i64::from(sps.offset_top_bottom)
                 + i64::from(pic.delta_pic_order_cnt1),
         )
         .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
@@ -1115,37 +1202,18 @@ impl PocTracker {
 mod tests {
     use std::rc::Rc;
 
+    use rust_video_h264::VuiParams;
+
     use super::{Frontend, Picture, PocTracker, SliceKey, SurfaceSlot};
     use crate::error::VaApiError;
-    use crate::h264::dpb::ReferencePicLists;
-    use crate::h264::parser::{
-        BitstreamRestriction, ChromaFormat, FrameFieldCoding, Level, ListModificationFlags,
-        PpsBuilder, RefPicListModification, RefPicMarking, SliceHeader, Sps, VuiParams,
+    use crate::h264::{Marking, PocType, RefMod, SliceHeader, SlicePoc, SliceType, Sps};
+    use crate::h264_dpb::ReferencePicLists;
+    use crate::h264_fixture::{
+        annexed, idr_slice_body, p_slice_body, pps, pps_body, slice_header, sps, sps_body,
     };
-    use crate::h264::picture::{IsIdr, PictureData, Reference};
+    use crate::h264_picture::{IsIdr, PictureData, Reference};
 
-    /// Sequence set for 1080p, order-count type `poc_type`.
-    fn sps(poc_type: u8) -> Sps {
-        Sps {
-            profile_idc: 100,
-            level_idc: Level::L4,
-            chroma: ChromaFormat {
-                idc: 1,
-                ..Default::default()
-            },
-            pic_width_in_mbs_minus1: 119,
-            pic_height_in_map_units_minus1: 67,
-            frame_field: FrameFieldCoding {
-                frame_mbs_only: true,
-                ..Default::default()
-            },
-            log2_max_frame_num_minus4: 0,
-            pic_order_cnt_type: poc_type,
-            log2_max_pic_order_cnt_lsb_minus4: 0,
-            max_num_ref_frames: 4,
-            ..Sps::default()
-        }
-    }
+    use bytes::Bytes;
 
     /// Picture with `frame_num`, reference flag, and order inputs.
     fn picture(frame_num: u32, nal_ref_idc: u8) -> PictureData {
@@ -1166,16 +1234,16 @@ mod tests {
     /// Committable picture over `sps` with `frame_num` and IDR flag.
     fn committable(sps: &Rc<Sps>, frame_num: u32, idr: bool) -> Picture {
         let mut pic = picture(frame_num, 1);
-        pic.pic_order_cnt_type = sps.pic_order_cnt_type;
+        pic.pic_order_cnt_type = sps.poc_type.id();
         if idr {
             pic.is_idr = IsIdr::Yes { idr_pic_id: 0 };
             pic.frame_num = 0;
         }
-        pic.ref_pic_marking = RefPicMarking::default();
+        pic.ref_pic_marking = Marking::Silent;
         Picture {
             pic,
             sps: sps.clone(),
-            pps: PpsBuilder::new(sps.clone()).build(),
+            pps: Rc::new(pps()),
             slices: Vec::new(),
             initial: ReferencePicLists::default(),
         }
@@ -1183,7 +1251,7 @@ mod tests {
 
     #[test]
     fn poc_type0_counts_lsb_and_delta() {
-        let sps = sps(0);
+        let sps = sps(PocType::Lsb);
         let mut tracker = PocTracker::default();
         let mut idr = picture(0, 1);
         idr.is_idr = IsIdr::Yes { idr_pic_id: 0 };
@@ -1210,8 +1278,8 @@ mod tests {
 
     #[test]
     fn poc_type0_wraps_msb() {
-        let mut base = sps(0);
-        base.log2_max_pic_order_cnt_lsb_minus4 = 1;
+        let mut base = sps(PocType::Lsb);
+        base.log2_max_poc_lsb_minus4 = 1;
         let sps = base;
         let mut tracker = PocTracker::default();
 
@@ -1237,11 +1305,11 @@ mod tests {
 
     #[test]
     fn poc_type1_sums_cycle_offsets_to_position() {
-        let mut sps = sps(1);
-        sps.num_ref_frames_in_pic_order_cnt_cycle = 2;
-        sps.offset_for_ref_frame[0] = 2;
-        sps.offset_for_ref_frame[1] = 2;
-        sps.expected_delta_per_pic_order_cnt_cycle = 4;
+        let mut sps = sps(PocType::Delta);
+        sps.cycle = 2;
+        sps.cycle_offsets[0] = 2;
+        sps.cycle_offsets[1] = 2;
+        sps.expected_delta = 4;
         let mut tracker = PocTracker::default();
 
         let mut idr = picture(0, 1);
@@ -1264,7 +1332,7 @@ mod tests {
 
     #[test]
     fn poc_type2_counts_double_frame_num() {
-        let sps = sps(2);
+        let sps = sps(PocType::FrameNum);
         let mut tracker = PocTracker::default();
         let mut idr = picture(0, 1);
         idr.pic_order_cnt_type = 2;
@@ -1289,7 +1357,7 @@ mod tests {
 
     #[test]
     fn poc_rejects_unknown_type() {
-        let sps = sps(0);
+        let sps = sps(PocType::Lsb);
         let mut tracker = PocTracker::default();
         let mut pic = picture(0, 1);
         pic.pic_order_cnt_type = 3;
@@ -1301,21 +1369,20 @@ mod tests {
 
     #[test]
     fn slice_key_splits_on_clause_fields() {
-        let sps = sps(0);
-        let header = SliceHeader::default();
-        let open = SliceKey::new(&header, &sps, 1, false);
+        let header = slice_header();
+        let open = SliceKey::new(&header, 1, false);
         assert!(!open.opens_new_picture(&open));
 
         let mut changed = header.clone();
         changed.frame_num = 1;
-        assert!(open.opens_new_picture(&SliceKey::new(&changed, &sps, 1, false)));
+        assert!(open.opens_new_picture(&SliceKey::new(&changed, 1, false)));
 
         let mut changed = header.clone();
-        changed.pic_order_cnt_lsb = 2;
-        assert!(open.opens_new_picture(&SliceKey::new(&changed, &sps, 1, false)));
+        changed.poc = SlicePoc::Lsb(2, 0);
+        assert!(open.opens_new_picture(&SliceKey::new(&changed, 1, false)));
 
-        assert!(open.opens_new_picture(&SliceKey::new(&header, &sps, 0, false)));
-        assert!(open.opens_new_picture(&SliceKey::new(&header, &sps, 1, true)));
+        assert!(open.opens_new_picture(&SliceKey::new(&header, 0, false)));
+        assert!(open.opens_new_picture(&SliceKey::new(&header, 1, true)));
     }
 
     #[test]
@@ -1334,7 +1401,7 @@ mod tests {
 
     /// Frontend with two short-term refs of picnums 5 and 3.
     fn frontend_with_refs() -> (Frontend, Rc<Sps>) {
-        let sps = Rc::new(sps(0));
+        let sps = Rc::new(sps(PocType::Lsb));
         let mut frontend = Frontend::new();
         frontend.dpb.set_limits(16, 16);
         for (frame_num, slot) in [(5, 0), (3, 1)] {
@@ -1354,29 +1421,15 @@ mod tests {
     #[test]
     fn modify_reorders_short_term_to_front() {
         let (frontend, _) = frontend_with_refs();
-        let initial = vec![0usize, 1];
+        let mut pic = pps();
+        pic.num_ref_l0 = 1;
         let header = SliceHeader {
-            list_modification: ListModificationFlags {
-                l0: true,
-                ..Default::default()
-            },
-            num_ref_idx_l0_active_minus1: 1,
-            ref_pic_list_modification_l0: vec![
-                RefPicListModification {
-                    modification_of_pic_nums_idc: 0,
-                    abs_diff_pic_num_minus1: 3,
-                    ..Default::default()
-                },
-                RefPicListModification {
-                    modification_of_pic_nums_idc: 3,
-                    ..Default::default()
-                },
-            ],
-            ..SliceHeader::default()
+            ref_mod_l0: vec![RefMod::ShortBelow(3)],
+            ..slice_header()
         };
-        let mut list = Vec::new();
+        let mut list = vec![0usize, 1];
         frontend
-            .modify_into(&header, &initial, false, 7, 16, &mut list)
+            .modify_into(&header, &pic, false, 7, 16, &mut list)
             .expect("reorder");
         assert_eq!(list, vec![1, 0]);
     }
@@ -1385,31 +1438,25 @@ mod tests {
     fn modify_reports_absent_reference() {
         let (frontend, _) = frontend_with_refs();
         let header = SliceHeader {
-            list_modification: ListModificationFlags {
-                l0: true,
-                ..Default::default()
-            },
-            ref_pic_list_modification_l0: vec![RefPicListModification {
-                modification_of_pic_nums_idc: 0,
-                abs_diff_pic_num_minus1: 0,
-                ..Default::default()
-            }],
-            ..SliceHeader::default()
+            ref_mod_l0: vec![RefMod::ShortBelow(0)],
+            ..slice_header()
         };
-        let mut list = Vec::new();
+        let mut list = vec![0usize, 1];
         assert!(matches!(
-            frontend.modify_into(&header, &[0, 1], false, 7, 16, &mut list),
+            frontend.modify_into(&header, &pps(), false, 7, 16, &mut list),
             Err(VaApiError::BrokenReference(_))
         ));
     }
 
     #[test]
     fn commit_slides_window_past_one_ref() {
-        let mut sps = sps(0);
+        let mut sps = sps(PocType::Lsb);
         sps.max_num_ref_frames = 1;
         let sps = Rc::new(sps);
         let mut frontend = Frontend::new();
-        frontend.dpb.set_limits(sps.max_dpb_frames(), 16);
+        frontend
+            .dpb
+            .set_limits(Frontend::max_dpb_frames_of(&sps), 16);
 
         let idr = committable(&sps, 0, true);
         assert_eq!(
@@ -1433,7 +1480,7 @@ mod tests {
 
     #[test]
     fn commit_emits_bumping_in_output_order() {
-        let mut sps = sps(0);
+        let mut sps = sps(PocType::Lsb);
         sps.max_num_ref_frames = 2;
         let sps = Rc::new(sps);
         let mut frontend = Frontend::new();
@@ -1465,24 +1512,108 @@ mod tests {
 
     /// Sequence set signalling zero reorder frames through the VUI.
     fn sps_no_reorder() -> Sps {
-        let mut sps = sps(0);
+        let mut sps = sps(PocType::Lsb);
         sps.vui = Some(VuiParams {
-            restriction: Some(BitstreamRestriction {
-                max_num_reorder_frames: 0,
-                max_dec_frame_buffering: 4,
-                ..Default::default()
-            }),
+            max_num_reorder_frames: Some(0),
+            max_dec_frame_buffering: Some(4),
             ..Default::default()
         });
         sps
     }
 
+    /// Annex B stream with sets followed by `slices`.
+    fn stream(slices: &[(u8, Vec<u8>)]) -> Bytes {
+        let mut bytes = annexed(0x67, &sps_body(0));
+        bytes.extend(annexed(0x68, &pps_body()));
+        for (header, body) in slices {
+            bytes.extend(annexed(*header, body));
+        }
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn ingest_groups_slices_into_pictures() {
+        let mut frontend = Frontend::new();
+        let bytes = stream(&[(0x65, idr_slice_body()), (0x41, p_slice_body())]);
+        let mut ingest = frontend.ingest(&bytes).expect("slices parse");
+        let pictures = ingest.pictures();
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].slices.len(), 1);
+        assert_eq!(pictures[0].slices[0].header.slice_type, SliceType::I);
+        assert_eq!(pictures[0].slices[0].header.frame_num, 0);
+        let pending = frontend.take_pending().expect("open p picture");
+        assert_eq!(pending.slices.len(), 1);
+        assert_eq!(pending.slices[0].header.slice_type, SliceType::P);
+        assert_eq!(pending.slices[0].header.frame_num, 1);
+        assert!(frontend.take_pending().is_none());
+    }
+
+    #[test]
+    fn ingest_joins_same_picture_slices() {
+        let mut frontend = Frontend::new();
+        let bytes = stream(&[(0x41, p_slice_body()), (0x41, p_slice_body())]);
+        let mut ingest = frontend.ingest(&bytes).expect("slices parse");
+        assert_eq!(ingest.pictures().len(), 0);
+        let pending = frontend.take_pending().expect("open picture");
+        assert_eq!(pending.slices.len(), 2);
+    }
+
+    #[test]
+    fn ingest_declines_partitions_typed() {
+        let mut frontend = Frontend::new();
+        let bytes = stream(&[(0x42, vec![0xFF])]);
+        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
+            panic!("partitions decline");
+        };
+        assert_eq!(message, "slice partitions");
+    }
+
+    #[test]
+    fn ingest_rejects_slice_without_sets() {
+        let mut frontend = Frontend::new();
+        let bytes = Bytes::from(annexed(0x65, &idr_slice_body()));
+        let Err(VaApiError::Parse(message)) = frontend.ingest(&bytes) else {
+            panic!("slice without sets fails");
+        };
+        assert!(message.contains("Could not get PPS"));
+    }
+
+    #[test]
+    fn ingest_completes_on_end_and_ignores_delimiter() {
+        let mut frontend = Frontend::new();
+        let mut bytes = stream(&[(0x65, idr_slice_body())]);
+        let mut raw = bytes.to_vec();
+        raw.extend(annexed(0x09, &[]));
+        raw.extend(annexed(0x0A, &[]));
+        bytes = Bytes::from(raw);
+        let mut ingest = frontend.ingest(&bytes).expect("stream parses");
+        let pictures = ingest.pictures();
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].slices.len(), 1);
+        assert!(frontend.take_pending().is_none());
+    }
+
+    #[test]
+    fn ingest_reconfigures_on_sequence_change() {
+        let mut frontend = Frontend::new();
+        let bytes = stream(&[(0x65, idr_slice_body())]);
+        frontend.ingest(&bytes).expect("first sequence");
+        assert_eq!(frontend.coded_size(), Some((320, 240)));
+        let bytes = Bytes::from(annexed(0x67, &sps_body(2)));
+        let ingest = frontend.ingest(&bytes).expect("second sequence");
+        assert!(ingest.reconfigured);
+        assert_eq!(ingest.drained_size, Some((320, 240)));
+        assert!(frontend.take_pending().is_none());
+    }
+
     #[test]
     fn commit_no_reorder_emits_each_picture() {
         let sps = Rc::new(sps_no_reorder());
-        assert_eq!(sps.max_num_order_frames(), 0);
+        assert_eq!(Frontend::max_num_order_frames_of(&sps), 0);
         let mut frontend = Frontend::new();
-        frontend.dpb.set_limits(sps.max_dpb_frames(), 0);
+        frontend
+            .dpb
+            .set_limits(Frontend::max_dpb_frames_of(&sps), 0);
 
         let idr = committable(&sps, 0, true);
         assert_eq!(
@@ -1502,10 +1633,12 @@ mod tests {
 
     #[test]
     fn commit_reorder_holds_back_until_full() {
-        let sps = Rc::new(sps(0));
-        assert_ne!(sps.max_num_order_frames(), 0);
+        let sps = Rc::new(sps(PocType::Lsb));
+        assert_ne!(Frontend::max_num_order_frames_of(&sps), 0);
         let mut frontend = Frontend::new();
-        frontend.dpb.set_limits(sps.max_dpb_frames(), 16);
+        frontend
+            .dpb
+            .set_limits(Frontend::max_dpb_frames_of(&sps), 16);
 
         let idr = committable(&sps, 0, true);
         assert_eq!(

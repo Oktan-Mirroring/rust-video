@@ -37,6 +37,50 @@ pub const OBU_PADDING: u8 = 15;
 /// Tile grid ceiling behind the DXVA grid.
 const MAX_TILES: usize = 256;
 
+/// Byte offset of the tile group past frame-header alignment, 5.10.
+///
+/// The alignment bit and padding are unconditional in frame OBUs;
+/// validates both.
+///
+/// # Errors
+///
+/// Returns `Err` on truncated payload or invalid alignment bits.
+///
+/// # Arguments
+///
+/// * `payload` - frame OBU payload bytes.
+/// * `consumed_bits` - header bits consumed by the frame parse.
+pub fn frame_obu_tile_offset<E: From<Error>>(
+    payload: &[u8],
+    consumed_bits: usize,
+) -> Result<usize, E> {
+    let total_bits = payload.len().saturating_mul(8);
+    if consumed_bits >= total_bits {
+        return Err(Error::parse(ParseReason::Truncated {
+            syntax: "alignment_bit",
+        }));
+    }
+    let end = consumed_bits / 8 * 8 + 8;
+    if end > total_bits {
+        return Err(Error::parse(ParseReason::Truncated {
+            syntax: "alignment_bit",
+        }));
+    }
+    if payload[consumed_bits / 8] & (0x80 >> (consumed_bits % 8)) == 0 {
+        return Err(Error::parse(ParseReason::Range {
+            syntax: "alignment_bit",
+        }));
+    }
+    for bit in consumed_bits + 1..end {
+        if payload[bit / 8] & (0x80 >> (bit % 8)) != 0 {
+            return Err(Error::parse(ParseReason::Range {
+                syntax: "alignment_bit",
+            }));
+        }
+    }
+    Ok(end / 8)
+}
+
 /// One decoded tile: payload plus grid position.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TileData {

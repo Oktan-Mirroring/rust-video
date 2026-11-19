@@ -7,9 +7,9 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::rc::Rc;
 
-use crate::h265::parser::Sps;
-use crate::h265::picture::PictureData;
-use crate::h265::picture::Reference;
+use crate::h265::Sps;
+use crate::h265_picture::PictureData;
+use crate::h265_picture::Reference;
 
 // Shortcut to refer to a DPB entry.
 //
@@ -112,18 +112,17 @@ impl<T: Clone> Dpb<T> {
             .filter(|pic| pic.state.needed_for_output)
             .count();
 
-        let highest_tid = sps.max_sub_layers_minus1;
-        let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
-        let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
-        let pic_over_max_latency = self.pictures().find(|pic| {
-            pic.state.needed_for_output
-                && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
-        });
+        let max_num_reorder_pics = sps.ordering_reorder.last().copied().unwrap_or(0);
+        let max_latency = sps.ordering_latency.last().copied().unwrap_or(0);
+        let max_latency_i32 = i32::try_from(max_latency).unwrap_or(i32::MAX);
+        let pic_over_max_latency = self
+            .pictures()
+            .find(|pic| pic.state.needed_for_output && pic.pic_latency_cnt >= max_latency_i32);
         let max_dec_pic_buffering =
-            usize::from(sps.max_dec_pic_buffering_minus1[usize::from(highest_tid)]) + 1;
+            usize::from(sps.ordering_buffering.last().copied().unwrap_or(0)) + 1;
 
-        num_needed_for_output > max_num_reorder_pics.into()
-            || (max_latency_increase_plus1 != 0 && pic_over_max_latency.is_some())
+        num_needed_for_output > usize::from(max_num_reorder_pics)
+            || (max_latency != 0 && pic_over_max_latency.is_some())
             || self.entries().len() >= max_dec_pic_buffering
     }
 
@@ -175,18 +174,17 @@ impl<T: Clone> Dpb<T> {
             .pictures()
             .filter(|pic| pic.state.needed_for_output)
             .count();
-        let highest_tid = sps.max_sub_layers_minus1;
 
-        let max_num_reorder_pics = sps.max_num_reorder_pics[usize::from(highest_tid)];
-        let max_latency_increase_plus1 = sps.max_latency_increase_plus1[usize::from(highest_tid)];
+        let max_num_reorder_pics = sps.ordering_reorder.last().copied().unwrap_or(0);
+        let max_latency = sps.ordering_latency.last().copied().unwrap_or(0);
+        let max_latency_i32 = i32::try_from(max_latency).unwrap_or(i32::MAX);
 
-        let pic_over_max_latency = self.pictures().find(|pic| {
-            pic.state.needed_for_output
-                && pic.pic_latency_cnt >= i32::from(max_latency_increase_plus1)
-        });
+        let pic_over_max_latency = self
+            .pictures()
+            .find(|pic| pic.state.needed_for_output && pic.pic_latency_cnt >= max_latency_i32);
 
-        num_needed_for_output > max_num_reorder_pics.into()
-            || (max_latency_increase_plus1 != 0 && pic_over_max_latency.is_some())
+        num_needed_for_output > usize::from(max_num_reorder_pics)
+            || (max_latency != 0 && pic_over_max_latency.is_some())
     }
 
     /// Clears the DPB, dropping all the pictures.

@@ -2547,3 +2547,57 @@ fn round_two_signed(value: i64, shift: u32) -> i64 {
         round_two(u64::try_from(value).unwrap_or(0), shift).cast_signed()
     }
 }
+
+/// Reference slots refreshed from a completed `header`.
+///
+/// Mirrors the slot update behind OBU ingest; rejects intra-only
+/// frames refreshing every slot.
+///
+/// # Errors
+///
+/// Returns `Err` on intra-only frames refreshing every slot.
+pub fn refresh_refs<E: From<Error>>(
+    refs: &mut [RefInfo; NUM_REF_FRAMES],
+    header: &FrameHeader,
+) -> Result<(), E> {
+    if header.frame_type == FrameType::IntraOnly && header.refresh_frame_flags == 0xFF {
+        return Err(Error::parse(ParseReason::Range {
+            syntax: "refresh_frame_flags",
+        }));
+    }
+    for (index, slot) in refs.iter_mut().enumerate() {
+        if header.refresh_frame_flags >> index & 1 == 0 {
+            continue;
+        }
+        slot.valid = true;
+        slot.frame_type = header.frame_type;
+        slot.frame_width = header.frame_width;
+        slot.frame_height = header.frame_height;
+        slot.upscaled_width = header.upscaled_width;
+        slot.render_width = header.render_width;
+        slot.render_height = header.render_height;
+        slot.order_hint = header.order_hint;
+        slot.frame_id = header.current_frame_id;
+        slot.loop_ref_deltas = header.loop_ref_deltas;
+        slot.loop_mode_deltas = header.loop_mode_deltas;
+        slot.seg_enabled = header.seg_enabled;
+        slot.seg_value = header.seg_value;
+        for (position, motion) in header.global_motion.iter().enumerate() {
+            slot.gm_params[position] = motion.params;
+        }
+        slot.grain = header.film_grain;
+    }
+    Ok(())
+}
+
+/// Reference slots behind a show-existing `header`.
+///
+/// Key frames rebroadcast the shown slot; other types hold.
+pub fn show_existing_refs(refs: &mut [RefInfo; NUM_REF_FRAMES], header: &FrameHeader) {
+    if header.frame_type == FrameType::Key {
+        let shown = refs[usize::from(header.frame_to_show_map_idx)].clone();
+        for slot in refs.iter_mut() {
+            *slot = shown.clone();
+        }
+    }
+}

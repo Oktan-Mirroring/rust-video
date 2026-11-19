@@ -8,8 +8,8 @@ use crate::error::VaApiError;
 use crate::frontend::SurfaceSlot;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
-use crate::vp9::frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
-use crate::vp9::params::Params;
+use crate::vp9_frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
+use crate::vp9_params::Params;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
@@ -160,8 +160,8 @@ impl<'a> Vp9Decoder<'a> {
                 let picture = picture.as_ref();
                 let slot = self.acquire_pipelined(frames)?;
                 self.submit_picture(picture, slot)?;
-                let size = (picture.header().width, picture.header().height);
-                let shown = picture.header().show.show_frame;
+                let size = (picture.header().frame_width, picture.header().frame_height);
+                let shown = picture.header().show_frame();
                 self.frontend.commit(picture, slot);
                 if shown {
                     self.read_slots(vec![slot], frames, size, readback)?;

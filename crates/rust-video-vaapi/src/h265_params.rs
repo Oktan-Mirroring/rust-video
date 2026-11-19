@@ -11,13 +11,10 @@ use crate::ffi::{
     VaSurfaceId,
 };
 use crate::frontend::SurfaceSlot;
-use crate::h265::dpb::Dpb;
-use crate::h265::frontend::Rps;
-use crate::h265::parser::{
-    NaluType, Pps, Profile, ScalingLists, SliceHeader, SliceType, Sps, DEFAULT_SCALING_LIST_0,
-    DEFAULT_SCALING_LIST_1, DEFAULT_SCALING_LIST_2,
-};
-use crate::h265::picture::{PictureData, Reference};
+use crate::h265::{is_idr, is_irap, Pps, SliceHeader, SliceTail, SliceType, Sps};
+use crate::h265_dpb::Dpb;
+use crate::h265_frontend::{PendingSlice, Rps};
+use crate::h265_picture::{PictureData, Reference};
 
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
@@ -52,10 +49,9 @@ impl<'a> Params<'a> {
     ///
     /// Returns `Err` for profiles outside Main and Main Still Picture.
     pub fn profile(profile_idc: u8) -> Result<c_int, VaApiError> {
-        let unsupported = || VaApiError::Unsupported(format!("h265 profile {profile_idc}"));
-        match Profile::try_from(profile_idc).map_err(|_| unsupported())? {
-            Profile::Main | Profile::MainStill => Ok(crate::ffi::VA_PROFILE_HEVC_MAIN),
-            _ => Err(unsupported()),
+        match profile_idc {
+            1 | 3 => Ok(crate::ffi::VA_PROFILE_HEVC_MAIN),
+            other => Err(VaApiError::Unsupported(format!("h265 profile {other}"))),
         }
     }
 
@@ -65,11 +61,11 @@ impl<'a> Params<'a> {
     ///
     /// Returns `Err` when `sps` neither names nor declares compatibility with Main.
     pub fn sps_profile(sps: &Sps) -> Result<c_int, VaApiError> {
-        let ptl = &sps.profile_tier_level;
-        if ptl.general_profile_compatibility_flag[1] || ptl.general_profile_compatibility_flag[3] {
+        // Compatibility flags pack into bits 31..0 for profiles 0..32.
+        if sps.ptl.compat & (1u32 << 30) != 0 || sps.ptl.compat & (1u32 << 28) != 0 {
             return Ok(crate::ffi::VA_PROFILE_HEVC_MAIN);
         }
-        Self::profile(ptl.general_profile_idc)
+        Self::profile(sps.ptl.profile_idc)
     }
 
     /// Picture-parameter buffer for `pic` on `surface`.
@@ -87,21 +83,9 @@ impl<'a> Params<'a> {
         rps: &Rps,
         surface: VaSurfaceId,
     ) -> Result<VaPictureParameterBufferHevc, VaApiError> {
-        let layer = usize::from(sps.max_sub_layers_minus1);
-        let buffering = sps
-            .max_dec_pic_buffering_minus1
-            .get(layer)
-            .copied()
-            .ok_or_else(|| VaApiError::Parse("sublayer range".to_owned()))?;
+        let buffering = sps.ordering_buffering.last().copied().unwrap_or(0);
         let range = |what: &str| VaApiError::Parse(format!("picture {what} range"));
-        let mut columns = [0u16; 19];
-        for (out, width) in columns.iter_mut().zip(pps.column_width_minus1.iter()) {
-            *out = u16::try_from(*width).map_err(|_| range("column width"))?;
-        }
-        let mut rows = [0u16; 21];
-        for (out, height) in rows.iter_mut().zip(pps.row_height_minus1.iter()) {
-            *out = u16::try_from(*height).map_err(|_| range("row height"))?;
-        }
+        let (columns, rows) = Self::tile_grid(sps, pps, &range)?;
         Ok(VaPictureParameterBufferHevc {
             curr_pic: VaPictureHevc {
                 picture_id: surface,
@@ -110,39 +94,41 @@ impl<'a> Params<'a> {
                 reserved: [0; 4],
             },
             reference_frames: self.reference_frames(rps)?,
-            pic_width_in_luma_samples: sps.pic_width_in_luma_samples,
-            pic_height_in_luma_samples: sps.pic_height_in_luma_samples,
+            pic_width_in_luma_samples: u16::try_from(sps.width)
+                .map_err(|_| range("coded width"))?,
+            pic_height_in_luma_samples: u16::try_from(sps.height)
+                .map_err(|_| range("coded height"))?,
             pic_fields: Self::pic_fields(sps, pps),
             sps_max_dec_pic_buffering_minus1: buffering,
-            bit_depth_luma_minus8: sps.bit_depth_luma_minus8,
-            bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8,
-            pcm_sample_bit_depth_luma_minus1: sps.pcm_sample_bit_depth_luma_minus1,
-            pcm_sample_bit_depth_chroma_minus1: sps.pcm_sample_bit_depth_chroma_minus1,
-            log2_min_luma_coding_block_size_minus3: sps.log2_min_luma_coding_block_size_minus3,
-            log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_luma_coding_block_size,
-            log2_min_transform_block_size_minus2: sps.log2_min_luma_transform_block_size_minus2,
-            log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_luma_transform_block_size,
-            log2_min_pcm_luma_coding_block_size_minus3: sps
-                .log2_min_pcm_luma_coding_block_size_minus3,
-            log2_diff_max_min_pcm_luma_coding_block_size: sps
-                .log2_diff_max_min_pcm_luma_coding_block_size,
-            max_transform_hierarchy_depth_intra: sps.max_transform_hierarchy_depth_intra,
-            max_transform_hierarchy_depth_inter: sps.max_transform_hierarchy_depth_inter,
-            init_qp_minus26: pps.init_qp_minus26,
+            bit_depth_luma_minus8: sps.bit_depth_luma,
+            bit_depth_chroma_minus8: sps.bit_depth_chroma,
+            pcm_sample_bit_depth_luma_minus1: sps.pcm_depth_luma,
+            pcm_sample_bit_depth_chroma_minus1: sps.pcm_depth_chroma,
+            log2_min_luma_coding_block_size_minus3: sps.log2_min_cb_size_minus3,
+            log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_cb_size,
+            log2_min_transform_block_size_minus2: sps.log2_min_tb_size_minus2,
+            log2_diff_max_min_transform_block_size: sps.log2_diff_max_min_tb_size,
+            log2_min_pcm_luma_coding_block_size_minus3: sps.pcm_log2_min_minus3,
+            log2_diff_max_min_pcm_luma_coding_block_size: sps.pcm_log2_diff,
+            max_transform_hierarchy_depth_intra: sps.max_transform_depth_intra,
+            max_transform_hierarchy_depth_inter: sps.max_transform_depth_inter,
+            init_qp_minus26: pps.pic_init_qp_minus26,
             diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth,
             pps_cb_qp_offset: pps.cb_qp_offset,
             pps_cr_qp_offset: pps.cr_qp_offset,
-            log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level_minus2,
-            num_tile_columns_minus1: pps.num_tile_columns_minus1,
-            num_tile_rows_minus1: pps.num_tile_rows_minus1,
+            log2_parallel_merge_level_minus2: pps.log2_parallel_merge_minus2,
+            num_tile_columns_minus1: pps.num_tile_columns.saturating_sub(1),
+            num_tile_rows_minus1: pps.num_tile_rows.saturating_sub(1),
             column_width_minus1: columns,
             row_height_minus1: rows,
             slice_parsing_fields: Self::slice_parsing_fields(sps, pps, pic),
-            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4,
-            num_short_term_ref_pic_sets: sps.num_short_term_ref_pic_sets,
-            num_long_term_ref_pic_sps: sps.num_long_term_ref_pics,
-            num_ref_idx_l0_default_active_minus1: pps.num_ref_idx_l0_default_active_minus1,
-            num_ref_idx_l1_default_active_minus1: pps.num_ref_idx_l1_default_active_minus1,
+            log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb_minus4,
+            num_short_term_ref_pic_sets: u8::try_from(sps.rps.len())
+                .map_err(|_| range("rps count"))?,
+            num_long_term_ref_pic_sps: u8::try_from(sps.lt_poc_lsb.len())
+                .map_err(|_| range("long-term count"))?,
+            num_ref_idx_l0_default_active_minus1: pps.num_ref_l0,
+            num_ref_idx_l1_default_active_minus1: pps.num_ref_l1,
             pps_beta_offset_div2: pps.beta_offset_div2,
             pps_tc_offset_div2: pps.tc_offset_div2,
             num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
@@ -151,81 +137,90 @@ impl<'a> Params<'a> {
         })
     }
 
-    /// Inverse-quantization matrix for `pps`, absent without scaling lists.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when a corrupt DC coefficient falls outside the
-    /// parameter range.
-    pub fn matrix(sps: &Sps, pps: &Pps) -> Result<Option<VaIqMatrixBufferHevc>, VaApiError> {
-        if !sps.scaling.scaling_list_enabled_flag {
-            return Ok(None);
+    /// Tile extents as minus-one widths, uniform-derived or explicit.
+    fn tile_grid(
+        sps: &Sps,
+        pps: &Pps,
+        range: &impl Fn(&str) -> VaApiError,
+    ) -> Result<([u16; 19], [u16; 21]), VaApiError> {
+        let mut columns = [0u16; 19];
+        let mut rows = [0u16; 21];
+        if !pps.tiles_enabled() {
+            return Ok((columns, rows));
         }
-        let mut lists = ScalingLists::default();
-        if pps.headers.scaling_list_data_present_flag {
-            lists = pps.scaling_list.clone();
-        } else if sps.scaling.scaling_list_data_present_flag {
-            lists = sps.scaling_list.clone();
-        } else {
-            lists.list_4x4.fill(DEFAULT_SCALING_LIST_0);
-            for (index, list) in lists
-                .list_8x8
+        if pps.uniform_spacing() {
+            let ncols = u32::from(pps.num_tile_columns);
+            let nrows = u32::from(pps.num_tile_rows);
+            let width_ctbs = sps.width_in_ctbs();
+            let height_ctbs = sps.height_in_ctbs();
+            for (index, out) in columns
                 .iter_mut()
-                .chain(lists.list_16x16.iter_mut())
-                .chain(lists.list_32x32.iter_mut())
                 .enumerate()
+                .take(usize::from(pps.num_tile_columns))
             {
-                *list = if index % 6 < 3 {
-                    DEFAULT_SCALING_LIST_1
-                } else {
-                    DEFAULT_SCALING_LIST_2
-                };
+                let j = u32::try_from(index).map_err(|_| range("column width"))?;
+                let minus1 = ((j + 1) * width_ctbs) / ncols - j * width_ctbs / ncols - 1;
+                *out = u16::try_from(minus1).map_err(|_| range("column width"))?;
             }
-            lists.dc_coef_minus8_16x16 = [8; 6];
-            lists.dc_coef_minus8_32x32 = [8; 6];
+            for (index, out) in rows
+                .iter_mut()
+                .enumerate()
+                .take(usize::from(pps.num_tile_rows))
+            {
+                let j = u32::try_from(index).map_err(|_| range("row height"))?;
+                let minus1 = ((j + 1) * height_ctbs) / nrows - j * height_ctbs / nrows - 1;
+                *out = u16::try_from(minus1).map_err(|_| range("row height"))?;
+            }
+            return Ok((columns, rows));
         }
+        for (out, width) in columns.iter_mut().zip(pps.column_width.iter()) {
+            *out = width.saturating_sub(1);
+        }
+        for (out, height) in rows.iter_mut().zip(pps.row_height.iter()) {
+            *out = height.saturating_sub(1);
+        }
+        Ok((columns, rows))
+    }
+
+    /// Inverse-quantization matrix for `pps`, absent without scaling lists.
+    #[must_use]
+    pub fn matrix(sps: &Sps, pps: &Pps) -> Option<VaIqMatrixBufferHevc> {
+        if !sps.scaling_enabled() {
+            return None;
+        }
+        let lists = &pps.scaling;
         let mut scaling_4x4 = [[0u8; 16]; 6];
         let mut scaling_8x8 = [[0u8; 64]; 6];
         let mut scaling_16x16 = [[0u8; 64]; 6];
         let mut scaling_32x32 = [[0u8; 64]; 2];
-        for (raster, scanned) in scaling_4x4.iter_mut().zip(lists.list_4x4.iter()) {
+        for (raster, scanned) in scaling_4x4.iter_mut().zip(lists.size0.iter()) {
             for (index, value) in scanned.iter().enumerate() {
                 raster[Self::SCAN_4X4[index]] = *value;
             }
         }
         for (raster, scanned) in scaling_8x8
             .iter_mut()
-            .zip(lists.list_8x8.iter())
-            .chain(scaling_16x16.iter_mut().zip(lists.list_16x16.iter()))
+            .zip(lists.size1.iter())
+            .chain(scaling_16x16.iter_mut().zip(lists.size2.iter()))
         {
             for (index, value) in scanned.iter().enumerate() {
                 raster[Self::SCAN_8X8[index]] = *value;
             }
         }
-        for (matrix, raster) in scaling_32x32.iter_mut().enumerate() {
-            for (index, value) in lists.list_32x32[matrix * 3].iter().enumerate() {
+        for (raster, scanned) in scaling_32x32.iter_mut().zip(lists.size3.iter()) {
+            for (index, value) in scanned.iter().enumerate() {
                 raster[Self::SCAN_8X8[index]] = *value;
             }
         }
-        let mut dc_16x16 = [0u8; 6];
-        for (out, dc) in dc_16x16.iter_mut().zip(lists.dc_coef_minus8_16x16.iter()) {
-            *out = u8::try_from(dc + 8)
-                .map_err(|_| VaApiError::Parse("scaling dc range".to_owned()))?;
-        }
-        let mut dc_32x32 = [0u8; 2];
-        for (matrix, out) in dc_32x32.iter_mut().enumerate() {
-            *out = u8::try_from(lists.dc_coef_minus8_32x32[matrix * 3] + 8)
-                .map_err(|_| VaApiError::Parse("scaling dc range".to_owned()))?;
-        }
-        Ok(Some(VaIqMatrixBufferHevc {
+        Some(VaIqMatrixBufferHevc {
             scaling_list_4x4: scaling_4x4,
             scaling_list_8x8: scaling_8x8,
             scaling_list_16x16: scaling_16x16,
             scaling_list_32x32: scaling_32x32,
-            scaling_list_dc_16x16: dc_16x16,
-            scaling_list_dc_32x32: dc_32x32,
+            scaling_list_dc_16x16: lists.dc2,
+            scaling_list_dc_32x32: lists.dc3,
             reserved: [0; 4],
-        }))
+        })
     }
 
     /// Slice-parameter buffer for one slice.
@@ -233,38 +228,42 @@ impl<'a> Params<'a> {
     /// # Errors
     ///
     /// Returns `Err` when a listed reference lost its surface, or when a
-    /// corrupt slice size falls outside the parameter range.
+    /// corrupt slice size or delta falls outside the parameter range.
     pub fn slice(
         &self,
-        header: &SliceHeader,
-        data_len: usize,
+        slice: &PendingSlice,
         list0: &[Option<usize>],
         list1: &[Option<usize>],
-        sps: &Sps,
         last: bool,
     ) -> Result<VaSliceParameterBufferHevc, VaApiError> {
-        let weights = Weights::new(header, sps)?;
+        let header = slice.header();
+        let tail = slice.tail();
+        let weights = Weights::try_new(tail, header.slice_type)?;
         let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
         Ok(VaSliceParameterBufferHevc {
-            slice_data_size: u32::try_from(data_len).map_err(|_| range("data size"))?,
+            slice_data_size: u32::try_from(slice.data().len()).map_err(|_| range("data size"))?,
             slice_data_offset: 0,
             slice_data_flag: crate::ffi::VA_SLICE_DATA_FLAG_ALL,
-            slice_data_byte_offset: header.header_bit_size / 8,
-            slice_segment_address: header.segment_address,
+            slice_data_byte_offset: u32::try_from(slice.bit_size() / 8)
+                .map_err(|_| range("byte offset"))?,
+            slice_segment_address: header.address,
             ref_pic_list: [self.ref_list(list0)?, self.ref_list(list1)?],
-            long_slice_flags: Self::slice_flags(header, last),
-            collocated_ref_idx: if header.motion.temporal_mvp_enabled_flag {
-                header.collocated_ref_idx
+            long_slice_flags: Self::slice_flags(header, tail, last),
+            collocated_ref_idx: if tail.temporal_mvp {
+                tail.collocated_ref_idx
             } else {
                 0xff
             },
-            num_ref_idx_l0_active_minus1: header.num_ref_idx_l0_active_minus1,
-            num_ref_idx_l1_active_minus1: header.num_ref_idx_l1_active_minus1,
-            slice_qp_delta: header.qp_delta,
-            slice_cb_qp_offset: header.cb_qp_offset,
-            slice_cr_qp_offset: header.cr_qp_offset,
-            slice_beta_offset_div2: header.beta_offset_div2,
-            slice_tc_offset_div2: header.tc_offset_div2,
+            num_ref_idx_l0_active_minus1: tail.num_ref_l0,
+            num_ref_idx_l1_active_minus1: tail.num_ref_l1,
+            slice_qp_delta: i8::try_from(tail.qp_delta).map_err(|_| range("qp delta"))?,
+            slice_cb_qp_offset: i8::try_from(tail.cb_qp_offset)
+                .map_err(|_| range("cb qp offset"))?,
+            slice_cr_qp_offset: i8::try_from(tail.cr_qp_offset)
+                .map_err(|_| range("cr qp offset"))?,
+            slice_beta_offset_div2: i8::try_from(tail.beta_offset)
+                .map_err(|_| range("beta offset"))?,
+            slice_tc_offset_div2: i8::try_from(tail.tc_offset).map_err(|_| range("tc offset"))?,
             luma_log2_weight_denom: weights.luma_log2_denom,
             delta_chroma_log2_weight_denom: weights.delta_chroma_log2_denom,
             delta_luma_weight_l0: weights.delta_luma_l0,
@@ -275,11 +274,11 @@ impl<'a> Params<'a> {
             luma_offset_l1: weights.luma_offset_l1,
             delta_chroma_weight_l1: weights.delta_chroma_l1,
             chroma_offset_l1: weights.chroma_offset_l1,
-            five_minus_max_num_merge_cand: header.five_minus_max_num_merge_cand,
-            num_entry_point_offsets: u16::try_from(header.num_entry_point_offsets)
+            five_minus_max_num_merge_cand: tail.merge_cand_minus5,
+            num_entry_point_offsets: u16::try_from(header.entry_count)
                 .map_err(|_| range("entry points"))?,
             entry_offset_to_subset_array: 0,
-            slice_data_num_emu_prevn_bytes: u16::try_from(header.n_emulation_prevention_bytes)
+            slice_data_num_emu_prevn_bytes: u16::try_from(slice.epb())
                 .map_err(|_| range("emulation prevention"))?,
             reserved: [0; 2],
         })
@@ -386,29 +385,29 @@ impl<'a> Params<'a> {
             HEVC_STRONG_INTRA_SMOOTHING_ENABLED, HEVC_TILES_ENABLED, HEVC_TRANSFORM_SKIP_ENABLED,
             HEVC_TRANSQUANT_BYPASS_ENABLED, HEVC_WEIGHTED_BIPRED, HEVC_WEIGHTED_PRED,
         };
-        (u32::from(sps.chroma_format_idc) << HEVC_CHROMA_FORMAT_IDC)
-            | (u32::from(sps.format.separate_colour_plane_flag) << HEVC_SEPARATE_COLOUR_PLANE)
-            | (u32::from(sps.pcm.pcm_enabled_flag) << HEVC_PCM_ENABLED)
-            | (u32::from(sps.scaling.scaling_list_enabled_flag) << HEVC_SCALING_LIST_ENABLED)
-            | (u32::from(pps.transform.transform_skip_enabled_flag) << HEVC_TRANSFORM_SKIP_ENABLED)
-            | (u32::from(sps.tools.amp_enabled_flag) << HEVC_AMP_ENABLED)
-            | (u32::from(sps.tools.strong_intra_smoothing_enabled_flag)
-                << HEVC_STRONG_INTRA_SMOOTHING_ENABLED)
-            | (u32::from(pps.coding.sign_data_hiding_enabled_flag) << HEVC_SIGN_DATA_HIDING_ENABLED)
-            | (u32::from(pps.coding.constrained_intra_pred_flag) << HEVC_CONSTRAINED_INTRA_PRED)
-            | (u32::from(pps.transform.cu_qp_delta_enabled_flag) << HEVC_CU_QP_DELTA_ENABLED)
-            | (u32::from(pps.prediction.weighted_pred_flag) << HEVC_WEIGHTED_PRED)
-            | (u32::from(pps.prediction.weighted_bipred_flag) << HEVC_WEIGHTED_BIPRED)
-            | (u32::from(pps.transform.transquant_bypass_enabled_flag)
-                << HEVC_TRANSQUANT_BYPASS_ENABLED)
-            | (u32::from(pps.tiles.tiles_enabled_flag) << HEVC_TILES_ENABLED)
-            | (u32::from(pps.tiles.entropy_coding_sync_enabled_flag)
-                << HEVC_ENTROPY_CODING_SYNC_ENABLED)
-            | (u32::from(pps.loop_filter.loop_filter_across_slices_enabled_flag)
-                << HEVC_PPS_LOOP_FILTER_ACROSS_SLICES)
-            | (u32::from(pps.loop_filter.loop_filter_across_tiles_enabled_flag)
-                << HEVC_LOOP_FILTER_ACROSS_TILES)
-            | (u32::from(sps.pcm.pcm_loop_filter_disabled_flag) << HEVC_PCM_LOOP_FILTER_DISABLED)
+        let loop_across_tiles = if pps.tiles_enabled() {
+            pps.loop_across_tiles()
+        } else {
+            true
+        };
+        (u32::from(sps.chroma_format) << HEVC_CHROMA_FORMAT_IDC)
+            | (u32::from(sps.separate_colour_plane) << HEVC_SEPARATE_COLOUR_PLANE)
+            | (u32::from(sps.pcm()) << HEVC_PCM_ENABLED)
+            | (u32::from(sps.scaling_enabled()) << HEVC_SCALING_LIST_ENABLED)
+            | (u32::from(pps.transform_skip()) << HEVC_TRANSFORM_SKIP_ENABLED)
+            | (u32::from(sps.amp()) << HEVC_AMP_ENABLED)
+            | (u32::from(sps.smoothing()) << HEVC_STRONG_INTRA_SMOOTHING_ENABLED)
+            | (u32::from(pps.sign_hiding()) << HEVC_SIGN_DATA_HIDING_ENABLED)
+            | (u32::from(pps.constrained_intra()) << HEVC_CONSTRAINED_INTRA_PRED)
+            | (u32::from(pps.cu_qp_delta()) << HEVC_CU_QP_DELTA_ENABLED)
+            | (u32::from(pps.weighted_pred()) << HEVC_WEIGHTED_PRED)
+            | (u32::from(pps.weighted_bipred()) << HEVC_WEIGHTED_BIPRED)
+            | (u32::from(pps.transquant_bypass()) << HEVC_TRANSQUANT_BYPASS_ENABLED)
+            | (u32::from(pps.tiles_enabled()) << HEVC_TILES_ENABLED)
+            | (u32::from(pps.entropy_sync()) << HEVC_ENTROPY_CODING_SYNC_ENABLED)
+            | (u32::from(pps.loop_across_slices()) << HEVC_PPS_LOOP_FILTER_ACROSS_SLICES)
+            | (u32::from(loop_across_tiles) << HEVC_LOOP_FILTER_ACROSS_TILES)
+            | (u32::from(sps.pcm_loop_disabled()) << HEVC_PCM_LOOP_FILTER_DISABLED)
     }
 
     /// Packed slice-parsing flags.
@@ -422,58 +421,49 @@ impl<'a> Params<'a> {
             HEVC_SAMPLE_ADAPTIVE_OFFSET_ENABLED, HEVC_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT,
             HEVC_SPS_TEMPORAL_MVP_ENABLED,
         };
-        let rap = u32::from(
-            (NaluType::BlaWLp as u32..=NaluType::CraNut as u32).contains(&(pic.nalu_type as u32)),
-        );
-        (u32::from(pps.prediction.lists_modification_present_flag)
-            << HEVC_LISTS_MODIFICATION_PRESENT)
-            | (u32::from(sps.features.long_term_ref_pics_present_flag)
-                << HEVC_LONG_TERM_REF_PICS_PRESENT)
-            | (u32::from(sps.tools.temporal_mvp_enabled_flag) << HEVC_SPS_TEMPORAL_MVP_ENABLED)
-            | (u32::from(pps.coding.cabac_init_present_flag) << HEVC_CABAC_INIT_PRESENT)
-            | (u32::from(pps.presence.output_flag_present_flag) << HEVC_OUTPUT_FLAG_PRESENT)
-            | (u32::from(pps.presence.dependent_slice_segments_enabled_flag)
-                << HEVC_DEPENDENT_SLICE_SEGMENTS_ENABLED)
-            | (u32::from(pps.presence.slice_chroma_qp_offsets_present_flag)
-                << HEVC_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT)
-            | (u32::from(sps.features.sample_adaptive_offset_enabled_flag)
-                << HEVC_SAMPLE_ADAPTIVE_OFFSET_ENABLED)
-            | (u32::from(pps.deblocking.deblocking_filter_override_enabled_flag)
-                << HEVC_DEBLOCKING_FILTER_OVERRIDE_ENABLED)
-            | (u32::from(pps.deblocking.deblocking_filter_disabled_flag)
-                << HEVC_PPS_DISABLE_DEBLOCKING_FILTER)
-            | (u32::from(pps.headers.slice_segment_header_extension_present_flag)
-                << HEVC_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT)
+        let rap = u32::from((16..=21).contains(&pic.nalu_type));
+        (u32::from(pps.lists_modification_present()) << HEVC_LISTS_MODIFICATION_PRESENT)
+            | (u32::from(sps.long_term_present()) << HEVC_LONG_TERM_REF_PICS_PRESENT)
+            | (u32::from(sps.temporal_mvp()) << HEVC_SPS_TEMPORAL_MVP_ENABLED)
+            | (u32::from(pps.cabac_init_present()) << HEVC_CABAC_INIT_PRESENT)
+            | (u32::from(pps.output_flag_present()) << HEVC_OUTPUT_FLAG_PRESENT)
+            | (u32::from(pps.dependent_slices()) << HEVC_DEPENDENT_SLICE_SEGMENTS_ENABLED)
+            | (u32::from(pps.chroma_offsets_present()) << HEVC_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT)
+            | (u32::from(sps.sao()) << HEVC_SAMPLE_ADAPTIVE_OFFSET_ENABLED)
+            | (u32::from(pps.deblocking_override()) << HEVC_DEBLOCKING_FILTER_OVERRIDE_ENABLED)
+            | (u32::from(pps.deblocking_disabled()) << HEVC_PPS_DISABLE_DEBLOCKING_FILTER)
+            | (u32::from(pps.slice_ext_present()) << HEVC_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT)
             | (rap << HEVC_RAP_PIC)
-            | (u32::from(pic.nalu_type.is_idr()) << HEVC_IDR_PIC)
-            | (u32::from(pic.nalu_type.is_irap()) << HEVC_INTRA_PIC)
+            | (u32::from(is_idr(pic.nalu_type)) << HEVC_IDR_PIC)
+            | (u32::from(is_irap(pic.nalu_type)) << HEVC_INTRA_PIC)
     }
 
     /// Packed slice flags.
-    fn slice_flags(header: &SliceHeader, last: bool) -> u32 {
+    ///
+    /// Dependent segments decline at ingest, so the dependent bit stays clear.
+    fn slice_flags(header: &SliceHeader, tail: &SliceTail, last: bool) -> u32 {
         use crate::ffi::{
-            HEVC_CABAC_INIT, HEVC_COLLOCATED_FROM_L0, HEVC_COLOR_PLANE_ID,
-            HEVC_DEPENDENT_SLICE_SEGMENT, HEVC_LAST_SLICE_OF_PIC, HEVC_MVD_L1_ZERO,
-            HEVC_SLICE_DEBLOCKING_FILTER_DISABLED, HEVC_SLICE_LOOP_FILTER_ACROSS_SLICES,
-            HEVC_SLICE_SAO_CHROMA, HEVC_SLICE_SAO_LUMA, HEVC_SLICE_TEMPORAL_MVP_ENABLED,
-            HEVC_SLICE_TYPE,
+            HEVC_CABAC_INIT, HEVC_COLLOCATED_FROM_L0, HEVC_COLOR_PLANE_ID, HEVC_LAST_SLICE_OF_PIC,
+            HEVC_MVD_L1_ZERO, HEVC_SLICE_DEBLOCKING_FILTER_DISABLED,
+            HEVC_SLICE_LOOP_FILTER_ACROSS_SLICES, HEVC_SLICE_SAO_CHROMA, HEVC_SLICE_SAO_LUMA,
+            HEVC_SLICE_TEMPORAL_MVP_ENABLED, HEVC_SLICE_TYPE,
+        };
+        let slice_type = match header.slice_type {
+            SliceType::B => 0,
+            SliceType::P => 1,
+            SliceType::I => 2,
         };
         (u32::from(last) << HEVC_LAST_SLICE_OF_PIC)
-            | (u32::from(header.position.dependent_slice_segment_flag)
-                << HEVC_DEPENDENT_SLICE_SEGMENT)
-            | ((header.type_ as u32) << HEVC_SLICE_TYPE)
-            | (u32::from(header.colour_plane_id) << HEVC_COLOR_PLANE_ID)
-            | (u32::from(header.sao.sao_luma_flag) << HEVC_SLICE_SAO_LUMA)
-            | (u32::from(header.sao.sao_chroma_flag) << HEVC_SLICE_SAO_CHROMA)
-            | (u32::from(header.motion.mvd_l1_zero_flag) << HEVC_MVD_L1_ZERO)
-            | (u32::from(header.coding.cabac_init_flag) << HEVC_CABAC_INIT)
-            | (u32::from(header.motion.temporal_mvp_enabled_flag)
-                << HEVC_SLICE_TEMPORAL_MVP_ENABLED)
-            | (u32::from(header.deblocking.deblocking_filter_disabled_flag)
-                << HEVC_SLICE_DEBLOCKING_FILTER_DISABLED)
-            | (u32::from(header.motion.collocated_from_l0_flag) << HEVC_COLLOCATED_FROM_L0)
-            | (u32::from(header.deblocking.loop_filter_across_slices_enabled_flag)
-                << HEVC_SLICE_LOOP_FILTER_ACROSS_SLICES)
+            | (slice_type << HEVC_SLICE_TYPE)
+            | (u32::from(tail.colour_plane) << HEVC_COLOR_PLANE_ID)
+            | (u32::from(tail.sao_luma) << HEVC_SLICE_SAO_LUMA)
+            | (u32::from(tail.sao_chroma) << HEVC_SLICE_SAO_CHROMA)
+            | (u32::from(tail.mvd_l1_zero) << HEVC_MVD_L1_ZERO)
+            | (u32::from(tail.cabac_init) << HEVC_CABAC_INIT)
+            | (u32::from(tail.temporal_mvp) << HEVC_SLICE_TEMPORAL_MVP_ENABLED)
+            | (u32::from(tail.deblocking_disabled) << HEVC_SLICE_DEBLOCKING_FILTER_DISABLED)
+            | (u32::from(tail.collocated_from_l0) << HEVC_COLLOCATED_FROM_L0)
+            | (u32::from(tail.loop_filter_across) << HEVC_SLICE_LOOP_FILTER_ACROSS_SLICES)
     }
 }
 
@@ -515,68 +505,90 @@ struct Weights {
 }
 
 impl Weights {
-    /// Weights for `header` under `sps`.
+    /// Weights for `tail` on a `slice_type` slice.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when a corrupt denominator falls outside the
-    /// parameter range.
-    fn new(header: &SliceHeader, sps: &Sps) -> Result<Self, VaApiError> {
-        let table = &header.pred_weight_table;
-        if table.chroma_log2_weight_denom > 7 {
+    /// Returns `Err` when a corrupt denominator or delta falls outside
+    /// the parameter range.
+    fn try_new(tail: &SliceTail, slice_type: SliceType) -> Result<Self, VaApiError> {
+        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
+        let chroma_denom = i32::from(tail.weights.luma_denom) + tail.weights.delta_chroma_denom;
+        if !(0..=7).contains(&chroma_denom) {
             return Err(VaApiError::Parse("weight denom range".to_owned()));
         }
+        let chroma_denom = u8::try_from(chroma_denom)
+            .map_err(|_| VaApiError::Parse("weight denom range".to_owned()))?;
         let mut weights = Self {
-            luma_log2_denom: table.luma_log2_weight_denom,
-            delta_chroma_log2_denom: table.delta_chroma_log2_weight_denom,
-            delta_luma_l0: table.delta_luma_weight_l0,
-            luma_offset_l0: table.luma_offset_l0,
-            delta_chroma_l0: table.delta_chroma_weight_l0,
+            luma_log2_denom: tail.weights.luma_denom,
+            delta_chroma_log2_denom: i8::try_from(tail.weights.delta_chroma_denom)
+                .map_err(|_| range("chroma denom"))?,
+            delta_luma_l0: [0; 15],
+            luma_offset_l0: [0; 15],
+            delta_chroma_l0: [[0; 2]; 15],
             chroma_offset_l0: [[0; 2]; 15],
             delta_luma_l1: [0; 15],
             luma_offset_l1: [0; 15],
             delta_chroma_l1: [[0; 2]; 15],
             chroma_offset_l1: [[0; 2]; 15],
         };
-        let half = i32::try_from(sps.wp_offset_half_range_c)
-            .map_err(|_| VaApiError::Parse("weight offset range".to_owned()))?;
-        for index in 0..15 {
-            for component in 0..2 {
-                weights.chroma_offset_l0[index][component] = Self::chroma_offset(
-                    half,
-                    table.chroma_log2_weight_denom,
-                    table.delta_chroma_weight_l0[index][component],
-                    table.delta_chroma_offset_l0[index][component],
-                )?;
-            }
-        }
-        if matches!(header.type_, SliceType::B) {
-            weights.delta_luma_l1 = table.delta_luma_weight_l1;
-            weights.luma_offset_l1 = table.luma_offset_l1;
-            weights.delta_chroma_l1 = table.delta_chroma_weight_l1;
-            for index in 0..15 {
-                for component in 0..2 {
-                    weights.chroma_offset_l1[index][component] = Self::chroma_offset(
-                        half,
-                        table.chroma_log2_weight_denom,
-                        table.delta_chroma_weight_l1[index][component],
-                        table.delta_chroma_offset_l1[index][component],
-                    )?;
-                }
-            }
+        Self::fill_list(
+            &mut weights.delta_luma_l0,
+            &mut weights.luma_offset_l0,
+            &mut weights.delta_chroma_l0,
+            &mut weights.chroma_offset_l0,
+            &tail.weights.l0,
+            chroma_denom,
+            &range,
+        )?;
+        if matches!(slice_type, SliceType::B) {
+            Self::fill_list(
+                &mut weights.delta_luma_l1,
+                &mut weights.luma_offset_l1,
+                &mut weights.delta_chroma_l1,
+                &mut weights.chroma_offset_l1,
+                &tail.weights.l1,
+                chroma_denom,
+                &range,
+            )?;
         }
         Ok(weights)
     }
 
+    /// One weight list into the `delta`/`offset` arrays.
+    fn fill_list(
+        delta_luma: &mut [i8; 15],
+        luma_offset: &mut [i8; 15],
+        delta_chroma: &mut [[i8; 2]; 15],
+        chroma_offset: &mut [[i8; 2]; 15],
+        entries: &[crate::h265::WeightEntry],
+        chroma_denom: u8,
+        range: &impl Fn(&str) -> VaApiError,
+    ) -> Result<(), VaApiError> {
+        for index in 0..15 {
+            let entry = entries.get(index);
+            let (weight, offset) = entry.map_or((0, 0), |entry| entry.luma.unwrap_or((0, 0)));
+            delta_luma[index] = i8::try_from(weight).map_err(|_| range("luma weight"))?;
+            luma_offset[index] = i8::try_from(offset).map_err(|_| range("luma offset"))?;
+            let pairs = entry.map_or([(0, 0); 2], |entry| entry.chroma.unwrap_or([(0, 0); 2]));
+            for (component, (weight, offset)) in pairs.iter().enumerate() {
+                delta_chroma[index][component] =
+                    i8::try_from(*weight).map_err(|_| range("chroma weight"))?;
+                chroma_offset[index][component] =
+                    Self::chroma_offset(chroma_denom, *weight, *offset)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Derived chroma offset from the weight delta and offset delta.
-    fn chroma_offset(
-        half: i32,
-        denom: u8,
-        delta_weight: i8,
-        delta_offset: i16,
-    ) -> Result<i8, VaApiError> {
-        let weight = (1 << denom) + i32::from(delta_weight);
-        let offset = half + i32::from(delta_offset) - ((half * weight) >> denom);
+    ///
+    /// Half range is 128: range extensions decline, so the high
+    /// precision path never engages.
+    fn chroma_offset(denom: u8, delta_weight: i32, delta_offset: i32) -> Result<i8, VaApiError> {
+        let half = 128;
+        let weight = (1 << denom) + delta_weight;
+        let offset = half + delta_offset - ((half * weight) >> denom);
         i8::try_from(offset.clamp(-half, half - 1))
             .map_err(|_| VaApiError::Parse("weight offset range".to_owned()))
     }
@@ -584,35 +596,49 @@ impl Weights {
 
 #[cfg(test)]
 mod tests {
+    use rust_video_h265::SPS_SCALING;
+
     use super::Params;
     use crate::error::VaApiError;
     use crate::frontend::SurfaceSlot;
-    use crate::h265::dpb::Dpb;
-    use crate::h265::fixture::{nal, pps_payload, sps_payload};
-    use crate::h265::frontend::Rps;
-    use crate::h265::parser::{
-        Nalu, NaluType, Parser, Pps, PredWeightTable, SliceHeader, SliceMotion, SliceType, Sps,
+    use crate::h265::{
+        Gate, Pps, SliceHeader, SliceTail, SliceType, SliceWeights, Sps, WeightEntry,
     };
-    use crate::h265::picture::{PictureData, Reference};
+    use crate::h265_dpb::Dpb;
+    use crate::h265_fixture::{pps_payload, sps_payload};
+    use crate::h265_frontend::{PendingSlice, Rps};
+    use crate::h265_picture::{PictureData, Reference};
 
     use std::cell::RefCell;
-    use std::io::Cursor;
     use std::rc::Rc;
 
     /// Parsed fixture sequence and picture sets.
-    fn sets() -> (Rc<Sps>, Rc<Pps>) {
-        let mut parser = Parser::default();
-        let mut stream = nal(NaluType::SpsNut, &sps_payload());
-        stream.extend(nal(NaluType::PpsNut, &pps_payload()));
-        let mut cursor = Cursor::new(stream.as_slice());
-        let sps = Nalu::next(&mut cursor).expect("sps nal");
-        parser.parse_sps(&sps).expect("sps parses");
-        let pps = Nalu::next(&mut cursor).expect("pps nal");
-        parser.parse_pps(&pps).expect("pps parses");
-        (
-            parser.get_sps(0).expect("sps stored").clone(),
-            parser.get_pps(0).expect("pps stored").clone(),
+    fn sets() -> (Sps, Pps) {
+        let sps = crate::h265::parse_sps::<VaApiError, Gate>(&crate::h265::rbsp(&sps_payload()))
+            .expect("sps parses");
+        let pps = crate::h265::parse_pps::<VaApiError, Gate>(
+            &crate::h265::rbsp(&pps_payload()),
+            Some(&sps),
         )
+        .expect("pps parses");
+        (sps, pps)
+    }
+
+    /// P slice header over `tail` defaults.
+    fn header() -> SliceHeader {
+        SliceHeader {
+            first: true,
+            address: 0,
+            slice_type: SliceType::P,
+            pic_output: true,
+            no_output_prior: false,
+            poc_lsb: Some(0),
+            rps: None,
+            rps_bits: None,
+            lt: Vec::new(),
+            entry_count: 0,
+            extension_length: 0,
+        }
     }
 
     /// DPB holding `pocs` as short-term references on matching slots.
@@ -667,17 +693,15 @@ mod tests {
     #[test]
     fn matrix_absent_without_scaling_lists() {
         let (sps, pps) = sets();
-        assert!(Params::matrix(&sps, &pps).expect("no matrix").is_none());
+        assert!(Params::matrix(&sps, &pps).is_none());
     }
 
     #[test]
     fn matrix_defaults_match_spec_tables() {
         let (sps, pps) = sets();
-        let mut enabled = (*sps).clone();
-        enabled.scaling.scaling_list_enabled_flag = true;
-        let matrix = Params::matrix(&enabled, &pps)
-            .expect("default matrix")
-            .expect("matrix present");
+        let mut enabled = sps;
+        enabled.flags |= SPS_SCALING;
+        let matrix = Params::matrix(&enabled, &pps).expect("matrix present");
         assert_eq!(matrix.scaling_list_4x4[0], [16; 16]);
         assert_eq!(
             matrix.scaling_list_8x8[0],
@@ -706,31 +730,26 @@ mod tests {
     #[test]
     fn matrix_prefers_picture_set_and_unscans() {
         let (sps, pps) = sets();
-        let mut enabled = (*sps).clone();
-        enabled.scaling.scaling_list_enabled_flag = true;
-        enabled.scaling.scaling_list_data_present_flag = true;
-        enabled.scaling_list.list_4x4[0][1] = 9;
-        let mut pps = (*pps).clone();
-        pps.headers.scaling_list_data_present_flag = true;
-        pps.scaling_list.list_4x4[0][1] = 7;
-        let matrix = Params::matrix(&enabled, &pps)
-            .expect("pps matrix")
-            .expect("matrix present");
+        let mut enabled = sps;
+        enabled.flags |= SPS_SCALING;
+        enabled.scaling.size0[0][1] = 9;
+        let mut pps = pps;
+        pps.scaling.size0[0][1] = 7;
+        let matrix = Params::matrix(&enabled, &pps).expect("matrix present");
         assert_eq!(matrix.scaling_list_4x4[0][Params::SCAN_4X4[1]], 7);
     }
 
     #[test]
-    fn matrix_rejects_dc_range() {
+    fn matrix_maps_custom_dc_coefficients() {
         let (sps, pps) = sets();
-        let mut enabled = (*sps).clone();
-        enabled.scaling.scaling_list_enabled_flag = true;
-        let mut pps = (*pps).clone();
-        pps.headers.scaling_list_data_present_flag = true;
-        pps.scaling_list.dc_coef_minus8_16x16[0] = 248;
-        assert!(matches!(
-            Params::matrix(&enabled, &pps),
-            Err(VaApiError::Parse(_))
-        ));
+        let mut enabled = sps;
+        enabled.flags |= SPS_SCALING;
+        let mut pps = pps;
+        pps.scaling.dc2[0] = 20;
+        pps.scaling.dc3[1] = 24;
+        let matrix = Params::matrix(&enabled, &pps).expect("matrix present");
+        assert_eq!(matrix.scaling_list_dc_16x16[0], 20);
+        assert_eq!(matrix.scaling_list_dc_32x32[1], 24);
     }
 
     #[test]
@@ -803,23 +822,25 @@ mod tests {
 
     #[test]
     fn slice_maps_weights_and_lists() {
-        let (sps, _) = sets();
         let dpb = dpb_with(&[0, 2]);
         let surfaces = [50, 51];
         let params = Params::new(&dpb, &surfaces);
-        let mut header = SliceHeader {
-            type_: SliceType::P,
-            header_bit_size: 80,
-            pred_weight_table: PredWeightTable {
-                chroma_log2_weight_denom: 2,
-                ..PredWeightTable::default()
+        let tail = SliceTail {
+            bit_size: 80,
+            weights: SliceWeights {
+                luma_denom: 0,
+                delta_chroma_denom: 2,
+                l0: vec![WeightEntry {
+                    luma: None,
+                    chroma: Some([(0, 10), (0, 200)]),
+                }],
+                l1: Vec::new(),
             },
-            ..SliceHeader::default()
+            ..SliceTail::default()
         };
-        header.pred_weight_table.delta_chroma_offset_l0[0][0] = 10;
-        header.pred_weight_table.delta_chroma_offset_l0[0][1] = 200;
+        let pending = PendingSlice::assembled(header(), tail, 64, 0);
         let slice = params
-            .slice(&header, 64, &[Some(1), None], &[], &sps, true)
+            .slice(&pending, &[Some(1), None], &[], true)
             .expect("slice maps");
         assert_eq!(slice.slice_data_size, 64);
         assert_eq!(slice.slice_data_byte_offset, 10);
@@ -829,17 +850,18 @@ mod tests {
         assert_eq!(slice.ref_pic_list[0][1], 0xff);
         assert_eq!(slice.ref_pic_list[1][0], 0xff);
         assert_eq!(slice.chroma_offset_l0[0], [10, 127]);
-        let header = SliceHeader {
-            type_: SliceType::B,
-            motion: SliceMotion {
-                temporal_mvp_enabled_flag: true,
-                ..SliceMotion::default()
-            },
-            collocated_ref_idx: 1,
-            ..SliceHeader::default()
+        let b_header = SliceHeader {
+            slice_type: SliceType::B,
+            ..header()
         };
+        let b_tail = SliceTail {
+            temporal_mvp: true,
+            collocated_ref_idx: 1,
+            ..SliceTail::default()
+        };
+        let pending = PendingSlice::assembled(b_header, b_tail, 64, 0);
         let slice = params
-            .slice(&header, 64, &[], &[], &sps, false)
+            .slice(&pending, &[], &[], false)
             .expect("b slice maps");
         assert_eq!(slice.collocated_ref_idx, 1);
         assert_eq!(slice.long_slice_flags & 0x1, 0);
@@ -847,45 +869,49 @@ mod tests {
 
     #[test]
     fn slice_rejects_bad_denom_and_overflow() {
-        let (sps, _) = sets();
         let dpb = dpb_with(&[0]);
         let surfaces = [50];
         let params = Params::new(&dpb, &surfaces);
-        let mut header = SliceHeader {
-            type_: SliceType::P,
-            pred_weight_table: PredWeightTable {
-                chroma_log2_weight_denom: 8,
-                ..PredWeightTable::default()
+        let tail = SliceTail {
+            weights: SliceWeights {
+                luma_denom: 0,
+                delta_chroma_denom: 8,
+                l0: Vec::new(),
+                l1: Vec::new(),
             },
-            ..SliceHeader::default()
+            ..SliceTail::default()
         };
+        let pending = PendingSlice::assembled(header(), tail, 64, 0);
         assert!(matches!(
-            params.slice(&header, 64, &[], &[], &sps, true),
+            params.slice(&pending, &[], &[], true),
             Err(VaApiError::Parse(_))
         ));
-        header.pred_weight_table.chroma_log2_weight_denom = 0;
+        let tail = SliceTail::default();
+        let pending = PendingSlice::assembled(header(), tail, 64, 0);
         let long = vec![Some(0); 16];
         assert!(matches!(
-            params.slice(&header, 64, &long, &[], &sps, true),
+            params.slice(&pending, &long, &[], true),
             Err(VaApiError::BrokenReference(_))
         ));
     }
 
     #[test]
     fn weights_derive_chroma_offsets() {
-        let (sps, _) = sets();
-        let mut header = SliceHeader {
-            type_: SliceType::P,
-            pred_weight_table: PredWeightTable {
-                chroma_log2_weight_denom: 2,
-                ..PredWeightTable::default()
+        let tail = SliceTail {
+            weights: SliceWeights {
+                luma_denom: 0,
+                delta_chroma_denom: 2,
+                l0: vec![WeightEntry {
+                    luma: None,
+                    chroma: Some([(1, 0), (-1, 0)]),
+                }],
+                l1: Vec::new(),
             },
-            ..SliceHeader::default()
+            ..SliceTail::default()
         };
-        header.pred_weight_table.delta_chroma_weight_l0[0] = [1, -1];
-        header.pred_weight_table.delta_chroma_offset_l0[0] = [0, 0];
+        let pending = PendingSlice::assembled(header(), tail, 8, 0);
         let slice = Params::new(&dpb_with(&[]), &[])
-            .slice(&header, 8, &[], &[], &sps, true)
+            .slice(&pending, &[], &[], true)
             .expect("weights derive");
         assert_eq!(slice.delta_chroma_weight_l0[0], [1, -1]);
         assert_eq!(slice.chroma_offset_l0[0], [-32, 32]);

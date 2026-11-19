@@ -1778,11 +1778,10 @@ impl BitWriter {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use super::{BitWriter, EncodeCodec, GopShape, VaApiEncoder, Words};
-    use crate::h264::parser::{Nalu, Parser, SliceType};
-    use crate::h265::parser::{Nalu as Nalu265, Parser as Parser265, SliceType as SliceType265};
+    use crate::error::VaApiError;
+    use crate::h264::Gate;
+    use crate::h265::Gate as Gate265;
 
     #[test]
     fn writer_packs_bits_msb_first() {
@@ -1871,16 +1870,44 @@ mod tests {
         assert_eq!(VaApiEncoder::level(EncodeCodec::H265, (3840, 2160)), 150);
     }
 
-    /// First NAL unit of Annex B `bytes`.
-    fn first(bytes: &[u8]) -> Nalu<'_> {
-        let mut cursor = Cursor::new(bytes);
-        Nalu::next(&mut cursor).expect("annex b unit")
+    /// RBSP body of Annex B `bytes`: start code and header stripped.
+    fn body(bytes: &[u8]) -> Vec<u8> {
+        let start = bytes
+            .windows(3)
+            .position(|window| window == [0x00, 0x00, 0x01])
+            .expect("start code")
+            + 3;
+        rust_video_h264::rbsp(&bytes[start + 1..]).into_owned()
     }
 
-    /// First H.265 NAL unit of Annex B `bytes`.
-    fn first265(bytes: &[u8]) -> Nalu265<'_> {
-        let mut cursor = Cursor::new(bytes);
-        Nalu265::next(&mut cursor).expect("annex b unit")
+    /// Header byte of Annex B `bytes`.
+    fn header(bytes: &[u8]) -> u8 {
+        let start = bytes
+            .windows(3)
+            .position(|window| window == [0x00, 0x00, 0x01])
+            .expect("start code")
+            + 3;
+        bytes[start]
+    }
+
+    /// RBSP body of H.265 Annex B `bytes`: start code and header stripped.
+    fn body265(bytes: &[u8]) -> Vec<u8> {
+        let start = bytes
+            .windows(3)
+            .position(|window| window == [0x00, 0x00, 0x01])
+            .expect("start code")
+            + 3;
+        rust_video_h265::rbsp(&bytes[start + 2..]).into_owned()
+    }
+
+    /// Two-byte header of H.265 Annex B `bytes`.
+    fn header265(bytes: &[u8]) -> [u8; 2] {
+        let start = bytes
+            .windows(3)
+            .position(|window| window == [0x00, 0x00, 0x01])
+            .expect("start code")
+            + 3;
+        [bytes[start], bytes[start + 1]]
     }
 
     /// Raw header bytes with emulation prevention inserted for the parser.
@@ -1909,39 +1936,47 @@ mod tests {
             sps_bytes.len() * 8
         );
         let sps_bytes = annexed(&sps_bytes);
-        let mut parser = Parser::default();
-        let sps = parser.parse_sps(&first(&sps_bytes)).expect("sps").clone();
+        let sps_body = body(&sps_bytes);
+        let sps = rust_video_h264::parse_sps::<VaApiError, Gate>(&sps_body).expect("sps");
         assert_eq!(sps.profile_idc, 100);
         assert_eq!((sps.width(), sps.height()), (320, 240));
-        assert_eq!(sps.pic_order_cnt_type, 0);
+        assert!(matches!(sps.poc_type, rust_video_h264::PocType::Lsb));
         assert_eq!(sps.log2_max_frame_num_minus4, 0);
-        assert!(sps.frame_field.frame_mbs_only);
-        let restriction = sps
-            .vui
-            .as_ref()
-            .and_then(|vui| vui.restriction)
-            .expect("low-delay vui");
-        assert_eq!(restriction.max_num_reorder_frames, 0);
-        assert_eq!(restriction.max_dec_frame_buffering, 2);
+        let vui = sps.vui.as_ref().expect("low-delay vui");
+        assert_eq!(vui.max_num_reorder_frames, Some(0));
+        assert_eq!(vui.max_dec_frame_buffering, Some(2));
 
         VaApiEncoder::h264_pps(26, &mut writer);
         let (pps_bytes, _) = writer.take();
         let pps_bytes = annexed(&pps_bytes);
-        let pps = parser.parse_pps(&first(&pps_bytes)).expect("pps");
-        assert!(pps.coding.entropy_coding_mode_flag);
-        assert!(pps.coding.transform_8x8_mode_flag);
-        assert_eq!(pps.pic_init_qp_minus26, 0);
+        let pps_body = body(&pps_bytes);
+        let pps =
+            rust_video_h264::parse_pps::<VaApiError, Gate>(&pps_body, Some(&sps)).expect("pps");
+        assert!(pps.entropy());
+        assert!(pps.transform_8x8());
+        assert_eq!(pps.pic_init_qp, 0);
 
         VaApiEncoder::h264_slice(3, 7, 6, &mut writer);
         let (slice_bytes, slice_bits) = writer.take();
         let slice_bytes = annexed(&slice_bytes);
-        let slice = parser
-            .parse_slice_header(first(&slice_bytes))
-            .expect("slice");
-        assert_eq!(slice.header.slice_type, SliceType::I);
-        assert_eq!(slice.header.frame_num, 3);
-        assert_eq!(slice.header.idr_pic_id, 7);
-        assert_eq!(slice.header.pic_order_cnt_lsb, 6);
+        let head = header(&slice_bytes);
+        let slice_body = body(&slice_bytes);
+        let mut reader = rust_video_h264::BitReader::new(&slice_body);
+        let prefix =
+            rust_video_h264::parse_slice_prefix::<VaApiError>(&mut reader).expect("prefix");
+        let slice = rust_video_h264::parse_slice_rest::<VaApiError, Gate>(
+            &mut reader,
+            prefix,
+            head & 0x1F == 5,
+            (head >> 5) & 3,
+            &sps,
+            &pps,
+        )
+        .expect("slice");
+        assert_eq!(slice.slice_type, rust_video_h264::SliceType::I);
+        assert_eq!(slice.frame_num, 3);
+        assert_eq!(slice.idr_pic_id, Some(7));
+        assert_eq!(slice.poc, rust_video_h264::SlicePoc::Lsb(6, 0));
         assert!(usize::try_from(slice_bits).expect("small header") < slice_bytes.len() * 8);
     }
 
@@ -1957,15 +1992,26 @@ mod tests {
         let sps_bytes = annexed(&sps_bytes);
         let pps_bytes = annexed(&pps_bytes);
         let slice_bytes = annexed(&slice_bytes);
-        let mut parser = Parser::default();
-        parser.parse_sps(&first(&sps_bytes)).expect("sps");
-        parser.parse_pps(&first(&pps_bytes)).expect("pps");
-        let slice = parser
-            .parse_slice_header(first(&slice_bytes))
-            .expect("p slice");
-        assert_eq!(slice.header.slice_type, SliceType::P);
-        assert_eq!(slice.header.frame_num, 3);
-        assert_eq!(slice.header.pic_order_cnt_lsb, 6);
+        let sps = rust_video_h264::parse_sps::<VaApiError, Gate>(&body(&sps_bytes)).expect("sps");
+        let pps = rust_video_h264::parse_pps::<VaApiError, Gate>(&body(&pps_bytes), Some(&sps))
+            .expect("pps");
+        let head = header(&slice_bytes);
+        let slice_body = body(&slice_bytes);
+        let mut reader = rust_video_h264::BitReader::new(&slice_body);
+        let prefix =
+            rust_video_h264::parse_slice_prefix::<VaApiError>(&mut reader).expect("prefix");
+        let slice = rust_video_h264::parse_slice_rest::<VaApiError, Gate>(
+            &mut reader,
+            prefix,
+            head & 0x1F == 5,
+            (head >> 5) & 3,
+            &sps,
+            &pps,
+        )
+        .expect("p slice");
+        assert_eq!(slice.slice_type, rust_video_h264::SliceType::P);
+        assert_eq!(slice.frame_num, 3);
+        assert_eq!(slice.poc, rust_video_h264::SlicePoc::Lsb(6, 0));
         assert!(usize::try_from(slice_bits).expect("small header") < slice_bytes.len() * 8);
     }
 
@@ -1975,14 +2021,9 @@ mod tests {
         VaApiEncoder::h264_sps((320, 208), (320, 200), 22, &mut writer);
         let (bytes, _) = writer.take();
         let bytes = annexed(&bytes);
-        let mut parser = Parser::default();
-        let sps = parser.parse_sps(&first(&bytes)).expect("sps").clone();
+        let sps = rust_video_h264::parse_sps::<VaApiError, Gate>(&body(&bytes)).expect("sps");
         assert_eq!((sps.width(), sps.height()), (320, 208));
-        let rect = sps.visible_rectangle();
-        assert_eq!(
-            (rect.max.x - rect.min.x, rect.max.y - rect.min.y),
-            (320, 200)
-        );
+        assert_eq!((sps.visible_width(), sps.visible_height()), (320, 200));
     }
 
     #[test]
@@ -2022,38 +2063,56 @@ mod tests {
         let pps_bytes = annexed(&pps_bytes);
         let idr_bytes = annexed(&idr_bytes);
         let p_bytes = annexed(&p_bytes);
-        let mut parser = Parser265::default();
-        parser.parse_vps(&first265(&vps_bytes)).expect("vps");
-        let sps = parser
-            .parse_sps(&first265(&sps_bytes))
-            .expect("sps")
-            .clone();
-        assert_eq!(
-            (
-                sps.pic_width_in_luma_samples,
-                sps.pic_height_in_luma_samples
-            ),
-            (320, 240)
-        );
-        assert_eq!(sps.num_short_term_ref_pic_sets, 1);
-        assert_eq!(sps.max_dec_pic_buffering_minus1[0], 1);
-        assert_eq!(sps.max_num_reorder_pics[0], 0);
-        let rps = &sps.short_term_ref_pic_set[0];
-        assert_eq!((rps.num_negative_pics, rps.num_positive_pics), (1, 0));
-        assert_eq!(rps.delta_poc_s0[0], -2);
-        assert!(rps.used_by_curr_pic_s0[0]);
-        let pps = parser.parse_pps(&first265(&pps_bytes)).expect("pps");
-        assert_eq!(pps.init_qp_minus26, 0);
-        let idr = parser
-            .parse_slice_header(first265(&idr_bytes))
-            .expect("idr slice");
-        assert_eq!(idr.header.type_, SliceType265::I);
-        let p = parser
-            .parse_slice_header(first265(&p_bytes))
-            .expect("p slice");
-        assert_eq!(p.header.type_, SliceType265::P);
-        assert_eq!(p.header.pic_order_cnt_lsb, 6);
-        assert_eq!(p.header.short_term_ref_pic_set_idx, 0);
+        rust_video_h265::parse_vps::<VaApiError>(&body265(&vps_bytes)).expect("vps");
+        let sps =
+            rust_video_h265::parse_sps::<VaApiError, Gate265>(&body265(&sps_bytes)).expect("sps");
+        assert_eq!((sps.width, sps.height), (320, 240));
+        assert_eq!(sps.rps.len(), 1);
+        assert_eq!(sps.ordering_buffering[0], 1);
+        assert_eq!(sps.ordering_reorder[0], 0);
+        let rps = &sps.rps[0];
+        assert_eq!((rps.negative_count, rps.positive_count), (1, 0));
+        assert_eq!(rps.negative[0], -2);
+        assert!(rps.negative_used[0]);
+        let pps =
+            rust_video_h265::parse_pps::<VaApiError, Gate265>(&body265(&pps_bytes), Some(&sps))
+                .expect("pps");
+        assert_eq!(pps.pic_init_qp_minus26, 0);
+        let head = header265(&idr_bytes);
+        let idr_body = body265(&idr_bytes);
+        let mut reader = rust_video_h265::BitReader::new(&idr_body);
+        let idr_type = (head[0] >> 1) & 0x3F;
+        let prefix = rust_video_h265::parse_slice_prefix::<VaApiError>(&mut reader, idr_type)
+            .expect("prefix");
+        let idr = rust_video_h265::parse_slice_rest::<VaApiError>(
+            &mut reader,
+            prefix,
+            idr_type,
+            &sps,
+            &pps,
+        )
+        .expect("idr slice");
+        assert_eq!(idr.slice_type, rust_video_h265::SliceType::I);
+        let head = header265(&p_bytes);
+        let p_body = body265(&p_bytes);
+        let mut reader = rust_video_h265::BitReader::new(&p_body);
+        let nal_type = (head[0] >> 1) & 0x3F;
+        let prefix = rust_video_h265::parse_slice_prefix::<VaApiError>(&mut reader, nal_type)
+            .expect("prefix");
+        let p = rust_video_h265::parse_slice_rest::<VaApiError>(
+            &mut reader,
+            prefix,
+            nal_type,
+            &sps,
+            &pps,
+        )
+        .expect("p slice");
+        assert_eq!(p.slice_type, rust_video_h265::SliceType::P);
+        assert_eq!(p.poc_lsb, Some(6));
+        assert_eq!(p.rps_bits.and_then(|bits| bits.table_idx), Some(0));
+        let tail = rust_video_h265::parse_slice_tail::<VaApiError>(&p_body, nal_type, &sps, &pps)
+            .expect("tail");
+        assert!(tail.bit_size > 16);
         assert!(usize::try_from(p_bits).expect("small header") < p_bytes.len() * 8);
     }
 }

@@ -11,7 +11,7 @@ use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::{self, VaSliceParameterBufferH264};
 use crate::frontend::{Frontend, PendingPicture, Picture, SurfaceSlot};
-use crate::h264::parser::{SliceHeader, SliceType};
+use crate::h264::{SliceHeader, SliceType};
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::params::Params;
 use crate::readback::Reader;
@@ -411,8 +411,7 @@ impl<'a> H264Decoder<'a> {
                 max_pic_num,
             )?;
             self.slice_params.push(params.slice(
-                slice.header(),
-                slice.data().len(),
+                slice,
                 &self.list0,
                 &self.list1,
                 picture.sps(),
@@ -445,10 +444,12 @@ impl<'a> H264Decoder<'a> {
         let initial = picture.initial();
         let curr_pic_num = picture.pic().pic_num;
         match header.slice_type {
-            SliceType::P | SliceType::Sp => {
+            SliceType::P => {
+                list0.clear();
+                list0.extend(initial.p_list.iter().copied());
                 frontend.modify_into(
                     header,
-                    &initial.p_list,
+                    picture.pps(),
                     false,
                     curr_pic_num,
                     max_pic_num,
@@ -457,24 +458,28 @@ impl<'a> H264Decoder<'a> {
                 list1.clear();
             }
             SliceType::B => {
+                list0.clear();
+                list0.extend(initial.b_list0.iter().copied());
                 frontend.modify_into(
                     header,
-                    &initial.b_list0,
+                    picture.pps(),
                     false,
                     curr_pic_num,
                     max_pic_num,
                     list0,
                 )?;
+                list1.clear();
+                list1.extend(initial.b_list1.iter().copied());
                 frontend.modify_into(
                     header,
-                    &initial.b_list1,
+                    picture.pps(),
                     true,
                     curr_pic_num,
                     max_pic_num,
                     list1,
                 )?;
             }
-            SliceType::I | SliceType::Si => {
+            SliceType::I => {
                 list0.clear();
                 list1.clear();
             }

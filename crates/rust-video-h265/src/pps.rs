@@ -375,6 +375,31 @@ fn parse_pps_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E
     })
 }
 
+/// Picture and sequence ids behind a picture set.
+///
+/// Reads only the leading ids without enforcing set counts; `parse_pps`
+/// enforces them.
+///
+/// # Errors
+///
+/// Returns `Err` on truncated or out-of-range ids.
+pub fn parse_pps_ids<E: HevcError>(rbsp: &[u8]) -> Result<(u8, u8), E> {
+    let mut reader = BitReader::new(rbsp);
+    let pps_id = reader.read_ue("pic_parameter_set_id")?;
+    let pps_id = u8::try_from(pps_id).map_err(|_| {
+        E::parse(ParseKind::Range {
+            syntax: "pic_parameter_set_id",
+        })
+    })?;
+    let sps_id = reader.read_ue("pps_seq_parameter_set_id")?;
+    let sps_id = u8::try_from(sps_id).map_err(|_| {
+        E::parse(ParseKind::Range {
+            syntax: "pps_seq_parameter_set_id",
+        })
+    })?;
+    Ok((pps_id, sps_id))
+}
+
 /// Reference count field below the 31 ceiling.
 pub fn parse_ref_count<E: HevcError>(
     reader: &mut BitReader<'_, E>,

@@ -9,16 +9,57 @@ use std::rc::Rc;
 
 use log::debug;
 
-use crate::h264::parser::MaxLongTermFrameIdx;
-use crate::h264::parser::RefPicMarkingInner;
-use crate::h264::parser::Sps;
-use crate::h264::picture::Field;
-use crate::h264::picture::IsIdr;
-use crate::h264::picture::PictureData;
-use crate::h264::picture::RcPictureData;
-use crate::h264::picture::Reference;
+use crate::h264::Sps;
+use crate::h264_picture::Field;
+use crate::h264_picture::IsIdr;
+use crate::h264_picture::PictureData;
+use crate::h264_picture::RcPictureData;
+use crate::h264_picture::Reference;
 
 pub type DpbPicRefList<'a, H> = Vec<&'a DpbEntry<H>>;
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MaxLongTermFrameIdx {
+    #[default]
+    NoLongTermFrameIndices,
+    Idx(u32),
+}
+
+impl MaxLongTermFrameIdx {
+    /// Create a value from `max_long_term_frame_idx_plus1`.
+    pub fn from_value_plus1(max_long_term_frame_idx_plus1: u32) -> Self {
+        match max_long_term_frame_idx_plus1 {
+            0 => Self::NoLongTermFrameIndices,
+            i @ 1.. => Self::Idx(i - 1),
+        }
+    }
+
+    /// Convert this value to the representation used by `max_long_term_frame_idx_plus1`.
+    pub fn to_value_plus1(self) -> u32 {
+        match self {
+            Self::NoLongTermFrameIndices => 0,
+            Self::Idx(i) => i + 1,
+        }
+    }
+}
+
+impl PartialEq<u32> for MaxLongTermFrameIdx {
+    fn eq(&self, other: &u32) -> bool {
+        match self {
+            MaxLongTermFrameIdx::NoLongTermFrameIndices => false,
+            MaxLongTermFrameIdx::Idx(idx) => idx.eq(other),
+        }
+    }
+}
+
+impl PartialOrd<u32> for MaxLongTermFrameIdx {
+    fn partial_cmp(&self, other: &u32) -> Option<std::cmp::Ordering> {
+        match self {
+            MaxLongTermFrameIdx::NoLongTermFrameIndices => Some(std::cmp::Ordering::Less),
+            MaxLongTermFrameIdx::Idx(idx) => Some(idx.cmp(other)),
+        }
+    }
+}
 
 /// All the reference picture lists used to decode a picture.
 #[derive(Default)]
@@ -487,9 +528,9 @@ impl<T: Clone> Dpb<T> {
     pub fn mmco_op_1(
         &mut self,
         pic: &PictureData,
-        marking: &RefPicMarkingInner,
+        difference_of_pic_nums_minus1: u32,
     ) -> Result<(), MmcoError> {
-        let pic_num_x = pic.pic_num - (marking.difference_of_pic_nums_minus1.cast_signed() + 1);
+        let pic_num_x = pic.pic_num - (difference_of_pic_nums_minus1.cast_signed() + 1);
 
         log::debug!("MMCO op 1 for pic_num_x {pic_num_x}");
         log::trace!("Dpb state before MMCO=1: {self:#?}");
@@ -503,16 +544,13 @@ impl<T: Clone> Dpb<T> {
         Ok(())
     }
 
-    pub fn mmco_op_2(&mut self, marking: &RefPicMarkingInner) -> Result<(), MmcoError> {
-        log::debug!(
-            "MMCO op 2 for long_term_pic_num {}",
-            marking.long_term_pic_num
-        );
+    pub fn mmco_op_2(&mut self, long_term_pic_num: u32) -> Result<(), MmcoError> {
+        log::debug!("MMCO op 2 for long_term_pic_num {long_term_pic_num}");
 
         log::trace!("Dpb state before MMCO=2: {self:#?}");
 
         let to_mark = self
-            .find_long_term_with_long_term_pic_num(marking.long_term_pic_num)
+            .find_long_term_with_long_term_pic_num(long_term_pic_num)
             .ok_or(MmcoError::NoShortTermPic)?;
 
         to_mark.pic.borrow_mut().set_reference(Reference::None);
@@ -523,9 +561,10 @@ impl<T: Clone> Dpb<T> {
     pub fn mmco_op_3(
         &mut self,
         pic: &PictureData,
-        marking: &RefPicMarkingInner,
+        difference_of_pic_nums_minus1: u32,
+        long_term_frame_idx: u32,
     ) -> Result<(), MmcoError> {
-        let pic_num_x = pic.pic_num - (marking.difference_of_pic_nums_minus1.cast_signed() + 1);
+        let pic_num_x = pic.pic_num - (difference_of_pic_nums_minus1.cast_signed() + 1);
 
         log::debug!("MMCO op 3 for pic_num_x {pic_num_x}");
         log::trace!("Dpb state before MMCO=3: {self:#?}");
@@ -542,8 +581,6 @@ impl<T: Clone> Dpb<T> {
         if to_mark_as_long.borrow().nonexisting {
             return Err(MmcoError::ExpectedExisting);
         }
-
-        let long_term_frame_idx = marking.long_term_frame_idx;
 
         for mut picture in self.pictures_mut() {
             let long_already_assigned = matches!(picture.reference(), Reference::LongTerm)
@@ -569,23 +606,21 @@ impl<T: Clone> Dpb<T> {
     }
 
     /// Returns the new `max_long_term_frame_idx`.
-    pub fn mmco_op_4(&mut self, marking: &RefPicMarkingInner) -> MaxLongTermFrameIdx {
-        log::debug!(
-            "MMCO op 4, max_long_term_frame_idx: {:?}",
-            marking.max_long_term_frame_idx
-        );
+    pub fn mmco_op_4(&mut self, max_long_term_frame_idx_plus1: u32) -> MaxLongTermFrameIdx {
+        let max = MaxLongTermFrameIdx::from_value_plus1(max_long_term_frame_idx_plus1);
+        log::debug!("MMCO op 4, max_long_term_frame_idx: {max:?}");
 
         log::trace!("Dpb state before MMCO=4: {self:#?}");
 
         for mut dpb_pic in self
             .pictures_mut()
             .filter(|pic| matches!(pic.reference(), Reference::LongTerm))
-            .filter(|pic| marking.max_long_term_frame_idx < pic.long_term_frame_idx)
+            .filter(|pic| max < pic.long_term_frame_idx)
         {
             dpb_pic.set_reference(Reference::None);
         }
 
-        marking.max_long_term_frame_idx
+        max
     }
 
     /// Returns the new `max_long_term_frame_idx`.
@@ -632,9 +667,7 @@ impl<T: Clone> Dpb<T> {
         MaxLongTermFrameIdx::NoLongTermFrameIndices
     }
 
-    pub fn mmco_op_6(&mut self, pic: &mut PictureData, marking: &RefPicMarkingInner) {
-        let long_term_frame_idx = marking.long_term_frame_idx;
-
+    pub fn mmco_op_6(&mut self, pic: &mut PictureData, long_term_frame_idx: u32) {
         log::debug!("MMCO op 6, long_term_frame_idx: {long_term_frame_idx}");
         log::trace!("Dpb state before MMCO=6: {self:#?}");
 
@@ -1138,7 +1171,7 @@ impl<T> std::fmt::Debug for Dpb<T> {
 #[cfg(test)]
 mod tests {
     use super::Dpb;
-    use crate::h264::picture::{PictureData, Reference};
+    use crate::h264_picture::{PictureData, Reference};
 
     #[test]
     fn bump_ready_emits_in_output_order_and_keeps_refs() {

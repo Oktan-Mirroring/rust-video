@@ -5,17 +5,17 @@
 
 use crate::error::VaApiError;
 use crate::frontend::SurfaceSlot;
-use crate::vp9::parser::{BitDepth, Header, Parser, Profile};
+use crate::vp9::{FrameHeader, Parser};
 
 use bytes::Bytes;
 
 /// Number of VP9 reference slots.
-pub use crate::vp9::parser::NUM_REF_FRAMES as NUM_SLOTS;
+pub(crate) use crate::vp9::NUM_REF_FRAMES as NUM_SLOTS;
 
 /// Coded frame with its bitstream bytes.
 pub struct PendingFrame {
     /// Parsed frame header.
-    header: Header,
+    header: FrameHeader,
     /// Frame bytes, uncompressed header included.
     data: Bytes,
 }
@@ -23,7 +23,7 @@ pub struct PendingFrame {
 /// Coded frame with reference slots resolved.
 pub struct Picture {
     /// Parsed frame header.
-    header: Header,
+    header: FrameHeader,
     /// Frame bytes, uncompressed header included.
     data: Bytes,
     /// Reference slots with coded sizes.
@@ -33,7 +33,7 @@ pub struct Picture {
 impl Picture {
     /// Parsed frame header.
     #[must_use]
-    pub fn header(&self) -> &Header {
+    pub fn header(&self) -> &FrameHeader {
         &self.header
     }
 
@@ -86,12 +86,12 @@ impl Ingest {
 
 /// VP9 frontend: chunk stream in, ordered frames out.
 pub struct Frontend {
-    /// Bitstream parser with cached color state.
+    /// Shared ingest with cached color state.
     parser: Parser,
     /// Active coded size.
     active: Option<(u32, u32)>,
     /// Active bitstream profile.
-    profile: Option<Profile>,
+    profile: Option<u8>,
     /// Reference slots with coded sizes.
     refs: [Option<(SurfaceSlot, (u32, u32))>; NUM_SLOTS],
 }
@@ -101,7 +101,7 @@ impl Frontend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            parser: Parser::default(),
+            parser: Parser::new(),
             active: None,
             profile: None,
             refs: Default::default(),
@@ -116,7 +116,7 @@ impl Frontend {
 
     /// Active bitstream profile, if a frame arrived.
     #[must_use]
-    pub fn profile(&self) -> Option<Profile> {
+    pub fn profile(&self) -> Option<u8> {
         self.profile
     }
 
@@ -131,8 +131,6 @@ impl Frontend {
 
     /// Frames finished by the chunk stream in `bytes`.
     ///
-    /// Frame payloads sub-slice `bytes` without copying.
-    ///
     /// # Errors
     ///
     /// Returns `Err` when a frame fails to parse.
@@ -141,19 +139,12 @@ impl Frontend {
             frames: Vec::new(),
             reconfigured: false,
         };
-        let frames = self
-            .parser
-            .parse_chunk(bytes.as_ref())
-            .map_err(VaApiError::Parse)?;
+        let frames = self.parser.ingest_packet(bytes.as_ref())?;
         for frame in frames {
-            let payload: &[u8] = frame.as_ref();
-            let base = bytes.as_ptr() as usize;
-            let offset = payload.as_ptr() as usize - base;
-            debug_assert!(offset + payload.len() <= bytes.len());
-            let data = bytes.slice(offset..offset + payload.len());
-            let header = frame.header.clone();
-            if !header.show.show_existing_frame {
-                let size = (header.width, header.height);
+            let data = Bytes::copy_from_slice(&frame.bytes);
+            let header = frame.header;
+            if !header.show_existing_frame() {
+                let size = (header.frame_width, header.frame_height);
                 if self.active != Some(size) || self.profile != Some(header.profile) {
                     self.active = Some(size);
                     self.profile = Some(header.profile);
@@ -168,7 +159,7 @@ impl Frontend {
 
     /// Store `picture` on `slot`, refreshing reference slots.
     pub fn commit(&mut self, picture: &Picture, slot: SurfaceSlot) {
-        let size = (picture.header.width, picture.header.height);
+        let size = (picture.header.frame_width, picture.header.frame_height);
         self.refresh(slot, size, picture.header.refresh_frame_flags);
     }
 
@@ -180,7 +171,7 @@ impl Frontend {
     /// names a reference slot that holds no frame.
     pub fn begin(&mut self, pending: PendingFrame) -> Result<Begun, VaApiError> {
         Self::check_supported(&pending.header)?;
-        if pending.header.show.show_existing_frame {
+        if pending.header.show_existing_frame() {
             let index = usize::from(pending.header.frame_to_show_map_idx);
             let (slot, size) = self.refs.get(index).copied().flatten().ok_or_else(|| {
                 VaApiError::BrokenReference("no reference picture to display".to_owned())
@@ -206,23 +197,23 @@ impl Frontend {
     }
 
     /// Profile 0 8-bit 4:2:0 gate.
-    fn check_supported(header: &Header) -> Result<(), VaApiError> {
-        if header.show.show_existing_frame {
+    fn check_supported(header: &FrameHeader) -> Result<(), VaApiError> {
+        if header.show_existing_frame() {
             return Ok(());
         }
-        if !matches!(header.profile, Profile::Profile0) {
+        if header.profile != 0 {
             return Err(VaApiError::Unsupported(format!(
                 "vp9 profile {}",
-                header.profile as u8
+                header.profile
             )));
         }
-        if !matches!(header.color.bit_depth, BitDepth::Depth8) {
+        if header.bit_depth != 8 {
             return Err(VaApiError::Unsupported(format!(
                 "vp9 bit depth {}",
-                header.color.bit_depth as u8
+                header.bit_depth
             )));
         }
-        if !header.color.subsampling_x || !header.color.subsampling_y {
+        if !header.subsampling_x() || !header.subsampling_y() {
             return Err(VaApiError::Unsupported(
                 "vp9 chroma outside 4:2:0".to_owned(),
             ));

@@ -5,9 +5,15 @@
 #[allow(dead_code)]
 mod av1;
 #[cfg(target_os = "linux")]
-mod backend;
+mod av1_decoder;
+#[cfg(test)]
+mod av1_fixture;
 #[allow(dead_code)]
-mod bitstream;
+mod av1_frontend;
+#[allow(dead_code)]
+mod av1_params;
+#[cfg(target_os = "linux")]
+mod backend;
 #[cfg(target_os = "linux")]
 mod buffer;
 #[cfg(target_os = "linux")]
@@ -27,7 +33,25 @@ mod frontend;
 #[allow(dead_code)]
 mod h264;
 #[allow(dead_code)]
+mod h264_dpb;
+#[cfg(test)]
+mod h264_fixture;
+#[allow(dead_code)]
+mod h264_picture;
+#[allow(dead_code)]
 mod h265;
+#[cfg(target_os = "linux")]
+mod h265_decoder;
+#[allow(dead_code)]
+mod h265_dpb;
+#[cfg(test)]
+mod h265_fixture;
+#[allow(dead_code)]
+mod h265_frontend;
+#[allow(dead_code)]
+mod h265_params;
+#[allow(dead_code)]
+mod h265_picture;
 #[allow(dead_code)]
 mod inflight;
 #[allow(dead_code)]
@@ -44,8 +68,16 @@ mod sys;
 mod transcode;
 #[cfg(target_os = "linux")]
 mod vp8;
-#[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod vp9;
+#[cfg(target_os = "linux")]
+mod vp9_decoder;
+#[allow(dead_code)]
+mod vp9_frontend;
+#[allow(dead_code)]
+mod vp9_lookups;
+#[allow(dead_code)]
+mod vp9_params;
 
 #[cfg(target_os = "linux")]
 pub use av1::Av1Decoder;

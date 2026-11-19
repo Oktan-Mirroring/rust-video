@@ -1,7 +1,5 @@
 //! Synthetic AV1 OBU payloads for unit tests.
 
-use crate::av1::parser::ObuType;
-
 /// Bit writer for synthetic OBU payloads.
 #[derive(Default)]
 pub(crate) struct Writer {
@@ -56,8 +54,8 @@ impl Writer {
 }
 
 /// Low-overhead OBU of `type_` with `payload`.
-pub(crate) fn obu(type_: ObuType, payload: &[u8]) -> Vec<u8> {
-    let mut obu = vec![(type_ as u8) << 3 | 0x02];
+pub(crate) fn obu(type_: u8, payload: &[u8]) -> Vec<u8> {
+    let mut obu = vec![type_ << 3 | 0x02];
     let mut size = Vec::new();
     let mut value = u32::try_from(payload.len()).unwrap_or(u32::MAX);
     loop {
