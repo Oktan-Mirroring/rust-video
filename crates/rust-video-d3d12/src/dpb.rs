@@ -17,6 +17,7 @@ use crate::h264::{Marking, Mmco, Picture, PocType, Pps, SlicePoc, Sps};
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+use rust_video_h264::{abs_frame_num, frame_num_wrap, mmco_short_target, poc_type2};
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -26,8 +27,8 @@ const SLOTS: usize = 16;
 struct Occupant {
     /// Transmitted frame number.
     frame_num: u32,
-    /// Wrapped frame number for short-term pictures.
-    wrap: i32,
+    /// Transmitted frame number, inferred 0 after MMCO 5.
+    inferred: u32,
     /// Picture order count.
     poc: i32,
     /// Long-term reference.
@@ -86,8 +87,6 @@ pub(crate) struct Dpb {
     max_refs: u8,
     /// Frame number modulus.
     max_frame_num: u32,
-    /// Maximum long-term index, -1 for none.
-    max_long_idx: i32,
     /// Next transmitted frame number.
     expected_frame_num: Option<u32>,
     /// Previous reference POC behind MSB derivation.
@@ -115,7 +114,6 @@ impl Dpb {
             slots: core::array::from_fn(|_| None),
             max_refs: sps.max_num_ref_frames,
             max_frame_num: sps.max_frame_num(),
-            max_long_idx: -1,
             expected_frame_num: None,
             poc: PocTracker::new(),
             prev_ref_frame_num: 0,
@@ -157,11 +155,11 @@ impl Dpb {
         }
         let poc = self.picture_poc(picture, sps)?;
         let slot = self.alloc()?;
-        let wrap = Self::current_wrap(picture, frame_num)?;
+        let inferred = Self::inferred_num(picture, frame_num);
         let (long_term, long_term_idx) = Self::current_long_term(picture);
         self.slots[slot] = Some(Occupant {
             frame_num,
-            wrap,
+            inferred,
             poc,
             long_term,
             long_term_idx,
@@ -213,14 +211,10 @@ impl Dpb {
         if !picture.ref_pic() {
             return true;
         }
-        let Ok(wrap) = Self::current_wrap(picture, frame_num) else {
-            return false;
-        };
-        !self
-            .slots
-            .iter()
-            .flatten()
-            .any(|occupant| occupant.reference && !occupant.long_term && occupant.wrap == wrap)
+        let inferred = Self::inferred_num(picture, frame_num);
+        !self.slots.iter().flatten().any(|occupant| {
+            occupant.reference && !occupant.long_term && occupant.inferred == inferred
+        })
     }
 
     /// IDR reset: prior pictures out, state zeroed.
@@ -246,7 +240,6 @@ impl Dpb {
                 }
             }
         }
-        self.max_long_idx = -1;
         self.poc.reset();
         self.prev_ref_frame_num = 0;
         self.prev_frame_num_offset = 0;
@@ -290,12 +283,16 @@ impl Dpb {
         if self.max_refs == 0 {
             return Err(D3d12Error::Parse(ParseReason::ReferenceWithZeroRefFrames));
         }
+        let curr = picture.frame_num();
+        let max = self.max_frame_num;
         let mut victim: Option<usize> = None;
         let mut smallest = i32::MAX;
         for (index, slot) in self.slots.iter().enumerate() {
             if let Some(occupant) = slot {
-                if occupant.reference && !occupant.long_term && occupant.wrap < smallest {
-                    smallest = occupant.wrap;
+                // ITU-T H.264 (01/2012) 8.2.5.3 evicts the smallest FrameNumWrap.
+                let wrapped = frame_num_wrap(occupant.inferred, curr, max);
+                if occupant.reference && !occupant.long_term && wrapped < smallest {
+                    smallest = wrapped;
                     victim = Some(index);
                 }
             }
@@ -316,11 +313,16 @@ impl Dpb {
         picture: &Picture,
         emits: &mut Vec<(i32, usize)>,
     ) -> Result<(), D3d12Error> {
+        let curr = picture.frame_num();
+        let max = self.max_frame_num;
+        let wrapped = |inferred: u32| frame_num_wrap(inferred, curr, max);
         match op {
             Mmco::ForgetShort(diff) => {
-                let target = self.short_target(picture, diff)?;
+                let target = mmco_short_target(diff, curr);
                 self.forget_where(
-                    |occupant| !occupant.long_term && occupant.wrap == target,
+                    |occupant| {
+                        !occupant.long_term && i64::from(wrapped(occupant.inferred)) == target
+                    },
                     emits,
                 )?;
             }
@@ -332,7 +334,7 @@ impl Dpb {
                 )?;
             }
             Mmco::ShortToLong(diff, index) => {
-                let target = self.short_target(picture, diff)?;
+                let target = mmco_short_target(diff, curr);
                 let index = index_u8(index)?;
                 let _ = self.forget_where(
                     |occupant| occupant.long_term && occupant.long_term_idx == index,
@@ -340,7 +342,10 @@ impl Dpb {
                 );
                 let mut moved = false;
                 for slot in self.slots.iter_mut().flatten() {
-                    if slot.reference && !slot.long_term && slot.wrap == target {
+                    if slot.reference
+                        && !slot.long_term
+                        && i64::from(wrapped(slot.inferred)) == target
+                    {
                         slot.long_term = true;
                         slot.long_term_idx = index;
                         moved = true;
@@ -351,9 +356,6 @@ impl Dpb {
                         BrokenReferenceReason::ShortTermTargetAbsent,
                     ));
                 }
-                if self.max_long_idx < i32::from(index) {
-                    self.max_long_idx = i32::from(index);
-                }
             }
             Mmco::SetMaxLong(plus1) => {
                 let max = i32::try_from(plus1).map_err(|_| {
@@ -361,7 +363,6 @@ impl Dpb {
                         syntax: "max_long_term_frame_idx",
                     })
                 })? - 1;
-                self.max_long_idx = max;
                 let mut victims = Vec::new();
                 for (index, slot) in self.slots.iter().enumerate() {
                     if let Some(occupant) = slot {
@@ -375,7 +376,6 @@ impl Dpb {
                 }
             }
             Mmco::MarkAllUnused => {
-                self.max_long_idx = -1;
                 for slot in self.slots.iter_mut().flatten() {
                     slot.release();
                 }
@@ -386,21 +386,9 @@ impl Dpb {
                     |occupant| occupant.long_term && occupant.long_term_idx == index,
                     emits,
                 );
-                if self.max_long_idx < i32::from(index) {
-                    self.max_long_idx = i32::from(index);
-                }
             }
         }
         Ok(())
-    }
-
-    /// Short-term picture number named by a difference.
-    fn short_target(&self, picture: &Picture, diff: u32) -> Result<i32, D3d12Error> {
-        let max = i64::from(self.max_frame_num);
-        let current = i64::from(picture.frame_num());
-        let target = (current - i64::from(diff) - 1).rem_euclid(max);
-        i32::try_from(target)
-            .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "pic_num" }))
     }
 
     /// Forget references matching `matches`, emitting undisplayed victims.
@@ -439,37 +427,21 @@ impl Dpb {
             })
     }
 
-    /// Wrapped frame number for the current picture.
-    fn current_wrap(picture: &Picture, frame_num: u32) -> Result<i32, D3d12Error> {
+    /// Inferred frame number for the current picture.
+    fn inferred_num(picture: &Picture, frame_num: u32) -> u32 {
         if has_mmco5(picture) {
-            return Ok(0);
+            return 0;
         }
-        i32::try_from(frame_num).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "frame_num",
-            })
-        })
+        frame_num
     }
 
     /// Long-term assignment for the current picture.
     fn current_long_term(picture: &Picture) -> (bool, u8) {
-        for slice in &picture.slices {
-            match &slice.header.marking {
-                Marking::Idr {
-                    long_term: true, ..
-                } => return (true, 0),
-                Marking::Adaptive(operations) => {
-                    if let Some(index) = operations.iter().find_map(|op| match op {
-                        Mmco::CurrentToLong(index) => Some(*index),
-                        _ => None,
-                    }) {
-                        return (true, u8::try_from(index).unwrap_or(0));
-                    }
-                }
-                _ => {}
-            }
-        }
-        (false, 0)
+        picture
+            .slices
+            .iter()
+            .find_map(|slice| slice.header.marking.current_to_long())
+            .map_or((false, 0), |index| (true, u8::try_from(index).unwrap_or(0)))
     }
 
     /// Frame number and POC state after storing the current picture.
@@ -486,126 +458,45 @@ impl Dpb {
 
     /// Picture order count for `picture`.
     fn picture_poc(&mut self, picture: &Picture, sps: &Sps) -> Result<i32, D3d12Error> {
-        if has_mmco5(picture) {
-            return Ok(0);
-        }
         let first = &picture.slices[0].header;
-        match (sps.poc_type, &first.poc) {
-            (PocType::Lsb, SlicePoc::Lsb(lsb, _)) => self.poc_lsb(*lsb, sps, picture.ref_pic()),
-            (PocType::Delta, SlicePoc::Deltas(first_delta, second)) => {
-                self.poc_delta(picture, sps, *first_delta, *second)
+        let frame_num = picture.frame_num();
+        let reset = picture.idr || !self.has_prev_ref;
+        let prev_state = (!reset).then_some((self.prev_ref_frame_num, self.prev_frame_num_offset));
+        let offset = sps.frame_num_offset(prev_state, frame_num);
+        let poc = match (sps.poc_type, &first.poc) {
+            (PocType::Lsb, SlicePoc::Lsb(lsb, bottom)) => {
+                let prev = (!reset).then(|| self.poc.previous());
+                sps.poc_type0(*lsb, *bottom, prev)
             }
-            (PocType::FrameNum, SlicePoc::None) => self.poc_frame_num(picture),
-            _ => Err(D3d12Error::Parse(
-                ParseReason::PocSyntaxAgainstSequenceMethod,
-            )),
-        }
-    }
-
-    /// Type 0 POC from the slice LSB.
-    fn poc_lsb(&mut self, lsb: u32, sps: &Sps, ref_pic: bool) -> Result<i32, D3d12Error> {
-        let max_lsb = i64::from(sps.max_poc_lsb());
-        let msb = self.poc_msb(i64::from(lsb), max_lsb);
-        let poc = msb + i64::from(lsb);
-        let poc = i32::try_from(poc).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "pic_order_cnt",
-            })
-        })?;
-        if ref_pic {
-            self.poc.observe(msb, lsb);
-            self.has_prev_ref = true;
-        }
-        Ok(poc)
-    }
-
-    /// Type 0 MSB against the previous reference LSB.
-    fn poc_msb(&self, wide: i64, max_lsb: i64) -> i64 {
-        if !self.has_prev_ref {
-            return 0;
-        }
-        self.poc.msb_for(wide, max_lsb)
-    }
-
-    /// Type 1 POC from slice deltas.
-    fn poc_delta(
-        &mut self,
-        picture: &Picture,
-        sps: &Sps,
-        first: i32,
-        second: Option<i32>,
-    ) -> Result<i32, D3d12Error> {
-        let frame_num = picture.frame_num();
-        let offset = self.frame_num_offset(frame_num, picture.idr);
-        let abs_frame_num = offset + i64::from(frame_num);
-        let expected = Self::expected_poc(abs_frame_num, sps);
-        let top = expected + i64::from(first);
-        let bottom =
-            expected + i64::from(sps.offset_top_bottom) + i64::from(second.unwrap_or(first));
-        let mut poc = top.min(bottom);
-        if !picture.ref_pic() {
-            poc += i64::from(sps.offset_non_ref);
-        }
-        let poc = i32::try_from(poc).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "pic_order_cnt",
-            })
-        })?;
+            (PocType::Delta, SlicePoc::Deltas(first_delta, second)) => {
+                let abs = abs_frame_num(offset, frame_num, picture.ref_pic());
+                sps.poc_type1(
+                    abs,
+                    *first_delta,
+                    second.unwrap_or(*first_delta),
+                    picture.ref_pic(),
+                )
+            }
+            (PocType::FrameNum, SlicePoc::None) => poc_type2(offset, frame_num, picture.ref_pic()),
+            _ => {
+                return Err(D3d12Error::Parse(
+                    ParseReason::PocSyntaxAgainstSequenceMethod,
+                ));
+            }
+        };
+        let poc = poc.ok_or(D3d12Error::Parse(ParseReason::Range {
+            syntax: "pic_order_cnt",
+        }))?;
         if picture.ref_pic() {
             self.prev_ref_frame_num = frame_num;
             self.prev_frame_num_offset = offset;
             self.has_prev_ref = true;
+            if let SlicePoc::Lsb(lsb, bottom) = first.poc {
+                let top = i64::from(poc) - i64::from(bottom).min(0);
+                self.poc.observe(top - i64::from(lsb), lsb);
+            }
         }
         Ok(poc)
-    }
-
-    /// Expected POC for an absolute frame number.
-    fn expected_poc(abs_frame_num: i64, sps: &Sps) -> i64 {
-        if abs_frame_num <= 0 || sps.cycle == 0 {
-            return 0;
-        }
-        let cycle = i64::from(sps.cycle);
-        let cycle_count = (abs_frame_num - 1) / cycle;
-        let in_cycle = (abs_frame_num - 1) % cycle;
-        let mut expected = cycle_count * i64::from(sps.expected_delta);
-        for offset in sps
-            .cycle_offsets
-            .iter()
-            .take(usize::try_from(in_cycle).unwrap_or(0))
-        {
-            expected += i64::from(*offset);
-        }
-        expected
-    }
-
-    /// Type 2 POC from the frame number.
-    fn poc_frame_num(&mut self, picture: &Picture) -> Result<i32, D3d12Error> {
-        let frame_num = picture.frame_num();
-        let offset = self.frame_num_offset(frame_num, picture.idr);
-        let poc = 2 * (offset + i64::from(frame_num));
-        let poc = i32::try_from(poc).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "pic_order_cnt",
-            })
-        })?;
-        if picture.ref_pic() {
-            self.prev_ref_frame_num = frame_num;
-            self.prev_frame_num_offset = offset;
-            self.has_prev_ref = true;
-        }
-        Ok(poc)
-    }
-
-    /// Frame number offset with wraparound tracking.
-    fn frame_num_offset(&self, frame_num: u32, idr: bool) -> i64 {
-        if idr || !self.has_prev_ref {
-            return 0;
-        }
-        if frame_num < self.prev_ref_frame_num {
-            self.prev_frame_num_offset + i64::from(self.max_frame_num)
-        } else {
-            self.prev_frame_num_offset
-        }
     }
 
     /// Undisplayed pictures below the decoded maximum, in POC order.
@@ -780,10 +671,7 @@ fn has_mmco5(picture: &Picture) -> bool {
     picture
         .slices
         .iter()
-        .any(|slice| match &slice.header.marking {
-            Marking::Adaptive(operations) => operations.contains(&Mmco::MarkAllUnused),
-            _ => false,
-        })
+        .any(|slice| slice.header.marking.has_mmco5())
 }
 
 /// Long-term index as a byte.
@@ -1112,13 +1000,13 @@ mod tests {
             SliceType::P,
         );
         let decoded = dpb.decode(&reset, &sps(), &pps()).expect("mmco5");
-        assert_eq!(decoded.submission.params.curr_field_order_cnt, [0, 0]);
-        assert_eq!(slots(&decoded.outputs), vec![2]);
+        assert_eq!(decoded.submission.params.curr_field_order_cnt, [4, 4]);
+        assert_eq!(slots(&decoded.outputs), vec![1]);
         let decoded = dpb.decode(&p(3, 4), &sps(), &pps()).expect("p3");
         assert_eq!(decoded.submission.params.curr_field_order_cnt, [4, 4]);
         assert_eq!(decoded.submission.slot, 0);
-        assert_eq!(slots(&decoded.outputs), vec![1]);
-        assert_eq!(slots(&dpb.drain()), vec![0]);
+        assert_eq!(slots(&decoded.outputs), Vec::<u8>::new());
+        assert_eq!(slots(&dpb.drain()), vec![0, 2]);
     }
 
     #[test]
@@ -1270,7 +1158,7 @@ mod tests {
             SliceType::I,
         );
         dpb.decode(&idr, &sequence, &pps()).expect("idr");
-        for (frame_num, poc) in [(1, 2), (2, 4)] {
+        for (frame_num, poc) in [(1, 4), (2, 6)] {
             let p = picture(
                 false,
                 2,

@@ -19,7 +19,8 @@ use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedRe
 use crate::hevc::{Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
 
-use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
+use rust_video_h265::{anchors_tid0, is_slnr};
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -79,12 +80,8 @@ pub(crate) struct HevcDpb {
     capacity: u8,
     /// Reorder limit.
     max_reorder: u8,
-    /// Maximum POC LSB.
-    max_poc_lsb: u32,
-    /// Previous temporal-zero POC behind MSB derivation.
-    poc: PocTracker,
-    /// True past the first temporal-zero picture.
-    has_prev_tid0: bool,
+    /// POC anchor of the last temporal-zero picture.
+    poc_tid0: Option<i32>,
     /// Driver-echoed picture serial.
     feedback: u32,
 }
@@ -97,9 +94,7 @@ impl HevcDpb {
             pins,
             capacity: sps.max_dec_pic_buffering_minus1 + 1,
             max_reorder: sps.max_num_reorder_pics,
-            max_poc_lsb: sps.max_poc_lsb(),
-            poc: PocTracker::new(),
-            has_prev_tid0: false,
+            poc_tid0: None,
             feedback: 1,
         }
     }
@@ -117,7 +112,7 @@ impl HevcDpb {
         if matches!(self.alloc(), Err(D3d12Error::NoFreeSlot)) {
             return Err(D3d12Error::NoFreeSlot);
         }
-        let poc = self.picture_poc(picture)?;
+        let poc = self.picture_poc(picture, sps)?;
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
         let header = &picture.slices[0].header;
         if picture.irap && picture.no_output_prior() {
@@ -163,35 +158,17 @@ impl HevcDpb {
     }
 
     /// Picture order count for `picture`.
-    fn picture_poc(&self, picture: &Picture) -> Result<i32, D3d12Error> {
+    fn picture_poc(&self, picture: &Picture, sps: &Sps) -> Result<i32, D3d12Error> {
         if picture.idr {
             return Ok(0);
         }
         let lsb = picture
             .poc_lsb()
             .ok_or(D3d12Error::Parse(ParseReason::PictureWithoutPoc))?;
-        if is_bla(picture) {
-            return i32::try_from(lsb).map_err(|_| {
-                D3d12Error::Parse(ParseReason::Range {
-                    syntax: "pic_order_cnt",
-                })
-            });
-        }
-        let msb = self.poc_msb(i64::from(lsb));
-        let poc = msb + i64::from(lsb);
-        i32::try_from(poc).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
+        sps.poc_from_lsb(self.poc_tid0, lsb, is_bla(picture))
+            .ok_or(D3d12Error::Parse(ParseReason::Range {
                 syntax: "pic_order_cnt",
-            })
-        })
-    }
-
-    /// POC MSB against the previous temporal-zero picture.
-    fn poc_msb(&self, lsb: i64) -> i64 {
-        if !self.has_prev_tid0 {
-            return 0;
-        }
-        self.poc.msb_for(lsb, i64::from(self.max_poc_lsb))
+            }))
     }
 
     /// Undisplayed priors emitted, references kept for set marking.
@@ -258,16 +235,12 @@ impl HevcDpb {
 
     /// POC state after storing the current picture.
     fn close_picture(&mut self, picture: &Picture, poc: i32) {
-        if picture.temporal_id() != 0 {
+        let Some(slice) = picture.slices.first() else {
             return;
-        }
-        let lsb = if picture.idr {
-            0
-        } else {
-            picture.poc_lsb().unwrap_or(0)
         };
-        self.poc.observe(i64::from(poc) - i64::from(lsb), lsb);
-        self.has_prev_tid0 = true;
+        if anchors_tid0(slice.nal_type, picture.temporal_id()) {
+            self.poc_tid0 = Some(poc);
+        }
     }
 
     /// First free slot no live surface pins.
@@ -350,10 +323,9 @@ impl HevcDpb {
         slot: usize,
         poc: i32,
     ) -> Result<PicParamsHevc, D3d12Error> {
-        let min_cb = sps.min_cb();
-        let width_in_min_cbs = u16::try_from(sps.width().div_ceil(min_cb))
+        let width_in_min_cbs = u16::try_from(sps.width_in_min_cbs())
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let height_in_min_cbs = u16::try_from(sps.height().div_ceil(min_cb))
+        let height_in_min_cbs = u16::try_from(sps.height_in_min_cbs())
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         let mut params = PicParamsHevc::empty();
         params.pic_width_in_min_cbs_y = width_in_min_cbs;
@@ -362,12 +334,12 @@ impl HevcDpb {
             HEVC_CHROMA_420 | (u16::from(sps.log2_max_poc_lsb_minus4) << HEVC_POC_LSB_SHIFT);
         params.curr_pic = PicEntryHevc::frame(slot_u8(slot)?);
         params.sps_max_dec_pic_buffering_minus1 = sps.max_dec_pic_buffering_minus1;
-        params.log2_min_luma_coding_block_size_minus3 = sps.log2_min_cb_minus3;
-        params.log2_diff_max_min_luma_coding_block_size = sps.log2_diff_max_min_cb;
-        params.log2_min_transform_block_size_minus2 = sps.log2_min_tb_minus2;
-        params.log2_diff_max_min_transform_block_size = sps.log2_diff_max_min_tb;
-        params.max_transform_hierarchy_depth_inter = sps.max_depth_inter;
-        params.max_transform_hierarchy_depth_intra = sps.max_depth_intra;
+        params.log2_min_luma_coding_block_size_minus3 = sps.log2_min_cb_size_minus3;
+        params.log2_diff_max_min_luma_coding_block_size = sps.log2_diff_max_min_cb_size;
+        params.log2_min_transform_block_size_minus2 = sps.log2_min_tb_size_minus2;
+        params.log2_diff_max_min_transform_block_size = sps.log2_diff_max_min_tb_size;
+        params.max_transform_hierarchy_depth_inter = sps.max_transform_depth_inter;
+        params.max_transform_hierarchy_depth_intra = sps.max_transform_depth_intra;
         params.num_short_term_ref_pic_sets = u8::try_from(sps.rps.len()).map_err(|_| {
             D3d12Error::Parse(ParseReason::Range {
                 syntax: "rps count",
@@ -375,7 +347,7 @@ impl HevcDpb {
         })?;
         params.num_ref_idx_l0_default_active_minus1 = pps.num_ref_l0;
         params.num_ref_idx_l1_default_active_minus1 = pps.num_ref_l1;
-        params.init_qp_minus26 = pps.init_qp_minus26;
+        params.init_qp_minus26 = pps.pic_init_qp_minus26;
         let header = &picture.slices[0].header;
         if let Some(bits) = header.rps_bits {
             if bits.explicit {
@@ -390,9 +362,9 @@ impl HevcDpb {
         params.diff_cu_qp_delta_depth = pps.diff_cu_qp_delta_depth;
         params.pps_beta_offset_div2 = pps.beta_offset_div2;
         params.pps_tc_offset_div2 = pps.tc_offset_div2;
-        params.log2_parallel_merge_level_minus2 = pps.log2_parallel_merge_level_minus2;
+        params.log2_parallel_merge_level_minus2 = pps.log2_parallel_merge_minus2;
         params.curr_pic_order_cnt_val = poc;
-        fill_tiles(&mut params, pps);
+        fill_tiles(&mut params, pps)?;
         fill_ref_lists(&mut params, refs)?;
         if let Some(rps) = header.rps.as_ref() {
             fill_ref_sets(&mut params, rps, poc, refs)?;
@@ -406,7 +378,7 @@ fn is_bla(picture: &Picture) -> bool {
     picture
         .slices
         .first()
-        .is_some_and(|slice| matches!(slice.nal_type, 16..=18))
+        .is_some_and(|slice| rust_video_h265::is_bla(slice.nal_type))
 }
 
 /// True when the picture is used for reference, H.265 7.4.2.2.
@@ -414,7 +386,7 @@ fn ref_pic(picture: &Picture) -> bool {
     picture
         .slices
         .first()
-        .is_some_and(|slice| slice.nal_type >= 16 || slice.nal_type % 2 == 1)
+        .is_some_and(|slice| !is_slnr(slice.nal_type))
 }
 
 /// True when stored `poc` sits in any short-term set against `current`.
@@ -459,7 +431,7 @@ fn tool_flags(sps: &Sps, pps: &Pps) -> u32 {
     if sps.temporal_mvp() {
         flags |= HEVC_TOOL_TEMPORAL_MVP;
     }
-    if sps.strong_intra_smoothing() {
+    if sps.smoothing() {
         flags |= HEVC_TOOL_STRONG_INTRA;
     }
     if pps.dependent_slices() {
@@ -469,7 +441,7 @@ fn tool_flags(sps: &Sps, pps: &Pps) -> u32 {
         flags |= HEVC_TOOL_OUTPUT_FLAG;
     }
     flags |= u32::from(pps.num_extra_slice_header_bits) << HEVC_TOOL_EXTRA_BITS_SHIFT;
-    if pps.sign_data_hiding() {
+    if pps.sign_hiding() {
         flags |= HEVC_TOOL_SIGN_HIDING;
     }
     if pps.cabac_init_present() {
@@ -490,7 +462,7 @@ fn pic_flags(picture: &Picture, pps: &Pps) -> u32 {
     if pps.cu_qp_delta() {
         flags |= HEVC_PROP_CU_QP_DELTA;
     }
-    if pps.slice_chroma_qp_offsets_present() {
+    if pps.chroma_offsets_present() {
         flags |= HEVC_PROP_CHROMA_QP_OFFSETS;
     }
     if pps.weighted_pred() {
@@ -502,7 +474,7 @@ fn pic_flags(picture: &Picture, pps: &Pps) -> u32 {
     if pps.transquant_bypass() {
         flags |= HEVC_PROP_TRANSQUANT_BYPASS;
     }
-    if pps.tiles() {
+    if pps.tiles_enabled() {
         flags |= HEVC_PROP_TILES;
         if pps.loop_across_tiles() {
             flags |= HEVC_PROP_LOOP_TILES;
@@ -539,17 +511,42 @@ fn pic_flags(picture: &Picture, pps: &Pps) -> u32 {
 }
 
 /// Tile grid into the picture parameters.
-fn fill_tiles(params: &mut PicParamsHevc, pps: &Pps) {
-    if !pps.tiles() {
-        return;
+fn fill_tiles(params: &mut PicParamsHevc, pps: &Pps) -> Result<(), D3d12Error> {
+    if !pps.tiles_enabled() {
+        return Ok(());
     }
-    params.num_tile_columns_minus1 = pps.tile_columns_minus1;
-    params.num_tile_rows_minus1 = pps.tile_rows_minus1;
+    params.num_tile_columns_minus1 = pps.num_tile_columns.saturating_sub(1);
+    params.num_tile_rows_minus1 = pps.num_tile_rows.saturating_sub(1);
     if pps.uniform_spacing() {
-        return;
+        return Ok(());
     }
-    params.column_width_minus1 = pps.column_width_minus1;
-    params.row_height_minus1 = pps.row_height_minus1;
+    for (index, width) in pps.column_width.iter().enumerate() {
+        if index + 1 >= pps.column_width.len() {
+            break;
+        }
+        let Some(slot) = params.column_width_minus1.get_mut(index) else {
+            break;
+        };
+        *slot = width
+            .checked_sub(1)
+            .ok_or(D3d12Error::Parse(ParseReason::Range {
+                syntax: "column_width_minus1",
+            }))?;
+    }
+    for (index, height) in pps.row_height.iter().enumerate() {
+        if index + 1 >= pps.row_height.len() {
+            break;
+        }
+        let Some(slot) = params.row_height_minus1.get_mut(index) else {
+            break;
+        };
+        *slot = height
+            .checked_sub(1)
+            .ok_or(D3d12Error::Parse(ParseReason::Range {
+                syntax: "row_height_minus1",
+            }))?;
+    }
+    Ok(())
 }
 
 /// Reference surfaces plus POCs compacted from the snapshot.
@@ -630,52 +627,91 @@ mod tests {
     use crate::dpb::Output;
     use crate::dxva::{HEVC_IDR_PIC, HEVC_INTRA_PIC, HEVC_IRAP_PIC};
     use crate::hevc::{
-        PendingSlice, Picture, Pps, RpsBits, ShortTermRps, SliceHeader, SliceType, Sps, FLAG_SAO,
-        FLAG_TEMPORAL_MVP,
+        ConstraintFlags, PendingSlice, Picture, Pps, ProfileTierLevel, RpsBits, ScalingLists,
+        ShortTermRps, SliceHeader, SliceType, SourceFlags, Sps, SPS_SAO, SPS_TEMPORAL_MVP,
     };
     use crate::pins::SlotPins;
 
     /// Sequence set with POC width 16 and reorder depth two.
     fn sps() -> Sps {
         Sps {
-            seq_parameter_set_id: 0,
+            id: 0,
+            flags: SPS_SAO | SPS_TEMPORAL_MVP,
+            max_sub_layers: 1,
+            level_idc: 120,
             width: 320,
             height: 240,
             crop: None,
             log2_max_poc_lsb_minus4: 0,
             max_dec_pic_buffering_minus1: 4,
             max_num_reorder_pics: 2,
+            log2_min_cb_size_minus3: 0,
+            log2_diff_max_min_cb_size: 3,
+            log2_min_tb_size_minus2: 0,
+            log2_diff_max_min_tb_size: 3,
+            max_transform_depth_inter: 1,
+            max_transform_depth_intra: 1,
+            scaling: ScalingLists::default(),
+            pcm_depth_luma: 0,
+            pcm_depth_chroma: 0,
+            pcm_log2_min_minus3: 0,
+            pcm_log2_diff: 0,
             rps: Vec::new(),
-            log2_min_cb_minus3: 0,
-            log2_diff_max_min_cb: 3,
-            log2_min_tb_minus2: 0,
-            log2_diff_max_min_tb: 3,
-            max_depth_inter: 1,
-            max_depth_intra: 1,
-            flags: FLAG_SAO | FLAG_TEMPORAL_MVP,
+            lt_poc_lsb: Vec::new(),
+            lt_used_by_curr: Vec::new(),
+            vps_id: 0,
+            ptl: ProfileTierLevel {
+                tier: false,
+                profile_idc: 1,
+                compat: 0x4000_0000,
+                source: SourceFlags {
+                    progressive: true,
+                    interlaced: false,
+                },
+                constraints: ConstraintFlags {
+                    non_packed: true,
+                    frame_only: true,
+                },
+                level_idc: 120,
+                sub_layers: Vec::new(),
+            },
+            chroma_format: 1,
+            separate_colour_plane: false,
+            bit_depth_luma: 0,
+            bit_depth_chroma: 0,
+            ordering_buffering: vec![4],
+            ordering_reorder: vec![2],
+            ordering_latency: vec![0],
+            vui: None,
+            sps_extension_present: false,
+            sps_extension_flags: [false; 4],
         }
     }
 
     /// Picture set with defaults.
     fn pps() -> Pps {
         Pps {
-            pic_parameter_set_id: 0,
-            seq_parameter_set_id: 0,
+            id: 0,
+            sps_id: 0,
             flags: 0,
             num_extra_slice_header_bits: 0,
             num_ref_l0: 0,
             num_ref_l1: 0,
-            init_qp_minus26: 0,
+            pic_init_qp_minus26: 0,
             diff_cu_qp_delta_depth: 0,
             cb_qp_offset: 0,
             cr_qp_offset: 0,
-            tile_columns_minus1: 0,
-            tile_rows_minus1: 0,
-            column_width_minus1: [0; 19],
-            row_height_minus1: [0; 21],
+            num_tile_columns: 1,
+            num_tile_rows: 1,
+            column_width: Vec::new(),
+            row_height: Vec::new(),
             beta_offset_div2: 0,
             tc_offset_div2: 0,
-            log2_parallel_merge_level_minus2: 0,
+            scaling: ScalingLists::default(),
+            log2_parallel_merge_minus2: 0,
+            deblock_control_present: false,
+            pps_extension_present: false,
+            pps_extension_flags: [false; 4],
         }
     }
 
@@ -723,19 +759,22 @@ mod tests {
         Picture {
             slices: vec![PendingSlice {
                 header: SliceHeader {
-                    pps_id: 0,
-                    slice_type,
-                    address: 0,
                     first: true,
+                    address: 0,
+                    slice_type,
                     pic_output: true,
                     no_output_prior: false,
                     poc_lsb,
                     rps,
                     rps_bits,
+                    lt: Vec::new(),
+                    entry_count: 0,
+                    extension_length: 0,
                 },
                 nal: vec![0x26, 0x01, 0x88],
                 nal_type,
                 temporal_id: 0,
+                pps_id: 0,
             }],
             idr: (19..=20).contains(&nal_type),
             irap: (16..=23).contains(&nal_type),

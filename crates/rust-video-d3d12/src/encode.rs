@@ -1937,12 +1937,12 @@ mod tests {
         let kinds: Vec<u8> = nals.iter().map(|nal| nal[0] >> 1).collect();
         assert_eq!(kinds, vec![32, 33, 34]);
         let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
-        assert_eq!((sps.width(), sps.height()), (64, 48));
+        assert_eq!((sps.width, sps.height), (64, 48));
         assert!(sps.crop.is_none());
-        assert_eq!(sps.min_cb(), 8);
-        assert_eq!(sps.log2_diff_max_min_cb, 2);
-        assert_eq!(sps.log2_min_tb_minus2, 0);
-        assert_eq!(sps.log2_diff_max_min_tb, 3);
+        assert_eq!(sps.min_cb_size(), 8);
+        assert_eq!(sps.log2_diff_max_min_cb_size, 2);
+        assert_eq!(sps.log2_min_tb_size_minus2, 0);
+        assert_eq!(sps.log2_diff_max_min_tb_size, 3);
         assert!(!sps.amp());
         assert!(!sps.sao());
         hevc::parse_pps(&rust_video_h265::rbsp(nals[2])[2..], &sps).expect("pps");
@@ -1957,7 +1957,7 @@ mod tests {
         let nals = hevc::split_nals(&bytes);
         assert_eq!(nals.len(), 3);
         let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
-        assert_eq!((sps.width(), sps.height()), (640, 368));
+        assert_eq!((sps.width, sps.height), (640, 368));
         assert_eq!((sps.visible_width(), sps.visible_height()), (640, 360));
     }
 

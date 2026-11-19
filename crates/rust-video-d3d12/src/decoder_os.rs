@@ -1633,16 +1633,19 @@ pub(crate) fn sequence_of_hevc(
     picture: &HevcPicture,
 ) -> Result<Active, D3d12Error> {
     let pps = ingest.pps(picture.pps_id()).ok_or(D3d12Error::NoSession)?;
-    let sps = ingest
-        .sps(pps.seq_parameter_set_id)
-        .ok_or(D3d12Error::NoSession)?;
+    let sps = ingest.sps(pps.sps_id).ok_or(D3d12Error::NoSession)?;
     let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
         .ok_or(D3d12Error::Parse(ParseReason::CropEmptiesPicture))?;
     Ok(Active {
-        sps_id: sps.seq_parameter_set_id,
-        width: sps.width(),
-        height: sps.height(),
-        crop: sps.crop,
+        sps_id: sps.id,
+        width: sps.width,
+        height: sps.height,
+        crop: sps.crop.map(|crop| Crop {
+            left: crop.left,
+            right: crop.right,
+            top: crop.top,
+            bottom: crop.bottom,
+        }),
         visible,
     })
 }
@@ -1659,9 +1662,7 @@ pub(crate) fn submit_hevc_dpb(
     picture: &HevcPicture,
 ) -> Result<HevcDecoded, D3d12Error> {
     let pps = ingest.pps(picture.pps_id()).ok_or(D3d12Error::NoSession)?;
-    let sps = ingest
-        .sps(pps.seq_parameter_set_id)
-        .ok_or(D3d12Error::NoSession)?;
+    let sps = ingest.sps(pps.sps_id).ok_or(D3d12Error::NoSession)?;
     dpb.decode(picture, sps, pps)
 }
 
