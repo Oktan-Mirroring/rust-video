@@ -6,7 +6,10 @@ use crate::frame::{
     inverse_recenter, reconstruct_motion_param, shear_valid, REF_ALTREF, REF_BWDREF,
 };
 use crate::syntax::{read_increment, read_leb128, read_ns, read_su, read_subexp, read_uvlc};
-use crate::{parse_sequence_header, relative_dist, split_obus, tile_log2, Ingest, SequenceHeader};
+use crate::{
+    frame_obu_tile_offset, parse_sequence_header, relative_dist, split_obus, tile_log2, Ingest,
+    SequenceHeader,
+};
 
 use rust_video_harness::Bits;
 
@@ -593,4 +596,40 @@ fn libaom_sequence_header_pins_geometry() {
     assert!(seq.enable_order_hint());
     assert!(!seq.frame_id_numbers_present());
     assert!(!seq.use_128x128_superblock());
+}
+
+#[test]
+fn aligned_header_consumes_full_alignment_byte() {
+    let payload = [0x00, 0x00, 0x80, 0x00];
+    assert_eq!(frame_obu_tile_offset::<Error>(&payload, 16), Ok(3));
+}
+
+#[test]
+fn mid_byte_header_rounds_up_past_padding() {
+    let payload = [0x00, 0x20, 0x00];
+    assert_eq!(frame_obu_tile_offset::<Error>(&payload, 10), Ok(2));
+}
+
+#[test]
+fn zero_alignment_bit_rejected() {
+    let payload = [0x00, 0x00, 0x00];
+    assert!(frame_obu_tile_offset::<Error>(&payload, 10).is_err());
+}
+
+#[test]
+fn set_padding_bit_rejected() {
+    let payload = [0x00, 0x30, 0x00];
+    assert!(frame_obu_tile_offset::<Error>(&payload, 10).is_err());
+}
+
+#[test]
+fn truncated_alignment_rejected() {
+    let payload = [0x00, 0x00];
+    assert!(frame_obu_tile_offset::<Error>(&payload, 16).is_err());
+}
+
+#[test]
+fn consumed_past_end_rejected() {
+    let payload = [0x00, 0x00];
+    assert!(frame_obu_tile_offset::<Error>(&payload, 24).is_err());
 }
