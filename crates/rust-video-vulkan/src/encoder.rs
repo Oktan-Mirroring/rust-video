@@ -1,17 +1,18 @@
 //! GOP encode behind the caps `Encoder` trait.
 
+use crate::decoder::VulkanFrame;
+use crate::device::VulkanDevice;
+use crate::error::VulkanError;
+use crate::ladder::CodecOp;
+use crate::session::encode::{EncodeCodec, EncodeSession, PictureStamp};
+
 use bytes::Bytes;
 use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
-
-use crate::decoder::VulkanFrame;
-use crate::device::VulkanDevice;
-use crate::error::VulkanError;
-use crate::ladder::CodecOp;
-use crate::session::encode::{EncodeCodec, EncodeSession, PictureStamp};
+use rust_video_core::planes;
 
 /// H.264 frame-number modulus: `log2_max_frame_num_minus4` is 0.
 const MAX_FRAME_NUM: u16 = 16;
@@ -300,29 +301,21 @@ fn pack_plane(
     rows: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), VulkanError> {
-    let stride = plane.stride() as usize;
-    let data = plane.data();
-    if stride < width {
-        return Err(VulkanError::ShortReadback {
-            expected: width,
-            found: stride,
-        });
-    }
-    let want = stride * rows.saturating_sub(1) + width;
-    if data.len() < want {
-        return Err(VulkanError::ShortReadback {
-            expected: want,
-            found: data.len(),
-        });
-    }
-    if stride == width {
-        out.extend_from_slice(&data[..width * rows]);
-        return Ok(());
-    }
-    for row in 0..rows {
-        let start = row * stride;
-        out.extend_from_slice(&data[start..start + width]);
-    }
+    let width_32 = u32::try_from(width).unwrap_or(u32::MAX);
+    let rows_32 = u32::try_from(rows).unwrap_or(u32::MAX);
+    planes::check_plane(plane.data(), plane.stride(), width_32, rows_32).map_err(|fault| {
+        match fault {
+            planes::PlaneFault::StrideBelowWidth { stride, width } => VulkanError::ShortReadback {
+                expected: usize::try_from(width).unwrap_or(usize::MAX),
+                found: usize::try_from(stride).unwrap_or(usize::MAX),
+            },
+            planes::PlaneFault::ShortOfStride { need, len } => VulkanError::ShortReadback {
+                expected: usize::try_from(need).unwrap_or(usize::MAX),
+                found: len,
+            },
+        }
+    })?;
+    planes::copy_rows_extend(plane.data(), plane.stride(), width_32, rows_32, out);
     Ok(())
 }
 
