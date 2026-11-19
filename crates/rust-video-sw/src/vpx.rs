@@ -12,6 +12,7 @@ use crate::ffmpeg_sys as sys;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::GpuCaps;
 
 /// Realtime VP8 encoder over ffmpeg's `libvpx` wrapper.
 pub struct Vp8Encoder {
@@ -135,6 +136,10 @@ impl Vp8Encoder {
 
 impl Encoder for Vp8Encoder {
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         self.inner.encode(frame)
@@ -273,6 +278,10 @@ impl Vp9Encoder {
 
 impl Encoder for Vp9Encoder {
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         self.inner.encode(frame)

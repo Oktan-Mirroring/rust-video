@@ -11,6 +11,7 @@ use crate::guid::{Codec, Profile};
 use crate::DeviceOs;
 
 use rust_video_caps::traits::SharedDevice;
+use rust_video_caps::transcode::ShareMechanism;
 use windows::core::IUnknown;
 use windows::core::Interface;
 use windows::core::GUID;
@@ -262,6 +263,12 @@ impl D3d12Device {
     #[must_use]
     pub(crate) fn shared(&self) -> &SharedDevice {
         self.os.shared()
+    }
+
+    /// NT-handle share behind the adapter, absent without shared-texture export.
+    #[must_use]
+    pub(crate) fn share_mechanism(&self) -> Option<ShareMechanism> {
+        self.os.shareable().then_some(ShareMechanism::NtHandle)
     }
 
     /// Logical device behind the tier.

@@ -1,8 +1,7 @@
 //! Raw image access: decode one clip, touch every frame.
 //!
-//! Each frame reports metadata (extent, format), its NV12 bytes through a
-//! checksum, and its export handle. `d3d12` surfaces stay GPU-resident, so
-//! they report metadata plus the handle without bytes.
+//! Each run reports decoder caps, then every frame's metadata (extent,
+//! format), its NV12 bytes through a checksum, and its export handle.
 //!
 //! Usage: `raw_access [tier] [codec] [file]`. The tier defaults to the
 //! first that opens, the codec to `h264`, the file to the codec's bench
@@ -75,9 +74,6 @@ impl Codec {
 mod pipe {
     use rust_video::{Decoder, GpuExport, Packet, PictureSize, PixelFormat};
 
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    use rust_video_d3d12::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder};
-
     /// One decoded frame, shown.
     pub trait Show {
         /// Metadata, bytes, and export handle for frame `index`.
@@ -89,23 +85,16 @@ mod pipe {
         index: usize,
         size: PictureSize,
         format: PixelFormat,
-        bytes: Option<&[u8]>,
+        bytes: &[u8],
         export: &GpuExport,
     ) {
-        match bytes {
-            Some(bytes) => println!(
-                "frame {index}: {}x{} {format:?} bytes={} fnv={:016x} export={export:?}",
-                size.width(),
-                size.height(),
-                bytes.len(),
-                fnv(bytes),
-            ),
-            None => println!(
-                "frame {index}: {}x{} {format:?} bytes=gpu-resident export={export:?}",
-                size.width(),
-                size.height(),
-            ),
-        }
+        println!(
+            "frame {index}: {}x{} {format:?} bytes={} fnv={:016x} export={export:?}",
+            size.width(),
+            size.height(),
+            bytes.len(),
+            fnv(bytes),
+        );
     }
 
     /// FNV-1a over `bytes`: proves the read without printing megabytes.
@@ -127,11 +116,15 @@ mod pipe {
     }
 
     /// Frames decoded from `packets`, shown, counted.
-    #[cfg(any(all(target_os = "windows", feature = "d3d11"), feature = "vulkan"))]
-    pub fn drain<D: Decoder>(decoder: &mut D, packets: &[Packet]) -> Result<usize, String>
+    pub fn drain<D: Decoder>(
+        tier: &str,
+        decoder: &mut D,
+        packets: &[Packet],
+    ) -> Result<usize, String>
     where
         D::Frame: Show,
     {
+        println!("{tier} caps: {:?}", decoder.caps());
         let mut shown = 0;
         for packet in packets {
             match decoder.decode(packet) {
@@ -143,6 +136,7 @@ mod pipe {
             Ok(frames) => emit(&frames, &mut shown),
             Err(error) => return Err(error.to_string()),
         }
+        println!("{tier} caps after decode: {:?}", decoder.caps());
         Ok(shown)
     }
 
@@ -154,70 +148,24 @@ mod pipe {
                 index,
                 identity.size(),
                 identity.format(),
-                Some(self.nv12()),
+                self.nv12(),
                 &self.export(),
             );
         }
     }
 
     #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    impl Show for GpuSurface {
+    impl Show for rust_video_d3d12::D3d12Frame {
         fn show(&self, index: usize) {
-            show_frame(index, self.size(), self.format(), None, &self.export());
+            let identity = self.identity();
+            show_frame(
+                index,
+                identity.size(),
+                identity.format(),
+                self.nv12(),
+                &self.export(),
+            );
         }
-    }
-
-    /// One d3d12 surface decoder.
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    pub trait Pump {
-        /// Surfaces decoded from `packet`, possibly none.
-        fn pump(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, String>;
-        /// Surfaces held back for reordering or buffering.
-        fn finish(&mut self) -> Result<Vec<GpuSurface>, String>;
-    }
-
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    impl Pump for H264Decoder<'_> {
-        fn pump(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, String> {
-            self.decode_surface(packet)
-                .map_err(|error| error.to_string())
-        }
-        fn finish(&mut self) -> Result<Vec<GpuSurface>, String> {
-            self.flush_surface().map_err(|error| error.to_string())
-        }
-    }
-
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    impl Pump for HevcDecoder<'_> {
-        fn pump(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, String> {
-            self.decode_surface(packet)
-                .map_err(|error| error.to_string())
-        }
-        fn finish(&mut self) -> Result<Vec<GpuSurface>, String> {
-            self.flush_surface().map_err(|error| error.to_string())
-        }
-    }
-
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    impl Pump for Av1Decoder<'_> {
-        fn pump(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, String> {
-            self.decode_surface(packet)
-                .map_err(|error| error.to_string())
-        }
-        fn finish(&mut self) -> Result<Vec<GpuSurface>, String> {
-            self.flush_surface().map_err(|error| error.to_string())
-        }
-    }
-
-    /// Surfaces decoded from `packets`, shown, counted.
-    #[cfg(all(target_os = "windows", feature = "d3d12"))]
-    pub fn drain12(decoder: &mut impl Pump, packets: &[Packet]) -> Result<usize, String> {
-        let mut shown = 0;
-        for packet in packets {
-            emit(&decoder.pump(packet)?, &mut shown);
-        }
-        emit(&decoder.finish()?, &mut shown);
-        Ok(shown)
     }
 
     #[cfg(feature = "vulkan")]
@@ -227,7 +175,7 @@ mod pipe {
                 index,
                 self.size(),
                 self.format(),
-                Some(self.nv12()),
+                self.nv12(),
                 &self.export(),
             );
         }
@@ -290,10 +238,10 @@ fn run_d3d11(codec: Codec, packets: &[Packet]) -> Result<usize, String> {
 
     let device = D3d11Device::open().map_err(|error| error.to_string())?;
     match codec {
-        Codec::H264 => drain(&mut H264Decoder::open(&device), packets),
-        Codec::H265 => drain(&mut HevcDecoder::open(&device), packets),
-        Codec::Av1 => drain(&mut Av1Decoder::open(&device), packets),
-        Codec::Vp9 => drain(&mut Vp9Decoder::open(&device), packets),
+        Codec::H264 => drain("d3d11", &mut H264Decoder::open(&device), packets),
+        Codec::H265 => drain("d3d11", &mut HevcDecoder::open(&device), packets),
+        Codec::Av1 => drain("d3d11", &mut Av1Decoder::open(&device), packets),
+        Codec::Vp9 => drain("d3d11", &mut Vp9Decoder::open(&device), packets),
     }
 }
 
@@ -304,16 +252,16 @@ fn run_d3d11(_codec: Codec, _packets: &[Packet]) -> Result<usize, String> {
 
 #[cfg(all(target_os = "windows", feature = "d3d12"))]
 fn run_d3d12(codec: Codec, packets: &[Packet]) -> Result<usize, String> {
-    use rust_video_d3d12::{Av1Decoder, D3d12Device, H264Decoder, HevcDecoder};
+    use rust_video_d3d12::{Av1Decoder, D3d12Device, H264Decoder, HevcDecoder, Vp9Decoder};
 
-    use crate::pipe::drain12;
+    use crate::pipe::drain;
 
     let device = D3d12Device::open().map_err(|error| error.to_string())?;
     match codec {
-        Codec::H264 => drain12(&mut H264Decoder::open(&device), packets),
-        Codec::H265 => drain12(&mut HevcDecoder::open(&device), packets),
-        Codec::Av1 => drain12(&mut Av1Decoder::open(&device), packets),
-        Codec::Vp9 => Err("no d3d12 vp9 picture builder".to_owned()),
+        Codec::H264 => drain("d3d12", &mut H264Decoder::open(&device), packets),
+        Codec::H265 => drain("d3d12", &mut HevcDecoder::open(&device), packets),
+        Codec::Av1 => drain("d3d12", &mut Av1Decoder::open(&device), packets),
+        Codec::Vp9 => drain("d3d12", &mut Vp9Decoder::open(&device), packets),
     }
 }
 
@@ -337,14 +285,17 @@ fn run_vulkan(codec: Codec, packets: &[Packet]) -> Result<usize, String> {
     let device = VulkanDevice::open_or_skip(op).map_err(|error| error.to_string())?;
     match codec {
         Codec::H264 => drain(
+            "vulkan",
             &mut H264Decoder::open(&device).map_err(|error| error.to_string())?,
             packets,
         ),
         Codec::H265 => drain(
+            "vulkan",
             &mut H265Decoder::open(&device).map_err(|error| error.to_string())?,
             packets,
         ),
         Codec::Av1 => drain(
+            "vulkan",
             &mut Av1Decoder::open(&device).map_err(|error| error.to_string())?,
             packets,
         ),

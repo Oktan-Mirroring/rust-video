@@ -11,6 +11,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+use rust_video_caps::transcode::GpuCaps;
 
 use crate::device::VulkanDevice;
 use crate::error::{ParseError, VulkanError};
@@ -1259,6 +1260,10 @@ impl Decoder for H264Decoder<'_> {
     type Frame = VulkanFrame;
     type Error = VulkanError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(self.device.share_mechanism(), false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
@@ -2504,6 +2509,10 @@ impl Decoder for H265Decoder<'_> {
     type Frame = VulkanFrame;
     type Error = VulkanError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(self.device.share_mechanism(), false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
@@ -3301,6 +3310,10 @@ impl Decoder for Av1Decoder<'_> {
     type Frame = VulkanFrame;
     type Error = VulkanError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(self.device.share_mechanism(), false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.run_bytes(packet.data(), false, DrainMode::Sync)
     }
@@ -3794,5 +3807,100 @@ mod tests {
         let error = super::claim_slot(&mut book, ReferenceId(1)).unwrap_err();
         assert!(matches!(error, VulkanError::NoFreeSlot));
         assert_eq!(error.to_string(), "no free surface slot");
+    }
+
+    #[test]
+    fn caps_agree_with_frame_exports() {
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+        use rust_video_harness::H264Synth;
+
+        use crate::device::VulkanDevice;
+        use crate::ladder::CodecOp;
+
+        let device = match VulkanDevice::open_or_skip(CodecOp::H264Decode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: h264 on this box: {reason}");
+                return;
+            }
+            Err(error) => panic!("negotiation failed: {error}"),
+        };
+        let mut decoder = match super::H264Decoder::open(&device) {
+            Ok(decoder) => decoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM h264 open: {error}");
+                return;
+            }
+            Err(error) => panic!("engine starts: {error}"),
+        };
+        let caps = decoder.caps();
+        assert_eq!(caps.share(), device.share_mechanism());
+        assert!(!caps.decode_export());
+        assert!(!caps.encode_import());
+        let mut frames = Vec::new();
+        for raw in H264Synth::annex_b_packets() {
+            let packet = Packet::new(Bytes::copy_from_slice(&raw));
+            match decoder.decode(&packet) {
+                Ok(emitted) => frames.extend(emitted),
+                Err(error) if error.is_out_of_device_memory() => {
+                    println!("declined:OOM h264 decode: {error}");
+                    return;
+                }
+                Err(error) => panic!("decode runs: {error}"),
+            }
+        }
+        match decoder.flush() {
+            Ok(drained) => frames.extend(drained),
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM h264 flush: {error}");
+                return;
+            }
+            Err(error) => panic!("flush runs: {error}"),
+        }
+        assert!(!frames.is_empty());
+        let caps = decoder.caps();
+        assert_eq!(caps.share(), device.share_mechanism());
+        for frame in &frames {
+            assert_ne!(frame.nv12(), []);
+            assert!(matches!(frame.export(), GpuExport::Opaque { .. }));
+        }
+        let mut surface_decoder = match super::H264Decoder::open(&device) {
+            Ok(decoder) => decoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM h264 surface open: {error}");
+                return;
+            }
+            Err(error) => panic!("surface engine starts: {error}"),
+        };
+        let mut surfaces = Vec::new();
+        for raw in H264Synth::annex_b_packets() {
+            let packet = Packet::new(Bytes::copy_from_slice(&raw));
+            match surface_decoder.decode_surface(&packet) {
+                Ok(emitted) => surfaces.extend(emitted),
+                Err(error) if error.is_out_of_device_memory() => {
+                    println!("declined:OOM h264 surface decode: {error}");
+                    return;
+                }
+                Err(error) => panic!("surface decode runs: {error}"),
+            }
+        }
+        match surface_decoder.flush_surface() {
+            Ok(drained) => surfaces.extend(drained),
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM h264 surface flush: {error}");
+                return;
+            }
+            Err(error) => panic!("surface flush runs: {error}"),
+        }
+        assert!(!surfaces.is_empty());
+        if caps.share().is_none() {
+            for surface in &surfaces {
+                assert!(
+                    matches!(surface.export(), GpuExport::Opaque { .. }),
+                    "surface handle without advertised share"
+                );
+            }
+        }
     }
 }

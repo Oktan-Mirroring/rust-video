@@ -11,6 +11,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
 /// D3D12 hardware encoder over the video encode session.
 ///
@@ -124,6 +125,11 @@ impl<'a> D3d12Encoder<'a> {
 
 impl Encoder for D3d12Encoder<'_> {
     type Error = D3d12Error;
+
+    fn caps(&self) -> GpuCaps {
+        let live = self.device.supports_encode(self.codec);
+        GpuCaps::new(live.then_some(ShareMechanism::NtHandle), false, live)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, D3d12Error> {
         let (width, height, nv12) = pack_nv12(frame)?;
@@ -276,5 +282,33 @@ mod tests {
     fn pack_rejects_short_plane() {
         let mut out = Vec::new();
         assert!(copy_plane(&[0; 5], 4, 4, 2, &mut out).is_err());
+    }
+
+    #[test]
+    fn caps_agree_with_texture_import() {
+        use bytes::Bytes;
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Encoder;
+        use rust_video_harness::H264Synth;
+
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let Ok(mut encoder) = super::D3d12Encoder::open(&device, crate::guid::Codec::H264) else {
+            return;
+        };
+        let caps = encoder.caps();
+        assert_eq!(caps.share().is_some(), caps.encode_import());
+        assert!(!caps.decode_export());
+        assert!(caps.encode_import());
+        let mut decoder = crate::decoder_os::H264Decoder::open(&device);
+        let mut surfaces = Vec::new();
+        for raw in H264Synth::annex_b_h264_packets() {
+            let packet = Packet::new(Bytes::from(raw));
+            surfaces.extend(decoder.decode_surface(&packet).expect("decode runs"));
+        }
+        surfaces.extend(decoder.flush_surface().expect("decode drains"));
+        let surface = surfaces.pop().expect("first picture surfaces");
+        encoder.encode_texture(&surface).expect("import runs");
     }
 }

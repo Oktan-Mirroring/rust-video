@@ -14,6 +14,7 @@ use crate::error::VaApiError;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
+use rust_video_caps::transcode::GpuCaps;
 
 /// VP8 decoder handle: frontend staged, every packet declines typed.
 pub struct Vp8Decoder;
@@ -21,6 +22,10 @@ pub struct Vp8Decoder;
 impl Decoder for Vp8Decoder {
     type Frame = VaApiFrame;
     type Error = VaApiError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn decode(&mut self, _packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         Err(VaApiError::Unsupported("vp8 frontend not wired".to_owned()))
@@ -54,5 +59,13 @@ mod tests {
     fn flush_holds_nothing() {
         let mut decoder = Vp8Decoder;
         assert!(decoder.flush().expect("empty flush").is_empty());
+    }
+
+    #[test]
+    fn caps_report_no_share() {
+        use rust_video_caps::transcode::GpuCaps;
+
+        let decoder = Vp8Decoder;
+        assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
     }
 }

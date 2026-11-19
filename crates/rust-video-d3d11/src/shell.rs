@@ -8,6 +8,7 @@ use crate::D3d11Device;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
+use rust_video_caps::transcode::GpuCaps;
 
 /// Probed decoder shell; the picture builder is pending.
 macro_rules! shell {
@@ -29,6 +30,10 @@ macro_rules! shell {
         impl Decoder for $decoder<'_> {
             type Frame = D3d11Frame;
             type Error = D3d11Error;
+
+            fn caps(&self) -> GpuCaps {
+                GpuCaps::new(None, false, false)
+            }
 
             fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
                 if !self.device.supports(Codec::$codec) {
@@ -67,3 +72,26 @@ shell!(
     Vc1,
     "VC-1 decoder; the picture builder is pending."
 );
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_caps_decline_typed() {
+        use bytes::Bytes;
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+        use rust_video_caps::transcode::GpuCaps;
+
+        let Ok(device) = crate::D3d11Device::open() else {
+            return;
+        };
+        let packet = Packet::new(Bytes::new());
+        let mut mpeg2 = super::Mpeg2Decoder::open(&device);
+        assert_eq!(mpeg2.caps(), GpuCaps::new(None, false, false));
+        assert!(mpeg2.decode(&packet).is_err());
+        let mut vc1 = super::Vc1Decoder::open(&device);
+        assert_eq!(vc1.caps(), GpuCaps::new(None, false, false));
+        assert!(vc1.decode(&packet).is_err());
+    }
+}

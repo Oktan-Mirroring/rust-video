@@ -7,6 +7,7 @@
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::GpuCaps;
 
 use crate::error::SwError;
 use crate::ffmpeg_enc::FfmpegEncoder;
@@ -183,6 +184,10 @@ impl H265Encoder {
 
 impl Encoder for H265Encoder {
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         self.inner.encode(frame)

@@ -801,6 +801,11 @@ impl DecodeSession {
         Ok(())
     }
 
+    /// True when the pool texture exports an NT handle: uncropped session.
+    pub(crate) fn exports_shared(&self) -> bool {
+        crop_plan(self.width, self.height, self.crop).is_none()
+    }
+
     /// NT-handle export for pool `slot`, absent when cropped or refused.
     pub(crate) fn shared_handle(&self, slot: u8) -> Option<SharedExport> {
         if crop_plan(self.width, self.height, self.crop).is_some() {

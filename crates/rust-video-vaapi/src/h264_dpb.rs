@@ -799,7 +799,8 @@ mod tests {
         picture.pic_order_cnt = poc;
         picture.nonexisting = nonexisting;
         picture.set_reference(Reference::ShortTerm);
-        dpb.store_picture(picture.into_rc(), Some(slot)).expect("room");
+        dpb.store_picture(picture.into_rc(), Some(slot))
+            .expect("room");
     }
 
     /// Stored long-term picture over `dpb`.
@@ -810,7 +811,8 @@ mod tests {
         picture.long_term_pic_num = idx;
         picture.nonexisting = nonexisting;
         picture.set_reference(Reference::LongTerm);
-        dpb.store_picture(picture.into_rc(), Some(slot)).expect("room");
+        dpb.store_picture(picture.into_rc(), Some(slot))
+            .expect("room");
     }
 
     #[test]

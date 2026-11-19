@@ -2,8 +2,6 @@
 //!
 //! Export probe over COM/D3D11: live descriptors, checked handles.
 
-#![allow(unsafe_code)]
-
 use crate::decoder::GpuSurface;
 use crate::decoder::H264Decoder;
 use crate::device::D3d11Device;
@@ -11,24 +9,13 @@ use crate::encoder::D3d11Encoder;
 use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::scale::{ScaledSurface, Scaler};
-use crate::submit::flag_word;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::FallbackCause;
-use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
-use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::IDXGIResource;
-
-/// Probe texture extent in luma samples.
-const PROBE_EXTENT: u32 = 64;
+use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale};
 
 /// GPU transcode from decode surface to encoder texture.
 pub struct Transcoder<'a> {
@@ -64,7 +51,7 @@ impl<'a> Transcoder<'a> {
                 UnsupportedReason::DecodeWithoutSurfaceDecode { codec: decode },
             ));
         }
-        let share = shared_export(device).ok_or_else(declined_export)?;
+        let share = device.share_mechanism().ok_or_else(declined_export)?;
         let encoder = D3d11Encoder::open(device, encode)?;
         let caps = GpuCaps::new(Some(share), device.supports(decode), encoder.gpu_ready());
         let plan = Plan::for_caps(&caps);
@@ -208,41 +195,6 @@ impl<'a> Transcoder<'a> {
         let scaler = self.scaler.as_ref().ok_or(D3d11Error::NoSession)?;
         scaler.scale(surface)
     }
-}
-
-/// NT-handle share behind `device`, absent without shared-texture export.
-fn shared_export(device: &D3d11Device) -> Option<ShareMechanism> {
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: PROBE_EXTENT,
-        Height: PROBE_EXTENT,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_NV12,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: flag_word(D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0),
-        CPUAccessFlags: 0,
-        MiscFlags: flag_word(D3D11_RESOURCE_MISC_SHARED.0),
-    };
-    let mut texture = None;
-    // Sound: the descriptor stays live for the call.
-    let created = unsafe {
-        device.device().CreateTexture2D(
-            std::ptr::addr_of!(desc),
-            None,
-            Some(std::ptr::addr_of_mut!(texture)),
-        )
-    };
-    let (Ok(()), Some(texture)) = (created, texture) else {
-        return None;
-    };
-    let resource: IDXGIResource = texture.cast().ok()?;
-    // Sound: the resource is live.
-    let handle = unsafe { resource.GetSharedHandle() }.ok()?;
-    (!handle.0.is_null()).then_some(ShareMechanism::NtHandle)
 }
 
 /// Typed decline for a device without shared-texture export.

@@ -26,6 +26,7 @@ use ash::vk::native::{
     StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
     StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P, StdVideoH265VideoParameterSet,
 };
+use rust_video_caps::transcode::ShareMechanism;
 
 use crate::device::VulkanDevice;
 use crate::error::VulkanError;
@@ -895,6 +896,8 @@ pub(crate) struct EncodeSession {
     ext: Option<ExtDevice>,
     /// Import of the last encode, reused while the pair holds.
     import: Option<(Arc<ExportPair>, ImportPair)>,
+    /// Share mechanism behind texture import, absent when import is not live.
+    import_share: Option<ShareMechanism>,
     /// Source image view; drops before `input` below.
     input_view: GpuView,
     /// Source image for uploaded pictures.
@@ -1040,6 +1043,11 @@ impl EncodeSession {
             props: properties,
             ext: device.ext(),
             import: None,
+            import_share: if device.surface_import() {
+                device.share_mechanism()
+            } else {
+                None
+            },
             input_view: resources.input_view,
             input: resources.input,
             input_layout: vk::ImageLayout::UNDEFINED,
@@ -1238,6 +1246,11 @@ impl EncodeSession {
     /// True when two DPB slots back P pictures.
     pub(crate) fn supports_p_frames(&self) -> bool {
         self.p_capable
+    }
+
+    /// Share mechanism behind texture import, absent when import is not live.
+    pub(crate) fn import_share(&self) -> Option<ShareMechanism> {
+        self.import_share
     }
 
     /// Forget layouts and references after a submit-core reset.

@@ -13,6 +13,7 @@ use crate::vp9_params::Params;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
+use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
 /// Surface pool size: eight reference slots plus decode margin.
 const POOL_SIZE: usize = NUM_SLOTS + 4;
@@ -411,6 +412,14 @@ impl<'a> Vp9Decoder<'a> {
 impl Decoder for Vp9Decoder<'_> {
     type Frame = VaApiFrame;
     type Error = VaApiError;
+
+    fn caps(&self) -> GpuCaps {
+        let share = self
+            .device
+            .dmabuf_export()
+            .then_some(ShareMechanism::DmaBuf);
+        GpuCaps::new(share, false, false)
+    }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.decode_inner(packet, true)

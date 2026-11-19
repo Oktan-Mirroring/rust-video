@@ -14,6 +14,7 @@ use crate::seam::VaSeam;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
+use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
 /// H.265 decoder over a VA-API display.
 ///
@@ -489,6 +490,14 @@ impl<'a> H265Decoder<'a> {
 impl Decoder for H265Decoder<'_> {
     type Frame = VaApiFrame;
     type Error = VaApiError;
+
+    fn caps(&self) -> GpuCaps {
+        let share = self
+            .device
+            .dmabuf_export()
+            .then_some(ShareMechanism::DmaBuf);
+        GpuCaps::new(share, false, false)
+    }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.decode_inner(packet, true)

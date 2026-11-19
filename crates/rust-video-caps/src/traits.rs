@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::frame::CpuFrame;
 use crate::packet::Packet;
+use crate::transcode::GpuCaps;
 
 /// Coded packets to frames.
 pub trait Decoder {
@@ -13,6 +14,11 @@ pub trait Decoder {
     type Frame;
     /// Decode failure.
     type Error: std::error::Error;
+
+    /// Upfront share capabilities behind the decoder.
+    ///
+    /// Promise; per-frame export stays the outcome.
+    fn caps(&self) -> GpuCaps;
 
     /// Frames decoded from `packet`, possibly none.
     ///
@@ -43,6 +49,11 @@ pub trait Device {
 pub trait Encoder {
     /// Encode failure.
     type Error: std::error::Error;
+
+    /// Upfront share capabilities behind the encoder.
+    ///
+    /// Promise; texture import stays the outcome.
+    fn caps(&self) -> GpuCaps;
 
     /// Packets coded from `frame`, possibly none.
     ///
@@ -211,6 +222,7 @@ struct SharedInner {
 mod tests {
     use super::{Decoder, Device, Lease, OverBudget, SharedDevice};
     use crate::packet::Packet;
+    use crate::transcode::GpuCaps;
 
     use bytes::Bytes;
 
@@ -219,6 +231,10 @@ mod tests {
     impl Decoder for EchoDecoder {
         type Frame = u64;
         type Error = OverBudget;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, packet: &Packet) -> Result<Vec<u64>, OverBudget> {
             Ok(vec![packet.data().len() as u64])

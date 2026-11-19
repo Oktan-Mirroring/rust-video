@@ -10,6 +10,7 @@ use crate::scale::ScaledSurface;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
@@ -139,6 +140,11 @@ impl D3d11Encoder {
 
 impl Encoder for D3d11Encoder {
     type Error = D3d11Error;
+
+    fn caps(&self) -> GpuCaps {
+        let live = self.gpu_ready();
+        GpuCaps::new(live.then_some(ShareMechanism::NtHandle), false, live)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, D3d11Error> {
         let planes = Planes::of(frame)?;
@@ -343,5 +349,40 @@ mod tests {
     #[test]
     fn pack_rejects_short_plane() {
         assert!(check_plane(&[0; 5], 4, 4, 2).is_err());
+    }
+
+    #[test]
+    fn caps_agree_with_texture_import() {
+        use rust_video_caps::traits::Encoder;
+
+        let Ok(device) = crate::device::D3d11Device::open() else {
+            return;
+        };
+        let Ok(mut encoder) = super::D3d11Encoder::open(&device, crate::guid::Codec::H264) else {
+            return;
+        };
+        let caps = encoder.caps();
+        assert_eq!(caps.share().is_some(), caps.encode_import());
+        assert!(!caps.decode_export());
+        let mut decoder = crate::decoder::H264Decoder::open(&device);
+        let frame = rust_video_harness::Synth::noise(320, 240, 0);
+        let mut surfaces = Vec::new();
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            surfaces.extend(decoder.decode_surface(&packet).expect("decode runs"));
+        }
+        let surface = surfaces.pop().expect("first picture surfaces");
+        if caps.encode_import() {
+            encoder.encode_surface(&surface).expect("import runs");
+        } else {
+            let Err(crate::error::D3d11Error::Unsupported(reason)) =
+                encoder.encode_surface(&surface)
+            else {
+                panic!("unbound import declines");
+            };
+            assert!(matches!(
+                reason,
+                crate::error::UnsupportedReason::EncoderWithoutGpuImport
+            ));
+        }
     }
 }

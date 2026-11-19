@@ -604,6 +604,7 @@ mod tests {
     };
     use crate::packet::Packet;
     use crate::traits::Decoder;
+    use crate::transcode::GpuCaps;
 
     use bytes::Bytes;
 
@@ -628,6 +629,10 @@ mod tests {
     impl Decoder for HoldbackDecoder {
         type Frame = u64;
         type Error = Reject;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, _packet: &Packet) -> Result<Vec<u64>, Reject> {
             let id = self.next;

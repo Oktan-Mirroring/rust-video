@@ -13,20 +13,21 @@ use std::time::Duration;
 
 use crate::error::{D3d12Error, UnsupportedReason};
 use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC,
-    D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_FENCE_FLAG_NONE,
-    D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES,
-    D3D12_HEAP_TYPE, D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RANGE,
-    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Device, ID3D12DeviceChild,
+    ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE,
+    D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+    D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_FLAG_SHARED,
+    D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE, D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RANGE, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE,
-    D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
-    D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-    D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -271,11 +272,44 @@ pub(crate) struct DeviceResources {
 }
 
 impl DeviceResources {
+    /// Probe texture extent in luma samples.
+    const PROBE_EXTENT: u32 = 64;
+
     /// Resources over `device`.
     pub(crate) fn new(device: &ID3D12Device) -> Self {
         Self {
             device: device.clone(),
         }
+    }
+
+    /// True when the driver shares a probe texture through an NT handle.
+    pub(crate) fn probe_shared_export(&self) -> bool {
+        let desc = Self::texture_desc(Self::PROBE_EXTENT, Self::PROBE_EXTENT);
+        let Ok(resource) = self.committed_shared(
+            D3D12_HEAP_TYPE_DEFAULT,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            "ProbeShare",
+        ) else {
+            return false;
+        };
+        // Sound: the resource is live; every resource exposes the device-child face.
+        let Ok(child) = resource.cast::<ID3D12DeviceChild>() else {
+            return false;
+        };
+        // Sound: the device and resource are live; default security, unnamed.
+        let Ok(handle) = (unsafe {
+            self.device
+                .CreateSharedHandle(&child, None, GENERIC_ALL.0, PCWSTR::null())
+        }) else {
+            return false;
+        };
+        if handle.is_invalid() {
+            return false;
+        }
+        // Sound: the handle is live; the close ends the export.
+        let _ = unsafe { CloseHandle(handle) };
+        true
     }
 
     /// Queue of `queue_type` behind submissions.

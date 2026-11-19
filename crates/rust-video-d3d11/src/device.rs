@@ -13,21 +13,27 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11VideoContext,
-    ID3D11VideoDevice, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    ID3D11VideoDevice, D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIResource};
 
 use crate::error::D3d11Error;
 use crate::error::SkipReason;
 use crate::guid::{Codec, Profile};
-use crate::submit::SubmitLock;
+use crate::submit::{flag_word, SubmitLock};
 
 use rust_video_caps::traits::Device;
 use rust_video_caps::traits::SharedDevice;
+use rust_video_caps::transcode::ShareMechanism;
 
 /// H.264 VLD profile name the tier decodes.
 const H264_PROFILE: &str = "h264-vld-nofgt";
+
+/// Probe texture extent in luma samples.
+const PROBE_EXTENT: u32 = 64;
 
 /// D3D11 device with video interfaces and a VRAM budget.
 pub struct D3d11Device {
@@ -49,6 +55,8 @@ pub struct D3d11Device {
     level: i32,
     /// Adapter description.
     name: String,
+    /// Shared-texture export behind the adapter.
+    shareable: bool,
 }
 
 impl D3d11Device {
@@ -90,6 +98,7 @@ impl D3d11Device {
         }
         check_nv12(&video_device)?;
         let (name, budget) = adapter_info(&device)?;
+        let shareable = probe_shared_export(&device);
         Ok(Self {
             device,
             context,
@@ -100,6 +109,7 @@ impl D3d11Device {
             submit: Arc::new(SubmitLock::new()),
             level: level.0,
             name,
+            shareable,
         })
     }
 
@@ -119,6 +129,12 @@ impl D3d11Device {
     #[must_use]
     pub fn feature_level(&self) -> i32 {
         self.level
+    }
+
+    /// NT-handle share behind the adapter, absent without shared-texture export.
+    #[must_use]
+    pub(crate) fn share_mechanism(&self) -> Option<ShareMechanism> {
+        self.shareable.then_some(ShareMechanism::NtHandle)
     }
 
     /// VRAM budget shared with decoders.
@@ -279,6 +295,45 @@ fn adapter_info(device: &ID3D11Device) -> Result<(String, u64), D3d11Error> {
     let name = String::from_utf16_lossy(&desc.Description[..end]);
     let budget = u64::try_from(desc.DedicatedVideoMemory).unwrap_or(u64::MAX);
     Ok((name, budget))
+}
+
+/// True when `device` exports a shared probe texture through an NT handle.
+fn probe_shared_export(device: &ID3D11Device) -> bool {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: PROBE_EXTENT,
+        Height: PROBE_EXTENT,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: flag_word(D3D11_BIND_DECODER.0 | D3D11_BIND_SHADER_RESOURCE.0),
+        CPUAccessFlags: 0,
+        MiscFlags: flag_word(D3D11_RESOURCE_MISC_SHARED.0),
+    };
+    let mut texture = None;
+    // Sound: the descriptor stays live for the call.
+    let created = unsafe {
+        device.CreateTexture2D(
+            std::ptr::addr_of!(desc),
+            None,
+            Some(std::ptr::addr_of_mut!(texture)),
+        )
+    };
+    let (Ok(()), Some(texture)) = (created, texture) else {
+        return false;
+    };
+    let Ok(resource) = texture.cast::<IDXGIResource>() else {
+        return false;
+    };
+    // Sound: the resource is live.
+    let Ok(handle) = (unsafe { resource.GetSharedHandle() }) else {
+        return false;
+    };
+    !handle.0.is_null()
 }
 
 /// Profile for `guid`, if the tier drives it.

@@ -17,6 +17,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
+use rust_video_caps::transcode::GpuCaps;
 
 pub use crate::ffmpeg_sys::AVCodecContext;
 
@@ -504,6 +505,10 @@ impl Decoder for FfmpegDecoder {
     type Frame = CpuFrame;
     type Error = SwError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         let mut out = Vec::new();
         if self.submit_into(packet, &mut out)? {
@@ -584,6 +589,10 @@ impl Decoder for H264Decoder {
     type Frame = CpuFrame;
     type Error = SwError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.decode(packet)
     }
@@ -647,6 +656,10 @@ impl H265Decoder {
 impl Decoder for H265Decoder {
     type Frame = CpuFrame;
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.decode(packet)
@@ -712,6 +725,10 @@ impl Decoder for Vp8Decoder {
     type Frame = CpuFrame;
     type Error = SwError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.decode(packet)
     }
@@ -776,6 +793,10 @@ impl Decoder for Vp9Decoder {
     type Frame = CpuFrame;
     type Error = SwError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.decode(packet)
     }
@@ -839,6 +860,10 @@ impl Av1Decoder {
 impl Decoder for Av1Decoder {
     type Frame = CpuFrame;
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
         self.inner.decode(packet)
@@ -1161,6 +1186,26 @@ mod tests {
         assert_send::<H265Decoder>();
         assert_send::<Vp8Decoder>();
         assert_send::<Vp9Decoder>();
+    }
+
+    #[test]
+    fn caps_agree_with_cpu_frames() {
+        use rust_video_caps::transcode::GpuCaps;
+        use rust_video_harness::H264Synth;
+
+        let mut decoder = H264Decoder::open(4).expect("decoder");
+        assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
+        let mut frames = Vec::new();
+        for raw in H264Synth::annex_b_packets() {
+            let packet = Packet::new(Bytes::copy_from_slice(&raw));
+            frames.extend(decoder.decode(&packet).expect("decode"));
+        }
+        frames.extend(decoder.flush().expect("flush"));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
+        for frame in &frames {
+            assert!(!frame.planes().is_empty());
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ use ndk::media_error::MediaError;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::transcode::GpuCaps;
 
 /// `MediaCodec#BUFFER_FLAG_DECODE_ONLY`; `AndroidSeam` and `AsyncDrain` share it.
 const BUFFER_FLAG_DECODE_ONLY: u32 = 32;
@@ -678,6 +679,10 @@ impl Decoder for MediaCodecDecoder {
     type Frame = MediaCodecSurface;
     type Error = MediaCodecError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     /// Surfaces decoded from `packet`, possibly none.
     ///
     /// Per-call emission: the packet queues and the drain runs in this same
@@ -771,6 +776,10 @@ impl MediaCodecEncoder {
 impl Encoder for MediaCodecEncoder {
     type Error = MediaCodecError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     /// Packets coded from `frame`, possibly none.
     ///
     /// # Arguments
@@ -822,5 +831,63 @@ mod tests {
     #[test]
     fn probe_names_tier() {
         assert_eq!(MediaCodecDevice::probe().name(), "mediacodec");
+    }
+
+    #[test]
+    fn caps_agree_with_surface_exports() {
+        use bytes::Bytes;
+        use rust_video_caps::frame::GpuExport;
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+        use rust_video_caps::transcode::GpuCaps;
+
+        use super::MediaCodecDecoder;
+        use crate::error::MediaCodecError;
+        use crate::format::FormatSpec;
+
+        let spec = FormatSpec::h264(64, 64)
+            .expect("valid dims")
+            .with_csd_0(vec![0, 0, 1])
+            .with_csd_1(vec![0, 0, 1]);
+        let mut decoder = match MediaCodecDecoder::open(&spec) {
+            Ok(decoder) => decoder,
+            Err(
+                error @ (MediaCodecError::NoDecoder { .. } | MediaCodecError::BelowMinSdk { .. }),
+            ) => {
+                println!("SKIP mediacodec caps on this device: {error}");
+                return;
+            }
+            Err(error) => panic!("unexpected open failure: {error}"),
+        };
+        assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
+        let empty = Packet::new(Bytes::new());
+        let mut surfaces = decoder.decode(&empty).expect("empty packet queues");
+        surfaces.extend(decoder.flush().expect("flush drains"));
+        for surface in &surfaces {
+            assert!(matches!(surface.export(), GpuExport::Opaque { .. }));
+        }
+    }
+
+    #[test]
+    fn encoder_caps_report_no_share() {
+        use rust_video_caps::traits::Encoder;
+        use rust_video_caps::transcode::GpuCaps;
+
+        use super::MediaCodecEncoder;
+        use crate::encoder::EncodeSpec;
+        use crate::error::MediaCodecError;
+
+        let spec = EncodeSpec::h264(64, 64, 1_000_000, 30, 1).expect("valid spec");
+        let encoder = match MediaCodecEncoder::open(&spec) {
+            Ok(encoder) => encoder,
+            Err(
+                error @ (MediaCodecError::NoEncoder { .. } | MediaCodecError::BelowMinSdk { .. }),
+            ) => {
+                println!("SKIP mediacodec caps on this device: {error}");
+                return;
+            }
+            Err(error) => panic!("unexpected open failure: {error}"),
+        };
+        assert_eq!(encoder.caps(), GpuCaps::new(None, false, false));
     }
 }

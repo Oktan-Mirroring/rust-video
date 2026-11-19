@@ -284,6 +284,7 @@ mod tests {
     };
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
+    use rust_video_caps::transcode::GpuCaps;
 
     use super::{Drive, Packets, Parity, SERIAL};
     use crate::Synth;
@@ -368,6 +369,10 @@ mod tests {
     impl Decoder for EchoDecoder {
         type Frame = Vec<u8>;
         type Error = PumpError;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
             Ok(vec![packet.data().to_vec()])

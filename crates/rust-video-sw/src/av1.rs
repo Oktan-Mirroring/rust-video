@@ -13,6 +13,7 @@ use crate::ffmpeg_sys as sys;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
+use rust_video_caps::transcode::GpuCaps;
 
 /// Realtime AV1 encoder over `libsvtav1` or `libaom-av1`.
 pub struct Av1Encoder {
@@ -278,6 +279,10 @@ impl Av1Encoder {
 
 impl Encoder for Av1Encoder {
     type Error = SwError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         self.inner.encode(frame)

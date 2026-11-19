@@ -121,12 +121,13 @@ impl Convert {
     }
 }
 
-/// GPU transcode capabilities per hop.
+/// GPU capabilities: interop mechanism plus per-path texture handoff.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct GpuCaps {
-    /// Share mechanism behind the hops, absent without GPU interop.
+    /// Share mechanism the device negotiates, absent without GPU interop.
     share: Option<ShareMechanism>,
-    /// Decode texture export behind the hop.
+    /// Trait-path frames carry importable handles (`decode`); surface
+    /// paths may still export while this is false.
     decode_export: bool,
     /// Encoder texture import behind the hop.
     encode_import: bool,

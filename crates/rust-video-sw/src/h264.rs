@@ -15,6 +15,7 @@ use openh264::Timestamp;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder as CapsEncoder;
+use rust_video_caps::transcode::GpuCaps;
 
 /// Slice byte budget when multi-threaded; engages worker threads without tiny slice fragmentation.
 const MULTI_SLICE_BYTES: u32 = 16_384;
@@ -121,6 +122,10 @@ impl H264Encoder {
 impl CapsEncoder for H264Encoder {
     type Error = SwError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         SwError::check_yuv420p(frame, self.width, self.height)?;
         let source = Self::view(frame);
@@ -177,6 +182,14 @@ mod tests {
     #[test]
     fn encoder_is_send_sync() {
         assert_send_sync::<H264Encoder>();
+    }
+
+    #[test]
+    fn encoder_caps_report_no_share() {
+        use rust_video_caps::transcode::GpuCaps;
+
+        let encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
+        assert_eq!(encoder.caps(), GpuCaps::new(None, false, false));
     }
 
     #[test]

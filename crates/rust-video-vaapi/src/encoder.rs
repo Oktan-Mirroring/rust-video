@@ -23,7 +23,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
-use rust_video_caps::transcode::FallbackCause;
+use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
 
 /// Codec an encoder session writes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1379,6 +1379,10 @@ impl VaApiEncoder {
 impl Encoder for VaApiEncoder {
     type Error = VaApiError;
 
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(Some(ShareMechanism::DmaBuf), false, true)
+    }
+
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, VaApiError> {
         let slot = self.next_slot;
         self.next_slot = (self.next_slot + 1) % Self::UPLOADS;
@@ -1782,6 +1786,38 @@ mod tests {
     use crate::error::VaApiError;
     use crate::h264::Gate;
     use crate::h265::Gate as Gate265;
+
+    #[test]
+    fn caps_agree_with_texture_import() {
+        use rust_video_caps::common::PictureSize;
+        use rust_video_caps::traits::Encoder;
+        use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
+        use rust_video_harness::{H264Synth, Packets};
+
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let size = PictureSize::new(320, 240).expect("synth size");
+        let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+            Ok(encoder) => encoder,
+            Err(VaApiError::Unsupported(_)) => return,
+            Err(error) => panic!("unexpected encode failure: {error}"),
+        };
+        assert_eq!(
+            encoder.caps(),
+            GpuCaps::new(Some(ShareMechanism::DmaBuf), false, true)
+        );
+        let mut decoder = crate::decoder::H264Decoder::open(&device);
+        let raws = H264Synth::annex_b_h264_packets();
+        let packets = Packets::from_raws(&raws);
+        let mut surfaces = Vec::new();
+        for packet in &packets {
+            surfaces.extend(decoder.decode_surface(packet).expect("synth decodes"));
+        }
+        surfaces.extend(decoder.flush_surface().expect("decode drains"));
+        let surface = surfaces.pop().expect("first picture surfaces");
+        encoder.encode_surface(&surface).expect("import runs");
+    }
 
     #[test]
     fn writer_packs_bits_msb_first() {

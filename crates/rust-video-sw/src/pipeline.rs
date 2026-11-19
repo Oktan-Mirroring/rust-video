@@ -920,6 +920,7 @@ mod tests {
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
+    use rust_video_caps::transcode::GpuCaps;
 
     use super::{
         Converter, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource, SplitDecoder,
@@ -1009,6 +1010,10 @@ mod tests {
     impl Decoder for Scripted {
         type Frame = CpuFrame;
         type Error = SwError;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, packet: &Packet) -> Result<Vec<CpuFrame>, SwError> {
             let mut raws = Vec::new();

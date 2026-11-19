@@ -23,6 +23,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, SharedDevice};
+use rust_video_caps::transcode::GpuCaps;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 
 /// Active sequence behind the live session.
@@ -470,6 +471,15 @@ impl Decoder for HevcDecoder<'_> {
     type Frame = D3d12Frame;
     type Error = D3d12Error;
 
+    fn caps(&self) -> GpuCaps {
+        let share = self.device.share_mechanism().filter(|_| {
+            self.session
+                .as_ref()
+                .is_none_or(DecodeSession::exports_shared)
+        });
+        GpuCaps::new(share, share.is_some(), false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
         if !self.device.supports(Codec::Hevc) {
             return Err(SkipReason::ProfileUnsupported { codec: Codec::Hevc }.into());
@@ -911,6 +921,15 @@ impl<'a> Av1Decoder<'a> {
 impl Decoder for Av1Decoder<'_> {
     type Frame = D3d12Frame;
     type Error = D3d12Error;
+
+    fn caps(&self) -> GpuCaps {
+        let share = self.device.share_mechanism().filter(|_| {
+            self.session
+                .as_ref()
+                .is_none_or(DecodeSession::exports_shared)
+        });
+        GpuCaps::new(share, share.is_some(), false)
+    }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
         if !self.device.supports(Codec::Av1) {
@@ -1390,6 +1409,15 @@ impl Decoder for H264Decoder<'_> {
     type Frame = D3d12Frame;
     type Error = D3d12Error;
 
+    fn caps(&self) -> GpuCaps {
+        let share = self.device.share_mechanism().filter(|_| {
+            self.session
+                .as_ref()
+                .is_none_or(DecodeSession::exports_shared)
+        });
+        GpuCaps::new(share, share.is_some(), false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
         if !self.device.supports(Codec::H264) {
             return Err(SkipReason::ProfileUnsupported { codec: Codec::H264 }.into());
@@ -1758,4 +1786,60 @@ pub(crate) fn submit_av1_dpb(
 ) -> Result<Av1Decoded, D3d12Error> {
     let seq = ingest.seq().ok_or(D3d12Error::NoSession)?;
     dpb.decode(frame, seq)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use rust_video_caps::frame::GpuExport;
+    use rust_video_caps::packet::Packet;
+    use rust_video_caps::traits::Decoder;
+    use rust_video_caps::transcode::GpuCaps;
+    use rust_video_harness::H264Synth;
+
+    #[test]
+    fn caps_agree_with_frame_exports() {
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let mut decoder = super::H264Decoder::open(&device);
+        let idle = decoder.caps();
+        assert_eq!(idle.share().is_some(), idle.decode_export());
+        assert!(!idle.encode_import());
+        let mut frames = Vec::new();
+        for raw in H264Synth::annex_b_h264_packets() {
+            let packet = Packet::new(Bytes::from(raw));
+            frames.extend(decoder.decode(&packet).expect("decode runs"));
+        }
+        frames.extend(decoder.flush().expect("decode drains"));
+        assert!(!frames.is_empty());
+        let live = decoder.caps();
+        assert_eq!(live.share().is_some(), live.decode_export());
+        assert!(!live.encode_import());
+        for frame in &frames {
+            match live.share() {
+                Some(_) => assert!(matches!(frame.export(), GpuExport::NtHandle { .. })),
+                None => assert!(matches!(frame.export(), GpuExport::Opaque { .. })),
+            }
+        }
+    }
+
+    #[test]
+    fn cropped_session_reports_no_share() {
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let mut decoder = super::H264Decoder::open(&device);
+        let mut frames = Vec::new();
+        for raw in H264Synth::annex_b_h264_packets_cropped() {
+            let packet = Packet::new(Bytes::from(raw));
+            frames.extend(decoder.decode(&packet).expect("decode runs"));
+        }
+        frames.extend(decoder.flush().expect("decode drains"));
+        assert!(!frames.is_empty());
+        assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
+        for frame in &frames {
+            assert!(matches!(frame.export(), GpuExport::Opaque { .. }));
+        }
+    }
 }

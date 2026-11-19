@@ -40,6 +40,8 @@ pub struct VaApiDevice {
     _node: OwnedFd,
     /// Driver description.
     name: String,
+    /// PRIME export probe result, cached at open.
+    dmabuf: bool,
     /// Thread contract: `Send` without `Sync`.
     _thread: PhantomData<UnsafeCell<()>>,
 }
@@ -88,10 +90,12 @@ impl VaApiDevice {
                 vld = true;
                 if display.supports_nv12(profile) {
                     let name = display.vendor();
+                    let dmabuf = probe_dmabuf_export(display.display);
                     return Ok(Self {
                         display: display.leak(),
                         _node: node,
                         name,
+                        dmabuf,
                         _thread: PhantomData,
                     });
                 }
@@ -138,43 +142,48 @@ impl VaApiDevice {
     /// True when the display exports surfaces as DRM PRIME file descriptors.
     #[must_use]
     pub(crate) fn dmabuf_export(&self) -> bool {
-        // Sound: every handle below is live for its call; the probe
-        // surface and any exported descriptors close on every path.
-        unsafe {
-            let mut surface = 0;
-            let created = sys::vaCreateSurfaces(
-                self.display,
-                ffi::VA_RT_FORMAT_YUV420,
-                64,
-                64,
-                &raw mut surface,
-                1,
-                std::ptr::null_mut(),
-                0,
-            );
-            if created != ffi::VA_STATUS_SUCCESS {
-                return false;
-            }
-            let mut descriptor = std::mem::MaybeUninit::<ffi::VaDrmPrimeDescriptor>::uninit();
-            let status = sys::vaExportSurfaceHandle(
-                self.display,
-                surface,
-                ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                ffi::VA_EXPORT_SURFACE_READ_ONLY | ffi::VA_EXPORT_SURFACE_SEPARATE_LAYERS,
-                descriptor.as_mut_ptr().cast(),
-            );
-            if status == ffi::VA_STATUS_SUCCESS {
-                let descriptor = descriptor.assume_init();
-                let count = usize::try_from(descriptor.num_objects).unwrap_or(0).min(4);
-                for object in descriptor.objects.iter().take(count) {
-                    if object.fd >= 0 {
-                        drop(OwnedFd::from_raw_fd(object.fd));
-                    }
+        self.dmabuf
+    }
+}
+
+/// PRIME export probe over `display`: one surface created, exported, destroyed.
+fn probe_dmabuf_export(display: ffi::VaDisplay) -> bool {
+    // Sound: every handle below is live for its call; the probe
+    // surface and any exported descriptors close on every path.
+    unsafe {
+        let mut surface = 0;
+        let created = sys::vaCreateSurfaces(
+            display,
+            ffi::VA_RT_FORMAT_YUV420,
+            64,
+            64,
+            &raw mut surface,
+            1,
+            std::ptr::null_mut(),
+            0,
+        );
+        if created != ffi::VA_STATUS_SUCCESS {
+            return false;
+        }
+        let mut descriptor = std::mem::MaybeUninit::<ffi::VaDrmPrimeDescriptor>::uninit();
+        let status = sys::vaExportSurfaceHandle(
+            display,
+            surface,
+            ffi::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+            ffi::VA_EXPORT_SURFACE_READ_ONLY | ffi::VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+            descriptor.as_mut_ptr().cast(),
+        );
+        if status == ffi::VA_STATUS_SUCCESS {
+            let descriptor = descriptor.assume_init();
+            let count = usize::try_from(descriptor.num_objects).unwrap_or(0).min(4);
+            for object in descriptor.objects.iter().take(count) {
+                if object.fd >= 0 {
+                    drop(OwnedFd::from_raw_fd(object.fd));
                 }
             }
-            sys::vaDestroySurfaces(self.display, &raw mut surface, 1);
-            status == ffi::VA_STATUS_SUCCESS
         }
+        sys::vaDestroySurfaces(display, &raw mut surface, 1);
+        status == ffi::VA_STATUS_SUCCESS
     }
 }
 

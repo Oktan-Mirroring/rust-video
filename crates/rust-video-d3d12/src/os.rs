@@ -2,6 +2,7 @@
 
 use crate::decode::SharedExport;
 use crate::seam::Seam;
+use crate::submit::DeviceResources;
 
 use rust_video_caps::frame::GpuExport;
 use rust_video_caps::traits::SharedDevice;
@@ -16,6 +17,8 @@ pub(crate) struct DeviceOs {
     video: ID3D12VideoDevice,
     /// VRAM budget shared with decoders.
     shared: SharedDevice,
+    /// Shared-texture export behind the adapter.
+    shareable: bool,
 }
 
 impl DeviceOs {
@@ -31,10 +34,12 @@ impl DeviceOs {
         video: ID3D12VideoDevice,
         shared: SharedDevice,
     ) -> Self {
+        let shareable = DeviceResources::new(&device).probe_shared_export();
         Self {
             device,
             video,
             shared,
+            shareable,
         }
     }
 
@@ -51,6 +56,11 @@ impl DeviceOs {
     /// VRAM budget shared with decoders.
     pub(crate) fn shared(&self) -> &SharedDevice {
         &self.shared
+    }
+
+    /// Shared-texture export behind the adapter.
+    pub(crate) fn shareable(&self) -> bool {
+        self.shareable
     }
 }
 

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease};
+use rust_video_caps::transcode::GpuCaps;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d12Frame {
@@ -120,6 +121,10 @@ macro_rules! shell {
         impl Decoder for $decoder<'_> {
             type Frame = D3d12Frame;
             type Error = D3d12Error;
+
+            fn caps(&self) -> GpuCaps {
+                GpuCaps::new(None, false, false)
+            }
 
             fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
                 if !self.device.supports(Codec::$codec) {
@@ -235,5 +240,33 @@ mod tests {
     fn frame_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<D3d12Frame>();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shell_caps_decline_typed() {
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+        use rust_video_caps::transcode::GpuCaps;
+
+        let Ok(device) = crate::device::D3d12Device::open() else {
+            return;
+        };
+        let packet = Packet::new(Bytes::new());
+        {
+            let mut shell = super::Mpeg2Decoder::open(&device);
+            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
+            assert!(shell.decode(&packet).is_err());
+        }
+        {
+            let mut shell = super::Vc1Decoder::open(&device);
+            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
+            assert!(shell.decode(&packet).is_err());
+        }
+        {
+            let mut shell = super::Vp9Decoder::open(&device);
+            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
+            assert!(shell.decode(&packet).is_err());
+        }
     }
 }

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
-use rust_video_caps::transcode::FallbackCause;
+use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
 
 use crate::decoder::VulkanFrame;
 use crate::device::VulkanDevice;
@@ -138,6 +138,11 @@ impl Engine {
     /// True when the session backs P pictures.
     fn supports_p_frames(&self) -> bool {
         self.session.supports_p_frames()
+    }
+
+    /// Share mechanism behind texture import, absent when import is not live.
+    fn import_share(&self) -> Option<ShareMechanism> {
+        self.session.import_share()
     }
 
     /// Packet coded from `frame`, keyframe on IDR pictures.
@@ -405,6 +410,11 @@ impl H264Encoder {
 impl Encoder for H264Encoder {
     type Error = VulkanError;
 
+    fn caps(&self) -> GpuCaps {
+        let share = self.engine.import_share();
+        GpuCaps::new(share, false, share.is_some())
+    }
+
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         Ok(vec![self.engine.encode_frame(frame)?])
     }
@@ -497,6 +507,11 @@ impl H265Encoder {
 
 impl Encoder for H265Encoder {
     type Error = VulkanError;
+
+    fn caps(&self) -> GpuCaps {
+        let share = self.engine.import_share();
+        GpuCaps::new(share, false, share.is_some())
+    }
 
     fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
         Ok(vec![self.engine.encode_frame(frame)?])
@@ -592,5 +607,43 @@ mod tests {
             super::pack_nv12(&frame, &mut out),
             Err(super::VulkanError::ShortReadback { .. })
         ));
+    }
+
+    #[test]
+    fn caps_agree_with_import_liveness() {
+        use rust_video_caps::traits::Encoder;
+        #[cfg(not(unix))]
+        use rust_video_caps::transcode::GpuCaps;
+
+        use crate::device::VulkanDevice;
+        use crate::error::VulkanError;
+        use crate::ladder::CodecOp;
+
+        let device = match VulkanDevice::open_or_skip(CodecOp::H264Encode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: h264 encode on this box: {reason}");
+                return;
+            }
+            Err(error) => panic!("negotiation failed: {error}"),
+        };
+        let encoder = match super::H264Encoder::open(&device, 320, 240) {
+            Ok(encoder) => encoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM h264 encode open: {error}");
+                return;
+            }
+            Err(error) => panic!("engine starts: {error}"),
+        };
+        let caps = encoder.caps();
+        assert_eq!(caps.share().is_some(), caps.encode_import());
+        assert!(!caps.decode_export());
+        assert_eq!(caps.encode_import(), device.surface_import());
+        assert_eq!(
+            caps.share(),
+            device.share_mechanism().filter(|_| device.surface_import())
+        );
+        #[cfg(not(unix))]
+        assert_eq!(caps, GpuCaps::new(None, false, false));
     }
 }

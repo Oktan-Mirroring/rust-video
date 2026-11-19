@@ -128,6 +128,7 @@ mod tests {
     };
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
+    use rust_video_caps::transcode::GpuCaps;
 
     struct HoldbackDecoder {
         next: u64,
@@ -137,6 +138,10 @@ mod tests {
     impl Decoder for HoldbackDecoder {
         type Frame = u64;
         type Error = Reject;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, _packet: &Packet) -> Result<Vec<u64>, Reject> {
             let id = self.next;

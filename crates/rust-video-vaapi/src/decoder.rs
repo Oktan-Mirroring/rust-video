@@ -23,6 +23,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, DmaBufPlane, GpuExport, GpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
+use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
 /// H.264 decoder over a VA-API display.
 ///
@@ -556,6 +557,14 @@ impl Decoder for H264Decoder<'_> {
     type Frame = VaApiFrame;
     type Error = VaApiError;
 
+    fn caps(&self) -> GpuCaps {
+        let share = self
+            .device
+            .dmabuf_export()
+            .then_some(ShareMechanism::DmaBuf);
+        GpuCaps::new(share, false, false)
+    }
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.decode_inner(packet, true)
     }
@@ -994,6 +1003,55 @@ mod tests {
     use rust_video_caps::common::PictureSize;
     use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
     use rust_video_caps::traits::SharedDevice;
+
+    #[test]
+    fn caps_agree_with_frame_exports() {
+        use rust_video_caps::traits::Decoder;
+        #[cfg(unix)]
+        use rust_video_caps::transcode::ShareMechanism;
+        use rust_video_harness::{Drive, H264Synth, Packets};
+
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let mut decoder = super::H264Decoder::open(&device);
+        let caps = decoder.caps();
+        #[cfg(unix)]
+        assert_eq!(
+            caps.share(),
+            device.dmabuf_export().then_some(ShareMechanism::DmaBuf)
+        );
+        assert!(!caps.decode_export());
+        assert!(!caps.encode_import());
+        let raws = H264Synth::annex_b_h264_packets();
+        let packets = Packets::from_raws(&raws);
+        let frames = Drive::decode_all(&mut decoder, &packets);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(decoder.caps().share(), caps.share());
+        for frame in &frames {
+            assert_ne!(frame.nv12(), []);
+            assert!(matches!(frame.export(), GpuExport::Opaque { .. }));
+        }
+        let mut surfaces = Vec::new();
+        let mut surface_decoder = super::H264Decoder::open(&device);
+        for packet in &packets {
+            surfaces.extend(
+                surface_decoder
+                    .decode_surface(packet)
+                    .expect("surface decode"),
+            );
+        }
+        surfaces.extend(surface_decoder.flush_surface().expect("surface flush"));
+        assert!(!surfaces.is_empty());
+        if caps.share().is_none() {
+            for surface in &surfaces {
+                assert!(
+                    matches!(surface.export(), GpuExport::Opaque { .. }),
+                    "surface handle without advertised share"
+                );
+            }
+        }
+    }
 
     /// Frame over `data` leased against `shared`.
     fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> VaApiFrame {

@@ -126,6 +126,7 @@ mod tests {
     use rust_video_caps::frame::CpuFrame;
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
+    use rust_video_caps::transcode::GpuCaps;
 
     use super::DecoderPump;
     use crate::error::SwError;
@@ -147,6 +148,10 @@ mod tests {
     impl Decoder for Scripted {
         type Frame = CpuFrame;
         type Error = SwError;
+
+        fn caps(&self) -> GpuCaps {
+            GpuCaps::new(None, false, false)
+        }
 
         fn decode(&mut self, _packet: &Packet) -> Result<Vec<CpuFrame>, SwError> {
             Ok(vec![frame_64()])
