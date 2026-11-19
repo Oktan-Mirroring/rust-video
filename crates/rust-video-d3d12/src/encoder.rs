@@ -12,6 +12,7 @@ use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
+use rust_video_core::planes;
 
 /// D3D12 hardware encoder over the video encode session.
 ///
@@ -177,6 +178,10 @@ fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d12Error> {
 }
 
 /// `rows` of `width` bytes from a strided `data` plane into `out`.
+///
+/// # Errors
+///
+/// Returns `Err` for a stride below the width or a plane short of its stride.
 fn copy_plane(
     data: &[u8],
     stride: u32,
@@ -184,27 +189,15 @@ fn copy_plane(
     rows: u32,
     out: &mut Vec<u8>,
 ) -> Result<(), D3d12Error> {
-    let stride_64 = u64::from(stride);
-    let width_64 = u64::from(width);
-    if stride_64 < width_64 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::PlaneStrideBelowWidth,
-        ));
-    }
-    let need = stride_64
-        .saturating_mul(u64::from(rows).saturating_sub(1))
-        .saturating_add(width_64);
-    if u64::try_from(data.len()).unwrap_or(0) < need {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::PlaneShortOfStride,
-        ));
-    }
-    let stride = usize::try_from(stride).unwrap_or(0);
-    let width = usize::try_from(width).unwrap_or(0);
-    let rows = usize::try_from(rows).unwrap_or(0);
-    for chunk in data.chunks(stride).take(rows) {
-        out.extend_from_slice(&chunk[..width]);
-    }
+    planes::check_plane(data, stride, width, rows).map_err(|fault| match fault {
+        planes::PlaneFault::StrideBelowWidth { .. } => {
+            D3d12Error::Unsupported(UnsupportedReason::PlaneStrideBelowWidth)
+        }
+        planes::PlaneFault::ShortOfStride { .. } => {
+            D3d12Error::Unsupported(UnsupportedReason::PlaneShortOfStride)
+        }
+    })?;
+    planes::copy_rows_extend(data, stride, width, rows, out);
     Ok(())
 }
 

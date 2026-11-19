@@ -1,29 +1,17 @@
-//! Split-phase NV12 readback: the submit thread maps, a worker copies.
-//!
-//! Map and unmap stay on the submit thread; the worker runs the CPU
-//! copy plus nothing else, so copies overlap submits with no lock.
-//! A spawn failure degrades to synchronous copies.
+//! D3D12 maps behind the shared copy pump.
 
 // FFI boundary: the mapped pointer crosses to the worker thread.
 #![allow(unsafe_code)]
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::error::D3d12Error;
 use crate::h264::frontend::Crop;
 use crate::submit::Nv12Layout;
 
-/// Queued copies before a launch waits.
-const DEPTH: usize = 8;
-
-/// Copies below this size run inline on the submit thread.
-const INLINE_COPY_BYTES: usize = 256 * 1024;
+use rust_video_core::{CopyPump, InlineCopy};
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 /// One copied transfer.
 pub(crate) struct Done {
@@ -73,129 +61,58 @@ pub(crate) struct Mapped {
 // and only the worker dereferences the pointer.
 unsafe impl Send for Mapped {}
 
-/// One queued copy.
-struct Job {
-    /// Mapped staging buffer to copy.
-    transfer: Mapped,
-}
-
 /// Readback handle with a copy worker behind one decoder.
 pub(crate) struct Readback {
-    /// Copy jobs, absent after shutdown or a spawn failure.
-    tx: Option<SyncSender<Job>>,
-    /// Landed copies in send order.
-    rx: Option<std::sync::mpsc::Receiver<Done>>,
-    /// Worker thread, absent after shutdown or a spawn failure.
-    worker: Option<JoinHandle<()>>,
-    /// Queued copies not yet received.
-    inflight: AtomicUsize,
+    /// Shared copy pump behind launches.
+    pump: CopyPump<Mapped, Done>,
 }
 
 impl Readback {
     /// Worker over nothing; maps arrive per copy.
     #[must_use]
     pub(crate) fn spawn() -> Self {
-        let (tx, rx) = sync_channel::<Job>(DEPTH);
-        let (done_tx, done_rx) = sync_channel::<Done>(DEPTH);
-        let worker = std::thread::Builder::new()
-            .name("d3d12-readback".to_owned())
-            .spawn(move || {
-                for job in rx {
-                    let started = Instant::now();
-                    // Sound: the map spans `len` bytes by construction.
-                    let staged =
-                        unsafe { std::slice::from_raw_parts(job.transfer.data, job.transfer.len) };
-                    let bytes = job.transfer.layout.tighten(
-                        staged,
-                        job.transfer.width,
-                        job.transfer.height,
-                        job.transfer.crop,
-                    );
-                    let done = Done {
-                        slot: job.transfer.slot,
-                        bytes,
-                        release: job.transfer.release,
-                        copy: started.elapsed(),
-                    };
-                    if done_tx.send(done).is_err() {
-                        return;
-                    }
-                }
-            })
-            .ok();
         Self {
-            tx: worker.is_some().then_some(tx),
-            rx: worker.is_some().then_some(done_rx),
-            worker,
-            inflight: AtomicUsize::new(0),
+            pump: CopyPump::spawn("d3d12-readback", |mapped: Mapped, started: Instant| {
+                // Sound: the map spans `len` bytes by construction.
+                let staged = unsafe { std::slice::from_raw_parts(mapped.data, mapped.len) };
+                let bytes = mapped
+                    .layout
+                    .tighten(staged, mapped.width, mapped.height, mapped.crop);
+                Done {
+                    slot: mapped.slot,
+                    bytes,
+                    release: mapped.release,
+                    copy: started.elapsed(),
+                }
+            }),
         }
     }
 
     /// Queue the copy of `mapped`, oldest-first behind earlier jobs.
     ///
     /// Small copies complete inline, as does every copy without a worker.
+    ///
+    /// # Arguments
+    ///
+    /// * `mapped` - mapped source awaiting its copy.
     pub(crate) fn launch(&self, mapped: Mapped) -> Option<Done> {
-        let started = Instant::now();
-        let copy_inline = |mapped: Mapped| {
-            // Sound: the map spans `len` bytes by construction.
-            let staged = unsafe { std::slice::from_raw_parts(mapped.data, mapped.len) };
-            let bytes = mapped
-                .layout
-                .tighten(staged, mapped.width, mapped.height, mapped.crop);
-            Done {
-                slot: mapped.slot,
-                bytes,
-                release: mapped.release,
-                copy: started.elapsed(),
-            }
-        };
-        if mapped.len < INLINE_COPY_BYTES && self.inflight() == 0 {
-            return Some(copy_inline(mapped));
-        }
-        let Some(tx) = self.tx.as_ref() else {
-            return Some(copy_inline(mapped));
-        };
-        match tx.send(Job { transfer: mapped }) {
-            Ok(()) => {
-                self.inflight.fetch_add(1, Ordering::Relaxed);
-                None
-            }
-            Err(returned) => Some(copy_inline(returned.0.transfer)),
-        }
-    }
-
-    /// Queued copies not yet received.
-    fn inflight(&self) -> usize {
-        self.inflight.load(Ordering::Relaxed)
+        let len = mapped.len;
+        self.pump.launch(mapped, len, InlineCopy::Allowed)
     }
 
     /// Oldest landed copy, if any arrived.
     pub(crate) fn harvest(&self) -> Option<Done> {
-        let rx = self.rx.as_ref()?;
-        let done = rx.try_recv().ok()?;
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-        Some(done)
+        self.pump.harvest()
     }
 
     /// Oldest landed copy, waiting for it.
     pub(crate) fn collect(&self) -> Option<Done> {
-        let rx = self.rx.as_ref()?;
-        let done = rx.recv().ok()?;
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-        Some(done)
+        self.pump.collect()
     }
 
     /// Queued copies drain, the worker joins, orphaned maps release.
     pub(crate) fn shutdown(&mut self) {
-        self.tx = None;
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        if let Some(rx) = self.rx.take() {
-            while let Ok(done) = rx.try_recv() {
-                done.release.unmap();
-            }
-        }
+        self.pump.shutdown_with(|done| done.release.unmap());
     }
 }
 

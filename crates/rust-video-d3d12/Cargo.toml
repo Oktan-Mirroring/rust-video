@@ -16,6 +16,7 @@ windows = { version = "0.62.2", default-features = false, features = ["Win32_Fou
 bytes = "1"
 rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1" }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
+rust-video-core = { version = "0.1.0", path = "../rust-video-core" }
 rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264" }
 rust-video-h265 = { version = "0.1.0", path = "../rust-video-h265" }
 thiserror = "1"
