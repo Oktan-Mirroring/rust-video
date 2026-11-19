@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use rust_video_harness::FrameHash;
+use rust_video_harness::{AnnexB, BitReader, Bits, FrameHash};
 
 /// Canonical frames per clip; every matrix vector keeps all of them.
 const CLIP_FRAMES: u32 = 120;
@@ -2029,235 +2029,6 @@ fn run_bsf(corpus: &Path, synth: &Synth, filter: &str) -> Result<PathBuf, String
     Ok(out)
 }
 
-/// Bit reader over RBSP bytes.
-struct Br<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Br<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
-    }
-
-    fn bit(&mut self) -> Result<u32, String> {
-        if self.pos >= self.bytes.len() * 8 {
-            return Err("bitstream overrun".to_owned());
-        }
-        let byte = self.bytes[self.pos / 8];
-        let shift = 7 - (self.pos % 8);
-        self.pos += 1;
-        Ok(u32::from((byte >> shift) & 1))
-    }
-
-    fn bits(&mut self, count: usize) -> Result<u32, String> {
-        let mut value = 0;
-        for _ in 0..count {
-            value = (value << 1) | self.bit()?;
-        }
-        Ok(value)
-    }
-
-    fn byte(&mut self) -> Result<u8, String> {
-        let mut value = 0u8;
-        for _ in 0..8 {
-            value = (value << 1) | u8::from(self.bit()? == 1);
-        }
-        Ok(value)
-    }
-
-    fn ue(&mut self) -> Result<u32, String> {
-        let mut zeros = 0;
-        while self.bit()? == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return Err("ue overrun".to_owned());
-            }
-        }
-        if zeros == 0 {
-            return Ok(0);
-        }
-        let rest = self.bits(zeros)?;
-        Ok(((1 << zeros) - 1) + rest)
-    }
-
-    /// Remaining bits verbatim (prefix rewrites copy these through).
-    fn rest(&self) -> Vec<bool> {
-        let total = self.bytes.len() * 8;
-        (self.pos..total)
-            .map(|at| self.bytes[at / 8] >> (7 - at % 8) & 1 == 1)
-            .collect()
-    }
-}
-
-/// Bit writer; [`Bw::rbsp`] finishes with the stop bit and alignment.
-struct Bw {
-    out: Vec<u8>,
-    cur: u8,
-    filled: u8,
-}
-
-impl Bw {
-    fn new() -> Self {
-        Self {
-            out: Vec::new(),
-            cur: 0,
-            filled: 0,
-        }
-    }
-
-    fn bit(&mut self, value: u32) {
-        self.cur = (self.cur << 1) | u8::from((value & 1) == 1);
-        self.filled += 1;
-        if self.filled == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.filled = 0;
-        }
-    }
-
-    fn bits(&mut self, value: u32, count: usize) {
-        for index in (0..count).rev() {
-            self.bit((value >> index) & 1);
-        }
-    }
-
-    fn byte(&mut self, value: u8) {
-        self.bits(u32::from(value), 8);
-    }
-
-    fn ue(&mut self, value: u32) {
-        let code = value + 1;
-        let len = 32 - code.leading_zeros() as usize;
-        for _ in 1..len {
-            self.bit(0);
-        }
-        self.bits(code, len);
-    }
-
-    fn copy(&mut self, bits: &[bool]) {
-        for bit in bits {
-            self.bit(u32::from(*bit));
-        }
-    }
-
-    /// Raw bytes (caller guarantees byte alignment).
-    fn bytes(mut self) -> Vec<u8> {
-        if self.filled > 0 {
-            self.cur <<= 8 - self.filled;
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.filled = 0;
-        }
-        self.out
-    }
-
-    /// RBSP trailing: stop bit plus alignment zeros.
-    fn rbsp(mut self) -> Vec<u8> {
-        self.bit(1);
-        while self.filled > 0 {
-            self.bit(0);
-        }
-        self.out
-    }
-}
-
-/// Strip H.264/H.265 emulation-prevention bytes.
-fn remove_emulation(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for byte in nal {
-        if zeros == 2 && *byte == 0x03 {
-            zeros = 0;
-            continue;
-        }
-        if *byte == 0x00 {
-            zeros += 1;
-        } else {
-            zeros = 0;
-        }
-        out.push(*byte);
-    }
-    out
-}
-
-/// Insert emulation-prevention bytes.
-fn insert_emulation(rbsp: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rbsp.len() + 8);
-    let mut zeros = 0;
-    for byte in rbsp {
-        if zeros == 2 && *byte <= 0x03 {
-            out.push(0x03);
-            zeros = 0;
-        }
-        if *byte == 0x00 {
-            zeros += 1;
-        } else {
-            zeros = 0;
-        }
-        out.push(*byte);
-    }
-    out
-}
-
-/// Strip RBSP trailing (stop bit plus alignment zeros, swallowing
-/// any CABAC zero words with them). Prefix rewrites shorten or grow
-/// the head, so the original trailing no longer aligns; callers
-/// re-add clean trailing with [`Bw::rbsp`].
-fn strip_trailing(mut bits: Vec<bool>) -> Vec<bool> {
-    while bits.pop() == Some(false) {}
-    bits
-}
-
-/// Split Annex B into NAL units without start codes.
-fn split_annexb(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut starts = Vec::new();
-    let mut at = 0;
-    while at + 3 <= bytes.len() {
-        if bytes[at] == 0 && bytes[at + 1] == 0 {
-            if bytes[at + 2] == 1 {
-                starts.push((at, 3));
-                at += 3;
-                continue;
-            }
-            if at + 4 <= bytes.len() && bytes[at + 2] == 0 && bytes[at + 3] == 1 {
-                starts.push((at, 4));
-                at += 4;
-                continue;
-            }
-        }
-        at += 1;
-    }
-    let mut nals = Vec::new();
-    for (index, (start, len)) in starts.iter().enumerate() {
-        let end = starts.get(index + 1).map_or(bytes.len(), |(next, _)| *next);
-        nals.push(bytes[start + len..end].to_vec());
-    }
-    nals
-}
-
-/// Join NAL units into Annex B (4-byte first start code, 3-byte rest).
-fn join_annexb(nals: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (index, nal) in nals.iter().enumerate() {
-        if index == 0 {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-        } else {
-            out.extend_from_slice(&[0, 0, 1]);
-        }
-        out.extend_from_slice(nal);
-    }
-    out
-}
-
-fn h264_nal_type(nal: &[u8]) -> Option<u8> {
-    nal.first().map(|head| head & 0x1f)
-}
-
-fn h265_nal_type(nal: &[u8]) -> Option<u8> {
-    nal.first().map(|head| (head >> 1) & 0x3f)
-}
-
 /// One IVF frame payload with its presentation timestamp.
 struct IvfFrame {
     pts: u64,
@@ -2398,8 +2169,8 @@ struct H264SpsInfo {
 
 /// Parse an H.264 SPS NAL (header included) through the VUI flag.
 fn parse_h264_sps(nal: &[u8]) -> Result<H264SpsInfo, String> {
-    let rbsp = remove_emulation(nal);
-    let mut br = Br::new(&rbsp);
+    let rbsp = AnnexB::remove_emulation(nal);
+    let mut br = BitReader::new(&rbsp);
     br.byte()?;
     let profile = br.byte()?;
     let constraints = br.byte()?;
@@ -2440,7 +2211,7 @@ fn parse_h264_sps(nal: &[u8]) -> Result<H264SpsInfo, String> {
         }
     }
     br.ue()?;
-    let gaps_flag_at = br.pos;
+    let gaps_flag_at = br.pos();
     br.bit()?;
     br.ue()?;
     br.ue()?;
@@ -2454,7 +2225,7 @@ fn parse_h264_sps(nal: &[u8]) -> Result<H264SpsInfo, String> {
         br.ue()?;
         br.ue()?;
     }
-    let vui_flag_at = br.pos;
+    let vui_flag_at = br.pos();
     let vui_present = br.bit()? == 1;
     let prefix = vec![profile, constraints, level];
     Ok(H264SpsInfo {
@@ -2480,31 +2251,34 @@ fn rewrite_h264_slice(
     edit: impl Fn(u32, u32, u32, u32) -> (u32, u32),
 ) -> Result<Vec<u8>, String> {
     let header = nal[0];
-    let rbsp = remove_emulation(&nal[1..]);
-    let mut br = Br::new(&rbsp);
+    let rbsp = AnnexB::remove_emulation(&nal[1..]);
+    let mut br = BitReader::new(&rbsp);
     let first_mb = br.ue()?;
     let slice_type = br.ue()?;
     let pps_id = br.ue()?;
     let frame_num = br.bits(log2_max_frame_num)?;
     let rest = br.rest();
     let (new_pps, new_frame) = edit(first_mb, slice_type, pps_id, frame_num);
-    let mut bw = Bw::new();
+    let mut bw = Bits::new();
     bw.byte(header);
     bw.ue(first_mb);
     bw.ue(slice_type);
     bw.ue(new_pps);
-    bw.bits(new_frame, log2_max_frame_num);
-    bw.copy(&strip_trailing(rest));
-    Ok(insert_emulation(&bw.rbsp()))
+    bw.bits(
+        new_frame,
+        u32::try_from(log2_max_frame_num).expect("small count"),
+    );
+    bw.copy(&BitReader::strip_trailing(rest));
+    Ok(AnnexB::insert_emulation(&bw.finish_rbsp()))
 }
 
 fn h264_slice_frame_num(nal: &[u8], log2_max_frame_num: usize) -> Result<u32, String> {
-    let rbsp = remove_emulation(&nal[1..]);
-    let mut br = Br::new(&rbsp);
+    let rbsp = AnnexB::remove_emulation(&nal[1..]);
+    let mut br = BitReader::new(&rbsp);
     br.ue()?;
     br.ue()?;
     br.ue()?;
-    br.bits(log2_max_frame_num)
+    Ok(br.bits(log2_max_frame_num)?)
 }
 
 /// Annex B of an mp4 synth vector via the mp4toannexb filter.
@@ -2527,7 +2301,7 @@ fn annexb_of(input: &Path, filter: &str) -> Result<Vec<u8>, String> {
 fn craft_h264_sps_change(first: &[u8], second: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = first.to_vec();
     out.extend_from_slice(second);
-    let nals = split_annexb(&out);
+    let nals = AnnexB::split_owned(&out);
     if nals.len() < 4 {
         return Err("sps-change concat too short".to_owned());
     }
@@ -2535,14 +2309,14 @@ fn craft_h264_sps_change(first: &[u8], second: &[u8]) -> Result<Vec<u8>, String>
 }
 
 fn craft_h264_slices_before_sets(annexb: &[u8]) -> Result<Vec<u8>, String> {
-    let nals = split_annexb(annexb);
+    let nals = AnnexB::split_owned(annexb);
     let first_sps = nals
         .iter()
-        .position(|nal| h264_nal_type(nal) == Some(7))
+        .position(|nal| AnnexB::h264_nal_type(nal) == Some(7))
         .ok_or("no SPS found")?;
     let first_slice = nals
         .iter()
-        .position(|nal| matches!(h264_nal_type(nal), Some(1 | 5)))
+        .position(|nal| matches!(AnnexB::h264_nal_type(nal), Some(1 | 5)))
         .ok_or("no slice found")?;
     if first_slice < first_sps {
         return Err("slices already precede sets".to_owned());
@@ -2550,16 +2324,16 @@ fn craft_h264_slices_before_sets(annexb: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = nals;
     let slice = out.remove(first_slice);
     out.insert(first_sps, slice);
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h264_vui_absent(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let mut out = Vec::with_capacity(nals.len());
     let mut stripped = 0;
     for nal in &nals {
-        if h264_nal_type(nal) != Some(7) {
+        if AnnexB::h264_nal_type(nal) != Some(7) {
             out.push(nal.clone());
             continue;
         }
@@ -2569,43 +2343,43 @@ fn craft_h264_vui_absent(mp4: &Path) -> Result<Vec<u8>, String> {
         }
         // Every field up to the VUI flag replays verbatim: copy raw bits
         // from the original RBSP between the fixed prefix and the flag.
-        let mut raw = Bw::new();
+        let mut raw = Bits::new();
         raw.byte(nal[0]);
         for byte in &info.prefix {
             raw.byte(*byte);
         }
         for at in (8 + 24)..info.vui_flag_at {
-            raw.bit(u32::from(info.rbsp[at / 8] >> (7 - at % 8) & 1));
+            raw.bit(info.rbsp[at / 8] >> (7 - at % 8) & 1 == 1);
         }
-        raw.bit(0);
-        out.push(insert_emulation(&raw.rbsp()));
+        raw.bit(false);
+        out.push(AnnexB::insert_emulation(&raw.finish_rbsp()));
         stripped += 1;
     }
     if stripped == 0 {
         return Err("no SPS stripped".to_owned());
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h264_set_ids(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let sps_at = nals
         .iter()
-        .position(|nal| h264_nal_type(nal) == Some(7))
+        .position(|nal| AnnexB::h264_nal_type(nal) == Some(7))
         .ok_or("no SPS found")?;
     let info = parse_h264_sps(&nals[sps_at])?;
     let prefix = info.prefix;
     let rbsp = info.rbsp;
     // SPS id starts right after the 4 fixed bytes.
-    let mut probe = Br::new(&rbsp);
+    let mut probe = BitReader::new(&rbsp);
     probe.byte()?;
     probe.byte()?;
     probe.byte()?;
     probe.byte()?;
     probe.ue()?;
-    let id_end = probe.pos;
-    let mut bw = Bw::new();
+    let id_end = probe.pos();
+    let mut bw = Bits::new();
     bw.byte(nals[sps_at][0]);
     for byte in &prefix {
         bw.byte(*byte);
@@ -2616,50 +2390,50 @@ fn craft_h264_set_ids(mp4: &Path) -> Result<Vec<u8>, String> {
     for at in id_end..total {
         tail.push(rbsp[at / 8] >> (7 - at % 8) & 1 == 1);
     }
-    bw.copy(&strip_trailing(tail));
-    let new_sps = insert_emulation(&bw.rbsp());
+    bw.copy(&BitReader::strip_trailing(tail));
+    let new_sps = AnnexB::insert_emulation(&bw.finish_rbsp());
     // Active sets use SPS id 2 (gap over 0-1); an inert PPS id 3
     // rides along parsed but never referenced. Active non-zero PPS
     // ids stay out: libav corrupts such decodes (MB errors on
     // bit-exact rewrites), so the gap shape keeps PPS id 0 active.
     let mut out = Vec::with_capacity(nals.len());
     for nal in &nals {
-        match h264_nal_type(nal) {
+        match AnnexB::h264_nal_type(nal) {
             Some(7) => out.push(new_sps.clone()),
             Some(8) => {
-                let body = remove_emulation(&nal[1..]);
-                let mut reader = Br::new(&body);
+                let body = AnnexB::remove_emulation(&nal[1..]);
+                let mut reader = BitReader::new(&body);
                 let pic_id = reader.ue()?;
                 if pic_id != 0 {
                     return Err("set-ids source PPS id drifted".to_owned());
                 }
                 reader.ue()?;
                 let rest = reader.rest();
-                let mut writer = Bw::new();
+                let mut writer = Bits::new();
                 writer.byte(nal[0]);
                 writer.ue(0);
                 writer.ue(2);
-                writer.copy(&strip_trailing(rest.clone()));
-                out.push(insert_emulation(&writer.rbsp()));
-                let mut inert = Bw::new();
+                writer.copy(&BitReader::strip_trailing(rest.clone()));
+                out.push(AnnexB::insert_emulation(&writer.finish_rbsp()));
+                let mut inert = Bits::new();
                 inert.byte(nal[0]);
                 inert.ue(3);
                 inert.ue(2);
-                inert.copy(&strip_trailing(rest));
-                out.push(insert_emulation(&inert.rbsp()));
+                inert.copy(&BitReader::strip_trailing(rest));
+                out.push(AnnexB::insert_emulation(&inert.finish_rbsp()));
             }
             _ => out.push(nal.clone()),
         }
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let sps_nal = nals
         .iter()
-        .find(|nal| h264_nal_type(nal) == Some(7))
+        .find(|nal| AnnexB::h264_nal_type(nal) == Some(7))
         .ok_or("no SPS found")?;
     let info = parse_h264_sps(sps_nal)?;
     let sps = info.sps;
@@ -2667,11 +2441,11 @@ fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
     // SPS flag on (single bit, emulation recomputed).
     let mut sps_rbsp = info.rbsp;
     sps_rbsp[info.gaps_flag_at / 8] |= 1u8 << (7 - info.gaps_flag_at % 8);
-    let gaps_sps = insert_emulation(&sps_rbsp);
+    let gaps_sps = AnnexB::insert_emulation(&sps_rbsp);
     let modulus = 1 << sps.log2_max_frame_num.min(16);
     let mut seen = BTreeSet::new();
     for nal in &nals {
-        if matches!(h264_nal_type(nal), Some(1 | 2 | 5)) {
+        if matches!(AnnexB::h264_nal_type(nal), Some(1 | 2 | 5)) {
             seen.insert(h264_slice_frame_num(nal, sps.log2_max_frame_num)?);
         }
     }
@@ -2688,15 +2462,15 @@ fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
     let mut patched = 0;
     let mut out = Vec::with_capacity(nals.len());
     for nal in &nals {
-        if h264_nal_type(nal) == Some(7) {
+        if AnnexB::h264_nal_type(nal) == Some(7) {
             out.push(gaps_sps.clone());
             continue;
         }
-        if !matches!(h264_nal_type(nal), Some(1 | 2 | 5)) {
+        if !matches!(AnnexB::h264_nal_type(nal), Some(1 | 2 | 5)) {
             out.push(nal.clone());
             continue;
         }
-        if h264_nal_type(nal) == Some(5) {
+        if AnnexB::h264_nal_type(nal) == Some(5) {
             shifting = false;
             out.push(nal.clone());
             continue;
@@ -2719,67 +2493,70 @@ fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
     if patched == 0 {
         return Err("no slice patched".to_owned());
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h264_si_slice(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let sps_nal = nals
         .iter()
-        .find(|nal| h264_nal_type(nal) == Some(7))
+        .find(|nal| AnnexB::h264_nal_type(nal) == Some(7))
         .ok_or("no SPS found")?
         .clone();
     let pps_nal = nals
         .iter()
-        .find(|nal| h264_nal_type(nal) == Some(8))
+        .find(|nal| AnnexB::h264_nal_type(nal) == Some(8))
         .ok_or("no PPS found")?
         .clone();
     let sps = parse_h264_sps(&sps_nal)?.sps;
-    let mut bw = Bw::new();
+    let mut bw = Bits::new();
     bw.byte(0x41);
     bw.ue(0);
     bw.ue(8);
     bw.ue(0);
-    bw.bits(1, sps.log2_max_frame_num);
+    bw.bits(
+        1,
+        u32::try_from(sps.log2_max_frame_num).expect("small count"),
+    );
     match sps.poc_type {
-        0 => bw.bits(2, sps.log2_max_poc_lsb),
+        0 => bw.bits(2, u32::try_from(sps.log2_max_poc_lsb).expect("small count")),
         2 => {}
         other => return Err(format!("SI craft needs poc_type 0/2, got {other}")),
     }
     bw.bits(0x3f, 6);
-    let slice = insert_emulation(&bw.bytes());
-    Ok(join_annexb(&[sps_nal, pps_nal, slice]))
+    let slice = AnnexB::insert_emulation(&bw.finish_raw());
+    Ok(AnnexB::join_units(&[sps_nal, pps_nal, slice]))
 }
 
 fn craft_h264_truncated_nal(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let pps_at = nals
         .iter()
-        .position(|nal| h264_nal_type(nal) == Some(8))
+        .position(|nal| AnnexB::h264_nal_type(nal) == Some(8))
         .ok_or("no PPS found")?;
     let mut out = nals[..=pps_at].to_vec();
-    let mut poison = Bw::new();
+    let mut poison = Bits::new();
     poison.byte(0x65);
     poison.ue(0);
     poison.ue((1 << 24) - 1);
-    out.push(insert_emulation(&poison.bytes()));
-    Ok(join_annexb(&out))
+    out.push(AnnexB::insert_emulation(&poison.finish_raw()));
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h264_fmo(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_of(mp4, "h264_mp4toannexb")?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let mut out = Vec::with_capacity(nals.len());
     let mut patched = 0;
     for nal in &nals {
-        if h264_nal_type(nal) != Some(8) {
+        if AnnexB::h264_nal_type(nal) != Some(8) {
             out.push(nal.clone());
             continue;
         }
-        let body = remove_emulation(&nal[1..]);
-        let mut br = Br::new(&body);
+        let body = AnnexB::remove_emulation(&nal[1..]);
+        let mut br = BitReader::new(&body);
         let pic_id = br.ue()?;
         let seq_id = br.ue()?;
         let cabac = br.bit()?;
@@ -2789,24 +2566,24 @@ fn craft_h264_fmo(mp4: &Path) -> Result<Vec<u8>, String> {
             return Err("source PPS already grouped".to_owned());
         }
         let rest = br.rest();
-        let mut bw = Bw::new();
+        let mut bw = Bits::new();
         bw.byte(nal[0]);
         bw.ue(pic_id);
         bw.ue(seq_id);
-        bw.bit(cabac);
-        bw.bit(bottom);
+        bw.bit(cabac == 1);
+        bw.bit(bottom == 1);
         bw.ue(1);
         bw.ue(0);
         bw.ue(100);
         bw.ue(100);
-        bw.copy(&strip_trailing(rest));
-        out.push(insert_emulation(&bw.rbsp()));
+        bw.copy(&BitReader::strip_trailing(rest));
+        out.push(AnnexB::insert_emulation(&bw.finish_rbsp()));
         patched += 1;
     }
     if patched == 0 {
         return Err("no PPS patched".to_owned());
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 /// Annex B of an HEVC mp4 synth vector.
@@ -2836,65 +2613,65 @@ fn annexb_hevc_of(input: &Path) -> Result<Vec<u8>, String> {
 
 fn craft_h265_truncated_sets(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_hevc_of(mp4)?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let vps_at = nals
         .iter()
-        .position(|nal| h265_nal_type(nal) == Some(32))
+        .position(|nal| AnnexB::h265_nal_type(nal) == Some(32))
         .ok_or("no VPS found")?;
     let mut out = nals[..=vps_at].to_vec();
-    let mut poison = Bw::new();
+    let mut poison = Bits::new();
     poison.byte(0x42);
     poison.byte(0x01);
     poison.bits(0, 4);
     poison.bits(0, 3);
-    poison.bit(1);
+    poison.bit(true);
     for _ in 0..12 {
         poison.byte(0);
     }
     poison.ue(0);
     poison.ue(1);
     poison.ue((1 << 24) - 1);
-    out.push(insert_emulation(&poison.bytes()));
-    Ok(join_annexb(&out))
+    out.push(AnnexB::insert_emulation(&poison.finish_raw()));
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h265_pps_unknown_sps(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_hevc_of(mp4)?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let mut out = Vec::with_capacity(nals.len());
     let mut patched = 0;
     for nal in &nals {
-        if h265_nal_type(nal) != Some(34) {
+        if AnnexB::h265_nal_type(nal) != Some(34) {
             out.push(nal.clone());
             continue;
         }
-        let body = remove_emulation(&nal[2..]);
-        let mut br = Br::new(&body);
+        let body = AnnexB::remove_emulation(&nal[2..]);
+        let mut br = BitReader::new(&body);
         let pic_id = br.ue()?;
         let _seq_id = br.ue()?;
         let rest = br.rest();
-        let mut bw = Bw::new();
+        let mut bw = Bits::new();
         bw.byte(nal[0]);
         bw.byte(nal[1]);
         bw.ue(pic_id);
         bw.ue(3);
-        bw.copy(&strip_trailing(rest));
-        out.push(insert_emulation(&bw.rbsp()));
+        bw.copy(&BitReader::strip_trailing(rest));
+        out.push(AnnexB::insert_emulation(&bw.finish_rbsp()));
         patched += 1;
     }
     if patched == 0 {
         return Err("no PPS patched".to_owned());
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h265_slice_unknown_pps(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_hevc_of(mp4)?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let mut out = Vec::with_capacity(nals.len());
     let mut patched = 0;
     for nal in &nals {
-        let Some(nal_type) = h265_nal_type(nal) else {
+        let Some(nal_type) = AnnexB::h265_nal_type(nal) else {
             out.push(nal.clone());
             continue;
         };
@@ -2903,41 +2680,41 @@ fn craft_h265_slice_unknown_pps(mp4: &Path) -> Result<Vec<u8>, String> {
             out.push(nal.clone());
             continue;
         }
-        let body = remove_emulation(&nal[2..]);
-        let mut br = Br::new(&body);
+        let body = AnnexB::remove_emulation(&nal[2..]);
+        let mut br = BitReader::new(&body);
         let first = br.bit()?;
         if first != 1 {
             return Err("first slice is dependent".to_owned());
         }
-        let mut bw = Bw::new();
+        let mut bw = Bits::new();
         bw.byte(nal[0]);
         bw.byte(nal[1]);
-        bw.bit(1);
+        bw.bit(true);
         if (16..=23).contains(&nal_type) {
             let noop = br.bit()?;
-            bw.bit(noop);
+            bw.bit(noop == 1);
         }
         let _pps_id = br.ue()?;
         bw.ue(5);
-        bw.copy(&strip_trailing(br.rest()));
-        out.push(insert_emulation(&bw.rbsp()));
+        bw.copy(&BitReader::strip_trailing(br.rest()));
+        out.push(AnnexB::insert_emulation(&bw.finish_rbsp()));
         patched += 1;
     }
     if patched == 0 {
         return Err("no slice patched".to_owned());
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_h265_conform_overrun(mp4: &Path) -> Result<Vec<u8>, String> {
     let annexb = annexb_hevc_of(mp4)?;
-    let nals = split_annexb(&annexb);
+    let nals = AnnexB::split_owned(&annexb);
     let sps_nal = nals
         .iter()
-        .find(|nal| h265_nal_type(nal) == Some(33))
+        .find(|nal| AnnexB::h265_nal_type(nal) == Some(33))
         .ok_or("no SPS found")?;
-    let body = remove_emulation(&sps_nal[2..]);
-    let mut br = Br::new(&body);
+    let body = AnnexB::remove_emulation(&sps_nal[2..]);
+    let mut br = BitReader::new(&body);
     br.bits(4)?;
     let max_sub_layers = br.bits(3)?;
     br.bit()?;
@@ -2954,7 +2731,7 @@ fn craft_h265_conform_overrun(mp4: &Path) -> Result<Vec<u8>, String> {
     }
     let width = br.ue()?;
     br.ue()?;
-    let flag_at = br.pos;
+    let flag_at = br.pos();
     let had_window = br.bit()?;
     if had_window == 1 {
         br.ue()?;
@@ -2967,28 +2744,28 @@ fn craft_h265_conform_overrun(mp4: &Path) -> Result<Vec<u8>, String> {
     let overrun = (width >> shift) + 8;
     // New RBSP: bits before the flag, flag set, overrunning window,
     // then the original tail verbatim.
-    let mut bw = Bw::new();
+    let mut bw = Bits::new();
     bw.byte(sps_nal[0]);
     bw.byte(sps_nal[1]);
     for at in 0..flag_at {
-        bw.bit(u32::from(body[at / 8] >> (7 - at % 8) & 1));
+        bw.bit(body[at / 8] >> (7 - at % 8) & 1 == 1);
     }
-    bw.bit(1);
+    bw.bit(true);
     bw.ue(0);
     bw.ue(overrun);
     bw.ue(0);
     bw.ue(overrun);
-    bw.copy(&strip_trailing(rest));
-    let new_sps = insert_emulation(&bw.rbsp());
+    bw.copy(&BitReader::strip_trailing(rest));
+    let new_sps = AnnexB::insert_emulation(&bw.finish_rbsp());
     let mut out = Vec::with_capacity(nals.len());
     for nal in &nals {
-        if h265_nal_type(nal) == Some(33) {
+        if AnnexB::h265_nal_type(nal) == Some(33) {
             out.push(new_sps.clone());
         } else {
             out.push(nal.clone());
         }
     }
-    Ok(join_annexb(&out))
+    Ok(AnnexB::join_units(&out))
 }
 
 fn craft_av1_bad_leb128(obu: &[u8]) -> Result<Vec<u8>, String> {
@@ -3262,7 +3039,7 @@ fn run_craft(corpus: &Path, synth: &Synth, craft: Craft) -> Result<PathBuf, Stri
 /// Framing elements the Annex B vectors must carry; fails the recipe
 /// when the encoder output lacks one.
 fn verify_annexb(codec: &str, annexb: &[u8]) -> Result<(), String> {
-    let nals = split_annexb(annexb);
+    let nals = AnnexB::split_owned(annexb);
     if nals.len() < 4 {
         return Err(format!("{codec} annexb holds {} NALs", nals.len()));
     }
@@ -3270,9 +3047,9 @@ fn verify_annexb(codec: &str, annexb: &[u8]) -> Result<(), String> {
         .iter()
         .filter_map(|nal| {
             if codec == "h264" {
-                h264_nal_type(nal)
+                AnnexB::h264_nal_type(nal)
             } else {
-                h265_nal_type(nal)
+                AnnexB::h265_nal_type(nal)
             }
         })
         .collect();
@@ -4069,10 +3846,8 @@ fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::frame_root_from;
-    use super::{
-        build_ivf, garbage, insert_emulation, join_annexb, parse_ivf, parse_shapes, read_leb128,
-        remove_emulation, split_annexb, walk_obus, Br, Bw, Shapes,
-    };
+    use super::{build_ivf, garbage, parse_ivf, parse_shapes, read_leb128, walk_obus, Shapes};
+    use rust_video_harness::{AnnexB, BitReader, Bits};
     use std::path::PathBuf;
 
     #[test]
@@ -4114,12 +3889,12 @@ mod tests {
     #[test]
     fn bits_roundtrip_ue() {
         for value in [0, 1, 2, 5, 100, 1000, 65535] {
-            let mut bw = Bw::new();
+            let mut bw = Bits::new();
             bw.ue(value);
             bw.ue(7);
-            bw.bit(1);
-            let bytes = bw.bytes();
-            let mut br = Br::new(&bytes);
+            bw.bit(true);
+            let bytes = bw.finish_raw();
+            let mut br = BitReader::new(&bytes);
             assert_eq!(br.ue().expect("ue"), value);
             assert_eq!(br.ue().expect("ue"), 7);
             assert_eq!(br.bit().expect("bit"), 1);
@@ -4129,15 +3904,15 @@ mod tests {
     #[test]
     fn emulation_roundtrips() {
         let raw = vec![0x00, 0x00, 0x01, 0x00, 0x00, 0x03, 0x27, 0x00, 0x00, 0x02];
-        let coded = insert_emulation(&raw);
-        assert_eq!(remove_emulation(&coded), raw);
+        let coded = AnnexB::insert_emulation(&raw);
+        assert_eq!(AnnexB::remove_emulation(&coded), raw);
     }
 
     #[test]
     fn annexb_roundtrips() {
         let nals = vec![vec![0x67, 0x42], vec![0x68, 0xce], vec![0x65, 0x01, 0x02]];
-        let joined = join_annexb(&nals);
-        assert_eq!(split_annexb(&joined), nals);
+        let joined = AnnexB::join_units(&nals);
+        assert_eq!(AnnexB::split_owned(&joined), nals);
     }
 
     #[test]

@@ -931,11 +931,11 @@ mod tests {
         for (n, timing) in timings.iter().enumerate() {
             assert_eq!(timing.seq(), u64::try_from(n).expect("small seq"));
             assert_eq!(
-                timing.submitted_pts_us(),
+                timing.submitted_pts_us().expect("stamped"),
                 u64::try_from(n).expect("small seq") * 1000
             );
             assert_eq!(
-                timing.completed_pts_us(),
+                timing.completed_pts_us().expect("stamped"),
                 i64::try_from(n).expect("small seq") * 1000
             );
         }
@@ -1036,10 +1036,10 @@ mod tests {
             );
         }
         assert!(overlapped < serial / 2);
-        let mean = |timings: &VecDeque<crate::pipeline::PhaseTiming>| {
+        let mean = |timings: &VecDeque<rust_video_caps::delivery::PhaseTiming>| {
             timings
                 .iter()
-                .map(crate::pipeline::PhaseTiming::total_us)
+                .map(rust_video_caps::delivery::PhaseTiming::total_us)
                 .sum::<u64>()
                 / 4
         };

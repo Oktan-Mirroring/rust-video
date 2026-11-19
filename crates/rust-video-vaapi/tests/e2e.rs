@@ -671,12 +671,16 @@ fn vaapi_pipelines_submit_depth() {
     eprintln!(
         "submit stats: submitted={} peak={} resets={} creates={}",
         stats.submitted(),
-        stats.peak(),
+        stats.peak_inflight(),
         stats.resets(),
         stats.buffer_creates(),
     );
     assert_eq!(stats.submitted(), 8);
-    assert!(stats.peak() > 1, "pipelined peak {}", stats.peak());
+    assert!(
+        stats.peak_inflight() > 1,
+        "pipelined peak {}",
+        stats.peak_inflight()
+    );
     assert_eq!(stats.resets(), 0);
     for (index, frame) in frames.iter().enumerate() {
         assert!(

@@ -20,6 +20,8 @@ use crate::readback::{Readback, Reader};
 use crate::seam::{ContextId, SurfaceId, VaSeam};
 use crate::sys;
 
+use rust_video_caps::delivery::SubmitStats;
+
 /// VA-API decode context over a surface pool.
 ///
 /// `Send`, never `Sync`: hand the context to another thread when idle,
@@ -729,12 +731,12 @@ impl StatsInner {
 
     /// Gauge snapshot.
     fn snapshot(&self) -> SubmitStats {
-        SubmitStats {
-            submitted: self.submitted.load(Ordering::Relaxed),
-            peak: self.peak.load(Ordering::Relaxed),
-            resets: self.resets.load(Ordering::Relaxed),
-            buffer_creates: self.buffer_creates.load(Ordering::Relaxed),
-        }
+        SubmitStats::snapshot(
+            self.submitted.load(Ordering::Relaxed),
+            self.peak.load(Ordering::Relaxed),
+            self.resets.load(Ordering::Relaxed),
+            self.buffer_creates.load(Ordering::Relaxed),
+        )
     }
 
     /// Phase-timing snapshot.
@@ -748,44 +750,5 @@ impl StatsInner {
             polled_ready: self.polled_ready.load(Ordering::Relaxed),
             overlapped: self.lock_phases().overlapped,
         }
-    }
-}
-
-/// Submit gauges since backend open.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SubmitStats {
-    /// Pictures submitted.
-    submitted: u64,
-    /// Peak pictures submitted ahead of sync.
-    peak: usize,
-    /// Failed submits quieted.
-    resets: u64,
-    /// Driver buffers created by this backend since open.
-    buffer_creates: u64,
-}
-
-impl SubmitStats {
-    /// Pictures submitted.
-    #[must_use]
-    pub const fn submitted(&self) -> u64 {
-        self.submitted
-    }
-
-    /// Peak pictures submitted ahead of sync.
-    #[must_use]
-    pub const fn peak(&self) -> usize {
-        self.peak
-    }
-
-    /// Failed submits quieted.
-    #[must_use]
-    pub const fn resets(&self) -> u64 {
-        self.resets
-    }
-
-    /// Driver buffers created by this backend since open.
-    #[must_use]
-    pub const fn buffer_creates(&self) -> u64 {
-        self.buffer_creates
     }
 }

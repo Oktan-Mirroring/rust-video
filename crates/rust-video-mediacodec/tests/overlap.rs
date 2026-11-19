@@ -113,8 +113,8 @@ fn print_ledger(name: &str, decoder: &MediaCodecDecoder) {
 fn check_matched(name: &str, decoder: &MediaCodecDecoder) {
     for timing in decoder.ledger().timings() {
         assert_eq!(
-            timing.submitted_pts_us(),
-            u64::try_from(timing.completed_pts_us()).expect("device pts fit"),
+            timing.submitted_pts_us().expect("stamped"),
+            u64::try_from(timing.completed_pts_us().expect("stamped")).expect("device pts fit"),
             "{name}: frame {} completion matches its submission",
             timing.seq()
         );

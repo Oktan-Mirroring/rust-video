@@ -10,8 +10,6 @@ mod av1_dpb;
 #[cfg(target_os = "windows")]
 mod decoder;
 #[cfg(target_os = "windows")]
-mod delivery;
-#[cfg(target_os = "windows")]
 mod device;
 #[cfg(not(target_os = "windows"))]
 mod device_portable;
@@ -54,8 +52,6 @@ mod vp9_dpb;
 
 #[cfg(target_os = "windows")]
 pub use decoder::{Av1Decoder, GpuSurface, H264Decoder, HevcDecoder, Vp9Decoder};
-#[cfg(target_os = "windows")]
-pub use delivery::DecoderPump;
 #[cfg(target_os = "windows")]
 pub use device::D3d11Device;
 #[cfg(not(target_os = "windows"))]

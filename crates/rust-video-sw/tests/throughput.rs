@@ -14,7 +14,7 @@ use bytes::Bytes;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::common::PictureSize;
 #[cfg(feature = "ffmpeg")]
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::frame::GpuExport;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
@@ -34,9 +34,7 @@ use rust_video_sw::H264Encoder;
 #[cfg(feature = "gpl")]
 use rust_video_sw::H265Encoder;
 #[cfg(feature = "ffmpeg")]
-use rust_video_sw::{
-    Av1Decoder, DecoderPump, H264Decoder, H265Decoder, SwSurface, Vp8Decoder, Vp9Decoder,
-};
+use rust_video_sw::{Av1Decoder, H264Decoder, H265Decoder, SwSurface, Vp8Decoder, Vp9Decoder};
 #[cfg(feature = "ffmpeg")]
 use rust_video_sw::{Av1Encoder, Vp8Encoder, Vp9Encoder};
 

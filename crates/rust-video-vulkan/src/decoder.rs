@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use bytes::{Bytes, BytesMut};
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::delivery::{PhaseTiming, SubmitStats};
+use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
@@ -30,7 +31,6 @@ use crate::session::geometry::{h264_profile_to_std, SessionGeometry};
 use crate::session::params::{
     h264_params_add, h264_params_create, H264ProfileChain, ParamsTemplate, H264_DECODE_STD_NAME,
 };
-use crate::session::slots::SubmitStats;
 use crate::session::std_h264::{fill_picture, fill_reference, H264Tables};
 
 /// Native NV12 planes behind one GPU surface: images plus allocations.
@@ -254,21 +254,7 @@ impl VulkanFrame {
     /// CPU copy split into NV12 planes.
     #[must_use]
     pub fn to_cpu(&self) -> Option<CpuFrame> {
-        let size = self.identity.size();
-        let luma = u64::from(size.width()) * u64::from(size.height());
-        let y_len = usize::try_from(luma).ok()?;
-        let uv_len = y_len / 2;
-        if self.data.len() < y_len + uv_len {
-            return None;
-        }
-        let y = self.data.slice(..y_len);
-        let uv = self.data.slice(y_len..y_len + uv_len);
-        let stride = size.width();
-        CpuFrame::new(
-            size,
-            PixelFormat::Nv12,
-            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
-        )
+        CpuFrame::from_nv12(self.identity.size(), &self.data)
     }
 }
 
@@ -310,6 +296,8 @@ pub(crate) struct FrameSink {
     shared: SharedDevice,
     /// Phase timing per collected picture, oldest first.
     timings: Vec<PhaseTiming>,
+    /// Collection order behind the next logged timing.
+    timing_seq: u64,
     /// Frame generation counter.
     generation: u64,
     /// Pooled display buffers for the collected size.
@@ -331,6 +319,7 @@ impl FrameSink {
             reorder: ReorderBuffer::with_capacity(0),
             shared,
             timings: Vec::new(),
+            timing_seq: 0,
             generation: 0,
             pool: None,
             exports: Vec::new(),
@@ -343,6 +332,13 @@ impl FrameSink {
     /// Display reordering.
     pub(crate) fn reorder(&mut self) -> &mut ReorderBuffer<VulkanFrame> {
         &mut self.reorder
+    }
+
+    /// Collection order behind the next logged timing.
+    pub(crate) fn next_timing_seq(&mut self) -> u64 {
+        let seq = self.timing_seq;
+        self.timing_seq += 1;
+        seq
     }
 
     /// Log the phase timing of one collected picture.
@@ -663,59 +659,6 @@ pub trait OverlappedDecode {
 
     /// Logged phase timings, oldest first, clearing the log.
     fn take_timings(&mut self) -> Vec<PhaseTiming>;
-}
-
-/// Submit, engine-wait, and copy phases of one collected picture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhaseTiming {
-    /// Queue-submit phase: record plus submit, no completion wait.
-    submit: Duration,
-    /// Engine-wait phase: fence wait for the decode to complete.
-    engine_wait: Duration,
-    /// Copy phase: readback map into the staging buffer.
-    copy: Duration,
-    /// Submit instant of the picture.
-    submitted_at: Instant,
-    /// Collection instant of the picture.
-    collected_at: Instant,
-}
-
-impl PhaseTiming {
-    /// Queue-submit phase: record plus submit, no completion wait.
-    #[must_use]
-    pub fn submit(&self) -> Duration {
-        self.submit
-    }
-
-    /// Engine-wait phase: fence wait for the decode to complete.
-    #[must_use]
-    pub fn engine_wait(&self) -> Duration {
-        self.engine_wait
-    }
-
-    /// Copy phase: readback map into the staging buffer.
-    #[must_use]
-    pub fn copy(&self) -> Duration {
-        self.copy
-    }
-
-    /// Submit instant of the picture.
-    #[must_use]
-    pub fn submitted_at(&self) -> Instant {
-        self.submitted_at
-    }
-
-    /// Collection instant of the picture.
-    #[must_use]
-    pub fn collected_at(&self) -> Instant {
-        self.collected_at
-    }
-
-    /// Stage-time sum: submit plus engine-wait plus copy.
-    #[must_use]
-    pub fn stage_sum(&self) -> Duration {
-        self.submit + self.engine_wait + self.copy
-    }
 }
 
 /// Run core behind the shared run path: session, sink, queue, gauges.
@@ -1671,18 +1614,15 @@ fn launch_waited(
         } else {
             sink.emit_queued(session, picture.poc, lease, layout)?
         };
-        fold_collection(
-            session,
-            sink,
-            stats,
-            PhaseTiming {
-                submit: picture.submit,
-                engine_wait,
-                copy: Duration::ZERO,
-                submitted_at: picture.submitted_at,
-                collected_at: Instant::now(),
-            },
+        let timing = PhaseTiming::new(
+            sink.next_timing_seq(),
+            picture.submit,
+            engine_wait,
+            Duration::ZERO,
+            picture.submitted_at,
+            Instant::now(),
         );
+        fold_collection(session, sink, stats, timing);
         return Ok(frames);
     }
     let (display_width, display_height) = session.geometry().display();
@@ -1746,18 +1686,15 @@ fn land_launched(
     } else {
         sink.emit_readback_queued(launched.size, buffer, picture.poc, launched.layout)?
     };
-    fold_collection(
-        session,
-        sink,
-        stats,
-        PhaseTiming {
-            submit: picture.submit,
-            engine_wait: launched.engine_wait,
-            copy,
-            submitted_at: picture.submitted_at,
-            collected_at: Instant::now(),
-        },
+    let timing = PhaseTiming::new(
+        sink.next_timing_seq(),
+        picture.submit,
+        launched.engine_wait,
+        copy,
+        picture.submitted_at,
+        Instant::now(),
     );
+    fold_collection(session, sink, stats, timing);
     Ok(frames)
 }
 
@@ -1826,8 +1763,10 @@ fn fold_collection(
 ) {
     sink.push_timing(timing);
     let snapshot = session.submit_stats();
-    stats.peak_inflight = stats.peak_inflight.max(snapshot.peak_inflight);
-    stats.resets += session.take_resets();
+    stats.fold_peak(snapshot.peak_inflight());
+    stats.add_submitted(session.take_submitted());
+    stats.add_resets(session.take_resets());
+    stats.add_buffer_creates(session.take_creates());
 }
 
 /// Collect the oldest submitted picture, waiting it out.
@@ -3167,13 +3106,14 @@ impl<'a> Av1Decoder<'a> {
             self.sink
                 .emit_readback_queued(size, buffer, picture.poc, layout)?
         };
-        let timing = PhaseTiming {
-            submit: picture.submit,
+        let timing = PhaseTiming::new(
+            self.sink.next_timing_seq(),
+            picture.submit,
             engine_wait,
             copy,
-            submitted_at: picture.submitted_at,
-            collected_at: Instant::now(),
-        };
+            picture.submitted_at,
+            Instant::now(),
+        );
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
         };

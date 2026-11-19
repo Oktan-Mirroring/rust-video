@@ -5,13 +5,14 @@
 use std::time::{Duration, Instant};
 
 use rust_video_caps::delivery::{
-    DropPolicy, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    DropPolicy, PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SubmitStats,
+    TrySendError,
 };
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets, Parity};
 use rust_video_vulkan::{
-    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, OverlappedDecode, PhaseTiming,
-    SubmitStats, VulkanDevice, VulkanFrame,
+    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, OverlappedDecode, VulkanDevice,
+    VulkanFrame,
 };
 
 /// Device for `op`, skipping loud when the tier declines.
@@ -200,13 +201,13 @@ fn h264_overlap_matches_sync_bytes() {
         &overlap_timings,
         sync_wall,
         overlap_wall,
-        sync_stats.peak_inflight,
-        overlap_stats.peak_inflight,
+        sync_stats.peak_inflight(),
+        overlap_stats.peak_inflight(),
     );
     assert!(
-        overlap_stats.peak_inflight >= 2,
+        overlap_stats.peak_inflight() >= 2,
         "overlap observed: peak {}",
-        overlap_stats.peak_inflight
+        overlap_stats.peak_inflight()
     );
     assert!(
         interleaved(&overlap_timings),
@@ -249,7 +250,7 @@ fn h264_overlap_depth_exceeds_one() {
     }
     frames.extend(Drive::finish_all(&mut pump));
     assert!(pump.is_finished());
-    peak = peak.max(pump.decoder().submit_stats().peak_inflight);
+    peak = peak.max(pump.decoder().submit_stats().peak_inflight());
     println!("h264: observed in-flight depth {peak}");
     assert!(peak >= 2, "depth observed above one: {peak}");
     assert!(!frames.is_empty(), "stream emits frames");
@@ -367,13 +368,13 @@ fn h265_overlap_matches_sync_bytes() {
         &overlap_timings,
         sync_wall,
         overlap_wall,
-        sync_stats.peak_inflight,
-        overlap_stats.peak_inflight,
+        sync_stats.peak_inflight(),
+        overlap_stats.peak_inflight(),
     );
     assert!(
-        overlap_stats.peak_inflight >= 2,
+        overlap_stats.peak_inflight() >= 2,
         "overlap observed: peak {}",
-        overlap_stats.peak_inflight
+        overlap_stats.peak_inflight()
     );
     assert!(
         interleaved(&overlap_timings),
@@ -423,13 +424,13 @@ fn av1_overlap_matches_sync_bytes() {
         &overlap_timings,
         sync_wall,
         overlap_wall,
-        sync_stats.peak_inflight,
-        overlap_stats.peak_inflight,
+        sync_stats.peak_inflight(),
+        overlap_stats.peak_inflight(),
     );
     assert!(
-        overlap_stats.peak_inflight >= 2,
+        overlap_stats.peak_inflight() >= 2,
         "overlap observed: peak {}",
-        overlap_stats.peak_inflight
+        overlap_stats.peak_inflight()
     );
     assert!(
         interleaved(&overlap_timings),

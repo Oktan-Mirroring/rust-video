@@ -5,12 +5,10 @@
 
 #![cfg(target_os = "android")]
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::frame::GpuExport;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets};
-use rust_video_mediacodec::{
-    DecoderPump, FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface,
-};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface};
 
 /// True when the device gate env requests on-device cases.
 fn device_gate() -> bool {

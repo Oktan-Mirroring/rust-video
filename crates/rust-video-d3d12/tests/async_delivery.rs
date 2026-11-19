@@ -4,12 +4,10 @@
 
 #![cfg(target_os = "windows")]
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_d3d12::{
-    Codec, D3d12Device, D3d12Error, D3d12Frame, DecoderPump, H264Decoder, HevcDecoder,
-};
+use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder};
 use rust_video_harness::{decode_dir, AnnexB, Drive, Packets, Parity};
 
 /// Pictures in each shared vector.

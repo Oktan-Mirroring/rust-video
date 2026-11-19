@@ -10,11 +10,11 @@ mod vp9;
 
 use std::time::Instant;
 
-use rust_video_caps::delivery::{DropPolicy, ReceiveFrames};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, ReceiveFrames};
 use rust_video_caps::packet::Packet;
 use rust_video_d3d11::{
-    Av1Decoder, Codec, D3d11Device, D3d11Frame, DecoderPump, H264Decoder, HevcDecoder,
-    OverlappedPump, PhaseCapture, Vp9Decoder,
+    Av1Decoder, Codec, D3d11Device, D3d11Frame, H264Decoder, HevcDecoder, OverlappedPump,
+    PhaseCapture, Vp9Decoder,
 };
 use rust_video_harness::{decode_dir, AnnexB, Drive, Obu, Packets, Parity};
 

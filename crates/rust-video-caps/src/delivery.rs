@@ -7,7 +7,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, WaitTimeoutResult};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::packet::Packet;
 use crate::traits::Decoder;
@@ -455,7 +455,7 @@ impl<F> FrameChannel<F> {
 /// `try_send` decodes now and queues output through the bound plus policy;
 /// consumers poll, block, or drain through a callback. Slow consumers drop
 /// frames per policy instead of growing memory.
-pub struct Pump<D: Decoder> {
+pub struct DecoderPump<D: Decoder> {
     /// Sync decode behind sends.
     decoder: D,
     /// Bounded output with drop policy.
@@ -464,7 +464,7 @@ pub struct Pump<D: Decoder> {
     finished: bool,
 }
 
-impl<D: Decoder> Pump<D> {
+impl<D: Decoder> DecoderPump<D> {
     /// Pump decoding through `decoder` into `config` frames of queue.
     ///
     /// # Arguments
@@ -472,7 +472,7 @@ impl<D: Decoder> Pump<D> {
     /// * `decoder` - sync decode behind sends.
     /// * `config` - bound plus drop policy.
     #[must_use]
-    pub fn new(decoder: D, config: ChannelConfig) -> Self {
+    pub fn open(decoder: D, config: ChannelConfig) -> Self {
         Self {
             decoder,
             channel: FrameChannel::new(config),
@@ -523,7 +523,7 @@ impl<D: Decoder> Pump<D> {
     }
 }
 
-impl<D: Decoder> SendPackets for Pump<D> {
+impl<D: Decoder> SendPackets for DecoderPump<D> {
     type Error = D::Error;
 
     fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
@@ -553,7 +553,7 @@ impl<D: Decoder> SendPackets for Pump<D> {
     }
 }
 
-impl<D: Decoder> PollFrames for Pump<D> {
+impl<D: Decoder> PollFrames for DecoderPump<D> {
     type Frame = D::Frame;
     type Error = D::Error;
 
@@ -562,7 +562,7 @@ impl<D: Decoder> PollFrames for Pump<D> {
     }
 }
 
-impl<D: Decoder> ReceiveFrames for Pump<D> {
+impl<D: Decoder> ReceiveFrames for DecoderPump<D> {
     type Frame = D::Frame;
     type Error = D::Error;
 
@@ -580,6 +580,167 @@ impl<D: Decoder> ReceiveFrames for Pump<D> {
     }
 }
 
+/// Submit, engine-wait, and copy phases of one collected picture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhaseTiming {
+    /// Collection order.
+    seq: u64,
+    /// Queue-submit phase: record plus submit, no completion wait.
+    submit: Duration,
+    /// Engine-wait phase: submit to output-ready.
+    engine_wait: Duration,
+    /// Copy phase: output-to-surface conversion.
+    copy: Duration,
+    /// Submit instant of the picture.
+    submitted_at: Instant,
+    /// Collection instant of the picture.
+    collected_at: Instant,
+    /// Input stamp in microseconds, present on stamp-correlated backends.
+    submitted_pts_us: Option<u64>,
+    /// Output stamp in microseconds, present on stamp-correlated backends.
+    completed_pts_us: Option<i64>,
+}
+
+impl PhaseTiming {
+    /// Timing of sequence `seq` over its three phases and wall span.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - collection order.
+    /// * `submit` - queue-submit phase.
+    /// * `engine_wait` - engine-wait phase.
+    /// * `copy` - copy phase.
+    /// * `submitted_at` - submit instant.
+    /// * `collected_at` - collection instant.
+    #[must_use]
+    pub fn new(
+        seq: u64,
+        submit: Duration,
+        engine_wait: Duration,
+        copy: Duration,
+        submitted_at: Instant,
+        collected_at: Instant,
+    ) -> Self {
+        Self {
+            seq,
+            submit,
+            engine_wait,
+            copy,
+            submitted_at,
+            collected_at,
+            submitted_pts_us: None,
+            completed_pts_us: None,
+        }
+    }
+
+    /// Timing stamped with its input and output presentation stamps.
+    ///
+    /// # Arguments
+    ///
+    /// * `submitted_pts_us` - input stamp in microseconds.
+    /// * `completed_pts_us` - output stamp in microseconds.
+    #[must_use]
+    pub fn with_pts(mut self, submitted_pts_us: u64, completed_pts_us: i64) -> Self {
+        self.submitted_pts_us = Some(submitted_pts_us);
+        self.completed_pts_us = Some(completed_pts_us);
+        self
+    }
+
+    /// Collection order.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Queue-submit phase: record plus submit, no completion wait.
+    #[must_use]
+    pub fn submit(&self) -> Duration {
+        self.submit
+    }
+
+    /// Engine-wait phase: submit to output-ready.
+    #[must_use]
+    pub fn engine_wait(&self) -> Duration {
+        self.engine_wait
+    }
+
+    /// Copy phase: output-to-surface conversion.
+    #[must_use]
+    pub fn copy(&self) -> Duration {
+        self.copy
+    }
+
+    /// Submit instant of the picture.
+    #[must_use]
+    pub fn submitted_at(&self) -> Instant {
+        self.submitted_at
+    }
+
+    /// Collection instant of the picture.
+    #[must_use]
+    pub fn collected_at(&self) -> Instant {
+        self.collected_at
+    }
+
+    /// Input stamp in microseconds, present on stamp-correlated backends.
+    #[must_use]
+    pub fn submitted_pts_us(&self) -> Option<u64> {
+        self.submitted_pts_us
+    }
+
+    /// Output stamp in microseconds, present on stamp-correlated backends.
+    #[must_use]
+    pub fn completed_pts_us(&self) -> Option<i64> {
+        self.completed_pts_us
+    }
+
+    /// Stage-time sum: submit plus engine-wait plus copy.
+    #[must_use]
+    pub fn stage_sum(&self) -> Duration {
+        self.submit + self.engine_wait + self.copy
+    }
+
+    /// Queue-submit phase in whole microseconds, saturating.
+    #[must_use]
+    pub fn submit_us(&self) -> u64 {
+        Self::micros(self.submit)
+    }
+
+    /// Engine-wait phase in whole microseconds, saturating.
+    #[must_use]
+    pub fn engine_wait_us(&self) -> u64 {
+        Self::micros(self.engine_wait)
+    }
+
+    /// Copy phase in whole microseconds, saturating.
+    #[must_use]
+    pub fn copy_us(&self) -> u64 {
+        Self::micros(self.copy)
+    }
+
+    /// Submit plus engine-wait plus copy in microseconds, saturating.
+    #[must_use]
+    pub fn total_us(&self) -> u64 {
+        self.submit_us()
+            .saturating_add(self.engine_wait_us())
+            .saturating_add(self.copy_us())
+    }
+
+    /// Frame latency in microseconds, submit to collection, saturating.
+    #[must_use]
+    pub fn latency_us(&self) -> u64 {
+        Self::micros(
+            self.collected_at
+                .saturating_duration_since(self.submitted_at),
+        )
+    }
+
+    /// Whole microseconds behind `duration`, saturating.
+    fn micros(duration: Duration) -> u64 {
+        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Lapsed blocking-receive budget.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ReceiveTimeout;
@@ -592,6 +753,122 @@ impl fmt::Display for ReceiveTimeout {
 
 impl std::error::Error for ReceiveTimeout {}
 
+/// Submit gauges since backend open.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SubmitStats {
+    /// Pictures submitted.
+    submitted: u64,
+    /// Deepest submitted-but-uncollected count observed.
+    peak_inflight: usize,
+    /// Submit-core resets after failures.
+    resets: u64,
+    /// Driver objects created since open.
+    buffer_creates: u64,
+}
+
+impl SubmitStats {
+    /// Zeroed gauges.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            submitted: 0,
+            peak_inflight: 0,
+            resets: 0,
+            buffer_creates: 0,
+        }
+    }
+
+    /// Snapshot of `submitted` submits peaking at `peak_inflight` with
+    /// `resets` resets and `buffer_creates` driver creates.
+    ///
+    /// # Arguments
+    ///
+    /// * `submitted` - pictures submitted.
+    /// * `peak_inflight` - deepest submitted-but-uncollected count observed.
+    /// * `resets` - submit-core resets after failures.
+    /// * `buffer_creates` - driver objects created since open.
+    #[must_use]
+    pub fn snapshot(
+        submitted: u64,
+        peak_inflight: usize,
+        resets: u64,
+        buffer_creates: u64,
+    ) -> Self {
+        Self {
+            submitted,
+            peak_inflight,
+            resets,
+            buffer_creates,
+        }
+    }
+
+    /// Pictures submitted.
+    #[must_use]
+    pub fn submitted(&self) -> u64 {
+        self.submitted
+    }
+
+    /// Deepest submitted-but-uncollected count observed.
+    #[must_use]
+    pub fn peak_inflight(&self) -> usize {
+        self.peak_inflight
+    }
+
+    /// Submit-core resets after failures.
+    #[must_use]
+    pub fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// Driver objects created since open.
+    #[must_use]
+    pub fn buffer_creates(&self) -> u64 {
+        self.buffer_creates
+    }
+
+    /// Peak raised to `peak` when deeper.
+    ///
+    /// # Arguments
+    ///
+    /// * `peak` - observed submitted-but-uncollected count.
+    pub fn fold_peak(&mut self, peak: usize) {
+        self.peak_inflight = self.peak_inflight.max(peak);
+    }
+
+    /// `submitted` more pictures submitted, saturating.
+    ///
+    /// # Arguments
+    ///
+    /// * `submitted` - pictures submitted since the last fold.
+    pub fn add_submitted(&mut self, submitted: u64) {
+        self.submitted = self.submitted.saturating_add(submitted);
+    }
+
+    /// `resets` more submit-core resets, saturating.
+    ///
+    /// # Arguments
+    ///
+    /// * `resets` - resets since the last fold.
+    pub fn add_resets(&mut self, resets: u64) {
+        self.resets = self.resets.saturating_add(resets);
+    }
+
+    /// `creates` more driver creates, saturating.
+    ///
+    /// # Arguments
+    ///
+    /// * `creates` - driver objects created since the last fold.
+    pub fn add_buffer_creates(&mut self, creates: u64) {
+        self.buffer_creates = self.buffer_creates.saturating_add(creates);
+    }
+}
+
+impl Default for SubmitStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -599,8 +876,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ChannelConfig, DropPolicy, FrameChannel, PollFrames, Pump, ReceiveError, ReceiveFrames,
-        ReceiveTimeout, SendPackets, TrySendError,
+        ChannelConfig, DecoderPump, DropPolicy, FrameChannel, PhaseTiming, PollFrames,
+        ReceiveError, ReceiveFrames, ReceiveTimeout, SendPackets, SubmitStats, TrySendError,
     };
     use crate::packet::Packet;
     use crate::traits::Decoder;
@@ -705,7 +982,7 @@ mod tests {
 
     #[test]
     fn sends_receive_own_frames_then_drain() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(8, DropPolicy::DropOldest));
+        let mut pump = DecoderPump::open(HoldbackDecoder::new(), config(8, DropPolicy::DropOldest));
         for byte in 0..4u8 {
             pump.try_send(packet(byte)).expect("queue room");
         }
@@ -723,7 +1000,7 @@ mod tests {
 
     #[test]
     fn drop_oldest_keeps_latest_under_slow_consumer() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(2, DropPolicy::DropOldest));
+        let mut pump = DecoderPump::open(HoldbackDecoder::new(), config(2, DropPolicy::DropOldest));
         for byte in 0..5u8 {
             pump.try_send(packet(byte)).expect("policy absorbs");
         }
@@ -741,7 +1018,8 @@ mod tests {
 
     #[test]
     fn drop_incoming_keeps_first_under_slow_consumer() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(2, DropPolicy::DropIncoming));
+        let mut pump =
+            DecoderPump::open(HoldbackDecoder::new(), config(2, DropPolicy::DropIncoming));
         for byte in 0..5u8 {
             pump.try_send(packet(byte)).expect("policy absorbs");
         }
@@ -757,7 +1035,7 @@ mod tests {
 
     #[test]
     fn send_after_finish_returns_packet() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(4, DropPolicy::DropOldest));
+        let mut pump = DecoderPump::open(HoldbackDecoder::new(), config(4, DropPolicy::DropOldest));
         pump.finish().expect("finish");
         let err = pump.try_send(packet(9)).unwrap_err();
         let TrySendError::Full { packet } = err else {
@@ -768,7 +1046,8 @@ mod tests {
 
     #[test]
     fn finish_twice_drains_empty() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(4, DropPolicy::DropIncoming));
+        let mut pump =
+            DecoderPump::open(HoldbackDecoder::new(), config(4, DropPolicy::DropIncoming));
         pump.finish().expect("first finish");
         pump.finish().expect("second finish");
         assert_eq!(pump.try_receive().expect("poll"), None);
@@ -867,14 +1146,14 @@ mod tests {
 
     #[test]
     fn pump_receive_timeout_maps_lapsed_budget() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(4, DropPolicy::DropOldest));
+        let mut pump = DecoderPump::open(HoldbackDecoder::new(), config(4, DropPolicy::DropOldest));
         let err = pump.receive_timeout(Duration::from_millis(1)).unwrap_err();
         assert_eq!(err, ReceiveError::Timeout);
     }
 
     #[test]
     fn consumer_handle_shares_pump_queue() {
-        let mut pump = Pump::new(HoldbackDecoder::new(), config(8, DropPolicy::DropOldest));
+        let mut pump = DecoderPump::open(HoldbackDecoder::new(), config(8, DropPolicy::DropOldest));
         assert_eq!(pump.config(), config(8, DropPolicy::DropOldest));
         let consumer = pump.channel();
         for byte in 0..3u8 {
@@ -883,5 +1162,67 @@ mod tests {
         assert_eq!(consumer.try_receive(), Some(0u64));
         assert_eq!(pump.try_receive().expect("poll"), Some(1u64));
         assert_eq!(pump.try_receive().expect("poll"), None);
+    }
+
+    #[test]
+    fn phase_timing_reports_phases_and_derivations() {
+        let submitted_at = std::time::Instant::now();
+        let timing = PhaseTiming::new(
+            7,
+            Duration::from_micros(5),
+            Duration::from_micros(11),
+            Duration::from_micros(3),
+            submitted_at,
+            submitted_at + Duration::from_micros(40),
+        );
+        assert_eq!(timing.seq(), 7);
+        assert_eq!(timing.submit(), Duration::from_micros(5));
+        assert_eq!(timing.engine_wait(), Duration::from_micros(11));
+        assert_eq!(timing.copy(), Duration::from_micros(3));
+        assert_eq!(timing.submitted_at(), submitted_at);
+        assert_eq!(timing.stage_sum(), Duration::from_micros(19));
+        assert_eq!(timing.submit_us(), 5);
+        assert_eq!(timing.engine_wait_us(), 11);
+        assert_eq!(timing.copy_us(), 3);
+        assert_eq!(timing.total_us(), 19);
+        assert_eq!(timing.latency_us(), 40);
+        assert_eq!(timing.submitted_pts_us(), None);
+        assert_eq!(timing.completed_pts_us(), None);
+    }
+
+    #[test]
+    fn phase_timing_stamps_correlate() {
+        let submitted_at = std::time::Instant::now();
+        let timing = PhaseTiming::new(
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            submitted_at,
+            submitted_at,
+        )
+        .with_pts(1_000, 1_000);
+        assert_eq!(timing.submitted_pts_us(), Some(1_000));
+        assert_eq!(timing.completed_pts_us(), Some(1_000));
+    }
+
+    #[test]
+    fn submit_stats_fold_accumulates() {
+        let mut stats = SubmitStats::new();
+        assert_eq!(stats, SubmitStats::default());
+        assert_eq!(stats.submitted(), 0);
+        assert_eq!(stats.peak_inflight(), 0);
+        assert_eq!(stats.resets(), 0);
+        assert_eq!(stats.buffer_creates(), 0);
+        stats.add_submitted(3);
+        stats.fold_peak(2);
+        stats.fold_peak(1);
+        stats.add_resets(1);
+        stats.add_buffer_creates(7);
+        assert_eq!(
+            stats,
+            SubmitStats::snapshot(3, 2, 1, 7),
+            "folds match the snapshot"
+        );
     }
 }

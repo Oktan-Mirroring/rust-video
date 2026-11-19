@@ -60,6 +60,18 @@ impl AnnexB {
         packet
     }
 
+    /// H.264 NAL unit type of `nal`, absent when empty.
+    #[must_use]
+    pub fn h264_nal_type(nal: &[u8]) -> Option<u8> {
+        nal.first().map(|head| head & 0x1f)
+    }
+
+    /// HEVC NAL unit type of `nal`, absent when empty.
+    #[must_use]
+    pub fn h265_nal_type(nal: &[u8]) -> Option<u8> {
+        nal.first().map(|head| (head >> 1) & 0x3f)
+    }
+
     /// NAL units without start codes.
     #[must_use]
     pub fn split_nals(data: &[u8]) -> Vec<&[u8]> {
@@ -86,6 +98,93 @@ impl AnnexB {
             nals.push(&data[start..]);
         }
         nals
+    }
+
+    /// Owned NAL units without start codes, preamble dropped.
+    ///
+    /// Unlike [`split_nals`](Self::split_nals), bytes before the first
+    /// start code never surface, empty units stay, and input without a
+    /// start code yields nothing.
+    #[must_use]
+    pub fn split_owned(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut starts = Vec::new();
+        let mut at = 0;
+        while at + 3 <= data.len() {
+            if data[at] == 0 && data[at + 1] == 0 {
+                if data[at + 2] == 1 {
+                    starts.push((at, 3));
+                    at += 3;
+                    continue;
+                }
+                if at + 4 <= data.len() && data[at + 2] == 0 && data[at + 3] == 1 {
+                    starts.push((at, 4));
+                    at += 4;
+                    continue;
+                }
+            }
+            at += 1;
+        }
+        let mut nals = Vec::new();
+        for (index, (start, len)) in starts.iter().enumerate() {
+            let end = starts.get(index + 1).map_or(data.len(), |(next, _)| *next);
+            nals.push(data[start + len..end].to_vec());
+        }
+        nals
+    }
+
+    /// NAL units joined into Annex B: four-byte first start code, three-byte rest.
+    #[must_use]
+    pub fn join_units(nals: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (index, nal) in nals.iter().enumerate() {
+            if index == 0 {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+            } else {
+                out.extend_from_slice(&[0, 0, 1]);
+            }
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    /// RBSP without H.264/H.265 emulation-prevention bytes.
+    #[must_use]
+    pub fn remove_emulation(nal: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nal.len());
+        let mut zeros = 0;
+        for byte in nal {
+            if zeros == 2 && *byte == 0x03 {
+                zeros = 0;
+                continue;
+            }
+            if *byte == 0x00 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+            out.push(*byte);
+        }
+        out
+    }
+
+    /// EBSP with emulation-prevention bytes inserted.
+    #[must_use]
+    pub fn insert_emulation(rbsp: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rbsp.len() + 8);
+        let mut zeros = 0;
+        for byte in rbsp {
+            if zeros == 2 && *byte <= 0x03 {
+                out.push(0x03);
+                zeros = 0;
+            }
+            if *byte == 0x00 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+            out.push(*byte);
+        }
+        out
     }
 }
 
@@ -146,5 +245,40 @@ mod tests {
             AnnexB::group_pictures(&[0x41, 0xBB], AnnexB::is_h264_vcl),
             vec![vec![0, 0, 0, 1, 0x41, 0xBB]]
         );
+    }
+
+    #[test]
+    fn types_name_nal_headers() {
+        assert_eq!(AnnexB::h264_nal_type(&[0x67]), Some(7));
+        assert_eq!(AnnexB::h264_nal_type(&[0x41]), Some(1));
+        assert_eq!(AnnexB::h264_nal_type(&[]), None);
+        assert_eq!(AnnexB::h265_nal_type(&[0x42, 0x01]), Some(33));
+        assert_eq!(AnnexB::h265_nal_type(&[]), None);
+    }
+
+    #[test]
+    fn split_owned_drops_preamble_and_keeps_empties() {
+        assert_eq!(
+            AnnexB::split_owned(&[0xFF, 0, 0, 1, 0x67, 0, 0, 1, 0, 0, 1, 0x41]),
+            vec![vec![0x67], Vec::<u8>::new(), vec![0x41]]
+        );
+        assert_eq!(AnnexB::split_owned(&[0x41, 0xBB]), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn join_units_mixes_start_codes() {
+        assert_eq!(
+            AnnexB::join_units(&[vec![0x67], vec![0x41, 0x9A]]),
+            vec![0, 0, 0, 1, 0x67, 0, 0, 1, 0x41, 0x9A]
+        );
+        assert_eq!(AnnexB::join_units(&[]), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn emulation_roundtrips() {
+        let rbsp = vec![0, 0, 1, 0x67, 0, 0, 0, 0x80];
+        let ebsp = AnnexB::insert_emulation(&rbsp);
+        assert_eq!(ebsp, vec![0, 0, 3, 1, 0x67, 0, 0, 3, 0, 0x80]);
+        assert_eq!(AnnexB::remove_emulation(&ebsp), rbsp);
     }
 }

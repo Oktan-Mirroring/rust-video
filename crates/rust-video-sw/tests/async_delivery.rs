@@ -6,12 +6,12 @@
 
 use std::fs;
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Parity};
-use rust_video_sw::{Av1Decoder, DecoderPump, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+use rust_video_sw::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
 
 /// Frames polled from `pump` until the queue stands empty.
 fn polled<D>(pump: &mut DecoderPump<D>) -> Vec<CpuFrame>

@@ -17,6 +17,8 @@ use bytes::Bytes;
 #[cfg(have_corpus)]
 use rust_video::VideoCodec;
 #[cfg(have_corpus)]
+use rust_video_caps::delivery::SubmitStats;
+#[cfg(have_corpus)]
 use rust_video_caps::frame::CpuFrame;
 #[cfg(have_corpus)]
 use rust_video_caps::packet::Packet;
@@ -28,8 +30,8 @@ use rust_video_caps::transcode::Route;
 use rust_video_harness::{Case, Drive, Error, FrameHash, Golden, Oracle, Suite};
 #[cfg(have_corpus)]
 use rust_video_vulkan::{
-    CodecOp, Gop, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, SubmitStats,
-    Transcoder, VulkanDevice, VulkanError, VulkanFrame,
+    CodecOp, Gop, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, Transcoder,
+    VulkanDevice, VulkanError, VulkanFrame,
 };
 
 #[cfg(have_corpus)]
@@ -698,7 +700,7 @@ fn pipelined_decode_overlaps_frames() {
                     else {
                         continue;
                     };
-                    (frames, decoder.submit_stats().peak_inflight)
+                    (frames, decoder.submit_stats().peak_inflight())
                 }
                 VideoCodec::H265 => {
                     let Some(mut decoder) =
@@ -712,7 +714,7 @@ fn pipelined_decode_overlaps_frames() {
                     else {
                         continue;
                     };
-                    (frames, decoder.submit_stats().peak_inflight)
+                    (frames, decoder.submit_stats().peak_inflight())
                 }
                 _ => unreachable!("overlap proof covers h264 and h265"),
             };
@@ -749,7 +751,7 @@ fn recovery_case(
         "no {codec:?} frames from {}",
         path.display()
     );
-    let before = decoder.stats().resets;
+    let before = decoder.stats().resets();
     decoder.inject();
     let second = decode_all(decoder, bytes)?;
     let stats = decoder.stats();
@@ -758,7 +760,7 @@ fn recovery_case(
         path.display(),
         first.len(),
         second.len(),
-        stats.resets
+        stats.resets()
     );
     assert_eq!(
         second.len(),
@@ -767,7 +769,7 @@ fn recovery_case(
         path.display()
     );
     assert!(
-        stats.resets > before,
+        stats.resets() > before,
         "injected fault never fired on {}",
         path.display()
     );
@@ -939,12 +941,20 @@ fn steady_h264(guard: &MutexGuard<'_, ()>) {
         paths[0].display(),
         frames.len(),
         packets,
-        decoder.submit_stats().resets,
-        encoder.submit_stats().resets
+        decoder.submit_stats().resets(),
+        encoder.submit_stats().resets()
     );
     assert_eq!(packets, frames.len(), "one packet per frame");
-    assert_eq!(decoder.submit_stats().resets, 0, "decode recovered mid-run");
-    assert_eq!(encoder.submit_stats().resets, 0, "encode recovered mid-run");
+    assert_eq!(
+        decoder.submit_stats().resets(),
+        0,
+        "decode recovered mid-run"
+    );
+    assert_eq!(
+        encoder.submit_stats().resets(),
+        0,
+        "encode recovered mid-run"
+    );
 }
 
 #[cfg(have_corpus)]
@@ -999,12 +1009,20 @@ fn steady_h265(guard: &MutexGuard<'_, ()>) {
         paths[0].display(),
         frames.len(),
         packets,
-        decoder.submit_stats().resets,
-        encoder.submit_stats().resets
+        decoder.submit_stats().resets(),
+        encoder.submit_stats().resets()
     );
     assert_eq!(packets, frames.len(), "one packet per frame");
-    assert_eq!(decoder.submit_stats().resets, 0, "decode recovered mid-run");
-    assert_eq!(encoder.submit_stats().resets, 0, "encode recovered mid-run");
+    assert_eq!(
+        decoder.submit_stats().resets(),
+        0,
+        "decode recovered mid-run"
+    );
+    assert_eq!(
+        encoder.submit_stats().resets(),
+        0,
+        "encode recovered mid-run"
+    );
 }
 
 #[cfg(have_corpus)]

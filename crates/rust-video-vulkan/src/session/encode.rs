@@ -45,7 +45,9 @@ use crate::session::params::{
     h265_encode_params_create, H264EncodeProfileChain, H265EncodeProfileChain,
     H264_ENCODE_STD_NAME, H265_ENCODE_STD_NAME,
 };
-use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
+use crate::session::slots::{SubmitSlots, SUBMIT_SLOTS};
+
+use rust_video_caps::delivery::SubmitStats;
 
 /// Bitstream staging size in bytes: the largest coded picture the session takes.
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;

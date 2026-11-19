@@ -4,9 +4,9 @@
 
 #![cfg(target_os = "windows")]
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
-use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device, DecoderPump, H264Decoder, HevcDecoder};
+use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device, H264Decoder, HevcDecoder};
 use rust_video_harness::{decode_dir, AnnexB, Drive, Obu, Packets};
 
 /// Open device, loud skip without hardware.

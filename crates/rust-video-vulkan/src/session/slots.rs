@@ -10,6 +10,7 @@ use crate::inflight::{Fence, Inflight};
 use crate::raw::{CommandPool, VkFence};
 
 use ash::vk;
+use rust_video_caps::delivery::SubmitStats;
 
 /// Retries of one submit after a reset, before the error surfaces.
 pub(crate) const SUBMIT_RETRIES: u32 = 1;
@@ -68,10 +69,14 @@ pub(crate) struct SubmitSlots {
     inflight: Inflight<SlotFence>,
     /// Next acquire candidate.
     next: usize,
+    /// Successful queue submits since open.
+    submitted: u64,
     /// Deepest submitted-but-uncollected count observed.
     peak: usize,
     /// Ring resets after failures.
     resets: u64,
+    /// Driver objects created since open.
+    creates: u64,
     /// Idle wait failed; the next op retries the reset first.
     poisoned: bool,
     /// Submits to fail before running, armed by tests.
@@ -92,12 +97,14 @@ impl SubmitSlots {
     ) -> Result<Self, VulkanError> {
         let pool = CommandPool::create(device, family)?;
         let mut slots = Vec::with_capacity(SUBMIT_SLOTS);
+        let mut creates = 1;
         for _ in 0..SUBMIT_SLOTS {
             slots.push(SubmitSlot {
                 cmd: pool.allocate()?,
                 fence: Arc::new(VkFence::new(device, false)?),
                 busy: false,
             });
+            creates += 2;
         }
         Ok(Self {
             device: device.clone(),
@@ -107,8 +114,10 @@ impl SubmitSlots {
             slots,
             inflight: Inflight::new(),
             next: 0,
+            submitted: 0,
             peak: 0,
             resets: 0,
+            creates,
             poisoned: false,
             fail_next: 0,
         })
@@ -129,15 +138,22 @@ impl SubmitSlots {
     /// Gauges snapshot.
     #[must_use]
     pub(crate) fn stats(&self) -> SubmitStats {
-        SubmitStats {
-            peak_inflight: self.peak,
-            resets: self.resets,
-        }
+        SubmitStats::snapshot(self.submitted, self.peak, self.resets, self.creates)
+    }
+
+    /// Submits since the last take, zeroing the counter.
+    pub(crate) fn take_submitted(&mut self) -> u64 {
+        std::mem::replace(&mut self.submitted, 0)
     }
 
     /// Resets since the last take, zeroing the counter.
     pub(crate) fn take_resets(&mut self) -> u64 {
         std::mem::replace(&mut self.resets, 0)
+    }
+
+    /// Driver creates since the last take, zeroing the counter.
+    pub(crate) fn take_creates(&mut self) -> u64 {
+        std::mem::replace(&mut self.creates, 0)
     }
 
     /// Fail the next submit once, exercising the reset path.
@@ -305,6 +321,7 @@ impl SubmitSlots {
         )?;
         self.inflight.submit(SlotFence { slot: index, fence });
         self.slots[index].busy = true;
+        self.submitted += 1;
         self.peak = self.peak.max(self.inflight.len());
         Ok(())
     }
@@ -378,32 +395,6 @@ impl Drop for SubmitSlots {
     }
 }
 
-/// Submit-core gauges of one codec object.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SubmitStats {
-    /// Deepest submitted-but-uncollected count observed.
-    pub peak_inflight: usize,
-    /// Submit-core resets after failures.
-    pub resets: u64,
-}
-
-impl SubmitStats {
-    /// Zeroed gauges.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            peak_inflight: 0,
-            resets: 0,
-        }
-    }
-}
-
-impl Default for SubmitStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{SubmitSlots, SUBMIT_RETRIES, SUBMIT_SLOTS};
@@ -433,10 +424,7 @@ mod tests {
     fn stats_start_zeroed() {
         assert_eq!(
             super::SubmitStats::new(),
-            super::SubmitStats {
-                peak_inflight: 0,
-                resets: 0,
-            }
+            super::SubmitStats::snapshot(0, 0, 0, 0)
         );
         assert_eq!(super::SubmitStats::default(), super::SubmitStats::new());
     }
@@ -447,12 +435,18 @@ mod tests {
             println!("declined: submit ring needs a video device");
             return;
         };
+        assert_eq!(slots.stats().submitted(), 0);
+        assert_eq!(slots.take_submitted(), 0);
+        assert_eq!(slots.take_creates(), 1 + 2 * SUBMIT_SLOTS as u64);
         let index = slots.acquire().expect("acquire");
         record_empty(&slots, index);
         slots.submit(index).expect("submit");
         slots.poll(index).expect("poll");
-        assert_eq!(slots.stats().peak_inflight, 1);
-        assert_eq!(slots.stats().resets, 0);
+        assert_eq!(slots.stats().peak_inflight(), 1);
+        assert_eq!(slots.stats().resets(), 0);
+        assert_eq!(slots.stats().submitted(), 1);
+        assert_eq!(slots.take_submitted(), 1);
+        assert_eq!(slots.stats().submitted(), 0);
     }
 
     #[test]
@@ -471,7 +465,7 @@ mod tests {
         for &index in &indices {
             slots.submit(index).expect("submit");
         }
-        assert_eq!(slots.stats().peak_inflight, SUBMIT_SLOTS);
+        assert_eq!(slots.stats().peak_inflight(), SUBMIT_SLOTS);
         for index in indices {
             slots.poll(index).expect("poll");
         }
@@ -489,9 +483,9 @@ mod tests {
         record_empty(&slots, index);
         slots.submit(index).expect("retry succeeds");
         slots.poll(index).expect("poll");
-        assert_eq!(slots.stats().resets, 1);
+        assert_eq!(slots.stats().resets(), 1);
         assert_eq!(slots.take_resets(), 1);
-        assert_eq!(slots.stats().resets, 0);
+        assert_eq!(slots.stats().resets(), 0);
     }
 
     #[test]
@@ -506,6 +500,6 @@ mod tests {
         let index = slots.acquire().expect("acquire");
         record_empty(&slots, index);
         assert!(slots.submit(index).is_err());
-        assert_eq!(slots.stats().resets, 1);
+        assert_eq!(slots.stats().resets(), 1);
     }
 }

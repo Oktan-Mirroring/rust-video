@@ -914,8 +914,8 @@ mod tests {
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
     use rust_video_caps::delivery::{
-        ChannelConfig, DropPolicy, PollFrames, Pump, ReceiveError, ReceiveFrames, SendPackets,
-        TrySendError,
+        ChannelConfig, DecoderPump, DropPolicy, PollFrames, ReceiveError, ReceiveFrames,
+        SendPackets, TrySendError,
     };
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::packet::Packet;
@@ -1061,7 +1061,7 @@ mod tests {
     #[test]
     fn pump_preserves_bytes_and_order_vs_sync() {
         let packets: Vec<Packet> = (0..6u8).map(packet).collect();
-        let mut sync = Pump::new(Scripted::new(), config(16, DropPolicy::DropOldest));
+        let mut sync = DecoderPump::open(Scripted::new(), config(16, DropPolicy::DropOldest));
         for packet in &packets {
             sync.try_send(packet.clone()).expect("queue room");
         }

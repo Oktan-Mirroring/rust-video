@@ -22,7 +22,7 @@ mod vectors;
 
 pub use alloc_tracker::{assert_no_allocs_after_warmup, CountingAlloc};
 pub use annexb::AnnexB;
-pub use bits::Bits;
+pub use bits::{BitOverrun, BitReader, Bits};
 pub use drive::{Drive, Packets, Parity};
 pub use error::Error;
 pub use golden::{Golden, Mismatch};

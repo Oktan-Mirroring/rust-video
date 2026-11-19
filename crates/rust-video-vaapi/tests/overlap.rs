@@ -7,12 +7,11 @@
 
 use std::time::{Duration, Instant};
 
+use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Parity};
-use rust_video_vaapi::{
-    Av1Decoder, H264Decoder, H265Decoder, PhaseStats, SubmitStats, VaApiDevice, VaApiFrame,
-};
+use rust_video_vaapi::{Av1Decoder, H264Decoder, H265Decoder, PhaseStats, VaApiDevice, VaApiFrame};
 
 /// Repeat passes over single-picture packets.
 const PASSES: usize = 8;
@@ -136,7 +135,7 @@ fn report(name: &str, leg: &str, wall: Duration, phases: &PhaseStats, submits: &
         phases.polled_ready(),
         frames,
         phases.overlapped(),
-        submits.peak(),
+        submits.peak_inflight(),
     );
 }
 
@@ -179,7 +178,11 @@ fn h264_pipeline_overlaps_copy_with_engine() {
     assert!(frames.len() >= 3, "h264: overlap needs three frames");
     let (phases, submits) = stats(&decoder, "h264");
     report("h264", "pipelined", wall, &phases, &submits);
-    assert!(submits.peak() > 1, "h264: submits ahead {}", submits.peak());
+    assert!(
+        submits.peak_inflight() > 1,
+        "h264: submits ahead {}",
+        submits.peak_inflight()
+    );
     assert!(
         phases.overlapped() > 0,
         "h264: no copy overlapped an engine run"
@@ -261,7 +264,11 @@ fn h265_pipeline_overlaps_copy_with_engine() {
     assert!(frames.len() >= 3, "h265: overlap needs three frames");
     let (phases, submits) = stats(&decoder, "h265");
     report("h265", "pipelined", wall, &phases, &submits);
-    assert!(submits.peak() > 1, "h265: submits ahead {}", submits.peak());
+    assert!(
+        submits.peak_inflight() > 1,
+        "h265: submits ahead {}",
+        submits.peak_inflight()
+    );
     assert!(
         phases.overlapped() > 0,
         "h265: no copy overlapped an engine run"
@@ -299,7 +306,11 @@ fn av1_pipeline_overlaps_copy_with_engine() {
     assert!(frames.len() >= 3, "av1: overlap needs three frames");
     let (phases, submits) = stats(&decoder, "av1");
     report("av1", "pipelined", wall, &phases, &submits);
-    assert!(submits.peak() > 1, "av1: submits ahead {}", submits.peak());
+    assert!(
+        submits.peak_inflight() > 1,
+        "av1: submits ahead {}",
+        submits.peak_inflight()
+    );
     assert!(
         phases.overlapped() > 0,
         "av1: no copy overlapped an engine run"

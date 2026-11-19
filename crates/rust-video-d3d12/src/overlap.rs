@@ -26,7 +26,7 @@ use crate::readback::{Done, Readback};
 use crate::submit::Ticket;
 
 use rust_video_caps::delivery::{
-    PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::SharedDevice;
@@ -665,8 +665,14 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             .front()
             .and_then(|front| front.video_signaled)
             .unwrap_or(signaled);
-        self.timings
-            .push(PhaseTiming::new(&output, video, signaled, signaled));
+        self.timings.push(PhaseTiming::new(
+            output.generation,
+            output.submit_cpu,
+            video.saturating_duration_since(output.video_submit),
+            signaled.saturating_duration_since(output.copy_submit),
+            output.video_submit,
+            signaled,
+        ));
         let export = self
             .session
             .as_ref()
@@ -720,8 +726,14 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             .front()
             .and_then(|front| front.video_signaled)
             .unwrap_or(signaled);
-        self.timings
-            .push(PhaseTiming::new(&output, video, signaled, signaled));
+        self.timings.push(PhaseTiming::new(
+            output.generation,
+            output.submit_cpu,
+            video.saturating_duration_since(output.video_submit),
+            signaled.saturating_duration_since(output.copy_submit),
+            output.video_submit,
+            signaled,
+        ));
         let frame = emit_frame(
             &self.shared,
             nv12,
@@ -1090,116 +1102,6 @@ struct PendingOutput {
     video_submit: Instant,
     /// CPU time behind the video submit.
     submit_cpu: Duration,
-}
-
-/// Phase-split timing behind one overlapped frame.
-#[derive(Clone, Copy, Debug)]
-pub struct PhaseTiming {
-    /// Frame generation number.
-    generation: u64,
-    /// CPU microseconds behind the video submit.
-    submit_us: u64,
-    /// Video submit time.
-    video_submit: Instant,
-    /// Video signal time, polled.
-    video_signaled: Instant,
-    /// Copy submit time.
-    copy_submit: Instant,
-    /// Copy signal time, polled.
-    copy_signaled: Instant,
-    /// Frame harvest time.
-    harvested: Instant,
-}
-
-impl PhaseTiming {
-    /// Timing behind `output` with observed signal times.
-    fn new(
-        output: &PendingOutput,
-        video_signaled: Instant,
-        copy_signaled: Instant,
-        harvested: Instant,
-    ) -> Self {
-        Self {
-            generation: output.generation,
-            submit_us: Self::micros(output.submit_cpu),
-            video_submit: output.video_submit,
-            video_signaled,
-            copy_submit: output.copy_submit,
-            copy_signaled,
-            harvested,
-        }
-    }
-
-    /// Whole microseconds behind `duration`, saturating.
-    fn micros(duration: Duration) -> u64 {
-        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-    }
-
-    /// Frame generation number.
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// CPU microseconds behind the video submit.
-    #[must_use]
-    pub fn submit_us(&self) -> u64 {
-        self.submit_us
-    }
-
-    /// Video submit time.
-    #[must_use]
-    pub fn video_submit(&self) -> Instant {
-        self.video_submit
-    }
-
-    /// Video signal time, polled.
-    #[must_use]
-    pub fn video_signaled(&self) -> Instant {
-        self.video_signaled
-    }
-
-    /// Copy submit time.
-    #[must_use]
-    pub fn copy_submit(&self) -> Instant {
-        self.copy_submit
-    }
-
-    /// Copy signal time, polled.
-    #[must_use]
-    pub fn copy_signaled(&self) -> Instant {
-        self.copy_signaled
-    }
-
-    /// Frame harvest time.
-    #[must_use]
-    pub fn harvested(&self) -> Instant {
-        self.harvested
-    }
-
-    /// Engine microseconds, video submit to signal.
-    #[must_use]
-    pub fn engine_us(&self) -> u64 {
-        Self::micros(
-            self.video_signaled
-                .saturating_duration_since(self.video_submit),
-        )
-    }
-
-    /// Copy microseconds, copy submit to signal.
-    #[must_use]
-    pub fn copy_us(&self) -> u64 {
-        Self::micros(
-            self.copy_signaled
-                .saturating_duration_since(self.copy_submit),
-        )
-    }
-
-    /// Frame latency microseconds, video submit to harvest.
-    #[must_use]
-    pub fn latency_us(&self) -> u64 {
-        Self::micros(self.harvested.saturating_duration_since(self.video_submit))
-    }
 }
 
 /// Submission plus display-order outputs behind one picture.

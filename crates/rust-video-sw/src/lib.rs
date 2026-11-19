@@ -5,8 +5,6 @@
 
 #[cfg(feature = "ffmpeg")]
 pub mod av1;
-#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
-pub mod delivery;
 pub mod error;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
@@ -31,8 +29,6 @@ pub mod x264;
 
 #[cfg(feature = "ffmpeg")]
 pub use av1::Av1Encoder;
-#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
-pub use delivery::DecoderPump;
 pub use error::SwError;
 #[cfg(feature = "ffmpeg")]
 pub use ffmpeg::{

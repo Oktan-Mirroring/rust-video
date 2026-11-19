@@ -4,7 +4,9 @@
 //! every drained output notes its completion, matched FIFO.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use rust_video_caps::delivery::PhaseTiming;
 
 /// Single non-blocking queue attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,69 +28,6 @@ struct PendingSubmit {
     submitted_at: Instant,
     /// Queue call duration in microseconds.
     submit_us: u64,
-}
-
-/// One frame split across submit, engine wait, and copy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhaseTiming {
-    /// Submission order.
-    seq: u64,
-    /// Input stamp in microseconds.
-    submitted_pts_us: u64,
-    /// Output stamp in microseconds.
-    completed_pts_us: i64,
-    /// Queue call duration in microseconds.
-    submit_us: u64,
-    /// Submit to output-ready in microseconds.
-    engine_wait_us: u64,
-    /// Output-to-surface conversion in microseconds.
-    copy_us: u64,
-}
-
-impl PhaseTiming {
-    /// Submission order.
-    #[must_use]
-    pub fn seq(&self) -> u64 {
-        self.seq
-    }
-
-    /// Input stamp in microseconds.
-    #[must_use]
-    pub fn submitted_pts_us(&self) -> u64 {
-        self.submitted_pts_us
-    }
-
-    /// Output stamp in microseconds.
-    #[must_use]
-    pub fn completed_pts_us(&self) -> i64 {
-        self.completed_pts_us
-    }
-
-    /// Queue call duration in microseconds.
-    #[must_use]
-    pub fn submit_us(&self) -> u64 {
-        self.submit_us
-    }
-
-    /// Submit to output-ready in microseconds.
-    #[must_use]
-    pub fn engine_wait_us(&self) -> u64 {
-        self.engine_wait_us
-    }
-
-    /// Output-to-surface conversion in microseconds.
-    #[must_use]
-    pub fn copy_us(&self) -> u64 {
-        self.copy_us
-    }
-
-    /// Submit plus engine wait plus copy in microseconds.
-    #[must_use]
-    pub fn total_us(&self) -> u64 {
-        self.submit_us
-            .saturating_add(self.engine_wait_us)
-            .saturating_add(self.copy_us)
-    }
 }
 
 /// Bounded in-flight submissions plus per-frame phase timings.
@@ -218,14 +157,17 @@ impl PipelineLedger {
         if self.timings.len() >= Self::MAX_TIMINGS {
             self.timings.pop_front();
         }
-        self.timings.push_back(PhaseTiming {
-            seq: submit.seq,
-            submitted_pts_us: submit.pts_us,
-            completed_pts_us,
-            submit_us: submit.submit_us,
-            engine_wait_us: Self::elapsed_us(submit.submitted_at),
-            copy_us,
-        });
+        self.timings.push_back(
+            PhaseTiming::new(
+                submit.seq,
+                Duration::from_micros(submit.submit_us),
+                submit.submitted_at.elapsed(),
+                Duration::from_micros(copy_us),
+                submit.submitted_at,
+                Instant::now(),
+            )
+            .with_pts(submit.pts_us, completed_pts_us),
+        );
     }
 
     /// Queued inputs dropped; codec flush voids them.
@@ -265,10 +207,10 @@ mod tests {
             let timing = ledger.timings()[usize::try_from(seq).expect("small seq")];
             assert_eq!(timing.seq(), seq);
             assert_eq!(
-                timing.submitted_pts_us(),
+                timing.submitted_pts_us().expect("stamped"),
                 u64::try_from(pts).expect("small pts")
             );
-            assert_eq!(timing.completed_pts_us(), pts);
+            assert_eq!(timing.completed_pts_us().expect("stamped"), pts);
             assert_eq!(timing.submit_us(), 5);
             assert_eq!(timing.copy_us(), 7);
             assert_eq!(

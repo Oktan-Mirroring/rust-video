@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
-    OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump, PhaseTiming,
+    OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump,
 };
 
 use bytes::Bytes;
 use rust_video_caps::delivery::{
-    PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
@@ -243,9 +243,9 @@ fn print_phase_table(name: &str, timings: &[PhaseTiming]) {
     for timing in timings {
         println!(
             "{name} frame {}: {} {} {} {}",
-            timing.generation(),
+            timing.seq(),
             timing.submit_us(),
-            timing.engine_us(),
+            timing.engine_wait_us(),
             timing.copy_us(),
             timing.latency_us()
         );
@@ -254,7 +254,7 @@ fn print_phase_table(name: &str, timings: &[PhaseTiming]) {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for timing in timings {
         submit.push(timing.submit_us());
-        engine.push(timing.engine_us());
+        engine.push(timing.engine_wait_us());
         copy.push(timing.copy_us());
         latency.push(timing.latency_us());
     }
@@ -295,16 +295,8 @@ fn overlap_matches_sync_bytes() {
     assert_eq!(one.timings.len(), PICTURES);
     assert_eq!(four.timings.len(), PICTURES);
     for index in 0..PICTURES {
-        assert_eq!(
-            one.timings[index].generation(),
-            index as u64,
-            "bound-1 order"
-        );
-        assert_eq!(
-            four.timings[index].generation(),
-            index as u64,
-            "bound-4 order"
-        );
+        assert_eq!(one.timings[index].seq(), index as u64, "bound-1 order");
+        assert_eq!(four.timings[index].seq(), index as u64, "bound-4 order");
         assert_eq!(
             one.frames[index], sync.frames[index],
             "bound-1 frame {index} bytes"
@@ -352,12 +344,12 @@ fn overlap_observes_depth_above_one() {
     let mut best_us = 0u128;
     for pair in run.timings.windows(2) {
         let (first, second) = (&pair[0], &pair[1]);
-        if second.video_submit() < first.copy_signaled() {
+        if second.submitted_at() < first.collected_at() {
             overlaps += 1;
             best_us = best_us.max(
                 first
-                    .copy_signaled()
-                    .duration_since(second.video_submit())
+                    .collected_at()
+                    .duration_since(second.submitted_at())
                     .as_micros(),
             );
         }

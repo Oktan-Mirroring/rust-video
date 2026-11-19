@@ -1,7 +1,7 @@
 //! Decoded frame: NV12 bytes with identity, lease, and export.
 
 use bytes::Bytes;
-use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame};
 use rust_video_caps::traits::Lease;
 
 /// Shared-texture export behind one decoded frame.
@@ -56,21 +56,7 @@ impl D3d11Frame {
     /// CPU copy split into NV12 planes.
     #[must_use]
     pub fn to_cpu(&self) -> Option<CpuFrame> {
-        let size = self.identity.size();
-        let luma = u64::from(size.width()) * u64::from(size.height());
-        let y_len = usize::try_from(luma).ok()?;
-        let uv_len = y_len / 2;
-        if self.data.len() < y_len + uv_len {
-            return None;
-        }
-        let y = self.data.slice(..y_len);
-        let uv = self.data.slice(y_len..y_len + uv_len);
-        let stride = size.width();
-        CpuFrame::new(
-            size,
-            PixelFormat::Nv12,
-            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
-        )
+        CpuFrame::from_nv12(self.identity.size(), &self.data)
     }
 }
 

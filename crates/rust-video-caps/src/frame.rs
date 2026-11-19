@@ -113,6 +113,34 @@ impl CpuFrame {
         })
     }
 
+    /// NV12 frame of `size` split from tight `data`.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - picture dimensions in luma samples.
+    /// * `data` - tight NV12 bytes in row-major order.
+    ///
+    /// # Returns
+    ///
+    /// `None` when `data` holds fewer bytes than `size` needs.
+    #[must_use]
+    pub fn from_nv12(size: PictureSize, data: &Bytes) -> Option<Self> {
+        let luma = u64::from(size.width()) * u64::from(size.height());
+        let y_len = usize::try_from(luma).ok()?;
+        let uv_len = y_len / 2;
+        if data.len() < y_len + uv_len {
+            return None;
+        }
+        let y = data.slice(..y_len);
+        let uv = data.slice(y_len..y_len + uv_len);
+        let stride = size.width();
+        Self::new(
+            size,
+            PixelFormat::Nv12,
+            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
+        )
+    }
+
     /// Picture dimensions in luma samples.
     #[must_use]
     pub fn size(&self) -> PictureSize {
@@ -416,6 +444,24 @@ mod tests {
     fn cpu_frame_rejects_plane_count_mismatch() {
         assert!(CpuFrame::new(size(), PixelFormat::Nv12, vec![plane()]).is_none());
         assert!(CpuFrame::new(size(), PixelFormat::Rgba8, vec![plane(), plane()]).is_none());
+    }
+
+    #[test]
+    fn from_nv12_splits_planes() {
+        let size = PictureSize::new(4, 2).expect("valid size");
+        let mut data = vec![1; 8];
+        data.extend_from_slice(&[2; 4]);
+        let frame = CpuFrame::from_nv12(size, &Bytes::from(data)).expect("full nv12");
+        assert_eq!(frame.format(), PixelFormat::Nv12);
+        assert_eq!(frame.planes().len(), 2);
+        assert_eq!(frame.planes()[0].data(), &[1; 8]);
+        assert_eq!(frame.planes()[1].data(), &[2; 4]);
+    }
+
+    #[test]
+    fn from_nv12_rejects_truncated_bytes() {
+        let size = PictureSize::new(4, 2).expect("valid size");
+        assert!(CpuFrame::from_nv12(size, &Bytes::from(vec![0; 11])).is_none());
     }
 
     #[test]

@@ -15,7 +15,9 @@ use crate::raw::{
     VideoSession,
 };
 use crate::session::geometry::SessionGeometry;
-use crate::session::slots::{SubmitSlots, SubmitStats, SUBMIT_SLOTS};
+use crate::session::slots::{SubmitSlots, SUBMIT_SLOTS};
+
+use rust_video_caps::delivery::SubmitStats;
 
 /// Bitstream staging size in bytes: the largest access unit the session takes.
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
@@ -414,9 +416,19 @@ impl Session {
         self.submit.stats()
     }
 
+    /// Submits since the last take, zeroing the counter.
+    pub(crate) fn take_submitted(&mut self) -> u64 {
+        self.submit.take_submitted()
+    }
+
     /// Resets since the last take, zeroing the counter.
     pub(crate) fn take_resets(&mut self) -> u64 {
         self.submit.take_resets()
+    }
+
+    /// Driver creates since the last take, zeroing the counter.
+    pub(crate) fn take_creates(&mut self) -> u64 {
+        self.submit.take_creates()
     }
 
     /// Fail the next submit once, exercising the reset path.

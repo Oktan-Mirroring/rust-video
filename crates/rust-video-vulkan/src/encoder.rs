@@ -1,6 +1,7 @@
 //! GOP encode behind the caps `Encoder` trait.
 
 use bytes::Bytes;
+use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
@@ -11,7 +12,6 @@ use crate::device::VulkanDevice;
 use crate::error::VulkanError;
 use crate::ladder::CodecOp;
 use crate::session::encode::{EncodeCodec, EncodeSession, PictureStamp};
-use crate::session::slots::SubmitStats;
 
 /// H.264 frame-number modulus: `log2_max_frame_num_minus4` is 0.
 const MAX_FRAME_NUM: u16 = 16;

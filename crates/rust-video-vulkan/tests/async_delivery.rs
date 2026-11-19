@@ -2,13 +2,13 @@
 //!
 //! Skips without hardware; fails when the contract breaks.
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets};
 use rust_video_vulkan::{
-    Av1Decoder, CodecOp, DecoderPump, H264Decoder, H265Decoder, ParseError, VulkanDevice,
-    VulkanError, VulkanFrame,
+    Av1Decoder, CodecOp, H264Decoder, H265Decoder, ParseError, VulkanDevice, VulkanError,
+    VulkanFrame,
 };
 
 /// Device for `op`, skipping loud when the tier declines.

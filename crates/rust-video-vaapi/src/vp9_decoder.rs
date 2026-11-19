@@ -93,7 +93,7 @@ impl<'a> Vp9Decoder<'a> {
 
     /// Submit gauges of the live context, absent before the first frame.
     #[must_use]
-    pub fn submit_stats(&self) -> Option<crate::backend::SubmitStats> {
+    pub fn submit_stats(&self) -> Option<rust_video_caps::delivery::SubmitStats> {
         self.backend.as_ref().map(Backend::stats)
     }
 

@@ -4,13 +4,11 @@
 
 #![cfg(target_os = "linux")]
 
-use rust_video_caps::delivery::{DropPolicy, ReceiveFrames};
+use rust_video_caps::delivery::{DecoderPump, DropPolicy, ReceiveFrames};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets};
-use rust_video_vaapi::{
-    Av1Decoder, DecoderPump, H264Decoder, H265Decoder, VaApiDevice, VaApiError, VaApiFrame,
-};
+use rust_video_vaapi::{Av1Decoder, H264Decoder, H265Decoder, VaApiDevice, VaApiError, VaApiFrame};
 
 /// Open device, loud skip without hardware.
 fn device(name: &str) -> Option<VaApiDevice> {

@@ -20,7 +20,7 @@ use crate::sys;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, DmaBufPlane, GpuExport, GpuFrame, PixelFormat, Plane};
+use rust_video_caps::frame::{CpuFrame, DmaBufPlane, GpuExport, GpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
@@ -109,7 +109,7 @@ impl<'a> H264Decoder<'a> {
 
     /// Submit gauges of the live context, absent before the first sequence set.
     #[must_use]
-    pub fn submit_stats(&self) -> Option<crate::backend::SubmitStats> {
+    pub fn submit_stats(&self) -> Option<rust_video_caps::delivery::SubmitStats> {
         self.backend.as_ref().map(Backend::stats)
     }
 
@@ -853,21 +853,7 @@ impl VaApiFrame {
     /// CPU copy split into NV12 planes.
     #[must_use]
     pub fn to_cpu(&self) -> Option<CpuFrame> {
-        let size = self.identity.size();
-        let luma = u64::from(size.width()) * u64::from(size.height());
-        let y_len = usize::try_from(luma).ok()?;
-        let uv_len = y_len / 2;
-        if self.data.len() < y_len + uv_len {
-            return None;
-        }
-        let y = self.data.slice(..y_len);
-        let uv = self.data.slice(y_len..y_len + uv_len);
-        let stride = size.width();
-        CpuFrame::new(
-            size,
-            PixelFormat::Nv12,
-            vec![Plane::new(y, stride)?, Plane::new(uv, stride)?],
-        )
+        CpuFrame::from_nv12(self.identity.size(), &self.data)
     }
 }
 
