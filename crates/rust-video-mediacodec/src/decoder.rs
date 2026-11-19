@@ -12,6 +12,7 @@ use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
+use rust_video_core::micros;
 
 /// Decoder lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,9 +195,7 @@ impl MediaCodecDecoder {
     /// Presentation time in microseconds; unstamped packets read zero.
     #[must_use]
     pub fn pts_us(packet: &Packet) -> u64 {
-        packet
-            .pts()
-            .map_or(0, |pts| u64::try_from(pts.as_micros()).unwrap_or(u64::MAX))
+        packet.pts().map_or(0, micros)
     }
 
     /// Surfaces decoded from `packet`, possibly none.

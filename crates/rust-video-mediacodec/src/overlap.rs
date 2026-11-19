@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rust_video_caps::delivery::PhaseTiming;
+use rust_video_core::micros;
 
 /// Single non-blocking queue attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,7 +86,7 @@ impl PipelineLedger {
     /// * `since` - phase start.
     #[must_use]
     pub fn elapsed_us(since: Instant) -> u64 {
-        u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
+        micros(since.elapsed())
     }
 
     /// In-flight ceiling.

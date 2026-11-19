@@ -10,6 +10,7 @@ use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
+use rust_video_core::planes;
 
 /// Codec carried by an encode spec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -532,27 +533,23 @@ impl InputLayout {
 
     /// Plane stride after the stride and length checks.
     fn checked_stride(plane: &Plane, width: u32, height: u32) -> Result<usize, MediaCodecError> {
-        if plane.stride() < width {
-            return Err(MediaCodecError::BufferRange {
-                offset: 0,
-                size: i32::try_from(width).unwrap_or(i32::MAX),
-                len: usize::try_from(plane.stride()).unwrap_or(usize::MAX),
-            });
-        }
-        let stride = usize::try_from(plane.stride()).unwrap_or(usize::MAX);
-        let row = usize::try_from(width).unwrap_or(usize::MAX);
-        let rows = usize::try_from(height).unwrap_or(usize::MAX);
-        let needed = stride
-            .saturating_mul(rows.saturating_sub(1))
-            .saturating_add(row);
-        if plane.data().len() < needed {
-            return Err(MediaCodecError::BufferRange {
-                offset: 0,
-                size: i32::try_from(needed).unwrap_or(i32::MAX),
-                len: plane.data().len(),
-            });
-        }
-        Ok(stride)
+        planes::check_plane(plane.data(), plane.stride(), width, height).map_err(|fault| {
+            match fault {
+                planes::PlaneFault::StrideBelowWidth { stride, width } => {
+                    MediaCodecError::BufferRange {
+                        offset: 0,
+                        size: i32::try_from(width).unwrap_or(i32::MAX),
+                        len: usize::try_from(stride).unwrap_or(usize::MAX),
+                    }
+                }
+                planes::PlaneFault::ShortOfStride { need, len } => MediaCodecError::BufferRange {
+                    offset: 0,
+                    size: i32::try_from(need).unwrap_or(i32::MAX),
+                    len,
+                },
+            }
+        })?;
+        Ok(usize::try_from(plane.stride()).unwrap_or(usize::MAX))
     }
 }
 
