@@ -13,6 +13,7 @@ mod content;
 mod d3d11;
 #[cfg(all(target_os = "windows", feature = "d3d12"))]
 mod d3d12;
+mod driver;
 mod ffmpeg;
 mod measure;
 mod sw;
@@ -20,6 +21,7 @@ mod sw;
 mod vulkan;
 
 use content::{Clip, Codec, Op};
+use driver::Pipeline;
 
 /// Combo outcome: timed runs or a named decline.
 pub enum Outcome {
@@ -151,10 +153,13 @@ fn run_vulkan(backend: Option<&str>, codecs: &[Codec], ops: &[Op]) {
     if !wanted(backend, "vulkan") {
         return;
     }
-    if let Err(error) = vulkan::Backend::open() {
-        println!("vulkan: declined: {error}");
-        return;
-    }
+    let backend = match vulkan::Backend::open() {
+        Ok(backend) => backend,
+        Err(error) => {
+            println!("vulkan: declined: {error}");
+            return;
+        }
+    };
     for codec in codecs {
         let clip = match Clip::load(*codec) {
             Ok(clip) => clip,
@@ -164,12 +169,7 @@ fn run_vulkan(backend: Option<&str>, codecs: &[Codec], ops: &[Op]) {
             }
         };
         for op in ops {
-            report(
-                "vulkan",
-                *codec,
-                *op,
-                vulkan::Backend::run(*codec, *op, &clip),
-            );
+            report("vulkan", *codec, *op, backend.run(*codec, *op, &clip));
         }
     }
 }
@@ -187,10 +187,13 @@ fn run_sw(backend: Option<&str>, codecs: &[Codec], ops: &[Op]) {
     if !wanted(backend, "sw") {
         return;
     }
-    if let Err(error) = sw::Backend::open() {
-        println!("sw: declined: {error}");
-        return;
-    }
+    let backend = match sw::Backend::open() {
+        Ok(backend) => backend,
+        Err(error) => {
+            println!("sw: declined: {error}");
+            return;
+        }
+    };
     for codec in codecs {
         let clip = match Clip::load(*codec) {
             Ok(clip) => clip,
@@ -200,7 +203,7 @@ fn run_sw(backend: Option<&str>, codecs: &[Codec], ops: &[Op]) {
             }
         };
         for op in ops {
-            report("sw", *codec, *op, sw::Backend::run(*codec, *op, &clip));
+            report("sw", *codec, *op, backend.run(*codec, *op, &clip));
         }
     }
 }

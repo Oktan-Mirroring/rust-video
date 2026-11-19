@@ -89,9 +89,10 @@ impl Backend {
             Err(error) => Err(error.to_string()),
         }
     }
+}
 
-    /// Decode, clear chroma on the GPU, re-encode: median of 5.
-    pub fn run(codec: Codec, op: Op, clip: &Clip) -> Outcome {
+impl crate::driver::Pipeline for Backend {
+    fn run(&self, codec: Codec, op: Op, clip: &Clip) -> Outcome {
         if op != Op::Gray {
             return Outcome::Declined(
                 "vulkan covers grayscale in place; downscale needs frame wrap".to_owned(),
@@ -114,7 +115,9 @@ impl Backend {
             note: first,
         }
     }
+}
 
+impl Backend {
     /// One validated pass plus the combo note, or the decline reason.
     fn preflight(codec: Codec, op: Op, packets: &[Packet]) -> Result<String, String> {
         let (decode_device, encode_device) = Self::devices(codec)?;

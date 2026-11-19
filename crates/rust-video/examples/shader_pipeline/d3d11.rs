@@ -5,9 +5,8 @@
 
 use std::mem::ManuallyDrop;
 
-use crate::content::{Clip, Codec, Op};
-use crate::measure::{median_of_5, Sample};
-use crate::Outcome;
+use crate::content::{Codec, Op};
+use crate::driver::surface::{DecodeSurface, DrainEncoder, SurfacePipeline};
 
 use rust_video::Encoder;
 use rust_video::Packet;
@@ -42,7 +41,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 const GRAY_CSO: &[u8] = include_bytes!("shaders/gray_cs.cso");
 
 /// GPU filter behind one combo.
-enum Filter {
+pub(crate) enum Filter {
     /// Compute grayscale at full extent.
     Gray(Gray),
     /// Video-process downscale, colorspace, or crop.
@@ -50,7 +49,7 @@ enum Filter {
 }
 
 /// Decode source behind one combo.
-enum Source<'a> {
+pub(crate) enum Source<'a> {
     /// H.264 decoder.
     H264(Box<H264Decoder<'a>>),
     /// HEVC decoder.
@@ -83,8 +82,9 @@ impl Filter {
     }
 }
 
-impl Source<'_> {
-    /// Surfaces decoded from `packet`, possibly none.
+impl DecodeSurface for Source<'_> {
+    type Surface = GpuSurface;
+
     fn decode(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, String> {
         match self {
             Self::H264(decoder) => decoder.decode_surface(packet).map_err(err),
@@ -94,7 +94,6 @@ impl Source<'_> {
         }
     }
 
-    /// Surfaces held back for reordering or buffering.
     fn flush(&mut self) -> Result<Vec<GpuSurface>, String> {
         match self {
             Self::H264(decoder) => decoder.flush_surface().map_err(err),
@@ -102,6 +101,12 @@ impl Source<'_> {
             Self::Vp9(decoder) => decoder.flush_surface().map_err(err),
             Self::Av1(decoder) => decoder.flush_surface().map_err(err),
         }
+    }
+}
+
+impl DrainEncoder for D3d11Encoder {
+    fn drain(&mut self) -> Result<Vec<Packet>, String> {
+        self.flush().map_err(err)
     }
 }
 
@@ -122,111 +127,31 @@ impl Backend {
             .map(|device| Self { device })
             .map_err(err)
     }
+}
 
-    /// Decode, filter on the GPU, re-encode: median of 5.
-    pub fn run(&self, codec: Codec, op: Op, clip: &Clip) -> Outcome {
-        let packets = clip.packets();
-        let first = match self.preflight(codec, op, &packets) {
-            Ok(first) => first,
-            Err(error) => return Outcome::Declined(error),
-        };
-        let (fps, spread, frames, reran) = median_of_5(|| self.pass(codec, op, &packets));
-        Outcome::Ran {
-            fps,
-            spread,
-            frames,
-            reran,
-            note: first,
-        }
+impl SurfacePipeline for Backend {
+    type Surface = GpuSurface;
+    type Source<'s> = Source<'s>;
+    type Filter<'s> = Filter;
+    type Encoder<'s> = D3d11Encoder;
+
+    fn name(&self) -> &'static str {
+        "d3d11"
     }
 
-    /// One validated pass plus the combo note, or the decline reason.
-    fn preflight(&self, codec: Codec, op: Op, packets: &[Packet]) -> Result<String, String> {
-        let mut source = self.source(codec);
-        let mut filter = Filter::open(&self.device, op)?;
-        let mut encoder = self.encoder(codec)?;
-        let note = Self::note(codec, &encoder);
-        let mut surfaces = 0;
-        let mut out = Vec::new();
-        for packet in packets {
-            let decoded = source.decode(packet)?;
-            surfaces += decoded.len();
-            for surface in &decoded {
-                self.encode_surface(&mut filter, &mut encoder, surface, &mut out)?;
-            }
-        }
-        for surface in &source.flush()? {
-            surfaces += 1;
-            self.encode_surface(&mut filter, &mut encoder, surface, &mut out)?;
-        }
-        for packet in encoder.flush().map_err(err)? {
-            out.extend_from_slice(packet.data());
-        }
-        if surfaces == 0 {
-            return Err("decoder emitted no surfaces".to_owned());
-        }
-        if out.is_empty() {
-            return Err("encoder emitted no bytes".to_owned());
-        }
-        crate::dump("d3d11", codec, op, ext(encoder.codec()), &out);
-        Ok(format!("{note}, {surfaces} surfaces, {} bytes", out.len()))
-    }
-
-    /// One timed pass; failures score zero frames.
-    fn pass(&self, codec: Codec, op: Op, packets: &[Packet]) -> Sample {
-        let mut source = self.source(codec);
-        let Ok(mut filter) = Filter::open(&self.device, op) else {
-            return Sample {
-                frames: 0,
-                fps: 0.0,
-            };
-        };
-        let Ok(mut encoder) = self.encoder(codec) else {
-            return Sample {
-                frames: 0,
-                fps: 0.0,
-            };
-        };
-        let start = std::time::Instant::now();
-        let mut frames = 0;
-        let mut out = Vec::new();
-        for packet in packets {
-            let Ok(decoded) = source.decode(packet) else {
-                return Sample {
-                    frames: 0,
-                    fps: 0.0,
-                };
-            };
-            for surface in &decoded {
-                if self
-                    .encode_surface(&mut filter, &mut encoder, surface, &mut out)
-                    .is_err()
-                {
-                    return Sample {
-                        frames: 0,
-                        fps: 0.0,
-                    };
-                }
-            }
-            out.clear();
-            frames += decoded.len();
-        }
-        let elapsed = start.elapsed().as_secs_f64();
-        let fps = f64::from(u32::try_from(frames).unwrap_or(u32::MAX)) / elapsed.max(1e-9);
-        Sample { frames, fps }
-    }
-
-    /// Decode source for `codec`.
-    fn source(&self, codec: Codec) -> Source<'_> {
-        match codec {
+    fn source(&self, codec: Codec) -> Result<Source<'_>, String> {
+        Ok(match codec {
             Codec::H264 => Source::H264(Box::new(H264Decoder::open(&self.device))),
             Codec::H265 => Source::Hevc(Box::new(HevcDecoder::open(&self.device))),
             Codec::Vp9 => Source::Vp9(Box::new(Vp9Decoder::open(&self.device))),
             Codec::Av1 => Source::Av1(Box::new(Av1Decoder::open(&self.device))),
-        }
+        })
     }
 
-    /// GPU-bound encoder: same codec, else H.264.
+    fn filter(&self, op: Op) -> Result<Filter, String> {
+        Filter::open(&self.device, op)
+    }
+
     fn encoder(&self, codec: Codec) -> Result<D3d11Encoder, String> {
         let tier = match codec {
             Codec::H264 => TierCodec::H264,
@@ -249,7 +174,6 @@ impl Backend {
         }
     }
 
-    /// Combo note: encode codec, MFT, bind.
     fn note(codec: Codec, encoder: &D3d11Encoder) -> String {
         let target = match encoder.codec() {
             TierCodec::H264 => "h264",
@@ -261,7 +185,10 @@ impl Backend {
         format!("{}->{target} via {}", codec.name(), encoder.mft_name())
     }
 
-    /// Coded bytes for one filtered `surface` into `out`.
+    fn ext(encoder: &D3d11Encoder) -> &'static str {
+        ext(encoder.codec())
+    }
+
     fn encode_surface(
         &self,
         filter: &mut Filter,
@@ -281,7 +208,7 @@ impl Backend {
 }
 
 /// Compute grayscale over one extent.
-struct Gray {
+pub(crate) struct Gray {
     /// Compiled grayscale shader.
     shader: ID3D11ComputeShader,
     /// NV12 target texture.
@@ -354,7 +281,7 @@ impl Gray {
 }
 
 /// Video-process filter over one source and target extent.
-struct Vproc {
+pub(crate) struct Vproc {
     /// Processor, views, and target behind the blt.
     state: VprocState,
     /// Operation behind the rects and colorspaces.
@@ -399,7 +326,7 @@ impl Vproc {
 }
 
 /// Processor, views, and target behind one geometry.
-struct VprocState {
+pub(crate) struct VprocState {
     /// Video processor behind the blt.
     processor: ID3D11VideoProcessor,
     /// Enumerator behind the views.

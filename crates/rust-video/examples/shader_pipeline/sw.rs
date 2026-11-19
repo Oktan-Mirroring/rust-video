@@ -32,9 +32,10 @@ impl Backend {
         }
         Ok(Self)
     }
+}
 
-    /// Decode, filter on the CPU, re-encode: median of 5.
-    pub fn run(codec: Codec, op: Op, clip: &Clip) -> Outcome {
+impl crate::driver::Pipeline for Backend {
+    fn run(&self, codec: Codec, op: Op, clip: &Clip) -> Outcome {
         let vector = vector(codec);
         let Some(vector) = vector else {
             return Outcome::Declined("no bench vector".to_owned());
@@ -60,7 +61,9 @@ impl Backend {
             note: format!("cpu {} {frames}f, {}", op.name(), encoder(codec)),
         }
     }
+}
 
+impl Backend {
     /// One decode, filter, encode pass.
     fn pass(
         codec: Codec,
