@@ -37,6 +37,20 @@ benches:
     cargo test -p rust-video-sw --features h264-openh264 --test throughput
     cargo test -p rust-video-livepack --test throughput
 
+# Release throughput headline, one binary at a time: same legs as benches
+# with --release. Debug benches stay the enforced CI floor (see ci).
+benches-release:
+    {{python}} scripts/check-bench-legs.py
+    cargo test --release -p rust-video-d3d11 --test throughput
+    cargo test --release -p rust-video-d3d11 --test throughput -- --ignored --exact encode_vp9_1080p_measures_realtime
+    cargo test --release -p rust-video-d3d12 --test throughput
+    cargo test --release -p rust-video-vulkan --test throughput
+    cargo test --release -p rust-video-vaapi --test throughput
+    cargo test --release -p rust-video-mediacodec --test throughput
+    cargo test --release -p rust-video-sw --test throughput
+    cargo test --release -p rust-video-sw --features h264-openh264 --test throughput
+    cargo test --release -p rust-video-livepack --test throughput
+
 # Debug build of the workspace.
 build:
     cargo build --workspace
