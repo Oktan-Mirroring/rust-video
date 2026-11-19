@@ -23,7 +23,8 @@ use ash::vk::native::{
     StdVideoH265VpsFlags,
 };
 
-use crate::dpb::{H265Picture, SlotBook};
+use super::dpb::H265Picture;
+use crate::dpb::SlotBook;
 use crate::error::ParseError;
 use crate::h265::{
     HrdLayerData, HrdParams, Pps, ProfileTierLevel, ScalingLists, ShortTermRps, Sps, Vps,
@@ -944,8 +945,9 @@ fn narrow_len(value: usize, syntax: &'static str) -> Result<u8, ParseError> {
 #[cfg(test)]
 mod tests {
     use crate::au::{AccessUnit, AuSplitter};
-    use crate::dpb::{H265Context, H265Instruction, ReferenceId, SlotBook};
+    use crate::dpb::{ReferenceId, SlotBook};
     use crate::fixtures::{hex, split265};
+    use crate::h265::dpb::{H265Context, H265Instruction};
     use crate::h265::{H265Parser, ParsedNalu};
 
     /// Fork `demo.h265` video set.

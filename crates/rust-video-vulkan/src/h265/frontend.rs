@@ -389,7 +389,7 @@ mod tests {
 
     use super::{H265Parser, ParsedNalu, SliceType};
     use crate::fixtures::{hex, split265};
-    use crate::session::std_h265::fill_rps;
+    use crate::h265::params::fill_rps;
 
     /// First NAL units of the fork `demo.h265` vector.
     const DEMO_VPS: &str = "40010c01ffff01600000030090000003000003003c92809000";

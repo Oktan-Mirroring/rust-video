@@ -497,8 +497,8 @@ fn narrow_u8(value: u32, syntax: &'static str) -> Result<u8, ParseError> {
 #[cfg(test)]
 mod tests {
     use crate::au::{AccessUnit, AuSplitter};
-    use crate::dpb::{H264Context, H264Instruction};
     use crate::fixtures::{hex, split264};
+    use crate::h264::dpb::{H264Context, H264Instruction};
     use crate::h264::{H264Parser, ParsedNalu};
 
     /// Fork `demo.h264` sequence set.
