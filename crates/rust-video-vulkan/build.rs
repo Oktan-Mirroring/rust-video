@@ -13,6 +13,7 @@ fn main() {
         },
         PathBuf::from,
     );
+    println!("cargo::rerun-if-changed={}", root.display());
     if root.is_dir() {
         println!("cargo::rustc-cfg=have_corpus");
     } else if env_root.is_some() {
