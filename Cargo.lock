@@ -312,6 +312,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rust-video"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bytes",
  "rust-video-av1",
  "rust-video-av2",
@@ -325,6 +326,7 @@ dependencies = [
  "rust-video-vaapi",
  "rust-video-vp9",
  "rust-video-vulkan",
+ "windows",
 ]
 
 [[package]]

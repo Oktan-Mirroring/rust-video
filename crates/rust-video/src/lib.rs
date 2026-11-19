@@ -8,6 +8,7 @@ pub mod tier;
 pub use error::Error;
 pub use tier::{Capabilities, Platform, SoftwareH265, Tier, TierError, TierPreference, VideoCodec};
 
+pub use rust_video_caps::common::PictureSize;
 pub use rust_video_caps::frame::{
     CpuFrame, CpuReadback, FramePool, GpuExport, GpuFrame, PixelFormat, Plane,
 };
