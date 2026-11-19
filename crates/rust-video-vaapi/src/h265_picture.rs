@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::h265::{is_bla, is_cra, is_idr, is_irap, is_radl, is_rasl, is_slnr, SliceHeader};
+use crate::h265::{anchors_tid0, is_bla, is_cra, is_idr, is_irap, is_rasl, SliceHeader, Sps};
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Reference {
@@ -59,13 +59,12 @@ impl PictureData {
         temporal_id: u8,
         first_picture_in_bitstream: bool,
         first_picture_after_eos: bool,
-        prev_tid0_pic: Option<&PictureData>,
-        max_pic_order_cnt_lsb: i32,
+        prev_tid0_poc: Option<i32>,
+        sps: &Sps,
     ) -> Self {
         // We assume HandleCraAsBlafFLag == 0, as it is only set through
         // external means, which we do not provide.
 
-        let mut pic_order_cnt_msb = 0;
         let slice_pic_order_cnt_lsb: i32 = header.poc_lsb.unwrap_or(0).cast_signed();
         let pic_output_flag = header.pic_output;
         let no_output_of_prior_pics_flag = header.no_output_prior;
@@ -90,25 +89,12 @@ impl PictureData {
 
         // Compute the Picture Order Count. See 8.3.1 Decoding Process for
         // Picture Order Count
-        if !(is_irap(nalu_type) && no_rasl_output_flag) {
-            if let Some(prev_tid0_pic) = prev_tid0_pic {
-                // Equation (8-1)
-                let prev_pic_order_cnt_lsb = prev_tid0_pic.slice_pic_order_cnt_lsb;
-                if (slice_pic_order_cnt_lsb < prev_pic_order_cnt_lsb)
-                    && (prev_pic_order_cnt_lsb - slice_pic_order_cnt_lsb)
-                        >= (max_pic_order_cnt_lsb / 2)
-                {
-                    pic_order_cnt_msb = prev_tid0_pic.pic_order_cnt_msb + max_pic_order_cnt_lsb;
-                } else if (slice_pic_order_cnt_lsb > prev_pic_order_cnt_lsb)
-                    && (slice_pic_order_cnt_lsb - prev_pic_order_cnt_lsb)
-                        > (max_pic_order_cnt_lsb / 2)
-                {
-                    pic_order_cnt_msb = prev_tid0_pic.pic_order_cnt_msb - max_pic_order_cnt_lsb;
-                } else {
-                    pic_order_cnt_msb = prev_tid0_pic.pic_order_cnt_msb;
-                }
-            }
-        }
+        let reset_msb = is_irap(nalu_type) && no_rasl_output_flag;
+        let pic_order_cnt_val = sps
+            .poc_from_lsb(prev_tid0_poc, header.poc_lsb.unwrap_or(0), reset_msb)
+            .unwrap_or(0);
+        // Equation (8-2), solved for the most significant bits.
+        let pic_order_cnt_msb = pic_order_cnt_val - slice_pic_order_cnt_lsb;
 
         // Compute whether this picture will be a valid prevTid0Pic, i.e.:
         //
@@ -117,8 +103,7 @@ impl PictureData {
         //
         // Use this flag to correctly set up the field in the decoder during
         // `finish_picture`.
-        let valid_for_prev_tid0_pic =
-            temporal_id == 0 && !is_radl(nalu_type) && !is_rasl(nalu_type) && !is_slnr(nalu_type);
+        let valid_for_prev_tid0_pic = anchors_tid0(nalu_type, temporal_id);
 
         let no_output_of_prior_pics_flag =
             if is_irap(nalu_type) && no_rasl_output_flag && !first_picture_in_bitstream {
@@ -141,8 +126,7 @@ impl PictureData {
             },
             slice_pic_order_cnt_lsb,
             pic_order_cnt_msb,
-            // Equation (8-2)
-            pic_order_cnt_val: pic_order_cnt_msb + slice_pic_order_cnt_lsb,
+            pic_order_cnt_val,
             reference: Reference::default(),
             pic_latency_cnt: 0,
             short_term_ref_pic_set_size_bits: u32::from(st_rps_bits),

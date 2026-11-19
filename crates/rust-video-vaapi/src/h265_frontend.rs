@@ -396,8 +396,8 @@ pub struct Frontend {
     pending: Vec<PendingSlice>,
     /// Sets of the open picture.
     pending_sets: Option<(Rc<Sps>, Rc<Pps>)>,
-    /// Previous temporal-zero picture, for order counts.
-    prev_tid0: Option<PictureData>,
+    /// Previous temporal-zero POC, for order counts.
+    prev_tid0: Option<i32>,
     /// True before the first picture of the stream.
     first_in_bitstream: bool,
     /// True after an end-of-sequence NAL.
@@ -542,7 +542,7 @@ impl Frontend {
                 continue;
             };
             let body = &nal[2..];
-            match (header[0] >> 1) & 0x3F {
+            match crate::h265::nal_unit_type(header[0]) {
                 32 => {
                     let rbsp = rbsp(body);
                     parse_vps::<VaApiError>(&rbsp)?;
@@ -677,8 +677,8 @@ impl Frontend {
         if layer_id != 0 {
             return Err(VaApiError::Unsupported("multilayer".to_owned()));
         }
-        let nalu_type = (header[0] >> 1) & 0x3F;
-        let temporal_id = (header[1] & 7).saturating_sub(1);
+        let nalu_type = crate::h265::nal_unit_type(header[0]);
+        let temporal_id = crate::h265::temporal_id(header[1]);
         let rbsp = rbsp(body);
         let mut reader = BitReader::new(&rbsp);
         let prefix = parse_slice_prefix::<VaApiError>(&mut reader, nalu_type)?;
@@ -772,8 +772,8 @@ impl Frontend {
             first.temporal_id,
             self.first_in_bitstream,
             self.first_after_eos,
-            self.prev_tid0.as_ref(),
-            self.max_poc_lsb,
+            self.prev_tid0,
+            &pending.sps,
         );
         self.first_in_bitstream = false;
         self.first_after_eos = false;
@@ -808,7 +808,7 @@ impl Frontend {
         slot: SurfaceSlot,
     ) -> Result<Vec<SurfaceSlot>, VaApiError> {
         if picture.pic.state.valid_for_prev_tid0_pic {
-            self.prev_tid0 = Some(picture.pic.clone());
+            self.prev_tid0 = Some(picture.pic.pic_order_cnt_val);
         }
         self.dpb
             .store_picture(Rc::new(RefCell::new(picture.pic)), slot)
@@ -1023,13 +1023,12 @@ fn long_term_pocs(
     let mut foll = Vec::new();
     let mut foll_masked = Vec::new();
     for pic in lt {
-        let mut entry = i64::from(pic.poc_lsb);
-        if pic.msb_present {
-            entry += i64::from(poc);
-            entry -= i64::from(pic.msb_cycle) * i64::from(max_lsb);
-            entry -= i64::from(poc & (max_lsb - 1));
-        }
-        let entry = i32::try_from(entry).unwrap_or(i32::MAX);
+        let entry = if pic.msb_present {
+            let max = u32::try_from(max_lsb).unwrap_or(u32::MAX);
+            pic.poc_msb_present(poc, max).unwrap_or(i32::MAX)
+        } else {
+            i32::try_from(pic.poc_lsb).unwrap_or(i32::MAX)
+        };
         if pic.used {
             curr.push(entry);
             curr_masked.push(!pic.msb_present);
@@ -1051,9 +1050,10 @@ mod tests {
         parse_pps, parse_slice_tail, parse_sps, rbsp, Gate, LtSpec, ShortTermRps, SliceHeader,
         SliceTail, SliceType,
     };
-    use crate::h265_fixture::{idr_payload, nal, p_payload, pps_payload, sps_payload, Writer};
+    use crate::h265_fixture::{idr_payload, nal, p_payload, pps_payload, sps_payload};
 
     use bytes::Bytes;
+    use rust_video_harness::Bits;
 
     /// Frontend that ingested the sequence and picture sets.
     fn sequenced() -> Frontend {
@@ -1161,7 +1161,7 @@ mod tests {
     fn dependent_slice_without_independent_fails() {
         let mut frontend = Frontend::new();
         let mut stream = nal(33, &sps_payload());
-        let mut pps = Writer::new();
+        let mut pps = Bits::new();
         pps.ue(0);
         pps.ue(0);
         pps.bit(true);
@@ -1190,13 +1190,13 @@ mod tests {
         pps.ue(0);
         pps.bit(false);
         pps.bit(false);
-        stream.extend(nal(34, &pps.bytes()));
-        let mut slice = Writer::new();
+        stream.extend(nal(34, &pps.finish()));
+        let mut slice = Bits::new();
         slice.bit(false);
         slice.ue(0);
         slice.bit(true);
         slice.se(0);
-        stream.extend(nal(1, &slice.bytes()));
+        stream.extend(nal(1, &slice.finish()));
         let bytes = Bytes::from(stream);
         let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
             panic!("orphan dependent slice fails");
@@ -1230,7 +1230,7 @@ mod tests {
         let mut ingest = frontend.ingest(&bytes).expect("same sets parse");
         assert!(!ingest.reconfigured());
         assert_eq!(ingest.drained(), []);
-        let mut writer = Writer::new();
+        let mut writer = Bits::new();
         writer.bits(0, 4);
         writer.bits(0, 3);
         writer.bit(true);
@@ -1276,7 +1276,7 @@ mod tests {
         writer.bit(false);
         writer.bit(false);
         writer.bit(false);
-        let stream = nal(33, &writer.bytes());
+        let stream = nal(33, &writer.finish());
         let bytes = Bytes::from(stream);
         let mut ingest = frontend.ingest(&bytes).expect("new set parses");
         assert!(ingest.reconfigured());

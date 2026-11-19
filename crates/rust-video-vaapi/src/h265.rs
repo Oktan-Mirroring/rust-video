@@ -8,9 +8,10 @@
 pub use crate::h265_decoder::H265Decoder;
 
 pub(crate) use rust_video_h265::{
-    is_bla, is_cra, is_idr, is_irap, is_radl, is_rasl, is_slnr, parse_pps, parse_pps_ids,
-    parse_slice_prefix, parse_slice_rest, parse_slice_tail, parse_sps, parse_vps, rbsp, split_nals,
-    BitReader, LtSpec, Pps, ShortTermRps, SliceHeader, SliceTail, SliceType, Sps, WeightEntry,
+    anchors_tid0, is_bla, is_cra, is_idr, is_irap, is_rasl, nal_unit_type, parse_pps,
+    parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_slice_tail, parse_sps, parse_vps,
+    rbsp, split_nals, temporal_id, BitReader, LtSpec, Pps, ShortTermRps, SliceHeader, SliceTail,
+    SliceType, Sps, WeightEntry,
 };
 
 /// Shared weight table behind submit tests.

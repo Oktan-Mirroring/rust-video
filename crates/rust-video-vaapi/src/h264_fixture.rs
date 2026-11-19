@@ -1,78 +1,10 @@
 //! H.264 Annex B fixtures: sets and slices behind tier tests.
 
-/// Test bit writer, MSB first.
-pub(crate) struct BitWriter {
-    /// Finished bytes.
-    bytes: Vec<u8>,
-    /// Open byte under fill.
-    current: u8,
-    /// Bits filled in the open byte.
-    filled: u8,
-}
-
-impl BitWriter {
-    /// Empty writer.
-    pub(crate) fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            current: 0,
-            filled: 0,
-        }
-    }
-
-    /// Single bit.
-    pub(crate) fn bit(&mut self, set: bool) {
-        if set {
-            self.current |= 1 << (7 - self.filled);
-        }
-        self.filled += 1;
-        if self.filled == 8 {
-            self.bytes.push(self.current);
-            self.current = 0;
-            self.filled = 0;
-        }
-    }
-
-    /// Low `count` bits of `value`, most significant first.
-    pub(crate) fn bits(&mut self, value: u32, count: u32) {
-        for index in (0..count).rev() {
-            self.bit(value >> index & 1 != 0);
-        }
-    }
-
-    /// Unsigned Exp-Golomb code.
-    pub(crate) fn ue(&mut self, value: u32) {
-        let code = value + 1;
-        let width = 32 - code.leading_zeros();
-        for _ in 0..width - 1 {
-            self.bit(false);
-        }
-        self.bits(code, width);
-    }
-
-    /// Signed Exp-Golomb code.
-    pub(crate) fn se(&mut self, value: i32) {
-        let code = if value <= 0 {
-            u32::try_from(-value * 2).expect("small se")
-        } else {
-            u32::try_from(value * 2 - 1).expect("small se")
-        };
-        self.ue(code);
-    }
-
-    /// Finished RBSP with stop bit and alignment.
-    pub(crate) fn finish(mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.filled != 0 {
-            self.bit(false);
-        }
-        self.bytes
-    }
-}
+use rust_video_harness::Bits;
 
 /// Baseline SPS RBSP with `poc_type`, 320x240.
 pub(crate) fn sps_body(poc_type: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bits(66, 8);
     writer.bits(0, 8);
     writer.bits(30, 8);
@@ -90,12 +22,12 @@ pub(crate) fn sps_body(poc_type: u32) -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.bit(false);
-    writer.finish()
+    writer.finish_rbsp()
 }
 
 /// CAVLC picture set RBSP over sequence set 0.
 pub(crate) fn pps_body() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(false);
@@ -111,7 +43,7 @@ pub(crate) fn pps_body() -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.bit(false);
-    writer.finish()
+    writer.finish_rbsp()
 }
 
 /// Annex-B bytes with emulation prevention past `header`.
@@ -230,7 +162,7 @@ pub(crate) fn idr_slice_body() -> Vec<u8> {
 ///
 /// IDR slices carry `idr_pic_id`; inter slices carry silent marking.
 pub(crate) fn slice_body(type_: u32, frame_num: u32, lsb: u32, idr_pic_id: Option<u32>) -> Vec<u8> {
-    let mut slice = BitWriter::new();
+    let mut slice = Bits::new();
     slice.ue(0);
     slice.ue(type_);
     slice.ue(0);
@@ -251,7 +183,7 @@ pub(crate) fn slice_body(type_: u32, frame_num: u32, lsb: u32, idr_pic_id: Optio
     slice.ue(0);
     slice.se(0);
     slice.se(0);
-    slice.finish()
+    slice.finish_rbsp()
 }
 
 /// P slice RBSP over picture set 0, frame 1.

@@ -1,8 +1,10 @@
 //! H.264 Annex B ingest over the shared grammar.
 
 pub(crate) use rust_video_h264::{
-    parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, split_nals,
-    BitReader, Marking, Mmco, PocType, Pps, RefMod, SliceHeader, SlicePoc, SliceType, Sps,
+    abs_frame_num, frame_num_wrap, initial_ref_lists, is_idr, mmco_short_target, nal_ref_idc,
+    nal_unit_type, parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_sps,
+    poc_msb, poc_type2, rbsp, split_nals, BitReader, Marking, Mmco, PocType, Pps, RefCandidate,
+    RefMod, SliceHeader, SlicePoc, SliceType, Sps,
 };
 
 use rust_video_h264::{H264Error, H264Gate, ParseKind, UnsupportedKind};

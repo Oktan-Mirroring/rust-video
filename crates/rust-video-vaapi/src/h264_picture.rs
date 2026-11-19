@@ -10,25 +10,6 @@ use crate::h264::Marking;
 use crate::h264_dpb::MaxLongTermFrameIdx;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum Field {
-    #[default]
-    Frame,
-    Top,
-    Bottom,
-}
-
-impl Field {
-    /// Returns the field of opposite parity.
-    pub fn opposite(self) -> Self {
-        match self {
-            Field::Frame => Field::Frame,
-            Field::Top => Field::Bottom,
-            Field::Bottom => Field::Top,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Reference {
     #[default]
     None,
@@ -75,8 +56,6 @@ pub struct PictureData {
     // Not for decode or output.
     pub nonexisting: bool,
 
-    pub field: Field,
-
     // Values from slice_hdr to be used during reference marking and
     // memory management after finishing this picture.
     pub ref_pic_marking: Marking,
@@ -108,7 +87,6 @@ impl Default for PictureData {
             reference: Reference::None,
             has_mmco_5: false,
             nonexisting: false,
-            field: Field::Frame,
             ref_pic_marking: Marking::Silent,
             timestamp: 0,
         }
@@ -135,7 +113,6 @@ impl PictureData {
             frame_num,
             nonexisting: true,
             nal_ref_idc: 1,
-            field: Field::Frame,
             pic_num: frame_num.cast_signed(),
             reference: Reference::ShortTerm,
             timestamp,
@@ -209,7 +186,6 @@ impl std::fmt::Debug for PictureData {
             .field("reference", &self.reference)
             .field("has_mmco_5", &self.has_mmco_5)
             .field("nonexisting", &self.nonexisting)
-            .field("field", &self.field)
             .field("ref_pic_marking", &self.ref_pic_marking)
             .field("timestamp", &self.timestamp)
             .finish()

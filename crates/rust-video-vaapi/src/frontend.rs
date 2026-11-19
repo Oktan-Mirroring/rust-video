@@ -9,13 +9,15 @@ use std::rc::Rc;
 
 use crate::error::VaApiError;
 use crate::h264::{
-    parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_sps, rbsp, split_nals,
+    abs_frame_num, is_idr, nal_ref_idc, nal_unit_type, parse_pps, parse_pps_ids,
+    parse_slice_prefix, parse_slice_rest, parse_sps, poc_msb, poc_type2, rbsp, split_nals,
     BitReader, Gate, Marking, Mmco, PocType, Pps, RefMod, SliceHeader, SlicePoc, Sps,
 };
 use crate::h264_dpb::{Dpb, MaxLongTermFrameIdx, ReferencePicLists};
-use crate::h264_picture::{Field, IsIdr, PictureData, Reference};
+use crate::h264_picture::{IsIdr, PictureData, Reference};
 
 use bytes::Bytes;
+use rust_video_caps::dpb::PocTracker as CapsPocTracker;
 
 /// DPB surface slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -355,7 +357,7 @@ impl Frontend {
                 continue;
             };
             let body = &nal[1..];
-            match header & 0x1F {
+            match nal_unit_type(header) {
                 7 => {
                     if self.adopt_sps(body, &mut out)? {
                         out.reconfigured = true;
@@ -477,8 +479,8 @@ impl Frontend {
         bytes: &Bytes,
         pictures: &mut Vec<PendingPicture>,
     ) -> Result<(), VaApiError> {
-        let ref_idc = (header >> 5) & 3;
-        let is_idr = header & 0x1F == 5;
+        let ref_idc = nal_ref_idc(header);
+        let is_idr = is_idr(nal_unit_type(header));
         let rbsp = rbsp(body);
         let mut reader = BitReader::new(&rbsp);
         let prefix = parse_slice_prefix::<VaApiError>(&mut reader)?;
@@ -599,7 +601,7 @@ impl Frontend {
         let bumped = self.bridge_gap(&pending.sps, &pic)?;
         self.poc.derive(&mut pic, &pending.sps)?;
         let max_frame_num = pending.sps.max_frame_num();
-        self.dpb.update_pic_nums(pic.frame_num, max_frame_num, &pic);
+        self.dpb.update_pic_nums(pic.frame_num, max_frame_num);
         let initial = self.dpb.build_ref_pic_lists(&pic);
         Ok((
             Picture {
@@ -851,7 +853,7 @@ impl Frontend {
             if !matches!(sps.poc_type, PocType::Lsb) {
                 self.poc.derive(&mut gap, sps)?;
             }
-            self.dpb.update_pic_nums(unused, max_frame_num, &gap);
+            self.dpb.update_pic_nums(unused, max_frame_num);
             self.dpb.sliding_window_marking(sps);
             bumped.extend(self.dpb.bump_as_needed(&gap));
             self.dpb
@@ -866,7 +868,6 @@ impl Frontend {
                     picture.pic_order_cnt_msb,
                     picture.pic_order_cnt_lsb,
                     picture.top_field_order_cnt,
-                    picture.field,
                 )
             });
             if let Some(noted) = noted {
@@ -986,14 +987,10 @@ impl SliceKey {
 /// Previous reference picture counts per 8.2.1.
 #[derive(Clone, Debug, Default)]
 struct ReferenceCounts {
-    /// Order-count msb.
-    msb: i32,
-    /// Order-count lsb.
-    lsb: i32,
-    /// Top order count.
+    /// Previous MSB/LSB pair behind the type-0 wrap.
+    tracker: CapsPocTracker,
+    /// Top order count, base after MMCO 5.
     top: i32,
-    /// Whether the picture is a bottom field.
-    bottom: bool,
     /// Whether the picture carries MMCO 5.
     mmco5: bool,
 }
@@ -1012,8 +1009,8 @@ struct PreviousNumbers {
 /// Picture-order-count state per 8.2.1.
 #[derive(Clone, Debug, Default)]
 struct PocTracker {
-    /// Previous reference picture counts, if one was stored.
-    reference: Option<ReferenceCounts>,
+    /// Previous reference picture counts; zeroed before the first.
+    reference: ReferenceCounts,
     /// Previous picture numbers, if one was stored.
     previous: Option<PreviousNumbers>,
 }
@@ -1028,7 +1025,7 @@ impl PocTracker {
     fn derive(&mut self, pic: &mut PictureData, sps: &Sps) -> Result<(), VaApiError> {
         let is_idr = matches!(pic.is_idr, IsIdr::Yes { .. });
         match pic.pic_order_cnt_type {
-            0 => self.derive_type0(pic, sps, is_idr),
+            0 => self.derive_type0(pic, sps, is_idr)?,
             1 => self.derive_type1(pic, sps, is_idr)?,
             2 => self.derive_type2(pic, sps, is_idr)?,
             other => {
@@ -1042,19 +1039,20 @@ impl PocTracker {
     }
 
     /// Type-0 counts per 8.2.1.1.
-    fn derive_type0(&self, pic: &mut PictureData, sps: &Sps, is_idr: bool) {
-        let base = self.type0_base(is_idr);
-        let max_lsb = 1 << (u32::from(sps.log2_max_poc_lsb_minus4) + 4);
-        let lsb = pic.pic_order_cnt_lsb;
-        pic.pic_order_cnt_msb = if lsb < base.1 && base.1 - lsb >= max_lsb / 2 {
-            base.0 + max_lsb
-        } else if lsb > base.1 && lsb - base.1 > max_lsb / 2 {
-            base.0 - max_lsb
-        } else {
-            base.0
-        };
-        pic.top_field_order_cnt = pic.pic_order_cnt_msb + lsb;
+    fn derive_type0(
+        &self,
+        pic: &mut PictureData,
+        sps: &Sps,
+        is_idr: bool,
+    ) -> Result<(), VaApiError> {
+        let prev = self.type0_base(is_idr);
+        let max_lsb = i64::from(sps.max_poc_lsb());
+        let lsb = i64::from(pic.pic_order_cnt_lsb);
+        pic.pic_order_cnt_msb = i32::try_from(poc_msb(lsb, max_lsb, prev))
+            .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
+        pic.top_field_order_cnt = pic.pic_order_cnt_msb + pic.pic_order_cnt_lsb;
         pic.bottom_field_order_cnt = pic.top_field_order_cnt + pic.delta_pic_order_cnt_bottom;
+        Ok(())
     }
 
     /// Type-1 counts per 8.2.1.2.
@@ -1065,28 +1063,12 @@ impl PocTracker {
         is_idr: bool,
     ) -> Result<(), VaApiError> {
         pic.frame_num_offset = self.frame_num_offset(pic, sps, is_idr);
-        let cycle = u64::from(sps.cycle);
-        let mut absolute = if cycle == 0 {
-            0
-        } else {
-            u64::from(pic.frame_num_offset) + u64::from(pic.frame_num)
-        };
-        if pic.nal_ref_idc == 0 && absolute > 0 {
-            absolute -= 1;
-        }
-        let mut expected = 0i64;
-        if absolute > 0 {
-            if cycle == 0 {
-                return Err(VaApiError::Parse("empty poc cycle".to_owned()));
-            }
-            let in_cycle = usize::try_from((absolute - 1) % cycle).unwrap_or(0);
-            let cycles = i64::try_from((absolute - 1) / cycle)
-                .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
-            expected = cycles * i64::from(sps.expected_delta);
-            for offset in sps.cycle_offsets.iter().take(in_cycle + 1) {
-                expected += i64::from(*offset);
-            }
-        }
+        let absolute = abs_frame_num(
+            i64::from(pic.frame_num_offset),
+            pic.frame_num,
+            pic.nal_ref_idc != 0,
+        );
+        let mut expected = sps.poc_cycle_expected(absolute);
         if pic.nal_ref_idc == 0 {
             expected += i64::from(sps.offset_non_ref);
         }
@@ -1109,55 +1091,46 @@ impl PocTracker {
         is_idr: bool,
     ) -> Result<(), VaApiError> {
         pic.frame_num_offset = self.frame_num_offset(pic, sps, is_idr);
-        let temporary = if is_idr {
+        let count = if is_idr {
             0
         } else {
-            let base = i64::from(pic.frame_num_offset) + i64::from(pic.frame_num);
-            2 * base - i64::from(pic.nal_ref_idc == 0)
+            poc_type2(
+                i64::from(pic.frame_num_offset),
+                pic.frame_num,
+                pic.nal_ref_idc != 0,
+            )
+            .ok_or_else(|| VaApiError::Unsupported("poc overflow".to_owned()))?
         };
-        let count = i32::try_from(temporary)
-            .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
         pic.top_field_order_cnt = count;
         pic.bottom_field_order_cnt = count;
         Ok(())
     }
 
     /// Previous `(msb, lsb)` pair for type-0 derivation.
-    fn type0_base(&self, is_idr: bool) -> (i32, i32) {
-        let Some(reference) = self.reference.as_ref() else {
-            return (0, 0);
-        };
+    fn type0_base(&self, is_idr: bool) -> (i64, i64) {
         if is_idr {
             (0, 0)
-        } else if reference.mmco5 {
-            if reference.bottom {
-                (0, 0)
-            } else {
-                (0, reference.top)
-            }
+        } else if self.reference.mmco5 {
+            (0, i64::from(self.reference.top))
         } else {
-            (reference.msb, reference.lsb)
+            self.reference.tracker.previous()
         }
     }
 
     /// Frame-number offset per 8-6/8-11.
     fn frame_num_offset(&self, pic: &PictureData, sps: &Sps, is_idr: bool) -> u32 {
-        let Some(previous) = self.previous.as_ref() else {
-            return 0;
-        };
         if is_idr {
             return 0;
         }
-        let base = if previous.mmco5 {
-            0
-        } else {
-            previous.frame_num_offset
-        };
-        if previous.frame_num > pic.frame_num {
-            base + sps.max_frame_num()
-        } else {
-            base
-        }
+        let prev = self.previous.as_ref().map(|previous| {
+            let offset = if previous.mmco5 {
+                0
+            } else {
+                previous.frame_num_offset
+            };
+            (previous.frame_num, i64::from(offset))
+        });
+        u32::try_from(sps.frame_num_offset(prev, pic.frame_num)).unwrap_or(u32::MAX)
     }
 
     /// Record `pic` as the previous picture.
@@ -1171,30 +1144,34 @@ impl PocTracker {
 
     /// Record `pic` as the previous reference picture.
     fn note_ref(&mut self, pic: &PictureData) {
-        self.reference = Some(ReferenceCounts {
-            msb: pic.pic_order_cnt_msb,
-            lsb: pic.pic_order_cnt_lsb,
-            top: pic.top_field_order_cnt,
-            bottom: matches!(pic.field, Field::Bottom),
-            mmco5: pic.has_mmco_5,
-        });
+        self.reference = Self::reference_counts(
+            pic.pic_order_cnt_msb,
+            pic.pic_order_cnt_lsb,
+            pic.top_field_order_cnt,
+            pic.has_mmco_5,
+        );
     }
 
     /// Record a stored gap picture as previous picture and reference.
-    fn note_stored(&mut self, noted: (u32, u32, bool, i32, i32, i32, Field)) {
-        let (frame_num, frame_num_offset, has_mmco_5, msb, lsb, top, field) = noted;
+    fn note_stored(&mut self, noted: (u32, u32, bool, i32, i32, i32)) {
+        let (frame_num, frame_num_offset, has_mmco_5, msb, lsb, top) = noted;
         self.previous = Some(PreviousNumbers {
             frame_num,
             frame_num_offset,
             mmco5: has_mmco_5,
         });
-        self.reference = Some(ReferenceCounts {
-            msb,
-            lsb,
+        self.reference = Self::reference_counts(msb, lsb, top, has_mmco_5);
+    }
+
+    /// Reference counts over an observed MSB/LSB pair.
+    fn reference_counts(msb: i32, lsb: i32, top: i32, mmco5: bool) -> ReferenceCounts {
+        let mut tracker = CapsPocTracker::new();
+        tracker.observe(i64::from(msb), u32::try_from(lsb).unwrap_or(0));
+        ReferenceCounts {
+            tracker,
             top,
-            bottom: matches!(field, Field::Bottom),
-            mmco5: has_mmco_5,
-        });
+            mmco5,
+        }
     }
 }
 
@@ -1204,7 +1181,9 @@ mod tests {
 
     use rust_video_h264::VuiParams;
 
-    use super::{Frontend, Picture, PocTracker, SliceKey, SurfaceSlot};
+    use super::{
+        Frontend, PendingPicture, PendingSlice, Picture, PocTracker, SliceKey, SurfaceSlot,
+    };
     use crate::error::VaApiError;
     use crate::h264::{Marking, PocType, RefMod, SliceHeader, SlicePoc, SliceType, Sps};
     use crate::h264_dpb::ReferencePicLists;
@@ -1353,6 +1332,110 @@ mod tests {
         non_ref.pic_order_cnt_type = 2;
         tracker.derive(&mut non_ref, &sps).expect("non-ref counts");
         assert_eq!(non_ref.top_field_order_cnt, 3);
+    }
+
+    #[test]
+    fn poc_type0_bases_next_counts_on_mmco5_top() {
+        let sps = sps(PocType::Lsb);
+        let mut tracker = PocTracker::default();
+        let mut idr = picture(0, 1);
+        idr.is_idr = IsIdr::Yes { idr_pic_id: 0 };
+        tracker.derive(&mut idr, &sps).expect("idr counts");
+        tracker.note_pic(&idr);
+        idr.has_mmco_5 = true;
+        tracker.note_ref(&idr);
+
+        let mut next = picture(1, 1);
+        next.pic_order_cnt_lsb = 6;
+        tracker.derive(&mut next, &sps).expect("p counts");
+        assert_eq!(next.pic_order_cnt_msb, 0);
+        assert_eq!(next.top_field_order_cnt, 6);
+    }
+
+    /// Assembled pending picture over `sps` with one slice.
+    fn pending_picture(
+        sps: &Rc<Sps>,
+        header: crate::h264::SliceHeader,
+        nal_ref_idc: u8,
+        is_idr: bool,
+    ) -> PendingPicture {
+        PendingPicture {
+            sps: sps.clone(),
+            pps: Rc::new(pps()),
+            nal_ref_idc,
+            is_idr,
+            slices: vec![PendingSlice::assembled(header, 16, 24)],
+        }
+    }
+
+    #[test]
+    fn begin_derives_counts_and_empty_lists_for_first_idr() {
+        let sps = Rc::new(sps(PocType::Lsb));
+        let mut header = slice_header();
+        header.idr_pic_id = Some(0);
+        let pending = pending_picture(&sps, header, 1, true);
+        let mut frontend = Frontend::new();
+        let (picture, bumped) = frontend.begin(pending).expect("first idr begins");
+        assert_eq!(bumped, []);
+        assert_eq!(picture.pic().pic_order_cnt, 0);
+        assert_eq!(picture.initial().p_list, []);
+        assert_eq!(picture.initial().b_list0, []);
+        assert_eq!(picture.initial().b_list1, []);
+    }
+
+    #[test]
+    fn begin_orders_second_picture_against_stored_idr() {
+        let sps = Rc::new(sps(PocType::Lsb));
+        let mut frontend = Frontend::new();
+        let mut idr_header = slice_header();
+        idr_header.idr_pic_id = Some(0);
+        let (idr, _) = frontend
+            .begin(pending_picture(&sps, idr_header, 1, true))
+            .expect("idr begins");
+        frontend.commit(idr, SurfaceSlot::new(0)).expect("idr");
+
+        let mut p_header = slice_header();
+        p_header.frame_num = 1;
+        p_header.poc = SlicePoc::Lsb(2, 0);
+        let (picture, bumped) = frontend
+            .begin(pending_picture(&sps, p_header, 1, false))
+            .expect("p begins");
+        assert_eq!(bumped, []);
+        assert_eq!(picture.pic().pic_order_cnt, 2);
+        assert_eq!(picture.initial().p_list, vec![0]);
+        assert_eq!(picture.initial().b_list0, vec![0]);
+        assert_eq!(picture.initial().b_list1, vec![0]);
+    }
+
+    #[test]
+    fn begin_bridges_gaps_with_non_existing_pictures() {
+        let mut raw = sps(PocType::Lsb);
+        raw.gaps_allowed = true;
+        let sps = Rc::new(raw);
+        let mut frontend = Frontend::new();
+        let mut idr_header = slice_header();
+        idr_header.idr_pic_id = Some(0);
+        let (idr, _) = frontend
+            .begin(pending_picture(&sps, idr_header, 1, true))
+            .expect("idr begins");
+        frontend.commit(idr, SurfaceSlot::new(0)).expect("idr");
+
+        let mut p_header = slice_header();
+        p_header.frame_num = 3;
+        p_header.poc = SlicePoc::Lsb(6, 0);
+        let (_, bumped) = frontend
+            .begin(pending_picture(&sps, p_header, 1, false))
+            .expect("p begins");
+        assert_eq!(bumped, []);
+        assert_eq!(frontend.dpb().len(), 3);
+        let frames: Vec<_> = frontend.dpb().entries()[1..]
+            .iter()
+            .map(|entry| {
+                let picture = entry.pic.borrow();
+                (picture.frame_num, picture.nonexisting)
+            })
+            .collect();
+        assert_eq!(frames, vec![(1, true), (2, true)]);
     }
 
     #[test]

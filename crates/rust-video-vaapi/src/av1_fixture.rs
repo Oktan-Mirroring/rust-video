@@ -1,57 +1,6 @@
 //! Synthetic AV1 OBU payloads for unit tests.
 
-/// Bit writer for synthetic OBU payloads.
-#[derive(Default)]
-pub(crate) struct Writer {
-    /// Finished bytes.
-    out: Vec<u8>,
-    /// Open byte, filled from the top.
-    cur: u8,
-    /// Bits in `cur`.
-    n: u8,
-}
-
-impl Writer {
-    /// Empty writer.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Append one bit.
-    pub(crate) fn bit(&mut self, value: bool) {
-        self.cur = (self.cur << 1) | u8::from(value);
-        self.n += 1;
-        if self.n == 8 {
-            self.out.push(self.cur);
-            self.cur = 0;
-            self.n = 0;
-        }
-    }
-
-    /// Append the low `count` bits of `value`.
-    pub(crate) fn bits(&mut self, value: u32, count: usize) {
-        for index in (0..count).rev() {
-            self.bit(value >> index & 1 == 1);
-        }
-    }
-
-    /// Finished payload with stop bit and byte alignment.
-    pub(crate) fn bytes(mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.n != 0 {
-            self.bit(false);
-        }
-        self.out
-    }
-
-    /// Finished bytes without trailing bits.
-    pub(crate) fn raw(mut self) -> Vec<u8> {
-        if self.n != 0 {
-            self.out.push(self.cur << (8 - self.n));
-        }
-        self.out
-    }
-}
+use rust_video_harness::Bits;
 
 /// Low-overhead OBU of `type_` with `payload`.
 pub(crate) fn obu(type_: u8, payload: &[u8]) -> Vec<u8> {
@@ -81,7 +30,7 @@ pub(crate) fn seq_payload() -> Vec<u8> {
 
 /// Minimal Profile 0 sequence header payload at `width` by `height`.
 pub(crate) fn seq_payload_sized(width: u32, height: u32) -> Vec<u8> {
-    let mut writer = Writer::new();
+    let mut writer = Bits::new();
     writer.bits(0, 3);
     writer.bit(false);
     writer.bit(false);
@@ -94,8 +43,8 @@ pub(crate) fn seq_payload_sized(width: u32, height: u32) -> Vec<u8> {
     let height_bits = (u32::BITS - (height - 1).leading_zeros()).max(1);
     writer.bits(width_bits - 1, 4);
     writer.bits(height_bits - 1, 4);
-    writer.bits(width - 1, width_bits as usize);
-    writer.bits(height - 1, height_bits as usize);
+    writer.bits(width - 1, width_bits);
+    writer.bits(height - 1, height_bits);
     writer.bit(false);
     writer.bit(false);
     writer.bit(false);
@@ -118,7 +67,7 @@ pub(crate) fn seq_payload_sized(width: u32, height: u32) -> Vec<u8> {
     writer.bits(0, 2);
     writer.bit(false);
     writer.bit(false);
-    writer.bytes()
+    writer.finish_rbsp()
 }
 
 /// Minimal keyframe header payload: shown, single tile, lossless.
@@ -138,7 +87,7 @@ pub(crate) fn keyframe_wide_payload() -> Vec<u8> {
 
 /// Keyframe header bits: `show` controls output, `wide` adds a tile column.
 fn keyframe_bits(show: bool, wide: bool) -> Vec<u8> {
-    let mut writer = Writer::new();
+    let mut writer = Bits::new();
     writer.bit(false);
     writer.bits(0, 2);
     writer.bit(show);
@@ -168,12 +117,12 @@ fn keyframe_bits(show: bool, wide: bool) -> Vec<u8> {
     writer.bit(false);
     writer.bit(false);
     writer.bit(false);
-    writer.bytes()
+    writer.finish_rbsp()
 }
 
 /// Minimal inter-frame header payload: hidden, single tile, lossless.
 pub(crate) fn pframe_payload() -> Vec<u8> {
-    let mut writer = Writer::new();
+    let mut writer = Bits::new();
     writer.bit(false);
     writer.bits(1, 2);
     writer.bit(false);
@@ -204,15 +153,15 @@ pub(crate) fn pframe_payload() -> Vec<u8> {
     for _ in 0..7 {
         writer.bit(false);
     }
-    writer.bytes()
+    writer.finish_rbsp()
 }
 
 /// Show-existing-frame header payload for reference slot `slot`.
 pub(crate) fn show_existing_payload(slot: u8) -> Vec<u8> {
-    let mut writer = Writer::new();
+    let mut writer = Bits::new();
     writer.bit(true);
     writer.bits(u32::from(slot), 3);
-    writer.bytes()
+    writer.finish_rbsp()
 }
 
 /// Tile group payload holding `tiles` bytes of tile data.
@@ -222,9 +171,9 @@ pub(crate) fn tile_group_payload(tiles: &[u8]) -> Vec<u8> {
 
 /// Two-tile group payload over 128x64: flag, first size, tile bytes.
 pub(crate) fn tile_group_2_payload(first: &[u8], second: &[u8]) -> Vec<u8> {
-    let mut writer = Writer::new();
+    let mut writer = Bits::new();
     writer.bit(false);
-    let mut payload = writer.raw();
+    let mut payload = writer.finish_raw();
     let size = u8::try_from(first.len().saturating_sub(1)).unwrap_or(u8::MAX);
     payload.push(size);
     payload.extend_from_slice(first);

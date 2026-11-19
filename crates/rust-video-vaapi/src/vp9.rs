@@ -30,59 +30,11 @@ mod tests {
     use crate::vp9_frontend::Frontend;
 
     use bytes::Bytes;
-
-    /// Test bit writer, MSB first.
-    struct BitWriter {
-        /// Finished bytes.
-        bytes: Vec<u8>,
-        /// Open byte under fill.
-        current: u8,
-        /// Bits filled in the open byte.
-        filled: u8,
-    }
-
-    impl BitWriter {
-        /// Empty writer.
-        fn new() -> Self {
-            Self {
-                bytes: Vec::new(),
-                current: 0,
-                filled: 0,
-            }
-        }
-
-        /// Single bit.
-        fn bit(&mut self, set: bool) {
-            if set {
-                self.current |= 1 << (7 - self.filled);
-            }
-            self.filled += 1;
-            if self.filled == 8 {
-                self.bytes.push(self.current);
-                self.current = 0;
-                self.filled = 0;
-            }
-        }
-
-        /// Low `count` bits of `value`, most significant first.
-        fn bits(&mut self, value: u32, count: u32) {
-            for index in (0..count).rev() {
-                self.bit(value >> index & 1 != 0);
-            }
-        }
-
-        /// Finished bytes, zero padded.
-        fn finish(mut self) -> Vec<u8> {
-            while self.filled != 0 {
-                self.bit(false);
-            }
-            self.bytes
-        }
-    }
+    use rust_video_harness::Bits;
 
     /// Profile 0 keyframe at `width` x `height`, one tile.
     fn keyframe(width: u32, height: u32) -> Vec<u8> {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.bits(0x02, 2);
         writer.bit(false);
         writer.bit(false);
@@ -109,7 +61,7 @@ mod tests {
         writer.bit(false);
         writer.bits(0, 1);
         writer.bits(0, 16);
-        let mut bytes = writer.finish();
+        let mut bytes = writer.finish_raw();
         bytes.extend_from_slice(&[0xAA; 8]);
         bytes
     }
