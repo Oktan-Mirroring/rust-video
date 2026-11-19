@@ -8,12 +8,12 @@ use std::fmt;
 
 use log::debug;
 
+use crate::h264::picture::IsIdr;
+use crate::h264::picture::PictureData;
+use crate::h264::picture::RcPictureData;
+use crate::h264::picture::Reference;
 use crate::h264::Sps;
 use crate::h264::{frame_num_wrap, initial_ref_lists, mmco_short_target, RefCandidate, SliceType};
-use crate::h264_picture::IsIdr;
-use crate::h264_picture::PictureData;
-use crate::h264_picture::RcPictureData;
-use crate::h264_picture::Reference;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum MaxLongTermFrameIdx {
@@ -750,7 +750,7 @@ impl<T> std::fmt::Debug for Dpb<T> {
 #[cfg(test)]
 mod tests {
     use super::Dpb;
-    use crate::h264_picture::{PictureData, Reference};
+    use crate::h264::picture::{PictureData, Reference};
 
     #[test]
     fn bump_ready_emits_in_output_order_and_keeps_refs() {

@@ -14,7 +14,7 @@ use crate::buffer::{bytes_of, VaBuffer};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
-use crate::h264_decoder::VaApiFrame;
+use crate::h264::decoder::VaApiFrame;
 use crate::scale::ScaledSurface;
 use crate::sys;
 
@@ -1807,7 +1807,7 @@ mod tests {
             encoder.caps(),
             GpuCaps::new(Some(ShareMechanism::DmaBuf), false, true)
         );
-        let mut decoder = crate::h264_decoder::H264Decoder::open(&device);
+        let mut decoder = crate::h264::decoder::H264Decoder::open(&device);
         let raws = H264Synth::annex_b_h264_packets();
         let packets = Packets::from_raws(&raws);
         let mut surfaces = Vec::new();

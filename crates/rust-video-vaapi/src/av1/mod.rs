@@ -5,7 +5,14 @@
 //! AV1 OBU ingest over the shared grammar.
 
 #[cfg(target_os = "linux")]
-pub use crate::av1_decoder::Av1Decoder;
+pub(crate) mod decoder;
+#[allow(dead_code)]
+pub(crate) mod frontend;
+#[allow(dead_code)]
+pub(crate) mod params;
+
+#[cfg(target_os = "linux")]
+pub use crate::av1::decoder::Av1Decoder;
 
 pub(crate) use rust_video_av1::{
     frame_obu_tile_offset, parse_frame_header, parse_sequence_header, refresh_refs,

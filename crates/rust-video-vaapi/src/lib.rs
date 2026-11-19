@@ -5,12 +5,6 @@
 #[allow(dead_code)]
 mod av1;
 #[cfg(target_os = "linux")]
-mod av1_decoder;
-#[allow(dead_code)]
-mod av1_frontend;
-#[allow(dead_code)]
-mod av1_params;
-#[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
 mod buffer;
@@ -26,28 +20,8 @@ mod ffi;
 mod fixtures;
 #[allow(dead_code)]
 mod h264;
-#[cfg(target_os = "linux")]
-mod h264_decoder;
-#[allow(dead_code)]
-mod h264_dpb;
-#[allow(dead_code)]
-mod h264_frontend;
-#[allow(dead_code)]
-mod h264_params;
-#[allow(dead_code)]
-mod h264_picture;
 #[allow(dead_code)]
 mod h265;
-#[cfg(target_os = "linux")]
-mod h265_decoder;
-#[allow(dead_code)]
-mod h265_dpb;
-#[allow(dead_code)]
-mod h265_frontend;
-#[allow(dead_code)]
-mod h265_params;
-#[allow(dead_code)]
-mod h265_picture;
 #[allow(dead_code)]
 mod inflight;
 #[cfg(target_os = "linux")]
@@ -64,14 +38,6 @@ mod transcode;
 mod vp8;
 #[allow(dead_code)]
 mod vp9;
-#[cfg(target_os = "linux")]
-mod vp9_decoder;
-#[allow(dead_code)]
-mod vp9_frontend;
-#[allow(dead_code)]
-mod vp9_lookups;
-#[allow(dead_code)]
-mod vp9_params;
 
 #[cfg(target_os = "linux")]
 pub use av1::Av1Decoder;
@@ -84,7 +50,7 @@ pub use encoder::{EncodeCodec, GopShape, VaApiEncoder};
 #[cfg(target_os = "linux")]
 pub use error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]
-pub use h264_decoder::{H264Decoder, VaApiFrame};
+pub use h264::decoder::{H264Decoder, VaApiFrame};
 #[cfg(target_os = "linux")]
 pub use h265::H265Decoder;
 #[cfg(target_os = "linux")]

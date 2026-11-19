@@ -1,5 +1,16 @@
 //! H.264 Annex B ingest over the shared grammar.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod decoder;
+#[allow(dead_code)]
+pub(crate) mod dpb;
+#[allow(dead_code)]
+pub(crate) mod frontend;
+#[allow(dead_code)]
+pub(crate) mod params;
+#[allow(dead_code)]
+pub(crate) mod picture;
+
 pub(crate) use rust_video_h264::{
     abs_frame_num, frame_num_wrap, initial_ref_lists, is_idr, mmco_short_target, nal_ref_idc,
     nal_unit_type, parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest, parse_sps,

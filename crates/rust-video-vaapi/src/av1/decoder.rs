@@ -1,14 +1,14 @@
 //! AV1 decode behind the caps `Decoder` trait.
 
-use crate::av1_frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
-use crate::av1_params::Params;
+use crate::av1::frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
+use crate::av1::params::Params;
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::VaSliceParameterBufferAv1;
-use crate::h264_decoder::{Emit, VaApiFrame};
-use crate::h264_frontend::SurfaceSlot;
+use crate::h264::decoder::{Emit, VaApiFrame};
+use crate::h264::frontend::SurfaceSlot;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 

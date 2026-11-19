@@ -10,11 +10,11 @@ use crate::ffi::{
     VaIqMatrixBufferHevc, VaPictureHevc, VaPictureParameterBufferHevc, VaSliceParameterBufferHevc,
     VaSurfaceId,
 };
-use crate::h264_frontend::SurfaceSlot;
+use crate::h264::frontend::SurfaceSlot;
+use crate::h265::dpb::Dpb;
+use crate::h265::frontend::{PendingSlice, Rps};
+use crate::h265::picture::{PictureData, Reference};
 use crate::h265::{is_idr, is_irap, Pps, SliceHeader, SliceTail, SliceType, Sps};
-use crate::h265_dpb::Dpb;
-use crate::h265_frontend::{PendingSlice, Rps};
-use crate::h265_picture::{PictureData, Reference};
 
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
@@ -601,13 +601,13 @@ mod tests {
     use super::Params;
     use crate::error::VaApiError;
     use crate::fixtures::{pps_payload, sps_payload};
-    use crate::h264_frontend::SurfaceSlot;
+    use crate::h264::frontend::SurfaceSlot;
+    use crate::h265::dpb::Dpb;
+    use crate::h265::frontend::{PendingSlice, Rps};
+    use crate::h265::picture::{PictureData, Reference};
     use crate::h265::{
         Gate, Pps, SliceHeader, SliceTail, SliceType, SliceWeights, Sps, WeightEntry,
     };
-    use crate::h265_dpb::Dpb;
-    use crate::h265_frontend::{PendingSlice, Rps};
-    use crate::h265_picture::{PictureData, Reference};
 
     use std::cell::RefCell;
     use std::rc::Rc;

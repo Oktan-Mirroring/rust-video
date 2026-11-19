@@ -7,9 +7,9 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::rc::Rc;
 
+use crate::h265::picture::PictureData;
+use crate::h265::picture::Reference;
 use crate::h265::Sps;
-use crate::h265_picture::PictureData;
-use crate::h265_picture::Reference;
 
 // Shortcut to refer to a DPB entry.
 //

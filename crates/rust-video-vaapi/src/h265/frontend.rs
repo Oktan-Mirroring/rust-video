@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
-use crate::h264_frontend::SurfaceSlot;
+use crate::h264::frontend::SurfaceSlot;
+use crate::h265::dpb::Dpb;
+use crate::h265::picture::{PictureData, Reference};
 use crate::h265::{
     is_idr, is_irap, is_rasl, parse_pps, parse_pps_ids, parse_slice_prefix, parse_slice_rest,
     parse_slice_tail, parse_sps, parse_vps, rbsp, split_nals, BitReader, Gate, LtSpec, Pps,
     ShortTermRps, SliceHeader, SliceTail, Sps,
 };
-use crate::h265_dpb::Dpb;
-use crate::h265_picture::{PictureData, Reference};
 
 use bytes::Bytes;
 
@@ -1096,7 +1096,7 @@ mod tests {
         assert_eq!(picture.pic().pic_order_cnt_val, 0);
         assert_eq!(picture.rps().st_curr_before(), []);
         let outputs = frontend
-            .commit(picture, crate::h264_frontend::SurfaceSlot::new(0))
+            .commit(picture, crate::h264::frontend::SurfaceSlot::new(0))
             .expect("idr commits");
         assert_eq!(outputs, []);
         let pending = frontend.take_pending().expect("open p picture");
@@ -1111,7 +1111,7 @@ mod tests {
         assert_eq!(list0, vec![Some(0)]);
         assert_eq!(list1, []);
         let outputs = frontend
-            .commit(picture, crate::h264_frontend::SurfaceSlot::new(1))
+            .commit(picture, crate::h264::frontend::SurfaceSlot::new(1))
             .expect("p commits");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].index(), 0);
@@ -1127,7 +1127,7 @@ mod tests {
         let idr = ingest.pictures().pop().expect("idr picture");
         let (picture, _) = frontend.begin(idr).expect("idr begins").expect("idr kept");
         frontend
-            .commit(picture, crate::h264_frontend::SurfaceSlot::new(0))
+            .commit(picture, crate::h264::frontend::SurfaceSlot::new(0))
             .expect("idr commits");
         let pending = frontend.take_pending().expect("open rasl picture");
         assert!(frontend.begin(pending).expect("rasl begins").is_none());
@@ -1222,7 +1222,7 @@ mod tests {
         let idr = frontend.take_pending().expect("open idr");
         let (picture, _) = frontend.begin(idr).expect("begins").expect("kept");
         frontend
-            .commit(picture, crate::h264_frontend::SurfaceSlot::new(3))
+            .commit(picture, crate::h264::frontend::SurfaceSlot::new(3))
             .expect("commits");
         let mut stream = nal(33, &sps_payload());
         stream.extend(nal(34, &pps_payload()));

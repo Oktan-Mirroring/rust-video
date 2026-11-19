@@ -5,7 +5,16 @@
 //! VP9 decode over the shared grammar: ingest, submit, decode.
 
 #[cfg(target_os = "linux")]
-pub use crate::vp9_decoder::Vp9Decoder;
+pub(crate) mod decoder;
+#[allow(dead_code)]
+pub(crate) mod frontend;
+#[allow(dead_code)]
+pub(crate) mod lookups;
+#[allow(dead_code)]
+pub(crate) mod params;
+
+#[cfg(target_os = "linux")]
+pub use crate::vp9::decoder::Vp9Decoder;
 
 pub(crate) use rust_video_vp9::{FrameHeader, MAX_SEGMENTS, NUM_REF_FRAMES};
 
@@ -27,7 +36,7 @@ impl From<rust_video_vp9::Fault> for crate::error::VaApiError {
 mod tests {
     use super::Parser;
     use crate::error::VaApiError;
-    use crate::vp9_frontend::Frontend;
+    use crate::vp9::frontend::Frontend;
 
     use bytes::Bytes;
     use rust_video_harness::Bits;
@@ -75,8 +84,8 @@ mod tests {
 
     #[test]
     fn keyframe_feeds_submit_params() {
-        use crate::vp9_frontend::Begun;
-        use crate::vp9_params::Params;
+        use crate::vp9::frontend::Begun;
+        use crate::vp9::params::Params;
 
         let bytes = Bytes::from(keyframe(320, 240));
         let mut frontend = Frontend::new();

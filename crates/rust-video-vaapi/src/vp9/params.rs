@@ -9,12 +9,12 @@ use crate::error::VaApiError;
 use crate::ffi::{
     VaDecPictureParameterBufferVp9, VaSegmentParameterVp9, VaSliceParameterBufferVp9, VaSurfaceId,
 };
-use crate::h264_frontend::SurfaceSlot;
-use crate::vp9::{FrameHeader, MAX_SEGMENTS};
-use crate::vp9_frontend::NUM_SLOTS;
-use crate::vp9_lookups::{
+use crate::h264::frontend::SurfaceSlot;
+use crate::vp9::frontend::NUM_SLOTS;
+use crate::vp9::lookups::{
     AC_QLOOKUP, AC_QLOOKUP_10, AC_QLOOKUP_12, DC_QLOOKUP, DC_QLOOKUP_10, DC_QLOOKUP_12,
 };
+use crate::vp9::{FrameHeader, MAX_SEGMENTS};
 
 /// Last-frame reference index, shared by `Params` and `Segmentation`.
 const LAST_FRAME: usize = 1;

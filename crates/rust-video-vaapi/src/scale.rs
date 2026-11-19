@@ -11,7 +11,7 @@ use crate::buffer::{bytes_of, VaBuffer};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
-use crate::h264_decoder::VaApiFrame;
+use crate::h264::decoder::VaApiFrame;
 use crate::sys;
 
 use rust_video_caps::common::PictureSize;

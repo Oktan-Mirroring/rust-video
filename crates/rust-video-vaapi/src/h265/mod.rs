@@ -5,7 +5,18 @@
 //! H.265 Annex B ingest over the shared grammar.
 
 #[cfg(target_os = "linux")]
-pub use crate::h265_decoder::H265Decoder;
+pub(crate) mod decoder;
+#[allow(dead_code)]
+pub(crate) mod dpb;
+#[allow(dead_code)]
+pub(crate) mod frontend;
+#[allow(dead_code)]
+pub(crate) mod params;
+#[allow(dead_code)]
+pub(crate) mod picture;
+
+#[cfg(target_os = "linux")]
+pub use crate::h265::decoder::H265Decoder;
 
 pub(crate) use rust_video_h265::{
     anchors_tid0, is_bla, is_cra, is_idr, is_irap, is_rasl, nal_unit_type, parse_pps,

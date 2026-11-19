@@ -10,7 +10,7 @@
 //! wired; until then every packet declines with typed `Unsupported`.
 
 use crate::error::VaApiError;
-use crate::h264_decoder::VaApiFrame;
+use crate::h264::decoder::VaApiFrame;
 
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;

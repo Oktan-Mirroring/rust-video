@@ -8,13 +8,13 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::error::VaApiError;
+use crate::h264::dpb::{Dpb, MaxLongTermFrameIdx, ReferencePicLists};
+use crate::h264::picture::{IsIdr, PictureData, Reference};
 use crate::h264::{
     abs_frame_num, is_idr, nal_ref_idc, nal_unit_type, parse_pps, parse_pps_ids,
     parse_slice_prefix, parse_slice_rest, parse_sps, poc_msb, poc_type2, rbsp, split_nals,
     BitReader, Gate, Marking, Mmco, PocType, Pps, RefMod, SliceHeader, SlicePoc, Sps,
 };
-use crate::h264_dpb::{Dpb, MaxLongTermFrameIdx, ReferencePicLists};
-use crate::h264_picture::{IsIdr, PictureData, Reference};
 
 use bytes::Bytes;
 use rust_video_caps::dpb::PocTracker as CapsPocTracker;
@@ -971,7 +971,7 @@ impl Frontend {
     }
 
     /// Marking failure as a broken reference list.
-    fn broken(error: &crate::h264_dpb::MmcoError) -> VaApiError {
+    fn broken(error: &crate::h264::dpb::MmcoError) -> VaApiError {
         VaApiError::BrokenReference(error.to_string())
     }
 }
@@ -1227,9 +1227,9 @@ mod tests {
     use crate::fixtures::{
         annexed, idr_slice_body, p_slice_body, pps, pps_body, slice_header, sps, sps_body,
     };
+    use crate::h264::dpb::ReferencePicLists;
+    use crate::h264::picture::{IsIdr, PictureData, Reference};
     use crate::h264::{Marking, PocType, RefMod, SliceHeader, SlicePoc, SliceType, Sps};
-    use crate::h264_dpb::ReferencePicLists;
-    use crate::h264_picture::{IsIdr, PictureData, Reference};
 
     use bytes::Bytes;
 

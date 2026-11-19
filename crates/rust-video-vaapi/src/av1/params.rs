@@ -5,17 +5,17 @@
 
 use std::os::raw::c_int;
 
+use crate::av1::frontend::{Tile, NUM_SLOTS};
 use crate::av1::{
     FilmGrain, FrameHeader, GlobalMotion, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES,
     REFS_PER_FRAME, SEG_LEVELS, SEQ_COLOR_RANGE, SUPERRES_NUM,
 };
-use crate::av1_frontend::{Tile, NUM_SLOTS};
 use crate::error::VaApiError;
 use crate::ffi::{
     VaDecPictureParameterBufferAv1, VaFilmGrainAv1, VaSegmentationAv1, VaSliceParameterBufferAv1,
     VaSurfaceId, VaWarpedMotionAv1,
 };
-use crate::h264_frontend::SurfaceSlot;
+use crate::h264::frontend::SurfaceSlot;
 
 /// VA-API parameter builder over the surface pool.
 pub struct Params<'a> {
@@ -468,10 +468,10 @@ mod tests {
     };
 
     use super::Params;
+    use crate::av1::frontend::{Tile, NUM_SLOTS};
     use crate::av1::{FrameHeader, FrameType, SequenceHeader};
-    use crate::av1_frontend::{Tile, NUM_SLOTS};
     use crate::error::VaApiError;
-    use crate::h264_frontend::SurfaceSlot;
+    use crate::h264::frontend::SurfaceSlot;
 
     /// Surfaces backing pool slots.
     const SURFACES: [u32; NUM_SLOTS + 4] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
