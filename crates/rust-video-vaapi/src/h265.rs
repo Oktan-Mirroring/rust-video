@@ -388,7 +388,7 @@ mod tests {
         BitReader, Gate, ParseKind, UnsupportedKind,
     };
     use crate::error::VaApiError;
-    use crate::h265_fixture::{idr_payload, pps_payload, sps_payload};
+    use crate::fixtures::{idr_payload, pps_payload, sps_payload};
 
     #[test]
     fn shared_grammar_agrees_on_fixture_sets() {

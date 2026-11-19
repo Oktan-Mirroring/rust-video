@@ -14,14 +14,14 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
 
+use crate::au::{AccessUnit, AuBoundary, AuSplitter};
 use crate::device::VulkanDevice;
-use crate::error::{ParseError, VulkanError};
-use crate::ladder::CodecOp;
-use crate::parse::au::{AccessUnit, AuBoundary, AuSplitter};
-use crate::parse::refs::{
+use crate::dpb::{
     H264Context, H264Instruction, H265Instruction, Picture, RefPicture, ReferenceId, ReorderBuffer,
     RpsEcho, SlotBook,
 };
+use crate::error::{ParseError, VulkanError};
+use crate::ladder::CodecOp;
 use crate::raw::{DeviceExport, ExportPair, ExtDevice, OwnedDevice, EXPORT_MECHANISM};
 use crate::readback::Readback;
 use crate::session::decode::{
@@ -834,19 +834,19 @@ pub struct H264Decoder<'a> {
     /// Negotiated device, borrowed for the decoder's life.
     device: &'a VulkanDevice,
     /// Annex-B splitter.
-    splitter: crate::parse::h264::NaluSplitter,
+    splitter: crate::h264::NaluSplitter,
     /// H.264 parser.
-    parser: crate::parse::h264::H264Parser,
+    parser: crate::h264::H264Parser,
     /// Access-unit splitter.
-    aus: AuSplitter<crate::parse::h264::ParsedNalu>,
+    aus: AuSplitter<crate::h264::ParsedNalu>,
     /// Reference context.
     context: H264Context,
     /// Standard-structure tables.
     tables: H264Tables,
     /// Parsed sequence sets by id.
-    sps: HashMap<u8, Rc<crate::parse::h264::Sps>>,
+    sps: HashMap<u8, Rc<crate::h264::Sps>>,
     /// Parsed picture sets by id.
-    pps: HashMap<u8, Rc<crate::parse::h264::Pps>>,
+    pps: HashMap<u8, Rc<crate::h264::Pps>>,
     /// Live session, built from the first sequence set.
     session: Option<Session>,
     /// Display sink.
@@ -889,8 +889,8 @@ impl<'a> H264Decoder<'a> {
         }
         Ok(Self {
             device,
-            splitter: crate::parse::h264::NaluSplitter::new(),
-            parser: crate::parse::h264::H264Parser::new(),
+            splitter: crate::h264::NaluSplitter::new(),
+            parser: crate::h264::H264Parser::new(),
             aus: AuSplitter::new(),
             context: H264Context::new(),
             tables: H264Tables::new(),
@@ -930,7 +930,7 @@ impl<'a> H264Decoder<'a> {
     /// pictures before replacing the session they reference.
     fn ensure_session(
         &mut self,
-        sps: &crate::parse::h264::Sps,
+        sps: &crate::h264::Sps,
     ) -> Result<(bool, Vec<VulkanFrame>), VulkanError> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
@@ -1014,8 +1014,8 @@ impl<'a> H264Decoder<'a> {
 }
 
 impl NalFrontend for H264Decoder<'_> {
-    type Raw = crate::parse::h264::Nalu;
-    type Nalu = crate::parse::h264::ParsedNalu;
+    type Raw = crate::h264::Nalu;
+    type Nalu = crate::h264::ParsedNalu;
     type Picture = Picture;
 
     fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Self::Raw> {
@@ -2025,21 +2025,21 @@ pub struct H265Decoder<'a> {
     /// Negotiated device, borrowed for the decoder's life.
     device: &'a VulkanDevice,
     /// Annex-B splitter.
-    splitter: crate::parse::h265::NaluSplitter,
+    splitter: crate::h265::NaluSplitter,
     /// H.265 parser.
-    parser: crate::parse::h265::H265Parser,
+    parser: crate::h265::H265Parser,
     /// Access-unit splitter.
-    aus: AuSplitter<crate::parse::h265::ParsedNalu>,
+    aus: AuSplitter<crate::h265::ParsedNalu>,
     /// Reference context.
-    context: crate::parse::refs::H265Context,
+    context: crate::dpb::H265Context,
     /// Standard-structure tables.
     tables: crate::session::std_h265::H265Tables,
     /// Parsed video sets by id.
-    vps: HashMap<u8, Rc<crate::parse::h265::Vps>>,
+    vps: HashMap<u8, Rc<crate::h265::Vps>>,
     /// Parsed sequence sets by id.
-    sps: HashMap<u8, Rc<crate::parse::h265::Sps>>,
+    sps: HashMap<u8, Rc<crate::h265::Sps>>,
     /// Parsed picture sets by id.
-    pps: HashMap<u8, Rc<crate::parse::h265::Pps>>,
+    pps: HashMap<u8, Rc<crate::h265::Pps>>,
     /// Live session, built from the first sequence set.
     session: Option<Session>,
     /// Display sink.
@@ -2082,10 +2082,10 @@ impl<'a> H265Decoder<'a> {
         }
         Ok(Self {
             device,
-            splitter: crate::parse::h265::NaluSplitter::new(),
-            parser: crate::parse::h265::H265Parser::new(),
+            splitter: crate::h265::NaluSplitter::new(),
+            parser: crate::h265::H265Parser::new(),
             aus: AuSplitter::new(),
-            context: crate::parse::refs::H265Context::new(),
+            context: crate::dpb::H265Context::new(),
             tables: crate::session::std_h265::H265Tables::new(),
             vps: HashMap::new(),
             sps: HashMap::new(),
@@ -2124,7 +2124,7 @@ impl<'a> H265Decoder<'a> {
     /// pictures before replacing the session they reference.
     fn ensure_session(
         &mut self,
-        sps: &crate::parse::h265::Sps,
+        sps: &crate::h265::Sps,
     ) -> Result<(bool, Vec<VulkanFrame>), VulkanError> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
@@ -2217,9 +2217,9 @@ impl<'a> H265Decoder<'a> {
 }
 
 impl NalFrontend for H265Decoder<'_> {
-    type Raw = crate::parse::h265::Nalu;
-    type Nalu = crate::parse::h265::ParsedNalu;
-    type Picture = crate::parse::refs::H265Picture;
+    type Raw = crate::h265::Nalu;
+    type Nalu = crate::h265::ParsedNalu;
+    type Picture = crate::dpb::H265Picture;
 
     fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Self::Raw> {
         self.splitter.push(bytes)
@@ -2252,7 +2252,7 @@ impl NalFrontend for H265Decoder<'_> {
 
     fn submit_picture(
         &mut self,
-        picture: &crate::parse::refs::H265Picture,
+        picture: &crate::dpb::H265Picture,
         gpu: bool,
     ) -> Result<(), VulkanError> {
         use crate::session::std_h265::{fill_picture, fill_reference};
@@ -2584,11 +2584,11 @@ pub struct Av1Decoder<'a> {
     /// Negotiated device, borrowed for the decoder's life.
     device: &'a VulkanDevice,
     /// Reference context.
-    context: crate::parse::refs::Av1Context,
+    context: crate::dpb::Av1Context,
     /// Standard-structure tables.
     tables: crate::session::std_av1::Av1Tables,
     /// Active sequence header.
-    seq: Option<Rc<crate::parse::av1::SequenceHeader>>,
+    seq: Option<Rc<crate::av1::SequenceHeader>>,
     /// Live session, built from the first sequence header.
     session: Option<Session>,
     /// Display sink.
@@ -2645,7 +2645,7 @@ impl<'a> Av1Decoder<'a> {
         }
         Ok(Self {
             device,
-            context: crate::parse::refs::Av1Context::new(),
+            context: crate::dpb::Av1Context::new(),
             tables: crate::session::std_av1::Av1Tables::new(),
             seq: None,
             session: None,
@@ -2681,7 +2681,7 @@ impl<'a> Av1Decoder<'a> {
     /// Session for `seq` at `display`, recreated on geometry change.
     fn ensure_session(
         &mut self,
-        seq: &Rc<crate::parse::av1::SequenceHeader>,
+        seq: &Rc<crate::av1::SequenceHeader>,
         display: (u32, u32),
     ) -> Result<(), VulkanError> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
@@ -2730,7 +2730,7 @@ impl<'a> Av1Decoder<'a> {
     /// Order hints, sign bias, and expected ids of `picture` references.
     fn resolve_ref_state(
         &self,
-        picture: &crate::parse::refs::Av1Picture,
+        picture: &crate::dpb::Av1Picture,
     ) -> Result<Av1RefState, VulkanError> {
         let (Some(session), Some(seq)) = (self.session.as_ref(), self.seq.as_ref()) else {
             return Err(VulkanError::NoSession);
@@ -2749,8 +2749,8 @@ impl<'a> Av1Decoder<'a> {
         }
         let mut bias = 0;
         if seq.enable_order_hint() && !header.frame_type.is_intra() {
-            for name in 0..crate::parse::av1::REFS_PER_FRAME {
-                if crate::parse::av1::relative_dist(
+            for name in 0..crate::av1::REFS_PER_FRAME {
+                if crate::av1::relative_dist(
                     order_hints[name + 1],
                     header.order_hint,
                     seq.order_hint_bits_minus1,
@@ -2762,7 +2762,7 @@ impl<'a> Av1Decoder<'a> {
         }
         let mut expected = [0_u32; 8];
         if !header.frame_type.is_intra() {
-            for name in 0..crate::parse::av1::REFS_PER_FRAME {
+            for name in 0..crate::av1::REFS_PER_FRAME {
                 expected[name + 1] = crate::session::std_av1::expected_frame_id(seq, header, name);
             }
         }
@@ -2776,7 +2776,7 @@ impl<'a> Av1Decoder<'a> {
     /// Queue-submit one decoded picture without waiting.
     fn submit_picture(
         &mut self,
-        picture: &crate::parse::refs::Av1Picture,
+        picture: &crate::dpb::Av1Picture,
         gpu: bool,
     ) -> Result<(), VulkanError> {
         use crate::session::std_av1::{fill_reference, Av1PictureStd};
@@ -2884,7 +2884,7 @@ impl<'a> Av1Decoder<'a> {
     /// Submit one picture, then collect per `mode`.
     fn run_picture(
         &mut self,
-        picture: &crate::parse::refs::Av1Picture,
+        picture: &crate::dpb::Av1Picture,
         gpu: bool,
         mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
@@ -2911,11 +2911,11 @@ impl<'a> Av1Decoder<'a> {
     /// Run one temporal unit through the context, submitting its pictures.
     fn run_unit(
         &mut self,
-        unit: &crate::parse::av1::TemporalUnit<'_>,
+        unit: &crate::av1::TemporalUnit<'_>,
         gpu: bool,
         mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        use crate::parse::refs::Av1Instruction;
+        use crate::dpb::Av1Instruction;
         let mut out = Vec::new();
         for instruction in self.context.compile(unit)? {
             match instruction {
@@ -3206,8 +3206,8 @@ impl<'a> Av1Decoder<'a> {
         mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
-        let obus = crate::parse::av1::split_obus(bytes)?;
-        for unit in crate::parse::av1::temporal_units(obus) {
+        let obus = crate::av1::split_obus(bytes)?;
+        for unit in crate::av1::temporal_units(obus) {
             out.extend(self.run_unit(&unit, gpu, mode)?);
         }
         match mode {
@@ -3313,7 +3313,7 @@ fn release_ids(session: &mut Session, ids: &[ReferenceId]) {
 /// Returns `Err` when a slot id exceeds its field width.
 fn av1_name_indices(
     session: &Session,
-    picture: &crate::parse::refs::Av1Picture,
+    picture: &crate::dpb::Av1Picture,
 ) -> Result<[i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR], VulkanError> {
     let mut name_indices = [-1_i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR];
     for (name, id) in picture.name_slots().iter().enumerate() {
@@ -3334,7 +3334,7 @@ fn av1_name_indices(
 ///
 /// Returns `Err` when the tile count exceeds its field width.
 fn av1_codec_info<'a>(
-    picture: &'a crate::parse::refs::Av1Picture,
+    picture: &'a crate::dpb::Av1Picture,
     std_sets: &'a crate::session::std_av1::Av1PictureStd,
     name_indices: [i32; vk::MAX_VIDEO_AV1_REFERENCES_PER_FRAME_KHR],
 ) -> Result<vk::VideoDecodeAV1PictureInfoKHR<'a>, VulkanError> {
@@ -3361,7 +3361,7 @@ fn av1_codec_info<'a>(
 /// resyncs instead of submitting a dangling `-1`.
 fn collect_av1_refs(
     session: &Session,
-    picture: &crate::parse::refs::Av1Picture,
+    picture: &crate::dpb::Av1Picture,
 ) -> Result<Vec<(usize, ReferenceId)>, VulkanError> {
     let mut refs = Vec::new();
     for id in picture.name_slots().iter().flatten() {
@@ -3654,8 +3654,8 @@ mod tests {
     }
 
     /// Kind tag of one instruction, asserting a zero reorder depth on sets.
-    fn tag(instruction: &crate::parse::refs::H264Instruction) -> &'static str {
-        use crate::parse::refs::H264Instruction;
+    fn tag(instruction: &crate::dpb::H264Instruction) -> &'static str {
+        use crate::dpb::H264Instruction;
         match instruction {
             H264Instruction::Sps(sps) => {
                 assert_eq!(sps.num_reorder_frames().unwrap_or(0), 0);
@@ -3670,14 +3670,14 @@ mod tests {
 
     /// Instruction tags out of one packet, trailing unit completed.
     fn feed_packet(
-        splitter: &mut crate::parse::h264::NaluSplitter,
-        parser: &mut crate::parse::h264::H264Parser,
-        aus: &mut crate::parse::au::AuSplitter<crate::parse::h264::ParsedNalu>,
-        context: &mut crate::parse::refs::H264Context,
+        splitter: &mut crate::h264::NaluSplitter,
+        parser: &mut crate::h264::H264Parser,
+        aus: &mut crate::au::AuSplitter<crate::h264::ParsedNalu>,
+        context: &mut crate::dpb::H264Context,
         bytes: &[u8],
     ) -> Vec<&'static str> {
         let mut tags = Vec::new();
-        let mut run_nal = |raw: crate::parse::h264::Nalu| {
+        let mut run_nal = |raw: crate::h264::Nalu| {
             let parsed = parser.parse(&raw).expect("synth parses");
             if let Some(unit) = aus.put(parsed) {
                 for instruction in context.compile(unit) {
@@ -3703,9 +3703,9 @@ mod tests {
     fn synth_packets_complete_one_picture_per_call_without_reorder() {
         use rust_video_harness::H264Synth;
 
-        use crate::parse::au::AuSplitter;
-        use crate::parse::h264::{H264Parser, NaluSplitter};
-        use crate::parse::refs::H264Context;
+        use crate::au::AuSplitter;
+        use crate::dpb::H264Context;
+        use crate::h264::{H264Parser, NaluSplitter};
 
         let packets = H264Synth::annex_b_packets();
         assert_eq!(packets.len(), 2);
@@ -3738,7 +3738,7 @@ mod tests {
 
     #[test]
     fn slot_exhaustion_is_no_free_slot() {
-        use crate::parse::refs::{ReferenceId, SlotBook};
+        use crate::dpb::{ReferenceId, SlotBook};
         let mut book = SlotBook::with_slots(1);
         assert_eq!(
             super::claim_slot(&mut book, ReferenceId(0)).expect("slot"),

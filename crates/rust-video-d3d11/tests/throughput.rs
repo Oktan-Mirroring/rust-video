@@ -1,8 +1,12 @@
 //! GPU transcode throughput: 1080p hops against the 60 fps bar.
 //!
 //! Skips without hardware; a hardware run fails below the bar.
+//! Also covers encode latency, VP9 tuning, and seam alloc cost.
 
 #![cfg(target_os = "windows")]
+
+use std::hint::black_box;
+use std::time::Instant;
 
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, GpuSurface, H264Decoder,
@@ -15,7 +19,12 @@ use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
+use rust_video_harness::{
+    bench_dir, decode_dir, AnnexB, CountingAlloc, Drive, H264Synth, Ivf, Packets, Synth,
+};
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
 
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
@@ -874,5 +883,335 @@ fn sustained_vp9_1080p_measures_realtime() {
     assert!(
         measured >= SUSTAINED_VP9_BAR,
         "below sustained bar: {measured:.1}fps < {SUSTAINED_VP9_BAR:.0}fps"
+    );
+}
+
+/// Calls of `codec` each return their own stamped packet, flush stays empty.
+fn audit_own_frames(codec: Codec, tag: &str) {
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("{tag} skipped: {error}");
+            return;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, codec) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("{tag} skipped: {error}");
+            return;
+        }
+    };
+    let mut step = None;
+    let mut first = None;
+    for call in 0..4u64 {
+        let frame = Synth::noise(1920, 1080, call);
+        let packets = encoder.encode(&frame).expect("encode runs");
+        assert!(!packets.is_empty(), "{tag} call {call} held its frame back");
+        let pts = packets[0].pts().expect("packet stamped");
+        if call == 0 {
+            first = Some(pts);
+        }
+        if call == 1 {
+            step = Some(
+                pts.checked_sub(first.expect("first stamped"))
+                    .expect("pts increase"),
+            );
+        }
+        let call = u32::try_from(call).expect("call fits");
+        let want = first.expect("first stamped") + step.unwrap_or_default() * call;
+        assert!(
+            packets.iter().any(|packet| packet.pts() == Some(want)),
+            "{tag} call {call} missed its own stamp"
+        );
+    }
+    let drained = encoder.flush().expect("flush runs");
+    assert!(
+        drained.is_empty(),
+        "{tag} flush held {} back",
+        drained.len()
+    );
+}
+
+#[test]
+fn encode_returns_own_frames() {
+    audit_own_frames(Codec::H264, "h264");
+    audit_own_frames(Codec::Hevc, "hevc");
+    audit_own_frames(Codec::Av1, "av1");
+    audit_own_frames(Codec::Vp9, "vp9");
+}
+
+/// Fps observation repeats on the contended box.
+const REPEATS: u32 = 3;
+
+/// Validity frames behind the ffmpeg decode.
+const VALIDITY_FRAMES: u64 = 8;
+
+/// Tuned VP9 encoder plus its first frame bytes.
+///
+/// The forcing frame configures the media types, which applies the tuning;
+/// its bytes head the validity bitstream. Loud skip without hardware, MFT,
+/// or property.
+fn tuned(width: u32, height: u32) -> Option<(D3d11Encoder, Vec<u8>)> {
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("vp9 skipped: {error}");
+            return None;
+        }
+    };
+    let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("vp9 skipped: {error}");
+            return None;
+        }
+    };
+    println!("vp9 mft: {}", encoder.mft_name());
+    let warmup = Synth::noise(width, height, 999);
+    let mut first = Vec::new();
+    match encoder.encode(&warmup) {
+        Ok(packets) => {
+            for packet in packets {
+                first.extend_from_slice(packet.data());
+            }
+        }
+        Err(error) => {
+            println!("vp9 skipped: configure encode failed ({error})");
+            return None;
+        }
+    }
+    if let Some(tuning) = encoder.vp9_tuning() {
+        println!("vp9 tuning: quality_vs_speed={}", tuning.quality_vs_speed());
+        Some((encoder, first))
+    } else {
+        println!("vp9 skipped: MFT declines the speed property");
+        None
+    }
+}
+
+/// Encoder tuned before its first frame.
+#[test]
+fn vp9_tuning_lands_fastest_level() {
+    let _serial = Drive::serial();
+    let Some((encoder, _)) = tuned(320, 240) else {
+        return;
+    };
+    let tuning = encoder.vp9_tuning().expect("tuning applies");
+    assert_eq!(tuning.quality_vs_speed(), 0, "landed level favors speed");
+}
+
+/// Tuned VP9 output decodes clean under ffmpeg.
+#[test]
+fn vp9_tuned_output_decodes_clean() {
+    let _serial = Drive::serial();
+    let Some((mut encoder, first)) = tuned(320, 240) else {
+        return;
+    };
+    let mut payloads = vec![first];
+    for call in 0..VALIDITY_FRAMES {
+        let frame = Synth::noise(320, 240, call);
+        let mut coded = Vec::new();
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            coded.extend_from_slice(packet.data());
+        }
+        assert!(!coded.is_empty(), "call {call} emits a frame");
+        payloads.push(coded);
+    }
+    for packet in encoder.flush().expect("flush runs") {
+        assert!(packet.data().is_empty(), "flush holds no frame back");
+    }
+    let path = std::env::temp_dir().join("rust-video-d3d11-vp9.ivf");
+    std::fs::write(&path, ivf(&payloads, 320, 240)).expect("oracle input writable");
+    ffmpeg_clean(&path);
+    std::fs::remove_file(&path).ok();
+    let bytes: usize = payloads.iter().map(Vec::len).sum();
+    println!(
+        "vp9 validity: {} frames, {bytes} bytes, ffmpeg-clean",
+        payloads.len()
+    );
+}
+
+/// Tuned VP9 calls each return their own stamped packet.
+#[test]
+fn vp9_tuned_latency_returns_own_frames() {
+    let _serial = Drive::serial();
+    let Some((mut encoder, _)) = tuned(320, 240) else {
+        return;
+    };
+    let mut step = None;
+    let mut first = None;
+    for call in 0..4u64 {
+        let frame = Synth::noise(320, 240, call);
+        let packets = encoder.encode(&frame).expect("encode runs");
+        assert!(!packets.is_empty(), "call {call} held its frame back");
+        let pts = packets[0].pts().expect("packet stamped");
+        if call == 0 {
+            first = Some(pts);
+        }
+        if call == 1 {
+            step = Some(
+                pts.checked_sub(first.expect("first stamped"))
+                    .expect("pts increase"),
+            );
+        }
+        let call = u32::try_from(call).expect("call fits");
+        let want = first.expect("first stamped") + step.unwrap_or_default() * call;
+        assert!(
+            packets.iter().any(|packet| packet.pts() == Some(want)),
+            "call {call} missed its own stamp"
+        );
+    }
+    let drained = encoder.flush().expect("flush runs");
+    assert!(drained.is_empty(), "flush held {} back", drained.len());
+}
+
+/// Contended 1080p fps observations with repeats, reported only.
+#[test]
+fn vp9_contended_fps_observations() {
+    let _serial = Drive::serial();
+    let Some((mut encoder, _)) = tuned(1920, 1080) else {
+        return;
+    };
+    let frames: Vec<_> = (0..WARMUP + u64::from(HOPS))
+        .map(|seed| Synth::noise(1920, 1080, seed))
+        .collect();
+    let (warmup, timed) = frames.split_at(usize::try_from(WARMUP).expect("warmup fits"));
+    let mut runs = Vec::new();
+    for _ in 0..REPEATS {
+        for frame in warmup {
+            encoder.encode(frame).expect("warmup encode");
+        }
+        let mut bytes = 0;
+        let start = std::time::Instant::now();
+        for frame in timed {
+            for packet in encoder.encode(frame).expect("timed encode") {
+                bytes += packet.data().len();
+            }
+        }
+        for packet in encoder.flush().expect("timed flush") {
+            bytes += packet.data().len();
+        }
+        assert!(bytes > 0);
+        runs.push(f64::from(HOPS) / start.elapsed().as_secs_f64());
+    }
+    let mean = runs.iter().sum::<f64>() / f64::from(REPEATS);
+    println!("vp9 contended fps: {runs:?}, mean {mean:.1}");
+}
+
+/// IVF file over `payloads` at `width` x `height`, 30 fps.
+fn ivf(payloads: &[Vec<u8>], width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"DKIF");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"VP90");
+    out.extend_from_slice(&u16::try_from(width).expect("width fits").to_le_bytes());
+    out.extend_from_slice(&u16::try_from(height).expect("height fits").to_le_bytes());
+    out.extend_from_slice(&30u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(payloads.len())
+            .expect("count fits")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for (index, payload) in payloads.iter().enumerate() {
+        out.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("frame fits")
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&u64::try_from(index).expect("pts fits").to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+/// ffmpeg decode over `path`, failing loud without the oracle.
+fn ffmpeg_clean(path: &std::path::Path) {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap_or_else(|error| panic!("ffmpeg oracle missing: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "ffmpeg rejects the bitstream: {stderr}"
+    );
+    assert!(output.stderr.is_empty(), "ffmpeg warnings: {stderr}");
+}
+
+/// Frames decoded from `packets` plus the flush drain.
+fn decode_all(decoder: &mut H264Decoder<'_>, packets: &[Packet]) -> usize {
+    let mut frames = 0;
+    for packet in packets {
+        frames += decoder.decode(packet).expect("steady decode").len();
+    }
+    frames += decoder.flush().expect("flush drains").len();
+    frames
+}
+
+/// Boxed export cost stays under one percent of frame decode time.
+///
+/// `emit_frame` boxes one 16-byte `SharedExport` (`Arc` plus handle)
+/// per frame behind the `FrameExport` seam. The count below covers
+/// Rust-side allocs only (COM and driver allocs bypass the counter);
+/// the Box microbench sizes one 16-byte alloc-plus-free against one
+/// frame decode on this hardware.
+#[test]
+fn seam_box_cost_is_negligible_per_frame() {
+    /// 16-byte payload, the `SharedExport` size behind the seam.
+    const BOX_PAYLOAD: [u64; 2] = [0x1234_5678, 0x9ABC_DEF0];
+    /// Box alloc-plus-free iterations in the microbench.
+    const BOX_ITERS: u32 = 200_000;
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
+    let path = decode_dir().join("valid_320x240.h264");
+    let raws = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl);
+    assert_eq!(raws.len(), 15, "vector holds one packet per picture");
+    let packets: Vec<Packet> = raws
+        .iter()
+        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+        .collect();
+    let mut decoder = H264Decoder::open(&device);
+    assert_eq!(
+        decode_all(&mut decoder, &packets),
+        15,
+        "warmup yields every picture"
+    );
+    CountingAlloc::reset();
+    let start = Instant::now();
+    let mut decoder = H264Decoder::open(&device);
+    assert_eq!(
+        decode_all(&mut decoder, &packets),
+        15,
+        "measured yields every picture"
+    );
+    let frame_ns = start.elapsed().as_nanos() / 15;
+    let allocs = CountingAlloc::allocation_count();
+    let start = Instant::now();
+    for _ in 0..BOX_ITERS {
+        drop(black_box(Box::new(BOX_PAYLOAD)));
+    }
+    let box_ns = start.elapsed().as_nanos() / u128::from(BOX_ITERS);
+    let millipct = box_ns * 100_000 / frame_ns;
+    println!(
+        "seam allocs: {allocs} Rust-side allocs over 15 frames ({} per frame), \
+         frame {frame_ns}ns, 16B box {box_ns}ns ({}.{:03}% of frame)",
+        allocs / 15,
+        millipct / 1000,
+        millipct % 1000,
+    );
+    assert!(
+        box_ns * 100 < frame_ns,
+        "box {box_ns}ns exceeds 1% of frame {frame_ns}ns"
     );
 }

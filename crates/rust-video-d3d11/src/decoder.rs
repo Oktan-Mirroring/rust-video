@@ -10,7 +10,7 @@ use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 use crate::frame::{D3d11Frame, FrameExport};
 use crate::guid::Codec;
 use crate::h264::{Crop, Ingest, Picture};
-use crate::inflight::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
+use crate::overlap::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
 use crate::pins::SlotPins;
 use crate::readback::Readback;
 use crate::session::Session;

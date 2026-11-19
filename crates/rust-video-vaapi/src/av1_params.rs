@@ -15,7 +15,7 @@ use crate::ffi::{
     VaDecPictureParameterBufferAv1, VaFilmGrainAv1, VaSegmentationAv1, VaSliceParameterBufferAv1,
     VaSurfaceId, VaWarpedMotionAv1,
 };
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 
 /// VA-API parameter builder over the surface pool.
 pub struct Params<'a> {
@@ -471,14 +471,14 @@ mod tests {
     use crate::av1::{FrameHeader, FrameType, SequenceHeader};
     use crate::av1_frontend::{Tile, NUM_SLOTS};
     use crate::error::VaApiError;
-    use crate::frontend::SurfaceSlot;
+    use crate::h264_frontend::SurfaceSlot;
 
     /// Surfaces backing pool slots.
     const SURFACES: [u32; NUM_SLOTS + 4] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
 
     /// Sequence header for Profile 0 8-bit 4:2:0.
     fn sequence() -> SequenceHeader {
-        rust_video_av1::parse_sequence_header::<VaApiError>(&crate::av1_fixture::seq_payload())
+        rust_video_av1::parse_sequence_header::<VaApiError>(&crate::fixtures::seq_payload())
             .expect("fixture sequence")
     }
 

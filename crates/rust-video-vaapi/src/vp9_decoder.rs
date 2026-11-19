@@ -2,10 +2,10 @@
 
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
-use crate::decoder::{Emit, VaApiFrame};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
-use crate::frontend::SurfaceSlot;
+use crate::h264_decoder::{Emit, VaApiFrame};
+use crate::h264_frontend::SurfaceSlot;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 use crate::vp9_frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};

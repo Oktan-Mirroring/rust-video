@@ -9,7 +9,7 @@ use crate::error::VaApiError;
 use crate::ffi::{
     VaDecPictureParameterBufferVp9, VaSegmentParameterVp9, VaSliceParameterBufferVp9, VaSurfaceId,
 };
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 use crate::vp9::{FrameHeader, MAX_SEGMENTS};
 use crate::vp9_frontend::NUM_SLOTS;
 use crate::vp9_lookups::{

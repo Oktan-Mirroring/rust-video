@@ -1,10 +1,10 @@
 //! GPU transcode: decode surface to encoder input without readback.
 
-use crate::decoder::{H264Decoder, VaApiFrame};
 use crate::device::VaApiDevice;
 use crate::encoder::{EncodeCodec, GopShape, VaApiEncoder};
 use crate::error::VaApiError;
 use crate::ffi;
+use crate::h264_decoder::{H264Decoder, VaApiFrame};
 use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
@@ -273,7 +273,7 @@ mod tests {
         cause: FallbackCause,
     ) -> super::Transcoder<'_> {
         super::Transcoder {
-            decoder: crate::decoder::H264Decoder::open(device),
+            decoder: crate::h264_decoder::H264Decoder::open(device),
             encode_codec: crate::encoder::EncodeCodec::H264,
             gop: crate::encoder::GopShape::AllIntra,
             encoder: None,

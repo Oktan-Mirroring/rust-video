@@ -23,12 +23,12 @@ use ash::vk::native::{
     StdVideoH265VpsFlags,
 };
 
+use crate::dpb::{H265Picture, SlotBook};
 use crate::error::ParseError;
-use crate::parse::h265::{
+use crate::h265::{
     HrdLayerData, HrdParams, Pps, ProfileTierLevel, ScalingLists, ShortTermRps, Sps, Vps,
     VuiParams, PPS_SCALING, SPS_NESTING, SPS_ORDERING_INFO,
 };
-use crate::parse::refs::{H265Picture, SlotBook};
 use crate::session::geometry::{h265_level_to_std, h265_profile_to_std};
 
 /// H.265 parameter tables with box-stable standard-structure backing.
@@ -875,7 +875,7 @@ pub(crate) fn fill_picture(
 
 /// DPB slot indices of one echo list.
 fn resolve_list(
-    list: &[Option<crate::parse::refs::ReferenceId>],
+    list: &[Option<crate::dpb::ReferenceId>],
     slots: &SlotBook,
     syntax: &'static str,
 ) -> Result<[u8; 8], ParseError> {
@@ -943,10 +943,10 @@ fn narrow_len(value: usize, syntax: &'static str) -> Result<u8, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::h265::{H265Parser, ParsedNalu};
-    use crate::parse::refs::{H265Context, H265Instruction, ReferenceId, SlotBook};
-    use crate::parse::test_support::{hex, split265};
+    use crate::au::{AccessUnit, AuSplitter};
+    use crate::dpb::{H265Context, H265Instruction, ReferenceId, SlotBook};
+    use crate::fixtures::{hex, split265};
+    use crate::h265::{H265Parser, ParsedNalu};
 
     /// Fork `demo.h265` video set.
     const VPS: &str = "40010c01ffff01600000030090000003000003003c92809000";
@@ -964,9 +964,9 @@ mod tests {
 
     /// Parsed parameter sets of the fork demo.
     fn demo_sets() -> (
-        std::rc::Rc<crate::parse::h265::Vps>,
-        std::rc::Rc<crate::parse::h265::Sps>,
-        std::rc::Rc<crate::parse::h265::Pps>,
+        std::rc::Rc<crate::h265::Vps>,
+        std::rc::Rc<crate::h265::Sps>,
+        std::rc::Rc<crate::h265::Pps>,
     ) {
         let units = split265(&[hex(VPS), hex(SPS), hex(PPS)]);
         let mut parser = H265Parser::new();

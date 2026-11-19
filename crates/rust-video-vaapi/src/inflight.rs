@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 
 /// Bounded holdback queue over decoded surfaces.
 ///
@@ -143,7 +143,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{PendingQueue, PendingSlot};
-    use crate::frontend::SurfaceSlot;
+    use crate::h264_frontend::SurfaceSlot;
 
     /// Staged slot over pool index `index`.
     fn slot(index: u32) -> PendingSlot {

@@ -243,7 +243,7 @@ impl Default for H264Parser {
 #[cfg(test)]
 mod tests {
     use super::{H264Parser, ParsedNalu, SliceType};
-    use crate::parse::test_support::{hex, split264};
+    use crate::fixtures::{hex, split264};
 
     /// First two NAL units of the fork `demo.h264` vector.
     const DEMO_SPS: &str = "6764000dacb20283f60220000003002000000641e2854900";

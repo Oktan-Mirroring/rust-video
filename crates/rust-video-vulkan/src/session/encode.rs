@@ -29,8 +29,8 @@ use ash::vk::native::{
 use rust_video_caps::transcode::ShareMechanism;
 
 use crate::device::VulkanDevice;
+use crate::dpb::{ReferenceId, SlotBook};
 use crate::error::VulkanError;
-use crate::parse::refs::{ReferenceId, SlotBook};
 use crate::raw::{
     DeviceExport, EncodeFeedback, EncodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView,
     ImportPair, SessionParameters, VideoSession, IMPORT_MECHANISM,

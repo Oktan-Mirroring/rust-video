@@ -73,13 +73,13 @@ impl<N> AccessUnit<N> {
     }
 }
 
-impl AuBoundary for crate::parse::h264::ParsedNalu {
+impl AuBoundary for crate::h264::ParsedNalu {
     fn is_slice(&self) -> bool {
-        matches!(self, crate::parse::h264::ParsedNalu::Slice(_))
+        matches!(self, crate::h264::ParsedNalu::Slice(_))
     }
 
     fn is_new_au(buffered: &[Self], nalu: &Self) -> bool {
-        use crate::parse::h264::ParsedNalu;
+        use crate::h264::ParsedNalu;
         let ParsedNalu::Slice(slice) = nalu else {
             return false;
         };
@@ -105,11 +105,8 @@ fn one_zero_ref_idc(last: u8, current: u8) -> bool {
 }
 
 /// True when type-0 POC fields differ between the two slices.
-fn poc_type_zero_differs(
-    last: &crate::parse::h264::Slice,
-    current: &crate::parse::h264::Slice,
-) -> bool {
-    use crate::parse::h264::{PocType, SlicePoc};
+fn poc_type_zero_differs(last: &crate::h264::Slice, current: &crate::h264::Slice) -> bool {
+    use crate::h264::{PocType, SlicePoc};
     if last.sps.poc_type != PocType::Lsb || current.sps.poc_type != PocType::Lsb {
         return false;
     }
@@ -122,22 +119,19 @@ fn poc_type_zero_differs(
 }
 
 /// True for two IDR slices with different IDR ids.
-fn idr_pic_id_differs(
-    last: &crate::parse::h264::Slice,
-    current: &crate::parse::h264::Slice,
-) -> bool {
+fn idr_pic_id_differs(last: &crate::h264::Slice, current: &crate::h264::Slice) -> bool {
     last.idr && current.idr && last.header.idr_pic_id != current.header.idr_pic_id
 }
 
-impl AuBoundary for crate::parse::h265::ParsedNalu {
+impl AuBoundary for crate::h265::ParsedNalu {
     fn is_slice(&self) -> bool {
-        matches!(self, crate::parse::h265::ParsedNalu::Slice(_))
+        matches!(self, crate::h265::ParsedNalu::Slice(_))
     }
 
     fn is_new_au(_buffered: &[Self], nalu: &Self) -> bool {
         matches!(
             nalu,
-            crate::parse::h265::ParsedNalu::Slice(slice) if slice.header.first
+            crate::h265::ParsedNalu::Slice(slice) if slice.header.first
         )
     }
 }

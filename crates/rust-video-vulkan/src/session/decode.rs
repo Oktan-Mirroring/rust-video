@@ -8,8 +8,8 @@
 use ash::vk;
 
 use crate::device::VulkanDevice;
+use crate::dpb::SlotBook;
 use crate::error::VulkanError;
-use crate::parse::refs::SlotBook;
 use crate::raw::{
     DecodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView, SessionParameters,
     VideoSession,

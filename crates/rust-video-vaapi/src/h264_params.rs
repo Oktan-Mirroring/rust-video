@@ -10,9 +10,9 @@ use crate::ffi::{
     VaIqMatrixBufferH264, VaPictureH264, VaPictureParameterBufferH264, VaSliceParameterBufferH264,
     VaSurfaceId,
 };
-use crate::frontend::{PendingSlice, SurfaceSlot};
 use crate::h264::{Pps, SliceHeader, SliceType, Sps};
 use crate::h264_dpb::Dpb;
+use crate::h264_frontend::{PendingSlice, SurfaceSlot};
 use crate::h264_picture::{PictureData, Reference};
 
 /// VA-API parameter builder over the DPB and the surface pool.
@@ -482,10 +482,10 @@ mod tests {
 
     use super::Params;
     use crate::error::VaApiError;
-    use crate::frontend::{PendingSlice, SurfaceSlot};
+    use crate::fixtures::{pps, slice_header, sps};
     use crate::h264::SliceHeader;
     use crate::h264_dpb::Dpb;
-    use crate::h264_fixture::{pps, slice_header, sps};
+    use crate::h264_frontend::{PendingSlice, SurfaceSlot};
     use crate::h264_picture::{PictureData, Reference};
 
     #[test]

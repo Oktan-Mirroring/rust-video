@@ -2,11 +2,11 @@
 
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
-use crate::decoder::{Emit, VaApiFrame};
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi::VaSliceParameterBufferHevc;
-use crate::frontend::SurfaceSlot;
+use crate::h264_decoder::{Emit, VaApiFrame};
+use crate::h264_frontend::SurfaceSlot;
 use crate::h265_frontend::{Frontend, PendingPicture, Picture};
 use crate::h265_params::Params;
 use crate::inflight::{PendingQueue, PendingSlot};

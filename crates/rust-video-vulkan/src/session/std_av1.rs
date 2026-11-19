@@ -13,11 +13,11 @@ use ash::vk::native::{
     StdVideoDecodeAV1ReferenceInfo, StdVideoDecodeAV1ReferenceInfoFlags,
 };
 
-use crate::error::ParseError;
-use crate::parse::av1::{
+use crate::av1::{
     FrameHeader, SequenceHeader, INTERP_SWITCHABLE, SEQ_COLOR_RANGE, SUPERRES_DENOM_MIN,
     SUPERRES_NUM,
 };
+use crate::error::ParseError;
 
 /// AV1 sequence tables with box-stable standard-structure backing.
 pub(crate) struct Av1Tables {
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn restoration_remaps_types_and_sizes() {
-        let header = crate::parse::av1::FrameHeader::default();
+        let header = crate::av1::FrameHeader::default();
         let restoration = fill_restoration(&header);
         assert_eq!(restoration.FrameRestorationType, [0, 0, 0]);
         assert_eq!(restoration.LoopRestorationSize, [1, 1, 1]);
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn grain_defaults_apply_nothing() {
-        let header = crate::parse::av1::FrameHeader::default();
+        let header = crate::av1::FrameHeader::default();
         let grain = fill_grain(&header);
         assert_eq!(grain.grain_seed, 0);
         assert_eq!(grain.num_y_points, 0);
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn expected_ids_wrap_on_frame_id_width() {
-        use crate::parse::av1::{FrameHeader, SequenceHeader, SEQ_FRAME_ID_NUMBERS};
+        use crate::av1::{FrameHeader, SequenceHeader, SEQ_FRAME_ID_NUMBERS};
         let seq = SequenceHeader {
             profile: 0,
             flags: SEQ_FRAME_ID_NUMBERS,

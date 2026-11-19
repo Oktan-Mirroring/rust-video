@@ -4,7 +4,7 @@
 //! resolves show-existing frames. A VA-API backend submits finished frames.
 
 use crate::error::VaApiError;
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 use crate::vp9::{FrameHeader, Parser};
 
 use bytes::Bytes;

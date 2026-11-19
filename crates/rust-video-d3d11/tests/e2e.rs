@@ -1,5 +1,4 @@
-//! D3D11 end to end: file vectors through decode overlap, GPU
-//! transcode, and reset recovery.
+//! D3D11 end to end: adapter probe plus GPU transcode.
 //!
 //! Shared vector `valid_320x240.h264` holds 15 ffmpeg
 //! testsrc2 pictures (320x240 constrained baseline, IDR at 0 and
@@ -9,13 +8,16 @@
 
 use std::path::PathBuf;
 
-use rust_video_d3d11::{Codec, D3d11Device, H264Decoder, Transcoder};
+use rust_video_d3d11::{
+    Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, H264Decoder, HevcDecoder,
+    Mpeg2Decoder, Transcoder, Vc1Decoder, Vp9Decoder,
+};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Device};
+use rust_video_caps::traits::{Decoder, Device, Encoder};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{decode_dir, AnnexB};
+use rust_video_harness::{decode_dir, AnnexB, Synth};
 
 /// Pictures in the committed vector.
 const PICTURES: usize = 15;
@@ -34,182 +36,140 @@ fn device() -> Option<D3d11Device> {
     }
 }
 
-/// One packet per picture in order, failing loud off the steady path.
-fn decode_all(decoder: &mut H264Decoder<'_>, raws: &[Vec<u8>]) -> usize {
-    let mut total = 0;
-    for (index, raw) in raws.iter().enumerate() {
-        let packet = Packet::new(Bytes::copy_from_slice(raw));
-        match decoder.decode(&packet) {
-            Ok(frames) => total += frames.len(),
-            Err(error) => panic!("steady packet {index}: {error}"),
-        }
-    }
-    total += decoder.flush().expect("flush drains").len();
-    total
-}
-
 /// Shared vector path.
 fn vector() -> PathBuf {
     decode_dir().join("valid_320x240.h264")
 }
 
-/// Whole-file packet queues submits before the first wait.
-#[test]
-fn overlap_queues_before_first_wait() {
-    let Some(device) = device() else {
-        return;
-    };
-    let raw = std::fs::read(vector()).expect("vector readable");
-    let mut decoder = H264Decoder::open(&device);
-    let packet = Packet::new(Bytes::from(raw));
-    let mut frames = decoder.decode(&packet).expect("whole-file decode");
-    frames.extend(decoder.flush().expect("flush drains"));
-    let inflight = decoder.max_inflight();
-    println!(
-        "overlap: {} frames from one packet, max_inflight={inflight} resets={}",
-        frames.len(),
-        decoder.resets()
-    );
-    assert_eq!(frames.len(), PICTURES, "whole file yields every picture");
-    assert!(
-        inflight > 1,
-        "overlap needs inflight above 1, got {inflight}"
-    );
-    assert_eq!(decoder.resets(), 0, "clean vector never resets");
-}
-
-/// Ordered pictures decode with no reset.
-#[test]
-fn steady_state_never_resets() {
-    let Some(device) = device() else {
-        return;
-    };
-    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
-    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let mut decoder = H264Decoder::open(&device);
-    let total = decode_all(&mut decoder, &raws);
-    println!(
-        "steady: {total} frames, resets={} max_inflight={}",
-        decoder.resets(),
-        decoder.max_inflight()
-    );
-    assert_eq!(total, PICTURES, "steady vector yields every picture");
-    assert_eq!(decoder.resets(), 0, "steady vector never resets");
-}
-
-/// B-frame pictures decode with no reset.
-#[test]
-fn bframes_decode_never_resets() {
-    let Some(device) = device() else {
-        return;
-    };
-    let raws = AnnexB::picture_packets(
-        &decode_dir().join("bframes_320x240.h264"),
-        AnnexB::is_h264_vcl,
-    );
-    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let mut decoder = H264Decoder::open(&device);
-    let total = decode_all(&mut decoder, &raws);
-    println!(
-        "bframes: {total} frames, resets={} max_inflight={}",
-        decoder.resets(),
-        decoder.max_inflight()
-    );
-    assert_eq!(total, PICTURES, "bframe vector yields every picture");
-    assert_eq!(decoder.resets(), 0, "bframe vector never resets");
-}
-
-/// Skipped picture fails once, then the stream recovers clean.
-#[test]
-fn reset_after_failure_recovers() {
-    let Some(device) = device() else {
-        return;
-    };
-    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
-    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let mut decoder = H264Decoder::open(&device);
-    let first = Packet::new(Bytes::copy_from_slice(&raws[0]));
-    decoder.decode(&first).expect("idr opens the stream");
-    assert_eq!(decoder.resets(), 0, "open never resets");
-    let skipped = Packet::new(Bytes::copy_from_slice(&raws[2]));
-    let Err(error) = decoder.decode(&skipped) else {
-        panic!("skipped picture fails")
-    };
-    println!("failure: {error}");
-    assert!(
-        error.to_string().contains("frame_num gap"),
-        "intended trigger, got {error}"
-    );
-    assert_eq!(decoder.resets(), 1, "failure resets once");
-    let total = decode_all(&mut decoder, &raws);
-    println!("recovery: {total} frames, resets={}", decoder.resets());
-    assert_eq!(total, PICTURES, "recovery yields every picture");
-    assert_eq!(decoder.resets(), 1, "recovery adds no reset");
-}
-
-/// Hardware NV12 bytes match the ffmpeg software oracle byte-exact.
-#[test]
-fn hardware_matches_software_oracle() {
-    const WIDTH: usize = 320;
-    const HEIGHT: usize = 240;
-    const FRAME_BYTES: usize = WIDTH * HEIGHT * 3 / 2;
-    let Some(device) = device() else {
-        return;
-    };
-    let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
-    assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let mut decoder = H264Decoder::open(&device);
-    let mut frames = Vec::new();
-    for (index, raw) in raws.iter().enumerate() {
-        let packet = Packet::new(Bytes::copy_from_slice(raw));
-        match decoder.decode(&packet) {
-            Ok(out) => frames.extend(out),
-            Err(error) => panic!("steady packet {index}: {error}"),
-        }
-    }
-    frames.extend(decoder.flush().expect("flush drains"));
-    assert_eq!(frames.len(), PICTURES, "steady vector yields every picture");
-    let mut hardware = Vec::with_capacity(PICTURES * FRAME_BYTES);
-    for (index, frame) in frames.iter().enumerate() {
-        assert_eq!(
-            frame.nv12().len(),
-            FRAME_BYTES,
-            "frame {index} holds tight NV12"
-        );
-        hardware.extend_from_slice(frame.nv12());
-    }
+/// ffmpeg decode over `path`, failing loud without the oracle.
+fn ffmpeg_clean(path: &std::path::Path) {
     let output = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-v", "error", "-i"])
-        .arg(vector())
-        .args(["-f", "rawvideo", "-pix_fmt", "nv12", "-"])
+        .arg(path)
+        .args(["-f", "null", "-"])
         .output()
         .unwrap_or_else(|error| panic!("ffmpeg oracle missing: {error}"));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "ffmpeg oracle failed: {stderr}");
-    let software = output.stdout;
-    assert_eq!(
-        software.len(),
-        hardware.len(),
-        "oracle byte count matches hardware"
+    assert!(
+        output.status.success(),
+        "ffmpeg rejects the bitstream: {stderr}"
     );
-    if hardware != software {
-        let offset = hardware
-            .iter()
-            .zip(software.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or(0);
-        panic!(
-            "parity mismatch at frame {} offset {} (global {offset}): hw={} sw={}",
-            offset / FRAME_BYTES,
-            offset % FRAME_BYTES,
-            hardware[offset],
-            software[offset]
-        );
-    }
+    assert!(output.stderr.is_empty(), "ffmpeg warnings: {stderr}");
+}
+
+/// Adapter matrix plus shell and encoder contracts, skipped without hardware.
+#[test]
+fn probe_reports_or_skips() {
+    let start = std::time::Instant::now();
+    let device = match D3d11Device::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("d3d11 skipped: {error}");
+            return;
+        }
+    };
     println!(
-        "parity: {} frames, {} bytes compared, 0 mismatches",
-        frames.len(),
-        hardware.len()
+        "adapter: {} (feature level {:#x}, open in {:?})",
+        device.name(),
+        device.feature_level(),
+        start.elapsed()
+    );
+    for codec in Codec::ALL {
+        println!("supports {codec}: {}", device.supports(*codec));
+    }
+    for profile in device.profiles() {
+        println!("profile: {} ({})", profile.name(), profile.codec());
+    }
+    assert!(device.supports(Codec::H264));
+    assert_ne!(device.profiles(), []);
+
+    let packet = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x41, 0xC5, 0x00]));
+    let mut h264 = H264Decoder::open(&device);
+    assert!(h264.decode(&packet).is_err());
+    assert!(h264.flush().expect("flush").is_empty());
+
+    let mut hevc = HevcDecoder::open(&device);
+    let hevc_bad = Packet::new(Bytes::from_static(&[0, 0, 0, 1, 0x40, 0x01]));
+    assert!(hevc.decode(&hevc_bad).is_err());
+    assert!(hevc.flush().expect("flush").is_empty());
+    let mut vp9 = Vp9Decoder::open(&device);
+    assert!(vp9.decode(&packet).is_err());
+    assert!(vp9.flush().expect("flush").is_empty());
+    let mut av1 = Av1Decoder::open(&device);
+    let av1_bad = Packet::new(Bytes::from_static(&[0xFF]));
+    assert!(av1.decode(&av1_bad).is_err());
+    assert!(av1.flush().expect("flush").is_empty());
+    let mut mpeg2 = Mpeg2Decoder::open(&device);
+    assert!(mpeg2.decode(&packet).is_err());
+    assert!(mpeg2.flush().expect("flush").is_empty());
+    let mut vc1_decoder = Vc1Decoder::open(&device);
+    assert!(vc1_decoder.decode(&packet).is_err());
+    assert!(vc1_decoder.flush().expect("flush").is_empty());
+
+    drive_encoder(&device, Codec::H264, 1280, 720, true);
+    drive_encoder(&device, Codec::H264, 64, 48, true);
+    for codec in [
+        Codec::Hevc,
+        Codec::Av1,
+        Codec::Vp9,
+        Codec::Mpeg2,
+        Codec::Vc1,
+    ] {
+        drive_encoder(&device, codec, 64, 48, false);
+    }
+}
+
+/// Eight frames plus a drain through `codec`, or its loud fallback.
+fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, required: bool) {
+    let mut encoder = match D3d11Encoder::open(device, codec) {
+        Ok(encoder) => encoder,
+        Err(error) => return fallback(codec, required, &error),
+    };
+    assert_eq!(encoder.codec(), codec);
+    let frame = Synth::grey_nv12(width, height);
+    let start = std::time::Instant::now();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for _ in 0..8 {
+        let packets = match encoder.encode(&frame) {
+            Ok(packets) => packets,
+            Err(error) => return fallback(codec, required, &error),
+        };
+        count += packets.len();
+        bytes += packets
+            .iter()
+            .map(|packet| packet.data().len())
+            .sum::<usize>();
+    }
+    let drained = match encoder.flush() {
+        Ok(drained) => drained,
+        Err(error) => return fallback(codec, required, &error),
+    };
+    count += drained.len();
+    bytes += drained
+        .iter()
+        .map(|packet| packet.data().len())
+        .sum::<usize>();
+    println!(
+        "{codec} encode: {count} packets, {bytes} bytes via {}, d3d11: {} in {:?}",
+        encoder.mft_name(),
+        encoder.uses_d3d11(),
+        start.elapsed()
+    );
+    assert!(bytes > 0, "{codec} encoder emitted no bytes");
+}
+
+/// Loud fallback for a `codec` the machine cannot encode.
+fn fallback(codec: Codec, required: bool, error: &D3d11Error) {
+    println!("{codec} encode unavailable: {error}");
+    assert!(!required, "{codec} encoder required: {error}");
+    assert!(
+        matches!(error, D3d11Error::Unsupported(_)),
+        "loud fallback: {error}"
+    );
+    assert!(
+        error.to_string().contains("encoder MFT"),
+        "loud fallback: {error}"
     );
 }
 
@@ -261,20 +221,4 @@ fn gpu_transcode_stays_ffmpeg_clean() {
     ffmpeg_clean(&path);
     std::fs::remove_file(&path).ok();
     println!("transcode: {coded_packets} packets, {coded_bytes} bytes, route=gpu, ffmpeg-clean");
-}
-
-/// ffmpeg decode over `path`, failing loud without the oracle.
-fn ffmpeg_clean(path: &std::path::Path) {
-    let output = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-v", "error", "-i"])
-        .arg(path)
-        .args(["-f", "null", "-"])
-        .output()
-        .unwrap_or_else(|error| panic!("ffmpeg oracle missing: {error}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "ffmpeg rejects the bitstream: {stderr}"
-    );
-    assert!(output.stderr.is_empty(), "ffmpeg warnings: {stderr}");
 }

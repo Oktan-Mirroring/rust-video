@@ -6,11 +6,11 @@
 
 use std::rc::Rc;
 
+use crate::au::AccessUnit;
+use crate::av1;
 use crate::error::ParseError;
-use crate::parse::au::AccessUnit;
-use crate::parse::av1;
-use crate::parse::h264;
-use crate::parse::h265;
+use crate::h264;
+use crate::h265;
 
 use rust_video_caps::dpb::PocTracker;
 
@@ -1797,8 +1797,8 @@ fn join_tiles(groups: &[TileGroup<'_>]) -> Result<JoinedTiles, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::{Av1Context, H264Context, H265Context, ReorderBuffer, SlotBook};
-    use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::test_support::{hex, split264, split265};
+    use crate::au::{AccessUnit, AuSplitter};
+    use crate::fixtures::{hex, split264, split265};
 
     #[test]
     fn join_tiles_concatenates_groups() {
@@ -1831,7 +1831,7 @@ mod tests {
     fn evicted_reports_only_unheld_priors() {
         use super::{Av1Entry, ReferenceId};
         use std::rc::Rc;
-        let header = Rc::new(crate::parse::av1::FrameHeader::default());
+        let header = Rc::new(crate::av1::FrameHeader::default());
         let mut context = Av1Context::new();
         context.slots[0] = Some(Av1Entry {
             header: Rc::clone(&header),
@@ -1930,11 +1930,11 @@ mod tests {
     #[test]
     fn poc_type2_fits_boundary_but_not_past() {
         assert_eq!(
-            crate::parse::h264::poc_type2(1_073_741_823, 0, true),
+            crate::h264::poc_type2(1_073_741_823, 0, true),
             Some(2_147_483_646)
         );
-        assert_eq!(crate::parse::h264::poc_type2(1_073_741_824, 0, true), None);
-        assert_eq!(crate::parse::h264::poc_type2(9, 1, false), Some(19));
+        assert_eq!(crate::h264::poc_type2(1_073_741_824, 0, true), None);
+        assert_eq!(crate::h264::poc_type2(9, 1, false), Some(19));
     }
 
     /// Access units out of parsed H.264 `payloads`.

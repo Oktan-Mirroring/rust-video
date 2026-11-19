@@ -1,7 +1,7 @@
 //! Direct3D 11 video tier: hardware decode and encode behind the caps traits.
 //!
 //! Hardware decode matches the ffmpeg software oracle byte-exact
-//! (`tests/e2e.rs hardware_matches_software_oracle`).
+//! (`tests/uniform.rs h264_hardware_matches_software_oracle`).
 
 #[cfg(target_os = "windows")]
 mod av1;
@@ -29,9 +29,9 @@ mod h265;
 #[cfg(target_os = "windows")]
 mod hevc_dpb;
 #[cfg(target_os = "windows")]
-mod inflight;
-#[cfg(target_os = "windows")]
 mod mf;
+#[cfg(target_os = "windows")]
+mod overlap;
 #[cfg(target_os = "windows")]
 mod pins;
 #[cfg(target_os = "windows")]
@@ -62,9 +62,9 @@ pub use error::{BrokenReferenceReason, D3d11Error, ParseReason, SkipReason, Unsu
 pub use frame::D3d11Frame;
 pub use guid::{Codec, Profile};
 #[cfg(target_os = "windows")]
-pub use inflight::{FramePhases, OverlappedPump, PhaseCapture, SplitDecoder};
-#[cfg(target_os = "windows")]
 pub use mf::Vp9Tuning;
+#[cfg(target_os = "windows")]
+pub use overlap::{FramePhases, OverlappedPump, PhaseCapture, SplitDecoder};
 #[cfg(not(target_os = "windows"))]
 pub use shell::Vp9Decoder;
 pub use shell::{Mpeg2Decoder, Vc1Decoder};

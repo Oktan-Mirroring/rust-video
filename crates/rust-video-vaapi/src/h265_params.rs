@@ -10,7 +10,7 @@ use crate::ffi::{
     VaIqMatrixBufferHevc, VaPictureHevc, VaPictureParameterBufferHevc, VaSliceParameterBufferHevc,
     VaSurfaceId,
 };
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 use crate::h265::{is_idr, is_irap, Pps, SliceHeader, SliceTail, SliceType, Sps};
 use crate::h265_dpb::Dpb;
 use crate::h265_frontend::{PendingSlice, Rps};
@@ -600,12 +600,12 @@ mod tests {
 
     use super::Params;
     use crate::error::VaApiError;
-    use crate::frontend::SurfaceSlot;
+    use crate::fixtures::{pps_payload, sps_payload};
+    use crate::h264_frontend::SurfaceSlot;
     use crate::h265::{
         Gate, Pps, SliceHeader, SliceTail, SliceType, SliceWeights, Sps, WeightEntry,
     };
     use crate::h265_dpb::Dpb;
-    use crate::h265_fixture::{pps_payload, sps_payload};
     use crate::h265_frontend::{PendingSlice, Rps};
     use crate::h265_picture::{PictureData, Reference};
 

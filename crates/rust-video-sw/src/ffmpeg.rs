@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
-use crate::pipeline::RawSource;
+use crate::overlap::RawSource;
 
 use bytes::{Bytes, BytesMut};
 use rust_video_caps::common::PictureSize;

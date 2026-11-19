@@ -25,9 +25,9 @@ use ash::vk::native::{
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_INVALID,
 };
 
+use crate::dpb::Picture;
 use crate::error::ParseError;
-use crate::parse::h264::{HrdParams, Pps, Sps, VuiParams};
-use crate::parse::refs::Picture;
+use crate::h264::{HrdParams, Pps, Sps, VuiParams};
 use crate::session::geometry::{h264_level_to_std, h264_profile_to_std};
 
 /// H.264 parameter tables with box-stable standard-structure backing.
@@ -283,8 +283,8 @@ fn fill_pps(pps: &Pps, entry: &PpsEntry) -> StdVideoH264PictureParameterSet {
 
 /// Standard scaling lists from one parsed set.
 fn fill_scaling(
-    scaling: &crate::parse::h264::ScalingSets,
-    map: Option<crate::parse::h264::ScalingMap>,
+    scaling: &crate::h264::ScalingSets,
+    map: Option<crate::h264::ScalingMap>,
 ) -> Option<StdVideoH264ScalingLists> {
     let map = map?;
     let mut four = [[16u8; 16]; 6];
@@ -308,7 +308,7 @@ fn fill_scaling(
 }
 
 /// True for a present list without the default-matrix escape.
-fn uses_parsed(map: crate::parse::h264::ScalingMap, bit: usize) -> bool {
+fn uses_parsed(map: crate::h264::ScalingMap, bit: usize) -> bool {
     map.present_mask & (1u16 << bit) != 0 && map.default_mask & (1u16 << bit) == 0
 }
 
@@ -496,10 +496,10 @@ fn narrow_u8(value: u32, syntax: &'static str) -> Result<u8, ParseError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::h264::{H264Parser, ParsedNalu};
-    use crate::parse::refs::{H264Context, H264Instruction};
-    use crate::parse::test_support::{hex, split264};
+    use crate::au::{AccessUnit, AuSplitter};
+    use crate::dpb::{H264Context, H264Instruction};
+    use crate::fixtures::{hex, split264};
+    use crate::h264::{H264Parser, ParsedNalu};
 
     /// Fork `demo.h264` sequence set.
     const SPS: &str = "6764000dacb20283f60220000003002000000641e2854900";
@@ -512,10 +512,7 @@ mod tests {
     const P: &str = "419a3b10cffe9e2a5997d0339bc66a0ec39c80006fafc5a3a0c7e796ec144229f6721f2948";
 
     /// Parsed sequence and picture sets of the fork demo.
-    fn demo_sets() -> (
-        std::rc::Rc<crate::parse::h264::Sps>,
-        std::rc::Rc<crate::parse::h264::Pps>,
-    ) {
+    fn demo_sets() -> (std::rc::Rc<crate::h264::Sps>, std::rc::Rc<crate::h264::Pps>) {
         let units = split264(&[hex(SPS), hex(PPS)]);
         let mut parser = H264Parser::new();
         let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
@@ -659,10 +656,7 @@ mod tests {
     const HIGH_PPS: &str = "68ef8fcb";
 
     /// Parsed High 1920x1080 level 4.0 sets.
-    fn high_vector_sets() -> (
-        std::rc::Rc<crate::parse::h264::Sps>,
-        std::rc::Rc<crate::parse::h264::Pps>,
-    ) {
+    fn high_vector_sets() -> (std::rc::Rc<crate::h264::Sps>, std::rc::Rc<crate::h264::Pps>) {
         let units = split264(&[hex(HIGH_SPS), hex(HIGH_PPS)]);
         let mut parser = H264Parser::new();
         let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {

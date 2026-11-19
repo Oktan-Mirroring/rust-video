@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::error::MediaCodecError;
 use crate::format::{pixel_format_for, FormatSpec};
-use crate::pipeline::{PipelineLedger, SubmitOutcome};
+use crate::overlap::{PipelineLedger, SubmitOutcome};
 use crate::seam::{CodecSeam, SeamItem};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};
 
@@ -559,7 +559,7 @@ mod tests {
 
     use super::{ranged_bytes, DecodeState, MediaCodecDecoder, MediaCodecError, OutputLayout};
     use crate::format::FormatSpec;
-    use crate::pipeline::SubmitOutcome;
+    use crate::overlap::SubmitOutcome;
     use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
     use crate::surface::{MediaCodecSurface, SurfaceSlots};
 

@@ -1185,11 +1185,11 @@ mod tests {
         Frontend, PendingPicture, PendingSlice, Picture, PocTracker, SliceKey, SurfaceSlot,
     };
     use crate::error::VaApiError;
-    use crate::h264::{Marking, PocType, RefMod, SliceHeader, SlicePoc, SliceType, Sps};
-    use crate::h264_dpb::ReferencePicLists;
-    use crate::h264_fixture::{
+    use crate::fixtures::{
         annexed, idr_slice_body, p_slice_body, pps, pps_body, slice_header, sps, sps_body,
     };
+    use crate::h264::{Marking, PocType, RefMod, SliceHeader, SlicePoc, SliceType, Sps};
+    use crate::h264_dpb::ReferencePicLists;
     use crate::h264_picture::{IsIdr, PictureData, Reference};
 
     use bytes::Bytes;

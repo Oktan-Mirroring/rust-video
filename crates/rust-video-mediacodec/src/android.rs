@@ -10,7 +10,7 @@ use crate::device::MediaCodecDevice;
 use crate::encoder::{EncodeSpec, EncodeState, InputLayout, MediaCodecEncoder};
 use crate::error::MediaCodecError;
 use crate::format::FormatSpec;
-use crate::pipeline::SubmitOutcome;
+use crate::overlap::SubmitOutcome;
 use crate::sdk::ApiLevel;
 use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};

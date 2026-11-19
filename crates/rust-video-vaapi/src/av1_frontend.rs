@@ -13,7 +13,7 @@ use crate::av1::{
     OBU_TILE_GROUP, OBU_TILE_LIST,
 };
 use crate::error::VaApiError;
-use crate::frontend::SurfaceSlot;
+use crate::h264_frontend::SurfaceSlot;
 
 use bytes::Bytes;
 
@@ -485,13 +485,13 @@ impl Default for Frontend {
 mod tests {
     use super::{Begun, Frontend, PendingFrame, PendingKind};
     use crate::av1::{FrameHeader, FrameType};
-    use crate::av1_fixture::{
+    use crate::error::VaApiError;
+    use crate::fixtures::{
         keyframe_hidden_payload, keyframe_payload, keyframe_wide_payload, obu, pframe_payload,
         seq_payload, seq_payload_sized, show_existing_payload, tile_group_2_payload,
         tile_group_payload,
     };
-    use crate::error::VaApiError;
-    use crate::frontend::SurfaceSlot;
+    use crate::h264_frontend::SurfaceSlot;
 
     use bytes::Bytes;
 
@@ -566,7 +566,7 @@ mod tests {
             panic!("regular picture");
         };
         assert!(picture.refs().iter().all(Option::is_none));
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(0));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(0));
         assert!(frontend
             .refs
             .iter()
@@ -581,7 +581,7 @@ mod tests {
             panic!("regular picture");
         };
         assert_eq!(picture.refs()[0].map(|(slot, _)| slot.index()), Some(0));
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(1));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(1));
         assert_eq!(frontend.refs[0].map(|(slot, _)| slot.index()), Some(1));
         assert_eq!(frontend.refs[1].map(|(slot, _)| slot.index()), Some(0));
     }
@@ -597,7 +597,7 @@ mod tests {
         let Begun::Picture(picture) = frontend.begin(pending).expect("begins") else {
             panic!("regular picture");
         };
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(0));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(0));
         let mut stream = obu(3, &pframe_payload());
         stream.extend(obu(4, &tile_group_payload(&[2])));
         stream.extend(obu(3, &show_existing_payload(0)));
@@ -610,7 +610,7 @@ mod tests {
         else {
             panic!("regular picture");
         };
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(1));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(1));
         let pending = frames.next().expect("existing frame");
         assert!(matches!(pending.kind, PendingKind::Existing));
         let Begun::Existing { slot, size } = frontend.begin(pending).expect("begins") else {
@@ -632,7 +632,7 @@ mod tests {
         let Begun::Picture(picture) = frontend.begin(pending).expect("begins") else {
             panic!("regular picture");
         };
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(5));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(5));
         let mut stream = obu(3, &pframe_payload());
         stream.extend(obu(4, &tile_group_payload(&[2])));
         let bytes = Bytes::from(stream);
@@ -641,7 +641,7 @@ mod tests {
         let Begun::Picture(picture) = frontend.begin(pending).expect("begins") else {
             panic!("regular picture");
         };
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(6));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(6));
         assert_eq!(frontend.refs[0].map(|(slot, _)| slot.index()), Some(6));
         let stream = obu(3, &show_existing_payload(1));
         let bytes = Bytes::from(stream);
@@ -751,7 +751,7 @@ mod tests {
         let Begun::Picture(picture) = frontend.begin(pending).expect("begins") else {
             panic!("regular picture");
         };
-        frontend.commit(&picture, crate::frontend::SurfaceSlot::new(0));
+        frontend.commit(&picture, crate::h264_frontend::SurfaceSlot::new(0));
         assert!(frontend.refs[0].is_some());
         let stream = obu(1, &seq_payload_sized(128, 64));
         let bytes = Bytes::from(stream);

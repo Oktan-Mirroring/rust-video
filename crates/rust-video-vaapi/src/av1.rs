@@ -81,8 +81,8 @@ impl From<Av1Error> for VaApiError {
 mod tests {
     use rust_video_av1::{BrokenReferenceReason, Error, ParseReason, UnsupportedReason};
 
-    use crate::av1_fixture::{keyframe_payload, seq_payload};
     use crate::error::VaApiError;
+    use crate::fixtures::{keyframe_payload, seq_payload};
 
     #[test]
     fn shared_grammar_agrees_on_fixture_stream() {

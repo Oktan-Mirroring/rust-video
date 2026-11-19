@@ -8,10 +8,10 @@ use std::os::raw::c_int;
 use std::sync::Arc;
 
 use crate::buffer::{bytes_of, VaBuffer};
-use crate::decoder::VaApiFrame;
 use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::ffi;
+use crate::h264_decoder::VaApiFrame;
 use crate::sys;
 
 use rust_video_caps::common::PictureSize;

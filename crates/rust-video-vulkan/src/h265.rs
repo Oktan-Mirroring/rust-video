@@ -388,7 +388,7 @@ mod tests {
     use rust_video_h265::{parse_short_term_rps, BitReader as SharedBitReader, ShortTermRps};
 
     use super::{H265Parser, ParsedNalu, SliceType};
-    use crate::parse::test_support::{hex, split265};
+    use crate::fixtures::{hex, split265};
     use crate::session::std_h265::fill_rps;
 
     /// First NAL units of the fork `demo.h265` vector.

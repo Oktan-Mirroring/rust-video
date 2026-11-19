@@ -2,7 +2,7 @@
 
 use crate::error::{ParseError, VulkanError};
 use crate::ladder::{CodecOp, DecodeFacts};
-use crate::parse::{h264, h265};
+use crate::{h264, h265};
 
 use ash::vk;
 
@@ -384,7 +384,7 @@ impl SessionGeometry {
     /// Returns `Err` on unsupported sampling, unknown profile or level,
     /// level or size above the caps, or no 4:2:0 format.
     pub fn av1(
-        seq: &crate::parse::av1::SequenceHeader,
+        seq: &crate::av1::SequenceHeader,
         display: (u32, u32),
         caps: &DecodeFacts,
         formats: &[vk::VideoFormatPropertiesKHR<'_>],
@@ -439,7 +439,7 @@ impl SessionGeometry {
             coded,
             display,
             (0, 0),
-            crate::parse::av1::DPB_SLOTS,
+            crate::av1::DPB_SLOTS,
             caps,
             formats,
         )
@@ -570,11 +570,11 @@ mod tests {
 
     #[test]
     fn demo_sps_sizes_session() {
-        let units = crate::parse::test_support::split264(&[crate::parse::test_support::hex(
+        let units = crate::fixtures::split264(&[crate::fixtures::hex(
             "6764000dacb20283f60220000003002000000641e2854900",
         )]);
-        let mut parser = crate::parse::h264::H264Parser::new();
-        let crate::parse::h264::ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
+        let mut parser = crate::h264::H264Parser::new();
+        let crate::h264::ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
         };
         let geometry = super::SessionGeometry::h264(&sps, &caps(), &formats()).expect("geometry");
@@ -601,9 +601,7 @@ mod tests {
 
     #[test]
     fn av1_sequence_sizes_session() {
-        use crate::parse::av1::{
-            OperatingPoint, SequenceHeader, SEQ_SUBSAMPLING_X, SEQ_SUBSAMPLING_Y,
-        };
+        use crate::av1::{OperatingPoint, SequenceHeader, SEQ_SUBSAMPLING_X, SEQ_SUBSAMPLING_Y};
         let seq = SequenceHeader {
             profile: 0,
             flags: SEQ_SUBSAMPLING_X | SEQ_SUBSAMPLING_Y,
@@ -657,11 +655,11 @@ mod tests {
 
     #[test]
     fn level_above_caps_errors() {
-        let units = crate::parse::test_support::split264(&[crate::parse::test_support::hex(
+        let units = crate::fixtures::split264(&[crate::fixtures::hex(
             "6764000dacb20283f60220000003002000000641e2854900",
         )]);
-        let mut parser = crate::parse::h264::H264Parser::new();
-        let crate::parse::h264::ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
+        let mut parser = crate::h264::H264Parser::new();
+        let crate::h264::ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
         };
         let mut capped = caps();

@@ -4,7 +4,7 @@
 //! Reached only from the Android module.
 
 use crate::error::MediaCodecError;
-use crate::pipeline::SubmitOutcome;
+use crate::overlap::SubmitOutcome;
 
 use bytes::Bytes;
 

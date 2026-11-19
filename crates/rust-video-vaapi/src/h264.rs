@@ -311,7 +311,7 @@ mod tests {
         ParseKind, SliceHeader, UnsupportedKind,
     };
     use crate::error::VaApiError;
-    use crate::h264_fixture::{idr_slice_body, pps, pps_body, sps, sps_body};
+    use crate::fixtures::{idr_slice_body, pps, pps_body, sps, sps_body};
 
     #[test]
     fn shared_grammar_agrees_on_baseline_sets() {
