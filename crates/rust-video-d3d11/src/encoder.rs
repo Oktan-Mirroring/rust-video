@@ -11,6 +11,7 @@ use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
+use rust_video_core::planes;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
@@ -229,8 +230,8 @@ impl<'a> Planes<'a> {
     fn fill(&self, dst: &mut [u8]) {
         let y_len = usize::try_from(u64::from(self.width) * u64::from(self.height)).unwrap_or(0);
         let (y_dst, uv_dst) = dst.split_at_mut(y_len);
-        copy_rows(self.y, self.y_stride, self.width, self.height, y_dst);
-        copy_rows(self.uv, self.uv_stride, self.width, self.height / 2, uv_dst);
+        planes::copy_rows(self.y, self.y_stride, self.width, self.height, y_dst);
+        planes::copy_rows(self.uv, self.uv_stride, self.width, self.height / 2, uv_dst);
     }
 }
 
@@ -240,37 +241,14 @@ impl<'a> Planes<'a> {
 ///
 /// Returns `Err` for a stride below the width or a plane short of its stride.
 fn check_plane(data: &[u8], stride: u32, width: u32, rows: u32) -> Result<(), D3d11Error> {
-    let stride_64 = u64::from(stride);
-    let width_64 = u64::from(width);
-    if stride_64 < width_64 {
-        return Err(D3d11Error::Unsupported(
-            UnsupportedReason::PlaneStrideBelowWidth,
-        ));
-    }
-    let need = stride_64
-        .saturating_mul(u64::from(rows).saturating_sub(1))
-        .saturating_add(width_64);
-    if u64::try_from(data.len()).unwrap_or(0) < need {
-        return Err(D3d11Error::Unsupported(
-            UnsupportedReason::PlaneShortOfStride,
-        ));
-    }
-    Ok(())
-}
-
-/// `rows` of `width` bytes from a validated strided `data` plane into `dst`.
-fn copy_rows(data: &[u8], stride: u32, width: u32, rows: u32, dst: &mut [u8]) {
-    let stride = usize::try_from(stride).unwrap_or(0);
-    let width = usize::try_from(width).unwrap_or(0);
-    let rows = usize::try_from(rows).unwrap_or(0);
-    if stride == width {
-        let total = width.saturating_mul(rows);
-        dst[..total].copy_from_slice(&data[..total]);
-        return;
-    }
-    for (row, chunk) in data.chunks(stride).take(rows).enumerate() {
-        dst[row * width..(row + 1) * width].copy_from_slice(&chunk[..width]);
-    }
+    planes::check_plane(data, stride, width, rows).map_err(|fault| match fault {
+        planes::PlaneFault::StrideBelowWidth { .. } => {
+            D3d11Error::Unsupported(UnsupportedReason::PlaneStrideBelowWidth)
+        }
+        planes::PlaneFault::ShortOfStride { .. } => {
+            D3d11Error::Unsupported(UnsupportedReason::PlaneShortOfStride)
+        }
+    })
 }
 
 #[cfg(test)]
