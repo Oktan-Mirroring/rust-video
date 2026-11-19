@@ -1,7 +1,7 @@
 //! VA-API H.265 decode: file in, frames out, hashes printed.
 //!
 //! Reads MP4 (demuxed) or raw Annex B; pass a corpus vector:
-//! `decode_h265_vaapi corpus/synth/h265/h265-main.mp4`.
+//! `decode_h265_vaapi corpus/synth/h265/anchor-main.mp4`.
 
 #[path = "common/frames.rs"]
 #[cfg(target_os = "linux")]

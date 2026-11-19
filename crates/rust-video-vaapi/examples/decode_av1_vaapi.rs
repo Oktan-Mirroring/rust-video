@@ -1,7 +1,7 @@
 //! VA-API AV1 decode: file in, frames out, hashes printed.
 //!
 //! Reads MP4 (demuxed) or raw OBU; pass a corpus vector:
-//! `decode_av1_vaapi corpus/synth/av1/av1-main.mp4`.
+//! `decode_av1_vaapi corpus/synth/av1/anchor-main.mp4`.
 
 #[path = "common/frames.rs"]
 #[cfg(target_os = "linux")]

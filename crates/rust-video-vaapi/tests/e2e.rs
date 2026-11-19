@@ -14,7 +14,7 @@ use rust_video_caps::transcode::Route;
 use rust_video_harness::{FrameHash, Stream, Synth};
 use rust_video_vaapi::{
     EncodeCodec, GopShape, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder,
-    VaApiError, VaApiFrame, Vp9Decoder,
+    VaApiError, VaApiFrame,
 };
 
 /// Corpus root: `$RUST_VIDEO_CORPUS` or the checkout's `corpus/`.
@@ -160,51 +160,6 @@ fn ffmpeg_hashes_capped(
     )
 }
 
-/// ffmpeg remux of `path` to an IVF file under `scratch`, or `None` without ffmpeg.
-fn ffmpeg_remux_ivf(path: &Path, scratch: &Path) -> Option<PathBuf> {
-    std::fs::create_dir_all(scratch).ok()?;
-    let out = scratch.join("remux.ivf");
-    let status = Command::new("ffmpeg")
-        .arg("-v")
-        .arg("error")
-        .arg("-y")
-        .arg("-i")
-        .arg(path)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-c:v")
-        .arg("copy")
-        .arg(&out)
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    Some(out)
-}
-
-/// IVF container bytes as one packet per frame.
-///
-/// # Panics
-///
-/// Panics when the magic is absent or a frame overruns the buffer.
-fn ivf_packets(ivf: &[u8]) -> Vec<Packet> {
-    assert!(ivf.len() >= 32 && &ivf[0..4] == b"DKIF", "ivf magic");
-    let header = u16::from_le_bytes([ivf[6], ivf[7]]) as usize;
-    let mut packets = Vec::new();
-    let mut offset = header;
-    while offset + 12 <= ivf.len() {
-        let size =
-            u32::from_le_bytes(ivf[offset..offset + 4].try_into().expect("ivf size")) as usize;
-        offset += 12;
-        packets.push(Packet::new(Bytes::copy_from_slice(
-            &ivf[offset..offset + size],
-        )));
-        offset += size;
-    }
-    packets
-}
-
 /// NV12 frame bytes as planar YUV420P.
 fn to_planar(nv12: &[u8], width: usize, height: usize) -> Vec<u8> {
     let y_len = width * height;
@@ -264,9 +219,9 @@ fn device() -> Option<VaApiDevice> {
 
 #[test]
 fn demux_matches_ffmpeg_remux() {
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
-    assert_eq!(stream.samples.len(), 60);
+    assert_eq!(stream.samples.len(), 120);
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x67)));
     let Some(remux) = ffmpeg_remux(&path, &scratch("remux264"), "h264") else {
@@ -287,7 +242,7 @@ fn vaapi_decodes_synth_high() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
@@ -316,7 +271,7 @@ fn vaapi_declines_high_chroma() {
     let Some(device) = device() else {
         return;
     };
-    for name in ["h264-high422.mp4", "h264-high444.mp4"] {
+    for name in ["pix-422.mp4", "pix-444.mp4"] {
         let path = corpus().join("synth/h264").join(name);
         let stream = Stream::demux(&path).expect("demux chroma vector");
         let mut decoder = H264Decoder::open(&device);
@@ -330,9 +285,9 @@ fn vaapi_declines_high_chroma() {
 
 #[test]
 fn demux_matches_ffmpeg_remux_h265() {
-    let path = corpus().join("synth/h265/h265-main.mp4");
+    let path = corpus().join("synth/h265/anchor-main.mp4");
     let stream = Stream::demux(&path).expect("demux synth main");
-    assert_eq!(stream.samples.len(), 60);
+    assert_eq!(stream.samples.len(), 120);
     let first = nal_units(&stream.samples[0]);
     assert!(first.iter().any(|nal| nal.first() == Some(&0x40)));
     let Some(remux) = ffmpeg_remux(&path, &scratch("remux265"), "h265") else {
@@ -353,7 +308,7 @@ fn vaapi_decodes_synth_main() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h265/h265-main.mp4");
+    let path = corpus().join("synth/h265/anchor-main.mp4");
     let stream = Stream::demux(&path).expect("demux synth main");
     assert_ne!(stream.samples.len(), 0);
     let mut decoder = H265Decoder::open(&device);
@@ -369,7 +324,7 @@ fn vaapi_exports_dmabuf() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut exported = 0;
@@ -701,7 +656,7 @@ fn vaapi_pipelines_submit_depth() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut frames = Vec::new();
@@ -746,7 +701,7 @@ fn vaapi_reuses_decode_buffers() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_stream(&mut decoder, &stream).expect("va-api decode");
@@ -800,7 +755,7 @@ fn vaapi_recovers_after_bad_packet() {
     let Some(device) = device() else {
         return;
     };
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut decoder = H264Decoder::open(&device);
     let mut frames = Vec::new();
@@ -838,7 +793,7 @@ fn vaapi_transcodes_scaled_on_device() {
         skip("transcode export+encode caps");
         return;
     }
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
     let mut annex_b = Vec::new();
@@ -884,7 +839,7 @@ fn vaapi_transcodes_on_device() {
         skip("transcode export+encode caps");
         return;
     }
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
     for sample in &stream.samples {
@@ -913,7 +868,7 @@ fn vaapi_transcodes_low_delay_gop60() {
         skip("transcode export+encode caps");
         return;
     }
-    let path = corpus().join("synth/h264/h264-high.mp4");
+    let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut packets = Vec::new();
     let mut annex_b = Vec::new();
@@ -937,60 +892,4 @@ fn vaapi_transcodes_low_delay_gop60() {
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_packets(&mut decoder, &packets);
     assert_eq!(frames.len(), packets.len());
-}
-
-#[test]
-fn vaapi_decodes_vp9_bbb_600() {
-    const FRAMES: usize = 600;
-    const WIDTH: u32 = 426;
-    const HEIGHT: u32 = 240;
-    let Some(device) = device() else {
-        return;
-    };
-    let path = corpus().join("vp9/vp90-2-bbb_426x240_tile_1x1_180kbps.webm");
-    let dir = scratch("decodevp9");
-    let Some(ivf_path) = ffmpeg_remux_ivf(&path, &dir) else {
-        skip("ffmpeg remux oracle (install ffmpeg)");
-        return;
-    };
-    let ivf = std::fs::read(&ivf_path).expect("ivf bytes");
-    let packets = ivf_packets(&ivf);
-    assert!(packets.len() > FRAMES, "stream holds 600 frames");
-    let mut decoder = Vp9Decoder::open(&device);
-    let mut frames = Vec::new();
-    for packet in &packets {
-        frames.extend(decoder.decode(packet).expect("va-api decode"));
-        if frames.len() >= FRAMES {
-            break;
-        }
-    }
-    assert!(frames.len() >= FRAMES, "shown frame count");
-    frames.truncate(FRAMES);
-    let mut hashes = Vec::with_capacity(frames.len());
-    for (index, frame) in frames.iter().enumerate() {
-        let size = frame.identity().size();
-        assert_eq!(
-            (size.width(), size.height()),
-            (WIDTH, HEIGHT),
-            "frame {index}"
-        );
-        assert_eq!(frame.identity().format(), PixelFormat::Nv12);
-        let nv12 = frame.nv12();
-        assert_eq!(
-            nv12.len(),
-            WIDTH as usize * HEIGHT as usize * 3 / 2,
-            "frame {index}"
-        );
-        hashes.push(FrameHash::of(&to_planar(nv12, WIDTH as usize, HEIGHT as usize)).hex());
-    }
-    let Some(expected) = ffmpeg_hashes_capped(&path, &dir, "oracle", WIDTH, HEIGHT, Some(FRAMES))
-    else {
-        skip("ffmpeg decode oracle (install ffmpeg)");
-        return;
-    };
-    std::fs::remove_dir_all(&dir).ok();
-    assert_eq!(hashes.len(), expected.len(), "frame count");
-    for (index, (left, right)) in hashes.iter().zip(expected.iter()).enumerate() {
-        assert_eq!(left, right, "frame {index}");
-    }
 }

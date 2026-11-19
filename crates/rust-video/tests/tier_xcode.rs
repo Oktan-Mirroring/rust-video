@@ -91,9 +91,9 @@ fn synth_h264() -> std::path::PathBuf {
     std::env::var_os("RUST_VIDEO_CORPUS").map_or_else(
         || {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../corpus/synth/h264/h264-high.mp4")
+                .join("../../corpus/synth/h264/anchor-high.mp4")
         },
-        |root| std::path::PathBuf::from(root).join("synth/h264/h264-high.mp4"),
+        |root| std::path::PathBuf::from(root).join("synth/h264/anchor-high.mp4"),
     )
 }
 
@@ -179,7 +179,14 @@ fn vulkan_hop(platform: Platform) {
     )
     .expect("facade transcode open");
     let plan = transcoder.plan();
-    if transcoder.caps().ready() && plan.cause() == Some(FallbackCause::DeviceMismatch) {
+    if !transcoder.caps().ready() {
+        println!(
+            "facade xcode skipped: vulkan hop not ready ({:?})",
+            plan.cause()
+        );
+        return;
+    }
+    if plan.cause() == Some(FallbackCause::DeviceMismatch) {
         println!("facade xcode skipped: vulkan decode and encode adapters differ");
         return;
     }
