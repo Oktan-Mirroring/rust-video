@@ -352,7 +352,7 @@ struct H264Entry {
     /// Stable identity.
     id: ReferenceId,
     /// Frame number.
-    frame_num: u16,
+    frame_num: u32,
     /// Picture order count.
     poc: i32,
     /// Long-term index, when long-term.
@@ -366,15 +366,13 @@ pub(crate) struct H264Context {
     /// Next reference identity.
     next_id: ReferenceId,
     /// Previous frame number.
-    prev_frame_num: u16,
+    prev_frame_num: u32,
     /// Previous frame-number offset.
-    prev_offset: i32,
-    /// Previous reference POC behind MSB derivation.
-    poc: PocTracker,
+    prev_offset: i64,
     /// Previous reference picture ran MMCO 5.
     prev_mmco5: bool,
-    /// Highest long-term index in use.
-    max_long_term: Option<u32>,
+    /// Previous reference POC behind MSB derivation.
+    poc: PocTracker,
     /// Pictures drop until the next IDR.
     waiting_idr: bool,
     /// First picture since reset.
@@ -390,27 +388,26 @@ impl H264Context {
             next_id: ReferenceId::default(),
             prev_frame_num: 0,
             prev_offset: 0,
-            poc: PocTracker::new(),
             prev_mmco5: false,
-            max_long_term: None,
+            poc: PocTracker::new(),
             waiting_idr: false,
             first: true,
         }
     }
 
     /// Instructions for one access unit.
-    pub fn compile(&mut self, au: AccessUnit<h264::Nalu>) -> Vec<H264Instruction> {
+    pub fn compile(&mut self, au: AccessUnit<h264::ParsedNalu>) -> Vec<H264Instruction> {
         let mut instructions = Vec::new();
         let mut slices = Vec::new();
         for nalu in au.into_nalus() {
-            match nalu.parsed() {
+            match nalu {
                 h264::ParsedNalu::Sps(sps) => {
-                    instructions.push(H264Instruction::Sps(Rc::clone(sps)));
+                    instructions.push(H264Instruction::Sps(sps));
                 }
                 h264::ParsedNalu::Pps(pps) => {
-                    instructions.push(H264Instruction::Pps(Rc::clone(pps)));
+                    instructions.push(H264Instruction::Pps(pps));
                 }
-                h264::ParsedNalu::Slice(slice) => slices.push(slice.clone()),
+                h264::ParsedNalu::Slice(slice) => slices.push(*slice),
                 h264::ParsedNalu::Other => {}
             }
         }
@@ -434,25 +431,30 @@ impl H264Context {
     /// One picture from its slices, or `None` when the picture drops.
     fn put_picture(&mut self, slices: &[h264::Slice]) -> Option<Picture> {
         let first = &slices[0];
-        let sps = Rc::clone(first.sps());
-        let pps = Rc::clone(first.pps());
-        let header = first.header();
-        let is_idr = first.nal().is_idr();
-        let is_reference = first.nal().ref_idc() != 0;
+        let sps = Rc::clone(&first.sps);
+        let pps = Rc::clone(&first.pps);
+        let header = &first.header;
+        let frame_num = header.frame_num;
+        let is_idr = first.idr;
+        let is_reference = first.ref_idc != 0;
         if self.waiting_idr && !is_idr {
             return None;
         }
         if !is_idr
             && !self.first
             && is_reference
-            && !sps.gaps_in_frame_num_allowed()
-            && !self.check_gap(&sps, header.frame_num())
+            && !sps.gaps_allowed
+            && frame_num != (self.prev_frame_num + 1) % sps.max_frame_num()
         {
             self.resync();
             return None;
         }
-        let offset = self.frame_num_offset(&sps, header.frame_num(), is_idr);
-        let Some(poc) = self.picture_poc(&sps, header, offset, is_idr, is_reference) else {
+        let reset = is_idr || self.prev_mmco5 || self.first;
+        let offset = sps.frame_num_offset(
+            (!reset).then_some((self.prev_frame_num, self.prev_offset)),
+            frame_num,
+        );
+        let Some(poc) = self.picture_poc(&sps, header, offset, is_reference, reset) else {
             self.resync();
             return None;
         };
@@ -460,38 +462,47 @@ impl H264Context {
         let mut drop_held = false;
         // ITU-T H.264 (01/2012) 8.2.4 lists before 8.2.5 marking: marking
         // first evicts entries the current lists still need.
-        let (l0, l1) = self.reference_lists(&sps, header, poc)?;
+        let (l0, l1) = self.reference_lists(&sps, &pps, header, poc)?;
         if is_idr {
-            drop_held = header.marking().no_output_of_prior_pics();
+            drop_held = matches!(
+                header.marking,
+                h264::Marking::Idr {
+                    no_output: true,
+                    ..
+                }
+            );
             self.flush(&mut releases);
-            self.max_long_term = header.marking().long_term_reference().then_some(0);
-        } else if header.marking().adaptive() {
-            if !self.apply_mmco(&sps, header, &mut releases) {
+        } else if matches!(header.marking, h264::Marking::Adaptive(_)) {
+            if !self.apply_mmco(&sps, header, frame_num, &mut releases) {
                 self.resync();
                 return None;
             }
         } else if is_reference {
-            self.sliding_window(&sps, header.frame_num(), &mut releases);
+            self.sliding_window(&sps, frame_num, &mut releases);
         }
-        let id = is_reference.then(|| self.track_reference(&sps, header, poc, offset, is_idr));
+        let id = is_reference.then(|| self.track_reference(header, poc, offset));
         self.waiting_idr = false;
         self.first = false;
-        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 0, 1], h264::Slice::payload);
+        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 0, 1], |slice| &slice.payload);
+        let Ok(narrowed) = u16::try_from(frame_num) else {
+            self.resync();
+            return None;
+        };
         Some(Picture {
             l0,
             l1,
             poc,
-            frame_num: header.frame_num(),
-            sps_id: sps.id(),
-            pps_id: pps.id(),
+            frame_num: narrowed,
+            sps_id: sps.seq_parameter_set_id,
+            pps_id: pps.pic_parameter_set_id,
             bytes,
             slice_offsets,
             coding: CodingFlags {
                 is_reference,
-                is_intra: header.slice_type() == h264::SliceType::I,
+                is_intra: header.slice_type.is_intra(),
                 is_idr,
             },
-            idr_pic_id: header.idr_pic_id(),
+            idr_pic_id: header.idr_pic_id.unwrap_or(0),
             id,
             releases,
             drop_held,
@@ -499,115 +510,124 @@ impl H264Context {
         })
     }
 
-    /// Reference lists of the picture by slice type.
-    fn reference_lists(
-        &mut self,
-        sps: &h264::Sps,
-        header: &h264::SliceHeader,
-        poc: i32,
-    ) -> Option<RefLists> {
-        match header.slice_type() {
-            h264::SliceType::I => Some((None, None)),
-            h264::SliceType::P => {
-                let Some(list) = self.init_list(sps, header, poc, true) else {
-                    self.resync();
-                    return None;
-                };
-                Some((Some(list), None))
-            }
-            h264::SliceType::B => {
-                let (Some(before), Some(after)) = (
-                    self.init_list(sps, header, poc, true),
-                    self.init_list(sps, header, poc, false),
-                ) else {
-                    self.resync();
-                    return None;
-                };
-                Some((Some(before), Some(after)))
-            }
-        }
-    }
-
-    /// Reference slot of the picture with its POC tracking state.
-    fn track_reference(
-        &mut self,
-        sps: &h264::Sps,
-        header: &h264::SliceHeader,
-        poc: i32,
-        offset: i32,
-        is_idr: bool,
-    ) -> ReferenceId {
-        let assigned = self.next_id.next();
-        let long_term = if is_idr && header.marking().long_term_reference() {
-            Some(0)
-        } else {
-            Self::current_long_term(header)
-        };
-        self.dpb.push(H264Entry {
-            id: assigned,
-            frame_num: header.frame_num(),
-            poc,
-            long_term,
-        });
-        self.prev_frame_num = header.frame_num();
-        self.prev_offset = offset;
-        self.prev_mmco5 = header.marking().ops().contains(&h264::Mmco::Reset);
-        if sps.pic_order_cnt_type() == 0 {
-            let delta = i64::from(header.delta_pic_order_cnt_bottom());
-            let top = i64::from(poc) - delta.min(0);
-            let lsb = header.pic_order_cnt_lsb();
-            self.poc.observe(top - i64::from(lsb), lsb);
-        }
-        assigned
-    }
-
-    /// Frame-number continuity against the previous picture.
-    fn check_gap(&self, sps: &h264::Sps, frame_num: u16) -> bool {
-        let max = 1_u32 << sps.frame_num_bits();
-        let expected = (u32::from(self.prev_frame_num) + 1) % max;
-        u32::from(frame_num) == expected
-    }
-
-    /// Frame-number offset of the current picture.
-    fn frame_num_offset(&self, sps: &h264::Sps, frame_num: u16, is_idr: bool) -> i32 {
-        if is_idr || self.prev_mmco5 || self.first {
-            return 0;
-        }
-        if self.prev_frame_num > frame_num {
-            let max = 1_i32 << sps.frame_num_bits();
-            self.prev_offset.saturating_add(max)
-        } else {
-            self.prev_offset
-        }
-    }
-
     /// Picture order count of the current picture.
     fn picture_poc(
         &self,
         sps: &h264::Sps,
         header: &h264::SliceHeader,
-        offset: i32,
-        is_idr: bool,
+        offset: i64,
         is_reference: bool,
+        reset: bool,
     ) -> Option<i32> {
-        match sps.pic_order_cnt_type() {
-            0 => poc_type0(sps, self, header, is_idr),
-            1 => poc_type1(sps, self, header, offset, is_reference),
-            _ => poc_type2(offset, header.frame_num(), is_reference),
+        match (&sps.poc_type, &header.poc) {
+            (h264::PocType::Lsb, h264::SlicePoc::Lsb(lsb, bottom)) => {
+                let prev = (!reset).then(|| self.poc.previous());
+                sps.poc_type0(*lsb, *bottom, prev)
+            }
+            (h264::PocType::Delta, h264::SlicePoc::Deltas(first, second)) => {
+                let abs = h264::abs_frame_num(offset, header.frame_num, is_reference);
+                sps.poc_type1(abs, *first, second.unwrap_or(*first), is_reference)
+            }
+            (h264::PocType::FrameNum, h264::SlicePoc::None) => {
+                h264::poc_type2(offset, header.frame_num, is_reference)
+            }
+            _ => None,
         }
+    }
+
+    /// Reference lists of the picture by slice type.
+    fn reference_lists(
+        &mut self,
+        sps: &h264::Sps,
+        pps: &h264::Pps,
+        header: &h264::SliceHeader,
+        poc: i32,
+    ) -> Option<RefLists> {
+        if header.slice_type.is_intra() {
+            return Some((None, None));
+        }
+        let curr = header.frame_num;
+        let max = sps.max_frame_num();
+        let cands: Vec<h264::RefCandidate> = self
+            .dpb
+            .iter()
+            .map(|entry| h264::RefCandidate {
+                frame_num: entry.frame_num,
+                pic_num: h264::frame_num_wrap(entry.frame_num, curr, max),
+                poc: entry.poc,
+                long_term_idx: entry.long_term,
+            })
+            .collect();
+        let (mut l0, mut l1) = h264::initial_ref_lists(&cands, header.slice_type, poc);
+        if !h264::apply_ref_mods(&mut l0, &cands, curr, max, &header.ref_mod_l0) {
+            self.resync();
+            return None;
+        }
+        l0.truncate(usize::from(header.num_ref_l0(pps)) + 1);
+        let l0 = self.resolve_refs(&l0)?;
+        if !header.slice_type.is_b() {
+            return Some((Some(l0), None));
+        }
+        if !h264::apply_ref_mods(&mut l1, &cands, curr, max, &header.ref_mod_l1) {
+            self.resync();
+            return None;
+        }
+        l1.truncate(usize::from(header.num_ref_l1(pps)) + 1);
+        let l1 = self.resolve_refs(&l1)?;
+        Some((Some(l0), Some(l1)))
+    }
+
+    /// Reference pictures behind list `order`.
+    fn resolve_refs(&self, order: &[usize]) -> Option<Vec<RefPicture>> {
+        order
+            .iter()
+            .map(|index| {
+                let entry = &self.dpb[*index];
+                Some(RefPicture {
+                    id: Some(entry.id),
+                    frame_num: u16::try_from(entry.frame_num).ok()?,
+                    poc: entry.poc,
+                    long_term: entry.long_term,
+                })
+            })
+            .collect()
+    }
+
+    /// Reference slot of the picture with its POC tracking state.
+    fn track_reference(
+        &mut self,
+        header: &h264::SliceHeader,
+        poc: i32,
+        offset: i64,
+    ) -> ReferenceId {
+        let assigned = self.next_id.next();
+        let long_term = header.marking.current_to_long();
+        self.dpb.push(H264Entry {
+            id: assigned,
+            frame_num: header.frame_num,
+            poc,
+            long_term,
+        });
+        self.prev_frame_num = header.frame_num;
+        self.prev_offset = offset;
+        self.prev_mmco5 = header.marking.has_mmco5();
+        if let h264::SlicePoc::Lsb(lsb, bottom) = header.poc {
+            let delta = i64::from(bottom);
+            let top = i64::from(poc) - delta.min(0);
+            self.poc.observe(top - i64::from(lsb), lsb);
+        }
+        assigned
     }
 
     /// Mark every DPB entry unused.
     fn flush(&mut self, releases: &mut Vec<ReferenceId>) {
         releases.extend(self.dpb.iter().map(|entry| entry.id));
         self.dpb.clear();
-        self.max_long_term = None;
     }
 
     /// Drop the DPB and wait for the next IDR.
     fn resync(&mut self) {
         self.dpb.clear();
-        self.max_long_term = None;
         self.prev_mmco5 = false;
         self.waiting_idr = true;
     }
@@ -616,7 +636,7 @@ impl H264Context {
     fn sliding_window(
         &mut self,
         sps: &h264::Sps,
-        curr_frame_num: u16,
+        curr_frame_num: u32,
         releases: &mut Vec<ReferenceId>,
     ) {
         let shorts = self
@@ -624,20 +644,19 @@ impl H264Context {
             .iter()
             .filter(|entry| entry.long_term.is_none())
             .count();
-        if shorts < usize::from(sps.max_num_ref_frames()) {
+        if shorts < usize::from(sps.max_num_ref_frames) {
             return;
         }
         // ITU-T H.264 (01/2012) 8.2.5.3 evicts the smallest FrameNumWrap.
-        let max = 1_i32 << sps.frame_num_bits();
-        let curr = i32::from(curr_frame_num);
+        let max = sps.max_frame_num();
         let mut first = None;
         for (index, entry) in self.dpb.iter().enumerate() {
             if entry.long_term.is_some() {
                 continue;
             }
             let earlier = first.is_none_or(|held: usize| {
-                pic_num_of(entry.frame_num, curr, max)
-                    < pic_num_of(self.dpb[held].frame_num, curr, max)
+                h264::frame_num_wrap(entry.frame_num, curr_frame_num, max)
+                    < h264::frame_num_wrap(self.dpb[held].frame_num, curr_frame_num, max)
             });
             if earlier {
                 first = Some(index);
@@ -654,23 +673,20 @@ impl H264Context {
         &mut self,
         sps: &h264::Sps,
         header: &h264::SliceHeader,
+        curr_frame_num: u32,
         releases: &mut Vec<ReferenceId>,
     ) -> bool {
-        let max = 1_i32 << sps.frame_num_bits();
-        let curr = i32::from(header.frame_num());
-        for op in header.marking().ops() {
-            match op {
-                h264::Mmco::ForgetShort(gap) => {
-                    let Ok(gap) = i32::try_from(*gap) else {
-                        return false;
-                    };
-                    let Some(target) = gap.checked_add(1).and_then(|step| curr.checked_sub(step))
-                    else {
-                        return false;
-                    };
+        let h264::Marking::Adaptive(ops) = &header.marking else {
+            return true;
+        };
+        let max = sps.max_frame_num();
+        let wrapped = |frame_num: u32| h264::frame_num_wrap(frame_num, curr_frame_num, max);
+        for op in ops {
+            match *op {
+                h264::Mmco::ForgetShort(diff) => {
+                    let target = h264::mmco_short_target(diff, curr_frame_num);
                     let Some(index) = self.dpb.iter().position(|entry| {
-                        entry.long_term.is_none()
-                            && pic_num_of(entry.frame_num, curr, max) == target
+                        entry.long_term.is_none() && i64::from(wrapped(entry.frame_num)) == target
                     }) else {
                         return false;
                     };
@@ -681,31 +697,35 @@ impl H264Context {
                     let Some(slot) = self
                         .dpb
                         .iter()
-                        .position(|entry| entry.long_term == Some(*index))
+                        .position(|entry| entry.long_term == Some(index))
                     else {
                         return false;
                     };
                     releases.push(self.dpb[slot].id);
                     self.dpb.remove(slot);
                 }
-                h264::Mmco::LongToShort { index, max_plus1 } => {
-                    let Some(slot) = self
+                h264::Mmco::ShortToLong(diff, index) => {
+                    let target = h264::mmco_short_target(diff, curr_frame_num);
+                    if let Some(held) = self
                         .dpb
                         .iter()
-                        .position(|entry| entry.long_term == Some(*index))
-                    else {
+                        .position(|entry| entry.long_term == Some(index))
+                    {
+                        releases.push(self.dpb[held].id);
+                        self.dpb.remove(held);
+                    }
+                    let Some(slot) = self.dpb.iter().position(|entry| {
+                        entry.long_term.is_none() && i64::from(wrapped(entry.frame_num)) == target
+                    }) else {
                         return false;
                     };
-                    self.dpb[slot].long_term = None;
-                    self.max_long_term = max_plus1.checked_sub(1);
+                    self.dpb[slot].long_term = Some(index);
                 }
                 h264::Mmco::SetMaxLong(max_plus1) => {
-                    self.max_long_term = max_plus1.checked_sub(1);
+                    let max = max_plus1.checked_sub(1);
                     let mut held = Vec::new();
                     for entry in self.dpb.drain(..) {
-                        let over = entry
-                            .long_term
-                            .is_some_and(|term| Some(term) > self.max_long_term);
+                        let over = entry.long_term.is_some_and(|term| Some(term) > max);
                         if over {
                             releases.push(entry.id);
                         } else {
@@ -714,13 +734,13 @@ impl H264Context {
                     }
                     self.dpb = held;
                 }
-                h264::Mmco::Reset => {
+                h264::Mmco::MarkAllUnused => {
                     self.flush(releases);
                 }
                 h264::Mmco::CurrentToLong(index) => {
                     let mut held = Vec::new();
                     for entry in self.dpb.drain(..) {
-                        if entry.long_term == Some(*index) {
+                        if entry.long_term == Some(index) {
                             releases.push(entry.id);
                         } else {
                             held.push(entry);
@@ -731,216 +751,6 @@ impl H264Context {
             }
         }
         true
-    }
-
-    /// Long-term index the current picture takes, if any.
-    fn current_long_term(header: &h264::SliceHeader) -> Option<u32> {
-        header.marking().ops().iter().find_map(|op| match op {
-            h264::Mmco::CurrentToLong(index) => Some(*index),
-            _ => None,
-        })
-    }
-
-    /// Initial reference list with modifications applied.
-    fn init_list(
-        &self,
-        sps: &h264::Sps,
-        header: &h264::SliceHeader,
-        poc: i32,
-        l0: bool,
-    ) -> Option<Vec<RefPicture>> {
-        let curr = i32::from(header.frame_num());
-        let max = 1_i32 << sps.frame_num_bits();
-        let mut shorts: Vec<&H264Entry> = self
-            .dpb
-            .iter()
-            .filter(|entry| entry.long_term.is_none())
-            .collect();
-        let mut longs: Vec<&H264Entry> = self
-            .dpb
-            .iter()
-            .filter(|entry| entry.long_term.is_some())
-            .collect();
-        if header.slice_type() == h264::SliceType::P {
-            shorts.sort_by_key(|entry| {
-                std::cmp::Reverse(i64::from(pic_num_of(entry.frame_num, curr, max)))
-            });
-        } else if l0 {
-            shorts.sort_by_key(|entry| l0_key(entry.poc, poc));
-        } else {
-            shorts.sort_by_key(|entry| l1_key(entry.poc, poc));
-        }
-        longs.sort_by_key(|entry| entry.long_term);
-        let mut list: Vec<RefPicture> = shorts
-            .iter()
-            .chain(longs.iter())
-            .map(|entry| RefPicture {
-                id: Some(entry.id),
-                frame_num: entry.frame_num,
-                poc: entry.poc,
-                long_term: entry.long_term,
-            })
-            .collect();
-        let mods = if l0 {
-            header.ref_mods().l0()
-        } else {
-            header.ref_mods().l1()
-        };
-        if !mods.is_empty() && !apply_ref_mods(&mut list, curr, max, mods) {
-            return None;
-        }
-        let active = if l0 {
-            header.num_ref_idx_l0_active()
-        } else {
-            header.num_ref_idx_l1_active()
-        };
-        let active = usize::try_from(active).unwrap_or(usize::MAX);
-        list.truncate(active);
-        Some(list)
-    }
-}
-
-/// Wrap-relative picture number of one short-term entry.
-fn pic_num_of(frame_num: u16, curr: i32, max: i32) -> i32 {
-    let num = i32::from(frame_num);
-    if num > curr {
-        num - max
-    } else {
-        num
-    }
-}
-
-/// L0 sort key: past pictures by descending POC, then future ascending.
-fn l0_key(entry: i32, poc: i32) -> (u8, i64) {
-    if entry < poc {
-        (0, -i64::from(entry))
-    } else {
-        (1, i64::from(entry))
-    }
-}
-
-/// L1 sort key: future pictures by ascending POC, then past descending.
-fn l1_key(entry: i32, poc: i32) -> (u8, i64) {
-    if entry > poc {
-        (0, i64::from(entry))
-    } else {
-        (1, -i64::from(entry))
-    }
-}
-
-/// Reference-list modification loop over the initial list.
-fn apply_ref_mods(list: &mut Vec<RefPicture>, curr: i32, max: i32, mods: &[h264::RefMod]) -> bool {
-    let mut pic_num = curr;
-    let mut index = 0;
-    for modification in mods {
-        match modification.idc() {
-            0 | 1 => {
-                let Ok(gap) = i32::try_from(modification.value()) else {
-                    return false;
-                };
-                let Some(step) = gap.checked_add(1) else {
-                    return false;
-                };
-                let next = if modification.idc() == 0 {
-                    pic_num.checked_sub(step)
-                } else {
-                    pic_num.checked_add(step)
-                };
-                let Some(next) = next else {
-                    return false;
-                };
-                pic_num = next.rem_euclid(max);
-                let Some(slot) = list.iter().position(|entry| {
-                    entry.long_term.is_none() && i32::from(entry.frame_num) == pic_num
-                }) else {
-                    return false;
-                };
-                let entry = list.remove(slot);
-                list.insert(index.min(list.len()), entry);
-                index += 1;
-            }
-            2 => {
-                let Some(slot) = list
-                    .iter()
-                    .position(|entry| entry.long_term == Some(modification.value()))
-                else {
-                    return false;
-                };
-                let entry = list.remove(slot);
-                list.insert(index.min(list.len()), entry);
-                index += 1;
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Type-0 picture order count from the LSB and previous reference.
-fn poc_type0(
-    sps: &h264::Sps,
-    context: &H264Context,
-    header: &h264::SliceHeader,
-    is_idr: bool,
-) -> Option<i32> {
-    let max = 1_i64 << sps.pic_order_cnt_lsb_bits();
-    let lsb = i64::from(header.pic_order_cnt_lsb());
-    let msb = if is_idr || context.prev_mmco5 || context.first {
-        0
-    } else {
-        context.poc.msb_for(lsb, max)
-    };
-    let top = msb + lsb;
-    let bottom = top + i64::from(header.delta_pic_order_cnt_bottom());
-    i32::try_from(top.min(bottom)).ok()
-}
-
-/// Type-1 picture order count from frame-number cycles.
-fn poc_type1(
-    sps: &h264::Sps,
-    context: &H264Context,
-    header: &h264::SliceHeader,
-    offset: i32,
-    is_reference: bool,
-) -> Option<i32> {
-    let _ = context;
-    let mut abs_frame_num = offset.checked_add(i32::from(header.frame_num()))?;
-    if !is_reference && abs_frame_num > 0 {
-        abs_frame_num -= 1;
-    }
-    let cycle = i32::from(sps.num_ref_frames_in_poc_cycle());
-    let mut expected = 0_i32;
-    if cycle > 0 {
-        let full = abs_frame_num / cycle;
-        let rest = usize::try_from(abs_frame_num % cycle).ok()?;
-        let mut per_cycle = 0_i32;
-        for offset in sps
-            .offset_for_ref_frame()
-            .iter()
-            .take(usize::from(sps.num_ref_frames_in_poc_cycle()))
-        {
-            per_cycle = per_cycle.checked_add(*offset)?;
-        }
-        expected = full.checked_mul(per_cycle)?;
-        for offset in sps.offset_for_ref_frame().iter().take(rest) {
-            expected = expected.checked_add(*offset)?;
-        }
-    }
-    let mut top = expected.checked_add(header.delta_pic_order_cnt()[0])?;
-    if !is_reference {
-        top = top.checked_add(sps.offset_for_non_ref_pic())?;
-    }
-    Some(top)
-}
-
-/// Type-2 picture order count from the offset plus frame number.
-fn poc_type2(offset: i32, frame_num: u16, is_reference: bool) -> Option<i32> {
-    let base = offset.checked_add(i32::from(frame_num))?;
-    let doubled = base.checked_mul(2)?;
-    if is_reference {
-        Some(doubled)
-    } else {
-        doubled.checked_sub(1)
     }
 }
 
@@ -1089,7 +899,7 @@ pub(crate) struct H265Context {
     /// Next reference identity.
     next_id: ReferenceId,
     /// POC anchor of the last temporal-0 picture.
-    poc_tid0: i32,
+    poc_tid0: Option<i32>,
     /// Leading pictures drop until the next IRAP.
     suppress_rasl: bool,
     /// Pictures drop until the next IDR or BLA.
@@ -1105,7 +915,7 @@ impl H265Context {
         Self {
             dpb: Vec::new(),
             next_id: ReferenceId::default(),
-            poc_tid0: 0,
+            poc_tid0: None,
             suppress_rasl: false,
             waiting: false,
             seen_first: false,
@@ -1113,21 +923,21 @@ impl H265Context {
     }
 
     /// Instructions for one access unit.
-    pub fn compile(&mut self, au: AccessUnit<h265::Nalu>) -> Vec<H265Instruction> {
+    pub fn compile(&mut self, au: AccessUnit<h265::ParsedNalu>) -> Vec<H265Instruction> {
         let mut instructions = Vec::new();
         let mut slices = Vec::new();
         for nalu in au.into_nalus() {
-            match nalu.parsed() {
+            match nalu {
                 h265::ParsedNalu::Vps(vps) => {
-                    instructions.push(H265Instruction::Vps(Rc::clone(vps)));
+                    instructions.push(H265Instruction::Vps(vps));
                 }
                 h265::ParsedNalu::Sps(sps) => {
-                    instructions.push(H265Instruction::Sps(Rc::clone(sps)));
+                    instructions.push(H265Instruction::Sps(sps));
                 }
                 h265::ParsedNalu::Pps(pps) => {
-                    instructions.push(H265Instruction::Pps(Rc::clone(pps)));
+                    instructions.push(H265Instruction::Pps(pps));
                 }
-                h265::ParsedNalu::Slice(slice) => slices.push(slice.as_ref().clone()),
+                h265::ParsedNalu::Slice(slice) => slices.push(*slice),
                 h265::ParsedNalu::Other => {}
             }
         }
@@ -1143,17 +953,18 @@ impl H265Context {
     /// One picture from its slices, or `None` when the picture drops.
     fn put_picture(&mut self, slices: &[h265::Slice]) -> Option<H265Picture> {
         let first = &slices[0];
-        let unit = first.nal().unit_type().id();
-        if is_rasl(unit) && self.suppress_rasl {
+        let unit = first.unit_type;
+        if h265::is_rasl(unit) && self.suppress_rasl {
             return None;
         }
-        if self.waiting && !is_restart(unit) {
+        if self.waiting && !(h265::is_idr(unit) || h265::is_bla(unit)) {
             return None;
         }
-        let sps = Rc::clone(first.sps());
-        let header = first.header();
-        let new_sequence = is_idr(unit) || is_bla(unit) || (unit == 21 && !self.seen_first);
-        let Some(poc) = self.picture_poc(header, unit, first.nal().temporal_id(), &sps) else {
+        let sps = Rc::clone(&first.sps);
+        let header = &first.header;
+        let new_sequence =
+            h265::is_idr(unit) || h265::is_bla(unit) || (h265::is_cra(unit) && !self.seen_first);
+        let Some(poc) = self.picture_poc(header, unit, first.temporal_id, &sps) else {
             self.resync();
             return None;
         };
@@ -1177,7 +988,7 @@ impl H265Context {
             after = rps.after;
             lt = rps.lt;
         }
-        if header.slice_type() != h265::SliceType::I
+        if header.slice_type != h265::SliceType::I
             && before.is_empty()
             && after.is_empty()
             && lt.is_empty()
@@ -1187,12 +998,12 @@ impl H265Context {
         }
         let id = self.next_id.next();
         self.dpb.push(H265Entry { id, poc });
-        if first.nal().unit_type().is_irap() {
+        if h265::is_irap(unit) {
             self.suppress_rasl = new_sequence;
         }
         self.seen_first = true;
         self.waiting = false;
-        let l0 = if header.slice_type() == h265::SliceType::I {
+        let l0 = if header.slice_type == h265::SliceType::I {
             None
         } else {
             let mut union = Vec::new();
@@ -1202,35 +1013,38 @@ impl H265Context {
             Some(union)
         };
         let echo = RpsEcho {
-            sps_flag: header.rps_sps_flag(),
-            ref_count: header.rps_ref_count(),
-            bits: header.rps_bits(),
+            sps_flag: header.rps_bits.as_ref().is_some_and(|bits| !bits.explicit),
+            ref_count: header
+                .rps_bits
+                .as_ref()
+                .map_or(0, |bits| bits.ref_num_delta_pocs),
+            bits: header.rps_bits.as_ref().map_or(0, |bits| bits.bits),
             before: before.iter().map(RefPicture::id).collect(),
             after: after.iter().map(RefPicture::id).collect(),
             lt: lt.iter().map(RefPicture::id).collect(),
-            is_irap: first.nal().unit_type().is_irap(),
-            is_idr: is_idr(unit),
-            vps_id: first.vps().id(),
+            is_irap: h265::is_irap(unit),
+            is_idr: h265::is_idr(unit),
+            vps_id: first.vps.id,
         };
-        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 1], h265::Slice::payload);
+        let (bytes, slice_offsets) = join_coded(slices, &[0, 0, 1], |slice| &slice.payload);
         let picture = Picture {
             l0,
             l1: None,
             poc,
             frame_num: 0,
-            sps_id: sps.id(),
-            pps_id: first.pps().id(),
+            sps_id: sps.id,
+            pps_id: first.pps.id,
             bytes,
             slice_offsets,
             coding: CodingFlags {
-                is_reference: is_reference(unit),
-                is_intra: header.slice_type() == h265::SliceType::I,
-                is_idr: is_idr(unit),
+                is_reference: !h265::is_slnr(unit),
+                is_intra: header.slice_type == h265::SliceType::I,
+                is_idr: h265::is_idr(unit),
             },
             idr_pic_id: 0,
             id: Some(id),
             releases,
-            drop_held: header.no_output_of_prior_pics() && first.nal().unit_type().is_irap(),
+            drop_held: header.no_output_prior && h265::is_irap(unit),
             resets_dpb: new_sequence,
         };
         Some(H265Picture { picture, echo })
@@ -1244,14 +1058,14 @@ impl H265Context {
         temporal_id: u8,
         sps: &h265::Sps,
     ) -> Option<i32> {
-        let poc = if is_idr(unit) {
+        let poc = if h265::is_idr(unit) {
             0
         } else {
-            let lsb = header.poc_lsb()?;
-            poc_from_lsb(sps, self.poc_tid0, lsb, is_bla(unit))?
+            let lsb = header.poc_lsb?;
+            sps.poc_from_lsb(self.poc_tid0, lsb, h265::is_bla(unit))?
         };
-        if temporal_id == 0 && !is_excluded(unit) {
-            self.poc_tid0 = poc;
+        if h265::anchors_tid0(unit, temporal_id) {
+            self.poc_tid0 = Some(poc);
         }
         Some(poc)
     }
@@ -1267,42 +1081,50 @@ impl H265Context {
         let mut before = Vec::new();
         let mut after = Vec::new();
         let mut unused = Vec::new();
-        for (delta, used) in header.rps().short() {
-            let entry_poc = poc.checked_add(*delta)?;
-            if *delta == 0 {
-                return None;
-            }
-            let entry = RefPicture {
-                id: self.find_exact(entry_poc),
-                frame_num: 0,
-                poc: entry_poc,
-                long_term: None,
-            };
-            if *used {
-                if *delta < 0 {
-                    before.push(entry);
-                } else {
-                    after.push(entry);
+        if let Some(rps) = header.rps.as_ref() {
+            let negative = usize::from(rps.negative_count);
+            let positive = usize::from(rps.positive_count);
+            for (delta, used) in rps.negative[..negative]
+                .iter()
+                .zip(rps.negative_used[..negative].iter())
+                .chain(
+                    rps.positive[..positive]
+                        .iter()
+                        .zip(rps.positive_used[..positive].iter()),
+                )
+            {
+                let entry_poc = poc.checked_add(*delta)?;
+                if *delta == 0 {
+                    return None;
                 }
-            } else {
-                unused.push(entry);
+                let entry = RefPicture {
+                    id: self.find_exact(entry_poc),
+                    frame_num: 0,
+                    poc: entry_poc,
+                    long_term: None,
+                };
+                if *used {
+                    if *delta < 0 {
+                        before.push(entry);
+                    } else {
+                        after.push(entry);
+                    }
+                } else {
+                    unused.push(entry);
+                }
             }
         }
-        let max = 1_i64 << sps.pic_order_cnt_lsb_bits();
+        let max = sps.max_poc_lsb();
         let mask = i32::try_from(max - 1).ok()?;
         let mut lt = Vec::new();
-        for lts in header.rps().long() {
-            let (entry_poc, id) = if lts.msb_cycle_present() {
-                let lsb = i64::from(header.poc_lsb()?);
-                let full = i64::from(lts.poc_lsb()) + i64::from(poc)
-                    - i64::from(lts.msb_cycle()) * max
-                    - lsb;
-                let narrowed = i32::try_from(full).ok()?;
+        for lts in &header.lt {
+            let (entry_poc, id) = if lts.msb_present {
+                let narrowed = lts.poc_msb_present(poc, max)?;
                 (narrowed, self.find_exact(narrowed))
-            } else if let Some(found) = self.find_lsb(i32::try_from(lts.poc_lsb()).ok()?, mask) {
+            } else if let Some(found) = self.find_lsb(i32::try_from(lts.poc_lsb).ok()?, mask) {
                 found
             } else {
-                (i32::try_from(lts.poc_lsb()).ok()?, None)
+                (i32::try_from(lts.poc_lsb).ok()?, None)
             };
             let entry = RefPicture {
                 id,
@@ -1310,7 +1132,7 @@ impl H265Context {
                 poc: entry_poc,
                 long_term: Some(0),
             };
-            if lts.used() {
+            if lts.used {
                 lt.push(entry);
             } else {
                 unused.push(entry);
@@ -1357,7 +1179,7 @@ impl H265Context {
     /// Drop the DPB and wait for the next IDR or BLA.
     fn resync(&mut self) {
         self.dpb.clear();
-        self.poc_tid0 = 0;
+        self.poc_tid0 = None;
         self.waiting = true;
     }
 }
@@ -1376,36 +1198,6 @@ struct ResolvedSets {
     after: Vec<RefPicture>,
     /// Current long-term references in list order.
     lt: Vec<RefPicture>,
-}
-
-/// True for IDR pictures.
-fn is_idr(unit: u8) -> bool {
-    unit == 19 || unit == 20
-}
-
-/// True for BLA pictures.
-fn is_bla(unit: u8) -> bool {
-    (16..=18).contains(&unit)
-}
-
-/// True for RASL pictures.
-fn is_rasl(unit: u8) -> bool {
-    unit == 8 || unit == 9
-}
-
-/// True for pictures restarting a resyncing context.
-fn is_restart(unit: u8) -> bool {
-    is_idr(unit) || is_bla(unit)
-}
-
-/// True for pictures usable as references.
-fn is_reference(unit: u8) -> bool {
-    unit >= 16 || unit % 2 == 1
-}
-
-/// True for pictures never anchoring the POC carry.
-fn is_excluded(unit: u8) -> bool {
-    matches!(unit, 0 | 2 | 4 | 6 | 7 | 8 | 9)
 }
 
 /// One AV1 reference slot occupant.
@@ -1429,6 +1221,8 @@ pub(crate) struct Av1Picture {
     tile_sizes: Vec<u32>,
     /// Reference id per name, `LAST` through `ALTREF`.
     name_slots: [Option<ReferenceId>; av1::REFS_PER_FRAME],
+    /// Skip-mode frame pair, 1-based reference names.
+    skip_frames: [u8; 2],
     /// Evicted ids no name cites, released before the submit.
     pre: Vec<ReferenceId>,
     /// Evicted ids a name still cites, released after the submit.
@@ -1459,6 +1253,11 @@ impl Av1Picture {
     /// Reference id per name, `LAST` through `ALTREF`.
     pub fn name_slots(&self) -> &[Option<ReferenceId>; av1::REFS_PER_FRAME] {
         &self.name_slots
+    }
+
+    /// Skip-mode frame pair, 1-based reference names.
+    pub fn skip_frames(&self) -> [u8; 2] {
+        self.skip_frames
     }
 
     /// Evicted ids no name cites, released before the submit.
@@ -1530,7 +1329,7 @@ impl Av1Context {
             index += 1;
             match obu.kind() {
                 av1::ObuType::SequenceHeader => {
-                    let seq = Rc::new(av1::parse_sequence_header(obu.payload())?);
+                    let seq = Rc::new(av1::parse_sequence_header::<ParseError>(obu.payload())?);
                     if self.seq.as_ref().is_some_and(|cur| cur != &seq) {
                         self.slots = [None, None, None, None, None, None, None, None];
                     }
@@ -1554,18 +1353,18 @@ impl Av1Context {
                     };
                     let views = self.views();
                     let (parsed, group) = if obu.kind() == av1::ObuType::Frame {
-                        av1::parse_frame_obu(obu.payload(), &seq, &views, 0)?
+                        parse_frame_obu(obu.payload(), &seq, &views)?
                     } else {
-                        let parsed = av1::parse_frame_header(obu.payload(), &seq, &views)?;
+                        let parsed = parse_frame_header(obu.payload(), &seq, &views)?;
                         (parsed, None)
                     };
                     let mut groups = group.into_iter().collect::<Vec<_>>();
-                    if !parsed.header.show().show_existing {
+                    if !parsed.header.show_existing_frame() {
                         while index < obus.len() && obus[index].kind() == av1::ObuType::TileGroup {
                             let expect = groups.last().map_or(0, |group| group.end + 1);
-                            groups.push(av1::parse_tile_group_obu(
+                            groups.push(parse_tile_group(
                                 obus[index].payload(),
-                                parsed.header.tiles(),
+                                &parsed.header,
                                 expect,
                             )?);
                             index += 1;
@@ -1590,26 +1389,29 @@ impl Av1Context {
     }
 
     /// Current slot views for frame header inference.
-    fn views(&self) -> [av1::SlotView; av1::TOTAL_REFS] {
-        let mut views = [av1::SlotView::default(); av1::TOTAL_REFS];
+    fn views(&self) -> [av1::RefInfo; av1::TOTAL_REFS] {
+        let mut views = core::array::from_fn(|_| av1::RefInfo::default());
         for (slot, view) in self.slots.iter().zip(views.iter_mut()) {
             let Some(entry) = slot else {
                 continue;
             };
             let header = &entry.header;
-            *view = av1::SlotView {
+            *view = av1::RefInfo {
                 valid: true,
-                order_hint: header.order_hint(),
-                frame_id: header.current_frame_id(),
-                frame_type: header.frame_type(),
-                upscaled_width: header.sizes().upscaled_width,
-                frame_height: header.sizes().frame_height,
-                render_width: header.sizes().render_width,
-                render_height: header.sizes().render_height,
-                segmentation: *header.segmentation(),
-                loop_filter: *header.loop_filter(),
-                gm_params: *header.gm_params(),
-                grain: *header.grain(),
+                frame_type: header.frame_type,
+                frame_width: header.upscaled_width,
+                frame_height: header.frame_height,
+                upscaled_width: header.upscaled_width,
+                render_width: header.render_width,
+                render_height: header.render_height,
+                order_hint: header.order_hint,
+                frame_id: header.current_frame_id,
+                loop_ref_deltas: header.loop_ref_deltas,
+                loop_mode_deltas: header.loop_mode_deltas,
+                seg_enabled: header.seg_enabled,
+                seg_value: header.seg_value,
+                gm_params: core::array::from_fn(|name| header.global_motion[name].params),
+                grain: header.film_grain,
             };
         }
         views
@@ -1618,16 +1420,15 @@ impl Av1Context {
     /// Instructions for one parsed frame plus its tile groups.
     fn put_frame(
         &mut self,
-        parsed: av1::ParsedFrame,
-        groups: &[av1::ParsedTileGroup<'_>],
+        parsed: ParsedFrame,
+        groups: &[TileGroup<'_>],
     ) -> Result<Vec<Av1Instruction>, crate::error::VulkanError> {
         use crate::error::ParseError;
         let header = Rc::new(parsed.header);
-        if header.show().show_existing {
+        if header.show_existing_frame() {
             return Ok(vec![self.put_show_existing(&header)?]);
         }
-        let tiles = header.tiles();
-        let count = u32::from(tiles.cols) * u32::from(tiles.rows);
+        let count = u32::from(header.tile_cols) * u32::from(header.tile_rows);
         if groups.is_empty()
             || groups
                 .iter()
@@ -1650,8 +1451,8 @@ impl Av1Context {
                 self.slots[index] = None;
             }
         }
-        for slot in header.refs().ref_frame_idx {
-            if !header.is_intra() && self.slots[usize::from(slot)].is_none() {
+        for slot in header.ref_frame_idx {
+            if !header.frame_type.is_intra() && self.slots[usize::from(slot)].is_none() {
                 return Err(ParseError::MissingSet {
                     id: u32::from(slot),
                 }
@@ -1659,10 +1460,10 @@ impl Av1Context {
             }
         }
         let id = self.next_id.next();
-        let reference = header.refresh_frame_flags() != 0;
+        let reference = header.refresh_frame_flags != 0;
         let mut name_slots = [None; av1::REFS_PER_FRAME];
-        if !header.is_intra() {
-            for (index, slot) in header.refs().ref_frame_idx.iter().enumerate() {
+        if !header.frame_type.is_intra() {
+            for (index, slot) in header.ref_frame_idx.iter().enumerate() {
                 name_slots[index] = self.slots[usize::from(*slot)]
                     .as_ref()
                     .map(|entry| entry.id);
@@ -1677,7 +1478,7 @@ impl Av1Context {
                 id,
             };
             for (index, slot) in self.slots.iter_mut().enumerate() {
-                if header.refresh_frame_flags() & (1_u8 << index) != 0 {
+                if header.refresh_frame_flags & (1_u8 << index) != 0 {
                     *slot = Some(entry.clone());
                 }
             }
@@ -1697,7 +1498,7 @@ impl Av1Context {
             slice_offsets: Vec::new(),
             coding: CodingFlags {
                 is_reference: reference,
-                is_intra: header.is_intra(),
+                is_intra: header.frame_type.is_intra(),
                 is_idr: parsed.reset_all,
             },
             idr_pic_id: 0,
@@ -1712,6 +1513,7 @@ impl Av1Context {
             tile_offsets: joined.offsets,
             tile_sizes: joined.sizes,
             name_slots,
+            skip_frames: parsed.skip_frames,
             pre,
             post,
         }))])
@@ -1720,18 +1522,18 @@ impl Av1Context {
     /// Show-existing instruction for `header`, refreshing on key types.
     fn put_show_existing(
         &mut self,
-        header: &Rc<av1::FrameHeader>,
+        header: &av1::FrameHeader,
     ) -> Result<Av1Instruction, crate::error::VulkanError> {
         use crate::error::ParseError;
-        let slot = usize::from(header.show().map_idx);
+        let slot = usize::from(header.frame_to_show_map_idx);
         let Some(entry) = self.slots[slot].clone() else {
             return Err(ParseError::MissingSet {
-                id: u32::from(header.show().map_idx),
+                id: u32::from(header.frame_to_show_map_idx),
             }
             .into());
         };
         let before = self.slot_ids();
-        if header.is_key() {
+        if header.frame_type == av1::FrameType::Key {
             for slot in &mut self.slots {
                 *slot = Some(entry.clone());
             }
@@ -1773,6 +1575,177 @@ impl Default for Av1Context {
     }
 }
 
+/// One parsed frame: header plus slot effects.
+struct ParsedFrame {
+    /// Parsed frame header.
+    header: av1::FrameHeader,
+    /// Keyframe display cleared every slot.
+    reset_all: bool,
+    /// Slots invalidated during the parse.
+    invalidated: [bool; av1::TOTAL_REFS],
+    /// Skip-mode frame pair, 1-based reference names.
+    skip_frames: [u8; 2],
+}
+
+/// Frame header of one OBU payload against `seq` and `views`.
+///
+/// Reads reference state for inference and validation; slot effects land
+/// in the returned invalidations for the caller to apply.
+fn parse_frame_header(
+    payload: &[u8],
+    seq: &av1::SequenceHeader,
+    views: &[av1::RefInfo; av1::TOTAL_REFS],
+) -> Result<ParsedFrame, ParseError> {
+    let mut refs = views.clone();
+    let before = valid_snapshot(&refs);
+    let (header, _) = av1::parse_frame_header::<ParseError>(payload, seq, &mut refs, 0, 0)?;
+    Ok(convert_parsed(header, seq, views, &refs, before))
+}
+
+/// Frame OBU: header plus its tile group over one OBU payload.
+fn parse_frame_obu<'a>(
+    payload: &'a [u8],
+    seq: &av1::SequenceHeader,
+    views: &[av1::RefInfo; av1::TOTAL_REFS],
+) -> Result<(ParsedFrame, Option<TileGroup<'a>>), ParseError> {
+    let mut refs = views.clone();
+    let before = valid_snapshot(&refs);
+    let (header, consumed) = av1::parse_frame_header::<ParseError>(payload, seq, &mut refs, 0, 0)?;
+    let parsed = convert_parsed(header, seq, views, &refs, before);
+    if parsed.header.show_existing_frame() {
+        return Ok((parsed, None));
+    }
+    let aligned = check_align_zero(payload, consumed)?;
+    let rest = payload.get(aligned / 8..).ok_or(ParseError::Truncated {
+        syntax: "tile group align",
+    })?;
+    let group = parse_tile_group(rest, &parsed.header, 0)?;
+    Ok((parsed, Some(group)))
+}
+
+/// Parsed frame with slot effects and skip-mode frames.
+fn convert_parsed(
+    header: av1::FrameHeader,
+    seq: &av1::SequenceHeader,
+    views: &[av1::RefInfo; av1::TOTAL_REFS],
+    refs: &[av1::RefInfo; av1::TOTAL_REFS],
+    before: [bool; av1::TOTAL_REFS],
+) -> ParsedFrame {
+    let reset_all = header.frame_type == av1::FrameType::Key && header.show_frame();
+    let mut invalidated = [false; av1::TOTAL_REFS];
+    if !reset_all {
+        for (index, slot) in refs.iter().enumerate() {
+            invalidated[index] = before[index] && !slot.valid;
+        }
+    }
+    let skip_frames = if header.show_existing_frame() {
+        [0, 0]
+    } else {
+        av1::skip_mode_frames(seq, &header, views).unwrap_or([0, 0])
+    };
+    ParsedFrame {
+        header,
+        reset_all,
+        invalidated,
+        skip_frames,
+    }
+}
+
+/// Validity of `refs` per slot.
+fn valid_snapshot(refs: &[av1::RefInfo; av1::TOTAL_REFS]) -> [bool; av1::TOTAL_REFS] {
+    core::array::from_fn(|index| refs[index].valid)
+}
+
+/// Byte alignment past `consumed` bits, rejecting nonzero padding.
+fn check_align_zero(payload: &[u8], consumed: usize) -> Result<usize, ParseError> {
+    let aligned = consumed.next_multiple_of(8);
+    for bit in consumed..aligned {
+        if payload[bit / 8] >> (7 - bit % 8) & 1 != 0 {
+            return Err(ParseError::OutOfRange {
+                syntax: "tile group align",
+            });
+        }
+    }
+    Ok(aligned)
+}
+
+/// Tile group tile ranges over one OBU payload.
+struct TileGroup<'a> {
+    /// First tile index of the group.
+    start: u32,
+    /// Last tile index of the group.
+    end: u32,
+    /// Tile data past the group header.
+    data: &'a [u8],
+    /// Byte offset and size of each tile within `data`.
+    tiles: Vec<(usize, usize)>,
+}
+
+/// Tile group of one OBU payload expecting tiles from `expect_start`.
+fn parse_tile_group<'a>(
+    payload: &'a [u8],
+    header: &av1::FrameHeader,
+    expect_start: u32,
+) -> Result<TileGroup<'a>, ParseError> {
+    let count = u32::from(header.tile_cols) * u32::from(header.tile_rows);
+    if count == 0 {
+        return Err(ParseError::OutOfRange {
+            syntax: "tile group range",
+        });
+    }
+    let head = av1::tile_group_range::<ParseError>(
+        payload,
+        usize::try_from(count).map_err(|_| ParseError::OutOfRange {
+            syntax: "tile group range",
+        })?,
+        u8::try_from(av1::tile_log2(1, u32::from(header.tile_cols))).map_err(|_| {
+            ParseError::OutOfRange {
+                syntax: "tile group range",
+            }
+        })?,
+        u8::try_from(av1::tile_log2(1, u32::from(header.tile_rows))).map_err(|_| {
+            ParseError::OutOfRange {
+                syntax: "tile group range",
+            }
+        })?,
+    )?;
+    let start = u32::try_from(head.start).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    let end = u32::try_from(head.end).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    if start < expect_start || start >= count || end < start || end >= count {
+        return Err(ParseError::OutOfRange {
+            syntax: "tile group range",
+        });
+    }
+    check_align_zero(payload, head.consumed_bits)?;
+    let tiles = split_tiles(head.data, start, end, header.tile_size_bytes.max(1))?;
+    Ok(TileGroup {
+        start,
+        end,
+        data: head.data,
+        tiles,
+    })
+}
+
+/// Tile ranges of `data` for tiles `start` through `end`.
+fn split_tiles(
+    data: &[u8],
+    start: u32,
+    end: u32,
+    size_bytes: u8,
+) -> Result<Vec<(usize, usize)>, ParseError> {
+    let start = usize::try_from(start).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    let end = usize::try_from(end).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    av1::split_tiles::<ParseError>(data, start, end, size_bytes)
+}
+
 /// Concatenated tile bytes plus per-tile offsets and sizes.
 struct JoinedTiles {
     /// Concatenated tile bytes.
@@ -1784,7 +1757,7 @@ struct JoinedTiles {
 }
 
 /// Concatenated tile bytes plus per-tile offsets and sizes.
-fn join_tiles(groups: &[av1::ParsedTileGroup<'_>]) -> Result<JoinedTiles, ParseError> {
+fn join_tiles(groups: &[TileGroup<'_>]) -> Result<JoinedTiles, ParseError> {
     let tiles: usize = groups.iter().map(|group| group.tiles.len()).sum();
     let total: usize = groups
         .iter()
@@ -1821,41 +1794,21 @@ fn join_tiles(groups: &[av1::ParsedTileGroup<'_>]) -> Result<JoinedTiles, ParseE
     Ok(joined)
 }
 
-/// POC from the LSB against the temporal-0 anchor.
-fn poc_from_lsb(sps: &h265::Sps, anchor: i32, lsb: u32, bla: bool) -> Option<i32> {
-    let max = 1_i64 << sps.pic_order_cnt_lsb_bits();
-    let anchor = i64::from(anchor);
-    let lsb = i64::from(lsb);
-    let prev_lsb = anchor.rem_euclid(max);
-    let msb_base = anchor - prev_lsb;
-    let mut msb = if lsb < prev_lsb && prev_lsb - lsb >= max / 2 {
-        msb_base + max
-    } else if lsb > prev_lsb && lsb - prev_lsb > max / 2 {
-        msb_base - max
-    } else {
-        msb_base
-    };
-    if bla {
-        msb = 0;
-    }
-    i32::try_from(msb + lsb).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Av1Context, H264Context, H265Context, ReorderBuffer, SlotBook};
     use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::test_support::{hex, split};
+    use crate::parse::test_support::{hex, split264, split265};
 
     #[test]
     fn join_tiles_concatenates_groups() {
-        let first = crate::parse::av1::ParsedTileGroup {
+        let first = super::TileGroup {
             start: 0,
             end: 1,
             data: &[9, 1, 2, 3, 4, 5],
             tiles: vec![(1, 3), (4, 2)],
         };
-        let second = crate::parse::av1::ParsedTileGroup {
+        let second = super::TileGroup {
             start: 2,
             end: 2,
             data: &[6, 7, 8],
@@ -1865,7 +1818,7 @@ mod tests {
         assert_eq!(joined.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(joined.offsets, vec![0, 3, 5]);
         assert_eq!(joined.sizes, vec![3, 2, 3]);
-        let short = crate::parse::av1::ParsedTileGroup {
+        let short = super::TileGroup {
             start: 0,
             end: 0,
             data: &[1, 2],
@@ -1977,22 +1930,21 @@ mod tests {
     #[test]
     fn poc_type2_fits_boundary_but_not_past() {
         assert_eq!(
-            super::poc_type2(1_073_741_823, 0, true),
+            crate::parse::h264::poc_type2(1_073_741_823, 0, true),
             Some(2_147_483_646)
         );
-        assert_eq!(super::poc_type2(1_073_741_824, 0, true), None);
-        assert_eq!(super::poc_type2(9, 1, false), Some(19));
+        assert_eq!(crate::parse::h264::poc_type2(1_073_741_824, 0, true), None);
+        assert_eq!(crate::parse::h264::poc_type2(9, 1, false), Some(19));
     }
 
     /// Access units out of parsed H.264 `payloads`.
-    fn units264(payloads: &[Vec<u8>]) -> Vec<AccessUnit<super::h264::Nalu>> {
+    fn units264(payloads: &[Vec<u8>]) -> Vec<AccessUnit<super::h264::ParsedNalu>> {
         let mut parser = super::h264::H264Parser::new();
         let mut splitter = AuSplitter::new();
         let mut units = Vec::new();
-        for raw in split(payloads) {
+        for raw in split264(payloads) {
             let parsed = parser.parse(&raw).expect("parse");
-            let nalu = super::h264::Nalu::new(parsed);
-            if let Some(unit) = splitter.put(nalu) {
+            if let Some(unit) = splitter.put(parsed) {
                 units.push(unit);
             }
         }
@@ -2072,11 +2024,12 @@ mod tests {
     }
 
     /// Single-slot 64x64 fixture SPS (`max_num_ref_frames` 1, type 2).
-    const SPS1: &str = "6764000aacb421360220000003002000000781e244d400";
+    const SPS1: &str = "6764000aacb42136022000000030020000000781e244d400";
     /// Single-slot 64x64 fixture PPS.
     const PPS1: &str = "68ef0fcb";
     /// Single-slot 64x64 fixture IDR slice head.
-    const IDR1: &str = "6588841dffbc35c57861ffe1d5931b630a8e06ea5eac31d954786d4359becf7fee26d3375d779cde1e1b686dfad19aa274aa15132fa314135310ed550d38020a7a493c9545c4608c385801ca225f0fa45d2a5c62a8f8d19a5f229c1a18111423ffc6c89ffaed6ae99a2556546bd7089cdfb3c059e15a8226737dbe6bf75af56e78df9aec3a94717b75f04f9d57aa4ab121dc49b1bcff6fa27e10498f5c8ee8ceedf7cb820c14d1710726daf53e0bde5bd7bc7002c669738687cadf4a142efe26bb1a8980996e65925cfa8d6a24ab3f66a198e5f44d77a44ebc634f41eedf268d837948303a5f1ed9f6a2f5a4138c353f0f0acfcdff731b35322f0e47d535d50bfe4680fc9c30a7ef51d6ba381cbe50b01a89e8c24d16baeb7765f2db0b4f69ac259cc56356b62ccd6f50077d4f64babcfc9b68195c5258d8ac175d9b460991ce4ad98a9dca7824ae06512fca561166b72e02571f9fcd8b0cef4d371e52e0e9bcdb5a9cde32d7b431b8fa8ea56106221129b06a39d68504f26cb674d897e6015a41e2960738f225b67ba24d42d87b4130cac70fe213e3de780395f85084da032e11383e4580a9b2be7d912d5bf0ba678b4665ea5f648f6a2d82575cab35be4f0dea19d577d133ba0d08c42291dd876e555d2a9e8c06f5d8355cef35967674e052500eee4d8c226e09c79a4f440abd68dd37020a28f483d707ba5552b79631b93d345cae6d79a64366399912bc895927df5eb23e16a48838491afb5c162f00b3de7c2bf1f5a0f5dd2d3e6407c9125b923279d9717a0b11f25e562259b4145edd1f8be937891cfae7417b9fec1111697bc38624d42b870461f560793c5956edfe5dda9e7c7b2b6c026182b7f1b43f57f3a4a4b3d9f5d62a799c7f37248b836fd378e8eebe56e9674700";
+    const IDR1: &str =
+        "6588841dffbc35c57861ffe1d5931b630a8e06ea5eac31d954786d4359becf7fee26d3375d779cde1e1b686dfad19aa274aa15132fa314135310ed550d38020a7a493c9545c4608c385801ca225f0fa45d2a5c62a8f8d19a5f229c1a18111423ffc6c89ffaed6ae99a2556546bd7089cdfb3c059e15a8226737dbe6bf75af56e78df9aec3a94717b75f04f9d57aa4ab121dc49b1bcff6fa27e10498f5c8ee8ceedf7cb820c14d1710726daf53e0bde5bd7bc7002c669738687cadf4a142efe26bb1a8980996e65925cfa8d6a24ab3f66a198e5f44d77a44ebc634f41eedf268d837948303a5f1ed9f6a2f5a4138c353f0f0acfcdff731b35322f0e47d535d50bfe4680fc9c30a7ef51d6ba381cbe50b01a89e8c24d16baeb7765f2db0b4f69ac259cc56356b62ccd6f50077d4f64babcfc9b68195c5258d8ac175d9b460991ce4ad98a9dca7824ae06512fca561166b72e02571f9fcd8b0cef4d371e52e0e9bcdb5a9cde32d7b431b8fa8ea56106221129b06a39d68504f26cb674d897e6015a41e2960738f225b67ba24d42d87b4130cac70fe213e3de780395f85084da032e11383e4580a9b2be7d912d5bf0ba678b4665ea5f648f6a2d82575cab35be4f0dea19d577d133ba0d08c42291dd876e555d2a9e8c06f5d8355cef35967674e052500eee4d8c226e09c79a4f440abd68dd37020a28f483d707ba5552b79631b93d345cae6d79a64366399912bc895927df5eb23e16a48838491afb5c162f00b3de7c2bf1f5a0f5dd2d3e6407c9125b923279d9717a0b11f25e562259b4145edd1f8be937891cfae7417b9fec1111697bc38624d42b870461f560793c5956edfe5dda9e7c7b2b6c026182b7f1b43f57f3a4a4b3d9f5d62a799c7f37248b836fd378e8eebe56e9674700";
     /// Single-slot 64x64 fixture first P slice head.
     const P1A: &str = "419a26210f463f3073e8eea39700";
     /// Single-slot 64x64 fixture second P slice head.
@@ -2106,27 +2059,23 @@ mod tests {
 
     #[test]
     fn sliding_window_evicts_smallest_wrap_not_raw() {
-        let units = split(&[hex(SPS264)]);
+        let units = split264(&[hex(SPS264)]);
         let mut parser = super::h264::H264Parser::new();
         let super::h264::ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
         };
-        let cap = usize::from(sps.max_num_ref_frames());
-        let max = 1_i32 << sps.frame_num_bits();
-        let cap_i32 = i32::try_from(cap).expect("cap");
-        assert!(cap >= 2 && max >= cap_i32 + 2);
+        let cap = usize::from(sps.max_num_ref_frames);
+        let max = sps.max_frame_num();
+        assert!(cap >= 2 && max >= u32::try_from(cap).expect("cap") + 2);
         let mut context = H264Context::new();
-        let curr = u16::try_from(cap).expect("cap") - 2;
-        let mut frames = vec![
-            u16::try_from(max - 2).expect("frame"),
-            u16::try_from(max - 1).expect("frame"),
-        ];
+        let curr = u32::try_from(cap).expect("cap") - 2;
+        let mut frames = vec![max - 2, max - 1];
         frames.extend(0..curr);
         assert_eq!(frames.len(), cap);
         let mut wrapped = None;
         for frame in frames {
             let id = context.next_id.next();
-            if frame == u16::try_from(max - 2).expect("frame") {
+            if frame == max - 2 {
                 wrapped = Some(id);
             }
             context.dpb.push(super::H264Entry {
@@ -2155,14 +2104,13 @@ mod tests {
     }
 
     /// Access units out of parsed H.265 `payloads`.
-    fn units265(payloads: &[Vec<u8>]) -> Vec<AccessUnit<super::h265::Nalu>> {
+    fn units265(payloads: &[Vec<u8>]) -> Vec<AccessUnit<super::h265::ParsedNalu>> {
         let mut parser = super::h265::H265Parser::new();
         let mut splitter = AuSplitter::new();
         let mut units = Vec::new();
-        for raw in split(payloads) {
+        for raw in split265(payloads) {
             let parsed = parser.parse(&raw).expect("parse");
-            let nalu = super::h265::Nalu::new(parsed);
-            if let Some(unit) = splitter.put(nalu) {
+            if let Some(unit) = splitter.put(parsed) {
                 units.push(unit);
             }
         }

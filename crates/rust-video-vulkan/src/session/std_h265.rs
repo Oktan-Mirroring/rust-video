@@ -25,7 +25,8 @@ use ash::vk::native::{
 
 use crate::error::ParseError;
 use crate::parse::h265::{
-    HrdParams, LtSps, Pps, ProfileTierLevel, RefPicSet, ScalingLists, Sps, Vps, VuiParams,
+    HrdLayerData, HrdParams, Pps, ProfileTierLevel, ScalingLists, ShortTermRps, Sps, Vps,
+    VuiParams, PPS_SCALING, SPS_NESTING, SPS_ORDERING_INFO,
 };
 use crate::parse::refs::{H265Picture, SlotBook};
 use crate::session::geometry::{h265_level_to_std, h265_profile_to_std};
@@ -151,11 +152,7 @@ impl H265Tables {
     /// # Errors
     ///
     /// Returns `Err` when a value exceeds its standard field width.
-    pub(crate) fn pps(
-        &self,
-        id: u8,
-        parsed: &Pps,
-    ) -> Option<Result<StdVideoH265PictureParameterSet, ParseError>> {
+    pub(crate) fn pps(&self, id: u8, parsed: &Pps) -> Option<StdVideoH265PictureParameterSet> {
         self.pps.get(&id).map(|entry| fill_pps(parsed, entry))
     }
 
@@ -165,16 +162,16 @@ impl H265Tables {
     ///
     /// Returns `Err` when a value exceeds its standard field width.
     pub(crate) fn insert_vps(&mut self, vps: &Vps) -> Result<(), ParseError> {
-        let ptl = Box::new(fill_ptl(vps.ptl())?);
+        let ptl = Box::new(fill_ptl(&vps.ptl)?);
         let dec_buf = Box::new(fill_dec_buf(
-            vps.ordering_info_present(),
-            usize::from(vps.max_sub_layers_minus1()) + 1,
-            vps.max_dec_pic_buffering(),
-            vps.max_num_reorder_pics(),
-            vps.max_latency(),
+            vps.ordering_info_present,
+            usize::from(vps.max_sub_layers_minus1) + 1,
+            &vps.max_dec_pic_buffering,
+            &vps.max_num_reorder_pics,
+            &vps.max_latency,
         )?);
         let mut hrd = Vec::new();
-        if let Some(timing) = vps.timing() {
+        if let Some(timing) = vps.timing.as_ref() {
             let mut first: Option<&HrdParams> = None;
             for set in &timing.hrd {
                 hrd.push(fill_hrd(set, first)?);
@@ -183,7 +180,7 @@ impl H265Tables {
                 }
             }
         }
-        self.vps.insert(vps.id(), VpsEntry { ptl, dec_buf, hrd });
+        self.vps.insert(vps.id, VpsEntry { ptl, dec_buf, hrd });
         Ok(())
     }
 
@@ -193,22 +190,31 @@ impl H265Tables {
     ///
     /// Returns `Err` when a value exceeds its standard field width.
     pub(crate) fn insert_sps(&mut self, sps: &Sps) -> Result<(), ParseError> {
-        let ptl = Box::new(fill_ptl(sps.ptl())?);
+        let ptl = Box::new(fill_ptl(&sps.ptl)?);
+        let buffering: Vec<u32> = sps
+            .ordering_buffering
+            .iter()
+            .map(|v| u32::from(*v))
+            .collect();
+        let reorder: Vec<u32> = sps.ordering_reorder.iter().map(|v| u32::from(*v)).collect();
         let dec_buf = Box::new(fill_dec_buf(
-            sps.ordering_info_present(),
-            usize::from(sps.max_sub_layers_minus1()) + 1,
-            sps.dec_pic_buffering(),
-            sps.reorder_pics(),
-            sps.max_latency(),
+            sps.flags & SPS_ORDERING_INFO != 0,
+            usize::from(sps.max_sub_layers).max(1),
+            &buffering,
+            &reorder,
+            &sps.ordering_latency,
         )?);
-        let scaling = sps.scaling().map(|lists| Box::new(fill_scaling(lists)));
-        let mut rps = Vec::with_capacity(sps.rps_sets().len());
-        for set in sps.rps_sets() {
+        let scaling = sps
+            .scaling_enabled()
+            .then(|| Box::new(fill_scaling(&sps.scaling)));
+        let mut rps = Vec::with_capacity(sps.rps.len());
+        for set in &sps.rps {
             rps.push(fill_rps(set)?);
         }
-        let lt = Box::new(fill_lt_sps(sps.lt_sps()));
+        let lt = Box::new(fill_lt_sps(&sps.lt_poc_lsb, &sps.lt_used_by_curr));
         let vui = sps
-            .vui()
+            .vui
+            .as_ref()
             .map(|vui| -> Result<VuiBacking, ParseError> {
                 let hrd = vui
                     .hrd
@@ -222,7 +228,7 @@ impl H265Tables {
             })
             .transpose()?;
         self.sps.insert(
-            sps.id(),
+            sps.id,
             SpsEntry {
                 ptl,
                 dec_buf,
@@ -241,22 +247,22 @@ impl H265Tables {
     ///
     /// Returns `Err` when a value exceeds its standard field width.
     pub(crate) fn insert_pps(&mut self, pps: &Pps, sps: &Sps) -> Result<(), ParseError> {
-        let scaling = pps.scaling().map(|lists| Box::new(fill_scaling(lists)));
+        let scaling = (pps.flags & PPS_SCALING != 0).then(|| Box::new(fill_scaling(&pps.scaling)));
         let mut widths = [0_u16; 19];
-        for (index, width) in pps.column_widths().iter().enumerate() {
-            widths[index] = narrow_u16(*width, "pps column width")?;
+        for (index, width) in pps.column_width.iter().enumerate() {
+            widths[index] = narrow_u16(u32::from(*width) - 1, "pps column width")?;
         }
         let mut heights = [0_u16; 21];
-        for (index, height) in pps.row_heights().iter().enumerate() {
-            heights[index] = narrow_u16(*height, "pps row height")?;
+        for (index, height) in pps.row_height.iter().enumerate() {
+            heights[index] = narrow_u16(u32::from(*height) - 1, "pps row height")?;
         }
         self.pps.insert(
-            pps.id(),
+            pps.id,
             PpsEntry {
                 scaling,
                 widths,
                 heights,
-                vps_id: sps.vps_id(),
+                vps_id: sps.vps_id,
             },
         );
         Ok(())
@@ -276,17 +282,17 @@ fn fill_vps(vps: &Vps, entry: &VpsEntry) -> StdVideoH265VideoParameterSet {
         _bitfield_1: __BindgenBitfieldUnit::new([0; 1]),
         __bindgen_padding_0: [0; 3],
     };
-    flags.set_vps_temporal_id_nesting_flag(u32::from(vps.temporal_nesting()));
-    flags.set_vps_sub_layer_ordering_info_present_flag(u32::from(vps.ordering_info_present()));
-    let timing = vps.timing();
+    flags.set_vps_temporal_id_nesting_flag(u32::from(vps.temporal_nesting));
+    flags.set_vps_sub_layer_ordering_info_present_flag(u32::from(vps.ordering_info_present));
+    let timing = vps.timing.as_ref();
     flags.set_vps_timing_info_present_flag(u32::from(timing.is_some()));
     flags.set_vps_poc_proportional_to_timing_flag(u32::from(
         timing.is_some_and(|timing| timing.poc_proportional),
     ));
     StdVideoH265VideoParameterSet {
         flags,
-        vps_video_parameter_set_id: vps.id(),
-        vps_max_sub_layers_minus1: vps.max_sub_layers_minus1(),
+        vps_video_parameter_set_id: vps.id,
+        vps_max_sub_layers_minus1: vps.max_sub_layers_minus1,
         reserved1: 0,
         reserved2: 0,
         vps_num_units_in_tick: timing.map_or(0, |timing| timing.num_units_in_tick),
@@ -308,58 +314,55 @@ fn sps_flags(sps: &Sps) -> StdVideoH265SpsFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_sps_temporal_id_nesting_flag(u32::from(sps.temporal_nesting()));
-    flags.set_separate_colour_plane_flag(u32::from(sps.separate_colour_plane()));
-    flags.set_conformance_window_flag(u32::from(sps.conformance().is_some()));
-    flags.set_sps_sub_layer_ordering_info_present_flag(u32::from(sps.ordering_info_present()));
-    flags.set_scaling_list_enabled_flag(u32::from(sps.scaling_enabled()));
-    flags.set_sps_scaling_list_data_present_flag(u32::from(sps.scaling().is_some()));
-    flags.set_amp_enabled_flag(u32::from(sps.amp_enabled()));
-    flags.set_sample_adaptive_offset_enabled_flag(u32::from(sps.sao_enabled()));
-    flags.set_pcm_enabled_flag(u32::from(sps.pcm().is_some()));
-    flags.set_pcm_loop_filter_disabled_flag(u32::from(
-        sps.pcm().is_some_and(|pcm| pcm.loop_filter_disabled),
+    flags.set_sps_temporal_id_nesting_flag(u32::from(sps.flags & SPS_NESTING != 0));
+    flags.set_separate_colour_plane_flag(u32::from(sps.separate_colour_plane));
+    flags.set_conformance_window_flag(u32::from(sps.crop.is_some()));
+    flags.set_sps_sub_layer_ordering_info_present_flag(u32::from(
+        sps.flags & SPS_ORDERING_INFO != 0,
     ));
-    flags.set_long_term_ref_pics_present_flag(u32::from(sps.lt_present()));
-    flags.set_sps_temporal_mvp_enabled_flag(u32::from(sps.temporal_mvp_enabled()));
-    flags.set_strong_intra_smoothing_enabled_flag(u32::from(sps.strong_intra_smoothing_enabled()));
-    flags.set_vui_parameters_present_flag(u32::from(sps.vui().is_some()));
+    flags.set_scaling_list_enabled_flag(u32::from(sps.scaling_enabled()));
+    flags.set_sps_scaling_list_data_present_flag(u32::from(sps.scaling_enabled()));
+    flags.set_amp_enabled_flag(u32::from(sps.amp()));
+    flags.set_sample_adaptive_offset_enabled_flag(u32::from(sps.sao()));
+    flags.set_pcm_enabled_flag(u32::from(sps.pcm()));
+    flags.set_pcm_loop_filter_disabled_flag(u32::from(sps.pcm() && sps.pcm_loop_disabled()));
+    flags.set_long_term_ref_pics_present_flag(u32::from(sps.long_term_present()));
+    flags.set_sps_temporal_mvp_enabled_flag(u32::from(sps.temporal_mvp()));
+    flags.set_strong_intra_smoothing_enabled_flag(u32::from(sps.smoothing()));
+    flags.set_vui_parameters_present_flag(u32::from(sps.vui.is_some()));
     flags
 }
 
 /// Standard sequence set with pointers into `entry`.
 fn fill_sps(sps: &Sps, entry: &SpsEntry) -> Result<StdVideoH265SequenceParameterSet, ParseError> {
     let flags = sps_flags(sps);
-    let window = sps.conformance().unwrap_or([0; 4]);
+    let window = sps.crop.map_or([0; 4], |crop| {
+        [crop.left / 2, crop.right / 2, crop.top / 2, crop.bottom / 2]
+    });
     let pcm = sps.pcm();
     Ok(StdVideoH265SequenceParameterSet {
         flags,
-        chroma_format_idc: chroma_to_std(sps.chroma_format_idc()),
-        pic_width_in_luma_samples: sps.pic_width(),
-        pic_height_in_luma_samples: sps.pic_height(),
-        sps_video_parameter_set_id: sps.vps_id(),
-        sps_max_sub_layers_minus1: sps.max_sub_layers_minus1(),
-        sps_seq_parameter_set_id: sps.id(),
-        bit_depth_luma_minus8: sps.bit_depth_luma_minus8(),
-        bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8(),
-        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4(),
-        log2_min_luma_coding_block_size_minus3: narrow_u8(sps.log2_min_cb_minus3(), "sps min cb")?,
-        log2_diff_max_min_luma_coding_block_size: narrow_u8(sps.log2_diff_cb(), "sps diff cb")?,
-        log2_min_luma_transform_block_size_minus2: narrow_u8(
-            sps.log2_min_tb_minus2(),
-            "sps min tb",
-        )?,
-        log2_diff_max_min_luma_transform_block_size: narrow_u8(sps.log2_diff_tb(), "sps diff tb")?,
-        max_transform_hierarchy_depth_inter: narrow_u8(sps.max_inter_depth(), "sps inter depth")?,
-        max_transform_hierarchy_depth_intra: narrow_u8(sps.max_intra_depth(), "sps intra depth")?,
-        num_short_term_ref_pic_sets: narrow_len(sps.rps_sets().len(), "sps num rps")?,
-        num_long_term_ref_pics_sps: narrow_len(sps.lt_sps().len(), "sps num lt")?,
-        pcm_sample_bit_depth_luma_minus1: pcm.map_or(0, |pcm| pcm.luma_depth_minus1),
-        pcm_sample_bit_depth_chroma_minus1: pcm.map_or(0, |pcm| pcm.chroma_depth_minus1),
-        log2_min_pcm_luma_coding_block_size_minus3: pcm
-            .map_or(Ok(0), |pcm| narrow_u8(pcm.min_cb_minus3, "sps pcm min cb"))?,
-        log2_diff_max_min_pcm_luma_coding_block_size: pcm
-            .map_or(Ok(0), |pcm| narrow_u8(pcm.diff_cb, "sps pcm diff cb"))?,
+        chroma_format_idc: chroma_to_std(sps.chroma_format),
+        pic_width_in_luma_samples: sps.width,
+        pic_height_in_luma_samples: sps.height,
+        sps_video_parameter_set_id: sps.vps_id,
+        sps_max_sub_layers_minus1: sps.max_sub_layers.saturating_sub(1),
+        sps_seq_parameter_set_id: sps.id,
+        bit_depth_luma_minus8: sps.bit_depth_luma,
+        bit_depth_chroma_minus8: sps.bit_depth_chroma,
+        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb_minus4,
+        log2_min_luma_coding_block_size_minus3: sps.log2_min_cb_size_minus3,
+        log2_diff_max_min_luma_coding_block_size: sps.log2_diff_max_min_cb_size,
+        log2_min_luma_transform_block_size_minus2: sps.log2_min_tb_size_minus2,
+        log2_diff_max_min_luma_transform_block_size: sps.log2_diff_max_min_tb_size,
+        max_transform_hierarchy_depth_inter: sps.max_transform_depth_inter,
+        max_transform_hierarchy_depth_intra: sps.max_transform_depth_intra,
+        num_short_term_ref_pic_sets: narrow_len(sps.rps.len(), "sps num rps")?,
+        num_long_term_ref_pics_sps: narrow_len(sps.lt_poc_lsb.len(), "sps num lt")?,
+        pcm_sample_bit_depth_luma_minus1: if pcm { sps.pcm_depth_luma } else { 0 },
+        pcm_sample_bit_depth_chroma_minus1: if pcm { sps.pcm_depth_chroma } else { 0 },
+        log2_min_pcm_luma_coding_block_size_minus3: if pcm { sps.pcm_log2_min_minus3 } else { 0 },
+        log2_diff_max_min_pcm_luma_coding_block_size: if pcm { sps.pcm_log2_diff } else { 0 },
         reserved1: 0,
         reserved2: 0,
         palette_max_size: 0,
@@ -392,64 +395,49 @@ fn pps_flags(pps: &Pps) -> StdVideoH265PpsFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_dependent_slice_segments_enabled_flag(u32::from(pps.dependent_slices_enabled()));
+    flags.set_dependent_slice_segments_enabled_flag(u32::from(pps.dependent_slices()));
     flags.set_output_flag_present_flag(u32::from(pps.output_flag_present()));
-    flags.set_sign_data_hiding_enabled_flag(u32::from(pps.sign_data_hiding_enabled()));
+    flags.set_sign_data_hiding_enabled_flag(u32::from(pps.sign_hiding()));
     flags.set_cabac_init_present_flag(u32::from(pps.cabac_init_present()));
-    flags.set_constrained_intra_pred_flag(u32::from(pps.constrained_intra_pred()));
-    flags.set_transform_skip_enabled_flag(u32::from(pps.transform_skip_enabled()));
-    flags.set_cu_qp_delta_enabled_flag(u32::from(pps.cu_qp_delta_enabled()));
-    flags.set_pps_slice_chroma_qp_offsets_present_flag(u32::from(
-        pps.slice_chroma_qp_offsets_present(),
-    ));
+    flags.set_constrained_intra_pred_flag(u32::from(pps.constrained_intra()));
+    flags.set_transform_skip_enabled_flag(u32::from(pps.transform_skip()));
+    flags.set_cu_qp_delta_enabled_flag(u32::from(pps.cu_qp_delta()));
+    flags.set_pps_slice_chroma_qp_offsets_present_flag(u32::from(pps.chroma_offsets_present()));
     flags.set_weighted_pred_flag(u32::from(pps.weighted_pred()));
     flags.set_weighted_bipred_flag(u32::from(pps.weighted_bipred()));
-    flags.set_transquant_bypass_enabled_flag(u32::from(pps.transquant_bypass_enabled()));
+    flags.set_transquant_bypass_enabled_flag(u32::from(pps.transquant_bypass()));
     flags.set_tiles_enabled_flag(u32::from(pps.tiles_enabled()));
-    flags.set_entropy_coding_sync_enabled_flag(u32::from(pps.entropy_coding_sync_enabled()));
+    flags.set_entropy_coding_sync_enabled_flag(u32::from(pps.entropy_sync()));
     flags.set_uniform_spacing_flag(u32::from(pps.uniform_spacing()));
-    flags.set_loop_filter_across_tiles_enabled_flag(u32::from(pps.loop_filter_across_tiles()));
-    flags
-        .set_pps_loop_filter_across_slices_enabled_flag(u32::from(pps.loop_filter_across_slices()));
-    flags.set_deblocking_filter_control_present_flag(u32::from(
-        pps.deblocking_filter_control_present(),
-    ));
-    flags.set_deblocking_filter_override_enabled_flag(u32::from(
-        pps.deblocking_filter_override_enabled(),
-    ));
-    flags.set_pps_deblocking_filter_disabled_flag(u32::from(pps.deblocking_filter_disabled()));
-    flags.set_pps_scaling_list_data_present_flag(u32::from(pps.scaling().is_some()));
+    flags.set_loop_filter_across_tiles_enabled_flag(u32::from(pps.loop_across_tiles()));
+    flags.set_pps_loop_filter_across_slices_enabled_flag(u32::from(pps.loop_across_slices()));
+    flags.set_deblocking_filter_control_present_flag(u32::from(pps.deblock_control_present));
+    flags.set_deblocking_filter_override_enabled_flag(u32::from(pps.deblocking_override()));
+    flags.set_pps_deblocking_filter_disabled_flag(u32::from(pps.deblocking_disabled()));
+    flags.set_pps_scaling_list_data_present_flag(u32::from(pps.flags & PPS_SCALING != 0));
     flags.set_lists_modification_present_flag(u32::from(pps.lists_modification_present()));
-    flags.set_slice_segment_header_extension_present_flag(u32::from(
-        pps.slice_header_extension_present(),
-    ));
+    flags.set_slice_segment_header_extension_present_flag(u32::from(pps.slice_ext_present()));
     flags
 }
 
 /// Standard picture set with pointers into `entry`.
-fn fill_pps(pps: &Pps, entry: &PpsEntry) -> Result<StdVideoH265PictureParameterSet, ParseError> {
+fn fill_pps(pps: &Pps, entry: &PpsEntry) -> StdVideoH265PictureParameterSet {
     let flags = pps_flags(pps);
-    Ok(StdVideoH265PictureParameterSet {
+    StdVideoH265PictureParameterSet {
         flags,
-        pps_pic_parameter_set_id: pps.id(),
-        pps_seq_parameter_set_id: pps.sps_id(),
+        pps_pic_parameter_set_id: pps.id,
+        pps_seq_parameter_set_id: pps.sps_id,
         sps_video_parameter_set_id: entry.vps_id,
-        num_extra_slice_header_bits: pps.num_extra_slice_header_bits(),
-        num_ref_idx_l0_default_active_minus1: narrow_u8(
-            pps.num_ref_idx_l0_default_minus1(),
-            "pps l0 default",
-        )?,
-        num_ref_idx_l1_default_active_minus1: narrow_u8(
-            pps.num_ref_idx_l1_default_minus1(),
-            "pps l1 default",
-        )?,
-        init_qp_minus26: narrow_i8(pps.init_qp_minus26(), "pps init qp")?,
-        diff_cu_qp_delta_depth: narrow_u8(pps.diff_cu_qp_delta_depth(), "pps qp depth")?,
-        pps_cb_qp_offset: narrow_i8(pps.cb_qp_offset(), "pps cb qp")?,
-        pps_cr_qp_offset: narrow_i8(pps.cr_qp_offset(), "pps cr qp")?,
-        pps_beta_offset_div2: narrow_i8(pps.beta_offset_div2(), "pps beta")?,
-        pps_tc_offset_div2: narrow_i8(pps.tc_offset_div2(), "pps tc")?,
-        log2_parallel_merge_level_minus2: pps.log2_parallel_merge_level_minus2(),
+        num_extra_slice_header_bits: pps.num_extra_slice_header_bits,
+        num_ref_idx_l0_default_active_minus1: pps.num_ref_l0,
+        num_ref_idx_l1_default_active_minus1: pps.num_ref_l1,
+        init_qp_minus26: pps.pic_init_qp_minus26,
+        diff_cu_qp_delta_depth: pps.diff_cu_qp_delta_depth,
+        pps_cb_qp_offset: pps.cb_qp_offset,
+        pps_cr_qp_offset: pps.cr_qp_offset,
+        pps_beta_offset_div2: pps.beta_offset_div2,
+        pps_tc_offset_div2: pps.tc_offset_div2,
+        log2_parallel_merge_level_minus2: pps.log2_parallel_merge_minus2,
         log2_max_transform_skip_block_size_minus2: 0,
         diff_cu_chroma_qp_offset_depth: 0,
         chroma_qp_offset_list_len_minus1: 0,
@@ -463,8 +451,8 @@ fn fill_pps(pps: &Pps, entry: &PpsEntry) -> Result<StdVideoH265PictureParameterS
         pps_num_palette_predictor_initializers: 0,
         luma_bit_depth_entry_minus8: 0,
         chroma_bit_depth_entry_minus8: 0,
-        num_tile_columns_minus1: narrow_u8(pps.num_tile_columns_minus1(), "pps tile columns")?,
-        num_tile_rows_minus1: narrow_u8(pps.num_tile_rows_minus1(), "pps tile rows")?,
+        num_tile_columns_minus1: pps.num_tile_columns.saturating_sub(1),
+        num_tile_rows_minus1: pps.num_tile_rows.saturating_sub(1),
         reserved1: 0,
         reserved2: 0,
         column_width_minus1: entry.widths,
@@ -475,7 +463,7 @@ fn fill_pps(pps: &Pps, entry: &PpsEntry) -> Result<StdVideoH265PictureParameterS
             .as_deref()
             .map_or(std::ptr::null(), std::ptr::from_ref),
         pPredictorPaletteEntries: std::ptr::null(),
-    })
+    }
 }
 
 /// Standard profile, tier and level.
@@ -485,15 +473,15 @@ fn fill_ptl(ptl: &ProfileTierLevel) -> Result<StdVideoH265ProfileTierLevel, Pars
         _bitfield_1: __BindgenBitfieldUnit::new([0; 1]),
         __bindgen_padding_0: [0; 3],
     };
-    flags.set_general_tier_flag(u32::from(ptl.tier()));
-    flags.set_general_progressive_source_flag(u32::from(ptl.progressive()));
+    flags.set_general_tier_flag(u32::from(ptl.tier));
+    flags.set_general_progressive_source_flag(u32::from(ptl.source.progressive));
     flags.set_general_interlaced_source_flag(0);
-    flags.set_general_non_packed_constraint_flag(u32::from(ptl.non_packed()));
-    flags.set_general_frame_only_constraint_flag(u32::from(ptl.frame_only()));
-    let profile = h265_profile_to_std(ptl.profile_idc()).ok_or(ParseError::OutOfRange {
+    flags.set_general_non_packed_constraint_flag(u32::from(ptl.constraints.non_packed));
+    flags.set_general_frame_only_constraint_flag(u32::from(ptl.constraints.frame_only));
+    let profile = h265_profile_to_std(ptl.profile_idc).ok_or(ParseError::OutOfRange {
         syntax: "ptl profile",
     })?;
-    let level = h265_level_to_std(ptl.level_idc()).ok_or(ParseError::OutOfRange {
+    let level = h265_level_to_std(ptl.level_idc).ok_or(ParseError::OutOfRange {
         syntax: "ptl level",
     })?;
     Ok(StdVideoH265ProfileTierLevel {
@@ -540,60 +528,79 @@ fn fill_dec_buf(
 /// Standard scaling lists from the parsed lists.
 fn fill_scaling(lists: &ScalingLists) -> StdVideoH265ScalingLists {
     StdVideoH265ScalingLists {
-        ScalingList4x4: lists.list_4x4,
-        ScalingList8x8: lists.list_8x8,
-        ScalingList16x16: lists.list_16x16,
-        ScalingList32x32: lists.list_32x32,
-        ScalingListDCCoef16x16: lists.dc_16x16,
-        ScalingListDCCoef32x32: lists.dc_32x32,
+        ScalingList4x4: lists.size0,
+        ScalingList8x8: lists.size1,
+        ScalingList16x16: lists.size2,
+        ScalingList32x32: lists.size3,
+        ScalingListDCCoef16x16: lists.dc2,
+        ScalingListDCCoef32x32: lists.dc3,
     }
 }
 
 /// Standard short-term reference picture set.
-pub(crate) fn fill_rps(set: &RefPicSet) -> Result<StdVideoH265ShortTermRefPicSet, ParseError> {
+pub(crate) fn fill_rps(set: &ShortTermRps) -> Result<StdVideoH265ShortTermRefPicSet, ParseError> {
     let mut flags = StdVideoH265ShortTermRefPicSetFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 1]),
         __bindgen_padding_0: [0; 3],
     };
-    flags.set_inter_ref_pic_set_prediction_flag(u32::from(set.inter()));
-    flags.set_delta_rps_sign(u32::from(set.delta_rps_sign()));
-    if set.s0().len() + set.s1().len() > 16 {
+    flags.set_inter_ref_pic_set_prediction_flag(u32::from(set.predicted));
+    flags.set_delta_rps_sign(u32::from(set.delta_sign));
+    let s0 = pairs(&set.negative, &set.negative_used, set.negative_count);
+    let s1 = pairs(&set.positive, &set.positive_used, set.positive_count);
+    if s0.len() + s1.len() > 16 {
         return Err(ParseError::OutOfRange { syntax: "rps size" });
     }
-    let (mut used, mut use_delta) = (set.used_mask(), set.use_mask());
-    if !set.inter() {
-        (used, use_delta) = pack_explicit_masks(set);
+    let (mut used, mut use_delta) = (set.used_mask, set.use_mask);
+    if !set.predicted {
+        (used, use_delta) = pack_explicit_masks(&s0, &s1);
     }
     let mut s0_used = 0_u16;
     let mut s0_delta = [0_u16; 16];
-    fill_delta_array(set.s0(), &mut s0_used, &mut s0_delta)?;
+    fill_delta_array(&s0, &mut s0_used, &mut s0_delta)?;
     let mut s1_used = 0_u16;
     let mut s1_delta = [0_u16; 16];
-    fill_delta_array(set.s1(), &mut s1_used, &mut s1_delta)?;
+    fill_delta_array(&s1, &mut s1_used, &mut s1_delta)?;
     Ok(StdVideoH265ShortTermRefPicSet {
         flags,
-        delta_idx_minus1: set.delta_idx_minus1(),
+        delta_idx_minus1: set.delta_idx_minus1,
         use_delta_flag: use_delta,
-        abs_delta_rps_minus1: set.abs_delta_rps_minus1(),
+        abs_delta_rps_minus1: narrow_abs_delta(set.abs_delta_minus1)?,
         used_by_curr_pic_flag: used,
         used_by_curr_pic_s0_flag: s0_used,
         used_by_curr_pic_s1_flag: s1_used,
         reserved1: 0,
         reserved2: 0,
         reserved3: 0,
-        num_negative_pics: narrow_len(set.s0().len(), "rps negative")?,
-        num_positive_pics: narrow_len(set.s1().len(), "rps positive")?,
+        num_negative_pics: narrow_len(s0.len(), "rps negative")?,
+        num_positive_pics: narrow_len(s1.len(), "rps positive")?,
         delta_poc_s0_minus1: s0_delta,
         delta_poc_s1_minus1: s1_delta,
     })
 }
 
+/// Delta and used-flag pairs of one stored list.
+fn pairs(deltas: &[i32], used: &[bool], count: u8) -> Vec<(i32, bool)> {
+    deltas
+        .iter()
+        .zip(used.iter())
+        .take(usize::from(count))
+        .map(|(delta, keep)| (*delta, *keep))
+        .collect()
+}
+
+/// Checked narrowing of an absolute delta RPS to `u16`.
+fn narrow_abs_delta(value: u32) -> Result<u16, ParseError> {
+    u16::try_from(value).map_err(|_| ParseError::OutOfRange {
+        syntax: "rps abs delta",
+    })
+}
+
 /// Used and use-delta masks of an explicit set: packed used flags, all kept.
-fn pack_explicit_masks(set: &RefPicSet) -> (u16, u16) {
+fn pack_explicit_masks(s0: &[(i32, bool)], s1: &[(i32, bool)]) -> (u16, u16) {
     let mut used = 0_u16;
     let mut use_delta = 0_u16;
-    for (bit, (_, keep)) in set.s0().iter().chain(set.s1().iter()).enumerate() {
+    for (bit, (_, keep)) in s0.iter().chain(s1.iter()).enumerate() {
         if bit >= 16 {
             break;
         }
@@ -633,14 +640,14 @@ fn fill_delta_array(
 }
 
 /// Standard long-term pictures from the sequence set.
-fn fill_lt_sps(entries: &[LtSps]) -> StdVideoH265LongTermRefPicsSps {
+fn fill_lt_sps(poc_lsb: &[u32], used_by_curr: &[bool]) -> StdVideoH265LongTermRefPicsSps {
     let mut used = 0_u32;
     let mut poc = [0_u32; 32];
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.used {
+    for (index, (lsb, keep)) in poc_lsb.iter().zip(used_by_curr.iter()).enumerate() {
+        if *keep {
             used |= 1 << index;
         }
-        poc[index] = entry.poc_lsb;
+        poc[index] = *lsb;
     }
     StdVideoH265LongTermRefPicsSps {
         used_by_curr_pic_lt_sps_flag: used,
@@ -684,8 +691,8 @@ fn fill_vui(vui: &VuiParams) -> Result<StdVideoH265SequenceParameterSetVui, Pars
     Ok(StdVideoH265SequenceParameterSetVui {
         flags,
         aspect_ratio_idc: aspect_to_std(vui.aspect.idc),
-        sar_width: vui.aspect.sar_width,
-        sar_height: vui.aspect.sar_height,
+        sar_width: narrow_u16(vui.aspect.sar_width, "vui sar width")?,
+        sar_height: narrow_u16(vui.aspect.sar_height, "vui sar height")?,
         video_format: vui.signal.format,
         colour_primaries: vui.signal.primaries,
         transfer_characteristics: vui.signal.transfer,
@@ -701,17 +708,22 @@ fn fill_vui(vui: &VuiParams) -> Result<StdVideoH265SequenceParameterSetVui, Pars
         vui_num_units_in_tick: vui.timing.num_units_in_tick,
         vui_time_scale: vui.timing.time_scale,
         vui_num_ticks_poc_diff_one_minus1: vui.timing.num_ticks_poc_diff_one_minus1,
-        min_spatial_segmentation_idc: restriction
-            .map_or(0, |restriction| restriction.min_spatial_segmentation),
+        min_spatial_segmentation_idc: restriction.map_or(Ok(0), |restriction| {
+            narrow_u16(restriction.min_spatial_segmentation, "vui min segmentation")
+        })?,
         reserved3: 0,
-        max_bytes_per_pic_denom: restriction
-            .map_or(0, |restriction| restriction.max_bytes_per_pic_denom),
-        max_bits_per_min_cu_denom: restriction
-            .map_or(0, |restriction| restriction.max_bits_per_mcu_denom),
-        log2_max_mv_length_horizontal: restriction
-            .map_or(0, |restriction| restriction.max_mv_horizontal),
-        log2_max_mv_length_vertical: restriction
-            .map_or(0, |restriction| restriction.max_mv_vertical),
+        max_bytes_per_pic_denom: restriction.map_or(Ok(0), |restriction| {
+            narrow_u8(restriction.max_bytes_per_pic_denom, "vui max bytes")
+        })?,
+        max_bits_per_min_cu_denom: restriction.map_or(Ok(0), |restriction| {
+            narrow_u8(restriction.max_bits_per_mcu_denom, "vui max bits")
+        })?,
+        log2_max_mv_length_horizontal: restriction.map_or(Ok(0), |restriction| {
+            narrow_u8(restriction.max_mv_horizontal, "vui max mv h")
+        })?,
+        log2_max_mv_length_vertical: restriction.map_or(Ok(0), |restriction| {
+            narrow_u8(restriction.max_mv_vertical, "vui max mv v")
+        })?,
         pHrdParameters: std::ptr::null(),
     })
 }
@@ -734,7 +746,14 @@ fn fill_hrd(hrd: &HrdParams, first: Option<&HrdParams>) -> Result<HrdBacking, Pa
     let top = hrd.fixed_rate.len().saturating_sub(1);
     let fixed_general = hrd.fixed_rate.get(top).copied().unwrap_or(false);
     let fixed_within = hrd.pic_duration.get(top).copied().unwrap_or(false);
-    let elemental = hrd.elemental.get(top).copied().unwrap_or(0);
+    let elemental = hrd
+        .elemental
+        .get(top)
+        .copied()
+        .flatten()
+        .map(|duration| narrow_u16(duration, "hrd elemental"))
+        .transpose()?
+        .unwrap_or(0);
     flags.set_fixed_pic_rate_general_flag(u32::from(fixed_general));
     flags.set_fixed_pic_rate_within_cvs_flag(u32::from(fixed_within));
     flags.set_low_delay_hrd_flag(u32::from(!fixed_general && fixed_within && elemental == 0));
@@ -744,7 +763,10 @@ fn fill_hrd(hrd: &HrdParams, first: Option<&HrdParams>) -> Result<HrdBacking, Pa
         cpb_cnt[layer] = narrow_u8(*count, "hrd cpb count")?;
     }
     for (layer, duration) in hrd.elemental.iter().enumerate().take(7) {
-        elemental_out[layer] = *duration;
+        elemental_out[layer] = duration
+            .map(|duration| narrow_u16(duration, "hrd elemental"))
+            .transpose()?
+            .unwrap_or(0);
     }
     let mut nal = Box::new([sub_layer_zero(); 7]);
     let mut vcl = Box::new([sub_layer_zero(); 7]);
@@ -786,9 +808,7 @@ fn sub_layer_zero() -> StdVideoH265SubLayerHrdParameters {
 }
 
 /// Standard sub-layer HRD parameters from one coded layer.
-fn fill_sub_layer(
-    layer: &crate::parse::h265::HrdLayer,
-) -> Result<StdVideoH265SubLayerHrdParameters, ParseError> {
+fn fill_sub_layer(layer: &HrdLayerData) -> Result<StdVideoH265SubLayerHrdParameters, ParseError> {
     if layer.bitrate_minus1.len() > 32 {
         return Err(ParseError::OutOfRange {
             syntax: "hrd layer size",
@@ -916,11 +936,6 @@ fn narrow_u16(value: u32, syntax: &'static str) -> Result<u16, ParseError> {
     u16::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
 }
 
-/// Checked narrowing of a fill value to `i8`.
-fn narrow_i8(value: i32, syntax: &'static str) -> Result<i8, ParseError> {
-    i8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
-}
-
 /// Checked narrowing of a length to `u8`.
 fn narrow_len(value: usize, syntax: &'static str) -> Result<u8, ParseError> {
     u8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
@@ -929,9 +944,9 @@ fn narrow_len(value: usize, syntax: &'static str) -> Result<u8, ParseError> {
 #[cfg(test)]
 mod tests {
     use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::h265::{H265Parser, Nalu, ParsedNalu};
+    use crate::parse::h265::{H265Parser, ParsedNalu};
     use crate::parse::refs::{H265Context, H265Instruction, ReferenceId, SlotBook};
-    use crate::parse::test_support::{hex, split};
+    use crate::parse::test_support::{hex, split265};
 
     /// Fork `demo.h265` video set.
     const VPS: &str = "40010c01ffff01600000030090000003000003003c92809000";
@@ -953,7 +968,7 @@ mod tests {
         std::rc::Rc<crate::parse::h265::Sps>,
         std::rc::Rc<crate::parse::h265::Pps>,
     ) {
-        let units = split(&[hex(VPS), hex(SPS), hex(PPS)]);
+        let units = split265(&[hex(VPS), hex(SPS), hex(PPS)]);
         let mut parser = H265Parser::new();
         let ParsedNalu::Vps(vps) = parser.parse(&units[0]).expect("vps") else {
             panic!("want vps");
@@ -968,14 +983,13 @@ mod tests {
     }
 
     /// Access units out of parsed H.265 `payloads`.
-    fn units265(payloads: &[Vec<u8>]) -> Vec<AccessUnit<Nalu>> {
+    fn units265(payloads: &[Vec<u8>]) -> Vec<AccessUnit<ParsedNalu>> {
         let mut parser = H265Parser::new();
         let mut splitter = AuSplitter::new();
         let mut units = Vec::new();
-        for raw in split(payloads) {
+        for raw in split265(payloads) {
             let parsed = parser.parse(&raw).expect("parse");
-            let nalu = Nalu::new(parsed);
-            if let Some(unit) = splitter.put(nalu) {
+            if let Some(unit) = splitter.put(parsed) {
                 units.push(unit);
             }
         }
@@ -1034,7 +1048,7 @@ mod tests {
         assert_eq!(std.flags.vui_parameters_present_flag(), 1);
         assert!(std.pScalingLists.is_null());
         assert!(!std.pSequenceParameterSetVui.is_null());
-        let profile = super::fill_ptl(sps.ptl()).expect("ptl");
+        let profile = super::fill_ptl(&sps.ptl).expect("ptl");
         assert_eq!(
             profile.general_profile_idc,
             StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN
@@ -1052,7 +1066,7 @@ mod tests {
         let (_, sps, pps) = demo_sets();
         let mut tables = super::H265Tables::new();
         tables.insert_pps(&pps, &sps).expect("insert");
-        let std = tables.pps(0, &pps).expect("std").expect("std");
+        let std = tables.pps(0, &pps).expect("std");
         assert_eq!(std.pps_pic_parameter_set_id, 0);
         assert_eq!(std.pps_seq_parameter_set_id, 0);
         assert_eq!(std.sps_video_parameter_set_id, 0);

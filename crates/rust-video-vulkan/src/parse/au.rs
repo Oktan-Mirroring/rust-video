@@ -73,32 +73,28 @@ impl<N> AccessUnit<N> {
     }
 }
 
-impl AuBoundary for crate::parse::h264::Nalu {
+impl AuBoundary for crate::parse::h264::ParsedNalu {
     fn is_slice(&self) -> bool {
-        matches!(self.parsed(), crate::parse::h264::ParsedNalu::Slice(_))
+        matches!(self, crate::parse::h264::ParsedNalu::Slice(_))
     }
 
     fn is_new_au(buffered: &[Self], nalu: &Self) -> bool {
         use crate::parse::h264::ParsedNalu;
-        let ParsedNalu::Slice(slice) = nalu.parsed() else {
+        let ParsedNalu::Slice(slice) = nalu else {
             return false;
         };
-        let Some(last) = buffered
-            .iter()
-            .rev()
-            .find_map(|buffered| match buffered.parsed() {
-                ParsedNalu::Slice(last) => Some(last),
-                _ => None,
-            })
-        else {
+        let Some(last) = buffered.iter().rev().find_map(|buffered| match buffered {
+            ParsedNalu::Slice(last) => Some(last),
+            _ => None,
+        }) else {
             return true;
         };
-        slice.header().first_mb_in_slice() == 0
-            || last.header().frame_num() != slice.header().frame_num()
-            || last.pps().id() != slice.pps().id()
-            || one_zero_ref_idc(last.nal().ref_idc(), slice.nal().ref_idc())
+        slice.header.first_mb == 0
+            || last.header.frame_num != slice.header.frame_num
+            || last.header.pps_id != slice.header.pps_id
+            || one_zero_ref_idc(last.ref_idc, slice.ref_idc)
             || poc_type_zero_differs(last, slice)
-            || last.nal().is_idr() != slice.nal().is_idr()
+            || last.idr != slice.idr
             || idr_pic_id_differs(last, slice)
     }
 }
@@ -113,12 +109,16 @@ fn poc_type_zero_differs(
     last: &crate::parse::h264::Slice,
     current: &crate::parse::h264::Slice,
 ) -> bool {
-    if last.sps().pic_order_cnt_type() != 0 || current.sps().pic_order_cnt_type() != 0 {
+    use crate::parse::h264::{PocType, SlicePoc};
+    if last.sps.poc_type != PocType::Lsb || current.sps.poc_type != PocType::Lsb {
         return false;
     }
-    last.header().pic_order_cnt_lsb() != current.header().pic_order_cnt_lsb()
-        || last.header().delta_pic_order_cnt_bottom()
-            != current.header().delta_pic_order_cnt_bottom()
+    match (&last.header.poc, &current.header.poc) {
+        (SlicePoc::Lsb(last_lsb, last_bottom), SlicePoc::Lsb(lsb, bottom)) => {
+            last_lsb != lsb || last_bottom != bottom
+        }
+        _ => false,
+    }
 }
 
 /// True for two IDR slices with different IDR ids.
@@ -126,20 +126,18 @@ fn idr_pic_id_differs(
     last: &crate::parse::h264::Slice,
     current: &crate::parse::h264::Slice,
 ) -> bool {
-    last.nal().is_idr()
-        && current.nal().is_idr()
-        && last.header().idr_pic_id() != current.header().idr_pic_id()
+    last.idr && current.idr && last.header.idr_pic_id != current.header.idr_pic_id
 }
 
-impl AuBoundary for crate::parse::h265::Nalu {
+impl AuBoundary for crate::parse::h265::ParsedNalu {
     fn is_slice(&self) -> bool {
-        matches!(self.parsed(), crate::parse::h265::ParsedNalu::Slice(_))
+        matches!(self, crate::parse::h265::ParsedNalu::Slice(_))
     }
 
     fn is_new_au(_buffered: &[Self], nalu: &Self) -> bool {
         matches!(
-            nalu.parsed(),
-            crate::parse::h265::ParsedNalu::Slice(slice) if slice.header().first_slice_in_pic()
+            nalu,
+            crate::parse::h265::ParsedNalu::Slice(slice) if slice.header.first
         )
     }
 }

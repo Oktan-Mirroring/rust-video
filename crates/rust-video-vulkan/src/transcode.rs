@@ -453,12 +453,16 @@ mod tests {
         assert_eq!(outcome.plan(), plan);
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn caps_miss_declines_typed() {
         let Some((decode, encode)) = devices() else {
             return;
         };
+        #[cfg(windows)]
         let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, false);
+        #[cfg(unix)]
+        let caps = GpuCaps::new(Some(ShareMechanism::DmaBuf), true, false);
         assert!(!caps.ready());
         let Some(mut transcoder) = forced(
             &decode,
@@ -482,12 +486,16 @@ mod tests {
         );
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn device_mismatch_declines_typed() {
         let Some((decode, encode)) = devices() else {
             return;
         };
+        #[cfg(windows)]
         let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, true);
+        #[cfg(unix)]
+        let caps = GpuCaps::new(Some(ShareMechanism::DmaBuf), true, true);
         assert!(caps.ready());
         let Some(mut transcoder) = forced(
             &decode,

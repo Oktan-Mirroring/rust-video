@@ -15,11 +15,10 @@ use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 use crate::device::VulkanDevice;
 use crate::error::{ParseError, VulkanError};
 use crate::ladder::CodecOp;
-use crate::parse::au::AuSplitter;
-use crate::parse::nal::NaluSplitter;
+use crate::parse::au::{AccessUnit, AuBoundary, AuSplitter};
 use crate::parse::refs::{
-    H264Context, H264Instruction, Picture, RefPicture, ReferenceId, ReorderBuffer, RpsEcho,
-    SlotBook,
+    H264Context, H264Instruction, H265Instruction, Picture, RefPicture, ReferenceId, ReorderBuffer,
+    RpsEcho, SlotBook,
 };
 use crate::raw::{DeviceExport, ExportPair, ExtDevice, OwnedDevice, EXPORT_MECHANISM};
 use crate::readback::Readback;
@@ -718,6 +717,171 @@ impl PhaseTiming {
     }
 }
 
+/// Run core behind the shared run path: session, sink, queue, gauges.
+struct RunCore<'a> {
+    /// Live session, built from the first sequence set.
+    session: &'a mut Option<Session>,
+    /// Display sink.
+    sink: &'a mut FrameSink,
+    /// Submitted but uncollected pictures.
+    pending: &'a mut Vec<PendingPicture>,
+    /// Accumulated submit-core gauges.
+    stats: &'a mut SubmitStats,
+}
+
+/// NAL/AU front end behind the shared H.26x run path.
+///
+/// AV1 stays separate: OBU framing has no NAL units or access-unit cuts.
+trait NalFrontend {
+    /// Streaming splitter output: one owned NAL unit.
+    type Raw;
+    /// Parsed NAL unit; access-unit cutting consumes it.
+    type Nalu: AuBoundary;
+    /// Decoded picture.
+    type Picture;
+
+    /// Complete raw units out of `bytes`.
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Self::Raw>;
+    /// Trailing raw units.
+    fn flush_splitter(&mut self) -> Vec<Self::Raw>;
+    /// Parse one raw unit.
+    fn parse(&mut self, raw: &Self::Raw) -> Result<Self::Nalu, VulkanError>;
+    /// Feed one parsed unit; returns the closed access unit, if any.
+    fn put_au(&mut self, nalu: Self::Nalu) -> Option<AccessUnit<Self::Nalu>>;
+    /// Trailing access unit, if any.
+    fn flush_au(&mut self) -> Option<AccessUnit<Self::Nalu>>;
+    /// Run core: session, sink, queue, gauges.
+    fn core(&mut self) -> RunCore<'_>;
+    /// Submit one picture without waiting.
+    fn submit_picture(&mut self, picture: &Self::Picture, gpu: bool) -> Result<(), VulkanError>;
+    /// Run one access unit through the context, submitting its picture.
+    fn run_unit(
+        &mut self,
+        unit: AccessUnit<Self::Nalu>,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Submit one picture, then collect per `mode`.
+    fn run_picture(
+        &mut self,
+        picture: &Self::Picture,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        if mode == DrainMode::Overlap {
+            let core = self.core();
+            out.extend(backpressure_to_depth(
+                core.session,
+                core.sink,
+                core.pending,
+                core.stats,
+            )?);
+        }
+        self.submit_picture(picture, gpu)?;
+        match mode {
+            DrainMode::Sync => {
+                if self.core().pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+                    let core = self.core();
+                    out.extend(drain_pending(
+                        core.session,
+                        core.sink,
+                        core.pending,
+                        core.stats,
+                    )?);
+                }
+            }
+            DrainMode::Overlap => {
+                let core = self.core();
+                out.extend(collect_ready(
+                    core.session,
+                    core.sink,
+                    core.pending,
+                    core.stats,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One NAL unit through parse, access-unit cut, and submit.
+    fn run_nal(
+        &mut self,
+        raw: &Self::Raw,
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        let parsed = self.parse(raw)?;
+        if let Some(unit) = self.put_au(parsed) {
+            out.extend(self.run_unit(unit, gpu, mode)?);
+        }
+        Ok(out)
+    }
+
+    /// Decode raw Annex-B bytes, returning display-ready frames.
+    ///
+    /// Streams with zero reorder depth emit each picture on the call
+    /// carrying its last byte; deeper streams buffer the trailing unit
+    /// across calls exactly as before.
+    fn run_bytes(
+        &mut self,
+        bytes: &[u8],
+        gpu: bool,
+        mode: DrainMode,
+    ) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        for raw in self.push_bytes(bytes) {
+            out.extend(self.run_nal(&raw, gpu, mode)?);
+        }
+        if self.core().sink.reorder().capacity() == 0 {
+            for raw in self.flush_splitter() {
+                out.extend(self.run_nal(&raw, gpu, mode)?);
+            }
+            if let Some(unit) = self.flush_au() {
+                out.extend(self.run_unit(unit, gpu, mode)?);
+            }
+        }
+        match mode {
+            DrainMode::Sync => {
+                let core = self.core();
+                let drained = drain_pending(core.session, core.sink, core.pending, core.stats)?;
+                out.extend(drained);
+            }
+            DrainMode::Overlap => {
+                let core = self.core();
+                out.extend(collect_ready(
+                    core.session,
+                    core.sink,
+                    core.pending,
+                    core.stats,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Held frames, draining the splitter and the access unit first.
+    fn flush_inner(&mut self, gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        for raw in self.flush_splitter() {
+            let parsed = self.parse(&raw)?;
+            if let Some(unit) = self.put_au(parsed) {
+                out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
+            }
+        }
+        if let Some(unit) = self.flush_au() {
+            out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
+        }
+        let core = self.core();
+        let drained = drain_pending(core.session, core.sink, core.pending, core.stats)?;
+        out.extend(drained);
+        out.extend(core.sink.reorder().flush());
+        Ok(out)
+    }
+}
+
 /// H.264 decoder over a negotiated Vulkan device.
 ///
 /// Thread-local: parser state holds `Rc` tables, so the decoder stays on
@@ -726,11 +890,11 @@ pub struct H264Decoder<'a> {
     /// Negotiated device, borrowed for the decoder's life.
     device: &'a VulkanDevice,
     /// Annex-B splitter.
-    splitter: NaluSplitter,
+    splitter: crate::parse::h264::NaluSplitter,
     /// H.264 parser.
     parser: crate::parse::h264::H264Parser,
     /// Access-unit splitter.
-    aus: AuSplitter<crate::parse::h264::Nalu>,
+    aus: AuSplitter<crate::parse::h264::ParsedNalu>,
     /// Reference context.
     context: H264Context,
     /// Standard-structure tables.
@@ -781,7 +945,7 @@ impl<'a> H264Decoder<'a> {
         }
         Ok(Self {
             device,
-            splitter: NaluSplitter::new(),
+            splitter: crate::parse::h264::NaluSplitter::new(),
             parser: crate::parse::h264::H264Parser::new(),
             aus: AuSplitter::new(),
             context: H264Context::new(),
@@ -827,7 +991,7 @@ impl<'a> H264Decoder<'a> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
-        let profile = h264_profile_to_std(sps.profile_idc()).ok_or(ParseError::Unsupported {
+        let profile = h264_profile_to_std(sps.profile_idc).ok_or(ParseError::Unsupported {
             what: "h264 profile",
         })?;
         let chain = H264ProfileChain::new(profile);
@@ -883,7 +1047,62 @@ impl<'a> H264Decoder<'a> {
         Ok((true, drained))
     }
 
-    /// Queue-submit one decoded picture without waiting.
+    /// Frames decoded from `packet` with device exports attached.
+    ///
+    /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
+    /// is absent. Each frame pins its export planes until dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot decode `packet` or export it.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), true, DrainMode::Sync)
+    }
+
+    /// Surface frames held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    pub fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner(true)
+    }
+}
+
+impl NalFrontend for H264Decoder<'_> {
+    type Raw = crate::parse::h264::Nalu;
+    type Nalu = crate::parse::h264::ParsedNalu;
+    type Picture = Picture;
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Self::Raw> {
+        self.splitter.push(bytes)
+    }
+
+    fn flush_splitter(&mut self) -> Vec<Self::Raw> {
+        self.splitter.flush()
+    }
+
+    fn parse(&mut self, raw: &Self::Raw) -> Result<Self::Nalu, VulkanError> {
+        Ok(self.parser.parse(raw)?)
+    }
+
+    fn put_au(&mut self, nalu: Self::Nalu) -> Option<AccessUnit<Self::Nalu>> {
+        self.aus.put(nalu)
+    }
+
+    fn flush_au(&mut self) -> Option<AccessUnit<Self::Nalu>> {
+        self.aus.flush()
+    }
+
+    fn core(&mut self) -> RunCore<'_> {
+        RunCore {
+            session: &mut self.session,
+            sink: &mut self.sink,
+            pending: &mut self.pending,
+            stats: &mut self.stats,
+        }
+    }
+
     fn submit_picture(&mut self, picture: &Picture, gpu: bool) -> Result<(), VulkanError> {
         apply_armed_fault(&mut self.session, &mut self.fault);
         let Self {
@@ -962,50 +1181,9 @@ impl<'a> H264Decoder<'a> {
         Ok(())
     }
 
-    /// Submit one picture, then collect per `mode`.
-    fn run_picture(
-        &mut self,
-        picture: &Picture,
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        if mode == DrainMode::Overlap {
-            out.extend(backpressure_to_depth(
-                &mut self.session,
-                &mut self.sink,
-                &mut self.pending,
-                &mut self.stats,
-            )?);
-        }
-        self.submit_picture(picture, gpu)?;
-        match mode {
-            DrainMode::Sync => {
-                if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                    out.extend(drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?);
-                }
-            }
-            DrainMode::Overlap => {
-                out.extend(collect_ready(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Run one access unit through the context, submitting its picture.
     fn run_unit(
         &mut self,
-        unit: crate::parse::au::AccessUnit<crate::parse::h264::Nalu>,
+        unit: AccessUnit<Self::Nalu>,
         gpu: bool,
         mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
@@ -1013,7 +1191,7 @@ impl<'a> H264Decoder<'a> {
         for instruction in self.context.compile(unit) {
             match instruction {
                 H264Instruction::Sps(sps) => {
-                    let fresh = !self.sps.contains_key(&sps.id());
+                    let fresh = !self.sps.contains_key(&sps.seq_parameter_set_id);
                     self.tables.insert_sps(&sps)?;
                     if fresh {
                         let drained = drain_pending(
@@ -1026,15 +1204,15 @@ impl<'a> H264Decoder<'a> {
                     }
                     self.sink
                         .reorder()
-                        .set_capacity(sps.max_num_reorder_frames());
-                    self.sps.insert(sps.id(), sps.clone());
+                        .set_capacity(sps.num_reorder_frames().unwrap_or(0).min(16));
+                    self.sps.insert(sps.seq_parameter_set_id, sps.clone());
                     let (recreated, drained) = self.ensure_session(&sps)?;
                     out.extend(drained);
                     let Some(session) = self.session.as_mut() else {
                         return Err(VulkanError::NoSession);
                     };
                     if fresh && !recreated {
-                        if let Some(std) = self.tables.sps(sps.id(), &sps) {
+                        if let Some(std) = self.tables.sps(sps.seq_parameter_set_id, &sps) {
                             let std_sps = [std];
                             let mut add = h264_params_add(&std_sps, &[])?;
                             let update = vk::VideoSessionParametersUpdateInfoKHR::default()
@@ -1044,8 +1222,8 @@ impl<'a> H264Decoder<'a> {
                     }
                 }
                 H264Instruction::Pps(pps) => {
-                    let fresh = !self.pps.contains_key(&pps.id());
-                    self.tables.insert_pps(&pps)?;
+                    let fresh = !self.pps.contains_key(&pps.pic_parameter_set_id);
+                    self.tables.insert_pps(&pps);
                     if fresh {
                         let drained = drain_pending(
                             &mut self.session,
@@ -1055,10 +1233,10 @@ impl<'a> H264Decoder<'a> {
                         )?;
                         out.extend(drained);
                     }
-                    self.pps.insert(pps.id(), pps.clone());
+                    self.pps.insert(pps.pic_parameter_set_id, pps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
-                            if let Some(std) = self.tables.pps(pps.id(), &pps) {
+                            if let Some(std) = self.tables.pps(pps.pic_parameter_set_id, &pps) {
                                 let std_pps = [std];
                                 let mut add = h264_params_add(&[], &std_pps)?;
                                 let update = vk::VideoSessionParametersUpdateInfoKHR::default()
@@ -1073,112 +1251,6 @@ impl<'a> H264Decoder<'a> {
                 }
             }
         }
-        Ok(out)
-    }
-
-    /// Decode raw Annex-B bytes, returning display-ready frames.
-    ///
-    /// Streams with zero reorder depth emit each picture on the call
-    /// carrying its last byte; deeper streams buffer the trailing unit
-    /// across calls exactly as before.
-    fn run_bytes(
-        &mut self,
-        bytes: &[u8],
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        for raw in self.splitter.push(bytes) {
-            out.extend(self.run_nal(&raw, gpu, mode)?);
-        }
-        if self.sink.reorder().capacity() == 0 {
-            for raw in self.splitter.flush() {
-                out.extend(self.run_nal(&raw, gpu, mode)?);
-            }
-            if let Some(unit) = self.aus.flush() {
-                out.extend(self.run_unit(unit, gpu, mode)?);
-            }
-        }
-        match mode {
-            DrainMode::Sync => {
-                let drained = drain_pending(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?;
-                out.extend(drained);
-            }
-            DrainMode::Overlap => {
-                out.extend(collect_ready(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?);
-            }
-        }
-        Ok(out)
-    }
-
-    /// One NAL unit through parse, access-unit cut, and submit.
-    fn run_nal(
-        &mut self,
-        raw: &crate::parse::nal::Nalu,
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        let parsed = self.parser.parse(raw)?;
-        let nalu = crate::parse::h264::Nalu::new(parsed);
-        if let Some(unit) = self.aus.put(nalu) {
-            out.extend(self.run_unit(unit, gpu, mode)?);
-        }
-        Ok(out)
-    }
-
-    /// Frames decoded from `packet` with device exports attached.
-    ///
-    /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
-    /// is absent. Each frame pins its export planes until dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot decode `packet` or export it.
-    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), true, DrainMode::Sync)
-    }
-
-    /// Surface frames held back for reordering or buffering.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its held frames.
-    pub fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.flush_inner(true)
-    }
-
-    /// Held frames, with device exports attached when `gpu` holds.
-    fn flush_inner(&mut self, gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        for raw in self.splitter.flush() {
-            let parsed = self.parser.parse(&raw)?;
-            let nalu = crate::parse::h264::Nalu::new(parsed);
-            if let Some(unit) = self.aus.put(nalu) {
-                out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
-            }
-        }
-        if let Some(unit) = self.aus.flush() {
-            out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
-        }
-        let drained = drain_pending(
-            &mut self.session,
-            &mut self.sink,
-            &mut self.pending,
-            &mut self.stats,
-        )?;
-        out.extend(drained);
-        out.extend(self.sink.reorder().flush());
         Ok(out)
     }
 }
@@ -2009,11 +2081,11 @@ pub struct H265Decoder<'a> {
     /// Negotiated device, borrowed for the decoder's life.
     device: &'a VulkanDevice,
     /// Annex-B splitter.
-    splitter: NaluSplitter,
+    splitter: crate::parse::h265::NaluSplitter,
     /// H.265 parser.
     parser: crate::parse::h265::H265Parser,
     /// Access-unit splitter.
-    aus: AuSplitter<crate::parse::h265::Nalu>,
+    aus: AuSplitter<crate::parse::h265::ParsedNalu>,
     /// Reference context.
     context: crate::parse::refs::H265Context,
     /// Standard-structure tables.
@@ -2066,7 +2138,7 @@ impl<'a> H265Decoder<'a> {
         }
         Ok(Self {
             device,
-            splitter: NaluSplitter::new(),
+            splitter: crate::parse::h265::NaluSplitter::new(),
             parser: crate::parse::h265::H265Parser::new(),
             aus: AuSplitter::new(),
             context: crate::parse::refs::H265Context::new(),
@@ -2113,10 +2185,11 @@ impl<'a> H265Decoder<'a> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
-        let profile = crate::session::geometry::h265_profile_to_std(sps.ptl().profile_idc())
-            .ok_or(ParseError::Unsupported {
+        let profile = crate::session::geometry::h265_profile_to_std(sps.ptl.profile_idc).ok_or(
+            ParseError::Unsupported {
                 what: "h265 profile",
-            })?;
+            },
+        )?;
         let chain = crate::session::params::H265ProfileChain::new(profile);
         let usage =
             vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
@@ -2164,7 +2237,7 @@ impl<'a> H265Decoder<'a> {
             }
         }
         for (id, pps) in &self.pps {
-            if let Some(std) = self.tables.pps(*id, pps).transpose()? {
+            if let Some(std) = self.tables.pps(*id, pps) {
                 pic_stds.push(std);
             }
         }
@@ -2177,7 +2250,62 @@ impl<'a> H265Decoder<'a> {
         Ok((true, drained))
     }
 
-    /// Queue-submit one decoded picture without waiting.
+    /// Frames decoded from `packet` with device exports attached.
+    ///
+    /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
+    /// is absent. Each frame pins its export planes until dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot decode `packet` or export it.
+    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.run_bytes(packet.data(), true, DrainMode::Sync)
+    }
+
+    /// Surface frames held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its held frames.
+    pub fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        self.flush_inner(true)
+    }
+}
+
+impl NalFrontend for H265Decoder<'_> {
+    type Raw = crate::parse::h265::Nalu;
+    type Nalu = crate::parse::h265::ParsedNalu;
+    type Picture = crate::parse::refs::H265Picture;
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<Self::Raw> {
+        self.splitter.push(bytes)
+    }
+
+    fn flush_splitter(&mut self) -> Vec<Self::Raw> {
+        self.splitter.flush()
+    }
+
+    fn parse(&mut self, raw: &Self::Raw) -> Result<Self::Nalu, VulkanError> {
+        Ok(self.parser.parse(raw)?)
+    }
+
+    fn put_au(&mut self, nalu: Self::Nalu) -> Option<AccessUnit<Self::Nalu>> {
+        self.aus.put(nalu)
+    }
+
+    fn flush_au(&mut self) -> Option<AccessUnit<Self::Nalu>> {
+        self.aus.flush()
+    }
+
+    fn core(&mut self) -> RunCore<'_> {
+        RunCore {
+            session: &mut self.session,
+            sink: &mut self.sink,
+            pending: &mut self.pending,
+            stats: &mut self.stats,
+        }
+    }
+
     fn submit_picture(
         &mut self,
         picture: &crate::parse::refs::H265Picture,
@@ -2263,59 +2391,17 @@ impl<'a> H265Decoder<'a> {
         Ok(())
     }
 
-    /// Submit one picture, then collect per `mode`.
-    fn run_picture(
-        &mut self,
-        picture: &crate::parse::refs::H265Picture,
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        if mode == DrainMode::Overlap {
-            out.extend(backpressure_to_depth(
-                &mut self.session,
-                &mut self.sink,
-                &mut self.pending,
-                &mut self.stats,
-            )?);
-        }
-        self.submit_picture(picture, gpu)?;
-        match mode {
-            DrainMode::Sync => {
-                if self.pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                    out.extend(drain_pending(
-                        &mut self.session,
-                        &mut self.sink,
-                        &mut self.pending,
-                        &mut self.stats,
-                    )?);
-                }
-            }
-            DrainMode::Overlap => {
-                out.extend(collect_ready(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Run one access unit through the context, submitting its picture.
     fn run_unit(
         &mut self,
-        unit: crate::parse::au::AccessUnit<crate::parse::h265::Nalu>,
+        unit: AccessUnit<Self::Nalu>,
         gpu: bool,
         mode: DrainMode,
     ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        use crate::parse::refs::H265Instruction;
         let mut out = Vec::new();
         for instruction in self.context.compile(unit) {
             match instruction {
                 H265Instruction::Vps(vps) => {
-                    let fresh = !self.vps.contains_key(&vps.id());
+                    let fresh = !self.vps.contains_key(&vps.id);
                     self.tables.insert_vps(&vps)?;
                     if fresh {
                         let drained = drain_pending(
@@ -2326,10 +2412,10 @@ impl<'a> H265Decoder<'a> {
                         )?;
                         out.extend(drained);
                     }
-                    self.vps.insert(vps.id(), vps.clone());
+                    self.vps.insert(vps.id, vps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
-                            if let Some(std) = self.tables.vps(vps.id(), &vps) {
+                            if let Some(std) = self.tables.vps(vps.id, &vps) {
                                 let std_vps = [std];
                                 let mut add =
                                     crate::session::params::h265_params_add(&std_vps, &[], &[])?;
@@ -2341,7 +2427,7 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Sps(sps) => {
-                    let fresh = !self.sps.contains_key(&sps.id());
+                    let fresh = !self.sps.contains_key(&sps.id);
                     self.tables.insert_sps(&sps)?;
                     if fresh {
                         let drained = drain_pending(
@@ -2352,15 +2438,17 @@ impl<'a> H265Decoder<'a> {
                         )?;
                         out.extend(drained);
                     }
-                    self.sink.reorder().set_capacity(sps.max_num_reorder_pics());
-                    self.sps.insert(sps.id(), sps.clone());
+                    self.sink.reorder().set_capacity(u32::from(
+                        sps.ordering_reorder.last().copied().unwrap_or(0).min(16),
+                    ));
+                    self.sps.insert(sps.id, sps.clone());
                     let (recreated, drained) = self.ensure_session(&sps)?;
                     out.extend(drained);
                     let Some(session) = self.session.as_mut() else {
                         return Err(VulkanError::NoSession);
                     };
                     if fresh && !recreated {
-                        if let Some(std) = self.tables.sps(sps.id(), &sps).transpose()? {
+                        if let Some(std) = self.tables.sps(sps.id, &sps).transpose()? {
                             let std_sps = [std];
                             let mut add =
                                 crate::session::params::h265_params_add(&[], &std_sps, &[])?;
@@ -2371,7 +2459,7 @@ impl<'a> H265Decoder<'a> {
                     }
                 }
                 H265Instruction::Pps(pps) => {
-                    let fresh = !self.pps.contains_key(&pps.id());
+                    let fresh = !self.pps.contains_key(&pps.id);
                     if fresh {
                         let drained = drain_pending(
                             &mut self.session,
@@ -2381,7 +2469,7 @@ impl<'a> H265Decoder<'a> {
                         )?;
                         out.extend(drained);
                     }
-                    let sps_id = pps.sps_id();
+                    let sps_id = pps.sps_id;
                     let Some(sps) = self.sps.get(&sps_id).cloned() else {
                         return Err(ParseError::MissingSet {
                             id: u32::from(sps_id),
@@ -2389,10 +2477,10 @@ impl<'a> H265Decoder<'a> {
                         .into());
                     };
                     self.tables.insert_pps(&pps, &sps)?;
-                    self.pps.insert(pps.id(), pps.clone());
+                    self.pps.insert(pps.id, pps.clone());
                     if fresh {
                         if let Some(session) = self.session.as_mut() {
-                            if let Some(std) = self.tables.pps(pps.id(), &pps).transpose()? {
+                            if let Some(std) = self.tables.pps(pps.id, &pps) {
                                 let std_pps = [std];
                                 let mut add =
                                     crate::session::params::h265_params_add(&[], &[], &std_pps)?;
@@ -2408,112 +2496,6 @@ impl<'a> H265Decoder<'a> {
                 }
             }
         }
-        Ok(out)
-    }
-
-    /// Decode raw Annex-B bytes, returning display-ready frames.
-    ///
-    /// Streams with zero reorder depth emit each picture on the call
-    /// carrying its last byte; deeper streams buffer the trailing unit
-    /// across calls exactly as before.
-    fn run_bytes(
-        &mut self,
-        bytes: &[u8],
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        for raw in self.splitter.push(bytes) {
-            out.extend(self.run_nal(&raw, gpu, mode)?);
-        }
-        if self.sink.reorder().capacity() == 0 {
-            for raw in self.splitter.flush() {
-                out.extend(self.run_nal(&raw, gpu, mode)?);
-            }
-            if let Some(unit) = self.aus.flush() {
-                out.extend(self.run_unit(unit, gpu, mode)?);
-            }
-        }
-        match mode {
-            DrainMode::Sync => {
-                let drained = drain_pending(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?;
-                out.extend(drained);
-            }
-            DrainMode::Overlap => {
-                out.extend(collect_ready(
-                    &mut self.session,
-                    &mut self.sink,
-                    &mut self.pending,
-                    &mut self.stats,
-                )?);
-            }
-        }
-        Ok(out)
-    }
-
-    /// One NAL unit through parse, access-unit cut, and submit.
-    fn run_nal(
-        &mut self,
-        raw: &crate::parse::nal::Nalu,
-        gpu: bool,
-        mode: DrainMode,
-    ) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        let parsed = self.parser.parse(raw)?;
-        let nalu = crate::parse::h265::Nalu::new(parsed);
-        if let Some(unit) = self.aus.put(nalu) {
-            out.extend(self.run_unit(unit, gpu, mode)?);
-        }
-        Ok(out)
-    }
-
-    /// Frames decoded from `packet` with device exports attached.
-    ///
-    /// The frames skip the NV12 readback: `nv12` is empty and `to_cpu`
-    /// is absent. Each frame pins its export planes until dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot decode `packet` or export it.
-    pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), true, DrainMode::Sync)
-    }
-
-    /// Surface frames held back for reordering or buffering.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its held frames.
-    pub fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.flush_inner(true)
-    }
-
-    /// Held frames, with device exports attached when `gpu` holds.
-    fn flush_inner(&mut self, gpu: bool) -> Result<Vec<VulkanFrame>, VulkanError> {
-        let mut out = Vec::new();
-        for raw in self.splitter.flush() {
-            let parsed = self.parser.parse(&raw)?;
-            let nalu = crate::parse::h265::Nalu::new(parsed);
-            if let Some(unit) = self.aus.put(nalu) {
-                out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
-            }
-        }
-        if let Some(unit) = self.aus.flush() {
-            out.extend(self.run_unit(unit, gpu, DrainMode::Sync)?);
-        }
-        let drained = drain_pending(
-            &mut self.session,
-            &mut self.sink,
-            &mut self.pending,
-            &mut self.stats,
-        )?;
-        out.extend(drained);
-        out.extend(self.sink.reorder().flush());
         Ok(out)
     }
 }
@@ -2757,7 +2739,7 @@ impl<'a> Av1Decoder<'a> {
         let crate::ladder::OpCaps::Decode(facts) = self.device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
-        let Some(profile) = crate::session::geometry::av1_profile_to_std(seq.profile()) else {
+        let Some(profile) = crate::session::geometry::av1_profile_to_std(seq.profile) else {
             return Err(ParseError::Unsupported {
                 what: "av1 profile",
             }
@@ -2807,7 +2789,7 @@ impl<'a> Av1Decoder<'a> {
         };
         let header = picture.header();
         let mut order_hints = [0_u8; 8];
-        if !header.is_intra() {
+        if !header.frame_type.is_intra() {
             for (name, id) in picture.name_slots().iter().enumerate() {
                 let Some(slot) = id.and_then(|id| session.slots().slot_of(id)) else {
                     continue;
@@ -2818,17 +2800,20 @@ impl<'a> Av1Decoder<'a> {
             }
         }
         let mut bias = 0;
-        if seq.enable_order_hint() && !header.is_intra() {
+        if seq.enable_order_hint() && !header.frame_type.is_intra() {
             for name in 0..crate::parse::av1::REFS_PER_FRAME {
-                if crate::parse::av1::relative_dist(seq, order_hints[name + 1], header.order_hint())
-                    > 0
+                if crate::parse::av1::relative_dist(
+                    order_hints[name + 1],
+                    header.order_hint,
+                    seq.order_hint_bits_minus1,
+                ) > 0
                 {
                     bias |= 1_u8 << (name + 1);
                 }
             }
         }
         let mut expected = [0_u32; 8];
-        if !header.is_intra() {
+        if !header.frame_type.is_intra() {
             for name in 0..crate::parse::av1::REFS_PER_FRAME {
                 expected[name + 1] = crate::session::std_av1::expected_frame_id(seq, header, name);
             }
@@ -2847,7 +2832,7 @@ impl<'a> Av1Decoder<'a> {
         gpu: bool,
     ) -> Result<(), VulkanError> {
         use crate::session::std_av1::{fill_reference, Av1PictureStd};
-        if picture.header().grain().apply_grain {
+        if picture.header().film_grain.apply_grain() {
             return Err(VulkanError::Unsupported {
                 what: "av1 film grain output".to_owned(),
             });
@@ -2891,15 +2876,21 @@ impl<'a> Av1Decoder<'a> {
         let ref_slots = ref_bufs.slots(&ref_entries, "decode slot")?;
         let begin_slots = begin_bufs.slots(&begin_entries, "begin slot")?;
         let setup_std = fill_reference(
-            header.order_hint(),
-            header.frame_type(),
+            header.order_hint,
+            header.frame_type.id(),
             state.bias,
             state.order_hints,
             header.disable_frame_end_update_cdf(),
-            header.segmentation().enabled,
+            header.segmentation_enabled(),
         );
         let (setup_resource, setup_index) = setup_target(session, extent, setup_slot)?;
-        let std_sets = Av1PictureStd::fill(header, super128, state.order_hints, state.expected);
+        let std_sets = Av1PictureStd::fill(
+            header,
+            super128,
+            state.order_hints,
+            state.expected,
+            picture.skip_frames(),
+        )?;
         let name_indices = av1_name_indices(session, picture)?;
         let codec = av1_codec_info(picture, &std_sets, name_indices)?;
         let setup_dpb = vk::VideoDecodeAV1DpbSlotInfoKHR {
@@ -2986,7 +2977,7 @@ impl<'a> Av1Decoder<'a> {
                         let drained = self.drain()?;
                         out.extend(drained);
                     }
-                    self.tables.insert(&seq);
+                    self.tables.insert(&seq)?;
                     if changed {
                         self.session = None;
                         self.shown.clear();
@@ -2997,7 +2988,11 @@ impl<'a> Av1Decoder<'a> {
                     let Some(seq) = self.seq.clone() else {
                         return Err(VulkanError::NoSession);
                     };
-                    self.ensure_session(&seq, picture.header().display_size())?;
+                    let display = (
+                        picture.header().upscaled_width,
+                        picture.header().frame_height,
+                    );
+                    self.ensure_session(&seq, display)?;
                     out.extend(self.run_picture(picture.as_ref(), gpu, mode)?);
                 }
                 Av1Instruction::ShowExisting { id, releases } => {
@@ -3710,8 +3705,8 @@ mod tests {
         use crate::parse::refs::H264Instruction;
         match instruction {
             H264Instruction::Sps(sps) => {
-                assert_eq!(sps.max_num_reorder_frames(), 0);
-                assert_eq!(sps.coded_size(), (64, 64));
+                assert_eq!(sps.num_reorder_frames().unwrap_or(0), 0);
+                assert_eq!((sps.width(), sps.height()), (64, 64));
                 assert_eq!(sps.display_size(), (64, 64));
                 "sps"
             }
@@ -3722,17 +3717,16 @@ mod tests {
 
     /// Instruction tags out of one packet, trailing unit completed.
     fn feed_packet(
-        splitter: &mut crate::parse::nal::NaluSplitter,
+        splitter: &mut crate::parse::h264::NaluSplitter,
         parser: &mut crate::parse::h264::H264Parser,
-        aus: &mut crate::parse::au::AuSplitter<crate::parse::h264::Nalu>,
+        aus: &mut crate::parse::au::AuSplitter<crate::parse::h264::ParsedNalu>,
         context: &mut crate::parse::refs::H264Context,
         bytes: &[u8],
     ) -> Vec<&'static str> {
         let mut tags = Vec::new();
-        let mut run_nal = |raw: crate::parse::nal::Nalu| {
+        let mut run_nal = |raw: crate::parse::h264::Nalu| {
             let parsed = parser.parse(&raw).expect("synth parses");
-            let nalu = crate::parse::h264::Nalu::new(parsed);
-            if let Some(unit) = aus.put(nalu) {
+            if let Some(unit) = aus.put(parsed) {
                 for instruction in context.compile(unit) {
                     tags.push(tag(&instruction));
                 }
@@ -3757,8 +3751,7 @@ mod tests {
         use rust_video_harness::H264Synth;
 
         use crate::parse::au::AuSplitter;
-        use crate::parse::h264::H264Parser;
-        use crate::parse::nal::NaluSplitter;
+        use crate::parse::h264::{H264Parser, NaluSplitter};
         use crate::parse::refs::H264Context;
 
         let packets = H264Synth::annex_b_packets();

@@ -296,37 +296,37 @@ impl SessionGeometry {
         caps: &DecodeFacts,
         formats: &[vk::VideoFormatPropertiesKHR<'_>],
     ) -> Result<Self, VulkanError> {
-        if sps.chroma_format_idc() != 1
-            || sps.bit_depth_luma_minus8() != 0
-            || sps.bit_depth_chroma_minus8() != 0
+        if sps.fidelity.chroma_format_idc != 1
+            || sps.fidelity.bit_depth_luma_minus8 != 0
+            || sps.fidelity.bit_depth_chroma_minus8 != 0
         {
             return Err(ParseError::Unsupported {
                 what: "h264 sampling",
             }
             .into());
         }
-        let Some(profile) = h264_profile_to_std(sps.profile_idc()) else {
+        let Some(profile) = h264_profile_to_std(sps.profile_idc) else {
             return Err(ParseError::Unsupported {
                 what: "h264 profile",
             }
             .into());
         };
-        let Some(level) = h264_level_to_std(sps.level_idc(), sps.constraint_set3()) else {
+        let Some(level) = h264_level_to_std(sps.level_idc, sps.constraint_set(3)) else {
             return Err(ParseError::Unsupported { what: "h264 level" }.into());
         };
-        if sps.level_idc() > caps.max_level {
+        if sps.level_idc > caps.max_level {
             return Err(VulkanError::UnsupportedLevel {
-                stream: sps.level_idc(),
+                stream: sps.level_idc,
                 max: caps.max_level,
             });
         }
         Self::sized(
             CodecOp::H264Decode,
             SessionProfile::H264 { profile, level },
-            sps.coded_size(),
+            (sps.width(), sps.height()),
             sps.display_size(),
             sps.crop_origin(),
-            sps.dpb_slots(),
+            h264_dpb_slots(sps),
             caps,
             formats,
         )
@@ -343,37 +343,35 @@ impl SessionGeometry {
         caps: &DecodeFacts,
         formats: &[vk::VideoFormatPropertiesKHR<'_>],
     ) -> Result<Self, VulkanError> {
-        if sps.chroma_format_idc() != 1
-            || sps.bit_depth_luma_minus8() != 0
-            || sps.bit_depth_chroma_minus8() != 0
-        {
+        if sps.chroma_format != 1 || sps.bit_depth_luma != 0 || sps.bit_depth_chroma != 0 {
             return Err(ParseError::Unsupported {
                 what: "h265 sampling",
             }
             .into());
         }
-        let Some(profile) = h265_profile_to_std(sps.ptl().profile_idc()) else {
+        let Some(profile) = h265_profile_to_std(sps.ptl.profile_idc) else {
             return Err(ParseError::Unsupported {
                 what: "h265 profile",
             }
             .into());
         };
-        let Some(level) = h265_level_to_std(sps.ptl().level_idc()) else {
+        let Some(level) = h265_level_to_std(sps.ptl.level_idc) else {
             return Err(ParseError::Unsupported { what: "h265 level" }.into());
         };
-        if sps.ptl().level_idc() > caps.max_level {
+        if sps.ptl.level_idc > caps.max_level {
             return Err(VulkanError::UnsupportedLevel {
-                stream: sps.ptl().level_idc(),
+                stream: sps.ptl.level_idc,
                 max: caps.max_level,
             });
         }
+        let (display, origin) = h265_visible(sps);
         Self::sized(
             CodecOp::H265Decode,
             SessionProfile::H265 { profile, level },
-            sps.coded_size(),
-            sps.display_size(),
-            sps.crop_origin(),
-            sps.dpb_slots(),
+            (sps.width, sps.height),
+            display,
+            origin,
+            h265_dpb_slots(sps),
             caps,
             formats,
         )
@@ -391,17 +389,14 @@ impl SessionGeometry {
         caps: &DecodeFacts,
         formats: &[vk::VideoFormatPropertiesKHR<'_>],
     ) -> Result<Self, VulkanError> {
-        if seq.mono_chrome()
-            || seq.subsampling_x() != 1
-            || seq.subsampling_y() != 1
-            || seq.bit_depth() != 8
+        if seq.mono_chrome() || !seq.subsampling_x() || !seq.subsampling_y() || seq.bit_depth() != 8
         {
             return Err(ParseError::Unsupported {
                 what: "av1 sampling",
             }
             .into());
         }
-        let Some(profile) = av1_profile_to_std(seq.profile()) else {
+        let Some(profile) = av1_profile_to_std(seq.profile) else {
             return Err(ParseError::Unsupported {
                 what: "av1 profile",
             }
@@ -413,16 +408,20 @@ impl SessionGeometry {
             }
             .into());
         }
-        let Some(level) = av1_level_to_std(seq.level_idx()) else {
+        let level_idx = seq.operating.first().map_or(0, |point| point.level);
+        let Some(level) = av1_level_to_std(level_idx) else {
             return Err(ParseError::Unsupported { what: "av1 level" }.into());
         };
-        if seq.level_idx() != 31 && seq.level_idx() > caps.max_level {
+        if level_idx != 31 && level_idx > caps.max_level {
             return Err(VulkanError::UnsupportedLevel {
-                stream: seq.level_idx(),
+                stream: level_idx,
                 max: caps.max_level,
             });
         }
-        let coded = seq.coded_size();
+        let coded = (
+            seq.max_frame_width_minus1 + 1,
+            seq.max_frame_height_minus1 + 1,
+        );
         if display.0 > coded.0 || display.1 > coded.1 {
             return Err(VulkanError::OverCaps {
                 what: "coded extent",
@@ -490,6 +489,28 @@ impl SessionGeometry {
     }
 }
 
+/// H.264 DPB slot budget: reference window plus the picture under decode.
+fn h264_dpb_slots(sps: &h264::Sps) -> u32 {
+    u32::from(sps.max_num_ref_frames).saturating_add(1).min(16)
+}
+
+/// H.265 DPB slot budget of the highest coded layer.
+fn h265_dpb_slots(sps: &h265::Sps) -> u32 {
+    u32::from(sps.ordering_buffering.last().copied().unwrap_or(0))
+        .saturating_add(2)
+        .min(16)
+}
+
+/// H.265 display size and crop origin in luma samples.
+fn h265_visible(sps: &h265::Sps) -> ((u32, u32), (u32, u32)) {
+    let Some(crop) = sps.crop else {
+        return ((sps.width, sps.height), (0, 0));
+    };
+    let width = sps.width.saturating_sub(crop.left + crop.right);
+    let height = sps.height.saturating_sub(crop.top + crop.bottom);
+    ((width, height), (crop.left, crop.top))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -549,7 +570,7 @@ mod tests {
 
     #[test]
     fn demo_sps_sizes_session() {
-        let units = crate::parse::test_support::split(&[crate::parse::test_support::hex(
+        let units = crate::parse::test_support::split264(&[crate::parse::test_support::hex(
             "6764000dacb20283f60220000003002000000641e2854900",
         )]);
         let mut parser = crate::parse::h264::H264Parser::new();
@@ -580,7 +601,41 @@ mod tests {
 
     #[test]
     fn av1_sequence_sizes_session() {
-        let seq = crate::parse::av1::SequenceHeader::test_main_420();
+        use crate::parse::av1::{
+            OperatingPoint, SequenceHeader, SEQ_SUBSAMPLING_X, SEQ_SUBSAMPLING_Y,
+        };
+        let seq = SequenceHeader {
+            profile: 0,
+            flags: SEQ_SUBSAMPLING_X | SEQ_SUBSAMPLING_Y,
+            operating: vec![OperatingPoint {
+                idc: 0,
+                level: 4,
+                tier: false,
+                decoder_model: None,
+                display_delay_present: false,
+                display_delay_minus1: 0,
+            }],
+            num_units_in_display_tick: 0,
+            time_scale: 0,
+            num_ticks_per_picture_minus1: 0,
+            buffer_delay_length_minus1: 0,
+            num_units_in_decoding_tick: 0,
+            buffer_removal_length_minus1: 0,
+            presentation_length_minus1: 0,
+            frame_width_bits_minus1: 0,
+            frame_height_bits_minus1: 0,
+            max_frame_width_minus1: 319,
+            max_frame_height_minus1: 239,
+            delta_frame_id_length_minus2: 0,
+            additional_frame_id_length_minus1: 0,
+            force_screen_content_tools: 0,
+            force_integer_mv: 0,
+            order_hint_bits_minus1: 0,
+            color_primaries: 0,
+            transfer_characteristics: 0,
+            matrix_coefficients: 0,
+            chroma_sample_position: 0,
+        };
         let mut capped = caps();
         capped.max_level = 4;
         let geometry =
@@ -602,7 +657,7 @@ mod tests {
 
     #[test]
     fn level_above_caps_errors() {
-        let units = crate::parse::test_support::split(&[crate::parse::test_support::hex(
+        let units = crate::parse::test_support::split264(&[crate::parse::test_support::hex(
             "6764000dacb20283f60220000003002000000641e2854900",
         )]);
         let mut parser = crate::parse::h264::H264Parser::new();

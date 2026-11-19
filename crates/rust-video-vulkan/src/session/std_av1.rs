@@ -13,7 +13,11 @@ use ash::vk::native::{
     StdVideoDecodeAV1ReferenceInfo, StdVideoDecodeAV1ReferenceInfoFlags,
 };
 
-use crate::parse::av1::{FrameHeader, SequenceHeader};
+use crate::error::ParseError;
+use crate::parse::av1::{
+    FrameHeader, SequenceHeader, INTERP_SWITCHABLE, SEQ_COLOR_RANGE, SUPERRES_DENOM_MIN,
+    SUPERRES_NUM,
+};
 
 /// AV1 sequence tables with box-stable standard-structure backing.
 pub(crate) struct Av1Tables {
@@ -38,10 +42,14 @@ impl Av1Tables {
     }
 
     /// Standard sequence header for `seq`, replacing any entry.
-    pub(crate) fn insert(&mut self, seq: &SequenceHeader) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a value exceeds its standard field width.
+    pub(crate) fn insert(&mut self, seq: &SequenceHeader) -> Result<(), ParseError> {
         let color = Box::new(fill_color(seq));
         let timing = Box::new(fill_timing(seq));
-        let mut header = Box::new(fill_sequence(seq));
+        let mut header = Box::new(fill_sequence(seq)?);
         header.pColorConfig = std::ptr::from_ref(color.as_ref());
         header.pTimingInfo = std::ptr::from_ref(timing.as_ref());
         self.seq = Some(SeqEntry {
@@ -49,6 +57,7 @@ impl Av1Tables {
             timing,
             header,
         });
+        Ok(())
     }
 
     /// Standard sequence header, if stored.
@@ -71,52 +80,50 @@ impl Default for Av1Tables {
 
 /// Standard color config of `seq`.
 fn fill_color(seq: &SequenceHeader) -> StdVideoAV1ColorConfig {
-    let color = seq.color();
     let mut flags = StdVideoAV1ColorConfigFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_mono_chrome(u32::from(color.depth.mono_chrome));
-    flags.set_color_range(u32::from(color.color_range));
-    flags.set_separate_uv_delta_q(u32::from(color.separate_uv_delta_q));
-    flags.set_color_description_present_flag(u32::from(color.color_description_present));
+    flags.set_mono_chrome(u32::from(seq.mono_chrome()));
+    flags.set_color_range(u32::from(seq.flags & SEQ_COLOR_RANGE != 0));
+    flags.set_separate_uv_delta_q(u32::from(seq.separate_uv_delta_q()));
+    flags.set_color_description_present_flag(u32::from(seq.color_description_present()));
     StdVideoAV1ColorConfig {
         flags,
         BitDepth: seq.bit_depth(),
-        subsampling_x: color.subsampling_x,
-        subsampling_y: color.subsampling_y,
+        subsampling_x: u8::from(seq.subsampling_x()),
+        subsampling_y: u8::from(seq.subsampling_y()),
         reserved1: 0,
-        color_primaries: u32::from(color.color_primaries),
-        transfer_characteristics: u32::from(color.transfer_characteristics),
-        matrix_coefficients: u32::from(color.matrix_coefficients),
-        chroma_sample_position: u32::from(color.chroma_sample_position),
+        color_primaries: u32::from(seq.color_primaries),
+        transfer_characteristics: u32::from(seq.transfer_characteristics),
+        matrix_coefficients: u32::from(seq.matrix_coefficients),
+        chroma_sample_position: u32::from(seq.chroma_sample_position),
     }
 }
 
 /// Standard timing info of `seq`.
 fn fill_timing(seq: &SequenceHeader) -> StdVideoAV1TimingInfo {
-    let timing = seq.timing();
     let mut flags = StdVideoAV1TimingInfoFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_equal_picture_interval(u32::from(timing.equal_picture_interval));
+    flags.set_equal_picture_interval(u32::from(seq.equal_picture_interval()));
     StdVideoAV1TimingInfo {
         flags,
-        num_units_in_display_tick: timing.num_units_in_display_tick,
-        time_scale: timing.time_scale,
-        num_ticks_per_picture_minus_1: timing.num_ticks_per_picture_minus_1,
+        num_units_in_display_tick: seq.num_units_in_display_tick,
+        time_scale: seq.time_scale,
+        num_ticks_per_picture_minus_1: seq.num_ticks_per_picture_minus1,
     }
 }
 
 /// Standard sequence header of `seq`, without color and timing links.
-fn fill_sequence(seq: &SequenceHeader) -> StdVideoAV1SequenceHeader {
+fn fill_sequence(seq: &SequenceHeader) -> Result<StdVideoAV1SequenceHeader, ParseError> {
     let mut flags = StdVideoAV1SequenceHeaderFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
     flags.set_still_picture(u32::from(seq.still_picture()));
-    flags.set_reduced_still_picture_header(u32::from(seq.reduced()));
+    flags.set_reduced_still_picture_header(u32::from(seq.reduced_header()));
     flags.set_use_128x128_superblock(u32::from(seq.use_128x128_superblock()));
     flags.set_enable_filter_intra(u32::from(seq.enable_filter_intra()));
     flags.set_enable_intra_edge_filter(u32::from(seq.enable_intra_edge_filter()));
@@ -132,24 +139,24 @@ fn fill_sequence(seq: &SequenceHeader) -> StdVideoAV1SequenceHeader {
     flags.set_enable_cdef(u32::from(seq.enable_cdef()));
     flags.set_enable_restoration(u32::from(seq.enable_restoration()));
     flags.set_film_grain_params_present(u32::from(seq.film_grain_params_present()));
-    flags.set_timing_info_present_flag(u32::from(seq.timing_present()));
+    flags.set_timing_info_present_flag(u32::from(seq.timing_info_present()));
     flags.set_initial_display_delay_present_flag(u32::from(seq.initial_display_delay_present()));
-    StdVideoAV1SequenceHeader {
+    Ok(StdVideoAV1SequenceHeader {
         flags,
-        seq_profile: u32::from(seq.profile()),
-        frame_width_bits_minus_1: seq.frame_width_bits_minus_1(),
-        frame_height_bits_minus_1: seq.frame_height_bits_minus_1(),
-        max_frame_width_minus_1: seq.max_frame_width_minus_1(),
-        max_frame_height_minus_1: seq.max_frame_height_minus_1(),
-        delta_frame_id_length_minus_2: seq.delta_frame_id_length_minus_2(),
-        additional_frame_id_length_minus_1: seq.additional_frame_id_length_minus_1(),
-        order_hint_bits_minus_1: seq.order_hint_bits_minus_1(),
-        seq_force_integer_mv: seq.seq_force_integer_mv(),
-        seq_force_screen_content_tools: seq.seq_force_screen_content_tools(),
+        seq_profile: u32::from(seq.profile),
+        frame_width_bits_minus_1: seq.frame_width_bits_minus1,
+        frame_height_bits_minus_1: seq.frame_height_bits_minus1,
+        max_frame_width_minus_1: narrow_u16(seq.max_frame_width_minus1, "seq max width")?,
+        max_frame_height_minus_1: narrow_u16(seq.max_frame_height_minus1, "seq max height")?,
+        delta_frame_id_length_minus_2: seq.delta_frame_id_length_minus2,
+        additional_frame_id_length_minus_1: seq.additional_frame_id_length_minus1,
+        order_hint_bits_minus_1: seq.order_hint_bits_minus1,
+        seq_force_integer_mv: seq.force_integer_mv,
+        seq_force_screen_content_tools: seq.force_screen_content_tools,
         reserved1: [0; 5],
         pColorConfig: std::ptr::null(),
         pTimingInfo: std::ptr::null(),
-    }
+    })
 }
 
 /// Standard picture info of one frame with box-stable backing.
@@ -191,45 +198,56 @@ impl Av1PictureStd {
     /// `order_hints` carries the stored order hint per reference name;
     /// `expected` carries the expected frame id per name. `super128`
     /// selects the 128x128 superblock grid behind the tile starts.
+    /// `skip_frames` carries the skip-mode frame pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a value exceeds its standard field width.
     pub(crate) fn fill(
         header: &FrameHeader,
         super128: bool,
         order_hints: [u8; 8],
         expected: [u32; 8],
-    ) -> Self {
-        let tiles = header.tiles();
-        let cols = usize::from(tiles.cols);
-        let rows = usize::from(tiles.rows);
+        skip_frames: [u8; 2],
+    ) -> Result<Self, ParseError> {
+        let cols = usize::from(header.tile_cols);
+        let rows = usize::from(header.tile_rows);
         let shift = if super128 { 5 } else { 4 };
         let mut mi_col_starts = vec![0_u16; cols + 1];
+        let mut at = 0_u32;
         for (index, start) in mi_col_starts.iter_mut().enumerate().take(cols) {
-            *start = u16::from(tiles.start_col_sb[index]) << shift;
+            *start = u16::from(narrow_tile_u8(at, "frame tile col")?) << shift;
+            let width = u32::from(header.width_in_sbs_minus_1[index]);
+            at += width + 1;
         }
-        mi_col_starts[cols] = mi_units(header.sizes().frame_width);
+        mi_col_starts[cols] = mi_units(header.frame_width);
         let mut mi_row_starts = vec![0_u16; rows + 1];
+        let mut at = 0_u32;
         for (index, start) in mi_row_starts.iter_mut().enumerate().take(rows) {
-            *start = u16::from(tiles.start_row_sb[index]) << shift;
+            *start = u16::from(narrow_tile_u8(at, "frame tile row")?) << shift;
+            let height = u32::from(header.height_in_sbs_minus_1[index]);
+            at += height + 1;
         }
-        mi_row_starts[rows] = mi_units(header.sizes().frame_height);
+        mi_row_starts[rows] = mi_units(header.frame_height);
         let mut width_sb = vec![0_u16; cols];
         for (index, width) in width_sb.iter_mut().enumerate() {
-            *width = u16::from(tiles.width_in_sbs_minus_1[index]);
+            *width = header.width_in_sbs_minus_1[index];
         }
         let mut height_sb = vec![0_u16; rows];
         for (index, height) in height_sb.iter_mut().enumerate() {
-            *height = u16::from(tiles.height_in_sbs_minus_1[index]);
+            *height = header.height_in_sbs_minus_1[index];
         }
         let mut tile_flags = StdVideoAV1TileInfoFlags {
             _bitfield_align_1: [],
             _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
         };
-        tile_flags.set_uniform_tile_spacing_flag(u32::from(tiles.uniform));
+        tile_flags.set_uniform_tile_spacing_flag(u32::from(header.uniform_tile_spacing));
         let tile = Box::new(StdVideoAV1TileInfo {
             flags: tile_flags,
-            TileCols: tiles.cols,
-            TileRows: tiles.rows,
-            context_update_tile_id: tiles.context_update_tile_id,
-            tile_size_bytes_minus_1: tiles.size_bytes_minus_1,
+            TileCols: header.tile_cols,
+            TileRows: header.tile_rows,
+            context_update_tile_id: header.context_update_tile_id,
+            tile_size_bytes_minus_1: header.tile_size_bytes.saturating_sub(1),
             reserved1: [0; 7],
             pMiColStarts: std::ptr::null(),
             pMiRowStarts: std::ptr::null(),
@@ -244,7 +262,7 @@ impl Av1PictureStd {
         let global = Box::new(fill_global(header));
         let grain = Box::new(fill_grain(header));
         let mut owned = Self {
-            info: fill_picture_info(header, order_hints, expected),
+            info: fill_picture_info(header, order_hints, expected, skip_frames),
             tile,
             mi_col_starts: mi_col_starts.into_boxed_slice(),
             mi_row_starts: mi_row_starts.into_boxed_slice(),
@@ -269,10 +287,10 @@ impl Av1PictureStd {
         owned.info.pCDEF = std::ptr::from_ref(owned.cdef.as_ref());
         owned.info.pLoopRestoration = std::ptr::from_ref(owned.restoration.as_ref());
         owned.info.pGlobalMotion = std::ptr::from_ref(owned.global.as_ref());
-        if header.grain().apply_grain {
+        if header.film_grain.apply_grain() {
             owned.info.pFilmGrain = std::ptr::from_ref(owned.grain.as_ref());
         }
-        owned
+        Ok(owned)
     }
 
     /// Standard picture info.
@@ -300,23 +318,24 @@ fn fill_picture_info(
     header: &FrameHeader,
     order_hints: [u8; 8],
     expected: [u32; 8],
+    skip_frames: [u8; 2],
 ) -> StdVideoDecodeAV1PictureInfo {
     let mut flags = StdVideoDecodeAV1PictureInfoFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
+    let use_superres = header.superres_denom != SUPERRES_NUM;
     flags.set_error_resilient_mode(u32::from(header.error_resilient_mode()));
     flags.set_disable_cdf_update(u32::from(header.disable_cdf_update()));
-    flags.set_use_superres(u32::from(header.use_superres()));
+    flags.set_use_superres(u32::from(use_superres));
     flags.set_render_and_frame_size_different(u32::from(header.render_and_frame_size_different()));
     flags.set_allow_screen_content_tools(u32::from(header.allow_screen_content_tools()));
-    flags.set_is_filter_switchable(u32::from(header.is_filter_switchable()));
+    flags.set_is_filter_switchable(u32::from(header.interp_filter == INTERP_SWITCHABLE));
     flags.set_force_integer_mv(u32::from(header.force_integer_mv()));
     flags.set_frame_size_override_flag(u32::from(header.frame_size_override_flag()));
-    flags
-        .set_buffer_removal_time_present_flag(u32::from(header.buffer_removal_time_present_flag()));
+    flags.set_buffer_removal_time_present_flag(u32::from(header.buffer_removal_time_present));
     flags.set_allow_intrabc(u32::from(header.allow_intrabc()));
-    flags.set_frame_refs_short_signaling(u32::from(header.refs().short_signaling));
+    flags.set_frame_refs_short_signaling(u32::from(header.frame_refs_short_signaling()));
     flags.set_allow_high_precision_mv(u32::from(header.allow_high_precision_mv()));
     flags.set_is_motion_mode_switchable(u32::from(header.is_motion_mode_switchable()));
     flags.set_use_ref_frame_mvs(u32::from(header.use_ref_frame_mvs()));
@@ -328,30 +347,31 @@ fn fill_picture_info(
     flags.set_delta_q_present(u32::from(header.delta_q_present()));
     flags.set_delta_lf_present(u32::from(header.delta_lf_present()));
     flags.set_delta_lf_multi(u32::from(header.delta_lf_multi()));
-    flags.set_segmentation_enabled(u32::from(header.segmentation().enabled));
-    flags.set_segmentation_update_map(u32::from(header.segmentation().update.update_map));
-    flags.set_segmentation_temporal_update(u32::from(header.segmentation().update.temporal_update));
-    flags.set_segmentation_update_data(u32::from(header.segmentation().update.update_data));
-    let restoration = header.restoration();
-    flags.set_UsesLr(u32::from(restoration.lr_type.iter().any(|lr| *lr != 0)));
-    flags.set_usesChromaLr(u32::from(
-        restoration.lr_type[1] != 0 || restoration.lr_type[2] != 0,
-    ));
-    flags.set_apply_grain(u32::from(header.grain().apply_grain));
+    flags.set_segmentation_enabled(u32::from(header.segmentation_enabled()));
+    flags.set_segmentation_update_map(u32::from(header.segmentation_update_map()));
+    flags.set_segmentation_temporal_update(u32::from(header.segmentation_temporal_update()));
+    flags.set_segmentation_update_data(u32::from(header.segmentation_update_data()));
+    flags.set_UsesLr(u32::from(header.lr_type.iter().any(|lr| *lr != 0)));
+    flags.set_usesChromaLr(u32::from(header.lr_type[1] != 0 || header.lr_type[2] != 0));
+    flags.set_apply_grain(u32::from(header.film_grain.apply_grain()));
     StdVideoDecodeAV1PictureInfo {
         flags,
-        frame_type: u32::from(header.frame_type()),
-        current_frame_id: header.current_frame_id(),
-        OrderHint: header.order_hint(),
-        primary_ref_frame: header.primary_ref_frame(),
-        refresh_frame_flags: header.refresh_frame_flags(),
+        frame_type: u32::from(header.frame_type.id()),
+        current_frame_id: header.current_frame_id,
+        OrderHint: header.order_hint,
+        primary_ref_frame: header.primary_ref_frame,
+        refresh_frame_flags: header.refresh_frame_flags,
         reserved1: 0,
-        interpolation_filter: u32::from(header.interpolation_filter()),
-        TxMode: u32::from(header.tx_mode()),
-        delta_q_res: header.delta_q_res(),
-        delta_lf_res: header.delta_lf_res(),
-        SkipModeFrame: *header.skip_mode_frames(),
-        coded_denom: header.coded_denom(),
+        interpolation_filter: u32::from(header.interp_filter),
+        TxMode: u32::from(header.tx_mode),
+        delta_q_res: header.delta_q_res,
+        delta_lf_res: header.delta_lf_res,
+        SkipModeFrame: skip_frames,
+        coded_denom: if use_superres {
+            header.superres_denom.saturating_sub(SUPERRES_DENOM_MIN)
+        } else {
+            0
+        },
         reserved2: [0; 3],
         OrderHints: order_hints,
         expectedFrameId: expected,
@@ -368,35 +388,33 @@ fn fill_picture_info(
 
 /// Standard quantizer of `header`.
 fn fill_quant(header: &FrameHeader) -> StdVideoAV1Quantization {
-    let quant = header.quant();
     let mut flags = StdVideoAV1QuantizationFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_using_qmatrix(u32::from(quant.using_qmatrix));
-    flags.set_diff_uv_delta(u32::from(quant.diff_uv_delta));
+    flags.set_using_qmatrix(u32::from(header.using_qmatrix()));
+    flags.set_diff_uv_delta(u32::from(header.diff_uv_delta()));
     StdVideoAV1Quantization {
         flags,
-        base_q_idx: quant.base_q_idx,
-        DeltaQYDc: quant.delta_q_y_dc,
-        DeltaQUDc: quant.delta_q_u_dc,
-        DeltaQUAc: quant.delta_q_u_ac,
-        DeltaQVDc: quant.delta_q_v_dc,
-        DeltaQVAc: quant.delta_q_v_ac,
-        qm_y: quant.qm_y,
-        qm_u: quant.qm_u,
-        qm_v: quant.qm_v,
+        base_q_idx: header.base_q_idx,
+        DeltaQYDc: header.delta_q_y_dc,
+        DeltaQUDc: header.delta_q_u_dc,
+        DeltaQUAc: header.delta_q_u_ac,
+        DeltaQVDc: header.delta_q_v_dc,
+        DeltaQVAc: header.delta_q_v_ac,
+        qm_y: header.qm_y,
+        qm_u: header.qm_u,
+        qm_v: header.qm_v,
     }
 }
 
 /// Standard segmentation of `header`.
 fn fill_segmentation(header: &FrameHeader) -> StdVideoAV1Segmentation {
-    let seg = header.segmentation();
     let mut enabled = [0_u8; 8];
     let mut data = [[0_i16; 8]; 8];
     for (segment, (seg_enabled, seg_data)) in enabled.iter_mut().zip(data.iter_mut()).enumerate() {
-        *seg_data = seg.feature_value[segment];
-        for (level, &flag) in seg.feature_enabled[segment].iter().enumerate() {
+        *seg_data = header.seg_value[segment];
+        for (level, &flag) in header.seg_enabled[segment].iter().enumerate() {
             if flag {
                 *seg_enabled |= 1 << level;
             }
@@ -410,48 +428,45 @@ fn fill_segmentation(header: &FrameHeader) -> StdVideoAV1Segmentation {
 
 /// Standard loop filter of `header`.
 fn fill_loop_filter(header: &FrameHeader) -> StdVideoAV1LoopFilter {
-    let filter = header.loop_filter();
     let mut flags = StdVideoAV1LoopFilterFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_loop_filter_delta_enabled(u32::from(filter.delta_enabled));
-    flags.set_loop_filter_delta_update(u32::from(filter.delta_update));
+    flags.set_loop_filter_delta_enabled(u32::from(header.loop_filter_delta_enabled()));
+    flags.set_loop_filter_delta_update(u32::from(header.loop_filter_delta_update()));
     StdVideoAV1LoopFilter {
         flags,
-        loop_filter_level: filter.level,
-        loop_filter_sharpness: filter.sharpness,
-        update_ref_delta: u8::from(filter.delta_update),
-        loop_filter_ref_deltas: filter.ref_deltas,
-        update_mode_delta: u8::from(filter.delta_update),
-        loop_filter_mode_deltas: filter.mode_deltas,
+        loop_filter_level: header.loop_filter_level,
+        loop_filter_sharpness: header.loop_filter_sharpness,
+        update_ref_delta: u8::from(header.loop_filter_delta_update()),
+        loop_filter_ref_deltas: header.loop_ref_deltas,
+        update_mode_delta: u8::from(header.loop_filter_delta_update()),
+        loop_filter_mode_deltas: header.loop_mode_deltas,
     }
 }
 
 /// Standard CDEF of `header`.
 fn fill_cdef(header: &FrameHeader) -> StdVideoAV1CDEF {
-    let cdef = header.cdef();
     StdVideoAV1CDEF {
-        cdef_damping_minus_3: cdef.damping_minus_3,
-        cdef_bits: cdef.bits,
-        cdef_y_pri_strength: cdef.y_pri,
-        cdef_y_sec_strength: cdef.y_sec,
-        cdef_uv_pri_strength: cdef.uv_pri,
-        cdef_uv_sec_strength: cdef.uv_sec,
+        cdef_damping_minus_3: header.cdef_damping_minus_3,
+        cdef_bits: header.cdef_bits,
+        cdef_y_pri_strength: header.cdef_y_pri,
+        cdef_y_sec_strength: header.cdef_y_sec,
+        cdef_uv_pri_strength: header.cdef_uv_pri,
+        cdef_uv_sec_strength: header.cdef_uv_sec,
     }
 }
 
 /// Standard loop restoration of `header`.
 fn fill_restoration(header: &FrameHeader) -> StdVideoAV1LoopRestoration {
     const REMAP: [u32; 4] = [0, 3, 1, 2];
-    let restoration = header.restoration();
-    let shift = u16::from(restoration.unit_shift);
-    let uv_shift = u16::from(restoration.uv_shift);
+    let shift = u16::from(header.lr_unit_shift);
+    let uv_shift = u16::from(header.lr_uv_shift);
     StdVideoAV1LoopRestoration {
         FrameRestorationType: [
-            REMAP[usize::from(restoration.lr_type[0])],
-            REMAP[usize::from(restoration.lr_type[1])],
-            REMAP[usize::from(restoration.lr_type[2])],
+            REMAP[usize::from(header.lr_type[0])],
+            REMAP[usize::from(header.lr_type[1])],
+            REMAP[usize::from(header.lr_type[2])],
         ],
         LoopRestorationSize: [1 + shift, 1 + shift - uv_shift, 1 + shift - uv_shift],
     }
@@ -459,26 +474,33 @@ fn fill_restoration(header: &FrameHeader) -> StdVideoAV1LoopRestoration {
 
 /// Standard global motion of `header`.
 fn fill_global(header: &FrameHeader) -> StdVideoAV1GlobalMotion {
+    let mut gm_type = [0u8; 8];
+    let mut gm_params = [[0i32; 6]; 8];
+    for (name, motion) in header.global_motion.iter().enumerate() {
+        gm_type[name + 1] = motion.warp_type;
+        gm_params[name + 1] = motion.params;
+    }
     StdVideoAV1GlobalMotion {
-        GmType: *header.gm_type(),
-        gm_params: *header.gm_params(),
+        GmType: gm_type,
+        gm_params,
     }
 }
 
 /// Standard film grain of `header`.
 fn fill_grain(header: &FrameHeader) -> StdVideoAV1FilmGrain {
-    let grain = header.grain();
+    let grain = &header.film_grain;
     let mut flags = StdVideoAV1FilmGrainFlags {
         _bitfield_align_1: [],
         _bitfield_1: __BindgenBitfieldUnit::new([0; 4]),
     };
-    flags.set_chroma_scaling_from_luma(u32::from(grain.chroma_scaling_from_luma));
-    flags.set_overlap_flag(u32::from(grain.clip.overlap_flag));
-    flags.set_clip_to_restricted_range(u32::from(grain.clip.clip_to_restricted_range));
+    flags.set_chroma_scaling_from_luma(u32::from(grain.chroma_scaling_from_luma()));
+    flags.set_overlap_flag(u32::from(grain.overlap_flag()));
+    flags.set_clip_to_restricted_range(u32::from(grain.clip_to_restricted_range()));
     flags.set_update_grain(u32::from(grain.update_grain));
     let luma = signed(&grain.ar_coeffs_y);
     let chroma_u = signed(&grain.ar_coeffs_cb);
     let chroma_v = signed(&grain.ar_coeffs_cr);
+
     StdVideoAV1FilmGrain {
         flags,
         grain_scaling_minus_8: grain.grain_scaling_minus_8,
@@ -488,14 +510,14 @@ fn fill_grain(header: &FrameHeader) -> StdVideoAV1FilmGrain {
         grain_seed: grain.grain_seed,
         film_grain_params_ref_idx: grain.ref_idx,
         num_y_points: grain.num_y_points,
-        point_y_value: grain.point_y_value,
-        point_y_scaling: grain.point_y_scaling,
+        point_y_value: split_points(&grain.scaling_points_y).0,
+        point_y_scaling: split_points(&grain.scaling_points_y).1,
         num_cb_points: grain.num_cb_points,
-        point_cb_value: grain.point_cb_value,
-        point_cb_scaling: grain.point_cb_scaling,
+        point_cb_value: split_points(&grain.scaling_points_cb).0,
+        point_cb_scaling: split_points(&grain.scaling_points_cb).1,
         num_cr_points: grain.num_cr_points,
-        point_cr_value: grain.point_cr_value,
-        point_cr_scaling: grain.point_cr_scaling,
+        point_cr_value: split_points(&grain.scaling_points_cr).0,
+        point_cr_scaling: split_points(&grain.scaling_points_cr).1,
         ar_coeffs_y_plus_128: luma,
         ar_coeffs_cb_plus_128: chroma_u,
         ar_coeffs_cr_plus_128: chroma_v,
@@ -506,6 +528,17 @@ fn fill_grain(header: &FrameHeader) -> StdVideoAV1FilmGrain {
         cr_luma_mult: grain.cr_luma_mult,
         cr_offset: grain.cr_offset,
     }
+}
+
+/// Value and scaling arrays of `points`.
+fn split_points<const N: usize>(points: &[[u8; 2]; N]) -> ([u8; N], [u8; N]) {
+    let mut values = [0u8; N];
+    let mut scalings = [0u8; N];
+    for (index, point) in points.iter().enumerate() {
+        values[index] = point[0];
+        scalings[index] = point[1];
+    }
+    (values, scalings)
 }
 
 /// Standard reference info of one stored frame.
@@ -537,15 +570,25 @@ pub(crate) fn expected_frame_id(seq: &SequenceHeader, header: &FrameHeader, inde
     if !seq.frame_id_numbers_present() {
         return 0;
     }
-    let width = u32::from(seq.additional_frame_id_length_minus_1())
-        + u32::from(seq.delta_frame_id_length_minus_2())
+    let width = u32::from(seq.additional_frame_id_length_minus1)
+        + u32::from(seq.delta_frame_id_length_minus2)
         + 3;
-    let delta = header.refs().delta_frame_id_minus1[index] + 1;
+    let delta = header.delta_frame_id_minus1[index] + 1;
     header
-        .current_frame_id()
+        .current_frame_id
         .wrapping_add(1 << width)
         .wrapping_sub(delta)
         % (1 << width)
+}
+
+/// Checked narrowing of a tile start to `u8`.
+fn narrow_tile_u8(value: u32, syntax: &'static str) -> Result<u8, ParseError> {
+    u8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
+}
+
+/// Checked narrowing of a sequence maximum to `u16`.
+fn narrow_u16(value: u32, syntax: &'static str) -> Result<u16, ParseError> {
+    u16::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
 }
 
 #[cfg(test)]
@@ -580,8 +623,37 @@ mod tests {
 
     #[test]
     fn expected_ids_wrap_on_frame_id_width() {
-        let seq = crate::parse::av1::SequenceHeader::test_with_frame_ids(4, 2);
-        let header = crate::parse::av1::FrameHeader::test_with_ids(7, [2, 0, 0, 0, 0, 0, 0]);
+        use crate::parse::av1::{FrameHeader, SequenceHeader, SEQ_FRAME_ID_NUMBERS};
+        let seq = SequenceHeader {
+            profile: 0,
+            flags: SEQ_FRAME_ID_NUMBERS,
+            operating: Vec::new(),
+            num_units_in_display_tick: 0,
+            time_scale: 0,
+            num_ticks_per_picture_minus1: 0,
+            buffer_delay_length_minus1: 0,
+            num_units_in_decoding_tick: 0,
+            buffer_removal_length_minus1: 0,
+            presentation_length_minus1: 0,
+            frame_width_bits_minus1: 0,
+            frame_height_bits_minus1: 0,
+            max_frame_width_minus1: 0,
+            max_frame_height_minus1: 0,
+            delta_frame_id_length_minus2: 2,
+            additional_frame_id_length_minus1: 4,
+            force_screen_content_tools: 0,
+            force_integer_mv: 0,
+            order_hint_bits_minus1: 0,
+            color_primaries: 0,
+            transfer_characteristics: 0,
+            matrix_coefficients: 0,
+            chroma_sample_position: 0,
+        };
+        let header = FrameHeader {
+            current_frame_id: 7,
+            delta_frame_id_minus1: [2, 0, 0, 0, 0, 0, 0],
+            ..FrameHeader::default()
+        };
         assert_eq!(expected_frame_id(&seq, &header, 0), 4);
         assert_eq!(expected_frame_id(&seq, &header, 1), 6);
     }

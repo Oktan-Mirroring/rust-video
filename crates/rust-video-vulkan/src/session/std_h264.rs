@@ -113,21 +113,21 @@ impl H264Tables {
     ///
     /// Returns `Err` when a value exceeds its standard field width.
     pub(crate) fn insert_sps(&mut self, sps: &Sps) -> Result<(), ParseError> {
-        let level = h264_level_to_std(sps.level_idc(), sps.constraint_set3()).ok_or(
+        let level = h264_level_to_std(sps.level_idc, sps.constraint_set(3)).ok_or(
             ParseError::OutOfRange {
                 syntax: "sps level",
             },
         )?;
-        let profile = h264_profile_to_std(sps.profile_idc()).ok_or(ParseError::OutOfRange {
+        let profile = h264_profile_to_std(sps.profile_idc).ok_or(ParseError::OutOfRange {
             syntax: "sps profile",
         })?;
-        let scaling = sps.scaling().map(|lists| Box::new(fill_scaling(lists)));
-        let offsets = (sps.num_ref_frames_in_poc_cycle() > 0).then(|| {
-            sps.offset_for_ref_frame()[..usize::from(sps.num_ref_frames_in_poc_cycle())]
+        let scaling = fill_scaling(&sps.scaling, sps.scaling_map).map(Box::new);
+        let offsets = (sps.cycle > 0).then(|| {
+            sps.cycle_offsets[..usize::from(sps.cycle)]
                 .to_vec()
                 .into_boxed_slice()
         });
-        let vui_parsed = sps.vui();
+        let vui_parsed = sps.vui.as_ref();
         let mut nal_hrd = None;
         let mut vcl_hrd = None;
         if let Some(vui) = vui_parsed {
@@ -140,7 +140,7 @@ impl H264Tables {
         }
         let vui = vui_parsed.map(fill_vui).transpose()?.map(Box::new);
         self.sps.insert(
-            sps.id(),
+            sps.seq_parameter_set_id,
             SpsEntry {
                 scaling,
                 offsets,
@@ -159,20 +159,19 @@ impl H264Tables {
     /// # Errors
     ///
     /// Returns `Err` when a value exceeds its standard field width.
-    pub(crate) fn insert_pps(&mut self, pps: &Pps) -> Result<(), ParseError> {
-        let scaling = pps.scaling().map(|lists| Box::new(fill_scaling(lists)));
+    pub(crate) fn insert_pps(&mut self, pps: &Pps) {
+        let scaling = fill_scaling(&pps.scaling, pps.scaling_map).map(Box::new);
         let entry = PpsEntry {
             scaling,
-            l0_default: narrow_u8(pps.num_ref_idx_l0_default_minus1(), "pps l0 default")?,
-            l1_default: narrow_u8(pps.num_ref_idx_l1_default_minus1(), "pps l1 default")?,
-            bipred: bipred_to_std(pps.weighted_bipred_idc()),
-            qp: narrow_i8(pps.pic_init_qp_minus26(), "pps init qp")?,
-            qs: narrow_i8(pps.pic_init_qs_minus26(), "pps init qs")?,
-            chroma: narrow_i8(pps.chroma_qp_index_offset(), "pps chroma qp")?,
-            chroma2: narrow_i8(pps.second_chroma_qp_index_offset(), "pps chroma qp 2")?,
+            l0_default: pps.num_ref_l0,
+            l1_default: pps.num_ref_l1,
+            bipred: bipred_to_std(pps.weighted_bipred_idc),
+            qp: pps.pic_init_qp,
+            qs: pps.pic_init_qs,
+            chroma: pps.chroma_qp,
+            chroma2: pps.second_chroma_qp,
         };
-        self.pps.insert(pps.id(), entry);
-        Ok(())
+        self.pps.insert(pps.pic_parameter_set_id, entry);
     }
 }
 
@@ -200,39 +199,39 @@ fn fill_sps(sps: &Sps, entry: &SpsEntry) -> StdVideoH264SequenceParameterSet {
             _ => flags.set_constraint_set5_flag(set),
         }
     }
-    flags.set_direct_8x8_inference_flag(u32::from(sps.direct_8x8_inference()));
-    flags.set_mb_adaptive_frame_field_flag(u32::from(sps.mb_adaptive_frame_field()));
-    flags.set_frame_mbs_only_flag(u32::from(sps.frame_mbs_only()));
-    flags.set_delta_pic_order_always_zero_flag(u32::from(sps.delta_pic_order_always_zero()));
-    flags.set_separate_colour_plane_flag(u32::from(sps.separate_colour_plane()));
-    flags.set_gaps_in_frame_num_value_allowed_flag(u32::from(sps.gaps_in_frame_num_allowed()));
-    flags
-        .set_qpprime_y_zero_transform_bypass_flag(u32::from(sps.qpprime_y_zero_transform_bypass()));
-    flags.set_frame_cropping_flag(u32::from(sps.frame_cropping()));
-    flags.set_seq_scaling_matrix_present_flag(u32::from(sps.scaling().is_some()));
-    flags.set_vui_parameters_present_flag(u32::from(sps.vui().is_some()));
+    flags.set_direct_8x8_inference_flag(u32::from(sps.direct_8x8));
+    flags.set_mb_adaptive_frame_field_flag(0);
+    flags.set_frame_mbs_only_flag(1);
+    flags.set_delta_pic_order_always_zero_flag(u32::from(sps.delta_zero));
+    flags.set_separate_colour_plane_flag(u32::from(sps.fidelity.separate_plane));
+    flags.set_gaps_in_frame_num_value_allowed_flag(u32::from(sps.gaps_allowed));
+    flags.set_qpprime_y_zero_transform_bypass_flag(u32::from(sps.fidelity.transform_bypass));
+    flags.set_frame_cropping_flag(u32::from(sps.crop_offsets.is_some()));
+    flags.set_seq_scaling_matrix_present_flag(u32::from(sps.scaling_map.is_some()));
+    flags.set_vui_parameters_present_flag(u32::from(sps.vui.is_some()));
+    let crop = sps.crop_offsets.unwrap_or([0; 4]);
     StdVideoH264SequenceParameterSet {
         flags,
         profile_idc: entry.profile,
         level_idc: entry.level,
-        chroma_format_idc: chroma_to_std(sps.chroma_format_idc()),
-        seq_parameter_set_id: sps.id(),
-        bit_depth_luma_minus8: sps.bit_depth_luma_minus8(),
-        bit_depth_chroma_minus8: sps.bit_depth_chroma_minus8(),
-        log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4(),
-        pic_order_cnt_type: poc_to_std(sps.pic_order_cnt_type()),
-        offset_for_non_ref_pic: sps.offset_for_non_ref_pic(),
-        offset_for_top_to_bottom_field: sps.offset_for_top_to_bottom_field(),
-        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_pic_order_cnt_lsb_minus4(),
-        num_ref_frames_in_pic_order_cnt_cycle: sps.num_ref_frames_in_poc_cycle(),
-        max_num_ref_frames: sps.max_num_ref_frames(),
+        chroma_format_idc: chroma_to_std(sps.fidelity.chroma_format_idc),
+        seq_parameter_set_id: sps.seq_parameter_set_id,
+        bit_depth_luma_minus8: sps.fidelity.bit_depth_luma_minus8,
+        bit_depth_chroma_minus8: sps.fidelity.bit_depth_chroma_minus8,
+        log2_max_frame_num_minus4: sps.log2_max_frame_num_minus4,
+        pic_order_cnt_type: poc_to_std(sps.poc_type.id()),
+        offset_for_non_ref_pic: sps.offset_non_ref,
+        offset_for_top_to_bottom_field: sps.offset_top_bottom,
+        log2_max_pic_order_cnt_lsb_minus4: sps.log2_max_poc_lsb_minus4,
+        num_ref_frames_in_pic_order_cnt_cycle: sps.cycle,
+        max_num_ref_frames: sps.max_num_ref_frames,
         reserved1: 0,
-        pic_width_in_mbs_minus1: u32::from(sps.pic_width_in_mbs_minus1()),
-        pic_height_in_map_units_minus1: u32::from(sps.pic_height_in_map_units_minus1()),
-        frame_crop_left_offset: sps.crop()[0],
-        frame_crop_right_offset: sps.crop()[1],
-        frame_crop_top_offset: sps.crop()[2],
-        frame_crop_bottom_offset: sps.crop()[3],
+        pic_width_in_mbs_minus1: u32::from(sps.width_in_mbs_minus1),
+        pic_height_in_map_units_minus1: u32::from(sps.height_in_mbs_minus1),
+        frame_crop_left_offset: crop[0],
+        frame_crop_right_offset: crop[1],
+        frame_crop_top_offset: crop[2],
+        frame_crop_bottom_offset: crop[3],
         reserved2: 0,
         pOffsetForRefFrame: entry
             .offsets
@@ -256,20 +255,18 @@ fn fill_pps(pps: &Pps, entry: &PpsEntry) -> StdVideoH264PictureParameterSet {
         _bitfield_1: __BindgenBitfieldUnit::new([0; 1]),
         __bindgen_padding_0: [0; 3],
     };
-    flags.set_transform_8x8_mode_flag(u32::from(pps.transform_8x8_mode()));
-    flags.set_redundant_pic_cnt_present_flag(u32::from(pps.redundant_pic_cnt_present()));
-    flags.set_constrained_intra_pred_flag(u32::from(pps.constrained_intra_pred()));
-    flags.set_deblocking_filter_control_present_flag(u32::from(pps.deblocking_control_present()));
+    flags.set_transform_8x8_mode_flag(u32::from(pps.transform_8x8()));
+    flags.set_redundant_pic_cnt_present_flag(u32::from(pps.redundant_present()));
+    flags.set_constrained_intra_pred_flag(u32::from(pps.constrained_intra()));
+    flags.set_deblocking_filter_control_present_flag(u32::from(pps.deblocking_present()));
     flags.set_weighted_pred_flag(u32::from(pps.weighted_pred()));
-    flags.set_bottom_field_pic_order_in_frame_present_flag(u32::from(
-        pps.bottom_field_pic_order_present(),
-    ));
-    flags.set_entropy_coding_mode_flag(u32::from(pps.entropy_coding_mode()));
-    flags.set_pic_scaling_matrix_present_flag(u32::from(pps.scaling().is_some()));
+    flags.set_bottom_field_pic_order_in_frame_present_flag(u32::from(pps.pic_order_present()));
+    flags.set_entropy_coding_mode_flag(u32::from(pps.entropy()));
+    flags.set_pic_scaling_matrix_present_flag(u32::from(pps.scaling_map.is_some()));
     StdVideoH264PictureParameterSet {
         flags,
-        seq_parameter_set_id: pps.sps_id(),
-        pic_parameter_set_id: pps.id(),
+        seq_parameter_set_id: pps.seq_parameter_set_id,
+        pic_parameter_set_id: pps.pic_parameter_set_id,
         num_ref_idx_l0_default_active_minus1: entry.l0_default,
         num_ref_idx_l1_default_active_minus1: entry.l1_default,
         weighted_bipred_idc: entry.bipred,
@@ -285,13 +282,34 @@ fn fill_pps(pps: &Pps, entry: &PpsEntry) -> StdVideoH264PictureParameterSet {
 }
 
 /// Standard scaling lists from one parsed set.
-fn fill_scaling(lists: &crate::parse::h264::ScalingLists) -> StdVideoH264ScalingLists {
-    StdVideoH264ScalingLists {
-        scaling_list_present_mask: lists.present_mask,
-        use_default_scaling_matrix_mask: lists.default_mask,
-        ScalingList4x4: lists.list_4x4,
-        ScalingList8x8: lists.list_8x8,
+fn fill_scaling(
+    scaling: &crate::parse::h264::ScalingSets,
+    map: Option<crate::parse::h264::ScalingMap>,
+) -> Option<StdVideoH264ScalingLists> {
+    let map = map?;
+    let mut four = [[16u8; 16]; 6];
+    let mut eight = [[16u8; 64]; 6];
+    for (index, list) in four.iter_mut().enumerate() {
+        if uses_parsed(map, index) {
+            *list = scaling.four[index];
+        }
     }
+    for (index, list) in eight.iter_mut().enumerate() {
+        if uses_parsed(map, 6 + index) {
+            *list = scaling.eight[index];
+        }
+    }
+    Some(StdVideoH264ScalingLists {
+        scaling_list_present_mask: map.present_mask,
+        use_default_scaling_matrix_mask: map.default_mask,
+        ScalingList4x4: four,
+        ScalingList8x8: eight,
+    })
+}
+
+/// True for a present list without the default-matrix escape.
+fn uses_parsed(map: crate::parse::h264::ScalingMap, bit: usize) -> bool {
+    map.present_mask & (1u16 << bit) != 0 && map.default_mask & (1u16 << bit) == 0
 }
 
 /// Standard VUI parameters with an unlinked HRD pointer.
@@ -476,17 +494,12 @@ fn narrow_u8(value: u32, syntax: &'static str) -> Result<u8, ParseError> {
     u8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
 }
 
-/// Checked narrowing of a fill value to `i8`.
-fn narrow_i8(value: i32, syntax: &'static str) -> Result<i8, ParseError> {
-    i8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
-}
-
 #[cfg(test)]
 mod tests {
     use crate::parse::au::{AccessUnit, AuSplitter};
-    use crate::parse::h264::{H264Parser, Nalu, ParsedNalu};
+    use crate::parse::h264::{H264Parser, ParsedNalu};
     use crate::parse::refs::{H264Context, H264Instruction};
-    use crate::parse::test_support::{hex, split};
+    use crate::parse::test_support::{hex, split264};
 
     /// Fork `demo.h264` sequence set.
     const SPS: &str = "6764000dacb20283f60220000003002000000641e2854900";
@@ -503,7 +516,7 @@ mod tests {
         std::rc::Rc<crate::parse::h264::Sps>,
         std::rc::Rc<crate::parse::h264::Pps>,
     ) {
-        let units = split(&[hex(SPS), hex(PPS)]);
+        let units = split264(&[hex(SPS), hex(PPS)]);
         let mut parser = H264Parser::new();
         let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
@@ -515,14 +528,13 @@ mod tests {
     }
 
     /// Access units out of parsed H.264 `payloads`.
-    fn units264(payloads: &[Vec<u8>]) -> Vec<AccessUnit<Nalu>> {
+    fn units264(payloads: &[Vec<u8>]) -> Vec<AccessUnit<ParsedNalu>> {
         let mut parser = H264Parser::new();
         let mut splitter = AuSplitter::new();
         let mut units = Vec::new();
-        for raw in split(payloads) {
+        for raw in split264(payloads) {
             let parsed = parser.parse(&raw).expect("parse");
-            let nalu = Nalu::new(parsed);
-            if let Some(unit) = splitter.put(nalu) {
+            if let Some(unit) = splitter.put(parsed) {
                 units.push(unit);
             }
         }
@@ -578,7 +590,7 @@ mod tests {
         use ash::vk::native::StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
         let (_, pps) = demo_sets();
         let mut tables = super::H264Tables::new();
-        tables.insert_pps(&pps).expect("insert");
+        tables.insert_pps(&pps);
         let std = tables.pps(0, &pps).expect("std pps");
         assert_eq!(std.seq_parameter_set_id, 0);
         assert_eq!(std.num_ref_idx_l0_default_active_minus1, 2);
@@ -651,7 +663,7 @@ mod tests {
         std::rc::Rc<crate::parse::h264::Sps>,
         std::rc::Rc<crate::parse::h264::Pps>,
     ) {
-        let units = split(&[hex(HIGH_SPS), hex(HIGH_PPS)]);
+        let units = split264(&[hex(HIGH_SPS), hex(HIGH_PPS)]);
         let mut parser = H264Parser::new();
         let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
@@ -672,7 +684,7 @@ mod tests {
         let (sps, _) = high_vector_sets();
         let mut tables = super::H264Tables::new();
         tables.insert_sps(&sps).expect("sps");
-        let std_sps = tables.sps(sps.id(), &sps).expect("std sps");
+        let std_sps = tables.sps(sps.seq_parameter_set_id, &sps).expect("std sps");
         assert_eq!(
             std_sps.profile_idc,
             StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH
@@ -698,31 +710,25 @@ mod tests {
             ],
             [0, 0, 0, 4]
         );
-        assert_eq!(
-            std_sps.pic_order_cnt_type,
-            u32::from(sps.pic_order_cnt_type())
-        );
-        assert_eq!(std_sps.max_num_ref_frames, sps.max_num_ref_frames());
+        assert_eq!(std_sps.pic_order_cnt_type, u32::from(sps.poc_type.id()));
+        assert_eq!(std_sps.max_num_ref_frames, sps.max_num_ref_frames);
         assert_eq!(
             std_sps.log2_max_pic_order_cnt_lsb_minus4,
-            sps.log2_max_pic_order_cnt_lsb_minus4()
+            sps.log2_max_poc_lsb_minus4
         );
         assert_eq!(
             std_sps.log2_max_frame_num_minus4,
-            sps.log2_max_frame_num_minus4()
+            sps.log2_max_frame_num_minus4
         );
         assert_eq!(
             std_sps.flags.direct_8x8_inference_flag(),
-            u32::from(sps.direct_8x8_inference())
+            u32::from(sps.direct_8x8)
         );
         assert_eq!(
             std_sps.flags.gaps_in_frame_num_value_allowed_flag(),
-            u32::from(sps.gaps_in_frame_num_allowed())
+            u32::from(sps.gaps_allowed)
         );
-        assert_eq!(
-            std_sps.flags.frame_mbs_only_flag(),
-            u32::from(sps.frame_mbs_only())
-        );
+        assert_eq!(std_sps.flags.frame_mbs_only_flag(), 1);
         assert!(std_sps.pOffsetForRefFrame.is_null());
     }
 
@@ -731,8 +737,8 @@ mod tests {
         use ash::vk::native::StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_IMPLICIT;
         let (_, pps) = high_vector_sets();
         let mut tables = super::H264Tables::new();
-        tables.insert_pps(&pps).expect("pps");
-        let std_pps = tables.pps(pps.id(), &pps).expect("std pps");
+        tables.insert_pps(&pps);
+        let std_pps = tables.pps(pps.pic_parameter_set_id, &pps).expect("std pps");
         assert_eq!(
             std_pps.weighted_bipred_idc,
             StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_IMPLICIT
@@ -743,45 +749,32 @@ mod tests {
         );
         assert_eq!(
             u32::from(std_pps.num_ref_idx_l0_default_active_minus1),
-            pps.num_ref_idx_l0_default_minus1()
+            u32::from(pps.num_ref_l0)
         );
         assert_eq!(
             u32::from(std_pps.num_ref_idx_l1_default_active_minus1),
-            pps.num_ref_idx_l1_default_minus1()
+            u32::from(pps.num_ref_l1)
         );
         assert_eq!(
             std_pps.flags.entropy_coding_mode_flag(),
-            u32::from(pps.entropy_coding_mode())
+            u32::from(pps.entropy())
         );
         assert_eq!(
             std_pps.flags.transform_8x8_mode_flag(),
-            u32::from(pps.transform_8x8_mode())
+            u32::from(pps.transform_8x8())
         );
         assert_eq!(
             std_pps.flags.deblocking_filter_control_present_flag(),
-            u32::from(pps.deblocking_control_present())
+            u32::from(pps.deblocking_present())
         );
-        assert_eq!(
-            std_pps.pic_init_qp_minus26,
-            pps.pic_init_qp_minus26().try_into().expect("qp width")
-        );
-        assert_eq!(
-            std_pps.chroma_qp_index_offset,
-            pps.chroma_qp_index_offset()
-                .try_into()
-                .expect("chroma width")
-        );
-        assert_eq!(
-            std_pps.second_chroma_qp_index_offset,
-            pps.second_chroma_qp_index_offset()
-                .try_into()
-                .expect("chroma2 width")
-        );
+        assert_eq!(std_pps.pic_init_qp_minus26, pps.pic_init_qp);
+        assert_eq!(std_pps.chroma_qp_index_offset, pps.chroma_qp);
+        assert_eq!(std_pps.second_chroma_qp_index_offset, pps.second_chroma_qp);
     }
 
     #[test]
     fn unknown_level_rejected_at_insert() {
-        let units = split(&[hex("67640063acb20283f60220000003002000000641e2854900")]);
+        let units = split264(&[hex("67640063acb20283f60220000003002000000641e2854900")]);
         let mut parser = H264Parser::new();
         let ParsedNalu::Sps(sps) = parser.parse(&units[0]).expect("sps") else {
             panic!("want sps");
