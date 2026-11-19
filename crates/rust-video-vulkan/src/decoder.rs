@@ -334,6 +334,11 @@ impl FrameSink {
         &mut self.reorder
     }
 
+    /// Launched but unlanded readback copies.
+    pub(crate) fn launched_len(&self) -> usize {
+        self.launched.len()
+    }
+
     /// Collection order behind the next logged timing.
     pub(crate) fn next_timing_seq(&mut self) -> u64 {
         let seq = self.timing_seq;
@@ -1257,7 +1262,7 @@ impl OverlappedDecode for H264Decoder<'_> {
     }
 
     fn inflight_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.sink.launched_len()
     }
 
     fn take_timings(&mut self) -> Vec<PhaseTiming> {
@@ -2502,7 +2507,7 @@ impl OverlappedDecode for H265Decoder<'_> {
     }
 
     fn inflight_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.sink.launched_len()
     }
 
     fn take_timings(&mut self) -> Vec<PhaseTiming> {
@@ -2944,6 +2949,19 @@ impl<'a> Av1Decoder<'a> {
                     out.extend(self.run_picture(picture.as_ref(), gpu, mode)?);
                 }
                 Av1Instruction::ShowExisting { id, releases } => {
+                    // Refuse cross-path replays before touching state.
+                    let foreign = self.shown.get(id).is_some_and(|stored| {
+                        if gpu {
+                            stored.gpu.is_none()
+                        } else {
+                            stored.cpu.is_none()
+                        }
+                    });
+                    if foreign {
+                        return Err(VulkanError::Unsupported {
+                            what: "av1 show-existing across cpu/gpu paths".to_owned(),
+                        });
+                    }
                     let drained = self.drain()?;
                     out.extend(drained);
                     if let Some(session) = self.session.as_mut() {
@@ -2963,10 +2981,15 @@ impl<'a> Av1Decoder<'a> {
                     };
                     let poc = self.show_seq;
                     self.show_seq = self.show_seq.wrapping_add(1);
+                    let (cpu, pair) = if gpu {
+                        (None, stored.gpu.as_ref())
+                    } else {
+                        (stored.cpu.as_ref(), None)
+                    };
                     out.extend(self.sink.emit_stored(
                         stored.size,
-                        stored.cpu.as_ref(),
-                        stored.gpu.as_ref(),
+                        cpu,
+                        pair,
                         poc,
                         stored.layout,
                     )?);
@@ -3026,6 +3049,9 @@ impl<'a> Av1Decoder<'a> {
         let start = Instant::now();
         session.wait_pending(picture.pending)?;
         let engine_wait = start.elapsed();
+        let emit = picture.emit;
+        let show_id = picture.show_id;
+        let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
         let frames = launch_waited(
             session,
             &mut self.sink,
@@ -3033,10 +3059,15 @@ impl<'a> Av1Decoder<'a> {
             picture,
             engine_wait,
         )?;
-        if !frames.is_empty() || self.sink.launched.is_empty() {
-            return Ok(frames);
+        // Inline surface landings retain like launched copies.
+        let mut out = if pair.is_some() {
+            self.finish_retained(emit, show_id, pair.as_ref(), frames)
+        } else {
+            frames
+        };
+        if !out.is_empty() || self.sink.launched.is_empty() {
+            return Ok(out);
         }
-        let mut out = frames;
         out.extend(self.collect_launched_one()?);
         Ok(out)
     }
@@ -3149,6 +3180,9 @@ impl<'a> Av1Decoder<'a> {
             return Ok(None);
         }
         let engine_wait = start.elapsed();
+        let emit = picture.emit;
+        let show_id = picture.show_id;
+        let pair = picture.lease.as_ref().map(|lease| lease.pair().clone());
         let frames = launch_waited(
             session,
             &mut self.sink,
@@ -3156,6 +3190,12 @@ impl<'a> Av1Decoder<'a> {
             picture,
             engine_wait,
         )?;
+        // Inline surface landings retain like launched copies.
+        let frames = if pair.is_some() {
+            self.finish_retained(emit, show_id, pair.as_ref(), frames)
+        } else {
+            frames
+        };
         if !frames.is_empty() {
             return Ok(Some(frames));
         }
@@ -3288,7 +3328,7 @@ impl OverlappedDecode for Av1Decoder<'_> {
     }
 
     fn inflight_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.sink.launched_len()
     }
 
     fn take_timings(&mut self) -> Vec<PhaseTiming> {
@@ -3840,6 +3880,345 @@ mod tests {
                     matches!(surface.export(), GpuExport::Opaque { .. }),
                     "surface handle without advertised share"
                 );
+            }
+        }
+    }
+
+    /// Per-temporal-unit packets of `bytes` in order.
+    fn unit_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+        use crate::av1::{split_obus, temporal_units};
+
+        let base = bytes.as_ptr() as usize;
+        let mut packets = Vec::new();
+        let mut start = 0;
+        for unit in temporal_units(split_obus(bytes).expect("vector splits")) {
+            let mut end = start;
+            for obu in unit.obus() {
+                let payload = obu.payload();
+                end = payload.as_ptr() as usize - base + payload.len();
+            }
+            assert!(end > start, "unit holds bytes");
+            packets.push(bytes[start..end].to_vec());
+            start = end;
+        }
+        assert_eq!(start, bytes.len(), "units partition the buffer");
+        packets
+    }
+
+    /// Reference decode units plus show-existing displays of `bytes`.
+    fn reference_map(
+        bytes: &[u8],
+    ) -> (
+        std::collections::HashMap<crate::dpb::ReferenceId, usize>,
+        Vec<(usize, crate::dpb::ReferenceId)>,
+    ) {
+        use crate::av1::{split_obus, temporal_units};
+        use crate::dpb::{Av1Context, Av1Instruction};
+
+        let mut context = Av1Context::new();
+        let mut decoded = std::collections::HashMap::new();
+        let mut shows = Vec::new();
+        for (index, unit) in temporal_units(split_obus(bytes).expect("vector splits"))
+            .iter()
+            .enumerate()
+        {
+            for instruction in context.compile(unit).expect("vector compiles") {
+                match instruction {
+                    Av1Instruction::Picture(picture) => {
+                        if let Some(id) = picture.picture().id() {
+                            decoded.insert(id, index);
+                        }
+                    }
+                    Av1Instruction::ShowExisting { id, .. } => shows.push((index, id)),
+                    Av1Instruction::Sequence(_) => {}
+                }
+            }
+        }
+        (decoded, shows)
+    }
+
+    /// Trait frames carry bytes behind an opaque backend descriptor.
+    fn check_trait_frame(frame: &super::VulkanFrame) {
+        assert!(
+            matches!(frame.export(), GpuExport::Opaque { .. }),
+            "trait frame carries a handle"
+        );
+        assert!(!frame.nv12().is_empty(), "trait frame holds bytes");
+        assert!(frame.planes().is_none(), "trait frame exposes no planes");
+    }
+
+    /// Surface frames pin export planes behind empty bytes.
+    fn check_surface_frame(frame: &super::VulkanFrame) {
+        assert!(frame.planes().is_some(), "surface frame pins planes");
+        assert!(frame.nv12().is_empty(), "surface frame skips the readback");
+        assert!(
+            frame.device_export().is_some(),
+            "surface frame carries its export"
+        );
+    }
+
+    /// Flushed frames hold exactly one form: bytes or export.
+    fn check_either_frame(frame: &super::VulkanFrame) {
+        let gpu = frame.planes().is_some();
+        assert_eq!(gpu, frame.nv12().is_empty(), "frame mixes bytes and export");
+        assert_eq!(
+            gpu,
+            frame.device_export().is_some(),
+            "planes agree with export"
+        );
+        if !gpu {
+            assert!(
+                matches!(frame.export(), GpuExport::Opaque { .. }),
+                "flushed trait frame carries a handle"
+            );
+        }
+    }
+
+    /// Export variant tag behind consistency checks.
+    fn export_tag(frame: &super::VulkanFrame) -> &'static str {
+        match frame.export() {
+            GpuExport::Opaque { .. } => "opaque",
+            #[cfg(unix)]
+            GpuExport::DmaBuf { .. } => "dmabuf",
+            #[cfg(windows)]
+            GpuExport::NtHandle { .. } => "nthandle",
+            _ => "other",
+        }
+    }
+
+    /// Frame count of `pattern` (`true` decodes the surface path) on a fresh decoder.
+    ///
+    /// `None` declines on VRAM exhaustion; every other error panics.
+    fn run_pattern(
+        device: &crate::device::VulkanDevice,
+        packets: &[Vec<u8>],
+        pattern: &[bool],
+        surface_flush: bool,
+    ) -> Option<usize> {
+        use bytes::Bytes;
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+
+        let mut decoder = match super::Av1Decoder::open(device) {
+            Ok(decoder) => decoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM av1 open: {error}");
+                return None;
+            }
+            Err(error) => panic!("engine starts: {error}"),
+        };
+        let mut count = 0;
+        let mut variants = std::collections::HashSet::new();
+        for (gpu, raw) in pattern.iter().zip(packets.iter()) {
+            let packet = Packet::new(Bytes::copy_from_slice(raw));
+            let frames = if *gpu {
+                match decoder.decode_surface(&packet) {
+                    Ok(frames) => frames,
+                    Err(error) if error.is_out_of_device_memory() => {
+                        println!("declined:OOM av1 surface decode: {error}");
+                        return None;
+                    }
+                    Err(error) => panic!("surface decode runs: {error}"),
+                }
+            } else {
+                match decoder.decode(&packet) {
+                    Ok(frames) => frames,
+                    Err(error) if error.is_out_of_device_memory() => {
+                        println!("declined:OOM av1 decode: {error}");
+                        return None;
+                    }
+                    Err(error) => panic!("decode runs: {error}"),
+                }
+            };
+            for frame in &frames {
+                if *gpu {
+                    check_surface_frame(frame);
+                    variants.insert(export_tag(frame));
+                } else {
+                    check_trait_frame(frame);
+                }
+            }
+            count += frames.len();
+        }
+        let flushed = if surface_flush {
+            match decoder.flush_surface() {
+                Ok(frames) => frames,
+                Err(error) if error.is_out_of_device_memory() => {
+                    println!("declined:OOM av1 surface flush: {error}");
+                    return None;
+                }
+                Err(error) => panic!("surface flush runs: {error}"),
+            }
+        } else {
+            match decoder.flush() {
+                Ok(frames) => frames,
+                Err(error) if error.is_out_of_device_memory() => {
+                    println!("declined:OOM av1 flush: {error}");
+                    return None;
+                }
+                Err(error) => panic!("flush runs: {error}"),
+            }
+        };
+        for frame in &flushed {
+            check_either_frame(frame);
+            if frame.planes().is_some() {
+                variants.insert(export_tag(frame));
+            }
+        }
+        count += flushed.len();
+        assert!(variants.len() <= 1, "surface exports stay consistent");
+        Some(count)
+    }
+
+    /// Cross-path replay of the first show-existing fails clean.
+    ///
+    /// The show-prefix decodes on one path, the show-existing unit on
+    /// the other; the retained form cannot cross, so the call errors
+    /// instead of leaking a handle. `None` declines on VRAM exhaustion.
+    fn run_cross_leg(
+        device: &crate::device::VulkanDevice,
+        packets: &[Vec<u8>],
+        decode_units: &std::collections::HashMap<crate::dpb::ReferenceId, usize>,
+        shows: &[(usize, crate::dpb::ReferenceId)],
+        gpu_first: bool,
+    ) -> Option<()> {
+        use crate::error::VulkanError;
+
+        use bytes::Bytes;
+        use rust_video_caps::packet::Packet;
+        use rust_video_caps::traits::Decoder;
+
+        let (show, id) = shows[0];
+        let found = decode_units[&id];
+        assert!(show > found, "show-existing replays a past decode");
+        let mut decoder = match super::Av1Decoder::open(device) {
+            Ok(decoder) => decoder,
+            Err(error) if error.is_out_of_device_memory() => {
+                println!("declined:OOM av1 open: {error}");
+                return None;
+            }
+            Err(error) => panic!("engine starts: {error}"),
+        };
+        for raw in packets.iter().take(show) {
+            let packet = Packet::new(Bytes::copy_from_slice(raw));
+            let frames = if gpu_first {
+                match decoder.decode_surface(&packet) {
+                    Ok(frames) => frames,
+                    Err(error) if error.is_out_of_device_memory() => {
+                        println!("declined:OOM av1 surface decode: {error}");
+                        return None;
+                    }
+                    Err(error) => panic!("surface decode runs: {error}"),
+                }
+            } else {
+                match decoder.decode(&packet) {
+                    Ok(frames) => frames,
+                    Err(error) if error.is_out_of_device_memory() => {
+                        println!("declined:OOM av1 decode: {error}");
+                        return None;
+                    }
+                    Err(error) => panic!("decode runs: {error}"),
+                }
+            };
+            for frame in &frames {
+                if gpu_first {
+                    check_surface_frame(frame);
+                } else {
+                    check_trait_frame(frame);
+                }
+            }
+        }
+        let packet = Packet::new(Bytes::copy_from_slice(&packets[show]));
+        let crossed = if gpu_first {
+            decoder.decode(&packet)
+        } else {
+            decoder.decode_surface(&packet)
+        };
+        match crossed {
+            Err(VulkanError::Unsupported { what }) if what.contains("show-existing") => Some(()),
+            Err(error) => panic!("cross-path replay fails clean: {error}"),
+            Ok(_) => panic!("cross-path replay must not leak across paths"),
+        }
+    }
+
+    /// Mixed surface+trait AV1 keeps trait frames opaque, surfaces pinned.
+    ///
+    /// Same-decoder interleavings over a show-existing vector pin both
+    /// path contracts plus the clean cross-path replay refusal: no
+    /// retained export ever lands on the other path.
+    #[test]
+    fn av1_mixed_surface_trait_keeps_exports_consistent() {
+        use crate::device::VulkanDevice;
+        use crate::error::VulkanError;
+        use crate::ladder::CodecOp;
+
+        use rust_video_harness::decode_dir;
+
+        let device = match VulkanDevice::open_or_skip(CodecOp::Av1Decode) {
+            Ok(device) => device,
+            Err(VulkanError::BackendAbsent(reason)) => {
+                println!("declined: av1 on this box: {reason}");
+                return;
+            }
+            Err(error) => panic!("negotiation failed: {error}"),
+        };
+        if device.share_mechanism().is_none() {
+            println!("declined: mixed-use pin needs platform export");
+            return;
+        }
+        let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector reads");
+        let packets = unit_packets(&bytes);
+        assert!(packets.len() > 1, "vector mixes across packets");
+        let (decoded, shows) = reference_map(&bytes);
+        assert!(!shows.is_empty(), "vector pins the retain path");
+        for (unit, id) in &shows {
+            assert!(
+                decoded.get(id).is_some_and(|found| found != unit),
+                "show-existing names a decoded reference"
+            );
+        }
+        let units = packets.len();
+        let all_trait = vec![false; units];
+        let all_surface = vec![true; units];
+        let mut surface_first: Vec<bool> = (0..units).map(|index| index % 2 == 0).collect();
+        let mut trait_first: Vec<bool> = (0..units).map(|index| index % 2 == 1).collect();
+        for pattern in [&mut surface_first, &mut trait_first] {
+            for _ in 0..units {
+                let mut changed = false;
+                for (show, id) in &shows {
+                    let found = decoded[id];
+                    if pattern[*show] != pattern[found] {
+                        pattern[*show] = pattern[found];
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            assert!(pattern.iter().any(|gpu| *gpu), "pattern uses surfaces");
+            assert!(pattern.iter().any(|gpu| !gpu), "pattern uses the trait");
+        }
+        assert_ne!(surface_first, trait_first, "interleavings differ");
+        let Some(expected) = run_pattern(&device, &packets, &all_trait, false) else {
+            return;
+        };
+        assert_eq!(expected, 15, "reference run yields every frame");
+        let Some(surface_count) = run_pattern(&device, &packets, &all_surface, true) else {
+            return;
+        };
+        assert_eq!(surface_count, expected, "surface run yields every frame");
+        let Some(first) = run_pattern(&device, &packets, &surface_first, true) else {
+            return;
+        };
+        assert_eq!(first, expected, "mixed run yields every frame");
+        let Some(second) = run_pattern(&device, &packets, &trait_first, false) else {
+            return;
+        };
+        assert_eq!(second, expected, "mixed run yields every frame");
+        for gpu_first in [true, false] {
+            if run_cross_leg(&device, &packets, &decoded, &shows, gpu_first).is_none() {
+                return;
             }
         }
     }
