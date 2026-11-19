@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/vp9/decline-token-partitions.ivf
+# expect: decline corrupt token data
+# frames: 0
+# recipe: craft over anchor-p0

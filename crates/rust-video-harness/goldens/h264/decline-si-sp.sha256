@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/h264/decline-si-sp.h264
+# expect: decline SI/SP slices unsupported
+# frames: 0
+# recipe: craft over profile-baseline

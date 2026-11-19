@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/h265/decline-conformance-overrun.h265
+# expect: decline conformance window exceeds picture
+# frames: 0
+# recipe: craft over anchor-main

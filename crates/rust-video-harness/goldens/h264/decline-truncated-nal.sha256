@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/h264/decline-truncated-nal.h264
+# expect: decline truncated NAL
+# frames: 0
+# recipe: craft over anchor-high

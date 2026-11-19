@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/av1/decline-bad-leb128.obu
+# expect: decline malformed OBU size
+# frames: 0
+# recipe: craft over obu-raw

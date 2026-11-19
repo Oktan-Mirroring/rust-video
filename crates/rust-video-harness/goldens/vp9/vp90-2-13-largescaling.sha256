@@ -1,7 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp9/vp90-2-13-largescaling.webm
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: Profile 0 yuv420p 19200x108
-# frames: 2
-e69369b2d18f035d1f8bb54c30ddf49c4d2658fc8f2395f736a3af4b78fa0073
-749b0b846eafdb799fc2d74d35c96787a262051f74b44739a70833e4d90a68d3

@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/h265/decline-truncated-sets.h265
+# expect: decline truncated parameter sets
+# frames: 0
+# recipe: craft over anchor-main

@@ -1,7 +1,8 @@
 # rust-video golden v1
-# vector: corpus/vp9/vp90-2-20-big_superframe-01.webm
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: Profile 0 yuv420p 352x288
+# vector: corpus/vp9/vp90-2-20-big_superframe-01.ivf
+# expect: match
+# ffmpeg: ffmpeg version 9.0-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 352x288 unknown b=0
 # frames: 13
 a9be5b99ea0d67a3cb42907d8f9b924bcb8913d87352cdf110d530e307d95a9a
 6a35869d30afed82dfe59dad1c1a154e0d1d4fa2e379aeea16138dca962ced85

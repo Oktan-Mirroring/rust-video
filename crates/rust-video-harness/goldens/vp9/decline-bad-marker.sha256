@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/vp9/decline-bad-marker.ivf
+# expect: decline bad VP9 frame marker
+# frames: 0
+# recipe: craft over anchor-p0

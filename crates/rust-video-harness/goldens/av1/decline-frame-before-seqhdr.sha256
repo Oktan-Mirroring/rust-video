@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/av1/decline-frame-before-seqhdr.obu
+# expect: decline frames before sequence header
+# frames: 0
+# recipe: craft over obu-raw

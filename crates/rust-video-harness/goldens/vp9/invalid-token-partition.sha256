@@ -1,6 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp9/invalid-token-partition.ivf
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: 0 yuv420p 1920x1080
-# frames: 1
-9538effa6dcfa5d2e26a8029fc81a6d04c7d46be3080caef2bc036caf54a60c1

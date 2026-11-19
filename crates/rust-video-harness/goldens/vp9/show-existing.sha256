@@ -1,0 +1,9 @@
+# rust-video golden v1
+# vector: corpus/synth/vp9/show-existing.ivf
+# expect: match
+# ffmpeg: ffmpeg version 9.0-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers
+# probe: Profile 0 yuv420p 1920x1080 unknown b=0
+# frames: 2
+# recipe: craft over anchor-p0
+7c22c5c9063e8471c7d9b01ab2aaa54db8c339011737adb063eae33a888c34e9
+7c22c5c9063e8471c7d9b01ab2aaa54db8c339011737adb063eae33a888c34e9

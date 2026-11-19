@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/av1/decline-truncated-obu.obu
+# expect: decline truncated OBU
+# frames: 0
+# recipe: craft over obu-raw

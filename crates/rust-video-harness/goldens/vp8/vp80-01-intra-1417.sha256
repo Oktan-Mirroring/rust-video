@@ -1,6 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp8/vp80-01-intra-1417.ivf
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: 0 yuv420p 176x144
-# frames: 1
-d8c268a5a69e15d81b1dd9f30d956a4663fca07b3168d15d43a8dd12d2a52c31

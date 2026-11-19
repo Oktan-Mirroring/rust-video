@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/h264/decline-fmo.h264
+# expect: decline flexible macroblock ordering unsupported
+# frames: 0
+# recipe: craft over anchor-high

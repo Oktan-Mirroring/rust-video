@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/av1/decline-garbage.obu
+# expect: decline unparseable bytes
+# frames: 0
+# recipe: craft over 

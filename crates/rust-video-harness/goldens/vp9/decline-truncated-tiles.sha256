@@ -1,0 +1,5 @@
+# rust-video golden v1
+# vector: corpus/synth/vp9/decline-truncated-tiles.ivf
+# expect: decline truncated tiles
+# frames: 0
+# recipe: craft over tiles-4col-rows

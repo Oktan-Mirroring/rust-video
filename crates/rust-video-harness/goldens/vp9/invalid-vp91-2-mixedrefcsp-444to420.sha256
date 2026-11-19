@@ -1,6 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp9/invalid-vp91-2-mixedrefcsp-444to420.ivf
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: Profile 0 yuv444p 352x288
-# frames: 1
-2376c76de23ff6e49eec665a5b03ec88b44ca585c640447d9214f927357dfaf1

@@ -1,7 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp8/vp80-03-segmentation-1436.ivf
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: 0 yuv420p 352x288
-# frames: 2
-0d70948ed6e528ccddb9ffcb6ca66c6b75bf051a59cea0973e0b4671d93a238d
-29baac19abcde741b5416eb53a9a7aad20484dd2fa1e4e8185eb4391128a9b3b

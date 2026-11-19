@@ -1,6 +1,0 @@
-# rust-video golden v1
-# vector: corpus/vp9/vp90-2-15-segkey.webm
-# ffmpeg: ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers
-# probe: Profile 0 yuv420p 1280x720
-# frames: 1
-f68a571cdece7acb54155c389f2a7920093e4af70207a3acc747fbf293780a64
