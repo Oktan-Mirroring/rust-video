@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 thiserror = "1"
+
+[dev-dependencies]
+rust-video-harness = { path = "../rust-video-harness" }

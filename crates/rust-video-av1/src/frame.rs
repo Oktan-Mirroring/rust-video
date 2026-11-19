@@ -2013,73 +2013,7 @@ impl<'a> HeaderReader<'a> {
 
     /// True when skip mode syntax is present.
     fn skip_mode_allowed(&self) -> bool {
-        if self.header.frame_type.is_intra()
-            || !self.header.reference_select()
-            || !self.seq.enable_order_hint()
-        {
-            return false;
-        }
-        let (forward, backward) = self.skip_mode_refs();
-        if forward.is_none() {
-            return false;
-        }
-        if backward.is_some() {
-            return true;
-        }
-        self.second_forward_ref(forward).is_some()
-    }
-
-    /// Nearest forward and backward references by order hint.
-    fn skip_mode_refs(&self) -> (Option<u8>, Option<u8>) {
-        let mut forward: Option<u8> = None;
-        let mut forward_hint = 0u8;
-        let mut backward: Option<u8> = None;
-        let mut backward_hint = 0u8;
-        for position in 0..REFS_PER_FRAME {
-            let slot = usize::from(self.header.ref_frame_idx[position]);
-            let hint = self.refs[slot].order_hint;
-            let dist = relative_dist(
-                hint,
-                self.header.order_hint,
-                self.seq.order_hint_bits_minus1,
-            );
-            if dist < 0
-                && forward.is_none_or(|_| {
-                    relative_dist(hint, forward_hint, self.seq.order_hint_bits_minus1) > 0
-                })
-            {
-                forward = Some(self.header.ref_frame_idx[position]);
-                forward_hint = hint;
-            } else if dist > 0
-                && backward.is_none_or(|_| {
-                    relative_dist(hint, backward_hint, self.seq.order_hint_bits_minus1) < 0
-                })
-            {
-                backward = Some(self.header.ref_frame_idx[position]);
-                backward_hint = hint;
-            }
-        }
-        (forward, backward)
-    }
-
-    /// Second forward reference behind the first.
-    fn second_forward_ref(&self, forward: Option<u8>) -> Option<u8> {
-        let forward_hint = forward.map(|slot| self.refs[usize::from(slot)].order_hint)?;
-        let mut second: Option<u8> = None;
-        let mut second_hint = 0u8;
-        for position in 0..REFS_PER_FRAME {
-            let slot = usize::from(self.header.ref_frame_idx[position]);
-            let hint = self.refs[slot].order_hint;
-            if relative_dist(hint, forward_hint, self.seq.order_hint_bits_minus1) < 0
-                && second.is_none_or(|_| {
-                    relative_dist(hint, second_hint, self.seq.order_hint_bits_minus1) > 0
-                })
-            {
-                second = Some(self.header.ref_frame_idx[position]);
-                second_hint = hint;
-            }
-        }
-        second
+        skip_mode_frames(self.seq, &self.header, self.refs).is_some()
     }
 
     /// Warped motion flag.
@@ -2546,6 +2480,91 @@ fn round_two_signed(value: i64, shift: u32) -> i64 {
     } else {
         round_two(u64::try_from(value).unwrap_or(0), shift).cast_signed()
     }
+}
+
+/// Skip-mode frame pair, 1-based reference names.
+///
+/// `None` when skip mode is disallowed or a single forward reference
+/// stands.
+#[must_use]
+pub fn skip_mode_frames(
+    seq: &SequenceHeader,
+    header: &FrameHeader,
+    refs: &[RefInfo; NUM_REF_FRAMES],
+) -> Option<[u8; 2]> {
+    if header.frame_type.is_intra() || !header.reference_select() || !seq.enable_order_hint() {
+        return None;
+    }
+    let (forward, backward) = skip_positions(seq, header, refs);
+    let first = forward?;
+    if let Some(second) = backward {
+        return frame_pair(first, second);
+    }
+    let other = second_forward_position(seq, header, refs, first)?;
+    frame_pair(first, other)
+}
+
+/// Nearest forward and backward reference positions by order hint.
+fn skip_positions(
+    seq: &SequenceHeader,
+    header: &FrameHeader,
+    refs: &[RefInfo; NUM_REF_FRAMES],
+) -> (Option<usize>, Option<usize>) {
+    let mut forward: Option<usize> = None;
+    let mut forward_hint = 0u8;
+    let mut backward: Option<usize> = None;
+    let mut backward_hint = 0u8;
+    for (position, named) in header.ref_frame_idx.iter().enumerate() {
+        let slot = usize::from(*named);
+        let hint = refs[slot].order_hint;
+        let dist = relative_dist(hint, header.order_hint, seq.order_hint_bits_minus1);
+        if dist < 0
+            && forward
+                .is_none_or(|_| relative_dist(hint, forward_hint, seq.order_hint_bits_minus1) > 0)
+        {
+            forward = Some(position);
+            forward_hint = hint;
+        } else if dist > 0
+            && backward
+                .is_none_or(|_| relative_dist(hint, backward_hint, seq.order_hint_bits_minus1) < 0)
+        {
+            backward = Some(position);
+            backward_hint = hint;
+        }
+    }
+    (forward, backward)
+}
+
+/// Second forward position behind `first`.
+fn second_forward_position(
+    seq: &SequenceHeader,
+    header: &FrameHeader,
+    refs: &[RefInfo; NUM_REF_FRAMES],
+    first: usize,
+) -> Option<usize> {
+    let forward_hint = refs[usize::from(header.ref_frame_idx[first])].order_hint;
+    let mut second: Option<usize> = None;
+    let mut second_hint = 0u8;
+    for (position, named) in header.ref_frame_idx.iter().enumerate() {
+        let slot = usize::from(*named);
+        let hint = refs[slot].order_hint;
+        if relative_dist(hint, forward_hint, seq.order_hint_bits_minus1) < 0
+            && second
+                .is_none_or(|_| relative_dist(hint, second_hint, seq.order_hint_bits_minus1) > 0)
+        {
+            second = Some(position);
+            second_hint = hint;
+        }
+    }
+    second
+}
+
+/// 1-based reference names of `first` and `second`, ascending.
+fn frame_pair(first: usize, second: usize) -> Option<[u8; 2]> {
+    Some([
+        u8::try_from(first.min(second) + 1).ok()?,
+        u8::try_from(first.max(second) + 1).ok()?,
+    ])
 }
 
 /// Reference slots refreshed from a completed `header`.
