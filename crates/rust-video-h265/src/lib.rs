@@ -22,8 +22,9 @@ pub use bits::BitReader;
 pub use error::{HevcError, HevcGate, NalAction, ParseKind, PermissiveGate, UnsupportedKind};
 pub use hrd::{HrdLayerData, HrdParams, HrdStreams};
 pub use nal::{
-    is_bla, is_cra, is_cra_bla, is_idr, is_irap, is_radl, is_rasl, is_slnr, rbsp, rbsp_prefix,
-    split_nals, Crop, HEADER_PREFIX, MAX_LT_SPS, MAX_PPS, MAX_RPS, MAX_RPS_PICS, MAX_SPS,
+    anchors_tid0, is_bla, is_cra, is_cra_bla, is_idr, is_irap, is_radl, is_rasl, is_slnr,
+    nal_unit_type, rbsp, rbsp_prefix, split_nals, temporal_id, Crop, Nalu, NaluSplitter,
+    HEADER_PREFIX, MAX_LT_SPS, MAX_PPS, MAX_RPS, MAX_RPS_PICS, MAX_SPS,
 };
 pub use picture::{Ingest, PendingSlice, Picture};
 pub use pps::{

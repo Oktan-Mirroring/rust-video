@@ -11,6 +11,8 @@ use crate::scaling::parse_scaling_list_data;
 use crate::slice::SliceType;
 use crate::sps::{parse_sps, Sps};
 
+use rust_video_harness::Bits;
+
 /// Test gate with ingest citation checks.
 struct TestGate;
 
@@ -61,107 +63,22 @@ impl HevcGate<TestError> for LayerGate {
     }
 }
 
-/// Test bit writer with emulation prevention.
-struct BitWriter {
-    /// Finished bytes.
-    bytes: Vec<u8>,
-    /// Open byte under fill.
-    current: u8,
-    /// Bits filled in the open byte.
-    filled: u8,
-}
-
-impl BitWriter {
-    /// Empty writer.
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            current: 0,
-            filled: 0,
-        }
+/// Profile-tier-level with Main profile compatibility.
+fn ptl(writer: &mut Bits, interlaced: bool) {
+    writer.bits(0, 2);
+    writer.bit(false);
+    writer.bits(1, 5);
+    for index in 0..32 {
+        writer.bit(index == 1);
     }
-
-    /// Single bit.
-    fn bit(&mut self, set: bool) {
-        if set {
-            self.current |= 1 << (7 - self.filled);
-        }
-        self.filled += 1;
-        if self.filled == 8 {
-            self.bytes.push(self.current);
-            self.current = 0;
-            self.filled = 0;
-        }
-    }
-
-    /// Low `count` bits of `value`, most significant first.
-    fn bits(&mut self, value: u32, count: u32) {
-        for index in (0..count).rev() {
-            self.bit(value >> index & 1 != 0);
-        }
-    }
-
-    /// Unsigned Exp-Golomb code.
-    fn ue(&mut self, value: u32) {
-        let code = value + 1;
-        let width = 32 - code.leading_zeros();
-        for _ in 1..width {
-            self.bit(false);
-        }
-        self.bits(code, width);
-    }
-
-    /// Signed Exp-Golomb code.
-    fn se(&mut self, value: i32) {
-        let code = if value > 0 {
-            u32::try_from(value).unwrap_or(u32::MAX) * 2 - 1
-        } else {
-            u32::try_from(-value).unwrap_or(u32::MAX) * 2
-        };
-        self.ue(code);
-    }
-
-    /// Profile-tier-level with Main profile compatibility.
-    fn ptl(&mut self, interlaced: bool) {
-        self.bits(0, 2);
-        self.bit(false);
-        self.bits(1, 5);
-        for index in 0..32 {
-            self.bit(index == 1);
-        }
-        self.bit(!interlaced);
-        self.bit(interlaced);
-        self.bit(true);
-        self.bit(true);
-        self.bits(0, 24);
-        self.bits(0, 19);
-        self.bit(false);
-        self.bits(120, 8);
-    }
-
-    /// Stop bit plus byte alignment.
-    fn finish(mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.filled != 0 {
-            self.bit(false);
-        }
-        self.bytes
-    }
-
-    /// Finished RBSP with emulation prevention inserted.
-    fn finish_ebsp(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut zeros = 0;
-        for byte in self.finish() {
-            if zeros == 2 && byte <= 3 {
-                out.push(3);
-                zeros = 0;
-            }
-            out.push(byte);
-            zeros = if byte == 0 { zeros + 1 } else { 0 };
-        }
-        out
-    }
+    writer.bit(!interlaced);
+    writer.bit(interlaced);
+    writer.bit(true);
+    writer.bit(true);
+    writer.bits(0, 24);
+    writer.bits(0, 19);
+    writer.bit(false);
+    writer.bits(120, 8);
 }
 
 /// NAL unit with two-byte header over the EBSP body.
@@ -183,11 +100,11 @@ fn packet(nals: &[Vec<u8>]) -> Vec<u8> {
 
 /// 320x240 sequence set body with one explicit reference set.
 fn sps_body() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bits(0, 4);
     writer.bits(0, 3);
     writer.bit(true);
-    writer.ptl(false);
+    ptl(&mut writer, false);
     writer.ue(0);
     writer.ue(1);
     writer.ue(320);
@@ -220,7 +137,7 @@ fn sps_body() -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Sequence set used across tests.
@@ -235,7 +152,7 @@ fn pps_body() -> Vec<u8> {
 
 /// Picture set body with dependent slice selection.
 fn pps_body_opts(dependent: bool) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(dependent);
@@ -265,12 +182,12 @@ fn pps_body_opts(dependent: bool) -> Vec<u8> {
     writer.ue(0);
     writer.bit(false);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// IDR slice header body over the test sets.
 fn idr_slice_body() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bit(true);
     writer.bit(false);
     writer.ue(0);
@@ -280,12 +197,12 @@ fn idr_slice_body() -> Vec<u8> {
     writer.se(0);
     writer.bit(true);
     writer.ue(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// P slice header body with `lsb` over the test sets.
 fn p_slice_body(lsb: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bit(true);
     writer.ue(0);
     writer.ue(1);
@@ -303,12 +220,12 @@ fn p_slice_body(lsb: u32) -> Vec<u8> {
     writer.se(0);
     writer.bit(true);
     writer.ue(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// B slice header body with an explicit reference set.
 fn b_slice_body(lsb: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bit(true);
     writer.ue(0);
     writer.ue(0);
@@ -331,12 +248,12 @@ fn b_slice_body(lsb: u32) -> Vec<u8> {
     writer.se(0);
     writer.bit(true);
     writer.ue(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// CRA I slice header body with `lsb` over the test sets.
 fn cra_slice_body(lsb: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bit(true);
     writer.bit(false);
     writer.ue(0);
@@ -349,7 +266,7 @@ fn cra_slice_body(lsb: u32) -> Vec<u8> {
     writer.se(0);
     writer.bit(true);
     writer.ue(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Parameter set NALs: video, sequence, picture.
@@ -387,11 +304,11 @@ fn sps_reports_coded_size() {
 
 #[test]
 fn sps_parses_predicted_rps() {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bits(0, 4);
     writer.bits(0, 3);
     writer.bit(true);
-    writer.ptl(false);
+    ptl(&mut writer, false);
     writer.ue(0);
     writer.ue(1);
     writer.ue(320);
@@ -439,8 +356,7 @@ fn sps_parses_predicted_rps() {
     writer.bit(false);
     writer.bit(false);
     writer.bit(false);
-    let sps =
-        parse_sps::<TestError, TestGate>(&rbsp(&writer.finish_ebsp())).expect("predicted rps");
+    let sps = parse_sps::<TestError, TestGate>(&rbsp(&writer.finish())).expect("predicted rps");
     assert_eq!(sps.rps.len(), 2);
     let predicted = &sps.rps[1];
     assert_eq!(predicted.negative_count, 3);
@@ -473,7 +389,7 @@ fn pps_reports_flags_and_defaults() {
 
 #[test]
 fn pps_parses_explicit_tiles() {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(false);
@@ -507,8 +423,8 @@ fn pps_parses_explicit_tiles() {
     writer.ue(0);
     writer.bit(false);
     writer.bit(false);
-    let pps = parse_pps::<TestError, TestGate>(&rbsp(&writer.finish_ebsp()), Some(&sps()))
-        .expect("tiled pps");
+    let pps =
+        parse_pps::<TestError, TestGate>(&rbsp(&writer.finish()), Some(&sps())).expect("tiled pps");
     assert!(pps.tiles_enabled());
     assert!(!pps.uniform_spacing());
     assert!(pps.loop_across_tiles());
@@ -607,7 +523,7 @@ fn ingest_drops_stream_start_rasl() {
 #[test]
 fn ingest_declines_dependent_and_multilayer() {
     let mut ingest = Ingest::<TestError, TestGate>::new();
-    let mut second = BitWriter::new();
+    let mut second = Bits::new();
     second.bit(false);
     second.bit(true);
     let all = vec![
@@ -615,7 +531,7 @@ fn ingest_declines_dependent_and_multilayer() {
         nal(33, 0, &sps_body()),
         nal(34, 0, &pps_body_opts(true)),
         nal(1, 0, &p_slice_body(1)),
-        nal(1, 0, &second.finish_ebsp()),
+        nal(1, 0, &second.finish()),
     ];
     let error = ingest.ingest_packet(&packet(&all)).unwrap_err();
     assert!(matches!(error, TestError::Unsupported(_)));
@@ -637,18 +553,18 @@ fn ingest_rejects_unknown_sets() {
 
     let mut ingest = Ingest::<TestError, TestGate>::new();
     let mut all = param_nals();
-    let mut bad = BitWriter::new();
+    let mut bad = Bits::new();
     bad.bit(true);
     bad.bit(false);
     bad.ue(3);
-    all.push(nal(20, 0, &bad.finish_ebsp()));
+    all.push(nal(20, 0, &bad.finish()));
     let error = ingest.ingest_packet(&packet(&all)).unwrap_err();
     assert!(matches!(error, TestError::Parse(_)));
 }
 
 #[test]
 fn scaling_list_data_parses_modes() {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     for size_id in 0..4 {
         let matrices = if size_id == 3 { 2 } else { 6 };
         for matrix_id in 0..matrices {
@@ -667,8 +583,8 @@ fn scaling_list_data_parses_modes() {
             }
         }
     }
-    let lists =
-        parse_scaling_list_data::<TestError>(&mut BitReader::new(&writer.finish())).expect("lists");
+    let lists = parse_scaling_list_data::<TestError>(&mut BitReader::new(&writer.finish_rbsp()))
+        .expect("lists");
     assert_eq!(lists.size0[0], [8; 16]);
     assert_eq!(lists.size0[1], [16; 16]);
     assert_eq!(lists.size1[0][0], 8);
@@ -682,11 +598,11 @@ fn scaling_list_data_parses_modes() {
 
 #[test]
 fn conformance_crop_insets_visible() {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bits(0, 4);
     writer.bits(0, 3);
     writer.bit(true);
-    writer.ptl(false);
+    ptl(&mut writer, false);
     writer.ue(0);
     writer.ue(1);
     writer.ue(320);
@@ -719,7 +635,7 @@ fn conformance_crop_insets_visible() {
     writer.bit(false);
     writer.bit(false);
     writer.bit(false);
-    let sps = parse_sps::<TestError, TestGate>(&rbsp(&writer.finish_ebsp())).expect("cropped sps");
+    let sps = parse_sps::<TestError, TestGate>(&rbsp(&writer.finish())).expect("cropped sps");
     assert_eq!(sps.visible_width(), 320);
     assert_eq!(sps.visible_height(), 240);
 }
@@ -729,4 +645,36 @@ fn nal_layer_id_reads_six_bits() {
     let mut ingest = Ingest::<TestError, LayerGate>::new();
     let packet = [0, 0, 1, 0x02, 0x11, 0xAA];
     ingest.ingest_packet(&packet).expect("layer-2 NAL ingests");
+}
+
+#[test]
+fn poc_from_lsb_wraps_against_anchor() {
+    let sps = Sps {
+        log2_max_poc_lsb_minus4: 4,
+        ..sps()
+    };
+    assert_eq!(sps.poc_from_lsb(None, 200, false), Some(200));
+    assert_eq!(sps.poc_from_lsb(Some(0), 200, false), Some(-56));
+    assert_eq!(sps.poc_from_lsb(Some(300), 200, false), Some(200));
+    assert_eq!(sps.poc_from_lsb(Some(300), 50, false), Some(306));
+    assert_eq!(sps.poc_from_lsb(Some(300), 50, true), Some(50));
+}
+
+#[test]
+fn lt_msb_present_adds_cycle_and_lsb() {
+    use crate::slice::LtSpec;
+
+    let spec = LtSpec {
+        poc_lsb: 10,
+        used: true,
+        msb_present: true,
+        msb_cycle: 1,
+    };
+    assert_eq!(spec.poc_msb_present(300, 256), Some(10));
+    assert_eq!(spec.poc_msb_present(44, 256), Some(-246));
+    let spec = LtSpec {
+        msb_cycle: 0,
+        ..spec
+    };
+    assert_eq!(spec.poc_msb_present(300, 256), Some(266));
 }

@@ -6,5 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+rust-video-harness = { path = "../rust-video-harness" }
+
 [lints]
 workspace = true

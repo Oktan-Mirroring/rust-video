@@ -205,6 +205,190 @@ pub fn is_slnr(nal_type: u8) -> bool {
     matches!(nal_type, 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14)
 }
 
+/// True for pictures anchoring the temporal-0 POC carry, H.265 8.3.1.
+#[must_use]
+pub fn anchors_tid0(nal_type: u8, temporal_id: u8) -> bool {
+    temporal_id == 0 && !is_slnr(nal_type) && !is_radl(nal_type) && !is_rasl(nal_type)
+}
+
+/// NAL unit type of the two-byte header's first byte, H.265 7.4.2.2.
+#[must_use]
+pub const fn nal_unit_type(header: u8) -> u8 {
+    (header >> 1) & 0x3F
+}
+
+/// Temporal id of the two-byte header's second byte, H.265 7.4.2.2.
+///
+/// Lenient: a forbidden zero `temporal_id_plus1` reads as id zero.
+/// The ingest path rejects it instead.
+#[must_use]
+pub const fn temporal_id(second: u8) -> u8 {
+    (second & 7).saturating_sub(1)
+}
+
+/// One owned NAL unit, start code stripped.
+#[derive(Clone, Debug)]
+pub struct Nalu {
+    /// Header plus payload.
+    bytes: Vec<u8>,
+}
+
+impl Nalu {
+    /// Header plus payload.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Start-code scanner buffering partial NAL units across pushes.
+#[derive(Default)]
+pub struct NaluSplitter {
+    /// Bytes not yet emitted.
+    buffer: Vec<u8>,
+    /// Rescan floor; keeps a split start code reparseable.
+    floor: usize,
+}
+
+impl NaluSplitter {
+    /// Empty splitter.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            floor: 0,
+        }
+    }
+
+    /// Complete NAL units out of `chunk`.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<Nalu> {
+        self.buffer.extend_from_slice(chunk);
+        self.trim_junk();
+        let mut out = Vec::new();
+        self.drain_complete(&mut out);
+        self.floor = self.buffer.len().saturating_sub(4);
+        out
+    }
+
+    /// Trailing bytes as one final NAL unit, if any.
+    pub fn flush(&mut self) -> Vec<Nalu> {
+        self.trim_junk();
+        let mut out = Vec::new();
+        self.drain_complete(&mut out);
+        if unit_contains_payload(&self.buffer) {
+            out.push(Nalu {
+                bytes: strip_code(std::mem::take(&mut self.buffer)),
+            });
+        } else {
+            self.buffer.clear();
+        }
+        self.floor = 0;
+        out
+    }
+}
+
+impl NaluSplitter {
+    /// Complete units out of the buffer into `out`.
+    ///
+    /// One split per unit: the retained tail parts first, then each
+    /// cut splits from the back, so consumed bytes move once.
+    fn drain_complete(&mut self, out: &mut Vec<Nalu>) {
+        let mut cuts = Vec::new();
+        let mut from = self.floor;
+        while let Some(cut) = find_start(&self.buffer, from) {
+            cuts.push(cut);
+            from = cut + 3;
+        }
+        let Some(last) = cuts.last().copied() else {
+            return;
+        };
+        let tail = self.buffer.split_off(last);
+        let mut units = Vec::with_capacity(cuts.len());
+        for cut in cuts[..cuts.len() - 1].iter().rev() {
+            units.push(self.buffer.split_off(*cut));
+        }
+        units.push(std::mem::take(&mut self.buffer));
+        for unit in units.into_iter().rev() {
+            if unit_contains_payload(&unit) {
+                out.push(Nalu {
+                    bytes: strip_code(unit),
+                });
+            }
+        }
+        self.buffer = tail;
+        self.floor = 0;
+    }
+
+    /// Drop bytes before the first start code.
+    fn trim_junk(&mut self) {
+        if starts_with_code(&self.buffer) {
+            return;
+        }
+        let mut i = 0;
+        while i + 2 < self.buffer.len() {
+            if self.buffer[i] == 0 && self.buffer[i + 1] == 0 && self.buffer[i + 2] == 1 {
+                let start = if i > 0 && self.buffer[i - 1] == 0 {
+                    i - 1
+                } else {
+                    i
+                };
+                self.buffer.drain(..start);
+                self.floor = 0;
+                return;
+            }
+            i += 1;
+        }
+        let keep = self.buffer.len().min(3);
+        self.buffer.drain(..self.buffer.len() - keep);
+        self.floor = 0;
+    }
+}
+
+/// Unit without its leading 3- or 4-byte start code.
+fn strip_code(mut unit: Vec<u8>) -> Vec<u8> {
+    let code = if unit.len() >= 4 && unit[2] == 0 {
+        4
+    } else {
+        3
+    };
+    unit.drain(..code.min(unit.len()));
+    unit
+}
+
+/// True when `buffer` opens with a 3- or 4-byte start code.
+fn starts_with_code(buffer: &[u8]) -> bool {
+    if buffer.len() >= 4 && buffer[..4] == [0, 0, 0, 1] {
+        return true;
+    }
+    buffer.len() >= 3 && buffer[..3] == [0, 0, 1]
+}
+
+/// Offset of the next start code at or after `from`, past the one opening the unit.
+fn find_start(buffer: &[u8], from: usize) -> Option<usize> {
+    let mut i = from.max(3);
+    while i + 2 < buffer.len() {
+        if buffer[i] == 0 && buffer[i + 1] == 0 && buffer[i + 2] == 1 {
+            if buffer[i - 1] == 0 {
+                return Some(i - 1);
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True when `unit` holds a start code plus at least one payload byte.
+fn unit_contains_payload(unit: &[u8]) -> bool {
+    if unit.len() >= 4 && unit[0] == 0 && unit[1] == 0 && unit[2] == 0 && unit[3] == 1 {
+        return unit.len() > 4;
+    }
+    if unit.len() >= 3 && unit[0] == 0 && unit[1] == 0 && unit[2] == 1 {
+        return unit.len() > 3;
+    }
+    false
+}
+
 /// Visible rectangle in luma samples.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Crop {
@@ -216,4 +400,71 @@ pub struct Crop {
     pub top: u32,
     /// Cropped luma rows at the bottom.
     pub bottom: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{anchors_tid0, nal_unit_type, temporal_id, NaluSplitter};
+
+    #[test]
+    fn header_extractors_split_type_and_id() {
+        assert_eq!(nal_unit_type(0x28), 20);
+        assert_eq!(temporal_id(0x01), 0);
+        assert_eq!(temporal_id(0x03), 2);
+        assert_eq!(temporal_id(0x00), 0);
+    }
+
+    #[test]
+    fn anchors_reject_leading_and_sublayer() {
+        assert!(anchors_tid0(1, 0));
+        assert!(anchors_tid0(19, 0));
+        assert!(!anchors_tid0(1, 1));
+        for unit in [0, 2, 4, 10, 12, 14] {
+            assert!(!anchors_tid0(unit, 0), "sublayer {unit} skips");
+        }
+        for unit in [6, 7, 8, 9] {
+            assert!(!anchors_tid0(unit, 0), "leading {unit} skips");
+        }
+    }
+
+    /// Payload bytes of each emitted unit.
+    fn payloads(units: &[super::Nalu]) -> Vec<Vec<u8>> {
+        units.iter().map(|unit| unit.bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn splits_mixed_start_codes() {
+        let mut splitter = NaluSplitter::new();
+        let units = splitter.push(&[0, 0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 2]);
+        assert_eq!(payloads(&units), vec![vec![0x40, 1]]);
+        let tail = splitter.flush();
+        assert_eq!(payloads(&tail), vec![vec![0x42, 2]]);
+    }
+
+    #[test]
+    fn start_code_split_across_pushes_survives() {
+        let mut splitter = NaluSplitter::new();
+        assert!(splitter.push(&[0, 0, 0, 1, 0x40]).is_empty());
+        let units = splitter.push(&[9, 0, 0]);
+        assert!(units.is_empty());
+        let units = splitter.push(&[1, 0x42]);
+        assert_eq!(payloads(&units), vec![vec![0x40, 9]]);
+        let tail = splitter.flush();
+        assert_eq!(payloads(&tail), vec![vec![0x42]]);
+    }
+
+    #[test]
+    fn leading_junk_before_first_start_code_drops() {
+        let mut splitter = NaluSplitter::new();
+        let units = splitter.push(&[0xFF, 0xFF, 0, 0, 1, 0x28, 0x01]);
+        assert!(units.is_empty());
+        let tail = splitter.flush();
+        assert_eq!(payloads(&tail), vec![vec![0x28, 0x01]]);
+    }
+
+    #[test]
+    fn flush_of_empty_emits_nothing() {
+        let mut splitter = NaluSplitter::default();
+        assert!(splitter.flush().is_empty());
+    }
 }

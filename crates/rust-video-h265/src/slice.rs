@@ -57,6 +57,20 @@ pub struct LtSpec {
     pub msb_cycle: u32,
 }
 
+impl LtSpec {
+    /// Long-term POC with signaled MSB cycle, H.265 8.3.2.
+    ///
+    /// `None` answers a count outside the `i32` range.
+    #[must_use]
+    pub fn poc_msb_present(&self, curr_poc: i32, max_lsb: u32) -> Option<i32> {
+        let max = i64::from(max_lsb);
+        let poc = i64::from(self.poc_lsb) + i64::from(curr_poc)
+            - i64::from(self.msb_cycle) * max
+            - i64::from(curr_poc).rem_euclid(max);
+        i32::try_from(poc).ok()
+    }
+}
+
 /// Short-term set provenance behind the DXVA hints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RpsBits {

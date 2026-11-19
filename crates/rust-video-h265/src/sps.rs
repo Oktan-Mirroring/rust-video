@@ -161,6 +161,34 @@ impl Sps {
         1 << (self.log2_max_poc_lsb_minus4 + 4)
     }
 
+    /// Picture order count from `lsb` against `anchor`, H.265 8.3.1.
+    ///
+    /// `anchor` carries the previous temporal-0 POC; `None` resets the
+    /// MSB on the first picture. `reset_msb` zeroes the MSB on BLA
+    /// pictures and first-sequence CRA pictures. `None` answers a count
+    /// outside the `i32` range.
+    #[must_use]
+    pub fn poc_from_lsb(&self, anchor: Option<i32>, lsb: u32, reset_msb: bool) -> Option<i32> {
+        let max = i64::from(self.max_poc_lsb());
+        let lsb = i64::from(lsb);
+        let mut msb = anchor.map_or(0, |anchor| {
+            let anchor = i64::from(anchor);
+            let prev_lsb = anchor.rem_euclid(max);
+            let base = anchor - prev_lsb;
+            if lsb < prev_lsb && prev_lsb - lsb >= max / 2 {
+                base + max
+            } else if lsb > prev_lsb && lsb - prev_lsb > max / 2 {
+                base - max
+            } else {
+                base
+            }
+        });
+        if reset_msb {
+            msb = 0;
+        }
+        i32::try_from(msb + lsb).ok()
+    }
+
     /// Minimum luma block width in samples.
     #[must_use]
     pub const fn min_cb_size(&self) -> u32 {
