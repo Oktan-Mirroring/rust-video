@@ -1,4 +1,4 @@
-//! HEVC decode on the D3D11 tier, from the committed vector to frames.
+//! VP9 decode on the D3D11 tier, from the committed vector to frames.
 
 #[cfg(target_os = "windows")]
 use bytes::Bytes;
@@ -7,9 +7,9 @@ use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::Decoder;
 #[cfg(target_os = "windows")]
-use rust_video_d3d11::{Codec, D3d11Device, D3d11Error, HevcDecoder};
+use rust_video_d3d11::{Codec, D3d11Device, D3d11Error, Vp9Decoder};
 #[cfg(target_os = "windows")]
-use rust_video_harness::{decode_dir, AnnexB};
+use rust_video_harness::{decode_dir, Ivf};
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -20,17 +20,16 @@ fn main() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
-        println!("SKIP: no hevc decoder profile");
+    if !device.supports(Codec::Vp9) {
+        println!("SKIP: no vp9 decoder profile");
         return;
     }
     let path = std::env::args().nth(1).map_or_else(
-        || decode_dir().join("inter_320x240.hevc"),
+        || decode_dir().join("valid_320x240.ivf"),
         std::path::PathBuf::from,
     );
-    let data = std::fs::read(&path).expect("vector readable");
-    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
-    let mut decoder = HevcDecoder::open(&device);
+    let raws = Ivf::read(&path).frames;
+    let mut decoder = Vp9Decoder::open(&device);
     let mut total = 0;
     for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));

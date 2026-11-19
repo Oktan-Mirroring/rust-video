@@ -1,4 +1,4 @@
-//! HEVC encode on the D3D11 tier, from synthetic NV12 to packets.
+//! H.265 encode on the D3D11 tier, from synthetic NV12 to packets.
 
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
@@ -20,7 +20,7 @@ fn main() {
     let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("SKIP: no hevc encoder ({error})");
+            println!("SKIP: no h265 encoder ({error})");
             return;
         }
     };

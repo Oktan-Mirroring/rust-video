@@ -1,6 +1,8 @@
 //! VP9 test vectors: committed stream plus per-frame packets.
-
-// Stays: byte-slice IVF splitter; the harness Ivf twin reads from a path.
+//!
+//! Thin delegate over the harness [`Ivf`](rust_video_harness::Ivf) parse:
+//! the d3d11 tests `#[path]`-include this file, so the names stay while the
+//! single implementation lives in the harness.
 
 use std::path::PathBuf;
 
@@ -11,18 +13,5 @@ pub fn vector() -> PathBuf {
 
 /// Frame payloads of `data` in file order, without IVF headers.
 pub fn frame_packets(data: &[u8]) -> Vec<Vec<u8>> {
-    assert!(data.len() >= 32 && data[..4] == *b"DKIF", "vector is IVF");
-    let head = usize::from(u16::from_le_bytes([data[6], data[7]]).max(32));
-    let mut packets = Vec::new();
-    let mut offset = head;
-    while let Some(entry) = data.get(offset..offset + 12) {
-        let size = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-        let size = usize::try_from(size).expect("payload fits");
-        let Some(payload) = data.get(offset + 12..offset + 12 + size) else {
-            break;
-        };
-        packets.push(payload.to_vec());
-        offset += 12 + size;
-    }
-    packets
+    rust_video_harness::Ivf::split(data)
 }
