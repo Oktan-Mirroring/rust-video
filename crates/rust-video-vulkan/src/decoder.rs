@@ -96,8 +96,8 @@ impl SurfaceLayout {
 /// Threading: the decoders stay on their creating thread while queue
 /// submission serializes on the device queue lock; a frame itself is
 /// `Send` plus `Sync`, so threads share frames freely and hold
-/// [`VulkanDevice::queue_lock`] across their own submits on
-/// [`VulkanDevice::queue`].
+/// [`crate::device::VulkanDevice::queue_lock`] across their own submits on
+/// [`crate::device::VulkanDevice::queue`].
 ///
 /// Lifetime: the frame owns its pixels or planes plus its budget lease
 /// and borrows nothing. A GPU frame pins its export slot until dropped;
