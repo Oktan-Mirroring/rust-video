@@ -72,8 +72,10 @@ pub enum Route {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShareMechanism {
     /// Windows NT handle share.
+    #[cfg(windows)]
     NtHandle,
     /// Linux DMA-BUF share.
+    #[cfg(unix)]
     DmaBuf,
 }
 
@@ -333,27 +335,39 @@ mod tests {
     use crate::common::PictureSize;
     use crate::frame::PixelFormat;
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn ready_needs_every_hop() {
+        #[cfg(windows)]
         let share = Some(ShareMechanism::NtHandle);
+        #[cfg(unix)]
+        let share = Some(ShareMechanism::DmaBuf);
         assert!(GpuCaps::new(share, true, true).ready());
         assert!(!GpuCaps::new(None, true, true).ready());
         assert!(!GpuCaps::new(share, false, true).ready());
         assert!(!GpuCaps::new(share, true, false).ready());
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn ready_accepts_either_share_mechanism() {
-        for share in [ShareMechanism::NtHandle, ShareMechanism::DmaBuf] {
-            assert!(GpuCaps::new(Some(share), true, true).ready());
-        }
+        #[cfg(windows)]
+        let share = ShareMechanism::NtHandle;
+        #[cfg(unix)]
+        let share = ShareMechanism::DmaBuf;
+        assert!(GpuCaps::new(Some(share), true, true).ready());
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn for_caps_matches_for_hops() {
-        let caps = GpuCaps::new(Some(ShareMechanism::NtHandle), true, true);
+        #[cfg(windows)]
+        let share = ShareMechanism::NtHandle;
+        #[cfg(unix)]
+        let share = ShareMechanism::DmaBuf;
+        let caps = GpuCaps::new(Some(share), true, true);
         assert_eq!(Plan::for_caps(&caps), Plan::gpu());
-        let caps = GpuCaps::new(Some(ShareMechanism::DmaBuf), false, true);
+        let caps = GpuCaps::new(Some(share), false, true);
         assert_eq!(
             Plan::for_caps(&caps).cause(),
             Some(FallbackCause::NoSharedExport)
@@ -398,9 +412,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn for_hops_names_first_miss() {
+        #[cfg(windows)]
         let share = Some(ShareMechanism::NtHandle);
+        #[cfg(unix)]
+        let share = Some(ShareMechanism::DmaBuf);
         assert_eq!(Plan::for_hops(share, true, true), Plan::gpu());
         assert_eq!(
             Plan::for_hops(None, true, true).cause(),

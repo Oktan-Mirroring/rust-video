@@ -259,6 +259,12 @@ impl PocTracker {
         self.lsb = lsb;
     }
 
+    /// Previous reference MSB and LSB.
+    #[must_use]
+    pub fn previous(&self) -> (i64, i64) {
+        (self.msb, i64::from(self.lsb))
+    }
+
     /// Zeroed pair, as before the first reference.
     pub fn reset(&mut self) {
         self.msb = 0;
@@ -378,9 +384,11 @@ mod tests {
         tracker.observe(64, 48);
         assert_eq!(tracker.msb_for(4, 64), 128);
         assert_eq!(tracker.msb_for(50, 64), 64);
+        assert_eq!(tracker.previous(), (64, 48));
         tracker.observe(64, 4);
         assert_eq!(tracker.msb_for(60, 64), 0);
         tracker.reset();
         assert_eq!(tracker.msb_for(4, 64), 0);
+        assert_eq!(tracker.previous(), (0, 0));
     }
 }
