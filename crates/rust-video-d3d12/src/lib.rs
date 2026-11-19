@@ -5,18 +5,18 @@
 #[cfg(target_os = "windows")]
 mod av1;
 #[cfg(target_os = "windows")]
-mod decode;
 mod decoder;
-#[cfg(target_os = "windows")]
-mod decoder_os;
 mod device;
 #[cfg(target_os = "windows")]
 mod device_os;
+#[cfg(target_os = "windows")]
+mod dpb;
 #[cfg(target_os = "windows")]
 mod encode;
 #[cfg(target_os = "windows")]
 mod encoder;
 mod error;
+mod frame;
 mod guid;
 #[cfg(target_os = "windows")]
 mod h264;
@@ -36,21 +36,24 @@ mod readback;
 mod scale;
 mod seam;
 #[cfg(target_os = "windows")]
+mod session;
+mod shell;
+#[cfg(target_os = "windows")]
 mod submit;
 #[cfg(target_os = "windows")]
 mod texture;
 #[cfg(target_os = "windows")]
 mod transcode;
+#[cfg(target_os = "windows")]
+mod vp9;
 
 #[cfg(target_os = "windows")]
 pub use av1::decoder::Av1Decoder;
-#[cfg(not(target_os = "windows"))]
-pub use decoder::Av1Decoder;
-pub use decoder::{D3d12Frame, Mpeg2Decoder, Vc1Decoder, Vp9Decoder};
 pub use device::D3d12Device;
 #[cfg(target_os = "windows")]
 pub use encoder::D3d12Encoder;
 pub use error::{BrokenReferenceReason, D3d12Error, ParseReason, SkipReason, UnsupportedReason};
+pub use frame::D3d12Frame;
 pub use guid::{Codec, Profile};
 #[cfg(target_os = "windows")]
 pub use h264::decoder::H264Decoder;
@@ -65,10 +68,17 @@ pub use overlap::{
     Av1Front, H264Front, HevcFront, OverlapPump, OverlappedAv1Pump, OverlappedH264Pump,
     OverlappedHevcPump,
 };
+#[cfg(not(target_os = "windows"))]
+pub use shell::Av1Decoder;
+#[cfg(not(target_os = "windows"))]
+pub use shell::Vp9Decoder;
+pub use shell::{Mpeg2Decoder, Vc1Decoder};
 #[cfg(target_os = "windows")]
 pub use texture::GpuSurface;
 #[cfg(target_os = "windows")]
 pub use transcode::Transcoder;
+#[cfg(target_os = "windows")]
+pub use vp9::decoder::Vp9Decoder;
 
 pub use rust_video_caps::transcode::GpuCaps;
 

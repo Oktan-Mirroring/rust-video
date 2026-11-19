@@ -9,11 +9,11 @@ use crate::av1::decoder::{frame_active_av1, open_sequence_av1, submit_av1_dpb};
 use crate::av1::dpb::Av1Dpb;
 use crate::av1::frontend::{Frame as Av1Frame, Ingest as Av1Ingest};
 use crate::av1::picture::Av1Submission;
-use crate::decode::{DecodeQueues, DecodeSession, Output};
-use crate::decoder::D3d12Frame;
-use crate::decoder_os::{emit_frame, visible_nv12, Active};
+use crate::decoder::{emit_frame, visible_nv12, Active};
 use crate::device::D3d12Device;
+use crate::dpb::Output;
 use crate::error::{D3d12Error, SkipReason};
+use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::h264::decoder::{open_sequence, sequence_of, submit_dpb};
 use crate::h264::dpb::Dpb;
@@ -25,6 +25,7 @@ use crate::h265::frontend::{Ingest as HevcIngest, Picture as HevcPicture};
 use crate::h265::picture::HevcSubmission;
 use crate::pins::{SlotPin, SlotPins};
 use crate::readback::{Done, Readback};
+use crate::session::{DecodeQueues, DecodeSession};
 use crate::submit::Ticket;
 
 use rust_video_caps::delivery::{

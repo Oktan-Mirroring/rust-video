@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use super::dpb::{Av1Decoded, Av1Dpb};
 use super::frontend::{Frame as Av1Frame, Ingest as Av1Ingest};
-use crate::decode::{DecodeQueues, DecodeSession};
-use crate::decoder::D3d12Frame;
-use crate::decoder_os::{emit_frame, session_surface_export, surface_layout, visible_nv12, Active};
+use crate::decoder::{emit_frame, session_surface_export, surface_layout, visible_nv12, Active};
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, ParseReason, SkipReason, UnsupportedReason};
+use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::h264::frontend::Crop;
 use crate::pins::SlotPins;
+use crate::session::{DecodeQueues, DecodeSession};
 use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 

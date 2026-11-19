@@ -1,6 +1,6 @@
 //! H.264 picture arguments behind one `DecodeFrame` call.
 
-use crate::decode::Submission;
+use crate::session::Submission;
 
 use super::params::{PicParamsH264, QmatrixH264, SliceShortH264};
 

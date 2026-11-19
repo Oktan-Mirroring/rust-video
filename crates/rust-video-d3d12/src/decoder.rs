@@ -1,258 +1,119 @@
-//! Decoded frames plus probed decoder shells behind the caps `Decoder` trait.
+//! Shared sequence state behind the live codec decoders.
 
-use crate::device::D3d12Device;
-use crate::error::{D3d12Error, SkipReason, UnsupportedReason};
-use crate::guid::Codec;
-use crate::seam::Seam;
+use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
+use crate::frame::D3d12Frame;
+use crate::h264::frontend::Crop;
+use crate::os::FrameOs;
+use crate::session::{DecodeSession, SharedExport};
+use crate::texture::SurfaceLayout;
 
 use bytes::Bytes;
-use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame};
-use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Lease};
-use rust_video_caps::transcode::GpuCaps;
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{GpuFrame, PixelFormat};
+use rust_video_caps::traits::SharedDevice;
 
-/// Decoded frame: NV12 bytes with identity and a budget lease.
-pub struct D3d12Frame {
-    /// Frame identity: size, format, generation.
-    identity: GpuFrame,
-    /// NV12 frame bytes in row-major order.
-    data: Bytes,
-    /// VRAM budget held for the bytes.
-    lease: Lease,
-    /// Platform export, absent without NT-handle sharing.
-    os: Option<Box<dyn Seam>>,
+/// Active sequence behind the live session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Active {
+    /// Sequence set id.
+    pub(crate) sps_id: u8,
+    /// Coded width in luma samples.
+    pub(crate) width: u32,
+    /// Coded height in luma samples.
+    pub(crate) height: u32,
+    /// Visible rectangle, absent when uncropped.
+    pub(crate) crop: Option<Crop>,
+    /// Visible size in luma samples.
+    pub(crate) visible: PictureSize,
 }
 
-impl D3d12Frame {
-    /// Decoded frame over leased bytes with identity and export.
-    ///
-    /// # Arguments
-    ///
-    /// * `identity` - frame size, format, and generation.
-    /// * `data` - NV12 frame bytes in row-major order.
-    /// * `lease` - VRAM budget held for the bytes.
-    /// * `os` - platform export, absent without NT-handle sharing.
-    // Unused off-target: only the Windows module and tests construct frames.
-    #[allow(dead_code)]
-    #[must_use]
-    pub(crate) fn new(
-        identity: GpuFrame,
-        data: Bytes,
-        lease: Lease,
-        os: Option<Box<dyn Seam>>,
-    ) -> Self {
-        Self {
-            identity,
-            data,
-            lease,
-            os,
-        }
-    }
-
-    /// Frame identity.
-    #[must_use]
-    pub fn identity(&self) -> GpuFrame {
-        self.identity
-    }
-
-    /// NV12 frame bytes in row-major order.
-    #[must_use]
-    pub fn nv12(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Budget bytes the frame holds.
-    #[must_use]
-    pub fn lease_bytes(&self) -> u64 {
-        self.lease.bytes()
-    }
-
-    /// Platform export handle for the frame.
-    ///
-    /// NT handle over the shared pool texture, or an opaque backend
-    /// descriptor when the driver declines sharing.
-    #[must_use]
-    pub fn export(&self) -> GpuExport {
-        if let Some(os) = &self.os {
-            os.export()
-        } else {
-            GpuExport::Opaque { name: "d3d12" }
-        }
-    }
-
-    /// CPU copy split into NV12 planes.
-    #[must_use]
-    pub fn to_cpu(&self) -> Option<CpuFrame> {
-        CpuFrame::from_nv12(self.identity.size(), &self.data)
+impl Active {
+    /// True when `other` shares the coded extent.
+    pub(crate) fn same_extent(self, other: Active) -> bool {
+        self.width == other.width && self.height == other.height
     }
 }
 
-/// Probed decoder shell; the picture builder is pending.
-macro_rules! shell {
-    ($decoder:ident, $codec:ident, $doc:literal) => {
-        #[doc = $doc]
-        pub struct $decoder<'a> {
-            /// Device behind the profile probe.
-            device: &'a D3d12Device,
-        }
-
-        impl<'a> $decoder<'a> {
-            /// Decoder over `device`; decode reports the pending builder.
-            #[must_use]
-            pub fn open(device: &'a D3d12Device) -> Self {
-                Self { device }
-            }
-        }
-
-        impl Decoder for $decoder<'_> {
-            type Frame = D3d12Frame;
-            type Error = D3d12Error;
-
-            fn caps(&self) -> GpuCaps {
-                GpuCaps::new(None, false, false)
-            }
-
-            fn decode(&mut self, _packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
-                if !self.device.supports(Codec::$codec) {
-                    return Err(SkipReason::ProfileUnsupported {
-                        codec: Codec::$codec,
-                    }
-                    .into());
-                }
-                Err(D3d12Error::Unsupported(
-                    UnsupportedReason::PictureBuilderPending {
-                        codec: Codec::$codec,
-                    },
-                ))
-            }
-
-            fn flush(&mut self) -> Result<Vec<D3d12Frame>, D3d12Error> {
-                Ok(Vec::new())
-            }
-        }
-    };
+/// Surface layout for pool `slot` under `active`.
+pub(crate) fn surface_layout(active: &Active, slot: u8) -> Result<SurfaceLayout, D3d12Error> {
+    let coded = PictureSize::new(active.width, active.height)
+        .ok_or(D3d12Error::Parse(ParseReason::EmptyCodedSize))?;
+    let origin = active.crop.map_or((0, 0), |crop| (crop.left, crop.top));
+    Ok(SurfaceLayout::new(
+        active.visible,
+        coded,
+        origin,
+        u32::from(slot),
+    ))
 }
 
-#[cfg(not(target_os = "windows"))]
-shell!(
-    Av1Decoder,
-    Av1,
-    "AV1 decoder; the picture builder is pending."
-);
-shell!(
-    Mpeg2Decoder,
-    Mpeg2,
-    "MPEG-2 decoder; the picture builder is pending."
-);
-shell!(
-    Vc1Decoder,
-    Vc1,
-    "VC-1 decoder; the picture builder is pending."
-);
-shell!(
-    Vp9Decoder,
-    Vp9,
-    "VP9 decoder; the picture builder is pending."
-);
-
-#[cfg(test)]
-mod tests {
-    use super::D3d12Frame;
-
-    use bytes::Bytes;
-    use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
-    use rust_video_caps::traits::SharedDevice;
-
-    /// Frame over `data` leased against `shared`.
-    fn frame(shared: &SharedDevice, width: u32, height: u32, data: Vec<u8>) -> D3d12Frame {
-        let size = PictureSize::new(width, height).expect("nonzero extent");
-        let identity = GpuFrame::new(size, PixelFormat::Nv12, 3);
-        let bytes = Bytes::from(data);
-        let lease = shared
-            .try_acquire(bytes.len() as u64)
-            .expect("within budget");
-        D3d12Frame::new(identity, bytes, lease, None)
+/// NT-handle export for pool `slot`, honoring the session crop.
+pub(crate) fn session_surface_export(session: &DecodeSession, slot: u8) -> Option<SharedExport> {
+    if session.cropped() {
+        session.shared_handle_crop(slot)
+    } else {
+        session.shared_handle(slot)
     }
+}
 
-    #[test]
-    fn frame_holds_lease_against_budget() {
-        let shared = SharedDevice::new("d3d12", 100);
-        let held = frame(&shared, 4, 2, vec![7; 12]);
-        assert_eq!(held.lease_bytes(), 12);
-        assert_eq!(shared.used(), 12);
-        assert_eq!(held.nv12(), &[7; 12]);
-        assert_eq!(held.identity().generation(), 3);
+/// Visible NV12 bytes of coded `nv12` under `active`.
+///
+/// AV1 sessions decode at the sequence maximum; frames below it crop
+/// the right and bottom pad.
+///
+/// # Errors
+///
+/// Returns `Err` past the picture cap, or when `nv12` falls short of
+/// the coded extent.
+pub(crate) fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
+    let too_large = || D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge);
+    let short = || D3d12Error::Unsupported(UnsupportedReason::ReadbackShortOfExtent);
+    let visible_width = usize::try_from(active.visible.width()).map_err(|_| too_large())?;
+    let visible_height = usize::try_from(active.visible.height()).map_err(|_| too_large())?;
+    let coded_width = usize::try_from(active.width).map_err(|_| too_large())?;
+    let coded_height = usize::try_from(active.height).map_err(|_| too_large())?;
+    if visible_width == coded_width && visible_height == coded_height {
+        return Ok(nv12);
     }
-
-    #[test]
-    fn dropped_frame_releases_budget() {
-        let shared = SharedDevice::new("d3d12", 100);
-        {
-            let _held = frame(&shared, 4, 2, vec![0; 12]);
-            assert_eq!(shared.used(), 12);
-        }
-        assert_eq!(shared.used(), 0);
+    let luma = coded_width.checked_mul(coded_height).ok_or_else(short)?;
+    if nv12.len() != luma + luma / 2 {
+        return Err(short());
     }
-
-    #[test]
-    fn export_without_sharing_names_backend() {
-        let shared = SharedDevice::new("d3d12", 100);
-        let held = frame(&shared, 4, 2, vec![0; 12]);
-        assert!(matches!(held.export(), GpuExport::Opaque { name: "d3d12" }));
+    let mut visible = Vec::with_capacity(visible_width * visible_height * 3 / 2);
+    for row in 0..visible_height {
+        let start = row.checked_mul(coded_width).ok_or_else(short)?;
+        visible.extend_from_slice(nv12.get(start..start + visible_width).ok_or_else(short)?);
     }
-
-    #[test]
-    fn to_cpu_splits_nv12_planes() {
-        let shared = SharedDevice::new("d3d12", 100);
-        let mut data = vec![1; 8];
-        data.extend_from_slice(&[2; 4]);
-        let held = frame(&shared, 4, 2, data);
-        let cpu = held.to_cpu().expect("full nv12");
-        assert_eq!(cpu.format(), PixelFormat::Nv12);
-        assert_eq!(cpu.planes().len(), 2);
-        assert_eq!(cpu.planes()[0].data(), &[1; 8]);
-        assert_eq!(cpu.planes()[1].data(), &[2; 4]);
+    for row in 0..visible_height / 2 {
+        let start = luma + row.checked_mul(coded_width).ok_or_else(short)?;
+        visible.extend_from_slice(nv12.get(start..start + visible_width).ok_or_else(short)?);
     }
+    Ok(visible)
+}
 
-    #[test]
-    fn to_cpu_rejects_truncated_bytes() {
-        let shared = SharedDevice::new("d3d12", 100);
-        let held = frame(&shared, 4, 2, vec![0; 11]);
-        assert!(held.to_cpu().is_none());
+/// Frame for NV12 `nv12` at `generation`.
+pub(crate) fn emit_frame(
+    budget: &SharedDevice,
+    nv12: Vec<u8>,
+    export: Option<SharedExport>,
+    active: &Active,
+    generation: u64,
+) -> Result<D3d12Frame, D3d12Error> {
+    let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
+    let y_len = usize::try_from(luma)
+        .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
+    if nv12.len() != y_len + y_len / 2 {
+        return Err(D3d12Error::Unsupported(
+            UnsupportedReason::ReadbackShortOfExtent,
+        ));
     }
-
-    #[test]
-    fn frame_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<D3d12Frame>();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn shell_caps_decline_typed() {
-        use rust_video_caps::packet::Packet;
-        use rust_video_caps::traits::Decoder;
-        use rust_video_caps::transcode::GpuCaps;
-
-        let Ok(device) = crate::device::D3d12Device::open() else {
-            return;
-        };
-        let packet = Packet::new(Bytes::new());
-        {
-            let mut shell = super::Mpeg2Decoder::open(&device);
-            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
-            assert!(shell.decode(&packet).is_err());
-        }
-        {
-            let mut shell = super::Vc1Decoder::open(&device);
-            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
-            assert!(shell.decode(&packet).is_err());
-        }
-        {
-            let mut shell = super::Vp9Decoder::open(&device);
-            assert_eq!(shell.caps(), GpuCaps::new(None, false, false));
-            assert!(shell.decode(&packet).is_err());
-        }
-    }
+    let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, generation);
+    let bytes = Bytes::from(nv12);
+    let lease = budget.try_acquire(bytes.len() as u64)?;
+    Ok(D3d12Frame::new(
+        identity,
+        bytes,
+        lease,
+        FrameOs::wrap(export),
+    ))
 }

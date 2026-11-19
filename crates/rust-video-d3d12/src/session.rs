@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::av1::params::{PicParamsAv1, TileAv1};
 use crate::av1::picture::Av1Submission;
-use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
+use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::frontend::Crop;
 use crate::h264::picture::H264Submission;
 use crate::h265::picture::HevcSubmission;
@@ -121,39 +121,6 @@ pub(crate) trait Submission {
     fn slices(&self) -> &[Self::Slice];
     /// Bitstream length in bytes.
     fn bitstream_len(&self) -> usize;
-}
-
-/// Slot number as a byte.
-pub(crate) fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
-    u8::try_from(slot).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "slot" }))
-}
-
-/// Outputs for `emits` in display order.
-pub(crate) fn outputs_sorted(mut emits: Vec<(i32, usize)>) -> Vec<Output> {
-    emits.sort_unstable();
-    emits
-        .into_iter()
-        .filter_map(|(_, slot)| slot_u8(slot).ok().map(|slot| Output { slot }))
-        .collect()
-}
-
-/// Picture ready for display from `slot`.
-#[derive(Debug)]
-pub(crate) struct Output {
-    /// Output surface slot.
-    pub(crate) slot: u8,
-}
-
-impl Output {
-    /// Output naming `slot`.
-    pub(crate) const fn from_slot(slot: u8) -> Self {
-        Self { slot }
-    }
-
-    /// Output surface slot.
-    pub(crate) const fn slot(&self) -> u8 {
-        self.slot
-    }
 }
 
 /// Visible extent plus per-plane source boxes under a crop.

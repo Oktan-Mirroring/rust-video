@@ -13,7 +13,7 @@ use super::params::{
     BITS_WEIGHTED_PRED,
 };
 use super::picture::H264Submission;
-use crate::decode::{outputs_sorted, slot_u8, Output};
+use crate::dpb::{outputs_sorted, slot_u8, Output};
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
 use crate::pins::SlotPins;
 
@@ -558,7 +558,7 @@ impl Dpb {
             .iter()
             .map(|slice| slice.nal.as_slice())
             .collect();
-        let (spans, bitstream) = crate::decode::start_coded_bitstream(&nals)?;
+        let (spans, bitstream) = crate::session::start_coded_bitstream(&nals)?;
         let slices = spans
             .into_iter()
             .map(|(location, bytes)| SliceShortH264 {
@@ -696,7 +696,7 @@ pub(crate) struct Decoded {
 #[cfg(test)]
 mod tests {
     use super::Dpb;
-    use crate::decode::Output;
+    use crate::dpb::Output;
     use crate::h264::frontend::{
         FidelityRange, Marking, Mmco, PendingSlice, Picture, PocType, Pps, ScalingSets,
         SliceHeader, SlicePoc, SliceType, Sps, VuiParams, Weights, PPS_DEBLOCKING,

@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use super::dpb::{HevcDecoded, HevcDpb};
 use super::frontend::{Ingest as HevcIngest, Picture as HevcPicture};
-use crate::decode::{DecodeQueues, DecodeSession};
-use crate::decoder::D3d12Frame;
-use crate::decoder_os::{emit_frame, session_surface_export, surface_layout, Active};
+use crate::decoder::{emit_frame, session_surface_export, surface_layout, Active};
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, ParseReason, SkipReason};
+use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::h264::frontend::Crop;
 use crate::pins::SlotPins;
+use crate::session::{DecodeQueues, DecodeSession};
 use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 

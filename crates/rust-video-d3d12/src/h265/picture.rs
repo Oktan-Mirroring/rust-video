@@ -1,6 +1,6 @@
 //! H.265 picture arguments behind one `DecodeFrame` call.
 
-use crate::decode::Submission;
+use crate::session::Submission;
 
 use super::params::{PicParamsHevc, QmatrixHevc, SliceShortHevc};
 

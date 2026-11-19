@@ -15,9 +15,10 @@ use super::params::{
     HEVC_TOOL_STRONG_INTRA, HEVC_TOOL_TEMPORAL_MVP,
 };
 use super::picture::HevcSubmission;
-use crate::decode::{outputs_sorted, slot_u8, start_coded_bitstream, Output};
+use crate::dpb::{outputs_sorted, slot_u8, Output};
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedReason};
 use crate::pins::SlotPins;
+use crate::session::start_coded_bitstream;
 
 use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
 use rust_video_h265::{anchors_tid0, is_slnr};
@@ -624,7 +625,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::HevcDpb;
-    use crate::decode::Output;
+    use crate::dpb::Output;
     use crate::h265::frontend::{
         ConstraintFlags, PendingSlice, Picture, Pps, ProfileTierLevel, RpsBits, ScalingLists,
         ShortTermRps, SliceHeader, SliceType, SourceFlags, Sps, SPS_SAO, SPS_TEMPORAL_MVP,

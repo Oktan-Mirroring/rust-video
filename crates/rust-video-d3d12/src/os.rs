@@ -1,7 +1,7 @@
 //! Windows OS state behind the portable d3d12 handles.
 
-use crate::decode::SharedExport;
 use crate::seam::Seam;
+use crate::session::SharedExport;
 use crate::submit::DeviceResources;
 
 use rust_video_caps::frame::GpuExport;

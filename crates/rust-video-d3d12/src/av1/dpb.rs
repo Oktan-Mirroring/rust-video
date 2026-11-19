@@ -27,7 +27,7 @@ use super::params::{
     AV1_SEG_ENABLED, AV1_SEG_TEMPORAL_UPDATE, AV1_SEG_UPDATE_DATA, AV1_SEG_UPDATE_MAP,
 };
 use super::picture::Av1Submission;
-use crate::decode::Output;
+use crate::dpb::Output;
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason};
 use crate::pins::SlotPins;
 
@@ -557,7 +557,7 @@ mod tests {
         FilmGrain, Frame, FrameHeader, FrameType, GlobalMotion, SequenceHeader, TileData,
         FH_SHOW_FRAME, SEQ_CDEF, SEQ_ORDER_HINT, SEQ_SUBSAMPLING_X, SEQ_SUBSAMPLING_Y,
     };
-    use crate::decode::Output;
+    use crate::dpb::Output;
 
     /// Empty pin table behind buffer tests.
     fn pins() -> Arc<crate::pins::SlotPins> {

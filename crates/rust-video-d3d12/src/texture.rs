@@ -1,8 +1,8 @@
 //! Device-resident NV12 surface behind GPU decode and transcode.
 
-use crate::decode::SharedExport;
 use crate::error::D3d12Error;
 use crate::pins::SlotPin;
+use crate::session::SharedExport;
 use crate::submit::Fence;
 
 use rust_video_caps::common::PictureSize;
