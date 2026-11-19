@@ -17,6 +17,10 @@ pub(crate) const TREE_PROBS: usize = 7;
 
 /// Segment prediction probabilities per frame.
 pub(crate) const PRED_PROBS: usize = 3;
+
+/// Switchable interpolation filter id.
+pub const INTERP_SWITCHABLE: u8 = 4;
+
 /// Existing-frame display flag bit.
 pub const FH_SHOW_EXISTING: u32 = 1;
 

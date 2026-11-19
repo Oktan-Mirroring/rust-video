@@ -2,10 +2,10 @@
 
 use core::marker::PhantomData;
 
-use crate::error::{HevcError, ParseKind};
+use crate::error::{H265Error, ParseKind};
 
 /// Exp-Golomb bit reader.
-pub struct BitReader<'a, E: HevcError> {
+pub struct BitReader<'a, E: H265Error> {
     /// RBSP bytes under read.
     data: &'a [u8],
     /// Bit offset of the next read.
@@ -14,7 +14,7 @@ pub struct BitReader<'a, E: HevcError> {
     error: PhantomData<E>,
 }
 
-impl<'a, E: HevcError> BitReader<'a, E> {
+impl<'a, E: H265Error> BitReader<'a, E> {
     /// Reader over `data`.
     #[must_use]
     pub fn new(data: &'a [u8]) -> Self {

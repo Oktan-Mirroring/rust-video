@@ -2,8 +2,8 @@
 
 use crate::bits::BitReader;
 use crate::error::{narrow_u8, H264Error, H264Gate, ParseKind, UnsupportedKind};
-use crate::nal::{Crop, MAX_SPS};
-use crate::scaling::{fallback_scaling, sequence_scaling, ScalingMap, ScalingSets};
+use crate::framing::{Crop, MAX_SPS};
+use crate::scaling::{fallback_scaling, sequence_scaling, ScalingLists, ScalingMap};
 use crate::vui::{parse_vui, VuiParams};
 
 /// Picture order count method, H.264 8.2.1.
@@ -68,7 +68,7 @@ pub struct Sps {
     /// Constraint-set flags with reserved bits.
     pub constraints: u8,
     /// Resolved sequence scaling lists.
-    pub scaling: ScalingSets,
+    pub scaling: ScalingLists,
     /// Scaling presence, absent without a matrix flag.
     pub scaling_map: Option<ScalingMap>,
     /// Fidelity-range extensions.
@@ -363,7 +363,7 @@ fn base_fidelity() -> FidelityRange {
 fn parse_sps_chroma<E: H264Error>(
     reader: &mut BitReader<E>,
     profile_idc: u8,
-) -> Result<(FidelityRange, ScalingSets, Option<ScalingMap>), E> {
+) -> Result<(FidelityRange, ScalingLists, Option<ScalingMap>), E> {
     if !matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 134 | 135 | 138 | 139
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn sps_vui_without_restriction_has_no_ceiling() {
         let body = sps_body_vui(None);
-        let bytes = crate::nal::rbsp(&body);
+        let bytes = crate::framing::rbsp(&body);
         let sps = parse_sps::<TestError, StrictGate>(&bytes).expect("vui sps");
         assert_eq!(sps.num_reorder_frames(), None);
     }
@@ -546,7 +546,7 @@ mod tests {
     fn sps_restriction_reports_reorder_ceiling() {
         for reorder in [0, 2] {
             let body = sps_body_vui(Some(reorder));
-            let bytes = crate::nal::rbsp(&body);
+            let bytes = crate::framing::rbsp(&body);
             let sps = parse_sps::<TestError, StrictGate>(&bytes).expect("restricted sps");
             assert_eq!(sps.num_reorder_frames(), Some(reorder));
         }

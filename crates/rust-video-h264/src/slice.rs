@@ -160,7 +160,7 @@ pub struct SliceHeader {
     /// L1 reference list modifications.
     pub ref_mod_l1: Vec<RefMod>,
     /// Prediction weight table.
-    pub weights: Weights,
+    pub weights: SliceWeights,
     /// Reference marking.
     pub marking: Marking,
     /// Redundant picture count.
@@ -204,7 +204,7 @@ pub struct WeightEntry {
 
 /// Prediction weight table for one slice.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Weights {
+pub struct SliceWeights {
     /// Luma weight denominator.
     pub luma_denom: u8,
     /// Chroma weight denominator.
@@ -214,6 +214,8 @@ pub struct Weights {
     /// Explicit L1 weights by reference index.
     pub l1: Vec<WeightEntry>,
 }
+
+pub use self::SliceWeights as Weights;
 
 /// Slice header prefix: address, type, fixed marker, set id.
 ///
@@ -273,7 +275,7 @@ pub fn parse_slice_rest<E: H264Error, G: H264Gate<E>>(
         ref_override: None,
         ref_mod_l0: Vec::new(),
         ref_mod_l1: Vec::new(),
-        weights: Weights::default(),
+        weights: SliceWeights::default(),
         marking: Marking::Silent,
         redundant_pic_cnt,
         cabac_init_idc: 0,
@@ -446,7 +448,7 @@ fn parse_weights<E: H264Error>(
     if header.slice_type.is_b() {
         l1 = parse_weight_list(reader, header.num_ref_l1(pps), chroma)?;
     }
-    header.weights = Weights {
+    header.weights = SliceWeights {
         luma_denom: narrow_u8(luma_denom, "luma_log2_weight_denom")?,
         chroma_denom: narrow_u8(chroma_denom, "chroma_log2_weight_denom")?,
         l0,

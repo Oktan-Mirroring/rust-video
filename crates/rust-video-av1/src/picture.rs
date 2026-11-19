@@ -1,304 +1,17 @@
-//! AV1 OBU ingest plus tile assembly.
+//! AV1 frame ingest: OBU dispatch plus tile assembly.
 
-use crate::bits::BitReader;
-use crate::error::{Error, ParseReason, UnsupportedReason};
-use crate::frame::{parse_frame_header, FrameHeader, FrameType, RefInfo};
+use crate::error::{Error, ParseKind, UnsupportedKind};
+use crate::frame::{parse_frame_header, Frame, FrameHeader, FrameType, RefInfo, TileData};
+use crate::framing::{
+    split_obus, split_tiles, tile_group_range, Obu, OBU_FRAME, OBU_FRAME_HEADER, OBU_METADATA,
+    OBU_PADDING, OBU_REDUNDANT_FRAME_HEADER, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER,
+    OBU_TILE_GROUP, OBU_TILE_LIST,
+};
 use crate::sequence::{parse_sequence_header, SequenceHeader};
-use crate::syntax::read_leb128;
 use crate::{NUM_REF_FRAMES, SUPERRES_NUM};
-
-/// Sequence header OBU type.
-pub const OBU_SEQUENCE_HEADER: u8 = 1;
-
-/// Temporal delimiter OBU type.
-pub const OBU_TEMPORAL_DELIMITER: u8 = 2;
-
-/// Frame header OBU type.
-pub const OBU_FRAME_HEADER: u8 = 3;
-
-/// Tile group OBU type.
-pub const OBU_TILE_GROUP: u8 = 4;
-
-/// Metadata OBU type.
-pub const OBU_METADATA: u8 = 5;
-
-/// Frame OBU type.
-pub const OBU_FRAME: u8 = 6;
-
-/// Redundant frame header OBU type.
-pub const OBU_REDUNDANT_FRAME_HEADER: u8 = 7;
-
-/// Tile list OBU type.
-pub const OBU_TILE_LIST: u8 = 8;
-
-/// Padding OBU type.
-pub const OBU_PADDING: u8 = 15;
 
 /// Tile grid ceiling behind the DXVA grid.
 const MAX_TILES: usize = 256;
-
-/// Byte offset of the tile group past frame-header alignment, 5.10.
-///
-/// # Errors
-///
-/// Returns `Err` on truncated payload or invalid alignment bits.
-///
-/// # Arguments
-///
-/// * `payload` - frame OBU payload bytes.
-/// * `consumed_bits` - header bits consumed by the frame parse.
-pub fn frame_obu_tile_offset<E: From<Error>>(
-    payload: &[u8],
-    consumed_bits: usize,
-) -> Result<usize, E> {
-    let total_bits = payload.len().saturating_mul(8);
-    if consumed_bits >= total_bits {
-        return Err(Error::parse(ParseReason::Truncated {
-            syntax: "alignment_bit",
-        }));
-    }
-    let end = consumed_bits / 8 * 8 + 8;
-    if end > total_bits {
-        return Err(Error::parse(ParseReason::Truncated {
-            syntax: "alignment_bit",
-        }));
-    }
-    if payload[consumed_bits / 8] & (0x80 >> (consumed_bits % 8)) == 0 {
-        return Err(Error::parse(ParseReason::Range {
-            syntax: "alignment_bit",
-        }));
-    }
-    for bit in consumed_bits + 1..end {
-        if payload[bit / 8] & (0x80 >> (bit % 8)) != 0 {
-            return Err(Error::parse(ParseReason::Range {
-                syntax: "alignment_bit",
-            }));
-        }
-    }
-    Ok(end / 8)
-}
-
-/// One decoded tile: payload plus grid position.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TileData {
-    /// Tile payload bytes without the size field.
-    pub bytes: Vec<u8>,
-    /// Tile row.
-    pub row: u16,
-    /// Tile column.
-    pub column: u16,
-}
-
-/// One coded frame: header plus tiles in tile order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Frame {
-    /// Parsed frame header.
-    pub header: FrameHeader,
-    /// Tile payloads in tile order.
-    pub tiles: Vec<TileData>,
-}
-
-/// OBU header with its payload span.
-pub struct Obu<'a> {
-    /// OBU type.
-    pub unit_type: u8,
-    /// Temporal id.
-    pub temporal_id: u8,
-    /// Spatial id.
-    pub spatial_id: u8,
-    /// Payload bytes.
-    pub payload: &'a [u8],
-}
-
-/// Payload OBUs of `data` in order.
-///
-/// # Errors
-///
-/// Returns `Err` on forbidden or reserved header bits, a short
-/// extension header, or a size field past the payload.
-pub fn split_obus<E: From<Error>>(data: &[u8]) -> Result<Vec<Obu<'_>>, E> {
-    let mut obus = Vec::new();
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let header = data[offset];
-        if header >> 7 != 0 {
-            return Err(Error::parse(ParseReason::ObuForbiddenBit));
-        }
-        let unit_type = (header >> 3) & 0x0F;
-        let extension = header >> 2 & 1 != 0;
-        let has_size = header >> 1 & 1 != 0;
-        if header & 1 != 0 {
-            return Err(Error::parse(ParseReason::ObuReservedBit));
-        }
-        offset += 1;
-        let (temporal_id, spatial_id) = if extension {
-            let extension = *data.get(offset).ok_or({
-                Error::parse(ParseReason::Truncated {
-                    syntax: "obu_extension_header",
-                })
-            })?;
-            if extension & 7 != 0 {
-                return Err(Error::parse(ParseReason::ObuExtensionReservedBits));
-            }
-            offset += 1;
-            (extension >> 5, (extension >> 3) & 3)
-        } else {
-            (0, 0)
-        };
-        let payload = if has_size {
-            let mut size_reader = BitReader::new(&data[offset..]);
-            let size = read_leb128(&mut size_reader, "obu_size")?;
-            let consumed = size_reader.position() / 8;
-            offset += consumed;
-            let size = usize::try_from(size)
-                .map_err(|_| Error::parse(ParseReason::Range { syntax: "obu_size" }))?;
-            let end = offset
-                .checked_add(size)
-                .filter(|end| *end <= data.len())
-                .ok_or(Error::parse(ParseReason::ObuSizeExceedsPayload))?;
-            let payload = &data[offset..end];
-            offset = end;
-            payload
-        } else {
-            let payload = &data[offset..];
-            offset = data.len();
-            payload
-        };
-        obus.push(Obu {
-            unit_type,
-            temporal_id,
-            spatial_id,
-            payload,
-        });
-    }
-    Ok(obus)
-}
-
-/// Tile group header: tile range plus data past the alignment.
-pub struct TileGroupHead<'a> {
-    /// First tile index of the group.
-    pub start: usize,
-    /// Last tile index of the group.
-    pub end: usize,
-    /// Header bits consumed before alignment.
-    pub consumed_bits: usize,
-    /// Tile data past the group header.
-    pub data: &'a [u8],
-}
-
-/// Tile range plus data behind the tile group header.
-///
-/// # Errors
-///
-/// Returns `Err` on a range outside the grid or data short of
-/// the alignment.
-///
-/// # Arguments
-///
-/// * `payload` - tile group OBU payload.
-/// * `tile_count` - tiles of the frame grid.
-/// * `cols_log2` - tile column shift.
-/// * `rows_log2` - tile row shift.
-pub fn tile_group_range<E: From<Error>>(
-    payload: &[u8],
-    tile_count: usize,
-    cols_log2: u8,
-    rows_log2: u8,
-) -> Result<TileGroupHead<'_>, E> {
-    let mut reader = BitReader::new(payload);
-    let mut start = 0usize;
-    let mut end = tile_count - 1;
-    if tile_count > 1 && reader.read_bit("tile_start_and_end_present_flag")? {
-        let width = u32::from(cols_log2) + u32::from(rows_log2);
-        start = usize::try_from(reader.read_bits(width, "tg_start")?)
-            .map_err(|_| Error::parse(ParseReason::Range { syntax: "tg_start" }))?;
-        end = usize::try_from(reader.read_bits(width, "tg_end")?)
-            .map_err(|_| Error::parse(ParseReason::Range { syntax: "tg_end" }))?;
-        if start > end || end >= tile_count {
-            return Err(Error::parse(ParseReason::Range {
-                syntax: "tile group",
-            }));
-        }
-    }
-    let consumed_bits = reader.position();
-    let aligned = consumed_bits.next_multiple_of(8);
-    let data = payload
-        .get(aligned / 8..)
-        .ok_or(Error::parse(ParseReason::TileGroupWithoutData))?;
-    Ok(TileGroupHead {
-        start,
-        end,
-        consumed_bits,
-        data,
-    })
-}
-
-/// Byte offset and length of tiles `start` through `end` in `data`.
-///
-/// # Errors
-///
-/// Returns `Err` when a size field or tile body runs past `data`.
-///
-/// # Arguments
-///
-/// * `data` - tile data past the group header.
-/// * `start` - first tile index of the group.
-/// * `end` - last tile index of the group.
-/// * `size_bytes` - little-endian tile size field width in bytes; each
-///   holds one less than the tile length.
-///
-/// # Returns
-///
-/// Offsets with lengths; the last tile runs to the data end.
-pub fn split_tiles<E: From<Error>>(
-    data: &[u8],
-    start: usize,
-    end: usize,
-    size_bytes: u8,
-) -> Result<Vec<(usize, usize)>, E> {
-    let mut tiles = Vec::new();
-    let mut offset = 0usize;
-    let width = usize::from(size_bytes);
-    for tile in start..=end {
-        let tail = data
-            .get(offset..)
-            .ok_or(Error::parse(ParseReason::Truncated {
-                syntax: "tile data",
-            }))?;
-        if tile == end {
-            tiles.push((offset, tail.len()));
-            return Ok(tiles);
-        }
-        let size = tail
-            .get(..width)
-            .ok_or(Error::parse(ParseReason::Truncated {
-                syntax: "tile size",
-            }))?;
-        let mut value: u64 = 0;
-        for (index, byte) in size.iter().enumerate() {
-            value |= u64::from(*byte) << (index * 8);
-        }
-        let length = usize::try_from(value + 1).map_err(|_| {
-            Error::parse(ParseReason::Range {
-                syntax: "tile size",
-            })
-        })?;
-        let body = tail
-            .get(width..)
-            .and_then(|tail| tail.get(..length))
-            .ok_or(Error::parse(ParseReason::Truncated {
-                syntax: "tile data",
-            }))?;
-        tiles.push((offset + width, body.len()));
-        offset = offset
-            .checked_add(width)
-            .and_then(|offset| offset.checked_add(length))
-            .ok_or(Error::parse(ParseReason::Range {
-                syntax: "tile size",
-            }))?;
-    }
-    Ok(tiles)
-}
 
 /// OBU ingest: sequence header plus frame assembly.
 pub struct Ingest {
@@ -393,8 +106,8 @@ impl Ingest {
             OBU_TILE_GROUP => self.ingest_tile_group(obu, frames),
             OBU_FRAME => self.ingest_frame(obu, frames),
             OBU_METADATA | OBU_PADDING => Ok(()),
-            OBU_TILE_LIST => Err(Error::unsupported(UnsupportedReason::TileList)),
-            _ => Err(Error::parse(ParseReason::ReservedObuType)),
+            OBU_TILE_LIST => Err(Error::unsupported(UnsupportedKind::TileList)),
+            _ => Err(Error::parse(ParseKind::ReservedObuType)),
         }
     }
 
@@ -404,14 +117,14 @@ impl Ingest {
         let depth = seq.bit_depth();
         if depth == 10 || depth == 12 {
             return Err(Error::unsupported(
-                UnsupportedReason::Av1BitDepthNeedsTarget { depth },
+                UnsupportedKind::Av1BitDepthNeedsTarget { depth },
             ));
         }
         if seq.mono_chrome() {
-            return Err(Error::unsupported(UnsupportedReason::Av1Monochrome));
+            return Err(Error::unsupported(UnsupportedKind::Av1Monochrome));
         }
         if !seq.subsampling_x() || !seq.subsampling_y() {
-            return Err(Error::unsupported(UnsupportedReason::Av1ChromaOutside420));
+            return Err(Error::unsupported(UnsupportedKind::Av1ChromaOutside420));
         }
         if self.seq.as_ref() != Some(&seq) {
             self.refs = core::array::from_fn(|_| RefInfo::default());
@@ -429,7 +142,7 @@ impl Ingest {
         if obu.unit_type == OBU_REDUNDANT_FRAME_HEADER {
             if let Some(previous) = &self.pending_bytes {
                 if previous.as_slice() != obu.payload {
-                    return Err(Error::parse(ParseReason::RedundantHeaderMismatch));
+                    return Err(Error::parse(ParseKind::RedundantHeaderMismatch));
                 }
                 return Ok(());
             }
@@ -460,7 +173,7 @@ impl Ingest {
         let tile_count = usize::from(tile_cols) * usize::from(tile_rows);
         let head = tile_group_range(obu.payload, tile_count, cols_log2, rows_log2)?;
         if head.start != self.pending_tiles.len() {
-            return Err(Error::parse(ParseReason::TileGroupOrder));
+            return Err(Error::parse(ParseKind::TileGroupOrder));
         }
         Self::push_tiles(
             &mut self.pending_tiles,
@@ -483,7 +196,7 @@ impl Ingest {
         let header = self
             .pending_header
             .as_ref()
-            .ok_or(Error::parse(ParseReason::TileGroupWithoutFrameHeader))?;
+            .ok_or(Error::parse(ParseKind::TileGroupWithoutFrameHeader))?;
         Ok((
             header.tile_cols,
             header.tile_rows,
@@ -511,7 +224,7 @@ impl Ingest {
         }
         let consumed = consumed_bits.div_ceil(8);
         let Some(rest) = obu.payload.get(consumed..) else {
-            return Err(Error::parse(ParseReason::FrameWithoutTileData));
+            return Err(Error::parse(ParseKind::FrameWithoutTileData));
         };
         let tile_count = usize::from(header.tile_cols) * usize::from(header.tile_rows);
         let head = tile_group_range(
@@ -540,12 +253,12 @@ impl Ingest {
     /// Frame header plus consumed bit count against the active sequence header.
     fn parse_header<E: From<Error>>(&mut self, obu: &Obu) -> Result<(FrameHeader, usize), E> {
         if obu.spatial_id != 0 {
-            return Err(Error::unsupported(UnsupportedReason::SpatialLayers));
+            return Err(Error::unsupported(UnsupportedKind::SpatialLayers));
         }
         let seq = self
             .seq
             .as_ref()
-            .ok_or(Error::parse(ParseReason::FrameBeforeSequenceHeader))?;
+            .ok_or(Error::parse(ParseKind::FrameBeforeSequenceHeader))?;
         let (header, consumed) = parse_frame_header(
             obu.payload,
             seq,
@@ -558,11 +271,11 @@ impl Ingest {
                 || header.render_height != header.frame_height)
         {
             return Err(Error::unsupported(
-                UnsupportedReason::RenderSizeDiffersFromFrameSize,
+                UnsupportedKind::RenderSizeDiffersFromFrameSize,
             ));
         }
         if header.superres_denom != SUPERRES_NUM {
-            return Err(Error::unsupported(UnsupportedReason::SuperresUpscale));
+            return Err(Error::unsupported(UnsupportedKind::SuperresUpscale));
         }
         Ok((header, consumed))
     }
@@ -581,9 +294,9 @@ impl Ingest {
             (start..).zip(split_tiles(data, start, end, tile_size_bytes)?)
         {
             let row = u16::try_from(tile / cols)
-                .map_err(|_| Error::parse(ParseReason::Range { syntax: "tile row" }))?;
+                .map_err(|_| Error::parse(ParseKind::Range { syntax: "tile row" }))?;
             let column = u16::try_from(tile % cols).map_err(|_| {
-                Error::parse(ParseReason::Range {
+                Error::parse(ParseKind::Range {
                     syntax: "tile column",
                 })
             })?;
@@ -619,10 +332,10 @@ impl Ingest {
         if self.pending_tiles.len() != self.pending_expected {
             self.pending_tiles.clear();
             self.pending_expected = 0;
-            return Err(Error::parse(ParseReason::IncompleteTileGroup));
+            return Err(Error::parse(ParseKind::IncompleteTileGroup));
         }
         if self.pending_tiles.len() > MAX_TILES {
-            return Err(Error::unsupported(UnsupportedReason::TileCountAbove256));
+            return Err(Error::unsupported(UnsupportedKind::TileCountAbove256));
         }
         let tiles = core::mem::take(&mut self.pending_tiles);
         self.pending_expected = 0;

@@ -1,7 +1,7 @@
 //! Profile, tier, and level.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, ParseKind};
+use crate::error::{H265Error, ParseKind};
 
 /// Source flags of one profile record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -60,7 +60,7 @@ pub struct ProfileTierLevel {
 }
 
 /// Profile, tier, and level, H.265 7.3.3.
-pub fn parse_profile_tier_level<E: HevcError>(
+pub(crate) fn parse_profile_tier_level<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     max_sub_layers: u8,
 ) -> Result<ProfileTierLevel, E> {
@@ -111,7 +111,7 @@ pub fn parse_profile_tier_level<E: HevcError>(
 }
 
 /// One profile-tier layer: record plus constraint flags.
-fn parse_ptl_layer<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<SubPtl, E> {
+fn parse_ptl_layer<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<SubPtl, E> {
     reader.read_bits(2, "general_profile_space")?;
     let tier = reader.read_bit("general_tier_flag")?;
     let idc = reader.read_bits(5, "general_profile_idc")?;
@@ -147,7 +147,7 @@ fn parse_ptl_layer<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<SubPtl
 }
 
 /// Constraint flags for profile `idc` with compatibility `compat`.
-fn parse_ptl_constraints<E: HevcError>(
+fn parse_ptl_constraints<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     idc: usize,
     compat: &[bool; 32],

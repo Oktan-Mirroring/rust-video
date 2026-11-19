@@ -1,6 +1,6 @@
 //! Frame ingest tests behind synthetic headers and the committed vector.
 
-use crate::error::Fault;
+use crate::error::Error;
 use crate::frame::FH_SEG_UPDATE_DATA;
 use crate::picture::Ingest;
 
@@ -143,7 +143,7 @@ fn tiled_4096x16() -> Vec<u8> {
 #[test]
 fn keyframe_header_parses_every_field() {
     let bytes = key_16x16();
-    let frames = Ingest::<Fault>::new()
+    let frames = Ingest::<Error>::new()
         .ingest_packet(&bytes)
         .expect("keyframe");
     assert_eq!(frames.len(), 1);
@@ -211,7 +211,7 @@ fn keyframe_header_parses_every_field() {
 
 #[test]
 fn inter_frame_inherits_size_and_state() {
-    let mut ingest = Ingest::<Fault>::new();
+    let mut ingest = Ingest::<Error>::new();
     ingest.ingest_packet(&key_16x16()).expect("keyframe");
     let frames = ingest.ingest_packet(&inter_16x16()).expect("inter");
     assert_eq!(frames.len(), 1);
@@ -246,16 +246,16 @@ fn inter_frame_inherits_size_and_state() {
 
 #[test]
 fn inter_before_key_breaks_reference() {
-    let error = Ingest::<Fault>::new()
+    let error = Ingest::<Error>::new()
         .ingest_packet(&inter_16x16())
         .unwrap_err();
-    assert!(matches!(error, Fault::NamesEmptySlot { .. }));
+    assert!(matches!(error, Error::NamesEmptySlot { .. }));
     assert_eq!(error.to_string(), "ref_frame_idx names empty slot");
 }
 
 #[test]
 fn reset_refs_recovers_after_failure() {
-    let mut ingest = Ingest::<Fault>::new();
+    let mut ingest = Ingest::<Error>::new();
     ingest
         .ingest_packet(&inter_16x16())
         .expect_err("inter before key");
@@ -266,40 +266,40 @@ fn reset_refs_recovers_after_failure() {
 
 #[test]
 fn bad_marker_rejects() {
-    let error = Ingest::<Fault>::new().ingest_packet(&[0x00]).unwrap_err();
-    assert!(matches!(error, Fault::FrameMarkerMismatch));
+    let error = Ingest::<Error>::new().ingest_packet(&[0x00]).unwrap_err();
+    assert!(matches!(error, Error::FrameMarkerMismatch));
     assert_eq!(error.to_string(), "frame marker mismatch");
 }
 
 #[test]
 fn bad_sync_code_rejects() {
-    let error = Ingest::<Fault>::new()
+    let error = Ingest::<Error>::new()
         .ingest_packet(&[0x82, 0x00, 0x00, 0x00])
         .unwrap_err();
-    assert!(matches!(error, Fault::SyncCodeMismatch));
+    assert!(matches!(error, Error::SyncCodeMismatch));
     assert_eq!(error.to_string(), "sync code mismatch");
 }
 
 #[test]
 fn reserved_profile_rejects() {
-    let error = Ingest::<Fault>::new().ingest_packet(&[0xBC]).unwrap_err();
-    assert!(matches!(error, Fault::ReservedProfile));
+    let error = Ingest::<Error>::new().ingest_packet(&[0xBC]).unwrap_err();
+    assert!(matches!(error, Error::ReservedProfile));
     assert_eq!(error.to_string(), "reserved profile");
 }
 
 #[test]
 fn truncated_header_rejects() {
-    let error = Ingest::<Fault>::new().ingest_packet(&[0x82]).unwrap_err();
-    assert!(matches!(error, Fault::Truncated { .. }));
+    let error = Ingest::<Error>::new().ingest_packet(&[0x82]).unwrap_err();
+    assert!(matches!(error, Error::Truncated { .. }));
 }
 
 #[test]
 fn empty_packet_yields_no_frames() {
-    let frames = Ingest::<Fault>::new()
+    let frames = Ingest::<Error>::new()
         .ingest_packet(&[])
         .expect("empty packet");
     assert!(frames.is_empty(), "empty packet yields no frames");
-    assert!(Ingest::<Fault>::new().finish().expect("finish").is_none());
+    assert!(Ingest::<Error>::new().finish().expect("finish").is_none());
 }
 
 #[test]
@@ -311,7 +311,7 @@ fn superframe_splits_members() {
     chunk.push(1);
     chunk.push(u8::try_from(key.len()).expect("key fits"));
     chunk.push(0xC1);
-    let frames = Ingest::<Fault>::new()
+    let frames = Ingest::<Error>::new()
         .ingest_packet(&chunk)
         .expect("superframe");
     assert_eq!(frames.len(), 2);
@@ -325,15 +325,15 @@ fn superframe_splits_members() {
 
 #[test]
 fn corrupt_superframe_index_rejects() {
-    let error = Ingest::<Fault>::new()
+    let error = Ingest::<Error>::new()
         .ingest_packet(&[0x88, 0xC1, 0x05, 0x00, 0xC1])
         .unwrap_err();
-    assert!(matches!(error, Fault::Range { .. }));
+    assert!(matches!(error, Error::Range { .. }));
 }
 
 #[test]
 fn mismatched_superframe_bookends_parse_single() {
-    let frames = Ingest::<Fault>::new()
+    let frames = Ingest::<Error>::new()
         .ingest_packet(&[0x88, 0xAA, 0xBB, 0x01, 0xC1])
         .expect("plain frame");
     assert_eq!(frames.len(), 1);
@@ -343,7 +343,7 @@ fn mismatched_superframe_bookends_parse_single() {
 #[test]
 fn tiles_split_big_endian_sizes() {
     let bytes = tiled_4096x16();
-    let frames = Ingest::<Fault>::new().ingest_packet(&bytes).expect("tiled");
+    let frames = Ingest::<Error>::new().ingest_packet(&bytes).expect("tiled");
     assert_eq!(frames.len(), 1);
     let frame = &frames[0];
     assert_eq!(
@@ -366,10 +366,10 @@ fn truncated_tile_size_rejects() {
     let bytes = tiled_4096x16();
     let tile_section: usize = (1..=7).sum::<usize>() + 7 * 4 + 8;
     let cut = bytes.len() - tile_section + 2;
-    let error = Ingest::<Fault>::new()
+    let error = Ingest::<Error>::new()
         .ingest_packet(&bytes[..cut])
         .unwrap_err();
-    assert!(matches!(error, Fault::Truncated { .. }));
+    assert!(matches!(error, Error::Truncated { .. }));
 }
 
 #[test]
@@ -378,8 +378,8 @@ fn oversized_tile_rejects() {
     let tile_section: usize = (1..=7).sum::<usize>() + 7 * 4 + 8;
     let start = bytes.len() - tile_section;
     bytes[start..start + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-    let error = Ingest::<Fault>::new().ingest_packet(&bytes).unwrap_err();
-    assert!(matches!(error, Fault::Truncated { .. }));
+    let error = Ingest::<Error>::new().ingest_packet(&bytes).unwrap_err();
+    assert!(matches!(error, Error::Truncated { .. }));
 }
 
 /// IVF payloads of the committed vector in file order.
@@ -406,7 +406,7 @@ fn vector_payloads() -> Vec<Vec<u8>> {
 fn committed_vector_parses_fifteen_frames() {
     let payloads = vector_payloads();
     assert_eq!(payloads.len(), 15, "vector holds fifteen packets");
-    let mut ingest = Ingest::<Fault>::new();
+    let mut ingest = Ingest::<Error>::new();
     let mut frames = Vec::new();
     for payload in &payloads {
         let parsed = ingest.ingest_packet(payload).expect("packet parses");

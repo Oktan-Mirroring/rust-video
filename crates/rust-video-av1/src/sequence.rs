@@ -1,7 +1,7 @@
 //! AV1 sequence headers.
 
 use crate::bits::BitReader;
-use crate::error::{Error, ParseReason};
+use crate::error::{Error, ParseKind};
 use crate::syntax::{read_small, read_uvlc};
 use crate::MAX_OPERATING_POINTS;
 use crate::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS};
@@ -365,12 +365,12 @@ pub fn parse_sequence_header<E: From<Error>>(payload: &[u8]) -> Result<SequenceH
     let mut reader = BitReader::new(payload);
     let profile = reader.read_bits(3, "seq_profile")?;
     if profile > 2 {
-        return Err(Error::parse(ParseReason::Range {
+        return Err(Error::parse(ParseKind::Range {
             syntax: "seq_profile",
         }));
     }
     let profile = u8::try_from(profile).map_err(|_| {
-        Error::parse(ParseReason::Range {
+        Error::parse(ParseKind::Range {
             syntax: "seq_profile",
         })
     })?;
@@ -480,7 +480,7 @@ fn parse_seq_operating_points<E: From<Error>>(
     let count_minus1 = reader.read_bits(5, "operating_points_cnt_minus_1")?;
     for _ in 0..=count_minus1 {
         if seq.operating.len() >= MAX_OPERATING_POINTS {
-            return Err(Error::parse(ParseReason::Range {
+            return Err(Error::parse(ParseKind::Range {
                 syntax: "operating_points_cnt",
             }));
         }
@@ -496,7 +496,7 @@ fn parse_operating_point<E: From<Error>>(
 ) -> Result<OperatingPoint, E> {
     let idc = reader.read_bits(12, "operating_point_idc")?;
     let idc = u16::try_from(idc).map_err(|_| {
-        Error::parse(ParseReason::Range {
+        Error::parse(ParseKind::Range {
             syntax: "operating_point_idc",
         })
     })?;

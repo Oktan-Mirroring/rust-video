@@ -1,6 +1,6 @@
 //! Bit reader over AV1 payload bytes.
 
-use crate::error::{Error, ParseReason};
+use crate::error::{Error, ParseKind};
 
 /// AV1 bit reader.
 pub struct BitReader<'a> {
@@ -55,7 +55,7 @@ impl<'a> BitReader<'a> {
         syntax: &'static str,
     ) -> Result<u32, E> {
         if count > 32 {
-            return Err(Error::parse(ParseReason::TooWide { syntax }));
+            return Err(Error::parse(ParseKind::TooWide { syntax }));
         }
         let mut value: u32 = 0;
         for _ in 0..count {
@@ -72,7 +72,7 @@ impl<'a> BitReader<'a> {
     pub fn read_bit<E: From<Error>>(&mut self, syntax: &'static str) -> Result<bool, E> {
         let total = self.data.len() * 8;
         if self.bit >= total {
-            return Err(Error::parse(ParseReason::Truncated { syntax }));
+            return Err(Error::parse(ParseKind::Truncated { syntax }));
         }
         let bit = self.peek(self.bit);
         self.bit += 1;
@@ -89,7 +89,7 @@ impl<'a> BitReader<'a> {
         while !self.read_bit(syntax)? {
             leading += 1;
             if leading > 31 {
-                return Err(Error::parse(ParseReason::OverflowU32 { syntax }));
+                return Err(Error::parse(ParseKind::OverflowU32 { syntax }));
             }
         }
         if leading == 0 {
@@ -97,7 +97,7 @@ impl<'a> BitReader<'a> {
         }
         let rest = self.read_bits(leading, syntax)?;
         rest.checked_add((1u32 << leading) - 1)
-            .ok_or_else(|| Error::parse(ParseReason::OverflowU32 { syntax }))
+            .ok_or_else(|| Error::parse(ParseKind::OverflowU32 { syntax }))
     }
 
     /// Signed Exp-Golomb code.
@@ -108,13 +108,13 @@ impl<'a> BitReader<'a> {
     pub fn read_se<E: From<Error>>(&mut self, syntax: &'static str) -> Result<i32, E> {
         let code = self.read_ue(syntax)?;
         let value = i32::try_from(code >> 1)
-            .map_err(|_| Error::parse(ParseReason::OverflowI32 { syntax }))?;
+            .map_err(|_| Error::parse(ParseKind::OverflowI32 { syntax }))?;
         if code & 1 == 0 {
             Ok(-value)
         } else {
             value
                 .checked_add(1)
-                .ok_or_else(|| Error::parse(ParseReason::OverflowI32 { syntax }))
+                .ok_or_else(|| Error::parse(ParseKind::OverflowI32 { syntax }))
         }
     }
 

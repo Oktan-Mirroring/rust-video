@@ -3,8 +3,8 @@
 use core::marker::PhantomData;
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, HevcGate, NalAction, ParseKind};
-use crate::nal::{
+use crate::error::{H265Error, H265Gate, NalAction, ParseKind};
+use crate::framing::{
     is_cra_bla, is_idr, is_irap, is_rasl, rbsp, rbsp_prefix, split_nals, HEADER_PREFIX, MAX_PPS,
     MAX_SPS,
 };
@@ -69,7 +69,7 @@ impl Picture {
 }
 
 /// Annex B ingest: parameter sets plus picture assembly.
-pub struct Ingest<E: HevcError, G: HevcGate<E>> {
+pub struct Ingest<E: H265Error, G: H265Gate<E>> {
     /// Seen video sets by id.
     vps: [bool; MAX_SPS],
     /// Stored sequence sets by id.
@@ -90,14 +90,14 @@ pub struct Ingest<E: HevcError, G: HevcGate<E>> {
     gate: PhantomData<(E, G)>,
 }
 
-impl<E: HevcError, G: HevcGate<E>> Default for Ingest<E, G> {
+impl<E: H265Error, G: H265Gate<E>> Default for Ingest<E, G> {
     /// Empty ingest.
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<E: HevcError, G: HevcGate<E>> Ingest<E, G> {
+impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
     /// Empty ingest.
     #[must_use]
     pub fn new() -> Self {

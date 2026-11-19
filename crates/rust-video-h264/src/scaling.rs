@@ -38,16 +38,18 @@ pub struct ScalingMap {
 
 /// Scaling lists in zig-zag scan order.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScalingSets {
+pub struct ScalingLists {
     /// Six 4x4 lists.
     pub four: [[u8; 16]; 6],
     /// Six 8x8 lists; indexes 2..6 stay flat outside 4:4:4.
     pub eight: [[u8; 64]; 6],
 }
 
+pub use self::ScalingLists as ScalingSets;
+
 /// Flat scaling lists, H.264 7.4.2.1.1 absent-matrix inference.
-pub(crate) fn fallback_scaling() -> ScalingSets {
-    ScalingSets {
+pub(crate) fn fallback_scaling() -> ScalingLists {
+    ScalingLists {
         four: [[16; 16]; 6],
         eight: [[16; 64]; 6],
     }
@@ -85,7 +87,7 @@ fn scaling_list<const N: usize, E: H264Error>(
 pub(crate) fn sequence_scaling<E: H264Error>(
     reader: &mut BitReader<E>,
     chroma: u8,
-) -> Result<(ScalingSets, ScalingMap), E> {
+) -> Result<(ScalingLists, ScalingMap), E> {
     let mut sets = fallback_scaling();
     let mut map = ScalingMap {
         present_mask: 0,
@@ -156,9 +158,9 @@ fn sequence_list_8x8<E: H264Error>(
 /// Scaling lists resolved against the sequence lists.
 pub(crate) fn picture_scaling<E: H264Error>(
     reader: &mut BitReader<E>,
-    base: &ScalingSets,
+    base: &ScalingLists,
     chroma: u8,
-) -> Result<(ScalingSets, ScalingMap), E> {
+) -> Result<(ScalingLists, ScalingMap), E> {
     let mut sets = fallback_scaling();
     let mut map = ScalingMap {
         present_mask: 0,
@@ -186,7 +188,7 @@ pub(crate) fn picture_scaling<E: H264Error>(
 fn picture_list_4x4<E: H264Error>(
     reader: &mut BitReader<E>,
     index: usize,
-    base: &ScalingSets,
+    base: &ScalingLists,
     four: &[[u8; 16]; 6],
 ) -> Result<([u8; 16], Option<bool>), E> {
     if reader.read_bit("pic_scaling_list_present_flag")? {
@@ -210,7 +212,7 @@ fn picture_list_4x4<E: H264Error>(
 fn picture_list_8x8<E: H264Error>(
     reader: &mut BitReader<E>,
     index: usize,
-    base: &ScalingSets,
+    base: &ScalingLists,
 ) -> Result<([u8; 64], Option<bool>), E> {
     if reader.read_bit("pic_scaling_list_present_flag")? {
         let default = if index.is_multiple_of(2) {

@@ -1,8 +1,8 @@
 //! Picture parameter sets.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, HevcGate, ParseKind};
-use crate::nal::MAX_PPS;
+use crate::error::{H265Error, H265Gate, ParseKind};
+use crate::framing::MAX_PPS;
 use crate::scaling::{parse_scaling_list_data, ScalingLists};
 use crate::sps::{parse_bounded_ue, Sps};
 
@@ -229,7 +229,7 @@ impl Pps {
 /// * `rbsp` - RBSP bytes with the NAL header stripped.
 /// * `sps` - sequence set behind derivation; without it tile extents stay
 ///   explicit and the trailing entry is absent.
-pub fn parse_pps<E: HevcError, G: HevcGate<E>>(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, E> {
+pub fn parse_pps<E: H265Error, G: H265Gate<E>>(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, E> {
     let mut reader = BitReader::new(rbsp);
     let id = parse_pps_id(&mut reader)?;
     let sps_id = parse_pps_sps_id(&mut reader)?;
@@ -348,7 +348,7 @@ struct Deblock {
 }
 
 /// Set id below the set count.
-fn parse_pps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
+fn parse_pps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("pic_parameter_set_id")?;
     let id = u8::try_from(id).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -364,7 +364,7 @@ fn parse_pps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 }
 
 /// Sequence id behind the picture set.
-fn parse_pps_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
+fn parse_pps_sps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("pps_seq_parameter_set_id")?;
     u8::try_from(id).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -382,7 +382,7 @@ fn parse_pps_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E
 /// # Returns
 ///
 /// Leading ids with set counts unenforced.
-pub fn parse_pps_ids<E: HevcError>(rbsp: &[u8]) -> Result<(u8, u8), E> {
+pub fn parse_pps_ids<E: H265Error>(rbsp: &[u8]) -> Result<(u8, u8), E> {
     let mut reader = BitReader::new(rbsp);
     let pps_id = reader.read_ue("pic_parameter_set_id")?;
     let pps_id = u8::try_from(pps_id).map_err(|_| {
@@ -400,7 +400,7 @@ pub fn parse_pps_ids<E: HevcError>(rbsp: &[u8]) -> Result<(u8, u8), E> {
 }
 
 /// Reference count field below the 31 ceiling.
-pub fn parse_ref_count<E: HevcError>(
+pub(crate) fn parse_ref_count<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
 ) -> Result<u8, E> {
@@ -408,13 +408,13 @@ pub fn parse_ref_count<E: HevcError>(
 }
 
 /// QP delta field.
-fn parse_qp<E: HevcError>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<i8, E> {
+fn parse_qp<E: H265Error>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<i8, E> {
     let value = reader.read_se(syntax)?;
     i8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
 }
 
 /// CU QP delta depth, zeroed without deltas.
-fn parse_cu_qp_depth<E: HevcError>(
+fn parse_cu_qp_depth<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     flags: &mut u32,
 ) -> Result<u8, E> {
@@ -431,7 +431,7 @@ fn parse_cu_qp_depth<E: HevcError>(
 }
 
 /// Tile grid: counts plus explicit widths with derived last entries.
-fn parse_tiles<E: HevcError>(
+fn parse_tiles<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: Option<&Sps>,
     flags: &mut u32,
@@ -476,7 +476,7 @@ fn parse_tiles<E: HevcError>(
 }
 
 /// Tile count from its minus-one field.
-fn parse_tile_count<E: HevcError>(
+fn parse_tile_count<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
 ) -> Result<u8, E> {
@@ -491,7 +491,7 @@ fn parse_tile_count<E: HevcError>(
 ///
 /// The trailing entry derives against a known grid; without `total`
 /// the extents stay explicit and unvalidated.
-fn parse_tile_widths<E: HevcError>(
+fn parse_tile_widths<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     count: u8,
     total: Option<u32>,
@@ -520,7 +520,7 @@ fn parse_tile_widths<E: HevcError>(
 }
 
 /// Picture deblocking presence with its offsets.
-fn parse_pps_deblocking<E: HevcError>(
+fn parse_pps_deblocking<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     flags: &mut u32,
 ) -> Result<Deblock, E> {
@@ -552,7 +552,7 @@ fn parse_pps_deblocking<E: HevcError>(
 }
 
 /// Picture scaling lists, copied from the sequence set without data.
-fn parse_pps_scaling<E: HevcError>(
+fn parse_pps_scaling<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: Option<&Sps>,
     flags: &mut u32,
@@ -565,7 +565,7 @@ fn parse_pps_scaling<E: HevcError>(
 }
 
 /// Picture extension presence with its range, multilayer, 3D, and SCC flags.
-fn parse_pps_extension<E: HevcError>(
+fn parse_pps_extension<E: H265Error>(
     reader: &mut BitReader<'_, E>,
 ) -> Result<(bool, [bool; 4]), E> {
     if !reader.read_bit("pps_extension_present_flag")? {

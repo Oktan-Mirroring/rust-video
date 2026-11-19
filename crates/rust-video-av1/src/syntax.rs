@@ -1,7 +1,7 @@
 //! AV1 bit-syntax readers.
 
 use crate::bits::BitReader;
-use crate::error::{Error, ParseReason};
+use crate::error::{Error, ParseKind};
 
 /// Unsigned variable-length code.
 pub(crate) fn read_uvlc<E: From<Error>>(
@@ -12,7 +12,7 @@ pub(crate) fn read_uvlc<E: From<Error>>(
     while !reader.read_bit(syntax)? {
         zeroes += 1;
         if zeroes >= 32 {
-            return Err(Error::parse(ParseReason::OverflowU32 { syntax }));
+            return Err(Error::parse(ParseKind::OverflowU32 { syntax }));
         }
     }
     if zeroes == 0 {
@@ -20,7 +20,7 @@ pub(crate) fn read_uvlc<E: From<Error>>(
     }
     let rest = reader.read_bits(zeroes, syntax)?;
     rest.checked_add((1u32 << zeroes) - 1)
-        .ok_or(Error::parse(ParseReason::OverflowU32 { syntax }))
+        .ok_or(Error::parse(ParseKind::OverflowU32 { syntax }))
 }
 
 /// Little-endian base-128 integer below the u32 ceiling.
@@ -33,10 +33,10 @@ pub(crate) fn read_leb128<E: From<Error>>(
         let byte = u64::from(reader.read_bits(8, syntax)?);
         value |= (byte & 0x7F) << (index * 7);
         if byte & 0x80 == 0 {
-            return u32::try_from(value).map_err(|_| Error::parse(ParseReason::Range { syntax }));
+            return u32::try_from(value).map_err(|_| Error::parse(ParseKind::Range { syntax }));
         }
     }
-    Err(Error::parse(ParseReason::Range { syntax }))
+    Err(Error::parse(ParseKind::Range { syntax }))
 }
 
 /// Nonsymmetric value below `n`.
@@ -87,7 +87,7 @@ pub(crate) fn read_subexp<E: From<Error>>(
     syntax: &'static str,
 ) -> Result<u32, E> {
     if max < 9 {
-        return Err(Error::parse(ParseReason::Range { syntax }));
+        return Err(Error::parse(ParseKind::Range { syntax }));
     }
     let max_len = 32 - (max - 1).leading_zeros() - 3 - 1;
     let len = read_increment(reader, 0, max_len, syntax)?;
@@ -103,7 +103,7 @@ pub(crate) fn read_subexp<E: From<Error>>(
     };
     value
         .checked_add(offset)
-        .ok_or(Error::parse(ParseReason::Range { syntax }))
+        .ok_or(Error::parse(ParseKind::Range { syntax }))
 }
 
 /// Signed two's complement value of `width` bits.
@@ -113,7 +113,7 @@ pub(crate) fn read_su<E: From<Error>>(
     syntax: &'static str,
 ) -> Result<i32, E> {
     if width == 0 || width > 32 {
-        return Err(Error::parse(ParseReason::Range { syntax }));
+        return Err(Error::parse(ParseKind::Range { syntax }));
     }
     let raw = reader.read_bits(width, syntax)?;
     Ok((raw << (32 - width)).cast_signed() >> (32 - width))
@@ -126,7 +126,7 @@ pub(crate) fn read_small<E: From<Error>>(
     syntax: &'static str,
 ) -> Result<u8, E> {
     let value = reader.read_bits(width, syntax)?;
-    u8::try_from(value).map_err(|_| Error::parse(ParseReason::Range { syntax }))
+    u8::try_from(value).map_err(|_| Error::parse(ParseKind::Range { syntax }))
 }
 
 /// Smallest shift with `block_size` shifted past `target`.

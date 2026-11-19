@@ -5,24 +5,22 @@
 use std::marker::PhantomData;
 
 use crate::bits::BitReader;
-use crate::error::Fault;
+use crate::error::Error;
 use crate::frame::{
     Frame, FrameHeader, FrameType, TileData, FH_ERROR_RESILIENT, FH_FRAME_PARALLEL,
     FH_HIGH_PRECISION_MV, FH_INTRA_ONLY, FH_LF_DELTA_ENABLED, FH_LF_DELTA_UPDATE,
     FH_REFRESH_CONTEXT, FH_RENDER_DIFFERS, FH_SEG_ABS_DELTA, FH_SEG_ENABLED,
     FH_SEG_TEMPORAL_UPDATE, FH_SEG_UPDATE_DATA, FH_SEG_UPDATE_MAP, FH_SHOW_EXISTING, FH_SHOW_FRAME,
-    FH_SUBSAMPLING_X, FH_SUBSAMPLING_Y, MAX_SEGMENTS, NUM_REF_FRAMES, PRED_PROBS, REFS_PER_FRAME,
-    SEG_LEVELS, TREE_PROBS,
+    FH_SUBSAMPLING_X, FH_SUBSAMPLING_Y, INTERP_SWITCHABLE, MAX_SEGMENTS, NUM_REF_FRAMES,
+    PRED_PROBS, REFS_PER_FRAME, SEG_LEVELS, TREE_PROBS,
 };
+use crate::framing::split_superframe;
 
 /// Frame marker bits opening every frame.
 const FRAME_MARKER: u32 = 2;
 
 /// Keyframe sync code.
 const SYNC_CODE: u32 = 0x49_83_42;
-
-/// Superframe index marker closing the chunk.
-const SUPERFRAME_MARKER: u8 = 0x06;
 
 /// Smallest tile width in superblocks.
 const MIN_TILE_WIDTH_SB: u32 = 4;
@@ -35,9 +33,6 @@ const MAX_TILE_COLS_LOG2: u8 = 6;
 
 /// Tile row shift ceiling.
 const MAX_TILE_ROWS_LOG2: u8 = 2;
-
-/// Switchable interpolation filter id.
-const INTERP_SWITCHABLE: u8 = 4;
 
 /// Literal to filter id per S6.2.
 const INTERP_LITERAL: [u8; 4] = [1, 0, 2, 3];
@@ -74,7 +69,7 @@ impl LoopFilter {
     }
 
     /// Loop filter parameters parsed from `reader`.
-    fn parse<E: From<Fault>>(&mut self, reader: &mut BitReader) -> Result<(), E> {
+    fn parse<E: From<Error>>(&mut self, reader: &mut BitReader) -> Result<(), E> {
         self.level = read_small(reader, 6, "loop_filter_level")?;
         self.sharpness = read_small(reader, 3, "loop_filter_sharpness")?;
         self.delta_enabled = reader.read_bit("loop_filter_delta_enabled")?;
@@ -179,7 +174,7 @@ impl Segmentation {
     }
 
     /// Segmentation parameters parsed from `reader`.
-    fn parse<E: From<Fault>>(&mut self, reader: &mut BitReader) -> Result<(), E> {
+    fn parse<E: From<Error>>(&mut self, reader: &mut BitReader) -> Result<(), E> {
         self.set(Self::UPDATE_MAP, false);
         self.set(Self::UPDATE_DATA, false);
         self.set(Self::ENABLED, reader.read_bit("segmentation_enabled")?);
@@ -229,7 +224,7 @@ impl Segmentation {
                     reader.read_bits(Self::FEATURE_BITS[level], "segmentation_feature_data")?,
                 )
                 .map_err(|_| {
-                    E::from(Fault::Range {
+                    E::from(Error::Range {
                         syntax: "segmentation_feature_data",
                     })
                 })?;
@@ -244,7 +239,7 @@ impl Segmentation {
 }
 
 /// VP9 frame ingest: uncompressed headers plus tile assembly.
-pub struct Ingest<E = Fault> {
+pub struct Ingest<E = Error> {
     /// Cached bit depth behind inter frames.
     bit_depth: u8,
     /// Cached horizontal subsampling behind inter frames.
@@ -298,12 +293,12 @@ impl<E> Default for Ingest<E> {
     }
 }
 
-impl<E: From<Fault>> Ingest<E> {
+impl<E: From<Error>> Ingest<E> {
     /// Frames completed by `data`; every frame completes inline.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `data` violates the VP9 grammar; each [`Fault`] converts into `E`.
+    /// Returns `Err` when `data` violates the VP9 grammar; each [`Error`] converts into `E`.
     pub fn ingest_packet(&mut self, data: &[u8]) -> Result<Vec<Frame>, E> {
         let mut frames = Vec::new();
         for coded in split_superframe(data)? {
@@ -327,7 +322,7 @@ impl<E: From<Fault>> Ingest<E> {
         let mut reader = BitReader::new(data);
         let mut header = FrameHeader::default();
         if reader.read_bits(2, "frame_marker")? != FRAME_MARKER {
-            return Err(E::from(Fault::FrameMarkerMismatch));
+            return Err(E::from(Error::FrameMarkerMismatch));
         }
         header.profile = parse_profile(&mut reader)?;
         if reader.read_bit("show_existing_frame")? {
@@ -388,12 +383,12 @@ impl<E: From<Fault>> Ingest<E> {
         self.parse_tile_info(&mut reader, &mut header)?;
         header.header_size_in_bytes = u16::try_from(reader.read_bits(16, "header_size_in_bytes")?)
             .map_err(|_| {
-                E::from(Fault::Range {
+                E::from(Error::Range {
                     syntax: "header_size_in_bytes",
                 })
             })?;
         header.uncompressed_size = u16::try_from(reader.position().div_ceil(8)).map_err(|_| {
-            E::from(Fault::Range {
+            E::from(Error::Range {
                 syntax: "uncompressed_header",
             })
         })?;
@@ -463,7 +458,7 @@ impl<E: From<Fault>> Ingest<E> {
         } else {
             let literal = reader.read_bits(2, "interp_filter")?;
             INTERP_LITERAL[usize::try_from(literal).map_err(|_| {
-                E::from(Fault::Range {
+                E::from(Error::Range {
                     syntax: "interp_filter",
                 })
             })?]
@@ -537,7 +532,7 @@ impl<E: From<Fault>> Ingest<E> {
             let slot = usize::from(header.ref_frame_idx[position]);
             let (width, height) = self.ref_dims[slot];
             if width == 0 || height == 0 {
-                return Err(E::from(Fault::NamesEmptySlot {
+                return Err(E::from(Error::NamesEmptySlot {
                     reference: "ref_frame_idx",
                 }));
             }
@@ -562,7 +557,7 @@ impl<E: From<Fault>> Ingest<E> {
             }
         }
         if cols > MAX_TILE_COLS_LOG2 {
-            return Err(E::from(Fault::Range {
+            return Err(E::from(Error::Range {
                 syntax: "tile_cols_log2",
             }));
         }
@@ -607,29 +602,29 @@ impl<E: From<Fault>> Ingest<E> {
 }
 
 /// Fixed-width value below 256.
-fn read_small<E: From<Fault>>(
+fn read_small<E: From<Error>>(
     reader: &mut BitReader,
     width: u32,
     syntax: &'static str,
 ) -> Result<u8, E> {
     let value = reader.read_bits(width, syntax)?;
-    u8::try_from(value).map_err(|_| E::from(Fault::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::from(Error::Range { syntax }))
 }
 
 /// Signed magnitude value of `width` bits plus a sign bit.
-fn read_delta<E: From<Fault>>(
+fn read_delta<E: From<Error>>(
     reader: &mut BitReader,
     width: u32,
     syntax: &'static str,
 ) -> Result<i8, E> {
     let magnitude = reader.read_bits(width, syntax)?;
     let negative = reader.read_bit(syntax)?;
-    let magnitude = i8::try_from(magnitude).map_err(|_| E::from(Fault::Range { syntax }))?;
+    let magnitude = i8::try_from(magnitude).map_err(|_| E::from(Error::Range { syntax }))?;
     Ok(if negative { -magnitude } else { magnitude })
 }
 
 /// Coded probability, 255 when absent.
-fn read_prob<E: From<Fault>>(reader: &mut BitReader, syntax: &'static str) -> Result<u8, E> {
+fn read_prob<E: From<Error>>(reader: &mut BitReader, syntax: &'static str) -> Result<u8, E> {
     if reader.read_bit(syntax)? {
         read_small(reader, 8, syntax)
     } else {
@@ -638,7 +633,7 @@ fn read_prob<E: From<Fault>>(reader: &mut BitReader, syntax: &'static str) -> Re
 }
 
 /// Quantizer delta, zero when absent.
-fn read_delta_q<E: From<Fault>>(reader: &mut BitReader, syntax: &'static str) -> Result<i8, E> {
+fn read_delta_q<E: From<Error>>(reader: &mut BitReader, syntax: &'static str) -> Result<i8, E> {
     if reader.read_bit(syntax)? {
         read_delta(reader, 4, syntax)
     } else {
@@ -647,26 +642,26 @@ fn read_delta_q<E: From<Fault>>(reader: &mut BitReader, syntax: &'static str) ->
 }
 
 /// Profile id with the reserved combination rejected.
-fn parse_profile<E: From<Fault>>(reader: &mut BitReader) -> Result<u8, E> {
+fn parse_profile<E: From<Error>>(reader: &mut BitReader) -> Result<u8, E> {
     let low = reader.read_bits(1, "profile")?;
     let high = reader.read_bits(1, "profile")?;
     let profile = low | high << 1;
     if profile == 3 && reader.read_bit("profile")? {
-        return Err(E::from(Fault::ReservedProfile));
+        return Err(E::from(Error::ReservedProfile));
     }
-    u8::try_from(profile).map_err(|_| E::from(Fault::Range { syntax: "profile" }))
+    u8::try_from(profile).map_err(|_| E::from(Error::Range { syntax: "profile" }))
 }
 
 /// Sync code checked against the codec bytes.
-fn parse_sync_code<E: From<Fault>>(reader: &mut BitReader) -> Result<(), E> {
+fn parse_sync_code<E: From<Error>>(reader: &mut BitReader) -> Result<(), E> {
     if reader.read_bits(24, "sync_code")? != SYNC_CODE {
-        return Err(E::from(Fault::SyncCodeMismatch));
+        return Err(E::from(Error::SyncCodeMismatch));
     }
     Ok(())
 }
 
 /// Render size, explicit or inferred from the frame size.
-fn parse_render_size<E: From<Fault>>(
+fn parse_render_size<E: From<Error>>(
     reader: &mut BitReader,
     header: &mut FrameHeader,
 ) -> Result<(), E> {
@@ -685,7 +680,7 @@ fn parse_render_size<E: From<Fault>>(
 }
 
 /// Quantizer base and deltas.
-fn parse_quantization<E: From<Fault>>(
+fn parse_quantization<E: From<Error>>(
     reader: &mut BitReader,
     header: &mut FrameHeader,
 ) -> Result<(), E> {
@@ -714,63 +709,22 @@ fn max_log2_tile_cols(sb64_cols: u32) -> u8 {
     shift - 1
 }
 
-/// Chunk frames: superframe members or the chunk alone.
-fn split_superframe<E: From<Fault>>(data: &[u8]) -> Result<Vec<&[u8]>, E> {
-    let Some(last) = data.last().copied() else {
-        return Ok(Vec::new());
-    };
-    if last >> 5 != SUPERFRAME_MARKER {
-        return Ok(vec![data]);
-    }
-    let bytes_per_size = usize::from((last >> 3) & 3) + 1;
-    let count = usize::from(last & 7) + 1;
-    let index = 2 + count * bytes_per_size;
-    let Some(coded) = data.len().checked_sub(index) else {
-        return Ok(vec![data]);
-    };
-    if data[coded] != last {
-        return Ok(vec![data]);
-    }
-    let mut frames = Vec::with_capacity(count);
-    let mut offset = 0usize;
-    for position in 0..count {
-        let mut size = 0usize;
-        for byte in 0..bytes_per_size {
-            size |= usize::from(data[coded + 1 + position * bytes_per_size + byte]) << (byte * 8);
-        }
-        let end = offset
-            .checked_add(size)
-            .filter(|end| *end <= coded)
-            .ok_or(E::from(Fault::Range {
-                syntax: "superframe_index",
-            }))?;
-        frames.push(&data[offset..end]);
-        offset = end;
-    }
-    if offset != coded {
-        return Err(E::from(Fault::Range {
-            syntax: "superframe_index",
-        }));
-    }
-    Ok(frames)
-}
-
 /// Tile payloads of `frame` in tile order.
-fn split_tiles<E: From<Fault>>(frame: &[u8], header: &FrameHeader) -> Result<Vec<TileData>, E> {
+fn split_tiles<E: From<Error>>(frame: &[u8], header: &FrameHeader) -> Result<Vec<TileData>, E> {
     if header.tile_cols_log2 > MAX_TILE_COLS_LOG2 {
-        return Err(E::from(Fault::Range {
+        return Err(E::from(Error::Range {
             syntax: "tile_cols_log2",
         }));
     }
     if header.tile_rows_log2 > MAX_TILE_ROWS_LOG2 {
-        return Err(E::from(Fault::Range {
+        return Err(E::from(Error::Range {
             syntax: "tile_rows_log2",
         }));
     }
     let cols = 1u16 << header.tile_cols_log2;
     let rows = 1u16 << header.tile_rows_log2;
     let start = usize::from(header.uncompressed_size) + usize::from(header.header_size_in_bytes);
-    let mut data = frame.get(start..).ok_or(E::from(Fault::Truncated {
+    let mut data = frame.get(start..).ok_or(E::from(Error::Truncated {
         syntax: "tile_data",
     }))?;
     let mut tiles = Vec::with_capacity(usize::from(cols) * usize::from(rows));
@@ -780,22 +734,22 @@ fn split_tiles<E: From<Fault>>(frame: &[u8], header: &FrameHeader) -> Result<Vec
             let (bytes, rest) = if last {
                 (data, &data[data.len()..])
             } else {
-                let field = data.get(..4).ok_or(E::from(Fault::Truncated {
+                let field = data.get(..4).ok_or(E::from(Error::Truncated {
                     syntax: "tile_size",
                 }))?;
                 let raw = u32::from_be_bytes([field[0], field[1], field[2], field[3]]);
                 let size = usize::try_from(raw).map_err(|_| {
-                    E::from(Fault::Range {
+                    E::from(Error::Range {
                         syntax: "tile_size",
                     })
                 })?;
-                let tail = data.get(4..).ok_or(E::from(Fault::Truncated {
+                let tail = data.get(4..).ok_or(E::from(Error::Truncated {
                     syntax: "tile_size",
                 }))?;
-                let bytes = tail.get(..size).ok_or(E::from(Fault::Truncated {
+                let bytes = tail.get(..size).ok_or(E::from(Error::Truncated {
                     syntax: "tile_data",
                 }))?;
-                let rest = tail.get(size..).ok_or(E::from(Fault::Truncated {
+                let rest = tail.get(size..).ok_or(E::from(Error::Truncated {
                     syntax: "tile_data",
                 }))?;
                 (bytes, rest)

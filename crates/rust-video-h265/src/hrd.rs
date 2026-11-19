@@ -1,7 +1,7 @@
 //! Hypothetical reference decoder parameters.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, ParseKind};
+use crate::error::{H265Error, ParseKind};
 
 /// HRD stream presence of one parameter set.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,7 +67,7 @@ pub struct HrdParams {
 }
 
 /// HRD parameters, H.265 E.2.2; `inherit` carries the first set's shared header.
-pub fn parse_hrd<E: HevcError>(
+pub(crate) fn parse_hrd<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     max_sub_layers: u8,
     inherit: Option<(HrdStreams, bool)>,
@@ -91,7 +91,7 @@ pub fn parse_hrd<E: HevcError>(
 }
 
 /// HRD common information into `hrd`.
-fn parse_hrd_common<E: HevcError>(
+fn parse_hrd_common<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     hrd: &mut HrdParams,
 ) -> Result<(), E> {
@@ -115,7 +115,7 @@ fn parse_hrd_common<E: HevcError>(
 }
 
 /// One HRD layer schedule with its CPB data into `hrd`.
-fn parse_hrd_layer<E: HevcError>(
+fn parse_hrd_layer<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     hrd: &mut HrdParams,
 ) -> Result<(), E> {
@@ -165,7 +165,7 @@ fn parse_hrd_layer<E: HevcError>(
 }
 
 /// One HRD coded picture buffer description into `layer`.
-fn parse_hrd_cpb<E: HevcError>(
+fn parse_hrd_cpb<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sub_pic: bool,
     layer: &mut HrdLayerData,
@@ -189,7 +189,7 @@ fn parse_hrd_cpb<E: HevcError>(
 }
 
 /// Checked narrowing of a parsed value to `u8`.
-fn narrow_u8<E: HevcError>(value: u32) -> Result<u8, E> {
+fn narrow_u8<E: H265Error>(value: u32) -> Result<u8, E> {
     u8::try_from(value).map_err(|_| {
         E::parse(ParseKind::Range {
             syntax: "hrd scale",

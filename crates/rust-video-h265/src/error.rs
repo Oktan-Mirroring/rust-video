@@ -1,6 +1,6 @@
 //! Tier errors behind the shared grammar.
 
-use crate::nal::{
+use crate::framing::{
     NAL_AUD, NAL_EOB, NAL_EOS, NAL_FD, NAL_PPS, NAL_PREFIX_SEI, NAL_SPS, NAL_SUFFIX_SEI, NAL_VPS,
     VCL_FIRST, VCL_LAST,
 };
@@ -10,7 +10,7 @@ use crate::sps::Sps;
 use crate::vps::Vps;
 
 /// Grammar error behind a tier failure.
-pub trait HevcError: Sized {
+pub trait H265Error: Sized {
     /// Parse failure of `kind`.
     fn parse(kind: ParseKind) -> Self;
 
@@ -18,8 +18,10 @@ pub trait HevcError: Sized {
     fn unsupported(kind: UnsupportedKind) -> Self;
 }
 
+pub use self::H265Error as HevcError;
+
 /// Tier capability gates over shared grammar output.
-pub trait HevcGate<E: HevcError> {
+pub trait H265Gate<E: H265Error> {
     /// Sequence set against tier caps.
     ///
     /// # Errors
@@ -134,6 +136,8 @@ pub trait HevcGate<E: HevcError> {
     }
 }
 
+pub use self::H265Gate as HevcGate;
+
 /// NAL unit action behind ingest dispatch.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NalAction {
@@ -232,7 +236,7 @@ pub enum UnsupportedKind {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct PermissiveGate;
 
-impl<E: HevcError> HevcGate<E> for PermissiveGate {
+impl<E: H265Error> H265Gate<E> for PermissiveGate {
     /// Sequence set against tier caps.
     fn check_sps(sps: &Sps) -> Result<(), E> {
         let _ = sps;
@@ -269,7 +273,7 @@ impl<E: HevcError> HevcGate<E> for PermissiveGate {
 pub(crate) mod test_support {
     //! Grammar test error.
 
-    use super::{HevcError, ParseKind, UnsupportedKind};
+    use super::{H265Error, ParseKind, UnsupportedKind};
 
     /// Test failure capturing grammar kinds.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -282,7 +286,7 @@ pub(crate) mod test_support {
         SpsCitesUnknownVps,
     }
 
-    impl HevcError for TestError {
+    impl H265Error for TestError {
         /// Parse failure of `kind`.
         fn parse(kind: ParseKind) -> Self {
             Self::Parse(kind)

@@ -1,6 +1,6 @@
 //! MSB-first bit reader over frame bytes.
 
-use crate::Fault;
+use crate::Error;
 
 /// Bit reader over frame bytes.
 pub struct BitReader<'a> {
@@ -28,13 +28,13 @@ impl<'a> BitReader<'a> {
     /// # Errors
     ///
     /// Returns `Err` when `count` exceeds 32 or fewer bits remain.
-    pub fn read_bits<E: From<Fault>>(
+    pub fn read_bits<E: From<Error>>(
         &mut self,
         count: u32,
         syntax: &'static str,
     ) -> Result<u32, E> {
         if count > 32 {
-            return Err(E::from(Fault::TooWide { syntax }));
+            return Err(E::from(Error::TooWide { syntax }));
         }
         let mut value: u32 = 0;
         for _ in 0..count {
@@ -48,10 +48,10 @@ impl<'a> BitReader<'a> {
     /// # Errors
     ///
     /// Returns `Err` when no bits remain.
-    pub fn read_bit<E: From<Fault>>(&mut self, syntax: &'static str) -> Result<bool, E> {
+    pub fn read_bit<E: From<Error>>(&mut self, syntax: &'static str) -> Result<bool, E> {
         let total = self.data.len() * 8;
         if self.bit >= total {
-            return Err(E::from(Fault::Truncated { syntax }));
+            return Err(E::from(Error::Truncated { syntax }));
         }
         let bit = self.peek(self.bit);
         self.bit += 1;

@@ -2,9 +2,9 @@
 
 use crate::bits::BitReader;
 use crate::error::test_support::TestError;
-use crate::error::HevcGate;
+use crate::error::H265Gate;
 use crate::error::NalAction;
-use crate::nal::rbsp;
+use crate::framing::rbsp;
 use crate::picture::Ingest;
 use crate::pps::{parse_pps, Pps};
 use crate::scaling::parse_scaling_list_data;
@@ -16,7 +16,7 @@ use rust_video_harness::Bits;
 /// Test gate with ingest citation checks.
 struct TestGate;
 
-impl HevcGate<TestError> for TestGate {
+impl H265Gate<TestError> for TestGate {
     /// Sequence set against tier caps.
     fn check_sps(sps: &Sps) -> Result<(), TestError> {
         let _ = sps;
@@ -43,7 +43,7 @@ impl HevcGate<TestError> for TestGate {
 /// Test gate asserting the classified NAL layer id.
 struct LayerGate;
 
-impl HevcGate<TestError> for LayerGate {
+impl H265Gate<TestError> for LayerGate {
     /// Layer 2 expected; anything else fails the pin.
     fn classify_nal(nal_type: u8, layer_id: u16) -> Result<NalAction, TestError> {
         assert_eq!((nal_type, layer_id), (1, 2));

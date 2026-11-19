@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 
 /// VP9 grammar fault behind tier errors.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Fault {
+pub enum Error {
     /// Frame marker against the codec bits.
     FrameMarkerMismatch,
     /// Reserved profile bits.
@@ -33,8 +33,8 @@ pub enum Fault {
     },
 }
 
-impl Display for Fault {
-    /// Fault message body behind tier error wrappers.
+impl Display for Error {
+    /// Error message body behind tier error wrappers.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FrameMarkerMismatch => write!(f, "frame marker mismatch"),
@@ -48,4 +48,6 @@ impl Display for Fault {
     }
 }
 
-impl std::error::Error for Fault {}
+impl std::error::Error for Error {}
+
+pub use self::Error as Fault;

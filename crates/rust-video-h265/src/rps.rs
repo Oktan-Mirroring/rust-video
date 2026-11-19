@@ -1,8 +1,8 @@
 //! Short-term reference picture sets.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, ParseKind};
-use crate::nal::MAX_RPS_PICS;
+use crate::error::{H265Error, ParseKind};
+use crate::framing::MAX_RPS_PICS;
 
 /// Pictures per resolved reference set.
 const MAX_RESOLVED_RPS: u8 = 15;
@@ -88,7 +88,7 @@ pub struct ResolvedRps {
 /// * `index` - set index behind prediction.
 /// * `num_sps` - sequence table size behind prediction.
 /// * `table` - decoded sets behind prediction.
-pub fn parse_short_term_rps<E: HevcError>(
+pub fn parse_short_term_rps<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     index: usize,
     num_sps: usize,
@@ -133,7 +133,7 @@ pub fn parse_short_term_rps<E: HevcError>(
 }
 
 /// Prediction source index for set `index` with its coded delta.
-fn predict_source<E: HevcError>(
+fn predict_source<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     index: usize,
     num_sps: usize,
@@ -153,7 +153,7 @@ fn predict_source<E: HevcError>(
 }
 
 /// Delta RPS value behind prediction with its coded sign and magnitude.
-fn parse_delta_rps<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(i32, bool, u32), E> {
+fn parse_delta_rps<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(i32, bool, u32), E> {
     let sign = reader.read_bit("delta_rps_sign")?;
     let abs = reader.read_ue("abs_delta_rps_minus1")?;
     if abs > 32767 {
@@ -170,7 +170,7 @@ fn parse_delta_rps<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(i32, 
 }
 
 /// Per-candidate used and delta flags behind prediction.
-fn parse_predict_flags<E: HevcError>(
+fn parse_predict_flags<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     num_delta_pocs: usize,
 ) -> Result<Vec<(bool, bool)>, E> {
@@ -188,7 +188,7 @@ fn parse_predict_flags<E: HevcError>(
 }
 
 /// Predicted set from `reference`, H.265 7.4.8.
-fn apply_prediction<E: HevcError>(
+fn apply_prediction<E: H265Error>(
     reference: &ShortTermRps,
     delta_rps: i32,
     flags: &[(bool, bool)],
@@ -230,7 +230,7 @@ fn apply_prediction<E: HevcError>(
 }
 
 /// Shifted candidate into the negative or positive list when kept.
-fn push_shifted<E: HevcError>(
+fn push_shifted<E: H265Error>(
     set: &mut ShortTermRps,
     delta: i32,
     shift: i32,
@@ -267,7 +267,7 @@ fn push_shifted<E: HevcError>(
 }
 
 /// Explicitly coded reference set.
-fn parse_explicit_rps<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<ShortTermRps, E> {
+fn parse_explicit_rps<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<ShortTermRps, E> {
     let negative = parse_rps_count(reader, "num_negative_pics")?;
     let positive = parse_rps_count(reader, "num_positive_pics")?;
     if usize::from(negative) + usize::from(positive) >= MAX_RPS_PICS {
@@ -294,7 +294,7 @@ fn parse_explicit_rps<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Sho
 }
 
 /// Reference set picture count below the set ceiling.
-fn parse_rps_count<E: HevcError>(
+fn parse_rps_count<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
 ) -> Result<u8, E> {
@@ -306,7 +306,7 @@ fn parse_rps_count<E: HevcError>(
 }
 
 /// Next explicit delta POC from a minus-one step.
-fn parse_rps_step<E: HevcError>(
+fn parse_rps_step<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     poc: i32,
     positive: bool,

@@ -1,7 +1,7 @@
 //! Video parameter sets.
 
 use crate::bits::BitReader;
-use crate::error::HevcError;
+use crate::error::H265Error;
 use crate::hrd::{parse_hrd, HrdParams};
 use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
 
@@ -58,7 +58,7 @@ pub struct Vps {
 /// # Arguments
 ///
 /// * `body` - RBSP bytes with the NAL header stripped.
-pub fn parse_vps<E: HevcError>(body: &[u8]) -> Result<Vps, E> {
+pub fn parse_vps<E: H265Error>(body: &[u8]) -> Result<Vps, E> {
     let mut reader = BitReader::new(body);
     let id = narrow_u8(reader.read_bits(4, "vps id")?);
     reader.read_bits(2, "vps base layer")?;
@@ -108,7 +108,7 @@ pub fn parse_vps<E: HevcError>(body: &[u8]) -> Result<Vps, E> {
 }
 
 /// VPS timing information with its HRD sets.
-fn parse_vps_timing<E: HevcError>(
+fn parse_vps_timing<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     layers: u8,
 ) -> Result<VpsTiming, E> {

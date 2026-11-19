@@ -1,8 +1,8 @@
 //! Slice segment headers.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, ParseKind, UnsupportedKind};
-use crate::nal::{is_idr, is_irap, MAX_LT_SPS};
+use crate::error::{H265Error, ParseKind, UnsupportedKind};
+use crate::framing::{is_idr, is_irap, MAX_LT_SPS};
 use crate::pps::{parse_ref_count, Pps};
 use crate::rps::{parse_short_term_rps, ShortTermRps};
 use crate::sps::Sps;
@@ -20,7 +20,7 @@ pub enum SliceType {
 
 impl SliceType {
     /// Type for the `slice_type` value.
-    fn new<E: HevcError>(value: u32) -> Result<Self, E> {
+    fn new<E: H265Error>(value: u32) -> Result<Self, E> {
         match value {
             0 => Ok(Self::B),
             1 => Ok(Self::P),
@@ -121,7 +121,7 @@ pub struct SliceHeader {
 ///
 /// * `reader` - bit reader over the slice header.
 /// * `nal_type` - NAL unit type.
-pub fn parse_slice_prefix<E: HevcError>(
+pub fn parse_slice_prefix<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     nal_type: u8,
 ) -> Result<(bool, bool, u8), E> {
@@ -153,7 +153,7 @@ pub fn parse_slice_prefix<E: HevcError>(
 /// * `nal_type` - NAL unit type.
 /// * `sps` - sequence set behind the header.
 /// * `pps` - picture set behind the header.
-pub fn parse_slice_rest<E: HevcError>(
+pub fn parse_slice_rest<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     prefix: (bool, bool, u8),
     nal_type: u8,
@@ -208,7 +208,7 @@ pub fn parse_slice_rest<E: HevcError>(
 }
 
 /// Slice segment address, declining dependent segments.
-fn parse_slice_address<E: HevcError>(
+fn parse_slice_address<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     first: bool,
     sps: &Sps,
@@ -247,7 +247,7 @@ struct SliceRefSets {
 }
 
 /// Slice POC LSB plus short-term and long-term reference sets.
-fn parse_slice_rps<E: HevcError>(
+fn parse_slice_rps<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     nal_type: u8,
     sps: &Sps,
@@ -276,7 +276,7 @@ fn parse_slice_rps<E: HevcError>(
 }
 
 /// Short-term set: explicit slice syntax or a table entry.
-fn parse_slice_short_term<E: HevcError>(
+fn parse_slice_short_term<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<(ShortTermRps, RpsBits), E> {
@@ -332,7 +332,7 @@ fn parse_slice_short_term<E: HevcError>(
 }
 
 /// Long-term pictures: sequence entries plus slice entries.
-fn parse_slice_long_term<E: HevcError>(
+fn parse_slice_long_term<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<Vec<LtSpec>, E> {
@@ -384,7 +384,7 @@ fn parse_slice_long_term<E: HevcError>(
 }
 
 /// Sequence long-term entry by table index.
-fn parse_lt_sps_entry<E: HevcError>(
+fn parse_lt_sps_entry<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<(u32, bool), E> {
@@ -415,7 +415,7 @@ fn parse_lt_sps_entry<E: HevcError>(
 }
 
 /// Slice sample adaptive offset flags.
-fn parse_slice_sao<E: HevcError>(
+fn parse_slice_sao<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<(bool, bool), E> {
@@ -428,7 +428,7 @@ fn parse_slice_sao<E: HevcError>(
 }
 
 /// Inter section: counts, list modification, collocated, weights, merge.
-fn parse_slice_inter<E: HevcError>(
+fn parse_slice_inter<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     temporal_mvp: bool,
@@ -469,7 +469,7 @@ fn poc_total_curr(rps: Option<&ShortTermRps>, lt: &[LtSpec]) -> usize {
 }
 
 /// Active reference counts with slice override.
-fn parse_ref_override<E: HevcError>(
+fn parse_ref_override<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     pps: &Pps,
@@ -487,7 +487,7 @@ fn parse_ref_override<E: HevcError>(
 }
 
 /// Reference list modification entries.
-fn parse_lists_modification<E: HevcError>(
+fn parse_lists_modification<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     num_l0: u8,
@@ -519,7 +519,7 @@ fn parse_lists_modification<E: HevcError>(
 }
 
 /// Collocated picture description.
-fn parse_collocated<E: HevcError>(
+fn parse_collocated<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     temporal_mvp: bool,
@@ -547,7 +547,7 @@ fn parse_collocated<E: HevcError>(
 }
 
 /// Prediction weight table.
-fn parse_weight_table<E: HevcError>(
+fn parse_weight_table<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     num_l0: u8,
@@ -567,7 +567,7 @@ fn parse_weight_table<E: HevcError>(
 }
 
 /// One reference weight list.
-fn parse_weight_list<E: HevcError>(
+fn parse_weight_list<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     count_minus1: u8,
 ) -> Result<(), E> {
@@ -595,7 +595,7 @@ fn parse_weight_list<E: HevcError>(
 }
 
 /// Slice quantization deltas.
-fn parse_slice_qp<E: HevcError>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<(), E> {
+fn parse_slice_qp<E: H265Error>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<(), E> {
     reader.read_se("slice_qp_delta")?;
     if pps.chroma_offsets_present() {
         reader.read_se("slice_cb_qp_offset")?;
@@ -605,7 +605,7 @@ fn parse_slice_qp<E: HevcError>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Res
 }
 
 /// Slice deblocking description, returning the disabled state.
-fn parse_slice_deblocking<E: HevcError>(
+fn parse_slice_deblocking<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     pps: &Pps,
 ) -> Result<bool, E> {
@@ -624,7 +624,7 @@ fn parse_slice_deblocking<E: HevcError>(
 }
 
 /// Slice loop filter flag across slices.
-fn parse_slice_loop_across<E: HevcError>(
+fn parse_slice_loop_across<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     pps: &Pps,
     sao: (bool, bool),
@@ -637,7 +637,7 @@ fn parse_slice_loop_across<E: HevcError>(
 }
 
 /// Tile and wavefront entry point offsets, returning the offset count.
-fn parse_entry_points<E: HevcError>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<u32, E> {
+fn parse_entry_points<E: H265Error>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<u32, E> {
     if !pps.tiles_enabled() && !pps.entropy_sync() {
         return Ok(0);
     }
@@ -658,7 +658,7 @@ fn parse_entry_points<E: HevcError>(reader: &mut BitReader<'_, E>, pps: &Pps) ->
 }
 
 /// Slice extension bytes, returning the extension length.
-fn parse_slice_extension<E: HevcError>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<u32, E> {
+fn parse_slice_extension<E: H265Error>(reader: &mut BitReader<'_, E>, pps: &Pps) -> Result<u32, E> {
     if !pps.slice_ext_present() {
         return Ok(0);
     }
@@ -767,7 +767,7 @@ pub struct SliceTail {
 /// # Usage Notes
 ///
 /// Reads mirror `parse_slice_rest` exactly; keep the two in sync.
-pub fn parse_slice_tail<E: HevcError>(
+pub fn parse_slice_tail<E: H265Error>(
     body: &[u8],
     nal_type: u8,
     sps: &Sps,
@@ -833,7 +833,7 @@ pub fn parse_slice_tail<E: HevcError>(
 }
 
 /// Slice order count plus reference sets into `tail`, returning short-term used count.
-fn parse_tail_rps<E: HevcError>(
+fn parse_tail_rps<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
     tail: &mut SliceTail,
@@ -846,7 +846,7 @@ fn parse_tail_rps<E: HevcError>(
 }
 
 /// Short-term set, returning its used-by-current count.
-fn parse_tail_short_term<E: HevcError>(
+fn parse_tail_short_term<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<usize, E> {
@@ -887,7 +887,7 @@ fn parse_tail_short_term<E: HevcError>(
 }
 
 /// Long-term pictures with accumulated MSB cycles into `tail`.
-fn parse_tail_long_term<E: HevcError>(
+fn parse_tail_long_term<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
     tail: &mut SliceTail,
@@ -945,7 +945,7 @@ fn parse_tail_long_term<E: HevcError>(
 }
 
 /// Sequence long-term entry by table index.
-fn parse_tail_lt_sps_entry<E: HevcError>(
+fn parse_tail_lt_sps_entry<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     sps: &Sps,
 ) -> Result<(u32, bool), E> {
@@ -976,7 +976,7 @@ fn parse_tail_lt_sps_entry<E: HevcError>(
 }
 
 /// Inter section into `tail`: counts, lists, collocated, weights, merge.
-fn parse_tail_inter<E: HevcError>(
+fn parse_tail_inter<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     temporal_mvp: bool,
@@ -1016,7 +1016,7 @@ fn parse_tail_inter<E: HevcError>(
 }
 
 /// Active reference counts with slice override into `tail`.
-fn parse_tail_ref_override<E: HevcError>(
+fn parse_tail_ref_override<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     pps: &Pps,
@@ -1034,7 +1034,7 @@ fn parse_tail_ref_override<E: HevcError>(
 }
 
 /// Reference count field below the 15 ceiling.
-fn parse_tail_ref_count<E: HevcError>(
+fn parse_tail_ref_count<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
 ) -> Result<u8, E> {
@@ -1046,7 +1046,7 @@ fn parse_tail_ref_count<E: HevcError>(
 }
 
 /// Reference list modification entries into `tail`.
-fn parse_tail_lists_modification<E: HevcError>(
+fn parse_tail_lists_modification<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     num_l0: u8,
@@ -1083,7 +1083,7 @@ fn parse_tail_lists_modification<E: HevcError>(
 }
 
 /// Collocated picture description into `tail`.
-fn parse_tail_collocated<E: HevcError>(
+fn parse_tail_collocated<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     temporal_mvp: bool,
@@ -1119,7 +1119,7 @@ fn parse_tail_collocated<E: HevcError>(
 }
 
 /// Prediction weight table into `tail`.
-fn parse_tail_weight_table<E: HevcError>(
+fn parse_tail_weight_table<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     slice_type: SliceType,
     num_l0: u8,
@@ -1146,7 +1146,7 @@ fn parse_tail_weight_table<E: HevcError>(
 }
 
 /// One reference weight list into `out`.
-fn parse_tail_weight_list<E: HevcError>(
+fn parse_tail_weight_list<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     count_minus1: u8,
     out: &mut Vec<WeightEntry>,
@@ -1188,7 +1188,7 @@ fn parse_tail_weight_list<E: HevcError>(
 }
 
 /// Signed value inside `min..=max`.
-fn tail_bounded_se<E: HevcError>(
+fn tail_bounded_se<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
     min: i32,
@@ -1202,7 +1202,7 @@ fn tail_bounded_se<E: HevcError>(
 }
 
 /// Slice quantization deltas into `tail`.
-fn parse_tail_qp<E: HevcError>(
+fn parse_tail_qp<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     pps: &Pps,
     sps: &Sps,
@@ -1236,7 +1236,7 @@ fn parse_tail_qp<E: HevcError>(
 }
 
 /// Slice deblocking description into `tail`.
-fn parse_tail_deblocking<E: HevcError>(
+fn parse_tail_deblocking<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     pps: &Pps,
     tail: &mut SliceTail,
@@ -1262,7 +1262,7 @@ fn parse_tail_deblocking<E: HevcError>(
 }
 
 /// Slice loop filter flag across slices into `tail`.
-fn parse_tail_loop_across<E: HevcError>(
+fn parse_tail_loop_across<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     pps: &Pps,
     tail: &mut SliceTail,

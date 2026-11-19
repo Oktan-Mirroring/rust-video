@@ -2,7 +2,7 @@
 
 use crate::bits::BitReader;
 use crate::error::{narrow_u8, H264Error, H264Gate, ParseKind, UnsupportedKind};
-use crate::scaling::{fallback_scaling, picture_scaling, ScalingMap, ScalingSets};
+use crate::scaling::{fallback_scaling, picture_scaling, ScalingLists, ScalingMap};
 use crate::sps::Sps;
 
 /// CABAC entropy coding flag bit.
@@ -44,7 +44,7 @@ pub struct Pps {
     /// Second chroma QP offset.
     pub second_chroma_qp: i8,
     /// Resolved picture scaling lists.
-    pub scaling: ScalingSets,
+    pub scaling: ScalingLists,
     /// Scaling presence, absent without a matrix flag.
     pub scaling_map: Option<ScalingMap>,
 }

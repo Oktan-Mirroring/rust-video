@@ -1,7 +1,7 @@
 //! Scaling lists in coded order.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, ParseKind};
+use crate::error::{H265Error, ParseKind};
 
 /// Default intra scaling list in diagonal scan order, H.265 7.4.5.
 const DEFAULT_INTRA: [u8; 64] = [
@@ -63,7 +63,7 @@ impl Default for ScalingLists {
 }
 
 /// Scaling list data, H.265 7.3.4.
-pub fn parse_scaling_list_data<E: HevcError>(
+pub(crate) fn parse_scaling_list_data<E: H265Error>(
     reader: &mut BitReader<'_, E>,
 ) -> Result<ScalingLists, E> {
     let mut lists = ScalingLists::default();
@@ -77,7 +77,7 @@ pub fn parse_scaling_list_data<E: HevcError>(
 }
 
 /// One scaling matrix: default, sibling copy, or parsed deltas.
-fn parse_scaling_matrix<E: HevcError>(
+fn parse_scaling_matrix<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     lists: &mut ScalingLists,
     size_id: usize,

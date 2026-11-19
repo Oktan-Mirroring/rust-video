@@ -2,7 +2,7 @@
 
 /// Reference list naming a picture the slots cannot supply.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
-pub enum BrokenReferenceReason {
+pub enum BrokenReferenceKind {
     /// Reference names an empty slot.
     #[error("{reference} names empty slot")]
     NamesEmptySlot {
@@ -11,24 +11,26 @@ pub enum BrokenReferenceReason {
     },
 }
 
+pub use self::BrokenReferenceKind as BrokenReferenceReason;
+
 /// AV1 grammar failure.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum Error {
     /// Bitstream the grammar declines: depth and chroma outside 8-bit
     /// 4:2:0, spatial layers, superres upscale, or tile lists.
     #[error("unsupported stream: {0}")]
-    Unsupported(UnsupportedReason),
+    Unsupported(UnsupportedKind),
     /// Bitstream parse failure.
     #[error("parse failed: {0}")]
-    Parse(ParseReason),
+    Parse(ParseKind),
     /// Reference list names a picture the slots cannot supply.
     #[error("broken reference list: {0}")]
-    BrokenReference(BrokenReferenceReason),
+    BrokenReference(BrokenReferenceKind),
 }
 
 /// Bitstream element the parser rejects.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
-pub enum ParseReason {
+pub enum ParseKind {
     /// Frame before its sequence header.
     #[error("frame before sequence header")]
     FrameBeforeSequenceHeader,
@@ -100,9 +102,11 @@ pub enum ParseReason {
     },
 }
 
+pub use self::ParseKind as ParseReason;
+
 /// Bitstream construct the grammar declines.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
-pub enum UnsupportedReason {
+pub enum UnsupportedKind {
     /// AV1 bit depth above the 8-bit target.
     #[error("av1 {depth}-bit needs a {depth}-bit target")]
     Av1BitDepthNeedsTarget {
@@ -132,34 +136,36 @@ pub enum UnsupportedReason {
     TileList,
 }
 
+pub use self::UnsupportedKind as UnsupportedReason;
+
 impl Error {
     /// Parse failure.
     ///
     /// # Returns
     ///
-    /// `reason` wrapped as the caller's error type.
+    /// `kind` wrapped as the caller's error type.
     #[must_use]
-    pub fn parse<E: From<Self>>(reason: ParseReason) -> E {
-        Self::Parse(reason).into()
+    pub fn parse<E: From<Self>>(kind: ParseKind) -> E {
+        Self::Parse(kind).into()
     }
 
     /// Declined construct.
     ///
     /// # Returns
     ///
-    /// `reason` wrapped as the caller's error type.
+    /// `kind` wrapped as the caller's error type.
     #[must_use]
-    pub fn unsupported<E: From<Self>>(reason: UnsupportedReason) -> E {
-        Self::Unsupported(reason).into()
+    pub fn unsupported<E: From<Self>>(kind: UnsupportedKind) -> E {
+        Self::Unsupported(kind).into()
     }
 
     /// Broken reference list.
     ///
     /// # Returns
     ///
-    /// `reason` wrapped as the caller's error type.
+    /// `kind` wrapped as the caller's error type.
     #[must_use]
-    pub fn broken<E: From<Self>>(reason: BrokenReferenceReason) -> E {
-        Self::BrokenReference(reason).into()
+    pub fn broken<E: From<Self>>(kind: BrokenReferenceKind) -> E {
+        Self::BrokenReference(kind).into()
     }
 }

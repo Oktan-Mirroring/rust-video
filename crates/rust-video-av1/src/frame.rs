@@ -1,7 +1,7 @@
 //! AV1 frame headers plus reference slots.
 
 use crate::bits::BitReader;
-use crate::error::{BrokenReferenceReason, Error, ParseReason};
+use crate::error::{BrokenReferenceKind, Error, ParseKind};
 use crate::sequence::SequenceHeader;
 use crate::syntax::{
     read_increment, read_ns, read_small, read_su, read_subexp, relative_dist, tile_log2,
@@ -168,7 +168,7 @@ impl FrameType {
             1 => Ok(Self::Inter),
             2 => Ok(Self::IntraOnly),
             3 => Ok(Self::Switch),
-            _ => Err(Error::parse(ParseReason::Range {
+            _ => Err(Error::parse(ParseKind::Range {
                 syntax: "frame_type",
             })),
         }
@@ -835,6 +835,26 @@ impl Default for RefInfo {
     }
 }
 
+/// One decoded tile: payload plus grid position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TileData {
+    /// Tile payload bytes without the size field.
+    pub bytes: Vec<u8>,
+    /// Tile row.
+    pub row: u16,
+    /// Tile column.
+    pub column: u16,
+}
+
+/// One coded frame: header plus tiles in tile order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Frame {
+    /// Parsed frame header.
+    pub header: FrameHeader,
+    /// Tile payloads in tile order.
+    pub tiles: Vec<TileData>,
+}
+
 /// Uncompressed header reader over one frame header payload.
 struct HeaderReader<'a> {
     /// Payload bits under read.
@@ -940,7 +960,7 @@ impl<'a> HeaderReader<'a> {
             .get(usize::from(index))
             .filter(|slot| slot.valid)
             .ok_or({
-                Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                Error::broken(BrokenReferenceKind::NamesEmptySlot {
                     reference: "show_existing_frame",
                 })
             })?;
@@ -1194,7 +1214,7 @@ impl<'a> HeaderReader<'a> {
         for index in 0..REFS_PER_FRAME {
             let slot = usize::from(self.header.ref_frame_idx[index]);
             if !self.refs.get(slot).is_some_and(|slot| slot.valid) {
-                return Err(Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                return Err(Error::broken(BrokenReferenceKind::NamesEmptySlot {
                     reference: "ref_frame_idx",
                 }));
             }
@@ -1221,7 +1241,7 @@ impl<'a> HeaderReader<'a> {
                 .get(usize::from(slot))
                 .is_some_and(|slot| slot.valid)
             {
-                return Err(Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                return Err(Error::broken(BrokenReferenceKind::NamesEmptySlot {
                     reference: "short reference",
                 }));
             }
@@ -1368,7 +1388,7 @@ impl<'a> HeaderReader<'a> {
             }
             let slot = usize::from(self.header.ref_frame_idx[position]);
             let reference = self.refs.get(slot).filter(|slot| slot.valid).ok_or({
-                Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                Error::broken(BrokenReferenceKind::NamesEmptySlot {
                     reference: "frame size",
                 })
             })?;
@@ -1419,7 +1439,7 @@ impl<'a> HeaderReader<'a> {
             denom = coded + u32::from(SUPERRES_DENOM_MIN);
         }
         self.header.superres_denom = u8::try_from(denom).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "coded_denom",
             })
         })?;
@@ -1485,7 +1505,7 @@ impl<'a> HeaderReader<'a> {
                 self.reader.read_bits(width, "context_update_tile_id")?,
             )
             .map_err(|_| {
-                Error::parse(ParseReason::Range {
+                Error::parse(ParseKind::Range {
                     syntax: "context_update_tile_id",
                 })
             })?;
@@ -1515,34 +1535,34 @@ impl<'a> HeaderReader<'a> {
         let tile_height_sb = (sb_rows + (1 << rows_log2) - 1) >> rows_log2;
         let rows = sb_rows.div_ceil(tile_height_sb);
         self.header.tile_cols_log2 = u8::try_from(cols_log2).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_cols_log2",
             })
         })?;
         self.header.tile_rows_log2 = u8::try_from(rows_log2).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_rows_log2",
             })
         })?;
         self.header.tile_cols = u8::try_from(cols).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_cols",
             })
         })?;
         self.header.tile_rows = u8::try_from(rows).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_rows",
             })
         })?;
         let cols = usize::from(self.header.tile_cols);
         let rows = usize::from(self.header.tile_rows);
         let width_minus1 = u16::try_from(tile_width_sb - 1).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile width",
             })
         })?;
         let height_minus1 = u16::try_from(tile_height_sb - 1).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile height",
             })
         })?;
@@ -1552,7 +1572,7 @@ impl<'a> HeaderReader<'a> {
             } else {
                 let last = sb_cols - u32::from(self.header.tile_cols - 1) * tile_width_sb - 1;
                 u16::try_from(last).map_err(|_| {
-                    Error::parse(ParseReason::Range {
+                    Error::parse(ParseKind::Range {
                         syntax: "tile width",
                     })
                 })?
@@ -1564,7 +1584,7 @@ impl<'a> HeaderReader<'a> {
             } else {
                 let last = sb_rows - u32::from(self.header.tile_rows - 1) * tile_height_sb - 1;
                 u16::try_from(last).map_err(|_| {
-                    Error::parse(ParseReason::Range {
+                    Error::parse(ParseKind::Range {
                         syntax: "tile height",
                     })
                 })?
@@ -1590,12 +1610,12 @@ impl<'a> HeaderReader<'a> {
         let max_height_sb = (max_area / widest).max(1);
         let (rows, _) = self.parse_tile_axis(sb_rows, max_height_sb, false)?;
         self.header.tile_cols_log2 = u8::try_from(tile_log2(1, u32::from(cols))).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_cols_log2",
             })
         })?;
         self.header.tile_rows_log2 = u8::try_from(tile_log2(1, u32::from(rows))).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "tile_rows_log2",
             })
         })?;
@@ -1616,7 +1636,7 @@ impl<'a> HeaderReader<'a> {
         let mut widest = 0u32;
         while start_sb < sb_count {
             if u32::from(count) >= MAX_TILE_COLS {
-                return Err(Error::parse(ParseReason::Range {
+                return Err(Error::parse(ParseKind::Range {
                     syntax: "tile count",
                 }));
             }
@@ -1624,7 +1644,7 @@ impl<'a> HeaderReader<'a> {
             let minus1 = read_ns(&mut self.reader, ceiling, "tile_width_minus_1")?;
             let size_sb = minus1 + 1;
             let stored = u16::try_from(minus1).map_err(|_| {
-                Error::parse(ParseReason::Range {
+                Error::parse(ParseKind::Range {
                     syntax: "tile width",
                 })
             })?;
@@ -1638,7 +1658,7 @@ impl<'a> HeaderReader<'a> {
             count += 1;
         }
         if start_sb != sb_count {
-            return Err(Error::parse(ParseReason::TileGridCoverage));
+            return Err(Error::parse(ParseKind::TileGridCoverage));
         }
         Ok((count, widest))
     }
@@ -1680,7 +1700,7 @@ impl<'a> HeaderReader<'a> {
             return Ok(0);
         }
         let value = read_su(&mut self.reader, 7, syntax)?;
-        i8::try_from(value).map_err(|_| Error::parse(ParseReason::Range { syntax }))
+        i8::try_from(value).map_err(|_| Error::parse(ParseKind::Range { syntax }))
     }
 
     /// Segmentation parameters.
@@ -1727,7 +1747,7 @@ impl<'a> HeaderReader<'a> {
             let primary =
                 usize::from(self.header.ref_frame_idx[usize::from(self.header.primary_ref_frame)]);
             let slot = self.refs.get(primary).filter(|slot| slot.valid).ok_or({
-                Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                Error::broken(BrokenReferenceKind::NamesEmptySlot {
                     reference: "segmentation",
                 })
             })?;
@@ -1752,7 +1772,7 @@ impl<'a> HeaderReader<'a> {
             )?)
         };
         self.header.seg_value[segment][level] = i16::try_from(value).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "feature_value",
             })
         })?;
@@ -1872,7 +1892,7 @@ impl<'a> HeaderReader<'a> {
         }
         let value = read_su(&mut self.reader, 7, "loop_filter_delta")?;
         let value = i8::try_from(value).map_err(|_| {
-            Error::parse(ParseReason::Range {
+            Error::parse(ParseKind::Range {
                 syntax: "loop_filter_delta",
             })
         })?;
@@ -1893,7 +1913,7 @@ impl<'a> HeaderReader<'a> {
         let primary =
             usize::from(self.header.ref_frame_idx[usize::from(self.header.primary_ref_frame)]);
         let slot = self.refs.get(primary).filter(|slot| slot.valid).ok_or({
-            Error::broken(BrokenReferenceReason::NamesEmptySlot {
+            Error::broken(BrokenReferenceKind::NamesEmptySlot {
                 reference: "loop filter",
             })
         })?;
@@ -1941,7 +1961,7 @@ impl<'a> HeaderReader<'a> {
         for plane in 0..usize::from(self.seq.num_planes()) {
             let lr_type = read_small(&mut self.reader, 2, "lr_type")?;
             if !is_restoration_type(lr_type) {
-                return Err(Error::parse(ParseReason::Range { syntax: "lr_type" }));
+                return Err(Error::parse(ParseKind::Range { syntax: "lr_type" }));
             }
             self.header.lr_type[plane] = lr_type;
             if lr_type != RESTORE_NONE {
@@ -1962,7 +1982,7 @@ impl<'a> HeaderReader<'a> {
         self.header.lr_unit_shift = read_increment(&mut self.reader, min, max, "lr_unit_shift")
             .and_then(|shift| {
                 u8::try_from(shift).map_err(|_| {
-                    Error::parse(ParseReason::Range {
+                    Error::parse(ParseKind::Range {
                         syntax: "lr_unit_shift",
                     })
                 })
@@ -1985,7 +2005,7 @@ impl<'a> HeaderReader<'a> {
             "tx_mode",
         )?;
         self.header.tx_mode = u8::try_from(tx_mode)
-            .map_err(|_| Error::parse(ParseReason::Range { syntax: "tx_mode" }))?;
+            .map_err(|_| Error::parse(ParseKind::Range { syntax: "tx_mode" }))?;
         Ok(())
     }
 
@@ -2126,13 +2146,13 @@ impl<'a> HeaderReader<'a> {
                 .get(usize::from(index))
                 .filter(|slot| slot.valid)
                 .ok_or({
-                    Error::broken(BrokenReferenceReason::NamesEmptySlot {
+                    Error::broken(BrokenReferenceKind::NamesEmptySlot {
                         reference: "film grain",
                     })
                 })?;
             let mut grain = slot.grain;
             grain.grain_seed = u16::try_from(seed).map_err(|_| {
-                Error::parse(ParseReason::Range {
+                Error::parse(ParseKind::Range {
                     syntax: "grain_seed",
                 })
             })?;
@@ -2144,7 +2164,7 @@ impl<'a> HeaderReader<'a> {
             flags: FG_APPLY,
             update_grain: true,
             grain_seed: u16::try_from(seed).map_err(|_| {
-                Error::parse(ParseReason::Range {
+                Error::parse(ParseKind::Range {
                     syntax: "grain_seed",
                 })
             })?,
@@ -2160,7 +2180,7 @@ impl<'a> HeaderReader<'a> {
     fn parse_grain_scaling<E: From<Error>>(&mut self, grain: &mut FilmGrain) -> Result<(), E> {
         grain.num_y_points = read_small(&mut self.reader, 4, "num_y_points")?;
         if grain.num_y_points > 14 {
-            return Err(Error::parse(ParseReason::Range {
+            return Err(Error::parse(ParseKind::Range {
                 syntax: "num_y_points",
             }));
         }
@@ -2184,7 +2204,7 @@ impl<'a> HeaderReader<'a> {
         }
         grain.num_cb_points = read_small(&mut self.reader, 4, "num_cb_points")?;
         if grain.num_cb_points > 10 {
-            return Err(Error::parse(ParseReason::Range {
+            return Err(Error::parse(ParseKind::Range {
                 syntax: "num_cb_points",
             }));
         }
@@ -2199,7 +2219,7 @@ impl<'a> HeaderReader<'a> {
         }
         grain.num_cr_points = read_small(&mut self.reader, 4, "num_cr_points")?;
         if grain.num_cr_points > 10 {
-            return Err(Error::parse(ParseReason::Range {
+            return Err(Error::parse(ParseKind::Range {
                 syntax: "num_cr_points",
             }));
         }
@@ -2226,7 +2246,7 @@ impl<'a> HeaderReader<'a> {
         let floor = previous.map_or(0, |prev| u16::from(prev) + 1);
         let ceiling = 255 - u16::try_from(count - index - 1).unwrap_or(255);
         if u16::from(value) < floor || u16::from(value) > ceiling {
-            return Err(Error::parse(ParseReason::Range {
+            return Err(Error::parse(ParseKind::Range {
                 syntax: "point_value",
             }));
         }
@@ -2265,7 +2285,7 @@ impl<'a> HeaderReader<'a> {
             grain.cb_luma_mult = read_small(&mut self.reader, 8, "cb_luma_mult")?;
             grain.cb_offset = self.reader.read_bits(9, "cb_offset").and_then(|offset| {
                 u16::try_from(offset).map_err(|_| {
-                    Error::parse(ParseReason::Range {
+                    Error::parse(ParseKind::Range {
                         syntax: "cb_offset",
                     })
                 })
@@ -2276,7 +2296,7 @@ impl<'a> HeaderReader<'a> {
             grain.cr_luma_mult = read_small(&mut self.reader, 8, "cr_luma_mult")?;
             grain.cr_offset = self.reader.read_bits(9, "cr_offset").and_then(|offset| {
                 u16::try_from(offset).map_err(|_| {
-                    Error::parse(ParseReason::Range {
+                    Error::parse(ParseKind::Range {
                         syntax: "cr_offset",
                     })
                 })
@@ -2580,7 +2600,7 @@ pub fn refresh_refs<E: From<Error>>(
     header: &FrameHeader,
 ) -> Result<(), E> {
     if header.frame_type == FrameType::IntraOnly && header.refresh_frame_flags == 0xFF {
-        return Err(Error::parse(ParseReason::Range {
+        return Err(Error::parse(ParseKind::Range {
             syntax: "refresh_frame_flags",
         }));
     }

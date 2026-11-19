@@ -1,8 +1,8 @@
 //! Sequence parameter sets.
 
 use crate::bits::BitReader;
-use crate::error::{HevcError, HevcGate, ParseKind};
-use crate::nal::{Crop, MAX_LT_SPS, MAX_RPS, MAX_SPS};
+use crate::error::{H265Error, H265Gate, ParseKind};
+use crate::framing::{Crop, MAX_LT_SPS, MAX_RPS, MAX_SPS};
 use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
 use crate::rps::{parse_short_term_rps, ShortTermRps};
 use crate::scaling::{parse_scaling_list_data, ScalingLists};
@@ -249,7 +249,7 @@ impl Sps {
 /// # Arguments
 ///
 /// * `rbsp` - RBSP bytes with the NAL header stripped.
-pub fn parse_sps<E: HevcError, G: HevcGate<E>>(rbsp: &[u8]) -> Result<Sps, E> {
+pub fn parse_sps<E: H265Error, G: H265Gate<E>>(rbsp: &[u8]) -> Result<Sps, E> {
     let mut reader = BitReader::new(rbsp);
     let vps_id = parse_vps_id(&mut reader)?;
     let max_sub_layers = parse_sub_layers(&mut reader)?;
@@ -332,7 +332,7 @@ pub fn parse_sps<E: HevcError, G: HevcGate<E>>(rbsp: &[u8]) -> Result<Sps, E> {
 }
 
 /// Video set id behind the sequence set.
-fn parse_vps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
+fn parse_vps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_bits(4, "sps_video_parameter_set_id")?;
     u8::try_from(id).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -342,7 +342,7 @@ fn parse_vps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 }
 
 /// Sublayer count from the minus-one field.
-fn parse_sub_layers<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
+fn parse_sub_layers<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let minus1 = reader.read_bits(3, "sps_max_sub_layers_minus1")?;
     u8::try_from(minus1 + 1).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -352,7 +352,7 @@ fn parse_sub_layers<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E
 }
 
 /// Set id below the set count.
-fn parse_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
+fn parse_sps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("seq_parameter_set_id")?;
     let id = u8::try_from(id).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -368,7 +368,7 @@ fn parse_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 }
 
 /// Chroma sampling indicator with its separate-plane flag.
-fn parse_chroma<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u8, bool), E> {
+fn parse_chroma<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u8, bool), E> {
     let chroma = reader.read_ue("chroma_format_idc")?;
     let chroma = u8::try_from(chroma).map_err(|_| {
         E::parse(ParseKind::Range {
@@ -380,7 +380,7 @@ fn parse_chroma<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u8, bool
 }
 
 /// Coded picture size in luma samples.
-fn parse_pic_size<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u32, u32), E> {
+fn parse_pic_size<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u32, u32), E> {
     let width = reader.read_ue("pic_width_in_luma_samples")?;
     let height = reader.read_ue("pic_height_in_luma_samples")?;
     if width == 0 || height == 0 {
@@ -390,7 +390,7 @@ fn parse_pic_size<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u32, u
 }
 
 /// Conformance crop rectangle in luma samples.
-fn parse_conformance<E: HevcError>(
+fn parse_conformance<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     width: u32,
     height: u32,
@@ -416,7 +416,7 @@ fn parse_conformance<E: HevcError>(
 }
 
 /// Luma and chroma bit depths minus eight.
-fn parse_depths<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u8, u8), E> {
+fn parse_depths<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u8, u8), E> {
     let luma = reader.read_ue("bit_depth_luma_minus8")?;
     let chroma = reader.read_ue("bit_depth_chroma_minus8")?;
     let luma = u8::try_from(luma).map_err(|_| {
@@ -433,7 +433,7 @@ fn parse_depths<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<(u8, u8),
 }
 
 /// Log2 width field below the 12 ceiling.
-fn parse_log2<E: HevcError>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<u8, E> {
+fn parse_log2<E: H265Error>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 12 {
         return Err(E::parse(ParseKind::Range { syntax }));
@@ -452,7 +452,7 @@ struct Ordering {
 }
 
 /// Buffering and reorder limits over sublayers.
-fn parse_ordering<E: HevcError>(
+fn parse_ordering<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     max_sub_layers: u8,
     flags: &mut u16,
@@ -501,7 +501,7 @@ fn parse_ordering<E: HevcError>(
 }
 
 /// Luma block sizes plus transform depths.
-fn parse_block_sizes<E: HevcError>(
+fn parse_block_sizes<E: H265Error>(
     reader: &mut BitReader<'_, E>,
 ) -> Result<(u8, u8, u8, u8, u8, u8), E> {
     let cb_min = parse_bounded_ue(reader, "log2_min_luma_coding_block_size_minus3", 3)?;
@@ -514,7 +514,7 @@ fn parse_block_sizes<E: HevcError>(
 }
 
 /// Unsigned field below `ceiling`.
-pub fn parse_bounded_ue<E: HevcError>(
+pub(crate) fn parse_bounded_ue<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     syntax: &'static str,
     ceiling: u32,
@@ -527,7 +527,7 @@ pub fn parse_bounded_ue<E: HevcError>(
 }
 
 /// Sequence scaling lists, flat without data.
-fn parse_sps_scaling<E: HevcError>(
+fn parse_sps_scaling<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     flags: &mut u16,
 ) -> Result<ScalingLists, E> {
@@ -542,7 +542,7 @@ fn parse_sps_scaling<E: HevcError>(
 }
 
 /// PCM parameters, zeroed without PCM.
-fn parse_pcm<E: HevcError>(
+fn parse_pcm<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     flags: &mut u16,
 ) -> Result<(u8, u8, u8, u8), E> {
@@ -571,7 +571,7 @@ fn parse_pcm<E: HevcError>(
 }
 
 /// Short-term reference set table.
-fn parse_rps_table<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Vec<ShortTermRps>, E> {
+fn parse_rps_table<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<Vec<ShortTermRps>, E> {
     let count = reader.read_ue("num_short_term_ref_pic_sets")?;
     if usize::try_from(count).is_ok_and(|count| count > MAX_RPS) {
         return Err(E::parse(ParseKind::RpsTableOversize));
@@ -587,7 +587,7 @@ fn parse_rps_table<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Vec<Sh
 }
 
 /// Sequence long-term pictures.
-fn parse_long_term_sps<E: HevcError>(
+fn parse_long_term_sps<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     log2_max_poc_lsb_minus4: u8,
     flags: &mut u16,
@@ -611,7 +611,7 @@ fn parse_long_term_sps<E: HevcError>(
 }
 
 /// Sequence extension presence with its range, multilayer, 3D, and SCC flags.
-fn parse_sps_extension<E: HevcError>(
+fn parse_sps_extension<E: H265Error>(
     reader: &mut BitReader<'_, E>,
 ) -> Result<(bool, [bool; 4]), E> {
     if !reader.read_bit("sps_extension_present_flag")? {

@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 
 use crate::bits::BitReader;
 use crate::error::{H264Error, H264Gate, NalAction, ParseKind};
-use crate::nal::{rbsp, rbsp_prefix, split_nals, HEADER_PREFIX, MAX_PPS, MAX_SPS};
+use crate::framing::{rbsp, rbsp_prefix, split_nals, HEADER_PREFIX, MAX_PPS, MAX_SPS};
 use crate::pps::{parse_pps, parse_pps_ids, Pps};
 use crate::slice::{parse_slice_prefix, parse_slice_rest, SliceHeader};
 use crate::sps::{parse_sps, Sps};

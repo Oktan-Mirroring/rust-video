@@ -1,7 +1,7 @@
 //! Video usability information.
 
 use crate::bits::BitReader;
-use crate::error::HevcError;
+use crate::error::H265Error;
 use crate::hrd::{parse_hrd, HrdParams};
 
 /// Aspect-ratio block of one VUI record.
@@ -129,7 +129,7 @@ pub struct VuiParams {
 ///
 /// * `reader` - bit reader over the VUI syntax.
 /// * `max_sub_layers` - sublayer count behind HRD schedules.
-pub fn parse_vui<E: HevcError>(
+pub fn parse_vui<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     max_sub_layers: u8,
 ) -> Result<VuiParams, E> {
@@ -159,7 +159,7 @@ pub fn parse_vui<E: HevcError>(
 }
 
 /// VUI aspect ratio section.
-fn parse_vui_aspect<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<AspectRatio, E> {
+fn parse_vui_aspect<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<AspectRatio, E> {
     let present = reader.read_bit("aspect_ratio_info_present_flag")?;
     let mut aspect = AspectRatio {
         present,
@@ -177,7 +177,7 @@ fn parse_vui_aspect<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Aspec
 }
 
 /// VUI overscan section.
-fn parse_vui_overscan<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Overscan, E> {
+fn parse_vui_overscan<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<Overscan, E> {
     let present = reader.read_bit("overscan_info_present_flag")?;
     let mut overscan = Overscan {
         present,
@@ -190,7 +190,7 @@ fn parse_vui_overscan<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Ove
 }
 
 /// VUI video signal section.
-fn parse_vui_signal<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<VideoSignal, E> {
+fn parse_vui_signal<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<VideoSignal, E> {
     let present = reader.read_bit("video_signal_type_present_flag")?;
     let mut signal = VideoSignal {
         present,
@@ -211,7 +211,7 @@ fn parse_vui_signal<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Video
 }
 
 /// VUI chroma location section.
-fn parse_vui_chroma_loc<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<ChromaLoc, E> {
+fn parse_vui_chroma_loc<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<ChromaLoc, E> {
     let present = reader.read_bit("chroma_loc_info_present_flag")?;
     let mut loc = ChromaLoc {
         present,
@@ -226,7 +226,7 @@ fn parse_vui_chroma_loc<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<C
 }
 
 /// VUI default display window section.
-fn parse_vui_window<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Option<[u32; 4]>, E> {
+fn parse_vui_window<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<Option<[u32; 4]>, E> {
     if !reader.read_bit("default_display_window_flag")? {
         return Ok(None);
     }
@@ -243,7 +243,7 @@ fn parse_vui_window<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<Optio
 }
 
 /// VUI timing and hypothetical reference decoder section.
-fn parse_vui_timing<E: HevcError>(
+fn parse_vui_timing<E: H265Error>(
     reader: &mut BitReader<'_, E>,
     max_sub_layers: u8,
 ) -> Result<(VuiTiming, Option<HrdParams>), E> {
@@ -271,7 +271,7 @@ fn parse_vui_timing<E: HevcError>(
 }
 
 /// VUI bitstream restriction section.
-fn parse_vui_restriction<E: HevcError>(
+fn parse_vui_restriction<E: H265Error>(
     reader: &mut BitReader<'_, E>,
 ) -> Result<Option<BitstreamRestriction>, E> {
     if !reader.read_bit("bitstream_restriction_flag")? {
