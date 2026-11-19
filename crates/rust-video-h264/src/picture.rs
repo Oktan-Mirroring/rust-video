@@ -268,11 +268,11 @@ impl Picture {
 mod tests {
     use crate::error::test_support::TestError;
     use crate::error::StrictGate;
-    use crate::test_support::{
-        idr_slice_body, nal, p_slice_body, packet, pps_body, sps_body, BitWriter,
-    };
+    use crate::tests::{idr_slice_body, nal, p_slice_body, packet, pps_body, sps_body};
 
     use super::Ingest;
+
+    use rust_video_harness::Bits;
 
     #[test]
     fn ingest_assembles_packet_picture() {
@@ -311,15 +311,15 @@ mod tests {
 
     #[test]
     fn ingest_rejects_unknown_set_and_aso() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.ue(0);
         writer.ue(2);
         writer.ue(9);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         let mut ingest = Ingest::<TestError, StrictGate>::new();
         assert!(ingest.ingest_packet(&packet(&[nal(5, 2, &body)])).is_err());
 
-        let mut first = BitWriter::new();
+        let mut first = Bits::new();
         first.ue(50);
         first.ue(2);
         first.ue(0);
@@ -334,7 +334,7 @@ mod tests {
         first.ue(0);
         first.se(0);
         first.se(0);
-        let mut second = BitWriter::new();
+        let mut second = Bits::new();
         second.ue(10);
         second.ue(2);
         second.ue(0);
@@ -353,10 +353,7 @@ mod tests {
         ingest
             .ingest_packet(&packet(&[nal(7, 3, &sps_body()), nal(8, 3, &pps_body())]))
             .expect("sets");
-        let data = packet(&[
-            nal(5, 2, &first.finish_ebsp()),
-            nal(5, 2, &second.finish_ebsp()),
-        ]);
+        let data = packet(&[nal(5, 2, &first.finish()), nal(5, 2, &second.finish())]);
         assert!(ingest.ingest_packet(&data).is_err());
     }
 

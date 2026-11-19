@@ -157,6 +157,125 @@ impl Sps {
     pub fn num_reorder_frames(&self) -> Option<u32> {
         self.vui.as_ref().and_then(|vui| vui.max_num_reorder_frames)
     }
+
+    /// Constraint-set flag `index`, H.264 7.4.2.1.
+    #[must_use]
+    pub const fn constraint_set(&self, index: u8) -> bool {
+        index < 6 && (self.constraints >> (7 - index)) & 1 != 0
+    }
+
+    /// Crop unit in luma samples per chroma sampling, H.264 7.4.2.1.
+    #[must_use]
+    pub const fn crop_unit(&self) -> (u32, u32) {
+        let unit_x = match self.fidelity.chroma_format_idc {
+            1 | 2 => 2,
+            _ => 1,
+        };
+        let unit_y = match self.fidelity.chroma_format_idc {
+            1 => 2,
+            _ => 1,
+        };
+        (unit_x, unit_y)
+    }
+
+    /// Display picture size in luma samples, cropping applied.
+    #[must_use]
+    pub fn display_size(&self) -> (u32, u32) {
+        let (mut width, mut height) = (self.width(), self.height());
+        if let Some(crop) = self.crop_offsets {
+            let (unit_x, unit_y) = self.crop_unit();
+            width = width.saturating_sub((crop[0] + crop[1]) * unit_x);
+            height = height.saturating_sub((crop[2] + crop[3]) * unit_y);
+        }
+        (width, height)
+    }
+
+    /// Crop left and top in luma samples, zero without a window.
+    #[must_use]
+    pub fn crop_origin(&self) -> (u32, u32) {
+        let Some(crop) = self.crop_offsets else {
+            return (0, 0);
+        };
+        let (unit_x, unit_y) = self.crop_unit();
+        (
+            crop[0].saturating_mul(unit_x),
+            crop[2].saturating_mul(unit_y),
+        )
+    }
+
+    /// Frame-number offset of `frame_num`, H.264 8.2.1.
+    ///
+    /// `prev` carries the previous reference number and offset; `None`
+    /// resets the offset on IDR pictures, MMCO 5, and the first picture.
+    #[must_use]
+    pub fn frame_num_offset(&self, prev: Option<(u32, i64)>, frame_num: u32) -> i64 {
+        let Some((prev_num, prev_offset)) = prev else {
+            return 0;
+        };
+        if prev_num > frame_num {
+            prev_offset.saturating_add(i64::from(self.max_frame_num()))
+        } else {
+            prev_offset
+        }
+    }
+
+    /// Type-0 picture order count, H.264 8.2.1.1.
+    ///
+    /// `prev` carries the previous reference MSB and LSB; `None` resets
+    /// the MSB on IDR pictures and the first picture. `None` answers a
+    /// count outside the `i32` range.
+    #[must_use]
+    pub fn poc_type0(&self, lsb: u32, delta_bottom: i32, prev: Option<(i64, i64)>) -> Option<i32> {
+        let max = i64::from(self.max_poc_lsb());
+        let lsb = i64::from(lsb);
+        let msb = prev.map_or(0, |pair| crate::derive::poc_msb(lsb, max, pair));
+        let top = msb + lsb;
+        let bottom = top + i64::from(delta_bottom);
+        i32::try_from(top.min(bottom)).ok()
+    }
+
+    /// Expected picture order count for `abs_frame_num`, H.264 8.2.1.2.
+    #[must_use]
+    pub fn poc_cycle_expected(&self, abs_frame_num: i64) -> i64 {
+        if abs_frame_num <= 0 || self.cycle == 0 {
+            return 0;
+        }
+        let cycle = i64::from(self.cycle);
+        let full = (abs_frame_num - 1) / cycle;
+        let rest = (abs_frame_num - 1) % cycle;
+        let mut expected = full.saturating_mul(i64::from(self.expected_delta));
+        for offset in self
+            .cycle_offsets
+            .iter()
+            .take(usize::try_from(rest + 1).unwrap_or(0))
+        {
+            expected = expected.saturating_add(i64::from(*offset));
+        }
+        expected
+    }
+
+    /// Type-1 picture order count, H.264 8.2.1.2.
+    ///
+    /// `None` answers a count outside the `i32` range.
+    #[must_use]
+    pub fn poc_type1(
+        &self,
+        abs_frame_num: i64,
+        delta0: i32,
+        delta1: i32,
+        is_reference: bool,
+    ) -> Option<i32> {
+        let expected = self.poc_cycle_expected(abs_frame_num);
+        let mut top = expected.saturating_add(i64::from(delta0));
+        let mut bottom = top
+            .saturating_add(i64::from(self.offset_top_bottom))
+            .saturating_add(i64::from(delta1));
+        if !is_reference {
+            top = top.saturating_add(i64::from(self.offset_non_ref));
+            bottom = bottom.saturating_add(i64::from(self.offset_non_ref));
+        }
+        i32::try_from(top.min(bottom)).ok()
+    }
 }
 
 /// Sequence parameter set from RBSP `rbsp`.
@@ -389,9 +508,11 @@ fn parse_crop<E: H264Error>(
 mod tests {
     use crate::error::test_support::TestError;
     use crate::error::{ParseKind, PermissiveGate, StrictGate, UnsupportedKind};
-    use crate::test_support::{crop_sps_body, fidelity_sps_body, sps, sps_body_vui, BitWriter};
+    use crate::tests::{crop_sps_body, fidelity_sps_body, sps, sps_body_vui};
 
-    use super::{parse_sps, PocType};
+    use super::{parse_sps, PocType, Sps};
+
+    use rust_video_harness::Bits;
 
     #[test]
     fn sps_reports_coded_size() {
@@ -433,17 +554,17 @@ mod tests {
 
     #[test]
     fn sps_refuses_depth_and_interlace() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.bits(100, 8);
         writer.bits(0, 8);
         writer.bits(40, 8);
         writer.ue(0);
         writer.ue(1);
         writer.ue(1);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         assert!(parse_sps::<TestError, StrictGate>(&body).is_err());
 
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.bits(66, 8);
         writer.bits(0, 8);
         writer.bits(30, 8);
@@ -456,7 +577,7 @@ mod tests {
         writer.ue(7);
         writer.ue(7);
         writer.bit(false);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         assert!(parse_sps::<TestError, StrictGate>(&body).is_err());
     }
 
@@ -490,5 +611,79 @@ mod tests {
         assert_eq!(sps.crop_offsets, Some([1, 2, 3, 4]));
         let crop = sps.crop.expect("validated crop");
         assert_eq!((crop.left, crop.right, crop.top, crop.bottom), (2, 4, 6, 8));
+    }
+
+    #[test]
+    fn constraint_set_reads_flag_bits() {
+        let sps = Sps {
+            constraints: 0b1010_0000,
+            ..sps()
+        };
+        assert!(sps.constraint_set(0));
+        assert!(!sps.constraint_set(1));
+        assert!(sps.constraint_set(2));
+        assert!(!sps.constraint_set(6));
+    }
+
+    #[test]
+    fn display_geometry_applies_crop_units() {
+        assert_eq!(sps().display_size(), (1920, 1088));
+        assert_eq!(sps().crop_origin(), (0, 0));
+        let body = crop_sps_body(1, 2, 3, 4);
+        let sps = parse_sps::<TestError, StrictGate>(&body).expect("cropped sps");
+        assert_eq!(sps.crop_unit(), (2, 2));
+        assert_eq!(sps.display_size(), (1914, 1074));
+        assert_eq!(sps.crop_origin(), (2, 6));
+    }
+
+    #[test]
+    fn frame_num_offset_wraps_past_previous() {
+        let sps = sps();
+        assert_eq!(sps.frame_num_offset(None, 7), 0);
+        assert_eq!(sps.frame_num_offset(Some((5, 0)), 7), 0);
+        assert_eq!(sps.frame_num_offset(Some((7, 0)), 5), 16);
+        assert_eq!(sps.frame_num_offset(Some((7, 32)), 5), 48);
+    }
+
+    #[test]
+    fn type0_poc_wraps_msb_and_mins_bottom() {
+        let sps = sps();
+        assert_eq!(sps.poc_type0(5, 0, None), Some(5));
+        assert_eq!(sps.poc_type0(15, 0, Some((0, 0))), Some(-1));
+        assert_eq!(sps.poc_type0(2, 0, Some((16, 2))), Some(18));
+        assert_eq!(sps.poc_type0(5, -3, None), Some(2));
+    }
+
+    /// Sequence set with a two-entry type-1 POC cycle.
+    fn cycle_sps() -> Sps {
+        let mut offsets = [0; 255];
+        offsets[0] = 2;
+        offsets[1] = 4;
+        Sps {
+            poc_type: PocType::Delta,
+            cycle: 2,
+            cycle_offsets: offsets,
+            expected_delta: 6,
+            offset_non_ref: 3,
+            offset_top_bottom: 1,
+            ..sps()
+        }
+    }
+
+    #[test]
+    fn cycle_expected_counts_full_cycles_plus_prefix() {
+        let sps = cycle_sps();
+        assert_eq!(sps.poc_cycle_expected(0), 0);
+        assert_eq!(sps.poc_cycle_expected(1), 2);
+        assert_eq!(sps.poc_cycle_expected(2), 6);
+        assert_eq!(sps.poc_cycle_expected(3), 8);
+    }
+
+    #[test]
+    fn type1_poc_mins_top_and_bottom() {
+        let sps = cycle_sps();
+        assert_eq!(sps.poc_type1(2, 1, 0, true), Some(7));
+        assert_eq!(sps.poc_type1(2, 1, 0, false), Some(10));
+        assert_eq!(sps.poc_type1(2, 1, -9, true), Some(-1));
     }
 }

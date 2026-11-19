@@ -5,90 +5,7 @@ use crate::error::StrictGate;
 use crate::pps::{parse_pps, Pps};
 use crate::sps::{parse_sps, Sps};
 
-/// Test bit writer with emulation prevention.
-pub(crate) struct BitWriter {
-    /// Finished bytes.
-    bytes: Vec<u8>,
-    /// Open byte under fill.
-    current: u8,
-    /// Bits filled in the open byte.
-    filled: u8,
-}
-
-impl BitWriter {
-    /// Empty writer.
-    pub(crate) fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            current: 0,
-            filled: 0,
-        }
-    }
-
-    /// Single bit.
-    pub(crate) fn bit(&mut self, set: bool) {
-        if set {
-            self.current |= 1 << (7 - self.filled);
-        }
-        self.filled += 1;
-        if self.filled == 8 {
-            self.bytes.push(self.current);
-            self.current = 0;
-            self.filled = 0;
-        }
-    }
-
-    /// Low `count` bits of `value`, most significant first.
-    pub(crate) fn bits(&mut self, value: u32, count: u32) {
-        for index in (0..count).rev() {
-            self.bit(value >> index & 1 != 0);
-        }
-    }
-
-    /// Unsigned Exp-Golomb code.
-    pub(crate) fn ue(&mut self, value: u32) {
-        let code = value + 1;
-        let width = 32 - code.leading_zeros();
-        for _ in 1..width {
-            self.bit(false);
-        }
-        self.bits(code, width);
-    }
-
-    /// Signed Exp-Golomb code.
-    pub(crate) fn se(&mut self, value: i32) {
-        let code = if value > 0 {
-            u32::try_from(value).unwrap_or(u32::MAX) * 2 - 1
-        } else {
-            u32::try_from(-value).unwrap_or(u32::MAX) * 2
-        };
-        self.ue(code);
-    }
-
-    /// Stop bit plus byte alignment.
-    fn finish(mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.filled != 0 {
-            self.bit(false);
-        }
-        self.bytes
-    }
-
-    /// Finished RBSP with emulation prevention inserted.
-    pub(crate) fn finish_ebsp(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut zeros = 0;
-        for byte in self.finish() {
-            if zeros == 2 && byte <= 3 {
-                out.push(3);
-                zeros = 0;
-            }
-            out.push(byte);
-            zeros = if byte == 0 { zeros + 1 } else { 0 };
-        }
-        out
-    }
-}
+use rust_video_harness::Bits;
 
 /// NAL unit with header over the EBSP body.
 pub(crate) fn nal(nal_type: u8, ref_idc: u8, body: &[u8]) -> Vec<u8> {
@@ -108,13 +25,13 @@ pub(crate) fn packet(nals: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Baseline prologue through the crop flag.
-pub(crate) fn sps_prologue(writer: &mut BitWriter) {
+pub(crate) fn sps_prologue(writer: &mut Bits) {
     sps_prologue_no_crop(writer);
     writer.bit(false);
 }
 
 /// Baseline prologue through direct 8x8 inference.
-fn sps_prologue_no_crop(writer: &mut BitWriter) {
+fn sps_prologue_no_crop(writer: &mut Bits) {
     writer.bits(66, 8);
     writer.bits(0, 8);
     writer.bits(30, 8);
@@ -132,15 +49,15 @@ fn sps_prologue_no_crop(writer: &mut BitWriter) {
 
 /// Baseline 1920x1088 sequence set body.
 pub(crate) fn sps_body() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     sps_prologue(&mut writer);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Baseline 1920x1088 sequence set body with VUI carrying `restriction`.
 pub(crate) fn sps_body_vui(restriction: Option<u32>) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     sps_prologue(&mut writer);
     writer.bit(true);
     writer.bit(false);
@@ -153,7 +70,7 @@ pub(crate) fn sps_body_vui(restriction: Option<u32>) -> Vec<u8> {
     writer.bit(false);
     let Some(reorder) = restriction else {
         writer.bit(false);
-        return writer.finish_ebsp();
+        return writer.finish();
     };
     writer.bit(true);
     writer.bit(true);
@@ -163,12 +80,12 @@ pub(crate) fn sps_body_vui(restriction: Option<u32>) -> Vec<u8> {
     writer.ue(0);
     writer.ue(reorder);
     writer.ue(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// High 320x240 sequence set body with chroma sampling `chroma`.
 pub(crate) fn fidelity_sps_body(chroma: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.bits(100, 8);
     writer.bits(0, 8);
     writer.bits(40, 8);
@@ -189,12 +106,12 @@ pub(crate) fn fidelity_sps_body(chroma: u32) -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Baseline 1920x1088 sequence set body with crop offsets.
 pub(crate) fn crop_sps_body(left: u32, right: u32, top: u32, bottom: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     sps_prologue_no_crop(&mut writer);
     writer.bit(true);
     writer.ue(left);
@@ -202,7 +119,7 @@ pub(crate) fn crop_sps_body(left: u32, right: u32, top: u32, bottom: u32) -> Vec
     writer.ue(top);
     writer.ue(bottom);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Sequence set used across tests.
@@ -217,7 +134,7 @@ pub(crate) fn pps_body() -> Vec<u8> {
 
 /// Picture set body with biprediction mode `idc`.
 pub(crate) fn pps_body_bipred(idc: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(true);
@@ -236,12 +153,12 @@ pub(crate) fn pps_body_bipred(idc: u32) -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Picture set body with redundant pictures present.
 pub(crate) fn pps_body_redundant() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(true);
@@ -260,7 +177,7 @@ pub(crate) fn pps_body_redundant() -> Vec<u8> {
     writer.bit(true);
     writer.bit(false);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// Picture set used across tests.
@@ -270,7 +187,7 @@ pub(crate) fn pps() -> Pps {
 
 /// Picture set body with chroma offset `qp` and no tail.
 pub(crate) fn pps_body_chroma_no_tail(qp: i32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.bit(false);
@@ -286,12 +203,12 @@ pub(crate) fn pps_body_chroma_no_tail(qp: i32) -> Vec<u8> {
     writer.bit(false);
     writer.bit(false);
     writer.bit(false);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// IDR slice header body over the test sets.
 pub(crate) fn idr_slice_body() -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(2);
     writer.ue(0);
@@ -304,12 +221,12 @@ pub(crate) fn idr_slice_body() -> Vec<u8> {
     writer.ue(0);
     writer.se(0);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// P slice header body with `frame_num` and `lsb`.
 pub(crate) fn p_slice_body(frame_num: u32, lsb: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.ue(0);
@@ -323,12 +240,12 @@ pub(crate) fn p_slice_body(frame_num: u32, lsb: u32) -> Vec<u8> {
     writer.ue(0);
     writer.se(0);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// P slice header body with redundant picture count `count`.
 pub(crate) fn p_slice_body_redundant(count: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.ue(0);
@@ -343,12 +260,12 @@ pub(crate) fn p_slice_body_redundant(count: u32) -> Vec<u8> {
     writer.ue(0);
     writer.se(0);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }
 
 /// P slice header body with adaptive marking assigning long-term `index`.
 pub(crate) fn p_slice_body_mmco(index: u32) -> Vec<u8> {
-    let mut writer = BitWriter::new();
+    let mut writer = Bits::new();
     writer.ue(0);
     writer.ue(0);
     writer.ue(0);
@@ -365,5 +282,5 @@ pub(crate) fn p_slice_body_mmco(index: u32) -> Vec<u8> {
     writer.ue(0);
     writer.se(0);
     writer.se(0);
-    writer.finish_ebsp()
+    writer.finish()
 }

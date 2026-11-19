@@ -237,9 +237,11 @@ mod tests {
     use crate::error::test_support::TestError;
     use crate::error::{ParseKind, PermissiveGate, StrictGate};
     use crate::scaling::DEFAULT_4X4_INTRA;
-    use crate::test_support::{pps_body, pps_body_bipred, pps_body_chroma_no_tail, sps, BitWriter};
+    use crate::tests::{pps_body, pps_body_bipred, pps_body_chroma_no_tail, sps};
 
     use super::parse_pps;
+
+    use rust_video_harness::Bits;
 
     #[test]
     fn pps_reports_flags_and_defaults() {
@@ -255,7 +257,7 @@ mod tests {
 
     #[test]
     fn pps_without_tail_copies_sequence_scaling() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.ue(0);
         writer.ue(0);
         writer.bit(false);
@@ -271,7 +273,7 @@ mod tests {
         writer.bit(false);
         writer.bit(false);
         writer.bit(false);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         let sps = sps();
         let pps = parse_pps::<TestError, StrictGate>(&body, Some(&sps)).expect("valid pps");
         assert!(!pps.transform_8x8());
@@ -292,13 +294,13 @@ mod tests {
 
     #[test]
     fn pps_refuses_fmo() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.ue(0);
         writer.ue(0);
         writer.bit(false);
         writer.bit(false);
         writer.ue(1);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         assert!(parse_pps::<TestError, StrictGate>(&body, Some(&sps())).is_err());
     }
 
@@ -318,7 +320,7 @@ mod tests {
 
     #[test]
     fn scaling_list_applies_default_on_zero_delta() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.ue(0);
         writer.ue(0);
         writer.bit(false);
@@ -342,7 +344,7 @@ mod tests {
             writer.bit(false);
         }
         writer.se(0);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         let pps = parse_pps::<TestError, StrictGate>(&body, Some(&sps())).expect("valid pps");
         assert_eq!(pps.scaling.four[0], DEFAULT_4X4_INTRA);
         assert_eq!(pps.scaling.four[1], pps.scaling.four[0]);

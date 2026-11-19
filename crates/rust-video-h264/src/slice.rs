@@ -60,6 +60,30 @@ pub enum SlicePoc {
     None,
 }
 
+impl Marking {
+    /// True when the marking resets every reference picture.
+    #[must_use]
+    pub fn has_mmco5(&self) -> bool {
+        match self {
+            Self::Adaptive(operations) => operations.contains(&Mmco::MarkAllUnused),
+            Self::Idr { .. } | Self::Silent => false,
+        }
+    }
+
+    /// Long-term index the current picture takes, if assigned.
+    #[must_use]
+    pub fn current_to_long(&self) -> Option<u32> {
+        match self {
+            Self::Idr { long_term, .. } => long_term.then_some(0),
+            Self::Adaptive(operations) => operations.iter().find_map(|op| match op {
+                Mmco::CurrentToLong(index) => Some(*index),
+                _ => None,
+            }),
+            Self::Silent => None,
+        }
+    }
+}
+
 /// Slice coding type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SliceType {
@@ -550,12 +574,14 @@ mod tests {
     use crate::error::{H264Gate, ParseKind, PermissiveGate, StrictGate, UnsupportedKind};
     use crate::pps::parse_pps;
 
-    use crate::test_support::{
+    use crate::tests::{
         idr_slice_body, p_slice_body, p_slice_body_mmco, p_slice_body_redundant, pps,
-        pps_body_redundant, sps, BitWriter,
+        pps_body_redundant, sps,
     };
 
     use super::{parse_slice_prefix, parse_slice_rest, Marking, Mmco, RefMod, SlicePoc, SliceType};
+
+    use rust_video_harness::Bits;
 
     /// Slice header over `body` with the IDR flag and reference idc.
     fn header(body: &[u8], idr: bool, ref_idc: u8) -> super::SliceHeader {
@@ -595,11 +621,11 @@ mod tests {
 
     #[test]
     fn slice_header_refuses_sp_type() {
-        let mut writer = BitWriter::new();
+        let mut writer = Bits::new();
         writer.ue(0);
         writer.ue(3);
         writer.ue(0);
-        let body = writer.finish_ebsp();
+        let body = writer.finish();
         let mut reader = BitReader::<TestError>::new(&body);
         assert!(parse_slice_prefix::<TestError>(&mut reader).is_err());
     }
@@ -663,5 +689,25 @@ mod tests {
             header.marking,
             Marking::Adaptive(vec![Mmco::CurrentToLong(2)])
         );
+    }
+
+    #[test]
+    fn marking_queries_reset_and_assignment() {
+        assert!(Marking::Adaptive(vec![Mmco::MarkAllUnused]).has_mmco5());
+        assert!(!Marking::Adaptive(vec![Mmco::CurrentToLong(1)]).has_mmco5());
+        assert!(!Marking::Silent.has_mmco5());
+        assert_eq!(
+            Marking::Idr {
+                no_output: false,
+                long_term: true,
+            }
+            .current_to_long(),
+            Some(0)
+        );
+        assert_eq!(
+            Marking::Adaptive(vec![Mmco::CurrentToLong(2)]).current_to_long(),
+            Some(2)
+        );
+        assert_eq!(Marking::Silent.current_to_long(), None);
     }
 }
