@@ -333,6 +333,7 @@ dependencies = [
 name = "rust-video-av1"
 version = "0.1.0"
 dependencies = [
+ "rust-video-harness",
  "thiserror",
 ]
 
@@ -380,10 +381,16 @@ dependencies = [
 [[package]]
 name = "rust-video-h264"
 version = "0.1.0"
+dependencies = [
+ "rust-video-harness",
+]
 
 [[package]]
 name = "rust-video-h265"
 version = "0.1.0"
+dependencies = [
+ "rust-video-harness",
+]
 
 [[package]]
 name = "rust-video-harness"
@@ -428,8 +435,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "log",
+ "rust-video-av1",
  "rust-video-caps",
+ "rust-video-h264",
+ "rust-video-h265",
  "rust-video-harness",
+ "rust-video-vp9",
  "thiserror",
 ]
 

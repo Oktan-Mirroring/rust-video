@@ -62,14 +62,11 @@ impl Bits {
 
     /// Finished EBSP with emulation prevention inserted.
     #[must_use]
-    pub fn finish(mut self) -> Vec<u8> {
-        self.bit(true);
-        while self.filled != 0 {
-            self.bit(false);
-        }
+    pub fn finish(self) -> Vec<u8> {
+        let bytes = self.finish_rbsp();
         let mut out = Vec::new();
         let mut zeros = 0;
-        for byte in self.bytes {
+        for byte in bytes {
             if zeros == 2 && byte <= 3 {
                 out.push(3);
                 zeros = 0;
@@ -78,6 +75,25 @@ impl Bits {
             zeros = if byte == 0 { zeros + 1 } else { 0 };
         }
         out
+    }
+
+    /// Finished bytes, zero-padded without a stop bit.
+    #[must_use]
+    pub fn finish_raw(mut self) -> Vec<u8> {
+        while self.filled != 0 {
+            self.bit(false);
+        }
+        self.bytes
+    }
+
+    /// Finished RBSP with stop bit and alignment.
+    #[must_use]
+    pub fn finish_rbsp(mut self) -> Vec<u8> {
+        self.bit(true);
+        while self.filled != 0 {
+            self.bit(false);
+        }
+        self.bytes
     }
 }
 
@@ -100,5 +116,22 @@ mod tests {
         let mut writer = Bits::new();
         writer.bits(0, 24);
         assert_eq!(writer.finish(), vec![0, 0, 3, 0, 0x80]);
+    }
+
+    #[test]
+    fn finish_raw_zero_pads_without_stop_bit() {
+        let mut writer = Bits::new();
+        writer.bits(0b101, 3);
+        assert_eq!(writer.finish_raw(), vec![0b1010_0000]);
+    }
+
+    #[test]
+    fn finish_rbsp_stops_without_prevention() {
+        let mut writer = Bits::new();
+        writer.ue(0);
+        assert_eq!(writer.finish_rbsp(), vec![0xC0]);
+        let mut writer = Bits::new();
+        writer.bits(0, 24);
+        assert_eq!(writer.finish_rbsp(), vec![0, 0, 0, 0x80]);
     }
 }
