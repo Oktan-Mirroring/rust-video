@@ -6,17 +6,13 @@
 
 #![cfg(feature = "ffmpeg")]
 
-use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets, TrySendError,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, decode_dir, AnnexB, Ivf};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB, Drive, Ivf, Packets, Parity};
 use rust_video_sw::{
     Av1Decoder, H264Decoder, H265Decoder, PipelineConfig, PipelinedDecoder, PipelinedPump,
     RawSource, SplitDecoder, SwError, Vp8Decoder, Vp9Decoder,
@@ -31,37 +27,8 @@ const SUSTAINED_H265_BAR: f64 = 60.0;
 const SUSTAINED_AV1_BAR: f64 = 60.0;
 const SUSTAINED_VP9_BAR: f64 = 60.0;
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
-/// Packets over `raws`, built once outside the pump.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
-/// Frames decoded straight through `decoder`, the pump oracle.
-fn oracle<D>(decoder: &mut D, packets: &[Packet]) -> Vec<CpuFrame>
-where
-    D: Decoder<Frame = CpuFrame>,
-    D::Error: std::fmt::Debug,
-{
-    let mut frames = Vec::new();
-    for packet in packets {
-        frames.extend(decoder.decode(packet).expect("oracle decode"));
-    }
-    frames.extend(decoder.flush().expect("oracle flush"));
-    frames
-}
-
 /// Ready frames moved into `frames`, waiting for one when empty.
-fn drain_ready<D>(pump: &mut PipelinedPump<D>, frames: &mut Vec<CpuFrame>)
+fn drain<D>(pump: &mut PipelinedPump<D>, frames: &mut Vec<CpuFrame>)
 where
     D: SplitDecoder<Frame = CpuFrame>,
     D::Error: std::fmt::Debug,
@@ -91,57 +58,15 @@ where
     D: RawSource<Frame = CpuFrame, Error = SwError>,
 {
     let decoder = PipelinedDecoder::open(inner, PipelineConfig::default().with_pace(pace));
-    let mut pump = PipelinedPump::open(decoder, config(packets.len() + 8, DropPolicy::DropOldest));
-    let mut frames = Vec::new();
-    let mut at = 0;
-    while at < packets.len() {
-        match pump.try_send(packets[at].clone()) {
-            Ok(()) => at += 1,
-            Err(TrySendError::Full { .. }) => drain_ready(&mut pump, &mut frames),
-            Err(TrySendError::Failed { error }) => panic!("submit failed: {error}"),
-        }
-    }
-    while let Some(frame) = pump.try_receive().expect("poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("drain") {
-        frames.push(frame);
-    }
+    let mut pump = PipelinedPump::open(
+        decoder,
+        Drive::channel(packets.len() + 8, DropPolicy::DropOldest),
+    );
+    let (mut frames, _) = Drive::send_all(&mut pump, packets, drain);
+    frames.extend(Drive::finish_all(&mut pump));
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
     let stats = pump.stats();
     (frames, stats)
-}
-
-/// Same geometry, format, and plane bytes at `index` of `codec`.
-fn assert_same_frame(left: &CpuFrame, right: &CpuFrame, index: usize, codec: &str) {
-    assert_eq!(left.size(), right.size(), "{codec} frame {index} size");
-    assert_eq!(
-        left.format(),
-        right.format(),
-        "{codec} frame {index} format"
-    );
-    assert_eq!(
-        left.planes().len(),
-        right.planes().len(),
-        "{codec} frame {index} plane count"
-    );
-    for (plane, (l, r)) in left.planes().iter().zip(right.planes().iter()).enumerate() {
-        assert_eq!(
-            l.stride(),
-            r.stride(),
-            "{codec} frame {index} plane {plane}"
-        );
-        assert_eq!(l.data(), r.data(), "{codec} frame {index} plane {plane}");
-    }
-}
-
-/// Same frames in order.
-fn assert_same_frames(frames: &[CpuFrame], expected: &[CpuFrame], codec: &str) {
-    assert_eq!(frames.len(), expected.len(), "{codec} frame count");
-    for (index, (frame, want)) in frames.iter().zip(expected.iter()).enumerate() {
-        assert_same_frame(frame, want, index, codec);
-    }
 }
 
 /// Sync and pipelined runs agree frame for frame over `packets`.
@@ -150,10 +75,10 @@ where
     D: Decoder<Frame = CpuFrame> + RawSource<Frame = CpuFrame, Error = SwError>,
     <D as Decoder>::Error: std::fmt::Debug,
 {
-    let expected = oracle(&mut open(), packets);
+    let expected = Drive::decode_all(&mut open(), packets);
     assert!(!expected.is_empty(), "{codec} vector decodes");
     let (frames, stats) = pipelined(open(), Duration::ZERO, packets);
-    assert_same_frames(&frames, &expected, codec);
+    Parity::assert_cpu_frames(codec, &frames, &expected);
     println!(
         "sw {codec} uniform: frames={} max_inflight={} overlap={}",
         frames.len(),
@@ -254,7 +179,7 @@ fn h264_shared_decode_yields_every_frame() {
         AnnexB::is_h264_vcl,
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let frames = oracle(&mut open(), &packets(&raws));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h264 yields every frame");
 }
 
@@ -269,7 +194,7 @@ fn h264_bframes_decode_yields_every_frame() {
         AnnexB::is_h264_vcl,
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let frames = oracle(&mut open(), &packets(&raws));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h264 yields every frame");
 }
 
@@ -282,7 +207,7 @@ fn h265_shared_decode_yields_every_frame() {
     let bytes = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    let frames = oracle(&mut open(), &packets(&raws));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h265 yields every frame");
 }
 
@@ -293,7 +218,7 @@ fn av1_shared_decode_yields_every_frame() {
         return;
     };
     let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let frames = oracle(&mut open(), &packets(&[bytes]));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&[bytes]));
     assert_eq!(frames.len(), PICTURES, "av1 yields every frame");
 }
 
@@ -305,7 +230,7 @@ fn vp9_shared_decode_yields_every_frame() {
     };
     let raws = Ivf::read(&decode_dir().join("valid_320x240.ivf")).frames;
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per frame");
-    let frames = oracle(&mut open(), &packets(&raws));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "vp9 yields every frame");
 }
 
@@ -317,7 +242,7 @@ fn vp8_shared_decode_yields_every_frame() {
     };
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "vector holds frames");
-    let frames = oracle(&mut open(), &packets(&raws));
+    let frames = Drive::decode_all(&mut open(), &Packets::from_raws(&raws));
     assert_eq!(frames.len(), raws.len(), "vp8 yields every frame");
 }
 
@@ -332,7 +257,7 @@ fn h264_shared_pipelined_matches_sync_bytes() {
         AnnexB::is_h264_vcl,
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    parity_case(open, &packets(&raws), "h264");
+    parity_case(open, &Packets::from_raws(&raws), "h264");
 }
 
 /// Pipelined H.265 matches sync bytes on the shared vector; lab-gated.
@@ -344,7 +269,7 @@ fn h265_shared_pipelined_matches_sync_bytes() {
     let bytes = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
-    parity_case(open, &packets(&raws), "h265");
+    parity_case(open, &Packets::from_raws(&raws), "h265");
 }
 
 /// Pipelined AV1 matches sync bytes on the shared vector; lab-gated.
@@ -354,7 +279,7 @@ fn av1_shared_pipelined_matches_sync_bytes() {
         return;
     };
     let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    parity_case(open, &packets(&[bytes]), "av1");
+    parity_case(open, &Packets::from_raws(&[bytes]), "av1");
 }
 
 /// Pipelined VP9 matches sync bytes on the shared vector; lab-gated.
@@ -365,7 +290,7 @@ fn vp9_shared_pipelined_matches_sync_bytes() {
     };
     let raws = Ivf::read(&decode_dir().join("valid_320x240.ivf")).frames;
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per frame");
-    parity_case(open, &packets(&raws), "vp9");
+    parity_case(open, &Packets::from_raws(&raws), "vp9");
 }
 
 /// Pipelined VP8 matches sync bytes on the shared vector; lab-gated.
@@ -376,7 +301,7 @@ fn vp8_shared_pipelined_matches_sync_bytes() {
     };
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "vector holds frames");
-    parity_case(open, &packets(&raws), "vp8");
+    parity_case(open, &Packets::from_raws(&raws), "vp8");
 }
 
 /// Sustained H.264 overlap throughput against its bar; lab-gated.
@@ -388,7 +313,7 @@ fn sustained_h264_1080p_measures_realtime() {
     let raws =
         AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
-    sustained_case(open, &packets(&raws), "h264", SUSTAINED_H264_BAR);
+    sustained_case(open, &Packets::from_raws(&raws), "h264", SUSTAINED_H264_BAR);
 }
 
 /// Sustained H.265 overlap throughput against its bar; lab-gated.
@@ -400,7 +325,7 @@ fn sustained_h265_1080p_measures_realtime() {
     let bytes = std::fs::read(bench_dir().join("h265-1080p_ip.h265")).expect("vector readable");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
-    sustained_case(open, &packets(&raws), "h265", SUSTAINED_H265_BAR);
+    sustained_case(open, &Packets::from_raws(&raws), "h265", SUSTAINED_H265_BAR);
 }
 
 /// Sustained AV1 overlap throughput against its bar; lab-gated.
@@ -411,7 +336,7 @@ fn sustained_av1_1080p_measures_realtime() {
     };
     let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
-    sustained_case(open, &packets(&raws), "av1", SUSTAINED_AV1_BAR);
+    sustained_case(open, &Packets::from_raws(&raws), "av1", SUSTAINED_AV1_BAR);
 }
 
 /// Sustained VP9 overlap throughput against its bar; lab-gated.
@@ -422,5 +347,5 @@ fn sustained_vp9_1080p_measures_realtime() {
     };
     let raws = Ivf::read(&bench_dir().join("vp9-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
-    sustained_case(open, &packets(&raws), "vp9", SUSTAINED_VP9_BAR);
+    sustained_case(open, &Packets::from_raws(&raws), "vp9", SUSTAINED_VP9_BAR);
 }

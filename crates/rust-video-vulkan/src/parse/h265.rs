@@ -3,13 +3,14 @@
 //! Syntax per ITU-T H.265 section 7.3; the hardware parses slice bodies,
 //! so the slice header stops after reference lists.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::error::ParseError;
-use crate::parse::bits::{BitReader, Rbsp};
+use crate::parse::bits::Rbsp;
 use crate::parse::nal::Nalu as RawNalu;
+
+use rust_video_h265::{HevcError, HevcGate, ParseKind, UnsupportedKind};
 
 /// H.265 NAL unit type id.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -29,6 +30,7 @@ impl NalType {
     }
 
     /// True for IDR pictures.
+    #[cfg(test)]
     #[must_use]
     pub fn is_idr(self) -> bool {
         self.0 == 19 || self.0 == 20
@@ -69,8 +71,6 @@ impl NalHeader {
 pub(crate) struct SourceFlags {
     /// Progressive source.
     pub(crate) progressive: bool,
-    /// Interlaced source.
-    pub(crate) interlaced: bool,
 }
 
 /// Packing constraint flags of one profile record.
@@ -132,72 +132,6 @@ impl ProfileTierLevel {
     #[must_use]
     pub fn frame_only(&self) -> bool {
         self.constraints.frame_only
-    }
-
-    /// Profile, tier and level for `max_sub_layers` sub-layers.
-    fn parse(reader: &mut BitReader<'_>, max_sub_layers: u8) -> Result<Self, ParseError> {
-        let general = Self::parse_profile(reader, "ptl")?;
-        if general.source.interlaced {
-            return Err(ParseError::Unsupported {
-                what: "interlaced source",
-            });
-        }
-        if max_sub_layers > 1 {
-            for _ in max_sub_layers - 1..8 {
-                reader.skip("ptl reserved", 2)?;
-            }
-            let mut layers = Vec::new();
-            for _ in 1..max_sub_layers {
-                let profile_present = reader.bit("ptl sub profile")?;
-                let level_present = reader.bit("ptl sub level")?;
-                layers.push((profile_present, level_present));
-            }
-            for (profile_present, level_present) in layers {
-                if profile_present {
-                    Self::parse_profile(reader, "ptl sub")?;
-                }
-                if level_present {
-                    narrow_u8(reader.bits("ptl sub level", 8)?, "ptl sub level")?;
-                }
-            }
-        }
-        let level_idc = narrow_u8(reader.bits("ptl level", 8)?, "ptl level")?;
-        Ok(Self {
-            level_idc,
-            ..general
-        })
-    }
-
-    /// One profile record without its level byte.
-    fn parse_profile(reader: &mut BitReader<'_>, syntax: &'static str) -> Result<Self, ParseError> {
-        reader.skip(syntax, 2)?;
-        let tier = reader.bit(syntax)?;
-        let profile_idc = narrow_u8(reader.bits(syntax, 5)?, syntax)?;
-        let compatibility = reader.bits(syntax, 32)?;
-        let progressive = reader.bit(syntax)?;
-        let interlaced = reader.bit(syntax)?;
-        let non_packed = reader.bit(syntax)?;
-        let frame_only = reader.bit(syntax)?;
-        if !matches!(profile_idc, 1..=3) && compatibility & 0x0E00_0000 == 0 {
-            return Err(ParseError::Unsupported {
-                what: "h265 profile",
-            });
-        }
-        reader.skip(syntax, 43)?;
-        reader.skip(syntax, 1)?;
-        Ok(Self {
-            tier,
-            profile_idc,
-            source: SourceFlags {
-                progressive,
-                interlaced,
-            },
-            constraints: ConstraintFlags {
-                non_packed,
-                frame_only,
-            },
-            level_idc: 0,
-        })
     }
 }
 
@@ -303,99 +237,6 @@ impl Vps {
     pub fn timing(&self) -> Option<&VpsTiming> {
         self.timing.as_ref()
     }
-
-    /// Video set from RBSP bytes.
-    fn parse(reader: &mut BitReader<'_>) -> Result<Self, ParseError> {
-        let vps_id = narrow_u8(reader.bits("vps id", 4)?, "vps id")?;
-        reader.skip("vps base layer", 2)?;
-        let max_layers_minus1 = reader.bits("vps max layers", 6)?;
-        if max_layers_minus1 > 0 {
-            return Err(ParseError::Unsupported {
-                what: "h265 layers",
-            });
-        }
-        let max_sub_layers_minus1 = narrow_u8(reader.bits("vps max sub", 3)?, "vps max sub")?;
-        if max_sub_layers_minus1 > 6 {
-            return Err(ParseError::OutOfRange {
-                syntax: "vps max sub",
-            });
-        }
-        let temporal_nesting = reader.bit("vps nesting")?;
-        reader.skip("vps reserved", 16)?;
-        let ptl = ProfileTierLevel::parse(reader, max_sub_layers_minus1 + 1)?;
-        let ordering_info_present = reader.bit("vps ordering info")?;
-        let start = if ordering_info_present {
-            0
-        } else {
-            u32::from(max_sub_layers_minus1)
-        };
-        let mut max_dec_pic_buffering = Vec::new();
-        let mut max_num_reorder_pics = Vec::new();
-        let mut max_latency = Vec::new();
-        for _ in start..=u32::from(max_sub_layers_minus1) {
-            max_dec_pic_buffering.push(reader.ue("vps buffering")?);
-            max_num_reorder_pics.push(reader.ue("vps reorder")?);
-            max_latency.push(reader.ue("vps latency")?);
-        }
-        reader.skip("vps max layer id", 6)?;
-        let layer_sets = reader.ue("vps layer sets")?;
-        if layer_sets > 0 {
-            return Err(ParseError::Unsupported {
-                what: "h265 layer sets",
-            });
-        }
-        let layers = u32::from(max_sub_layers_minus1) + 1;
-        let mut timing = None;
-        if reader.bit("vps timing present")? {
-            let num_units_in_tick = reader.bits("vps tick", 32)?;
-            let time_scale = reader.bits("vps scale", 32)?;
-            let poc_proportional = reader.bit("vps poc proportional")?;
-            let num_ticks_poc_diff_one_minus1 = if poc_proportional {
-                reader.ue("vps poc ticks")?
-            } else {
-                0
-            };
-            let hrd_count = reader.ue("vps hrd count")?;
-            if hrd_count > 16 {
-                return Err(ParseError::Unsupported { what: "vps hrd" });
-            }
-            let layers_u8 =
-                u8::try_from(layers).map_err(|_| ParseError::OutOfRange { syntax: "vps hrd" })?;
-            let mut hrd = Vec::new();
-            for index in 0..hrd_count {
-                reader.ue("vps hrd layer set")?;
-                let mut inherit = None;
-                if index > 0 && !reader.bit("vps hrd common")? {
-                    let first: &HrdParams = &hrd[0];
-                    inherit = Some((first.streams, first.sub_pic));
-                }
-                hrd.push(parse_hrd(reader, layers_u8, inherit)?);
-            }
-            timing = Some(VpsTiming {
-                num_units_in_tick,
-                time_scale,
-                poc_proportional,
-                num_ticks_poc_diff_one_minus1,
-                hrd,
-            });
-        }
-        if reader.more_rbsp() && reader.bit("vps extension")? {
-            return Err(ParseError::Unsupported {
-                what: "vps extension",
-            });
-        }
-        Ok(Self {
-            id: vps_id,
-            max_sub_layers_minus1,
-            temporal_nesting,
-            ptl,
-            ordering_info_present,
-            max_dec_pic_buffering,
-            max_num_reorder_pics,
-            max_latency,
-            timing,
-        })
-    }
 }
 
 /// Scaling lists for one parameter set.
@@ -428,60 +269,6 @@ impl Default for ScalingLists {
     }
 }
 
-impl ScalingLists {
-    /// Scaling lists from `scaling_list_data`.
-    fn parse(reader: &mut BitReader<'_>) -> Result<Self, ParseError> {
-        let mut lists = Self::default();
-        for size_id in 0..4_usize {
-            let step = if size_id == 3 { 3 } else { 1 };
-            let mut matrix_id = 0_usize;
-            while matrix_id < 6 {
-                if reader.bit("scaling pred mode")? {
-                    let coef_num: usize = 64.min(1 << (4 + (size_id << 1)));
-                    if size_id > 1 {
-                        let dc = reader.se("scaling dc")? + 8;
-                        let dc = u8::try_from(dc).map_err(|_| ParseError::OutOfRange {
-                            syntax: "scaling dc",
-                        })?;
-                        if size_id == 2 {
-                            lists.dc_16x16[matrix_id] = dc;
-                        } else {
-                            lists.dc_32x32[matrix_id / 3] = dc;
-                        }
-                    }
-                    let mut next_coef = 8_i32;
-                    for i in 0..coef_num {
-                        if i == 0 && size_id > 1 {
-                            let dc = if size_id == 2 {
-                                i32::from(lists.dc_16x16[matrix_id])
-                            } else {
-                                i32::from(lists.dc_32x32[matrix_id / 3])
-                            };
-                            next_coef = dc;
-                        }
-                        let delta = reader.se("scaling delta")?;
-                        next_coef = (next_coef + delta + 256) % 256;
-                        let value =
-                            u8::try_from(next_coef).map_err(|_| ParseError::OutOfRange {
-                                syntax: "scaling delta",
-                            })?;
-                        match size_id {
-                            0 => lists.list_4x4[matrix_id][i] = value,
-                            1 => lists.list_8x8[matrix_id][i] = value,
-                            2 => lists.list_16x16[matrix_id][i] = value,
-                            _ => lists.list_32x32[matrix_id / 3][i] = value,
-                        }
-                    }
-                } else {
-                    reader.ue("scaling pred delta")?;
-                }
-                matrix_id += step;
-            }
-        }
-        Ok(lists)
-    }
-}
-
 /// One short-term reference picture set with derived POC deltas.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RefPicSet {
@@ -490,6 +277,7 @@ pub(crate) struct RefPicSet {
     /// Positive deltas with used-by-current flags, coding order.
     s1: Vec<(i32, bool)>,
     /// Delta pictures of the predicted-from set.
+    #[cfg(test)]
     ref_pics: u8,
     /// Inter-predicted from another set.
     inter: bool,
@@ -507,6 +295,7 @@ pub(crate) struct RefPicSet {
 
 impl RefPicSet {
     /// Delta pictures of the predicted-from set.
+    #[cfg(test)]
     #[must_use]
     pub fn ref_pics(&self) -> u8 {
         self.ref_pics
@@ -558,136 +347,6 @@ impl RefPicSet {
     #[must_use]
     pub fn use_mask(&self) -> u16 {
         self.use_mask
-    }
-}
-
-impl RefPicSet {
-    /// Set from `st_ref_pic_set` syntax at index `idx`.
-    ///
-    /// `inline` marks a slice-header set, the only place `delta_idx_minus1` is coded.
-    fn parse(
-        reader: &mut BitReader<'_>,
-        idx: usize,
-        sets: &[Self],
-        inline: bool,
-    ) -> Result<Self, ParseError> {
-        if idx > 0 && reader.bit("rps inter predict")? {
-            return Self::parse_inter(reader, idx, sets, inline);
-        }
-        let mut set = Self::default();
-        let negative = reader.ue("rps negative")?;
-        let positive = reader.ue("rps positive")?;
-        if negative + positive > 16 {
-            return Err(ParseError::Unsupported {
-                what: "oversize rps",
-            });
-        }
-        let mut prev = 0_i32;
-        for _ in 0..negative {
-            let delta = reader.ue("rps delta s0")?;
-            let used = reader.bit("rps used s0")?;
-            prev -= i32::try_from(delta)
-                .map_err(|_| ParseError::OutOfRange {
-                    syntax: "rps delta s0",
-                })?
-                .saturating_add(1);
-            set.s0.push((prev, used));
-        }
-        prev = 0;
-        for _ in 0..positive {
-            let delta = reader.ue("rps delta s1")?;
-            let used = reader.bit("rps used s1")?;
-            prev += i32::try_from(delta)
-                .map_err(|_| ParseError::OutOfRange {
-                    syntax: "rps delta s1",
-                })?
-                .saturating_add(1);
-            set.s1.push((prev, used));
-        }
-        Ok(set)
-    }
-
-    /// Inter-predicted set from a reference set.
-    fn parse_inter(
-        reader: &mut BitReader<'_>,
-        idx: usize,
-        sets: &[Self],
-        inline: bool,
-    ) -> Result<Self, ParseError> {
-        let mut ref_idx = idx - 1;
-        let mut delta_idx_minus1 = 0;
-        if inline {
-            delta_idx_minus1 = reader.ue("rps delta idx")?;
-            ref_idx = idx
-                .checked_sub(
-                    1 + usize::try_from(delta_idx_minus1).map_err(|_| ParseError::OutOfRange {
-                        syntax: "rps delta idx",
-                    })?,
-                )
-                .ok_or(ParseError::OutOfRange {
-                    syntax: "rps delta idx",
-                })?;
-        }
-        let reference = sets.get(ref_idx).ok_or(ParseError::OutOfRange {
-            syntax: "rps delta idx",
-        })?;
-        let ref_pics = u8::try_from(reference.s0.len() + reference.s1.len()).map_err(|_| {
-            ParseError::OutOfRange {
-                syntax: "rps ref pics",
-            }
-        })?;
-        let delta_rps_sign = reader.bit("rps delta sign")?;
-        let abs = reader.ue("rps abs delta")?;
-        let abs_delta_rps_minus1 = u16::try_from(abs).map_err(|_| ParseError::OutOfRange {
-            syntax: "rps abs delta",
-        })?;
-        let delta = i32::try_from(abs)
-            .map_err(|_| ParseError::OutOfRange {
-                syntax: "rps abs delta",
-            })?
-            .saturating_add(1);
-        let delta = if delta_rps_sign { -delta } else { delta };
-        let mut combined: Vec<(i32, bool, bool)> = Vec::new();
-        let mut used_mask = 0_u16;
-        let mut keep_mask = 0_u16;
-        for (bit, (poc, _)) in reference.s0.iter().chain(reference.s1.iter()).enumerate() {
-            let used = reader.bit("rps used")?;
-            let keep = if used {
-                true
-            } else {
-                reader.bit("rps use delta")?
-            };
-            if bit < 16 {
-                let flag = 1_u16 << bit;
-                if used {
-                    used_mask |= flag;
-                }
-                if keep {
-                    keep_mask |= flag;
-                }
-            }
-            combined.push((*poc, used, keep));
-        }
-        let mut set = Self::default();
-        for (poc, used, keep) in combined {
-            if !keep {
-                continue;
-            }
-            let derived = poc.saturating_add(delta);
-            match derived.cmp(&0) {
-                Ordering::Less => set.s0.push((derived, used)),
-                Ordering::Greater => set.s1.push((derived, used)),
-                Ordering::Equal => {}
-            }
-        }
-        set.ref_pics = ref_pics;
-        set.inter = true;
-        set.delta_idx_minus1 = delta_idx_minus1;
-        set.delta_rps_sign = delta_rps_sign;
-        set.abs_delta_rps_minus1 = abs_delta_rps_minus1;
-        set.used_mask = used_mask;
-        set.use_mask = keep_mask;
-        Ok(set)
     }
 }
 
@@ -983,6 +642,8 @@ pub(crate) struct Sps {
     prediction: PredictionTools,
     /// VUI parameters, when present.
     vui: Option<VuiParams>,
+    /// Shared set behind slice parsing.
+    shared: Rc<rust_video_h265::Sps>,
 }
 
 impl Sps {
@@ -1252,483 +913,6 @@ impl Sps {
             .saturating_sub((window[2] + window[3]) * sub_height);
         (width, height)
     }
-
-    /// Sequence set from RBSP bytes.
-    fn parse(reader: &mut BitReader<'_>) -> Result<Self, ParseError> {
-        let vps_id = narrow_u8(reader.bits("sps vps id", 4)?, "sps vps id")?;
-        let max_sub_layers_minus1 = narrow_u8(reader.bits("sps max sub", 3)?, "sps max sub")?;
-        if max_sub_layers_minus1 > 6 {
-            return Err(ParseError::OutOfRange {
-                syntax: "sps max sub",
-            });
-        }
-        let temporal_nesting = reader.bit("sps nesting")?;
-        let ptl = ProfileTierLevel::parse(reader, max_sub_layers_minus1 + 1)?;
-        let sps_id = narrow_u8(reader.ue("sps id")?, "sps id")?;
-        let chroma_format_idc = narrow_u8(reader.ue("sps chroma")?, "sps chroma")?;
-        if chroma_format_idc > 3 {
-            return Err(ParseError::OutOfRange {
-                syntax: "sps chroma",
-            });
-        }
-        let mut separate_colour_plane = false;
-        if chroma_format_idc == 3 {
-            separate_colour_plane = reader.bit("sps separate plane")?;
-        }
-        let pic_width = reader.ue("sps width")?;
-        let pic_height = reader.ue("sps height")?;
-        if pic_width == 0 || pic_height == 0 {
-            return Err(ParseError::OutOfRange {
-                syntax: "sps width",
-            });
-        }
-        let conformance = parse_conformance(reader)?;
-        let bit_depth_luma_minus8 = narrow_u8(reader.ue("sps luma depth")?, "sps luma depth")?;
-        let bit_depth_chroma_minus8 =
-            narrow_u8(reader.ue("sps chroma depth")?, "sps chroma depth")?;
-        let log2_max_pic_order_cnt_lsb_minus4 =
-            narrow_u8(reader.ue("sps poc bits")?, "sps poc bits")?;
-        if log2_max_pic_order_cnt_lsb_minus4 > 12 {
-            return Err(ParseError::OutOfRange {
-                syntax: "sps poc bits",
-            });
-        }
-        let ordering_info_present = reader.bit("sps ordering info")?;
-        let ordering =
-            parse_sub_layer_ordering(reader, ordering_info_present, max_sub_layers_minus1)?;
-        let log2_min_cb_minus3 = reader.ue("sps min cb size")?;
-        let log2_diff_cb = reader.ue("sps diff cb size")?;
-        let log2_min_transform_minus2 = reader.ue("sps min tb size")?;
-        let log2_diff_transform = reader.ue("sps diff tb size")?;
-        let max_inter_depth = reader.ue("sps max inter depth")?;
-        let max_intra_depth = reader.ue("sps max intra depth")?;
-        let mut scaling = None;
-        let scaling_enabled = reader.bit("sps scaling enabled")?;
-        if scaling_enabled && reader.bit("sps scaling present")? {
-            scaling = Some(ScalingLists::parse(reader)?);
-        }
-        let amp_enabled = reader.bit("sps amp")?;
-        let sao_enabled = reader.bit("sps sao")?;
-        let pcm = parse_pcm_params(reader)?;
-        let reference_sets = parse_sps_ref_sets(reader)?;
-        let temporal_mvp_enabled = reader.bit("sps temporal mvp")?;
-        let strong_intra_smoothing_enabled = reader.bit("sps smoothing")?;
-        let vui = parse_sps_vui(reader, max_sub_layers_minus1)?;
-        Ok(Self {
-            vps_id,
-            max_sub_layers_minus1,
-            temporal_nesting,
-            ptl,
-            id: sps_id,
-            chroma_format_idc,
-            separate_colour_plane,
-            pic_width,
-            pic_height,
-            conformance,
-            bit_depth_luma_minus8,
-            bit_depth_chroma_minus8,
-            log2_max_pic_order_cnt_lsb_minus4,
-            ordering,
-            log2_min_cb_minus3,
-            log2_diff_cb,
-            log2_min_tb_minus2: log2_min_transform_minus2,
-            log2_diff_tb: log2_diff_transform,
-            max_inter_depth,
-            max_intra_depth,
-            block: BlockTools {
-                amp: amp_enabled,
-                sao: sao_enabled,
-                scaling: scaling_enabled,
-            },
-            scaling,
-            pcm,
-            rps_sets: reference_sets.short_term,
-            long_term: reference_sets.long_term,
-            prediction: PredictionTools {
-                long_term_present: reference_sets.long_term_present,
-                temporal_mvp: temporal_mvp_enabled,
-                strong_intra_smoothing: strong_intra_smoothing_enabled,
-            },
-            vui,
-        })
-    }
-}
-
-/// Conformance window of one sequence set, when present.
-fn parse_conformance(reader: &mut BitReader<'_>) -> Result<Option<[u32; 4]>, ParseError> {
-    if !reader.bit("sps conformance")? {
-        return Ok(None);
-    }
-    let left = reader.ue("sps crop left")?;
-    let right = reader.ue("sps crop right")?;
-    let top = reader.ue("sps crop top")?;
-    let bottom = reader.ue("sps crop bottom")?;
-    Ok(Some([left, right, top, bottom]))
-}
-
-/// Reference sets of one sequence set.
-struct SpsReferenceSets {
-    /// Short-term reference picture sets.
-    short_term: Vec<RefPicSet>,
-    /// Long-term pictures from the SPS.
-    long_term: Vec<LtSps>,
-    /// Long-term pictures may appear in slices.
-    long_term_present: bool,
-}
-
-/// Sub-layer ordering limits from RBSP bits.
-fn parse_sub_layer_ordering(
-    reader: &mut BitReader<'_>,
-    ordering_info_present: bool,
-    max_sub_layers_minus1: u8,
-) -> Result<SubLayerOrdering, ParseError> {
-    let start = if ordering_info_present {
-        0
-    } else {
-        u32::from(max_sub_layers_minus1)
-    };
-    let mut ordering = SubLayerOrdering {
-        info_present: ordering_info_present,
-        ..Default::default()
-    };
-    for _ in start..=u32::from(max_sub_layers_minus1) {
-        ordering.buffering.push(reader.ue("sps buffering")?);
-        ordering.reorder.push(reader.ue("sps reorder")?);
-        ordering.latency.push(reader.ue("sps latency")?);
-    }
-    Ok(ordering)
-}
-
-/// PCM parameters of one sequence set, when enabled.
-fn parse_pcm_params(reader: &mut BitReader<'_>) -> Result<Option<PcmParams>, ParseError> {
-    if !reader.bit("sps pcm enabled")? {
-        return Ok(None);
-    }
-    let luma_depth_minus1 = narrow_u8(reader.bits("sps pcm luma", 4)?, "sps pcm luma")?;
-    let chroma_depth_minus1 = narrow_u8(reader.bits("sps pcm chroma", 4)?, "sps pcm chroma")?;
-    let min_cb_minus3 = reader.ue("sps pcm min cb")?;
-    let diff_cb = reader.ue("sps pcm diff cb")?;
-    let loop_filter_disabled = reader.bit("sps pcm loop filter")?;
-    Ok(Some(PcmParams {
-        luma_depth_minus1,
-        chroma_depth_minus1,
-        min_cb_minus3,
-        diff_cb,
-        loop_filter_disabled,
-    }))
-}
-
-/// Short-term and long-term reference sets of one sequence set.
-fn parse_sps_ref_sets(reader: &mut BitReader<'_>) -> Result<SpsReferenceSets, ParseError> {
-    let num_rps = reader.ue("sps num rps")?;
-    if num_rps > 64 {
-        return Err(ParseError::Unsupported {
-            what: "oversize rps list",
-        });
-    }
-    let mut short_term = Vec::with_capacity(num_rps as usize);
-    for idx in 0..num_rps as usize {
-        let set = RefPicSet::parse(reader, idx, &short_term, false)?;
-        short_term.push(set);
-    }
-    let mut long_term = Vec::new();
-    let long_term_present = reader.bit("sps lt present")?;
-    if long_term_present {
-        let count = reader.ue("sps num lt")?;
-        if count > 32 {
-            return Err(ParseError::Unsupported {
-                what: "oversize lt list",
-            });
-        }
-        for _ in 0..count {
-            let poc_lsb = reader.ue("sps lt poc")?;
-            let used = reader.bit("sps lt used")?;
-            long_term.push(LtSps { poc_lsb, used });
-        }
-    }
-    Ok(SpsReferenceSets {
-        short_term,
-        long_term,
-        long_term_present,
-    })
-}
-
-/// VUI block of one sequence set, then the extension guard.
-fn parse_sps_vui(
-    reader: &mut BitReader<'_>,
-    max_sub_layers_minus1: u8,
-) -> Result<Option<VuiParams>, ParseError> {
-    let mut vui = None;
-    if reader.bit("sps vui present")? {
-        vui = Some(parse_vui(reader, max_sub_layers_minus1 + 1)?);
-    }
-    if reader.bit("sps extension present")? {
-        return Err(ParseError::Unsupported {
-            what: "sps extension",
-        });
-    }
-    Ok(vui)
-}
-
-/// VUI parameters.
-fn parse_vui(reader: &mut BitReader<'_>, max_sub_layers: u8) -> Result<VuiParams, ParseError> {
-    let aspect_present = reader.bit("vui aspect present")?;
-    let mut aspect = AspectRatio {
-        present: aspect_present,
-        ..Default::default()
-    };
-    if aspect.present {
-        aspect.idc = narrow_u8(reader.bits("vui aspect idc", 8)?, "vui aspect idc")?;
-        if aspect.idc == 255 {
-            aspect.sar_width = narrow_u16(reader.bits("vui sar width", 16)?, "vui sar width")?;
-            aspect.sar_height = narrow_u16(reader.bits("vui sar height", 16)?, "vui sar height")?;
-        }
-    }
-    let mut overscan = Overscan {
-        present: reader.bit("vui overscan present")?,
-        ..Default::default()
-    };
-    if overscan.present {
-        overscan.appropriate = reader.bit("vui overscan")?;
-    }
-    let mut signal = VideoSignal {
-        present: reader.bit("vui signal present")?,
-        ..Default::default()
-    };
-    if signal.present {
-        signal.format = narrow_u8(reader.bits("vui format", 3)?, "vui format")?;
-        signal.full_range = reader.bit("vui full range")?;
-        signal.colour_present = reader.bit("vui colour present")?;
-        if signal.colour_present {
-            signal.primaries = narrow_u8(reader.bits("vui primaries", 8)?, "vui primaries")?;
-            signal.transfer = narrow_u8(reader.bits("vui transfer", 8)?, "vui transfer")?;
-            signal.matrix = narrow_u8(reader.bits("vui matrix", 8)?, "vui matrix")?;
-        }
-    }
-    let mut chroma_loc = ChromaLoc {
-        present: reader.bit("vui chroma loc present")?,
-        ..Default::default()
-    };
-    if chroma_loc.present {
-        chroma_loc.top = reader.ue("vui chroma top")?;
-        chroma_loc.bottom = reader.ue("vui chroma bottom")?;
-    }
-    let neutral_chroma = reader.bit("vui neutral chroma")?;
-    let field_seq = reader.bit("vui field seq")?;
-    let frame_field_info = reader.bit("vui frame field info")?;
-    let mut display_window = None;
-    if reader.bit("vui default display present")? {
-        let left = reader.ue("vui display left")?;
-        let right = reader.ue("vui display right")?;
-        let top = reader.ue("vui display top")?;
-        let bottom = reader.ue("vui display bottom")?;
-        display_window = Some([left, right, top, bottom]);
-    }
-    let mut timing = VuiTiming {
-        present: reader.bit("vui timing present")?,
-        ..Default::default()
-    };
-    let mut hrd = None;
-    if timing.present {
-        timing.num_units_in_tick = reader.bits("vui tick", 32)?;
-        timing.time_scale = reader.bits("vui scale", 32)?;
-        timing.proportional = reader.bit("vui poc proportional")?;
-        if timing.proportional {
-            timing.num_ticks_poc_diff_one_minus1 = reader.ue("vui poc ticks")?;
-        }
-        if reader.bit("vui hrd present")? {
-            hrd = Some(parse_hrd(reader, max_sub_layers, None)?);
-        }
-    }
-    let mut restriction = None;
-    if reader.bit("vui bitstream restriction")? {
-        restriction = Some(parse_restriction(reader)?);
-    }
-    Ok(VuiParams {
-        aspect,
-        overscan,
-        signal,
-        chroma_loc,
-        neutral_chroma,
-        field_seq,
-        frame_field_info,
-        display_window,
-        timing,
-        hrd,
-        restriction,
-    })
-}
-
-/// Bitstream restriction of one VUI record.
-fn parse_restriction(reader: &mut BitReader<'_>) -> Result<BitstreamRestriction, ParseError> {
-    Ok(BitstreamRestriction {
-        tiles_fixed: reader.bit("vui tiles fixed")?,
-        mv_over_pic: reader.bit("vui mv over pic")?,
-        restricted_ref: reader.bit("vui restricted ref")?,
-        min_spatial_segmentation: narrow_u16(
-            reader.ue("vui min segmentation")?,
-            "vui min segmentation",
-        )?,
-        max_bytes_per_pic_denom: narrow_u8(reader.ue("vui max bytes")?, "vui max bytes")?,
-        max_bits_per_mcu_denom: narrow_u8(reader.ue("vui max bits")?, "vui max bits")?,
-        max_mv_horizontal: narrow_u8(reader.ue("vui max mv h")?, "vui max mv h")?,
-        max_mv_vertical: narrow_u8(reader.ue("vui max mv v")?, "vui max mv v")?,
-    })
-}
-
-/// HRD parameters; `inherit` carries the first set's shared header.
-fn parse_hrd(
-    reader: &mut BitReader<'_>,
-    max_sub_layers: u8,
-    inherit: Option<(HrdStreams, bool)>,
-) -> Result<HrdParams, ParseError> {
-    let common = inherit.is_none();
-    let (
-        streams,
-        sub_pic,
-        tick_divisor_minus2,
-        bitrate_scale,
-        cpb_scale,
-        du_cpb_scale,
-        initial_delay_minus1,
-        au_delay_minus1,
-        dpb_delay_minus1,
-    );
-    if let Some((first_streams, first_sub_pic)) = inherit {
-        streams = first_streams;
-        sub_pic = first_sub_pic;
-        tick_divisor_minus2 = 0;
-        bitrate_scale = 0;
-        cpb_scale = 0;
-        du_cpb_scale = 0;
-        initial_delay_minus1 = 0;
-        au_delay_minus1 = 0;
-        dpb_delay_minus1 = 0;
-    } else {
-        let mut present = HrdStreams::default();
-        if max_sub_layers > 1 {
-            present.nal = reader.bit("hrd nal present")?;
-            present.vcl = reader.bit("hrd vcl present")?;
-        } else {
-            present.nal = true;
-        }
-        streams = present;
-        sub_pic = reader.bit("hrd sub pic")?;
-        tick_divisor_minus2 = if sub_pic {
-            narrow_u8(reader.bits("hrd tick divisor", 8)?, "hrd tick divisor")?
-        } else {
-            0
-        };
-        bitrate_scale = narrow_u8(reader.bits("hrd bitrate scale", 4)?, "hrd bitrate scale")?;
-        cpb_scale = narrow_u8(reader.bits("hrd cpb scale", 4)?, "hrd cpb scale")?;
-        du_cpb_scale = if sub_pic {
-            narrow_u8(reader.bits("hrd cpb du scale", 4)?, "hrd cpb du scale")?
-        } else {
-            0
-        };
-        initial_delay_minus1 =
-            narrow_u8(reader.bits("hrd initial delay", 5)?, "hrd initial delay")?;
-        au_delay_minus1 = narrow_u8(reader.bits("hrd au delay", 5)?, "hrd au delay")?;
-        dpb_delay_minus1 = narrow_u8(reader.bits("hrd dpb delay", 5)?, "hrd dpb delay")?;
-    }
-    let mut hrd = HrdParams {
-        common,
-        streams,
-        sub_pic,
-        tick_divisor_minus2,
-        bitrate_scale,
-        cpb_scale,
-        du_cpb_scale,
-        initial_delay_minus1,
-        au_delay_minus1,
-        dpb_delay_minus1,
-        ..Default::default()
-    };
-    let layers = max_sub_layers as usize;
-    hrd.fixed_rate = vec![false; layers];
-    hrd.pic_duration = vec![false; layers];
-    hrd.elemental = vec![0; layers];
-    hrd.cpb_count_minus1 = vec![0; layers];
-    parse_hrd_layer_flags(reader, &mut hrd, layers)?;
-    parse_hrd_layer_data(reader, &mut hrd, layers)?;
-    Ok(hrd)
-}
-
-/// Per-layer rate flags and CPB counts of one HRD set.
-fn parse_hrd_layer_flags(
-    reader: &mut BitReader<'_>,
-    hrd: &mut HrdParams,
-    layers: usize,
-) -> Result<(), ParseError> {
-    for i in 0..layers {
-        hrd.fixed_rate[i] = reader.bit("hrd fixed rate")?;
-        if hrd.fixed_rate[i] {
-            hrd.elemental[i] = narrow_u16(reader.ue("hrd elemental")?, "hrd elemental")?;
-        } else {
-            hrd.pic_duration[i] = reader.bit("hrd pic duration")?;
-        }
-        if hrd.pic_duration[i] {
-            hrd.elemental[i] = narrow_u16(reader.ue("hrd elemental")?, "hrd elemental")?;
-            hrd.cpb_count_minus1[i] = reader.ue("hrd cpb count")?;
-            if hrd.cpb_count_minus1[i] > 31 {
-                return Err(ParseError::Unsupported {
-                    what: "oversize hrd",
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Per-layer CPB data of one HRD set.
-fn parse_hrd_layer_data(
-    reader: &mut BitReader<'_>,
-    hrd: &mut HrdParams,
-    layers: usize,
-) -> Result<(), ParseError> {
-    for i in 0..layers {
-        hrd.nal_layers.push(HrdLayer::default());
-        hrd.vcl_layers.push(HrdLayer::default());
-        if hrd.fixed_rate[i] {
-            continue;
-        }
-        if hrd.streams.nal {
-            parse_hrd_layer(
-                reader,
-                hrd.sub_pic,
-                hrd.cpb_count_minus1[i],
-                &mut hrd.nal_layers[i],
-            )?;
-        }
-        if hrd.streams.vcl {
-            parse_hrd_layer(
-                reader,
-                hrd.sub_pic,
-                hrd.cpb_count_minus1[i],
-                &mut hrd.vcl_layers[i],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// One HRD layer's CPB data.
-fn parse_hrd_layer(
-    reader: &mut BitReader<'_>,
-    sub_pic: bool,
-    cpb_count_minus1: u32,
-    layer: &mut HrdLayer,
-) -> Result<(), ParseError> {
-    for _ in 0..=cpb_count_minus1 {
-        layer.bitrate_minus1.push(reader.ue("hrd bitrate")?);
-        layer.cpb_size_minus1.push(reader.ue("hrd cpb size")?);
-        if sub_pic {
-            layer.du_cpb_size_minus1.push(reader.ue("hrd du cpb size")?);
-            layer.du_bitrate_minus1.push(reader.ue("hrd du bitrate")?);
-        }
-        layer.cbr.push(reader.bit("hrd cbr")?);
-    }
-    Ok(())
 }
 
 /// Slice-segment header flags of one picture set.
@@ -1859,6 +1043,8 @@ pub(crate) struct Pps {
     log2_parallel_merge_level_minus2: u8,
     /// Slice header extension present.
     slice_header_extension_present: bool,
+    /// Shared set behind slice parsing.
+    shared: Rc<rust_video_h265::Pps>,
 }
 
 impl Pps {
@@ -1892,12 +1078,6 @@ impl Pps {
         self.cabac_init_present
     }
 
-    /// Default active L0 reference count.
-    #[must_use]
-    pub fn num_ref_idx_l0_default(&self) -> u32 {
-        self.num_ref_idx_l0_default_minus1 + 1
-    }
-
     /// Default active L0 count minus 1.
     #[must_use]
     pub fn num_ref_idx_l0_default_minus1(&self) -> u32 {
@@ -1908,12 +1088,6 @@ impl Pps {
     #[must_use]
     pub fn num_ref_idx_l1_default_minus1(&self) -> u32 {
         self.num_ref_idx_l1_default_minus1
-    }
-
-    /// Default active L1 reference count.
-    #[must_use]
-    pub fn num_ref_idx_l1_default(&self) -> u32 {
-        self.num_ref_idx_l1_default_minus1 + 1
     }
 
     /// Weighted prediction on P slices.
@@ -2101,150 +1275,6 @@ impl Pps {
     pub fn sign_data_hiding_enabled(&self) -> bool {
         self.intra.sign_hiding
     }
-
-    /// Picture set from RBSP bytes.
-    fn parse(reader: &mut BitReader<'_>) -> Result<Self, ParseError> {
-        let pps_id = narrow_u8(reader.ue("pps id")?, "pps id")?;
-        let sps_id = narrow_u8(reader.ue("pps sps id")?, "pps sps id")?;
-        let dependent_slices_enabled = reader.bit("pps dependent slices")?;
-        let output_flag_present = reader.bit("pps output flag")?;
-        let num_extra_slice_header_bits =
-            narrow_u8(reader.bits("pps extra bits", 3)?, "pps extra bits")?;
-        let sign_data_hiding_enabled = reader.bit("pps sign hiding")?;
-        let cabac_init_present = reader.bit("pps cabac init")?;
-        let num_ref_idx_l0_default_minus1 = reader.ue("pps l0 default")?;
-        let num_ref_idx_l1_default_minus1 = reader.ue("pps l1 default")?;
-        let init_qp_minus26 = reader.se("pps init qp")?;
-        let constrained_intra_pred = reader.bit("pps constrained intra")?;
-        let transform_skip_enabled = reader.bit("pps transform skip")?;
-        let qp = parse_qp_tools(reader)?;
-        let weighted_pred = reader.bit("pps weighted pred")?;
-        let weighted_bipred = reader.bit("pps weighted bipred")?;
-        let transquant_bypass_enabled = reader.bit("pps transquant bypass")?;
-        let tiles = parse_tiles(reader)?;
-        let across_tiles = if tiles.enabled {
-            reader.bit("pps loop across tiles")?
-        } else {
-            false
-        };
-        let loop_filter_across_slices = reader.bit("pps loop across slices")?;
-        let deblock = parse_deblock(reader)?;
-        let mut scaling = None;
-        if reader.bit("pps scaling present")? {
-            scaling = Some(ScalingLists::parse(reader)?);
-        }
-        let lists_modification_present = reader.bit("pps list mods")?;
-        let log2_parallel_merge_level_minus2 =
-            narrow_u8(reader.ue("pps merge level")?, "pps merge level")?;
-        let slice_header_extension_present = reader.bit("pps slice extension")?;
-        if reader.bit("pps extension present")? {
-            return Err(ParseError::Unsupported {
-                what: "pps extension",
-            });
-        }
-        Ok(Self {
-            id: pps_id,
-            sps_id,
-            header: SliceHeaderFlags {
-                dependent: dependent_slices_enabled,
-                output_present: output_flag_present,
-                lists_modification: lists_modification_present,
-            },
-            num_extra_slice_header_bits,
-            cabac_init_present,
-            num_ref_idx_l0_default_minus1,
-            num_ref_idx_l1_default_minus1,
-            init_qp_minus26,
-            intra: IntraTools {
-                constrained_pred: constrained_intra_pred,
-                transform_skip: transform_skip_enabled,
-                sign_hiding: sign_data_hiding_enabled,
-            },
-            qp,
-            weights: WeightFlags {
-                pred_p: weighted_pred,
-                pred_b: weighted_bipred,
-            },
-            transquant_bypass_enabled,
-            tiles,
-            loop_filter: LoopFilter {
-                across_tiles,
-                across_slices: loop_filter_across_slices,
-            },
-            deblock,
-            scaling,
-            log2_parallel_merge_level_minus2,
-            slice_header_extension_present,
-        })
-    }
-}
-
-/// QP delta tools of one picture set from RBSP bits.
-fn parse_qp_tools(reader: &mut BitReader<'_>) -> Result<QpTools, ParseError> {
-    let cu_delta = reader.bit("pps cu qp delta")?;
-    let cu_depth = if cu_delta {
-        reader.ue("pps cu qp depth")?
-    } else {
-        0
-    };
-    let cb_offset = reader.se("pps cb qp")?;
-    let cr_offset = reader.se("pps cr qp")?;
-    let chroma_present = reader.bit("pps chroma qp offsets")?;
-    Ok(QpTools {
-        cu_delta,
-        cu_depth,
-        cb_offset,
-        cr_offset,
-        chroma_present,
-    })
-}
-
-/// Tile layout of one picture set from RBSP bits.
-fn parse_tiles(reader: &mut BitReader<'_>) -> Result<TileLayout, ParseError> {
-    let enabled = reader.bit("pps tiles")?;
-    let entropy_sync = reader.bit("pps entropy sync")?;
-    let mut tiles = TileLayout {
-        enabled,
-        entropy_sync,
-        ..Default::default()
-    };
-    if enabled {
-        tiles.columns_minus1 = reader.ue("pps tile columns")?;
-        tiles.rows_minus1 = reader.ue("pps tile rows")?;
-        if tiles.columns_minus1 > 19 || tiles.rows_minus1 > 21 {
-            return Err(ParseError::Unsupported {
-                what: "oversize tiles",
-            });
-        }
-        tiles.uniform = reader.bit("pps uniform spacing")?;
-        if !tiles.uniform {
-            for _ in 0..tiles.columns_minus1 {
-                tiles.column_widths.push(reader.ue("pps column width")?);
-            }
-            for _ in 0..tiles.rows_minus1 {
-                tiles.row_heights.push(reader.ue("pps row height")?);
-            }
-        }
-    }
-    Ok(tiles)
-}
-
-/// Deblocking defaults of one picture set from RBSP bits.
-fn parse_deblock(reader: &mut BitReader<'_>) -> Result<DeblockDefaults, ParseError> {
-    let control_present = reader.bit("pps deblocking")?;
-    let mut deblock = DeblockDefaults {
-        control_present,
-        ..Default::default()
-    };
-    if control_present {
-        deblock.override_enabled = reader.bit("pps deblocking override")?;
-        deblock.disabled = reader.bit("pps deblocking disabled")?;
-        if !deblock.disabled {
-            deblock.beta = reader.se("pps beta")?;
-            deblock.tc = reader.se("pps tc")?;
-        }
-    }
-    Ok(deblock)
 }
 
 /// Slice coding type.
@@ -2256,18 +1286,6 @@ pub(crate) enum SliceType {
     P,
     /// Intra slice.
     I,
-}
-
-impl SliceType {
-    /// Type from the raw `slice_type` idc.
-    fn from_idc(idc: u32) -> Option<Self> {
-        match idc {
-            0 => Some(Self::B),
-            1 => Some(Self::P),
-            2 => Some(Self::I),
-            _ => None,
-        }
-    }
 }
 
 /// Long-term reference picture of one slice.
@@ -2523,7 +1541,730 @@ impl H265Parser {
             pps: HashMap::new(),
         }
     }
+}
 
+impl Default for H265Parser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Tier capability gates over shared grammar output.
+struct Gate;
+
+impl HevcError for ParseError {
+    /// Parse failure of `kind`.
+    fn parse(kind: ParseKind) -> Self {
+        match kind {
+            ParseKind::Truncated { syntax } => Self::Truncated { syntax },
+            ParseKind::OverflowU32 { syntax } | ParseKind::OverflowI32 { syntax } => {
+                Self::Overflow { syntax }
+            }
+            ParseKind::TooWide { syntax } => Self::Overflow { syntax },
+            ParseKind::Range { syntax } => Self::OutOfRange {
+                syntax: remap_syntax(syntax),
+            },
+            ParseKind::NalForbiddenBit | ParseKind::NalTemporalId => Self::OutOfRange {
+                syntax: "nal header",
+            },
+            ParseKind::VpsWithoutBody
+            | ParseKind::SpsWithoutBody
+            | ParseKind::PpsWithoutBody
+            | ParseKind::SliceWithoutHeader => Self::Truncated { syntax: "nal body" },
+            ParseKind::PpsCitesUnknownSps
+            | ParseKind::SliceCitesUnknownPps
+            | ParseKind::SliceCitesUnknownSps => Self::MissingSet { id: 0 },
+            ParseKind::PictureSlicesDisagree => Self::OutOfRange {
+                syntax: "picture slices",
+            },
+            ParseKind::NonIntraSliceInIdr => Self::OutOfRange {
+                syntax: "slice type",
+            },
+            ParseKind::ShortTermRefPicSetSize => Self::Unsupported {
+                what: "oversize rps",
+            },
+            ParseKind::EmptyCodedSize => Self::OutOfRange {
+                syntax: "sps width",
+            },
+            ParseKind::ConformanceOutside => Self::OutOfRange {
+                syntax: "sps conformance",
+            },
+            ParseKind::RpsTableOversize => Self::Unsupported {
+                what: "oversize rps list",
+            },
+            ParseKind::LtSpsOversize | ParseKind::LtTotalOversize => Self::Unsupported {
+                what: "oversize lt list",
+            },
+            ParseKind::EmptySpsRps => Self::Unsupported {
+                what: "empty sps rps",
+            },
+        }
+    }
+
+    /// Tier-declined construct of `kind`.
+    fn unsupported(kind: UnsupportedKind) -> Self {
+        match kind {
+            UnsupportedKind::DependentSlices => Self::Unsupported {
+                what: "dependent slices",
+            },
+            UnsupportedKind::ArbitrarySliceOrder => Self::Unsupported {
+                what: "arbitrary slice order",
+            },
+            UnsupportedKind::Multilayer => Self::Unsupported { what: "multilayer" },
+        }
+    }
+}
+
+/// Shared syntax label behind the tier label.
+fn remap_syntax(syntax: &'static str) -> &'static str {
+    match syntax {
+        "slice_type" => "slice type",
+        "short_term_ref_pic_set_idx" => "slice rps idx",
+        "slice_segment_address" => "slice address",
+        "pic_parameter_set_id" => "pps id",
+        "seq_parameter_set_id" => "sps id",
+        "pps_seq_parameter_set_id" => "pps sps id",
+        "slice_pic_parameter_set_id" => "slice pps id",
+        "chroma_format_idc" => "sps chroma",
+        "bit_depth_luma_minus8" => "sps luma depth",
+        "bit_depth_chroma_minus8" => "sps chroma depth",
+        "log2_max_pic_order_cnt_lsb_minus4" => "sps poc bits",
+        "offset_len_minus1" => "slice offset len",
+        _ => syntax,
+    }
+}
+
+impl HevcGate<ParseError> for Gate {
+    /// Sequence set against tier caps.
+    fn check_sps(sps: &rust_video_h265::Sps) -> Result<(), ParseError> {
+        if sps.chroma_format > 3 {
+            return Err(ParseError::OutOfRange {
+                syntax: "sps chroma",
+            });
+        }
+        if sps.max_sub_layers > 7 {
+            return Err(ParseError::OutOfRange {
+                syntax: "sps max sub",
+            });
+        }
+        check_ptl(&sps.ptl)?;
+        if sps.sps_extension_present {
+            return Err(ParseError::Unsupported {
+                what: "sps extension",
+            });
+        }
+        Ok(())
+    }
+
+    /// Picture set against tier caps with its sequence set, absent for orphans.
+    fn check_pps(
+        pps: &rust_video_h265::Pps,
+        sps: Option<&rust_video_h265::Sps>,
+    ) -> Result<(), ParseError> {
+        let _ = sps;
+        if pps.num_tile_columns - 1 > 19 || pps.num_tile_rows - 1 > 21 {
+            return Err(ParseError::Unsupported {
+                what: "oversize tiles",
+            });
+        }
+        if pps.pps_extension_present {
+            return Err(ParseError::Unsupported {
+                what: "pps extension",
+            });
+        }
+        Ok(())
+    }
+
+    /// Video set against tier caps.
+    fn check_vps(vps: &rust_video_h265::Vps) -> Result<(), ParseError> {
+        if vps.max_layers_minus1 > 0 {
+            return Err(ParseError::Unsupported {
+                what: "h265 layers",
+            });
+        }
+        if vps.max_sub_layers_minus1 > 6 {
+            return Err(ParseError::OutOfRange {
+                syntax: "vps max sub",
+            });
+        }
+        check_ptl(&vps.ptl)?;
+        if vps.num_layer_sets > 0 {
+            return Err(ParseError::Unsupported {
+                what: "h265 layer sets",
+            });
+        }
+        if vps
+            .timing
+            .as_ref()
+            .is_some_and(|timing| timing.hrd.len() > 16)
+        {
+            return Err(ParseError::Unsupported { what: "vps hrd" });
+        }
+        if vps.extension {
+            return Err(ParseError::Unsupported {
+                what: "vps extension",
+            });
+        }
+        Ok(())
+    }
+
+    /// Slice header tail counts against tier caps.
+    fn check_slice_extra(header: &rust_video_h265::SliceHeader) -> Result<(), ParseError> {
+        if header.lt.len() > 16 {
+            return Err(ParseError::Unsupported {
+                what: "oversize lt list",
+            });
+        }
+        if header.entry_count > 256 {
+            return Err(ParseError::Unsupported {
+                what: "oversize entry points",
+            });
+        }
+        if header.extension_length > 256 {
+            return Err(ParseError::Unsupported {
+                what: "oversize slice extension",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Profile, tier, and level against tier caps.
+fn check_ptl(ptl: &rust_video_h265::ProfileTierLevel) -> Result<(), ParseError> {
+    check_profile(ptl.profile_idc, ptl.compat)?;
+    if ptl.source.interlaced {
+        return Err(ParseError::Unsupported {
+            what: "interlaced source",
+        });
+    }
+    for layer in &ptl.sub_layers {
+        if !layer.present {
+            continue;
+        }
+        check_profile(layer.profile_idc, layer.compat)?;
+    }
+    Ok(())
+}
+
+/// Profile indicator with compatibility against tier caps.
+fn check_profile(profile_idc: u8, compat: u32) -> Result<(), ParseError> {
+    if !matches!(profile_idc, 1..=3) && compat & 0x0E00_0000 == 0 {
+        return Err(ParseError::Unsupported {
+            what: "h265 profile",
+        });
+    }
+    Ok(())
+}
+
+/// Tier profile record from the shared record.
+fn convert_ptl(shared: &rust_video_h265::ProfileTierLevel) -> ProfileTierLevel {
+    ProfileTierLevel {
+        tier: shared.tier,
+        profile_idc: shared.profile_idc,
+        source: SourceFlags {
+            progressive: shared.source.progressive,
+        },
+        constraints: ConstraintFlags {
+            non_packed: shared.constraints.non_packed,
+            frame_only: shared.constraints.frame_only,
+        },
+        level_idc: shared.level_idc,
+    }
+}
+
+/// Tier HRD layer from the shared layer.
+fn convert_hrd_layer(shared: &rust_video_h265::HrdLayerData) -> HrdLayer {
+    HrdLayer {
+        bitrate_minus1: shared.bitrate_minus1.clone(),
+        cpb_size_minus1: shared.cpb_size_minus1.clone(),
+        du_cpb_size_minus1: shared.du_cpb_size_minus1.clone(),
+        du_bitrate_minus1: shared.du_bitrate_minus1.clone(),
+        cbr: shared.cbr.clone(),
+    }
+}
+
+/// Tier HRD parameters from the shared parameters.
+fn convert_hrd(shared: &rust_video_h265::HrdParams) -> Result<HrdParams, ParseError> {
+    let mut elemental = Vec::with_capacity(shared.elemental.len());
+    for duration in &shared.elemental {
+        elemental.push(match duration {
+            Some(value) => narrow_u16(*value, "hrd elemental")?,
+            None => 0,
+        });
+    }
+    Ok(HrdParams {
+        common: shared.common,
+        streams: HrdStreams {
+            nal: shared.streams.nal,
+            vcl: shared.streams.vcl,
+        },
+        sub_pic: shared.sub_pic,
+        tick_divisor_minus2: shared.tick_divisor_minus2,
+        bitrate_scale: shared.bitrate_scale,
+        cpb_scale: shared.cpb_scale,
+        du_cpb_scale: shared.du_cpb_scale,
+        initial_delay_minus1: shared.initial_delay_minus1,
+        au_delay_minus1: shared.au_delay_minus1,
+        dpb_delay_minus1: shared.dpb_delay_minus1,
+        fixed_rate: shared.fixed_rate.clone(),
+        pic_duration: shared.pic_duration.clone(),
+        elemental,
+        cpb_count_minus1: shared.cpb_count_minus1.clone(),
+        nal_layers: shared.nal_layers.iter().map(convert_hrd_layer).collect(),
+        vcl_layers: shared.vcl_layers.iter().map(convert_hrd_layer).collect(),
+    })
+}
+
+/// Tier video set from the shared set.
+fn convert_vps(shared: &rust_video_h265::Vps) -> Result<Vps, ParseError> {
+    let timing = shared
+        .timing
+        .as_ref()
+        .map(|timing| {
+            Ok::<_, ParseError>(VpsTiming {
+                num_units_in_tick: timing.num_units_in_tick,
+                time_scale: timing.time_scale,
+                poc_proportional: timing.poc_proportional,
+                num_ticks_poc_diff_one_minus1: timing.num_ticks_poc_diff_one_minus1,
+                hrd: timing
+                    .hrd
+                    .iter()
+                    .map(convert_hrd)
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        })
+        .transpose()?;
+    Ok(Vps {
+        id: shared.id,
+        max_sub_layers_minus1: shared.max_sub_layers_minus1,
+        temporal_nesting: shared.temporal_nesting,
+        ptl: convert_ptl(&shared.ptl),
+        ordering_info_present: shared.ordering_info_present,
+        max_dec_pic_buffering: shared.max_dec_pic_buffering.clone(),
+        max_num_reorder_pics: shared.max_num_reorder_pics.clone(),
+        max_latency: shared.max_latency.clone(),
+        timing,
+    })
+}
+
+/// Tier scaling lists from the shared lists.
+fn convert_scaling(shared: &rust_video_h265::ScalingLists) -> ScalingLists {
+    ScalingLists {
+        list_4x4: shared.size0,
+        list_8x8: shared.size1,
+        list_16x16: shared.size2,
+        list_32x32: shared.size3,
+        dc_16x16: shared.dc2,
+        dc_32x32: shared.dc3,
+    }
+}
+
+/// Tier reference set from the shared set against converted `table`.
+///
+/// Explicit sets map directly; inter sets re-derive over the tier table,
+/// which keeps coding order while the shared arrays keep resolve order.
+fn convert_rps(
+    shared: &rust_video_h265::ShortTermRps,
+    table: &[RefPicSet],
+) -> Result<RefPicSet, ParseError> {
+    if !shared.predicted {
+        return Ok(RefPicSet {
+            s0: pairs(
+                &shared.negative,
+                &shared.negative_used,
+                shared.negative_count,
+            ),
+            s1: pairs(
+                &shared.positive,
+                &shared.positive_used,
+                shared.positive_count,
+            ),
+            #[cfg(test)]
+            ref_pics: 0,
+            inter: false,
+            delta_idx_minus1: 0,
+            delta_rps_sign: false,
+            abs_delta_rps_minus1: 0,
+            used_mask: 0,
+            use_mask: 0,
+        });
+    }
+    let reference = table.get(shared.ref_idx).ok_or(ParseError::OutOfRange {
+        syntax: "rps delta idx",
+    })?;
+    let (s0, s1) = derive_inter(shared, reference);
+    Ok(RefPicSet {
+        s0,
+        s1,
+        #[cfg(test)]
+        ref_pics: narrow_u8(
+            u32::try_from(reference.s0.len() + reference.s1.len()).map_err(|_| {
+                ParseError::OutOfRange {
+                    syntax: "rps ref pics",
+                }
+            })?,
+            "rps ref pics",
+        )?,
+        inter: true,
+        delta_idx_minus1: shared.delta_idx_minus1,
+        delta_rps_sign: shared.delta_sign,
+        abs_delta_rps_minus1: narrow_u16(shared.abs_delta_minus1, "rps abs delta")?,
+        used_mask: shared.used_mask,
+        use_mask: shared.use_mask,
+    })
+}
+
+/// Delta and used pairs from parallel arrays.
+fn pairs(deltas: &[i32], used: &[bool], count: u8) -> Vec<(i32, bool)> {
+    deltas
+        .iter()
+        .zip(used.iter())
+        .take(usize::from(count))
+        .map(|(delta, used)| (*delta, *used))
+        .collect()
+}
+
+/// Negative then positive POC deltas with used flags.
+type DeltaLists = (Vec<(i32, bool)>, Vec<(i32, bool)>);
+
+/// Inter-predicted deltas over the tier reference set.
+fn derive_inter(shared: &rust_video_h265::ShortTermRps, reference: &RefPicSet) -> DeltaLists {
+    let magnitude = shared.abs_delta_minus1.saturating_add(1);
+    let delta = i32::try_from(magnitude).unwrap_or(i32::MAX);
+    let delta = if shared.delta_sign { -delta } else { delta };
+    let mut s0 = Vec::new();
+    let mut s1 = Vec::new();
+    for ((poc, _), flag) in reference
+        .s0
+        .iter()
+        .chain(reference.s1.iter())
+        .zip(shared.predict_flags.iter())
+    {
+        let (used, keep) = *flag;
+        if !keep {
+            continue;
+        }
+        let derived = poc.saturating_add(delta);
+        match derived.cmp(&0) {
+            std::cmp::Ordering::Less => s0.push((derived, used)),
+            std::cmp::Ordering::Greater => s1.push((derived, used)),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    (s0, s1)
+}
+
+/// Tier reference set table from the shared table.
+fn convert_rps_table(
+    table: &[rust_video_h265::ShortTermRps],
+) -> Result<Vec<RefPicSet>, ParseError> {
+    let mut out = Vec::with_capacity(table.len());
+    for set in table {
+        let converted = convert_rps(set, &out)?;
+        out.push(converted);
+    }
+    Ok(out)
+}
+
+/// Tier VUI parameters from the shared parameters.
+fn convert_vui(shared: &rust_video_h265::VuiParams) -> Result<VuiParams, ParseError> {
+    let aspect = AspectRatio {
+        present: shared.aspect.present,
+        idc: shared.aspect.idc,
+        sar_width: narrow_u16(shared.aspect.sar_width, "vui sar width")?,
+        sar_height: narrow_u16(shared.aspect.sar_height, "vui sar height")?,
+    };
+    let overscan = Overscan {
+        present: shared.overscan.present,
+        appropriate: shared.overscan.appropriate,
+    };
+    let signal = VideoSignal {
+        present: shared.signal.present,
+        format: shared.signal.format,
+        full_range: shared.signal.full_range,
+        colour_present: shared.signal.colour_present,
+        primaries: shared.signal.primaries,
+        transfer: shared.signal.transfer,
+        matrix: shared.signal.matrix,
+    };
+    let chroma_loc = ChromaLoc {
+        present: shared.chroma_loc.present,
+        top: shared.chroma_loc.top,
+        bottom: shared.chroma_loc.bottom,
+    };
+    let timing = VuiTiming {
+        present: shared.timing.present,
+        num_units_in_tick: shared.timing.num_units_in_tick,
+        time_scale: shared.timing.time_scale,
+        proportional: shared.timing.proportional,
+        num_ticks_poc_diff_one_minus1: shared.timing.num_ticks_poc_diff_one_minus1,
+    };
+    let hrd = shared.hrd.as_ref().map(convert_hrd).transpose()?;
+    let restriction = shared
+        .restriction
+        .as_ref()
+        .map(|restriction| {
+            Ok::<_, ParseError>(BitstreamRestriction {
+                tiles_fixed: restriction.tiles_fixed,
+                mv_over_pic: restriction.mv_over_pic,
+                restricted_ref: restriction.restricted_ref,
+                min_spatial_segmentation: narrow_u16(
+                    restriction.min_spatial_segmentation,
+                    "vui min segmentation",
+                )?,
+                max_bytes_per_pic_denom: narrow_u8(
+                    restriction.max_bytes_per_pic_denom,
+                    "vui max bytes",
+                )?,
+                max_bits_per_mcu_denom: narrow_u8(
+                    restriction.max_bits_per_mcu_denom,
+                    "vui max bits",
+                )?,
+                max_mv_horizontal: narrow_u8(restriction.max_mv_horizontal, "vui max mv h")?,
+                max_mv_vertical: narrow_u8(restriction.max_mv_vertical, "vui max mv v")?,
+            })
+        })
+        .transpose()?;
+    Ok(VuiParams {
+        aspect,
+        overscan,
+        signal,
+        chroma_loc,
+        neutral_chroma: shared.neutral_chroma,
+        field_seq: shared.field_seq,
+        frame_field_info: shared.frame_field_info,
+        display_window: shared.display_window,
+        timing,
+        hrd,
+        restriction,
+    })
+}
+
+/// Tier sequence set from the shared set.
+fn convert_sps(shared: &Rc<rust_video_h265::Sps>) -> Result<Sps, ParseError> {
+    let scaling = if shared.scaling_enabled() {
+        Some(convert_scaling(&shared.scaling))
+    } else {
+        None
+    };
+    let pcm = if shared.pcm() {
+        Some(PcmParams {
+            luma_depth_minus1: shared.pcm_depth_luma,
+            chroma_depth_minus1: shared.pcm_depth_chroma,
+            min_cb_minus3: u32::from(shared.pcm_log2_min_minus3),
+            diff_cb: u32::from(shared.pcm_log2_diff),
+            loop_filter_disabled: shared.pcm_loop_disabled(),
+        })
+    } else {
+        None
+    };
+    let mut long_term = Vec::with_capacity(shared.lt_poc_lsb.len());
+    for (poc_lsb, used) in shared.lt_poc_lsb.iter().zip(shared.lt_used_by_curr.iter()) {
+        long_term.push(LtSps {
+            poc_lsb: *poc_lsb,
+            used: *used,
+        });
+    }
+    Ok(Sps {
+        vps_id: shared.vps_id,
+        max_sub_layers_minus1: shared.max_sub_layers.saturating_sub(1),
+        temporal_nesting: shared.flags & rust_video_h265::SPS_NESTING != 0,
+        ptl: convert_ptl(&shared.ptl),
+        id: shared.id,
+        chroma_format_idc: shared.chroma_format,
+        separate_colour_plane: shared.separate_colour_plane,
+        pic_width: shared.width,
+        pic_height: shared.height,
+        conformance: shared
+            .crop
+            .map(|crop| [crop.left / 2, crop.right / 2, crop.top / 2, crop.bottom / 2]),
+        bit_depth_luma_minus8: shared.bit_depth_luma,
+        bit_depth_chroma_minus8: shared.bit_depth_chroma,
+        log2_max_pic_order_cnt_lsb_minus4: shared.log2_max_poc_lsb_minus4,
+        ordering: SubLayerOrdering {
+            info_present: shared.flags & rust_video_h265::SPS_ORDERING_INFO != 0,
+            buffering: shared
+                .ordering_buffering
+                .iter()
+                .map(|v| u32::from(*v))
+                .collect(),
+            reorder: shared
+                .ordering_reorder
+                .iter()
+                .map(|v| u32::from(*v))
+                .collect(),
+            latency: shared.ordering_latency.clone(),
+        },
+        log2_min_cb_minus3: u32::from(shared.log2_min_cb_size_minus3),
+        log2_diff_cb: u32::from(shared.log2_diff_max_min_cb_size),
+        log2_min_tb_minus2: u32::from(shared.log2_min_tb_size_minus2),
+        log2_diff_tb: u32::from(shared.log2_diff_max_min_tb_size),
+        max_inter_depth: u32::from(shared.max_transform_depth_inter),
+        max_intra_depth: u32::from(shared.max_transform_depth_intra),
+        block: BlockTools {
+            amp: shared.amp(),
+            sao: shared.sao(),
+            scaling: shared.scaling_enabled(),
+        },
+        scaling,
+        pcm,
+        rps_sets: convert_rps_table(&shared.rps)?,
+        long_term,
+        prediction: PredictionTools {
+            long_term_present: shared.long_term_present(),
+            temporal_mvp: shared.temporal_mvp(),
+            strong_intra_smoothing: shared.smoothing(),
+        },
+        vui: shared.vui.as_ref().map(convert_vui).transpose()?,
+        shared: Rc::clone(shared),
+    })
+}
+
+/// Tier picture set from the shared set.
+fn convert_pps(shared: &Rc<rust_video_h265::Pps>) -> Pps {
+    let tiles = TileLayout {
+        enabled: shared.tiles_enabled(),
+        entropy_sync: shared.entropy_sync(),
+        columns_minus1: u32::from(shared.num_tile_columns.saturating_sub(1)),
+        rows_minus1: u32::from(shared.num_tile_rows.saturating_sub(1)),
+        uniform: shared.uniform_spacing(),
+        column_widths: shared
+            .column_width
+            .iter()
+            .map(|width| u32::from(*width) - 1)
+            .collect(),
+        row_heights: shared
+            .row_height
+            .iter()
+            .map(|height| u32::from(*height) - 1)
+            .collect(),
+    };
+    let scaling = if shared.flags & rust_video_h265::PPS_SCALING != 0 {
+        Some(convert_scaling(&shared.scaling))
+    } else {
+        None
+    };
+    Pps {
+        id: shared.id,
+        sps_id: shared.sps_id,
+        header: SliceHeaderFlags {
+            dependent: shared.dependent_slices(),
+            output_present: shared.output_flag_present(),
+            lists_modification: shared.lists_modification_present(),
+        },
+        num_extra_slice_header_bits: shared.num_extra_slice_header_bits,
+        cabac_init_present: shared.cabac_init_present(),
+        num_ref_idx_l0_default_minus1: u32::from(shared.num_ref_l0),
+        num_ref_idx_l1_default_minus1: u32::from(shared.num_ref_l1),
+        init_qp_minus26: i32::from(shared.pic_init_qp_minus26),
+        intra: IntraTools {
+            constrained_pred: shared.constrained_intra(),
+            transform_skip: shared.transform_skip(),
+            sign_hiding: shared.sign_hiding(),
+        },
+        qp: QpTools {
+            cu_delta: shared.cu_qp_delta(),
+            cu_depth: u32::from(shared.diff_cu_qp_delta_depth),
+            cb_offset: i32::from(shared.cb_qp_offset),
+            cr_offset: i32::from(shared.cr_qp_offset),
+            chroma_present: shared.chroma_offsets_present(),
+        },
+        weights: WeightFlags {
+            pred_p: shared.weighted_pred(),
+            pred_b: shared.weighted_bipred(),
+        },
+        transquant_bypass_enabled: shared.transquant_bypass(),
+        tiles,
+        loop_filter: LoopFilter {
+            across_tiles: shared.loop_across_tiles(),
+            across_slices: shared.loop_across_slices(),
+        },
+        deblock: DeblockDefaults {
+            control_present: shared.deblock_control_present,
+            override_enabled: shared.deblocking_override(),
+            disabled: shared.deblocking_disabled(),
+            beta: i32::from(shared.beta_offset_div2),
+            tc: i32::from(shared.tc_offset_div2),
+        },
+        scaling,
+        log2_parallel_merge_level_minus2: shared.log2_parallel_merge_minus2,
+        slice_header_extension_present: shared.slice_ext_present(),
+        shared: Rc::clone(shared),
+    }
+}
+
+/// Tier slice header from the shared header against its sequence set.
+fn convert_slice(
+    shared: &rust_video_h265::SliceHeader,
+    sps: &Sps,
+) -> Result<SliceHeader, ParseError> {
+    let mut short = Vec::new();
+    let mut sps_flag = false;
+    let mut ref_count = 0;
+    let mut bits = 0;
+    if let (Some(rps), Some(provenance)) = (shared.rps.as_ref(), shared.rps_bits.as_ref()) {
+        sps_flag = !provenance.explicit;
+        ref_count = provenance.ref_num_delta_pocs;
+        bits = provenance.bits;
+        if provenance.explicit {
+            if rps.predicted {
+                let (s0, s1) = derive_inter_set(rps, sps.rps_sets())?;
+                short.extend(s0);
+                short.extend(s1);
+            } else {
+                short.extend(pairs(&rps.negative, &rps.negative_used, rps.negative_count));
+                short.extend(pairs(&rps.positive, &rps.positive_used, rps.positive_count));
+            }
+        } else {
+            let index = usize::from(provenance.table_idx.ok_or(ParseError::OutOfRange {
+                syntax: "slice rps idx",
+            })?);
+            let set = sps.rps_sets().get(index).ok_or(ParseError::OutOfRange {
+                syntax: "slice rps idx",
+            })?;
+            short.extend(set.s0().iter().copied());
+            short.extend(set.s1().iter().copied());
+        }
+    }
+    let mut long = Vec::with_capacity(shared.lt.len());
+    for entry in &shared.lt {
+        long.push(LtSlice {
+            poc_lsb: entry.poc_lsb,
+            msb_cycle: i32::try_from(entry.msb_cycle).map_err(|_| ParseError::OutOfRange {
+                syntax: "slice lt msb",
+            })?,
+            msb_cycle_present: entry.msb_present,
+            used: entry.used,
+        });
+    }
+    Ok(SliceHeader {
+        first_slice_in_pic: shared.first,
+        no_output_of_prior_pics: shared.no_output_prior,
+        slice_type: match shared.slice_type {
+            rust_video_h265::SliceType::B => SliceType::B,
+            rust_video_h265::SliceType::P => SliceType::P,
+            rust_video_h265::SliceType::I => SliceType::I,
+        },
+        poc_lsb: shared.poc_lsb,
+        rps_sps_flag: sps_flag,
+        rps_ref_count: ref_count,
+        rps_bits: bits,
+        rps: SliceRps { short, long },
+    })
+}
+
+/// Tier deltas behind a shared inter set against the tier table.
+fn derive_inter_set(
+    shared: &rust_video_h265::ShortTermRps,
+    table: &[RefPicSet],
+) -> Result<DeltaLists, ParseError> {
+    let reference = table.get(shared.ref_idx).ok_or(ParseError::OutOfRange {
+        syntax: "rps delta idx",
+    })?;
+    Ok(derive_inter(shared, reference))
+}
+
+impl H265Parser {
     /// Parse one Annex-B NAL unit.
     ///
     /// # Errors
@@ -2542,47 +2283,42 @@ impl H265Parser {
         };
         if header.unit_type.id() == 32 {
             let rbsp = Rbsp::strip(&payload[2..]);
-            let mut reader = BitReader::new(rbsp.bytes());
-            let vps = Rc::new(Vps::parse(&mut reader)?);
+            let shared = rust_video_h265::parse_vps::<ParseError>(rbsp.bytes())?;
+            Gate::check_vps(&shared)?;
+            let vps = Rc::new(convert_vps(&shared)?);
             self.vps.insert(vps.id(), Rc::clone(&vps));
             return Ok(ParsedNalu::Vps(vps));
         }
         if header.unit_type.id() == 33 {
             let rbsp = Rbsp::strip(&payload[2..]);
-            let mut reader = BitReader::new(rbsp.bytes());
-            let sps = Rc::new(Sps::parse(&mut reader)?);
+            let shared = Rc::new(rust_video_h265::parse_sps::<ParseError, Gate>(
+                rbsp.bytes(),
+            )?);
+            let sps = Rc::new(convert_sps(&shared)?);
             self.sps.insert(sps.id(), Rc::clone(&sps));
             return Ok(ParsedNalu::Sps(sps));
         }
         if header.unit_type.id() == 34 {
             let rbsp = Rbsp::strip(&payload[2..]);
-            let mut reader = BitReader::new(rbsp.bytes());
-            let pps = Rc::new(Pps::parse(&mut reader)?);
+            let body = rbsp.bytes();
+            let shared = Rc::new(rust_video_h265::parse_pps::<ParseError, Gate>(body, None)?);
+            let pps = Rc::new(convert_pps(&shared));
             self.pps.insert(pps.id(), Rc::clone(&pps));
             return Ok(ParsedNalu::Pps(pps));
         }
         if header.unit_type.is_slice() {
             let rbsp = Rbsp::strip(&payload[2..]);
-            let mut reader = BitReader::new(rbsp.bytes());
-            let slice = self.parse_slice(&mut reader, header, nalu.bytes())?;
+            let slice = self.parse_slice(rbsp.bytes(), header, nalu.bytes())?;
             return Ok(ParsedNalu::Slice(Box::new(slice)));
         }
         Ok(ParsedNalu::Other)
     }
 
     /// Parse a slice header against the stored tables.
-    fn parse_slice(
-        &self,
-        reader: &mut BitReader<'_>,
-        nal: NalHeader,
-        bytes: &[u8],
-    ) -> Result<Slice, ParseError> {
-        let first_slice_in_pic = reader.bit("slice first in pic")?;
-        let mut no_output_of_prior_pics = false;
-        if nal.unit_type().is_irap() {
-            no_output_of_prior_pics = reader.bit("slice no output prior")?;
-        }
-        let pps_id = narrow_u8(reader.ue("slice pps id")?, "slice pps id")?;
+    fn parse_slice(&self, body: &[u8], nal: NalHeader, bytes: &[u8]) -> Result<Slice, ParseError> {
+        let mut reader = rust_video_h265::BitReader::<ParseError>::new(body);
+        let prefix = rust_video_h265::parse_slice_prefix(&mut reader, nal.unit_type().id())?;
+        let pps_id = prefix.2;
         let pps = self
             .pps
             .get(&pps_id)
@@ -2590,21 +2326,6 @@ impl H265Parser {
             .ok_or(ParseError::MissingSet {
                 id: u32::from(pps_id),
             })?;
-        if pps.dependent_slices_enabled() && !first_slice_in_pic && reader.bit("slice dependent")? {
-            return Err(ParseError::Unsupported {
-                what: "dependent slices",
-            });
-        }
-        if !first_slice_in_pic {
-            reader.ue("slice address")?;
-        }
-        let raw_type = reader.ue("slice type")?;
-        let slice_type = SliceType::from_idc(raw_type).ok_or(ParseError::OutOfRange {
-            syntax: "slice type",
-        })?;
-        if pps.output_flag_present() {
-            reader.bit("slice output flag")?;
-        }
         if pps.sps_id() > 15 {
             return Err(ParseError::OutOfRange {
                 syntax: "slice sps id",
@@ -2624,36 +2345,18 @@ impl H265Parser {
             .ok_or(ParseError::MissingSet {
                 id: u32::from(sps.vps_id()),
             })?;
-        if sps.separate_colour_plane() {
-            reader.bits("slice colour plane", 2)?;
-        }
-        let mut poc_lsb = None;
-        if !nal.unit_type().is_idr() {
-            poc_lsb = Some(reader.bits("slice poc lsb", sps.pic_order_cnt_lsb_bits())?);
-        }
-        let (rps, short) = parse_slice_rps(reader, &sps, nal.unit_type())?;
-        let mut temporal_mvp = false;
-        if sps.temporal_mvp_enabled() && !nal.unit_type().is_idr() {
-            temporal_mvp = reader.bit("slice temporal mvp")?;
-        }
-        reader.skip(
-            "slice extra bits",
-            u32::from(pps.num_extra_slice_header_bits()),
+        let shared = rust_video_h265::parse_slice_rest(
+            &mut reader,
+            prefix,
+            nal.unit_type().id(),
+            &sps.shared,
+            &pps.shared,
         )?;
-        let filter = parse_slice_inter(reader, &pps, &sps, slice_type, &rps, temporal_mvp)?;
-        parse_slice_tail(reader, &pps, slice_type, &filter)?;
+        Gate::check_slice_extra(&shared)?;
+        let header = convert_slice(&shared, &sps)?;
         Ok(Slice {
             nal,
-            header: SliceHeader {
-                first_slice_in_pic,
-                no_output_of_prior_pics,
-                slice_type,
-                poc_lsb,
-                rps_sps_flag: short.sps_flag,
-                rps_ref_count: short.ref_count,
-                rps_bits: short.bits,
-                rps,
-            },
+            header,
             vps,
             sps,
             pps,
@@ -2662,372 +2365,54 @@ impl H265Parser {
     }
 }
 
-/// Loop-filter inputs of one non-intra slice.
-struct SliceFilter {
-    /// Luma or chroma SAO active.
-    sao: bool,
-    /// Deblocking filter disabled.
-    deblocking_disabled: bool,
+#[cfg(test)]
+impl RefPicSet {
+    /// Set from `st_ref_pic_set` syntax at index `idx`.
+    ///
+    /// `inline` marks a slice-header set, the only place `delta_idx_minus1` is coded.
+    fn parse(body: &[u8], idx: usize, sets: &[Self], inline: bool) -> Result<Self, ParseError> {
+        let table = sets
+            .iter()
+            .map(shared_rps_input)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut reader = rust_video_h265::BitReader::<ParseError>::new(body);
+        let num_sps = if inline { idx } else { idx + 1 };
+        let resolved = rust_video_h265::parse_short_term_rps(&mut reader, idx, num_sps, &table)?;
+        convert_rps(&resolved.set, sets)
+    }
 }
 
-/// Reference lists, SAO, collocated and weights of one non-intra slice.
-fn parse_slice_inter(
-    reader: &mut BitReader<'_>,
-    pps: &Pps,
-    sps: &Sps,
-    slice_type: SliceType,
-    rps: &SliceRps,
-    temporal_mvp: bool,
-) -> Result<SliceFilter, ParseError> {
-    let mut filter = SliceFilter {
-        sao: false,
-        deblocking_disabled: pps.deblocking_filter_disabled(),
-    };
-    if sps.sao_enabled() {
-        let sao_luma = reader.bit("slice sao luma")?;
-        let sao_chroma = reader.bit("slice sao chroma")?;
-        filter.sao = sao_luma || sao_chroma;
-    }
-    if slice_type == SliceType::I {
-        return Ok(filter);
-    }
-    let mut num_ref_idx_l0_active = pps.num_ref_idx_l0_default();
-    let mut num_ref_idx_l1_active = pps.num_ref_idx_l1_default();
-    if reader.bit("slice ref override")? {
-        num_ref_idx_l0_active = reader.ue("slice l0 active")? + 1;
-        if slice_type == SliceType::B {
-            num_ref_idx_l1_active = reader.ue("slice l1 active")? + 1;
-        }
-    }
-    if pps.lists_modification_present() {
-        let total = rps.short.len() + rps.long.len();
-        if total > 0 {
-            parse_ref_list(reader, num_ref_idx_l0_active)?;
-            if slice_type == SliceType::B {
-                parse_ref_list(reader, num_ref_idx_l1_active)?;
-            }
-        }
-    }
-    if slice_type == SliceType::B {
-        reader.bit("slice mvd l1 zero")?;
-    }
-    if pps.cabac_init_present() {
-        reader.bit("slice cabac init")?;
-    }
-    skip_collocated(
-        reader,
-        temporal_mvp,
-        slice_type,
-        num_ref_idx_l0_active,
-        num_ref_idx_l1_active,
-    )?;
-    if (pps.weighted_pred() && slice_type == SliceType::P)
-        || (pps.weighted_bipred() && slice_type == SliceType::B)
-    {
-        skip_pred_weights(
-            reader,
-            sps,
-            slice_type,
-            num_ref_idx_l0_active,
-            num_ref_idx_l1_active,
-        )?;
-    }
-    reader.ue("slice merge cands")?;
-    Ok(filter)
-}
-
-/// QP deltas, deblocking, loop filter and entry points of one slice.
-fn parse_slice_tail(
-    reader: &mut BitReader<'_>,
-    pps: &Pps,
-    slice_type: SliceType,
-    filter: &SliceFilter,
-) -> Result<(), ParseError> {
-    reader.se("slice qp delta")?;
-    if pps.slice_chroma_qp_offsets_present() {
-        reader.se("slice cb qp offset")?;
-        reader.se("slice cr qp offset")?;
-    }
-    let mut deblocking_disabled = filter.deblocking_disabled;
-    if slice_type != SliceType::I
-        && pps.deblocking_filter_override_enabled()
-        && reader.bit("slice deblocking override")?
-    {
-        deblocking_disabled = reader.bit("slice deblocking disabled")?;
-        if !deblocking_disabled {
-            reader.se("slice beta")?;
-            reader.se("slice tc")?;
-        }
-    }
-    if pps.loop_filter_across_slices() && (filter.sao || !deblocking_disabled) {
-        reader.bit("slice loop across slices")?;
-    }
-    if pps.tiles_enabled() || pps.entropy_coding_sync_enabled() {
-        skip_entry_offsets(reader)?;
-    }
-    if pps.slice_header_extension_present() {
-        skip_slice_extension(reader)?;
-    }
-    Ok(())
-}
-
-/// Entry-point offsets of one slice, consumed without storing.
-fn skip_entry_offsets(reader: &mut BitReader<'_>) -> Result<(), ParseError> {
-    let offsets = reader.ue("slice entry offsets")?;
-    if offsets == 0 {
-        return Ok(());
-    }
-    if offsets > 256 {
-        return Err(ParseError::Unsupported {
-            what: "oversize entry points",
-        });
-    }
-    let width = reader.ue("slice offset len")? + 1;
-    if width > 32 {
+/// Shared reference set input behind tier values.
+#[cfg(test)]
+fn shared_rps_input(set: &RefPicSet) -> Result<rust_video_h265::ShortTermRps, ParseError> {
+    if set.s0().len() > 16 {
         return Err(ParseError::OutOfRange {
-            syntax: "slice offset len",
+            syntax: "rps delta s0",
         });
     }
-    for _ in 0..offsets {
-        reader.skip("slice entry offset", width)?;
-    }
-    Ok(())
-}
-
-/// Extension bytes of one slice header, consumed without storing.
-fn skip_slice_extension(reader: &mut BitReader<'_>) -> Result<(), ParseError> {
-    let length = reader.ue("slice extension length")?;
-    if length > 256 {
-        return Err(ParseError::Unsupported {
-            what: "oversize slice extension",
-        });
-    }
-    for _ in 0..length {
-        reader.skip("slice extension byte", 8)?;
-    }
-    Ok(())
-}
-
-impl Default for H265Parser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Short-term set of one slice with its driver echo.
-struct ShortRps {
-    /// POC deltas with used flags.
-    deltas: Vec<(i32, bool)>,
-    /// Set comes from the SPS rather than the slice.
-    sps_flag: bool,
-    /// Delta pictures of the predicted-from set.
-    ref_count: u8,
-    /// Syntax bit length of an explicit set.
-    bits: u16,
-}
-
-/// Short-term reference set from the slice header.
-fn parse_short_rps(reader: &mut BitReader<'_>, sps: &Sps) -> Result<ShortRps, ParseError> {
-    let sps_flag = reader.bit("slice rps sps flag")?;
-    let before = reader.consumed();
-    let (deltas, ref_count) = parse_short_set(reader, sps, sps_flag)?;
-    let bits = u16::try_from(reader.consumed() - before).unwrap_or(u16::MAX);
-    Ok(ShortRps {
-        deltas,
-        sps_flag,
-        ref_count,
-        bits: if sps_flag { 0 } else { bits },
-    })
-}
-
-/// Short-term deltas from the SPS table or explicit syntax.
-fn parse_short_set(
-    reader: &mut BitReader<'_>,
-    sps: &Sps,
-    sps_flag: bool,
-) -> Result<(Vec<(i32, bool)>, u8), ParseError> {
-    if sps_flag {
-        let count = sps.rps_sets().len();
-        if count == 0 {
-            return Err(ParseError::Unsupported {
-                what: "empty sps rps",
-            });
-        }
-        let index = if count == 1 {
-            0
-        } else {
-            let count = u32::try_from(count).map_err(|_| ParseError::OutOfRange {
-                syntax: "slice rps idx",
-            })?;
-            let width = 32 - (count - 1).leading_zeros();
-            let raw = reader.bits("slice rps idx", width)?;
-            usize::try_from(raw).map_err(|_| ParseError::OutOfRange {
-                syntax: "slice rps idx",
-            })?
-        };
-        let set = sps.rps_sets().get(index).ok_or(ParseError::OutOfRange {
-            syntax: "slice rps idx",
-        })?;
-        let mut deltas = Vec::new();
-        deltas.extend(set.s0.iter().copied());
-        deltas.extend(set.s1.iter().copied());
-        return Ok((deltas, 0));
-    }
-    let set = RefPicSet::parse(reader, sps.rps_sets().len(), sps.rps_sets(), true)?;
-    let mut deltas = Vec::new();
-    deltas.extend(set.s0.iter().copied());
-    deltas.extend(set.s1.iter().copied());
-    Ok((deltas, set.ref_pics()))
-}
-
-/// Current picture's reference set from the slice header.
-fn parse_slice_rps(
-    reader: &mut BitReader<'_>,
-    sps: &Sps,
-    nal_type: NalType,
-) -> Result<(SliceRps, ShortRps), ParseError> {
-    let mut rps = SliceRps::default();
-    if nal_type.is_idr() {
-        let empty = ShortRps {
-            deltas: Vec::new(),
-            sps_flag: false,
-            ref_count: 0,
-            bits: 0,
-        };
-        return Ok((rps, empty));
-    }
-    let short = parse_short_rps(reader, sps)?;
-    rps.short.extend(short.deltas.iter().copied());
-    if !sps.lt_present() {
-        return Ok((rps, short));
-    }
-    let num_sps = reader.ue("slice num lt sps")?;
-    let num_pics = reader.ue("slice num lt pics")?;
-    if num_sps + num_pics > 16 {
-        return Err(ParseError::Unsupported {
-            what: "oversize lt list",
-        });
-    }
-    let sps_lts = usize::try_from(num_sps).map_err(|_| ParseError::OutOfRange {
-        syntax: "slice num lt sps",
-    })?;
-    if sps_lts > sps.lt_sps().len() {
+    if set.s1().len() > 16 {
         return Err(ParseError::OutOfRange {
-            syntax: "slice num lt sps",
+            syntax: "rps delta s1",
         });
     }
-    for entry in sps.lt_sps().iter().take(sps_lts) {
-        let used = reader.bit("slice lt used")?;
-        let msb_present = reader.bit("slice lt msb present")?;
-        let mut msb_cycle = 0;
-        let mut msb_cycle_present = false;
-        if msb_present {
-            msb_cycle = reader.se("slice lt msb")?;
-            msb_cycle_present = true;
-        }
-        rps.long.push(LtSlice {
-            poc_lsb: entry.poc_lsb,
-            msb_cycle,
-            msb_cycle_present,
-            used,
-        });
+    let mut out = rust_video_h265::ShortTermRps::default();
+    for (index, (delta, used)) in set.s0().iter().enumerate() {
+        out.negative[index] = *delta;
+        out.negative_used[index] = *used;
     }
-    let bits = sps.pic_order_cnt_lsb_bits();
-    for _ in 0..num_pics {
-        let poc_lsb = reader.bits("slice lt poc", bits)?;
-        let used = reader.bit("slice lt used")?;
-        let msb_present = reader.bit("slice lt msb present")?;
-        let mut msb_cycle = 0;
-        let mut msb_cycle_present = false;
-        if msb_present {
-            msb_cycle = reader.se("slice lt msb")?;
-            msb_cycle_present = true;
-        }
-        rps.long.push(LtSlice {
-            poc_lsb,
-            msb_cycle,
-            msb_cycle_present,
-            used,
-        });
+    out.negative_count = u8::try_from(set.s0().len()).unwrap_or(u8::MAX);
+    for (index, (delta, used)) in set.s1().iter().enumerate() {
+        out.positive[index] = *delta;
+        out.positive_used[index] = *used;
     }
-    Ok((rps, short))
-}
-
-/// One reference-list modification: flag plus entries.
-fn parse_ref_list(reader: &mut BitReader<'_>, active: u32) -> Result<Vec<u32>, ParseError> {
-    if active > 16 {
-        return Err(ParseError::OutOfRange {
-            syntax: "slice ref active",
-        });
-    }
-    if !reader.bit("slice list mod flag")? {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::with_capacity(active as usize);
-    for _ in 0..active {
-        entries.push(reader.ue("slice list entry")?);
-    }
-    Ok(entries)
-}
-
-/// Collocated picture syntax, skipped.
-/// Collocated picture of the slice, absent without temporal prediction.
-/// Collocated-picture syntax of one slice, consumed without storing.
-fn skip_collocated(
-    reader: &mut BitReader<'_>,
-    temporal_mvp: bool,
-    slice_type: SliceType,
-    l0_active: u32,
-    l1_active: u32,
-) -> Result<(), ParseError> {
-    if !temporal_mvp {
-        return Ok(());
-    }
-    let mut from_l0 = true;
-    if slice_type == SliceType::B {
-        from_l0 = reader.bit("slice collocated from l0")?;
-    }
-    if (from_l0 && l0_active > 1) || (!from_l0 && l1_active > 1) {
-        reader.ue("slice collocated idx")?;
-    }
-    Ok(())
-}
-
-/// Prediction weight table of one slice, consumed without storing.
-fn skip_pred_weights(
-    reader: &mut BitReader<'_>,
-    sps: &Sps,
-    slice_type: SliceType,
-    l0_active: u32,
-    l1_active: u32,
-) -> Result<(), ParseError> {
-    reader.ue("weights luma denom")?;
-    let chroma = sps.chroma_format_idc() != 0;
-    if chroma {
-        reader.se("weights chroma denom")?;
-    }
-    let lists = if slice_type == SliceType::B { 2 } else { 1 };
-    for list in 0..lists {
-        let active = if list == 0 { l0_active } else { l1_active };
-        if active > 16 {
-            return Err(ParseError::OutOfRange {
-                syntax: "weights active",
-            });
-        }
-        for _ in 0..active {
-            if reader.bit("weights luma flag")? {
-                reader.se("weights luma delta")?;
-                reader.se("weights luma offset")?;
-            }
-            if chroma && reader.bit("weights chroma flag")? {
-                for _ in 0..2 {
-                    reader.se("weights chroma delta")?;
-                    reader.se("weights chroma offset")?;
-                }
-            }
-        }
-    }
-    Ok(())
+    out.positive_count = u8::try_from(set.s1().len()).unwrap_or(u8::MAX);
+    out.predicted = set.inter();
+    out.delta_idx_minus1 = set.delta_idx_minus1();
+    out.delta_sign = set.delta_rps_sign();
+    out.abs_delta_minus1 = u32::from(set.abs_delta_rps_minus1());
+    out.used_mask = set.used_mask();
+    out.use_mask = set.use_mask();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3124,11 +2509,9 @@ mod tests {
     #[test]
     fn explicit_rps_round_trips_through_std() {
         use super::RefPicSet;
-        use crate::parse::bits::BitReader;
         // negative=2 (deltas 0,1; used 1,0), positive=1 (delta 2, used 1).
         let bytes = [0x6B, 0x47];
-        let mut reader = BitReader::new(&bytes);
-        let set = RefPicSet::parse(&mut reader, 0, &[], false).expect("rps");
+        let set = RefPicSet::parse(&bytes, 0, &[], false).expect("rps");
         assert_eq!(set.s0(), &[(-1, true), (-3, false)]);
         assert_eq!(set.s1(), &[(3, true)]);
         let std = crate::session::std_h265::fill_rps(&set).expect("fill");
@@ -3146,15 +2529,12 @@ mod tests {
     #[test]
     fn inter_rps_keeps_raw_prediction_syntax() {
         use super::RefPicSet;
-        use crate::parse::bits::BitReader;
         let bytes = [0x6B, 0x47];
-        let mut reader = BitReader::new(&bytes);
-        let first = RefPicSet::parse(&mut reader, 0, &[], false).expect("rps");
+        let first = RefPicSet::parse(&bytes, 0, &[], false).expect("rps");
         // Inter, sign 0, abs 0, used 1/0/1 with the middle kept.
         let bytes = [0xB7];
-        let mut reader = BitReader::new(&bytes);
         let sets = [first];
-        let set = RefPicSet::parse(&mut reader, 1, &sets, false).expect("inter");
+        let set = RefPicSet::parse(&bytes, 1, &sets, false).expect("inter");
         assert!(set.inter());
         assert_eq!(set.ref_pics(), 3);
         assert_eq!(set.used_mask(), 0b101);

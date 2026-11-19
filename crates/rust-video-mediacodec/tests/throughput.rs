@@ -4,13 +4,9 @@
 
 #![cfg(target_os = "android")]
 
-use std::sync::{LazyLock, Mutex};
-
-use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, GpuExport};
-use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
 use rust_video_mediacodec::{
     EncodeSpec, FormatSpec, MediaCodecDecoder, MediaCodecEncoder, MediaCodecError,
     MediaCodecSurface,
@@ -22,9 +18,6 @@ const ITERS: u32 = 30;
 /// Realtime bar in frames per second.
 const BAR: f64 = 60.0;
 
-/// One timed section at a time across this binary.
-static MEASURE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 /// True when the device gate env requests on-device cases.
 fn device_gate() -> bool {
     match std::env::var("RUST_VIDEO_MEDIACODEC_DEVICE") {
@@ -34,13 +27,6 @@ fn device_gate() -> bool {
             false
         }
     }
-}
-
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
 }
 
 /// Spec carrying the first SPS/PPS pair in `packet`.
@@ -125,16 +111,12 @@ fn check_surface(surface: &MediaCodecSurface) {
 
 /// Warmup plus timed decode of `raws` against the realtime bar.
 fn run_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
-    let _measure = MEASURE.lock().expect("measure lock");
+    let _measure = Drive::serial();
     let Some(mut decoder) = open_decoder_or_decline(name, spec) else {
         return;
     };
-    let coded = packets(raws);
-    let mut warmup = 0;
-    for packet in &coded {
-        warmup += decoder.decode(packet).expect("warmup decode").len();
-    }
-    warmup += decoder.flush().expect("warmup drain").len();
+    let coded = Packets::from_raws(raws);
+    let warmup = Drive::decode_all(&mut decoder, &coded).len();
     assert!(warmup > 0, "{name}: warmup decodes");
     let start = std::time::Instant::now();
     for _ in 0..ITERS {
@@ -153,7 +135,7 @@ fn run_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
 
 /// Warmup plus timed encode of `frames` against the realtime bar.
 fn run_encode(name: &str, spec: &EncodeSpec, frames: &[CpuFrame]) {
-    let _measure = MEASURE.lock().expect("measure lock");
+    let _measure = Drive::serial();
     let Some(mut encoder) = open_encoder_or_decline(name, spec) else {
         return;
     };
@@ -186,11 +168,11 @@ fn run_surface_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
     if !device_gate() {
         return;
     }
-    let _measure = MEASURE.lock().expect("measure lock");
+    let _measure = Drive::serial();
     let Some(mut decoder) = open_decoder_or_decline(name, spec) else {
         return;
     };
-    let coded = packets(raws);
+    let coded = Packets::from_raws(raws);
     let mut warmup = 0;
     for packet in &coded {
         for surface in decoder.decode(packet).expect("warmup decode") {

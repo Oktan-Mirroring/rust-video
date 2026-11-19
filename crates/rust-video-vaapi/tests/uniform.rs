@@ -8,10 +8,9 @@
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, decode_dir, AnnexB, Ivf};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB, Ivf, Packets, Parity};
 use rust_video_vaapi::{Av1Decoder, H264Decoder, H265Decoder, VaApiDevice, VaApiFrame, Vp9Decoder};
 
 /// Pictures in each shared vector.
@@ -32,13 +31,6 @@ fn device(name: &str) -> Option<VaApiDevice> {
             None
         }
     }
-}
-
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
 }
 
 /// Overlapped depth under test: env override or three.
@@ -95,16 +87,9 @@ fn run(decoder: &mut impl Pipelined, packets: &[Packet]) -> (Vec<VaApiFrame>, Du
 
 /// Byte-exact frames across both legs.
 fn assert_parity(name: &str, sync: &[VaApiFrame], pipelined: &[VaApiFrame]) {
-    assert_eq!(sync.len(), pipelined.len(), "{name}: frame count");
     assert!(!sync.is_empty(), "{name}: legs decoded no frames");
-    for (index, (left, right)) in sync.iter().zip(pipelined.iter()).enumerate() {
-        assert_eq!(
-            left.identity().generation(),
-            right.identity().generation(),
-            "{name}: frame {index} generation"
-        );
-        assert_eq!(left.nv12(), right.nv12(), "{name}: frame {index} bytes");
-    }
+    Parity::assert_bytes(name, sync, pipelined, VaApiFrame::nv12);
+    Parity::assert_generations(name, sync, pipelined, |frame| frame.identity().generation());
     println!(
         "vaapi {name} uniform parity: {} frames byte-exact",
         sync.len()
@@ -144,7 +129,7 @@ fn h264_shared_decode_yields_every_frame() {
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
-    let (frames, _) = run(&mut decoder, &packets(&raws));
+    let (frames, _) = run(&mut decoder, &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h264 yields every frame");
 }
 
@@ -160,7 +145,7 @@ fn h264_bframes_decode_yields_every_frame() {
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
-    let (frames, _) = run(&mut decoder, &packets(&raws));
+    let (frames, _) = run(&mut decoder, &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h264 yields every frame");
 }
 
@@ -176,7 +161,7 @@ fn h265_shared_decode_yields_every_frame() {
     );
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = H265Decoder::open(&device);
-    let (frames, _) = run(&mut decoder, &packets(&raws));
+    let (frames, _) = run(&mut decoder, &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "h265 yields every frame");
 }
 
@@ -188,7 +173,7 @@ fn av1_shared_decode_yields_every_frame() {
     };
     let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
     let mut decoder = Av1Decoder::open(&device);
-    let (frames, _) = run(&mut decoder, &packets(&[bytes]));
+    let (frames, _) = run(&mut decoder, &Packets::from_raws(&[bytes]));
     assert_eq!(frames.len(), PICTURES, "av1 yields every frame");
 }
 
@@ -201,7 +186,7 @@ fn vp9_shared_decode_yields_every_frame() {
     let raws = Ivf::read(&decode_dir().join("valid_320x240.ivf")).frames;
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per frame");
     let mut decoder = Vp9Decoder::open(&device);
-    let (frames, _) = run(&mut decoder, &packets(&raws));
+    let (frames, _) = run(&mut decoder, &Packets::from_raws(&raws));
     assert_eq!(frames.len(), PICTURES, "vp9 yields every frame");
 }
 
@@ -219,7 +204,7 @@ fn h264_shared_pipeline_matches_sync_bytes() {
     parity_case(
         H264Decoder::open(&device),
         H264Decoder::open(&device),
-        &packets(&raws),
+        &Packets::from_raws(&raws),
         "h264",
     );
 }
@@ -238,7 +223,7 @@ fn h265_shared_pipeline_matches_sync_bytes() {
     parity_case(
         H265Decoder::open(&device),
         H265Decoder::open(&device),
-        &packets(&raws),
+        &Packets::from_raws(&raws),
         "h265",
     );
 }
@@ -253,7 +238,7 @@ fn av1_shared_pipeline_matches_sync_bytes() {
     parity_case(
         Av1Decoder::open(&device),
         Av1Decoder::open(&device),
-        &packets(&[bytes]),
+        &Packets::from_raws(&[bytes]),
         "av1",
     );
 }
@@ -269,7 +254,7 @@ fn vp9_shared_pipeline_matches_sync_bytes() {
     parity_case(
         Vp9Decoder::open(&device),
         Vp9Decoder::open(&device),
-        &packets(&raws),
+        &Packets::from_raws(&raws),
         "vp9",
     );
 }
@@ -284,7 +269,7 @@ fn sustained_h264_1080p_measures_realtime() {
         AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut decoder = H264Decoder::open(&device);
-    let (measured, count) = sustained_fps(&mut decoder, &packets(&raws));
+    let (measured, count) = sustained_fps(&mut decoder, &Packets::from_raws(&raws));
     println!(
         "vaapi h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_H264_BAR:.0}fps"
     );
@@ -305,7 +290,7 @@ fn sustained_h265_1080p_measures_realtime() {
         AnnexB::picture_packets(&bench_dir().join("h265-1080p_ip.h265"), AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut decoder = H265Decoder::open(&device);
-    let (measured, count) = sustained_fps(&mut decoder, &packets(&raws));
+    let (measured, count) = sustained_fps(&mut decoder, &Packets::from_raws(&raws));
     println!(
         "vaapi h265 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_H265_BAR:.0}fps"
     );
@@ -325,7 +310,7 @@ fn sustained_av1_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let mut decoder = Av1Decoder::open(&device);
-    let (measured, count) = sustained_fps(&mut decoder, &packets(&raws));
+    let (measured, count) = sustained_fps(&mut decoder, &Packets::from_raws(&raws));
     println!(
         "vaapi av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_AV1_BAR:.0}fps"
     );
@@ -345,7 +330,7 @@ fn sustained_vp9_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("vp9-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let mut decoder = Vp9Decoder::open(&device);
-    let (measured, count) = sustained_fps(&mut decoder, &packets(&raws));
+    let (measured, count) = sustained_fps(&mut decoder, &Packets::from_raws(&raws));
     println!(
         "vaapi vp9 sustained overlap 1080p: {measured:.1}fps over {count} frames, bar {SUSTAINED_VP9_BAR:.0}fps"
     );

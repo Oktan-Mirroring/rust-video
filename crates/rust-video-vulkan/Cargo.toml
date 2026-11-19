@@ -14,7 +14,10 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 bytes = "1"
 log = "0"
 memchr = "2"
+rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1" }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
+rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264" }
+rust-video-h265 = { version = "0.1.0", path = "../rust-video-h265" }
 thiserror = "1"
 
 [dev-dependencies]

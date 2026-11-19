@@ -1,11 +1,11 @@
-//! AV1 OBU splitting plus sequence and frame header parsing.
+//! AV1 headers over the shared grammar, mapped onto tier types.
 //!
-//! Syntax mirrors the `AOMedia` AV1 specification sections 5.3, 5.5, and 5.9:
-//! each parse function consumes one OBU payload in bitstream order, with
-//! reference state borrowed from the caller for inference and validation.
+//! Parsing runs in `rust-video-av1`; this module converts both ways
+//! between shared headers and the submit structures below.
 
 use crate::error::ParseError;
-use crate::parse::bits::BitReader;
+
+use rust_video_av1 as shared;
 
 /// AV1 reference frame slot count.
 pub(crate) const NUM_REF_FRAMES: u32 = 8;
@@ -23,42 +23,10 @@ const SEG_LVL_MAX: usize = 8;
 const MAX_TILE_COLS: usize = 64;
 /// AV1 maximum tile rows.
 const MAX_TILE_ROWS: usize = 64;
-/// AV1 frame size selected per frame.
-const SELECT_SCREEN_CONTENT_TOOLS: u8 = 2;
-/// AV1 motion vector precision selected per frame.
-const SELECT_INTEGER_MV: u8 = 2;
-/// AV1 primary reference indicating past independence.
-const PRIMARY_REF_NONE: u8 = 7;
 /// AV1 key frame type.
 const FRAME_KEY: u8 = 0;
-/// AV1 inter frame type.
-const FRAME_INTER: u8 = 1;
 /// AV1 intra-only frame type.
 const FRAME_INTRA_ONLY: u8 = 2;
-/// AV1 switch frame type.
-const FRAME_SWITCH: u8 = 3;
-/// AV1 maximum tile width in luma samples.
-const MAX_TILE_WIDTH: u32 = 4096;
-/// AV1 maximum tile area in luma samples.
-const MAX_TILE_AREA: u32 = 4096 * 2304;
-/// AV1 superres scale numerator.
-const SUPERRES_NUM: u32 = 8;
-/// AV1 superres denominator minimum.
-const SUPERRES_DENOM_MIN: u32 = 9;
-/// AV1 global motion signed parameter bit counts.
-const GM_ABS_ALPHA_BITS: u32 = 12;
-/// AV1 translation-only global motion bit count.
-const GM_ABS_TRANS_ONLY_BITS: u32 = 9;
-/// AV1 translation global motion bit count.
-const GM_ABS_TRANS_BITS: u32 = 12;
-/// AV1 warped model precision bits.
-const WARPEDMODEL_PREC_BITS: u32 = 16;
-/// AV1 translation-only precision bits.
-const TRANS_ONLY_PREC_BITS: u32 = 3;
-/// AV1 translation precision bits.
-const TRANS_PREC_BITS: u32 = 6;
-/// AV1 alpha precision bits.
-const ALPHA_PREC_BITS: u32 = 15;
 
 /// OBU type of one unit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,86 +105,23 @@ impl<'a> Obu<'a> {
     }
 }
 
-/// Unsigned LEB128 value plus its byte length.
-fn uleb128(bytes: &[u8], syntax: &'static str) -> Result<(u64, usize), ParseError> {
-    let mut value: u64 = 0;
-    for (index, byte) in bytes.iter().enumerate().take(8) {
-        let low = u64::from(byte & 0x7f);
-        let shift = u32::try_from(index * 7).map_err(|_| ParseError::OutOfRange { syntax })?;
-        value |= low
-            .checked_shl(shift)
-            .ok_or(ParseError::OutOfRange { syntax })?;
-        if byte & 0x80 == 0 {
-            return Ok((value, index + 1));
-        }
-    }
-    Err(ParseError::Overflow { syntax })
-}
-
 /// OBUs of one buffer in order.
 ///
 /// A unit without a size field runs to the buffer end, so low-overhead
 /// streams split correctly only when fed one temporal unit per call.
 pub(crate) fn split_obus(bytes: &[u8]) -> Result<Vec<Obu<'_>>, ParseError> {
     let mut obus = Vec::new();
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let header = rest[0];
-        if header & 0x80 != 0 {
-            return Err(ParseError::OutOfRange {
-                syntax: "obu header",
+    for unit in shared::split_obus::<ParseError>(bytes)? {
+        let kind = ObuType::of(unit.unit_type)?;
+        if unit.temporal_id != 0 || unit.spatial_id != 0 {
+            return Err(ParseError::Unsupported {
+                what: "av1 layered stream",
             });
         }
-        let kind = ObuType::of((header >> 3) & 0x0f)?;
-        let extension = (header >> 2) & 1 == 1;
-        let has_size = (header >> 1) & 1 == 1;
-        if header & 1 != 0 {
-            return Err(ParseError::OutOfRange {
-                syntax: "obu header",
-            });
-        }
-        let mut at = 1;
-        if extension {
-            if rest.len() < 2 {
-                return Err(ParseError::Truncated {
-                    syntax: "obu header",
-                });
-            }
-            if rest[1] & 0x07 != 0 {
-                return Err(ParseError::OutOfRange {
-                    syntax: "obu header",
-                });
-            }
-            if rest[1] & 0xf8 != 0 {
-                return Err(ParseError::Unsupported {
-                    what: "av1 layered stream",
-                });
-            }
-            at = 2;
-        }
-        let payload;
-        if has_size {
-            let (size, len) = uleb128(&rest[at..], "obu size")?;
-            at += len;
-            let end = at
-                .checked_add(
-                    usize::try_from(size)
-                        .map_err(|_| ParseError::OutOfRange { syntax: "obu size" })?,
-                )
-                .ok_or(ParseError::OutOfRange { syntax: "obu size" })?;
-            if rest.len() < end {
-                return Err(ParseError::Truncated {
-                    syntax: "obu payload",
-                });
-            }
-            payload = &rest[at..end];
-            at = end;
-        } else {
-            payload = &rest[at..];
-            at = rest.len();
-        }
-        obus.push(Obu { kind, payload });
-        rest = &rest[at..];
+        obus.push(Obu {
+            kind,
+            payload: unit.payload,
+        });
     }
     Ok(obus)
 }
@@ -259,19 +164,9 @@ fn narrow_u8(value: u32, syntax: &'static str) -> Result<u8, ParseError> {
     u8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
 }
 
-/// Checked narrowing of a counted value.
-fn narrow_u32(value: usize, syntax: &'static str) -> Result<u32, ParseError> {
-    u32::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
-}
-
 /// Checked narrowing of a parsed value.
 fn narrow_u16(value: u32, syntax: &'static str) -> Result<u16, ParseError> {
     u16::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
-}
-
-/// Checked narrowing of a parsed value.
-fn narrow_i8(value: i32, syntax: &'static str) -> Result<i8, ParseError> {
-    i8::try_from(value).map_err(|_| ParseError::OutOfRange { syntax })
 }
 
 /// AV1 timing info of one sequence header.
@@ -474,8 +369,6 @@ pub(crate) struct SequenceHeader {
     film_grain_params_present: bool,
     /// Bit depth, 8 through 12.
     bit_depth: u8,
-    /// Plane count, 1 or 3.
-    num_planes: u8,
 }
 
 impl SequenceHeader {
@@ -659,15 +552,6 @@ impl SequenceHeader {
         self.order_hint_bits_minus_1
     }
 
-    /// Order hint width in bits, zero without order hints.
-    pub(crate) fn order_hint_bits(&self) -> u32 {
-        if self.order.enable_order_hint {
-            u32::from(self.order_hint_bits_minus_1) + 1
-        } else {
-            0
-        }
-    }
-
     /// Super-resolution.
     pub(crate) fn enable_superres(&self) -> bool {
         self.enable_superres
@@ -693,11 +577,6 @@ impl SequenceHeader {
         self.film_grain_params_present
     }
 
-    /// Plane count, 1 or 3.
-    pub(crate) fn num_planes(&self) -> u8 {
-        self.num_planes
-    }
-
     /// Main profile 4:2:0 8-bit sequence header for session tests.
     #[cfg(test)]
     pub(crate) fn test_main_420() -> Self {
@@ -707,7 +586,6 @@ impl SequenceHeader {
         seq.color.subsampling_x = 1;
         seq.color.subsampling_y = 1;
         seq.bit_depth = 8;
-        seq.num_planes = 3;
         seq.max_frame_width_minus_1 = 319;
         seq.max_frame_height_minus_1 = 239;
         seq.operating_points = vec![OperatingPoint {
@@ -745,299 +623,18 @@ impl SequenceHeader {
             color: ColorConfig::default(),
             film_grain_params_present: false,
             bit_depth: 8,
-            num_planes: 3,
         }
     }
 }
 
 /// Sequence header of one OBU payload.
 pub(crate) fn parse_sequence_header(payload: &[u8]) -> Result<SequenceHeader, ParseError> {
-    let mut reader = BitReader::new(payload);
-    let profile = narrow_u8(reader.bits("seq profile", 3)?, "seq profile")?;
-    if profile > 2 {
-        return Err(ParseError::OutOfRange {
-            syntax: "seq profile",
-        });
-    }
-    let still_picture = reader.bit("seq still")?;
-    let reduced = reader.bit("seq reduced")?;
-    let mut header = SequenceHeader {
-        profile,
-        still: SeqStill {
-            still_picture,
-            reduced,
-        },
-        presence: SeqPresence::default(),
-        timing: TimingInfo::default(),
-        decoder_model: DecoderModelInfo::default(),
-        operating_points: Vec::new(),
-        frame_width_bits_minus_1: 0,
-        frame_height_bits_minus_1: 0,
-        max_frame_width_minus_1: 0,
-        max_frame_height_minus_1: 0,
-        frame_id_numbers_present: false,
-        delta_frame_id_length_minus_2: 0,
-        additional_frame_id_length_minus_1: 0,
-        blocks: SeqBlocks::default(),
-        compound: SeqCompound::default(),
-        filters: SeqFilters::default(),
-        order: SeqOrder::default(),
-        seq_force_screen_content_tools: 0,
-        seq_force_integer_mv: 0,
-        order_hint_bits_minus_1: 0,
-        enable_superres: false,
-        color: ColorConfig::default(),
-        film_grain_params_present: false,
-        bit_depth: 8,
-        num_planes: 3,
-    };
-    parse_operating_points(&mut reader, &mut header)?;
-    header.frame_width_bits_minus_1 =
-        narrow_u8(reader.bits("seq width bits", 4)?, "seq width bits")?;
-    header.frame_height_bits_minus_1 =
-        narrow_u8(reader.bits("seq height bits", 4)?, "seq height bits")?;
-    header.max_frame_width_minus_1 = narrow_u16(
-        reader.bits(
-            "seq max width",
-            u32::from(header.frame_width_bits_minus_1) + 1,
-        )?,
-        "seq max width",
-    )?;
-    header.max_frame_height_minus_1 = narrow_u16(
-        reader.bits(
-            "seq max height",
-            u32::from(header.frame_height_bits_minus_1) + 1,
-        )?,
-        "seq max height",
-    )?;
-    header.frame_id_numbers_present = if reduced {
-        false
-    } else {
-        reader.bit("seq frame ids")?
-    };
-    if header.frame_id_numbers_present {
-        header.delta_frame_id_length_minus_2 =
-            narrow_u8(reader.bits("seq delta id bits", 4)?, "seq delta id bits")?;
-        header.additional_frame_id_length_minus_1 =
-            narrow_u8(reader.bits("seq extra id bits", 3)?, "seq extra id bits")?;
-    }
-    header.blocks.use_128x128_superblock = reader.bit("seq superblock")?;
-    header.blocks.enable_filter_intra = reader.bit("seq filter intra")?;
-    header.blocks.enable_intra_edge_filter = reader.bit("seq edge filter")?;
-    parse_seq_enables(&mut reader, &mut header)?;
-    header.enable_superres = reader.bit("seq superres")?;
-    header.filters.enable_cdef = reader.bit("seq cdef")?;
-    header.filters.enable_restoration = reader.bit("seq restoration")?;
-    parse_color_config(&mut reader, &mut header)?;
-    header.film_grain_params_present = reader.bit("seq film grain")?;
-    Ok(header)
-}
-
-/// Operating points of the sequence header into `header`.
-fn parse_operating_points(
-    reader: &mut BitReader<'_>,
-    header: &mut SequenceHeader,
-) -> Result<(), ParseError> {
-    if header.still.reduced {
-        let level = narrow_u8(reader.bits("seq level", 5)?, "seq level")?;
-        header.operating_points.push(OperatingPoint {
-            level_idx: level,
-            ..OperatingPoint::default()
-        });
-        return Ok(());
-    }
-    header.presence.timing_present = reader.bit("seq timing present")?;
-    if header.presence.timing_present {
-        header.timing.num_units_in_display_tick = reader.bits("seq tick units", 32)?;
-        if header.timing.num_units_in_display_tick == 0 {
-            return Err(ParseError::OutOfRange {
-                syntax: "seq tick units",
-            });
-        }
-        header.timing.time_scale = reader.bits("seq time scale", 32)?;
-        if header.timing.time_scale == 0 {
-            return Err(ParseError::OutOfRange {
-                syntax: "seq time scale",
-            });
-        }
-        header.timing.equal_picture_interval = reader.bit("seq equal interval")?;
-        if header.timing.equal_picture_interval {
-            header.timing.num_ticks_per_picture_minus_1 = reader.uvlc("seq ticks per picture")?;
-        }
-        header.presence.decoder_model_present = reader.bit("seq decoder model")?;
-        if header.presence.decoder_model_present {
-            header.decoder_model.buffer_delay_length_minus_1 = narrow_u8(
-                reader.bits("seq buffer delay bits", 5)?,
-                "seq buffer delay bits",
-            )?;
-            header.decoder_model.num_units_in_decoding_tick =
-                reader.bits("seq decoding tick", 32)?;
-            if header.decoder_model.num_units_in_decoding_tick == 0 {
-                return Err(ParseError::OutOfRange {
-                    syntax: "seq decoding tick",
-                });
-            }
-            header.decoder_model.buffer_removal_time_length_minus_1 =
-                narrow_u8(reader.bits("seq removal bits", 5)?, "seq removal bits")?;
-            header.decoder_model.frame_presentation_time_length_minus_1 = narrow_u8(
-                reader.bits("seq presentation bits", 5)?,
-                "seq presentation bits",
-            )?;
-        }
-    }
-    header.presence.initial_display_delay_present = reader.bit("seq delay present")?;
-    let count = reader.bits("seq operating points", 5)? + 1;
-    for _ in 0..count {
-        let idc = narrow_u16(reader.bits("seq op idc", 12)?, "seq op idc")?;
-        let level_idx = narrow_u8(reader.bits("seq op level", 5)?, "seq op level")?;
-        let tier = if level_idx > 7 {
-            u8::from(reader.bit("seq op tier")?)
-        } else {
-            0
-        };
-        let mut point = OperatingPoint {
-            idc,
-            level_idx,
-            tier,
-            ..OperatingPoint::default()
-        };
-        if header.presence.decoder_model_present {
-            point.decoder_present = reader.bit("seq op decoder model")?;
-            if point.decoder_present {
-                let width = u32::from(header.decoder_model.buffer_delay_length_minus_1) + 1;
-                point.decoder_buffer_delay = reader.bits("seq op buffer delay", width)?;
-                point.encoder_buffer_delay = reader.bits("seq op encoder delay", width)?;
-                point.low_delay = reader.bit("seq op low delay")?;
-            }
-        }
-        if header.presence.initial_display_delay_present {
-            point.initial_delay_present = reader.bit("seq op delay present")?;
-            if point.initial_delay_present {
-                point.initial_delay_minus_1 =
-                    narrow_u8(reader.bits("seq op delay", 4)?, "seq op delay")?;
-            }
-        }
-        header.operating_points.push(point);
-    }
-    Ok(())
-}
-
-/// Enable flags plus screen content tool selection into `header`.
-fn parse_seq_enables(
-    reader: &mut BitReader<'_>,
-    header: &mut SequenceHeader,
-) -> Result<(), ParseError> {
-    if header.still.reduced {
-        header.seq_force_screen_content_tools = SELECT_SCREEN_CONTENT_TOOLS;
-        header.seq_force_integer_mv = SELECT_INTEGER_MV;
-        return Ok(());
-    }
-    header.compound.enable_interintra_compound = reader.bit("seq interintra")?;
-    header.compound.enable_masked_compound = reader.bit("seq masked")?;
-    header.compound.enable_warped_motion = reader.bit("seq warped")?;
-    header.filters.enable_dual_filter = reader.bit("seq dual filter")?;
-    header.order.enable_order_hint = reader.bit("seq order hint")?;
-    if header.order.enable_order_hint {
-        header.order.enable_jnt_comp = reader.bit("seq jnt comp")?;
-        header.order.enable_ref_frame_mvs = reader.bit("seq ref mvs")?;
-    }
-    header.seq_force_screen_content_tools = if reader.bit("seq choose tools")? {
-        SELECT_SCREEN_CONTENT_TOOLS
-    } else {
-        u8::from(reader.bit("seq force tools")?)
-    };
-    header.seq_force_integer_mv =
-        if header.seq_force_screen_content_tools != 0 && !reader.bit("seq choose integer mv")? {
-            u8::from(reader.bit("seq force integer mv")?)
-        } else {
-            SELECT_INTEGER_MV
-        };
-    if header.order.enable_order_hint {
-        header.order_hint_bits_minus_1 =
-            narrow_u8(reader.bits("seq hint bits", 3)?, "seq hint bits")?;
-    }
-    Ok(())
-}
-
-/// Color config of the sequence header into `header`.
-fn parse_color_config(
-    reader: &mut BitReader<'_>,
-    header: &mut SequenceHeader,
-) -> Result<(), ParseError> {
-    let color = &mut header.color;
-    color.depth.high_bitdepth = reader.bit("seq high bitdepth")?;
-    if header.profile == 2 && color.depth.high_bitdepth {
-        color.depth.twelve_bit = reader.bit("seq twelve bit")?;
-        header.bit_depth = if color.depth.twelve_bit { 12 } else { 10 };
-    } else {
-        header.bit_depth = if color.depth.high_bitdepth { 10 } else { 8 };
-    }
-    color.depth.mono_chrome = if header.profile == 1 {
-        false
-    } else {
-        reader.bit("seq monochrome")?
-    };
-    header.num_planes = if color.depth.mono_chrome { 1 } else { 3 };
-    color.color_description_present = reader.bit("seq color desc")?;
-    if color.color_description_present {
-        color.color_primaries = narrow_u8(reader.bits("seq primaries", 8)?, "seq primaries")?;
-        color.transfer_characteristics =
-            narrow_u8(reader.bits("seq transfer", 8)?, "seq transfer")?;
-        color.matrix_coefficients = narrow_u8(reader.bits("seq matrix", 8)?, "seq matrix")?;
-    } else {
-        color.color_primaries = 2;
-        color.transfer_characteristics = 2;
-        color.matrix_coefficients = 2;
-    }
-    if color.depth.mono_chrome {
-        color.color_range = reader.bit("seq color range")?;
-        color.subsampling_x = 1;
-        color.subsampling_y = 1;
-        return Ok(());
-    }
-    if color.color_primaries == 1
-        && color.transfer_characteristics == 13
-        && color.matrix_coefficients == 0
-    {
-        color.color_range = true;
-        color.subsampling_x = 0;
-        color.subsampling_y = 0;
-        color.separate_uv_delta_q = reader.bit("seq separate uv")?;
-        return Ok(());
-    }
-    color.color_range = reader.bit("seq color range")?;
-    if header.profile == 0 {
-        color.subsampling_x = 1;
-        color.subsampling_y = 1;
-    } else if header.profile == 1 {
-        color.subsampling_x = 0;
-        color.subsampling_y = 0;
-    } else if header.bit_depth == 12 {
-        color.subsampling_x = u8::from(reader.bit("seq subsampling x")?);
-        color.subsampling_y = if color.subsampling_x == 1 {
-            u8::from(reader.bit("seq subsampling y")?)
-        } else {
-            0
-        };
-    } else {
-        color.subsampling_x = 1;
-        color.subsampling_y = 0;
-    }
-    if color.subsampling_x == 1 && color.subsampling_y == 1 {
-        color.chroma_sample_position =
-            narrow_u8(reader.bits("seq chroma pos", 2)?, "seq chroma pos")?;
-    }
-    color.separate_uv_delta_q = reader.bit("seq separate uv")?;
-    Ok(())
+    from_shared_seq(&shared::parse_sequence_header::<ParseError>(payload)?)
 }
 
 /// Ceiling of `log2(target / blksize)`.
 pub(crate) fn tile_log2(blksize: u32, target: u32) -> u32 {
-    let mut k = 0;
-    while (blksize << k) < target {
-        k += 1;
-    }
-    k
+    shared::tile_log2(blksize, target)
 }
 
 /// Signed order hint distance from `a` to `b`, zero without order hints.
@@ -1045,9 +642,7 @@ pub(crate) fn relative_dist(seq: &SequenceHeader, a: u8, b: u8) -> i32 {
     if !seq.enable_order_hint() {
         return 0;
     }
-    let diff = u32::from(a).wrapping_sub(u32::from(b));
-    let m = 1 << seq.order_hint_bits_minus_1();
-    (diff & (m - 1)).cast_signed() - (diff & m).cast_signed()
+    shared::relative_dist(a, b, seq.order_hint_bits_minus_1())
 }
 
 /// AV1 show-existing state of one frame header.
@@ -1865,13 +1460,6 @@ pub(crate) struct ParsedFrame {
     pub invalidated: [bool; TOTAL_REFS],
 }
 
-/// Frame id width in bits behind `seq`.
-fn id_len(seq: &SequenceHeader) -> u32 {
-    u32::from(seq.additional_frame_id_length_minus_1())
-        + u32::from(seq.delta_frame_id_length_minus_2())
-        + 3
-}
-
 /// Frame header of one OBU payload against `seq` and `slots`.
 ///
 /// Reads reference state for inference and validation; slot effects land
@@ -1881,996 +1469,842 @@ pub(crate) fn parse_frame_header(
     seq: &SequenceHeader,
     slots: &[SlotView; TOTAL_REFS],
 ) -> Result<ParsedFrame, ParseError> {
-    let mut reader = BitReader::new(payload);
-    parse_frame_header_with(&mut reader, seq, slots)
+    let shared_seq = to_shared_seq(seq);
+    let mut refs = to_shared_slots(slots)?;
+    let before = valid_snapshot(&refs);
+    let (header, _) =
+        shared::parse_frame_header::<ParseError>(payload, &shared_seq, &mut refs, 0, 0)?;
+    convert_parsed(&header, seq, slots, &refs, before)
 }
 
-/// Frame type plus show flags into `header`.
-fn parse_show_frame(
-    reader: &mut BitReader<'_>,
+/// Tile group tile ranges over one OBU payload.
+pub(crate) struct ParsedTileGroup<'a> {
+    /// First tile index of the group.
+    pub start: u32,
+    /// Last tile index of the group.
+    pub end: u32,
+    /// Tile data past the group header.
+    pub data: &'a [u8],
+    /// Byte offset and size of each tile within `data`.
+    pub tiles: Vec<(usize, usize)>,
+}
+
+/// Tile group of one OBU payload expecting tiles from `expect_start`.
+pub(crate) fn parse_tile_group_obu<'a>(
+    payload: &'a [u8],
+    tiles: &TileLayout,
+    expect_start: u32,
+) -> Result<ParsedTileGroup<'a>, ParseError> {
+    let count = u32::from(tiles.cols) * u32::from(tiles.rows);
+    if count == 0 {
+        return Err(ParseError::OutOfRange {
+            syntax: "tile group range",
+        });
+    }
+    let head = shared::tile_group_range::<ParseError>(
+        payload,
+        usize::try_from(count).map_err(|_| ParseError::OutOfRange {
+            syntax: "tile group range",
+        })?,
+        narrow_u8(tile_log2(1, u32::from(tiles.cols)), "tile group range")?,
+        narrow_u8(tile_log2(1, u32::from(tiles.rows)), "tile group range")?,
+    )?;
+    let start = u32::try_from(head.start).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    let end = u32::try_from(head.end).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    if start < expect_start || start >= count || end < start || end >= count {
+        return Err(ParseError::OutOfRange {
+            syntax: "tile group range",
+        });
+    }
+    check_align_zero(payload, head.consumed_bits)?;
+    let tiles = split_tiles(head.data, start, end, tiles.size_bytes_minus_1)?;
+    Ok(ParsedTileGroup {
+        start,
+        end,
+        data: head.data,
+        tiles,
+    })
+}
+
+/// Tile ranges of `data` for tiles `start` through `end`.
+fn split_tiles(
+    data: &[u8],
+    start: u32,
+    end: u32,
+    size_bytes_minus_1: u8,
+) -> Result<Vec<(usize, usize)>, ParseError> {
+    let start = usize::try_from(start).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    let end = usize::try_from(end).map_err(|_| ParseError::OutOfRange {
+        syntax: "tile group range",
+    })?;
+    let width = size_bytes_minus_1
+        .checked_add(1)
+        .ok_or(ParseError::OutOfRange {
+            syntax: "tile size",
+        })?;
+    shared::split_tiles::<ParseError>(data, start, end, width)
+}
+
+/// Frame OBU: header plus its tile group over one OBU payload.
+pub(crate) fn parse_frame_obu<'a>(
+    payload: &'a [u8],
     seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
+    slots: &[SlotView; TOTAL_REFS],
+    expect_start: u32,
+) -> Result<(ParsedFrame, Option<ParsedTileGroup<'a>>), ParseError> {
+    let shared_seq = to_shared_seq(seq);
+    let mut refs = to_shared_slots(slots)?;
+    let before = valid_snapshot(&refs);
+    let (header, consumed) =
+        shared::parse_frame_header::<ParseError>(payload, &shared_seq, &mut refs, 0, 0)?;
+    let parsed = convert_parsed(&header, seq, slots, &refs, before)?;
+    if parsed.header.show().show_existing {
+        return Ok((parsed, None));
+    }
+    let aligned = check_align_zero(payload, consumed)?;
+    let rest = payload.get(aligned / 8..).ok_or(ParseError::Truncated {
+        syntax: "tile group align",
+    })?;
+    let group = parse_tile_group_obu(rest, parsed.header.tiles(), expect_start)?;
+    Ok((parsed, Some(group)))
+}
+
+impl From<shared::Error> for ParseError {
+    fn from(error: shared::Error) -> Self {
+        use shared::{
+            BrokenReferenceReason as Broken, ParseReason as Parse, UnsupportedReason as Unsupported,
+        };
+        match error {
+            shared::Error::Parse(reason) => match reason {
+                Parse::Truncated { syntax } => Self::Truncated { syntax },
+                Parse::OverflowU32 { syntax }
+                | Parse::OverflowI32 { syntax }
+                | Parse::TooWide { syntax } => Self::Overflow { syntax },
+                Parse::Range { syntax } => Self::OutOfRange { syntax },
+                Parse::ObuForbiddenBit
+                | Parse::ObuReservedBit
+                | Parse::ObuExtensionReservedBits => Self::OutOfRange {
+                    syntax: "obu header",
+                },
+                Parse::ObuSizeExceedsPayload => Self::Truncated {
+                    syntax: "obu payload",
+                },
+                Parse::ReservedObuType => Self::Unsupported {
+                    what: "av1 obu type",
+                },
+                Parse::FrameBeforeSequenceHeader => Self::OutOfRange {
+                    syntax: "sequence header",
+                },
+                Parse::FrameWithoutTileData => Self::Truncated {
+                    syntax: "tile data",
+                },
+                Parse::IncompleteTileGroup => Self::Truncated {
+                    syntax: "tile group range",
+                },
+                Parse::RedundantHeaderMismatch => Self::OutOfRange {
+                    syntax: "redundant header",
+                },
+                Parse::TileGridCoverage => Self::OutOfRange {
+                    syntax: "tile grid",
+                },
+                Parse::TileGroupOrder | Parse::TileGroupWithoutFrameHeader => Self::OutOfRange {
+                    syntax: "tile group range",
+                },
+                Parse::TileGroupWithoutData => Self::Truncated {
+                    syntax: "tile group align",
+                },
+            },
+            shared::Error::Unsupported(reason) => Self::Unsupported {
+                what: match reason {
+                    Unsupported::TileList => "av1 tile list",
+                    Unsupported::SpatialLayers => "av1 layered stream",
+                    Unsupported::SuperresUpscale => "av1 superres upscale",
+                    Unsupported::RenderSizeDiffersFromFrameSize => "av1 render size",
+                    Unsupported::Av1BitDepthNeedsTarget { .. } => "av1 bit depth",
+                    Unsupported::Av1ChromaOutside420 => "av1 chroma",
+                    Unsupported::Av1Monochrome => "av1 monochrome",
+                    Unsupported::TileCountAbove256 => "av1 tile count",
+                },
+            },
+            shared::Error::BrokenReference(Broken::NamesEmptySlot { reference }) => {
+                Self::OutOfRange { syntax: reference }
+            }
+        }
+    }
+}
+
+/// Validity of `refs` per slot.
+fn valid_snapshot(refs: &[shared::RefInfo; TOTAL_REFS]) -> [bool; TOTAL_REFS] {
+    core::array::from_fn(|index| refs[index].valid)
+}
+
+/// Byte alignment past `consumed` bits, rejecting nonzero padding.
+fn check_align_zero(payload: &[u8], consumed: usize) -> Result<usize, ParseError> {
+    let aligned = consumed.next_multiple_of(8);
+    for bit in consumed..aligned {
+        if payload[bit / 8] >> (7 - bit % 8) & 1 != 0 {
+            return Err(ParseError::OutOfRange {
+                syntax: "tile group align",
+            });
+        }
+    }
+    Ok(aligned)
+}
+
+/// Shared flag word matching `seq`.
+fn shared_seq_flags(seq: &SequenceHeader) -> u32 {
+    let color = seq.color();
+    let mut flags = 0u32;
+    if seq.still_picture() {
+        flags |= shared::SEQ_STILL_PICTURE;
+    }
     if seq.reduced() {
-        header.frame_type = FRAME_KEY;
-        header.display.show_frame = true;
-        return Ok(());
+        flags |= shared::SEQ_REDUCED_HEADER;
     }
-    header.show.show_existing = reader.bit("frame show existing")?;
-    if header.show.show_existing {
-        header.show.map_idx = narrow_u8(reader.bits("frame show map", 3)?, "frame show map")?;
-        let view = &views[usize::from(header.show.map_idx)];
-        if !view.valid {
-            return Err(ParseError::MissingSet {
-                id: u32::from(header.show.map_idx),
-            });
-        }
-        if seq.decoder_model_present()
-            && seq.timing_present()
-            && !seq.timing().equal_picture_interval
-        {
-            let width = u32::from(seq.decoder_model().frame_presentation_time_length_minus_1) + 1;
-            header.show.presentation_time = reader.bits("frame presentation time", width)?;
-        }
-        if seq.frame_id_numbers_present() {
-            header.show.display_frame_id = reader.bits("frame display id", id_len(seq))?;
-        }
-        header.frame_type = view.frame_type;
-        header.refresh_frame_flags = if view.frame_type == FRAME_KEY {
-            0xff
-        } else {
-            0
-        };
-        return Ok(());
+    if seq.timing_present() {
+        flags |= shared::SEQ_TIMING_PRESENT;
     }
-    header.frame_type = narrow_u8(reader.bits("frame type", 2)?, "frame type")?;
-    if header.frame_type > FRAME_SWITCH {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame type",
-        });
+    if seq.decoder_model_present() {
+        flags |= shared::SEQ_DECODER_MODEL_PRESENT;
     }
-    header.display.show_frame = reader.bit("frame show")?;
-    if header.display.show_frame
-        && seq.decoder_model_present()
-        && seq.timing_present()
-        && !seq.timing().equal_picture_interval
-    {
-        let width = u32::from(seq.decoder_model().frame_presentation_time_length_minus_1) + 1;
-        header.show.presentation_time = reader.bits("frame presentation time", width)?;
+    if seq.initial_display_delay_present() {
+        flags |= shared::SEQ_INITIAL_DISPLAY_PRESENT;
     }
-    if header.display.show_frame {
-        header.display.showable_frame = header.frame_type != FRAME_KEY;
-    } else {
-        header.display.showable_frame = reader.bit("frame showable")?;
-    }
-    if header.frame_type == FRAME_SWITCH
-        || (header.frame_type == FRAME_KEY && header.display.show_frame)
-    {
-        header.resilience.error_resilient_mode = true;
-    } else {
-        header.resilience.error_resilient_mode = reader.bit("frame resilient")?;
-    }
-    Ok(())
-}
-
-/// Show-existing frame: sizes from the shown slot, no further syntax.
-fn show_existing_frame(
-    seq: &SequenceHeader,
-    views: &[SlotView; TOTAL_REFS],
-    mut header: FrameHeader,
-) -> ParsedFrame {
-    let view = &views[usize::from(header.show.map_idx)];
-    header.order_hint = if seq.enable_order_hint() {
-        view.order_hint
-    } else {
-        0
-    };
-    header.sizes.width_minus_1 = view.upscaled_width.saturating_sub(1);
-    header.sizes.height_minus_1 = view.frame_height.saturating_sub(1);
-    header.sizes.render_width_minus_1 = view.render_width.saturating_sub(1);
-    header.sizes.render_height_minus_1 = view.render_height.saturating_sub(1);
-    header.sizes.upscaled_width = view.upscaled_width;
-    header.sizes.frame_width = view.upscaled_width;
-    header.sizes.frame_height = view.frame_height;
-    header.sizes.render_width = view.render_width;
-    header.sizes.render_height = view.render_height;
-    ParsedFrame {
-        header,
-        reset_all: false,
-        invalidated: [false; TOTAL_REFS],
-    }
-}
-
-/// Screen content tools plus integer motion vectors into `header`.
-fn parse_tools(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.resilience.disable_cdf_update = reader.bit("frame cdf update")?;
-    if seq.seq_force_screen_content_tools() == SELECT_SCREEN_CONTENT_TOOLS {
-        header.content.allow_screen_content_tools = reader.bit("frame tools")?;
-    } else {
-        header.content.allow_screen_content_tools = seq.seq_force_screen_content_tools() != 0;
-    }
-    if header.content.allow_screen_content_tools {
-        if seq.seq_force_integer_mv() == SELECT_INTEGER_MV {
-            header.content.force_integer_mv = reader.bit("frame integer mv")?;
-        } else {
-            header.content.force_integer_mv = seq.seq_force_integer_mv() != 0;
-        }
-    }
-    Ok(())
-}
-
-/// Current frame id plus range invalidation of stale slots.
-fn parse_frame_id(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &mut [SlotView; TOTAL_REFS],
-    invalidated: &mut [bool; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    if !seq.frame_id_numbers_present() {
-        return Ok(());
-    }
-    header.current_frame_id = reader.bits("frame id", id_len(seq))?;
-    let diff_len = u32::from(seq.delta_frame_id_length_minus_2()) + 2;
-    for (index, view) in views.iter_mut().enumerate() {
-        if !view.valid {
-            continue;
-        }
-        let stale = if header.current_frame_id > (1 << diff_len) {
-            view.frame_id > header.current_frame_id
-                || view.frame_id < header.current_frame_id - (1 << diff_len)
-        } else {
-            view.frame_id > header.current_frame_id
-                && view.frame_id < (1 << id_len(seq)) + header.current_frame_id - (1 << diff_len)
-        };
-        if stale {
-            view.valid = false;
-            invalidated[index] = true;
-        }
-    }
-    Ok(())
-}
-
-/// Frame size override plus order hint and primary reference into `header`.
-fn parse_order_hint(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    if header.frame_type == FRAME_SWITCH {
-        header.sizing.frame_size_override_flag = true;
-    } else if seq.reduced() {
-        header.sizing.frame_size_override_flag = false;
-    } else {
-        header.sizing.frame_size_override_flag = reader.bit("frame size override")?;
-    }
-    let bits = seq.order_hint_bits();
-    if bits > 0 {
-        header.order_hint = narrow_u8(reader.bits("frame order hint", bits)?, "frame order hint")?;
-    }
-    if header.is_intra() || header.resilience.error_resilient_mode {
-        header.primary_ref_frame = PRIMARY_REF_NONE;
-    } else {
-        header.primary_ref_frame =
-            narrow_u8(reader.bits("frame primary ref", 3)?, "frame primary ref")?;
-    }
-    Ok(())
-}
-
-/// Decoder model buffer removal times, consumed and dropped.
-fn parse_buffer_removal(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-) -> Result<(), ParseError> {
-    if !seq.decoder_model_present() {
-        return Ok(());
-    }
-    if !reader.bit("frame removal present")? {
-        return Ok(());
-    }
-    let width = u32::from(seq.decoder_model().buffer_removal_time_length_minus_1) + 1;
-    for point in seq.operating_points() {
-        if point.decoder_present {
-            reader.bits("frame removal time", width)?;
-        }
-    }
-    Ok(())
-}
-
-/// Refresh flags into `header`.
-fn parse_refresh(reader: &mut BitReader<'_>, header: &mut FrameHeader) -> Result<(), ParseError> {
-    if header.frame_type == FRAME_SWITCH
-        || (header.frame_type == FRAME_KEY && header.display.show_frame)
-    {
-        header.refresh_frame_flags = 0xff;
-    } else {
-        header.refresh_frame_flags = narrow_u8(reader.bits("frame refresh", 8)?, "frame refresh")?;
-    }
-    Ok(())
-}
-
-/// Reference order hints with mismatch invalidation.
-fn parse_ref_order_hints(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &mut [SlotView; TOTAL_REFS],
-    invalidated: &mut [bool; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    if header.is_intra() && header.refresh_frame_flags == 0xff {
-        return Ok(());
-    }
-    if !seq.enable_order_hint() {
-        return Ok(());
-    }
-    let bits = seq.order_hint_bits();
-    for (index, view) in views.iter_mut().enumerate() {
-        let hint = if header.resilience.error_resilient_mode {
-            narrow_u8(reader.bits("frame ref hint", bits)?, "frame ref hint")?
-        } else {
-            view.order_hint
-        };
-        if hint != view.order_hint {
-            view.valid = false;
-            invalidated[index] = true;
-        }
-    }
-    Ok(())
-}
-
-/// Frame size plus superres into `header`.
-fn parse_frame_size(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    if header.sizing.frame_size_override_flag {
-        header.sizes.width_minus_1 =
-            reader.bits("frame width", u32::from(seq.frame_width_bits_minus_1()) + 1)?;
-        header.sizes.height_minus_1 = reader.bits(
-            "frame height",
-            u32::from(seq.frame_height_bits_minus_1()) + 1,
-        )?;
-    } else {
-        header.sizes.width_minus_1 = u32::from(seq.max_frame_width_minus_1());
-        header.sizes.height_minus_1 = u32::from(seq.max_frame_height_minus_1());
-    }
-    header.sizes.frame_width = header.sizes.width_minus_1 + 1;
-    header.sizes.frame_height = header.sizes.height_minus_1 + 1;
-    parse_superres(reader, seq, header)
-}
-
-/// Superres denominator plus upscaled width into `header`.
-fn parse_superres(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.sizing.use_superres = seq.enable_superres() && reader.bit("frame superres")?;
-    let denom = if header.sizing.use_superres {
-        header.coded_denom = narrow_u8(reader.bits("frame denom", 3)?, "frame denom")?;
-        u32::from(header.coded_denom) + SUPERRES_DENOM_MIN
-    } else {
-        SUPERRES_NUM
-    };
-    header.sizes.upscaled_width = header.sizes.frame_width;
-    header.sizes.frame_width = (header.sizes.upscaled_width * SUPERRES_NUM + denom / 2) / denom;
-    Ok(())
-}
-
-/// Render size into `header`.
-fn parse_render_size(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.sizing.render_and_frame_size_different = reader.bit("frame render differs")?;
-    if header.sizing.render_and_frame_size_different {
-        header.sizes.render_width_minus_1 = reader.bits("frame render width", 16)?;
-        header.sizes.render_height_minus_1 = reader.bits("frame render height", 16)?;
-    } else {
-        header.sizes.render_width_minus_1 = header.sizes.width_minus_1;
-        header.sizes.render_height_minus_1 = header.sizes.height_minus_1;
-    }
-    header.sizes.render_width = header.sizes.render_width_minus_1 + 1;
-    header.sizes.render_height = header.sizes.render_height_minus_1 + 1;
-    Ok(())
-}
-
-/// Inter reference selection into `header`, validating cited slots.
-fn parse_inter_refs(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    if seq.enable_order_hint() {
-        header.refs.short_signaling = reader.bit("frame short refs")?;
-        if header.refs.short_signaling {
-            header.refs.last_idx = narrow_u8(reader.bits("frame last idx", 3)?, "frame last idx")?;
-            header.refs.golden_idx =
-                narrow_u8(reader.bits("frame golden idx", 3)?, "frame golden idx")?;
-            set_frame_refs(seq, header, views);
-        }
-    } else {
-        header.refs.short_signaling = false;
-    }
-    for index in 0..REFS_PER_FRAME {
-        if !header.refs.short_signaling {
-            header.refs.ref_frame_idx[index] =
-                narrow_u8(reader.bits("frame ref idx", 3)?, "frame ref idx")?;
-        }
-        let slot = header.refs.ref_frame_idx[index];
-        if usize::from(slot) >= TOTAL_REFS || !views[usize::from(slot)].valid {
-            return Err(ParseError::MissingSet {
-                id: u32::from(slot),
-            });
-        }
-        if seq.frame_id_numbers_present() {
-            header.refs.delta_frame_id_minus1[index] = reader.bits(
-                "frame delta id",
-                u32::from(seq.delta_frame_id_length_minus_2()) + 2,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Short-signaled reference slots from order hint distances.
-fn set_frame_refs(seq: &SequenceHeader, header: &mut FrameHeader, views: &[SlotView; TOTAL_REFS]) {
-    const ORDER: [usize; 5] = [2, 3, 5, 6, 7];
-    let last = usize::from(header.refs.last_idx);
-    let golden = usize::from(header.refs.golden_idx);
-    let mut refs: [Option<u8>; REFS_PER_FRAME] = [None; REFS_PER_FRAME];
-    refs[0] = Some(header.refs.last_idx);
-    refs[3] = Some(header.refs.golden_idx);
-    let mut used = [false; TOTAL_REFS];
-    used[last] = true;
-    used[golden] = true;
-    let current = 1_i32 << seq.order_hint_bits_minus_1();
-    let mut shifted = [0_i32; TOTAL_REFS];
-    for (index, view) in views.iter().enumerate() {
-        shifted[index] = current + relative_dist(seq, view.order_hint, header.order_hint);
-    }
-    let mut latest = shifted[last];
-    let mut earliest = shifted[golden];
-    latest = pick_future(&shifted, &mut used, current, latest, true, &mut refs[6]);
-    earliest = pick_future(&shifted, &mut used, current, earliest, false, &mut refs[4]);
-    earliest = pick_future(&shifted, &mut used, current, earliest, false, &mut refs[5]);
-    for name in ORDER {
-        if refs[name - 1].is_some() {
-            continue;
-        }
-        let mut pick = None;
-        for (slot, taken) in used.iter().enumerate() {
-            if *taken || shifted[slot] >= current {
-                continue;
-            }
-            if pick.is_none() || shifted[slot] >= latest {
-                pick = u8::try_from(slot).ok();
-                latest = shifted[slot];
-            }
-        }
-        if let Some(slot) = pick {
-            refs[name - 1] = Some(slot);
-            used[usize::from(slot)] = true;
-        }
-    }
-    let mut fallback = 0_u8;
-    for (slot, hint) in shifted.iter().enumerate() {
-        if slot == 0 || *hint < earliest {
-            fallback = u8::try_from(slot).unwrap_or(0);
-            earliest = *hint;
-        }
-    }
-    for (index, slot) in refs.iter().enumerate() {
-        header.refs.ref_frame_idx[index] = slot.unwrap_or(fallback);
-    }
-}
-
-/// Latest or earliest future slot into `out`, returning the moved bound.
-fn pick_future(
-    shifted: &[i32; TOTAL_REFS],
-    used: &mut [bool; TOTAL_REFS],
-    current: i32,
-    bound: i32,
-    latest: bool,
-    out: &mut Option<u8>,
-) -> i32 {
-    let mut pick = None;
-    let mut edge = bound;
-    for (slot, taken) in used.iter().enumerate() {
-        if *taken || shifted[slot] < current {
-            continue;
-        }
-        let better = pick.is_none()
-            || (!latest && shifted[slot] < edge)
-            || (latest && shifted[slot] >= edge);
-        if better {
-            pick = u8::try_from(slot).ok();
-            edge = shifted[slot];
-        }
-    }
-    if let Some(slot) = pick {
-        *out = Some(slot);
-        used[usize::from(slot)] = true;
-    }
-    edge
-}
-
-/// Frame size inherited from a reference into `header`.
-fn parse_frame_size_with_refs(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    for index in 0..REFS_PER_FRAME {
-        header.refs.found_ref[index] = reader.bit("frame found ref")?;
-        if !header.refs.found_ref[index] {
-            continue;
-        }
-        let view = &views[usize::from(header.refs.ref_frame_idx[index])];
-        if !view.valid {
-            return Err(ParseError::MissingSet {
-                id: u32::from(header.refs.ref_frame_idx[index]),
-            });
-        }
-        header.sizes.width_minus_1 = view.upscaled_width.saturating_sub(1);
-        header.sizes.height_minus_1 = view.frame_height.saturating_sub(1);
-        header.sizes.render_width_minus_1 = view.render_width.saturating_sub(1);
-        header.sizes.render_height_minus_1 = view.render_height.saturating_sub(1);
-        header.sizes.upscaled_width = view.upscaled_width;
-        header.sizes.frame_width = view.upscaled_width;
-        header.sizes.frame_height = view.frame_height;
-        header.sizes.render_width = view.render_width;
-        header.sizes.render_height = view.render_height;
-        return parse_superres(reader, seq, header);
-    }
-    parse_frame_size(reader, seq, header)?;
-    parse_render_size(reader, header)
-}
-
-/// Inter prediction tools into `header`.
-fn parse_inter_tools(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    if header.content.force_integer_mv {
-        header.motion.allow_high_precision_mv = false;
-    } else {
-        header.motion.allow_high_precision_mv = reader.bit("frame high precision mv")?;
-    }
-    header.prediction.is_filter_switchable = reader.bit("frame filter switchable")?;
-    if header.prediction.is_filter_switchable {
-        header.interpolation_filter = 4;
-    } else {
-        header.interpolation_filter = narrow_u8(reader.bits("frame filter", 2)?, "frame filter")?;
-    }
-    header.motion.is_motion_mode_switchable = reader.bit("frame motion switchable")?;
-    if header.resilience.error_resilient_mode || !seq.enable_ref_frame_mvs() {
-        header.motion.use_ref_frame_mvs = false;
-    } else {
-        header.motion.use_ref_frame_mvs = reader.bit("frame ref mvs")?;
-    }
-    Ok(())
-}
-
-/// Tiles, quantizer, segmentation, and delta parameters; reports lossless.
-fn parse_tiles_quant_seg(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<bool, ParseError> {
-    parse_tile_info(reader, seq, header)?;
-    parse_quant(reader, seq, header)?;
-    parse_segmentation(reader, header, views)?;
-    if header.quant.base_q_idx > 0 {
-        header.delta.delta_q_present = reader.bit("frame delta q")?;
-    }
-    if header.delta.delta_q_present {
-        header.delta_q_res = narrow_u8(reader.bits("frame delta q res", 2)?, "frame delta q res")?;
-    }
-    if header.delta.delta_q_present {
-        if header.content.allow_intrabc {
-            header.delta.delta_lf_present = false;
-        } else {
-            header.delta.delta_lf_present = reader.bit("frame delta lf")?;
-        }
-        if header.delta.delta_lf_present {
-            header.delta_lf_res =
-                narrow_u8(reader.bits("frame delta lf res", 2)?, "frame delta lf res")?;
-            header.delta.delta_lf_multi = reader.bit("frame delta lf multi")?;
-        }
-    }
-    Ok(coded_lossless(header))
-}
-
-/// True when every segment quantizer and delta is zero.
-fn coded_lossless(header: &FrameHeader) -> bool {
-    if header.quant.delta_q_y_dc != 0
-        || header.quant.delta_q_u_dc != 0
-        || header.quant.delta_q_u_ac != 0
-        || header.quant.delta_q_v_dc != 0
-        || header.quant.delta_q_v_ac != 0
-    {
-        return false;
-    }
-    for segment in 0..MAX_SEGMENTS {
-        let mut qindex = i32::from(header.quant.base_q_idx);
-        if header.segmentation.feature_enabled[segment][0] {
-            qindex += i32::from(header.segmentation.feature_value[segment][0]);
-        }
-        if qindex.clamp(0, 255) != 0 {
-            return false;
-        }
-    }
-    true
-}
-
-/// Tile layout into `header`.
-fn parse_tile_info(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    let mi_cols = 2 * header.sizes.frame_width.div_ceil(8);
-    let mi_rows = 2 * header.sizes.frame_height.div_ceil(8);
-    let (sb_cols, sb_rows, sb_size) = if seq.use_128x128_superblock() {
-        (mi_cols.div_ceil(32), mi_rows.div_ceil(32), 7)
-    } else {
-        (mi_cols.div_ceil(16), mi_rows.div_ceil(16), 6)
-    };
-    let max_tile_width_sb = MAX_TILE_WIDTH / (1 << sb_size);
-    let max_tile_area_sb = MAX_TILE_AREA / (1 << (2 * sb_size));
-    let min_log2_tile_cols = tile_log2(max_tile_width_sb, sb_cols);
-    let max_cols = narrow_u32(MAX_TILE_COLS, "frame tile col")?;
-    let max_rows = narrow_u32(MAX_TILE_ROWS, "frame tile row")?;
-    let max_log2_tile_cols = tile_log2(1, sb_cols.min(max_cols));
-    let max_log2_tile_rows = tile_log2(1, sb_rows.min(max_rows));
-    let min_log2_tiles = min_log2_tile_cols.max(tile_log2(max_tile_area_sb, sb_rows * sb_cols));
-    header.tiles.uniform = reader.bit("frame uniform tiles")?;
-    let bounds = TileBounds {
-        sb_cols,
-        sb_rows,
-        min_cols: min_log2_tile_cols,
-        max_cols: max_log2_tile_cols,
-        max_rows: max_log2_tile_rows,
-        min_tiles: min_log2_tiles,
-        max_tile_width_sb,
-    };
-    let (cols_log2, rows_log2) = if header.tiles.uniform {
-        parse_uniform_tiles(reader, header, &bounds)?
-    } else {
-        parse_explicit_tiles(reader, header, &bounds)?
-    };
-    if cols_log2 > 0 || rows_log2 > 0 {
-        header.tiles.context_update_tile_id = narrow_u16(
-            reader.bits("frame context tile", cols_log2 + rows_log2)?,
-            "frame context tile",
-        )?;
-        header.tiles.size_bytes_minus_1 = narrow_u8(
-            reader.bits("frame tile size bytes", 2)?,
-            "frame tile size bytes",
-        )?;
-    }
-    Ok(())
-}
-
-/// Superblock grid plus tile count bounds behind tile parsing.
-struct TileBounds {
-    /// Superblock columns of the frame.
-    sb_cols: u32,
-    /// Superblock rows of the frame.
-    sb_rows: u32,
-    /// Minimum log2 tile columns.
-    min_cols: u32,
-    /// Maximum log2 tile columns.
-    max_cols: u32,
-    /// Maximum log2 tile rows.
-    max_rows: u32,
-    /// Minimum log2 tile count.
-    min_tiles: u32,
-    /// Maximum tile width in superblocks.
-    max_tile_width_sb: u32,
-}
-
-/// Uniform tile columns and rows into `header`, returning the log counts.
-fn parse_uniform_tiles(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-    bounds: &TileBounds,
-) -> Result<(u32, u32), ParseError> {
-    let cols_log2 = reader.increment("frame tile cols", bounds.min_cols, bounds.max_cols)?;
-    let tile_width_sb = bounds.sb_cols.div_ceil(1 << cols_log2);
-    let mut cols = 0;
-    let mut at = 0;
-    while at < bounds.sb_cols {
-        if cols >= MAX_TILE_COLS {
-            return Err(ParseError::OutOfRange {
-                syntax: "frame tile col",
-            });
-        }
-        header.tiles.start_col_sb[cols] = narrow_u8(at, "frame tile col")?;
-        cols += 1;
-        at += tile_width_sb;
-    }
-    let cols_count = narrow_u32(cols, "frame tile col")?;
-    header.tiles.cols = narrow_u8(cols_count, "frame tile col")?;
-    let min_rows = bounds.min_tiles.saturating_sub(cols_log2);
-    let rows_log2 = reader.increment("frame tile rows", min_rows, bounds.max_rows)?;
-    let tile_height_sb = bounds.sb_rows.div_ceil(1 << rows_log2);
-    let mut rows = 0;
-    at = 0;
-    while at < bounds.sb_rows {
-        if rows >= MAX_TILE_ROWS {
-            return Err(ParseError::OutOfRange {
-                syntax: "frame tile row",
-            });
-        }
-        header.tiles.start_row_sb[rows] = narrow_u8(at, "frame tile row")?;
-        rows += 1;
-        at += tile_height_sb;
-    }
-    let rows_count = narrow_u32(rows, "frame tile row")?;
-    header.tiles.rows = narrow_u8(rows_count, "frame tile row")?;
-    for width in header.tiles.width_in_sbs_minus_1.iter_mut().take(cols) {
-        *width = narrow_u8(tile_width_sb - 1, "frame tile width")?;
-    }
-    header.tiles.width_in_sbs_minus_1[cols - 1] = narrow_u8(
-        bounds.sb_cols - (cols_count - 1) * tile_width_sb - 1,
-        "frame tile width",
-    )?;
-    for height in header.tiles.height_in_sbs_minus_1.iter_mut().take(rows) {
-        *height = narrow_u8(tile_height_sb - 1, "frame tile height")?;
-    }
-    header.tiles.height_in_sbs_minus_1[rows - 1] = narrow_u8(
-        bounds.sb_rows - (rows_count - 1) * tile_height_sb - 1,
-        "frame tile height",
-    )?;
-    Ok((cols_log2, rows_log2))
-}
-
-/// Explicit tile columns and rows into `header`, returning the log counts.
-fn parse_explicit_tiles(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-    bounds: &TileBounds,
-) -> Result<(u32, u32), ParseError> {
-    let mut widest = 0;
-    let mut cols = 0;
-    let mut at = 0;
-    while at < bounds.sb_cols && cols < MAX_TILE_COLS {
-        header.tiles.start_col_sb[cols] = narrow_u8(at, "frame tile col")?;
-        let max_width = (bounds.sb_cols - at).min(bounds.max_tile_width_sb);
-        let width = reader.ns("frame tile width", max_width)? + 1;
-        header.tiles.width_in_sbs_minus_1[cols] = narrow_u8(width - 1, "frame tile width")?;
-        widest = widest.max(width);
-        at += width;
-        cols += 1;
-    }
-    if at < bounds.sb_cols {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame tile col",
-        });
-    }
-    let cols_count = narrow_u32(cols, "frame tile col")?;
-    header.tiles.cols = narrow_u8(cols_count, "frame tile col")?;
-    let area = if bounds.min_tiles > 0 {
-        (bounds.sb_rows * bounds.sb_cols) / (1 << (bounds.min_tiles + 1))
-    } else {
-        bounds.sb_rows * bounds.sb_cols
-    };
-    let max_tile_height_sb = (area / widest).max(1);
-    let mut rows = 0;
-    at = 0;
-    while at < bounds.sb_rows && rows < MAX_TILE_ROWS {
-        header.tiles.start_row_sb[rows] = narrow_u8(at, "frame tile row")?;
-        let max_height = (bounds.sb_rows - at).min(max_tile_height_sb);
-        let height = reader.ns("frame tile height", max_height)? + 1;
-        header.tiles.height_in_sbs_minus_1[rows] = narrow_u8(height - 1, "frame tile height")?;
-        at += height;
-        rows += 1;
-    }
-    if at < bounds.sb_rows {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame tile row",
-        });
-    }
-    let rows_count = narrow_u32(rows, "frame tile row")?;
-    header.tiles.rows = narrow_u8(rows_count, "frame tile row")?;
-    Ok((tile_log2(1, cols_count), tile_log2(1, rows_count)))
-}
-
-/// Quantizer parameters into `header`.
-fn parse_quant(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.quant.base_q_idx = narrow_u8(reader.bits("frame base q", 8)?, "frame base q")?;
-    header.quant.delta_q_y_dc = parse_delta_q(reader, "frame delta y")?;
-    if seq.num_planes() > 1 {
-        if seq.color().separate_uv_delta_q {
-            header.quant.diff_uv_delta = reader.bit("frame diff uv")?;
-        }
-        header.quant.delta_q_u_dc = parse_delta_q(reader, "frame delta u dc")?;
-        header.quant.delta_q_u_ac = parse_delta_q(reader, "frame delta u ac")?;
-        if header.quant.diff_uv_delta {
-            header.quant.delta_q_v_dc = parse_delta_q(reader, "frame delta v dc")?;
-            header.quant.delta_q_v_ac = parse_delta_q(reader, "frame delta v ac")?;
-        } else {
-            header.quant.delta_q_v_dc = header.quant.delta_q_u_dc;
-            header.quant.delta_q_v_ac = header.quant.delta_q_u_ac;
-        }
-    }
-    header.quant.using_qmatrix = reader.bit("frame qmatrix")?;
-    if header.quant.using_qmatrix {
-        header.quant.qm_y = narrow_u8(reader.bits("frame qm y", 4)?, "frame qm y")?;
-        header.quant.qm_u = narrow_u8(reader.bits("frame qm u", 4)?, "frame qm u")?;
-        if seq.color().separate_uv_delta_q {
-            header.quant.qm_v = narrow_u8(reader.bits("frame qm v", 4)?, "frame qm v")?;
-        } else {
-            header.quant.qm_v = header.quant.qm_u;
-        }
-    }
-    Ok(())
-}
-
-/// One delta quantizer: coded flag plus a 7-bit signed value.
-fn parse_delta_q(reader: &mut BitReader<'_>, syntax: &'static str) -> Result<i8, ParseError> {
-    if !reader.bit(syntax)? {
-        return Ok(0);
-    }
-    narrow_i8(reader.su(syntax, 7)?, syntax)
-}
-
-/// Segmentation parameters into `header`.
-fn parse_segmentation(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    const BITS: [u32; SEG_LVL_MAX] = [8, 6, 6, 6, 6, 3, 0, 0];
-    const SIGNS: [bool; SEG_LVL_MAX] = [true, true, true, true, true, false, false, false];
-    header.segmentation.enabled = reader.bit("frame seg")?;
-    if !header.segmentation.enabled {
-        return Ok(());
-    }
-    if header.primary_ref_frame == PRIMARY_REF_NONE {
-        header.segmentation.update.update_map = true;
-        header.segmentation.update.update_data = true;
-    } else {
-        header.segmentation.update.update_map = reader.bit("frame seg map")?;
-        if header.segmentation.update.update_map {
-            header.segmentation.update.temporal_update = reader.bit("frame seg temporal")?;
-        }
-        header.segmentation.update.update_data = reader.bit("frame seg data")?;
-    }
-    let inherit = (header.primary_ref_frame != PRIMARY_REF_NONE).then(|| {
-        let slot = header.refs.ref_frame_idx[usize::from(header.primary_ref_frame)];
-        &views[usize::from(slot)].segmentation
-    });
-    for segment in 0..MAX_SEGMENTS {
-        for level in 0..SEG_LVL_MAX {
-            if header.segmentation.update.update_data {
-                let enabled = reader.bit("frame seg feature")?;
-                header.segmentation.feature_enabled[segment][level] = enabled;
-                if enabled && BITS[level] > 0 {
-                    let value = if SIGNS[level] {
-                        reader.su("frame seg value", 1 + BITS[level])?
-                    } else {
-                        reader.bits("frame seg value", BITS[level])?.cast_signed()
-                    };
-                    header.segmentation.feature_value[segment][level] = i16::try_from(value)
-                        .map_err(|_| ParseError::OutOfRange {
-                            syntax: "frame seg value",
-                        })?;
-                } else {
-                    header.segmentation.feature_value[segment][level] = 0;
-                }
-            } else if let Some(prior) = inherit {
-                header.segmentation.feature_enabled[segment][level] =
-                    prior.feature_enabled[segment][level];
-                header.segmentation.feature_value[segment][level] =
-                    prior.feature_value[segment][level];
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Loop filter parameters into `header`.
-fn parse_loop_filter(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-    lossless: bool,
-) -> Result<(), ParseError> {
-    const DEFAULT_REF: [i8; TOTAL_REFS] = [1, 0, 0, 0, -1, 0, -1, -1];
-    if lossless || header.content.allow_intrabc {
-        header.loop_filter.level = [0; 4];
-        header.loop_filter.ref_deltas = DEFAULT_REF;
-        header.loop_filter.mode_deltas = [0; 2];
-        return Ok(());
-    }
-    header.loop_filter.level[0] = narrow_u8(reader.bits("frame lf level", 6)?, "frame lf level")?;
-    header.loop_filter.level[1] = narrow_u8(reader.bits("frame lf level", 6)?, "frame lf level")?;
-    if seq.num_planes() > 1
-        && (header.loop_filter.level[0] != 0 || header.loop_filter.level[1] != 0)
-    {
-        header.loop_filter.level[2] =
-            narrow_u8(reader.bits("frame lf level", 6)?, "frame lf level")?;
-        header.loop_filter.level[3] =
-            narrow_u8(reader.bits("frame lf level", 6)?, "frame lf level")?;
-    }
-    header.loop_filter.sharpness =
-        narrow_u8(reader.bits("frame lf sharpness", 3)?, "frame lf sharpness")?;
-    header.loop_filter.delta_enabled = reader.bit("frame lf delta")?;
-    if !header.loop_filter.delta_enabled {
-        header.loop_filter.ref_deltas = DEFAULT_REF;
-        return Ok(());
-    }
-    let prior = if header.primary_ref_frame == PRIMARY_REF_NONE {
-        None
-    } else {
-        let slot = header.refs.ref_frame_idx[usize::from(header.primary_ref_frame)];
-        Some(&views[usize::from(slot)].loop_filter)
-    };
-    header.loop_filter.delta_update = reader.bit("frame lf update")?;
-    let delta_update = header.loop_filter.delta_update;
-    for (index, delta) in header.loop_filter.ref_deltas.iter_mut().enumerate() {
-        let update = delta_update && reader.bit("frame lf ref update")?;
-        if update {
-            *delta = narrow_i8(reader.su("frame lf ref delta", 7)?, "frame lf ref delta")?;
-        } else if let Some(prior) = prior {
-            *delta = prior.ref_deltas[index];
-        } else {
-            *delta = DEFAULT_REF[index];
-        }
-    }
-    for index in 0..2 {
-        let update = delta_update && reader.bit("frame lf mode update")?;
-        if update {
-            header.loop_filter.mode_deltas[index] =
-                narrow_i8(reader.su("frame lf mode delta", 7)?, "frame lf mode delta")?;
-        } else if let Some(prior) = prior {
-            header.loop_filter.mode_deltas[index] = prior.mode_deltas[index];
-        }
-    }
-    Ok(())
-}
-
-/// CDEF parameters into `header`.
-fn parse_cdef(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    lossless: bool,
-) -> Result<(), ParseError> {
-    if lossless || header.content.allow_intrabc || !seq.enable_cdef() {
-        return Ok(());
-    }
-    header.cdef.damping_minus_3 =
-        narrow_u8(reader.bits("frame cdef damping", 2)?, "frame cdef damping")?;
-    header.cdef.bits = narrow_u8(reader.bits("frame cdef bits", 2)?, "frame cdef bits")?;
-    for index in 0..(1 << header.cdef.bits) {
-        header.cdef.y_pri[index] =
-            narrow_u8(reader.bits("frame cdef y pri", 4)?, "frame cdef y pri")?;
-        header.cdef.y_sec[index] =
-            narrow_u8(reader.bits("frame cdef y sec", 2)?, "frame cdef y sec")?;
-        if seq.num_planes() > 1 {
-            header.cdef.uv_pri[index] =
-                narrow_u8(reader.bits("frame cdef uv pri", 4)?, "frame cdef uv pri")?;
-            header.cdef.uv_sec[index] =
-                narrow_u8(reader.bits("frame cdef uv sec", 2)?, "frame cdef uv sec")?;
-        }
-    }
-    Ok(())
-}
-
-/// Loop restoration parameters into `header`.
-fn parse_restoration(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    lossless: bool,
-) -> Result<(), ParseError> {
-    let all_lossless = lossless && header.sizes.frame_width == header.sizes.upscaled_width;
-    if all_lossless || header.content.allow_intrabc || !seq.enable_restoration() {
-        return Ok(());
-    }
-    let mut uses = false;
-    let mut uses_chroma = false;
-    for (index, lr) in header
-        .restoration
-        .lr_type
-        .iter_mut()
-        .enumerate()
-        .take(usize::from(seq.num_planes()))
-    {
-        *lr = narrow_u8(reader.bits("frame lr type", 2)?, "frame lr type")?;
-        if *lr != 0 {
-            uses = true;
-            if index > 0 {
-                uses_chroma = true;
-            }
-        }
-    }
-    if !uses {
-        return Ok(());
+    if seq.frame_id_numbers_present() {
+        flags |= shared::SEQ_FRAME_ID_NUMBERS;
     }
     if seq.use_128x128_superblock() {
-        header.restoration.unit_shift =
-            narrow_u8(reader.increment("frame lr shift", 1, 2)?, "frame lr shift")?;
-    } else {
-        header.restoration.unit_shift =
-            narrow_u8(reader.increment("frame lr shift", 0, 2)?, "frame lr shift")?;
+        flags |= shared::SEQ_SUPERBLOCK_128;
     }
-    if seq.color().subsampling_x == 1 && seq.color().subsampling_y == 1 && uses_chroma {
-        header.restoration.uv_shift = u8::from(reader.bit("frame lr uv shift")?);
+    if seq.enable_filter_intra() {
+        flags |= shared::SEQ_FILTER_INTRA;
     }
-    Ok(())
+    if seq.enable_intra_edge_filter() {
+        flags |= shared::SEQ_INTRA_EDGE;
+    }
+    if seq.enable_interintra_compound() {
+        flags |= shared::SEQ_INTERINTRA;
+    }
+    if seq.enable_masked_compound() {
+        flags |= shared::SEQ_MASKED_COMPOUND;
+    }
+    if seq.enable_warped_motion() {
+        flags |= shared::SEQ_WARPED_MOTION;
+    }
+    if seq.enable_dual_filter() {
+        flags |= shared::SEQ_DUAL_FILTER;
+    }
+    if seq.enable_order_hint() {
+        flags |= shared::SEQ_ORDER_HINT;
+    }
+    if seq.enable_jnt_comp() {
+        flags |= shared::SEQ_JNT_COMP;
+    }
+    if seq.enable_ref_frame_mvs() {
+        flags |= shared::SEQ_REF_MVS;
+    }
+    if seq.seq_force_screen_content_tools() == 2 {
+        flags |= shared::SEQ_CHOOSE_SCREEN_CONTENT;
+    }
+    if seq.seq_force_integer_mv() == 2 && seq.seq_force_screen_content_tools() != 0 {
+        flags |= shared::SEQ_CHOOSE_INTEGER_MV;
+    }
+    if seq.enable_superres() {
+        flags |= shared::SEQ_SUPERRES;
+    }
+    if seq.enable_cdef() {
+        flags |= shared::SEQ_CDEF;
+    }
+    if seq.enable_restoration() {
+        flags |= shared::SEQ_RESTORATION;
+    }
+    if seq.film_grain_params_present() {
+        flags |= shared::SEQ_FILM_GRAIN;
+    }
+    if color.depth.high_bitdepth {
+        flags |= shared::SEQ_HIGH_BITDEPTH;
+    }
+    if color.depth.twelve_bit {
+        flags |= shared::SEQ_TWELVE_BIT;
+    }
+    if color.depth.mono_chrome {
+        flags |= shared::SEQ_MONO_CHROME;
+    }
+    if color.color_range {
+        flags |= shared::SEQ_COLOR_RANGE;
+    }
+    if color.separate_uv_delta_q {
+        flags |= shared::SEQ_SEPARATE_UV_DELTA_Q;
+    }
+    if color.subsampling_x != 0 {
+        flags |= shared::SEQ_SUBSAMPLING_X;
+    }
+    if color.subsampling_y != 0 {
+        flags |= shared::SEQ_SUBSAMPLING_Y;
+    }
+    if color.color_description_present {
+        flags |= shared::SEQ_COLOR_DESCRIPTION;
+    }
+    if seq.timing().equal_picture_interval {
+        flags |= shared::SEQ_EQUAL_INTERVAL;
+    }
+    flags
 }
 
-/// Transform mode into `header`.
-fn parse_tx_mode(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-    lossless: bool,
-) -> Result<(), ParseError> {
-    if lossless {
-        header.tx_mode = 0;
-    } else {
-        header.tx_mode = narrow_u8(reader.increment("frame tx mode", 1, 2)?, "frame tx mode")?;
+/// Shared sequence header matching `seq`.
+fn to_shared_seq(seq: &SequenceHeader) -> shared::SequenceHeader {
+    let color = seq.color();
+    let mut operating = Vec::with_capacity(seq.operating_points().len());
+    for point in seq.operating_points() {
+        let decoder_model = if point.decoder_present {
+            Some(shared::DecoderModelPoint {
+                decoder_buffer_delay: point.decoder_buffer_delay,
+                encoder_buffer_delay: point.encoder_buffer_delay,
+                low_delay: point.low_delay,
+            })
+        } else {
+            None
+        };
+        operating.push(shared::OperatingPoint {
+            idc: point.idc,
+            level: point.level_idx,
+            tier: point.tier != 0,
+            decoder_model,
+            display_delay_present: point.initial_delay_present,
+            display_delay_minus1: point.initial_delay_minus_1,
+        });
     }
-    Ok(())
+    shared::SequenceHeader {
+        profile: seq.profile(),
+        flags: shared_seq_flags(seq),
+        operating,
+        num_units_in_display_tick: seq.timing().num_units_in_display_tick,
+        time_scale: seq.timing().time_scale,
+        num_ticks_per_picture_minus1: seq.timing().num_ticks_per_picture_minus_1,
+        buffer_delay_length_minus1: seq.decoder_model().buffer_delay_length_minus_1,
+        num_units_in_decoding_tick: seq.decoder_model().num_units_in_decoding_tick,
+        buffer_removal_length_minus1: seq.decoder_model().buffer_removal_time_length_minus_1,
+        presentation_length_minus1: seq.decoder_model().frame_presentation_time_length_minus_1,
+        frame_width_bits_minus1: seq.frame_width_bits_minus_1(),
+        frame_height_bits_minus1: seq.frame_height_bits_minus_1(),
+        max_frame_width_minus1: u32::from(seq.max_frame_width_minus_1()),
+        max_frame_height_minus1: u32::from(seq.max_frame_height_minus_1()),
+        delta_frame_id_length_minus2: seq.delta_frame_id_length_minus_2(),
+        additional_frame_id_length_minus1: seq.additional_frame_id_length_minus_1(),
+        force_screen_content_tools: seq.seq_force_screen_content_tools(),
+        force_integer_mv: seq.seq_force_integer_mv(),
+        order_hint_bits_minus1: seq.order_hint_bits_minus_1(),
+        color_primaries: color.color_primaries,
+        transfer_characteristics: color.transfer_characteristics,
+        matrix_coefficients: color.matrix_coefficients,
+        chroma_sample_position: color.chroma_sample_position,
+    }
 }
 
-/// Skip mode presence into `header`.
-fn parse_skip_mode(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    if skip_mode_allowed(seq, header, views) {
-        header.skip_mode_present = reader.bit("frame skip present")?;
+/// Tier sequence header matching shared `seq`.
+fn from_shared_seq(seq: &shared::SequenceHeader) -> Result<SequenceHeader, ParseError> {
+    let mut operating_points = Vec::with_capacity(seq.operating.len());
+    for point in &seq.operating {
+        let model = point.decoder_model.as_ref();
+        operating_points.push(OperatingPoint {
+            idc: point.idc,
+            level_idx: point.level,
+            tier: u8::from(point.tier),
+            decoder_present: model.is_some(),
+            decoder_buffer_delay: model.map_or(0, |model| model.decoder_buffer_delay),
+            encoder_buffer_delay: model.map_or(0, |model| model.encoder_buffer_delay),
+            low_delay: model.is_some_and(|model| model.low_delay),
+            initial_delay_present: point.display_delay_present,
+            initial_delay_minus_1: point.display_delay_minus1,
+        });
     }
-    Ok(())
+    Ok(SequenceHeader {
+        profile: seq.profile,
+        still: SeqStill {
+            still_picture: seq.still_picture(),
+            reduced: seq.reduced_header(),
+        },
+        presence: SeqPresence {
+            timing_present: seq.timing_info_present(),
+            decoder_model_present: seq.decoder_model_present(),
+            initial_display_delay_present: seq.initial_display_delay_present(),
+        },
+        timing: TimingInfo {
+            num_units_in_display_tick: seq.num_units_in_display_tick,
+            time_scale: seq.time_scale,
+            equal_picture_interval: seq.equal_picture_interval(),
+            num_ticks_per_picture_minus_1: seq.num_ticks_per_picture_minus1,
+        },
+        decoder_model: DecoderModelInfo {
+            buffer_delay_length_minus_1: seq.buffer_delay_length_minus1,
+            num_units_in_decoding_tick: seq.num_units_in_decoding_tick,
+            buffer_removal_time_length_minus_1: seq.buffer_removal_length_minus1,
+            frame_presentation_time_length_minus_1: seq.presentation_length_minus1,
+        },
+        operating_points,
+        frame_width_bits_minus_1: seq.frame_width_bits_minus1,
+        frame_height_bits_minus_1: seq.frame_height_bits_minus1,
+        max_frame_width_minus_1: narrow_u16(seq.max_frame_width_minus1, "seq max width")?,
+        max_frame_height_minus_1: narrow_u16(seq.max_frame_height_minus1, "seq max height")?,
+        frame_id_numbers_present: seq.frame_id_numbers_present(),
+        delta_frame_id_length_minus_2: seq.delta_frame_id_length_minus2,
+        additional_frame_id_length_minus_1: seq.additional_frame_id_length_minus1,
+        blocks: SeqBlocks {
+            use_128x128_superblock: seq.use_128x128_superblock(),
+            enable_filter_intra: seq.enable_filter_intra(),
+            enable_intra_edge_filter: seq.enable_intra_edge_filter(),
+        },
+        compound: SeqCompound {
+            enable_interintra_compound: seq.enable_interintra_compound(),
+            enable_masked_compound: seq.enable_masked_compound(),
+            enable_warped_motion: seq.enable_warped_motion(),
+        },
+        filters: SeqFilters {
+            enable_dual_filter: seq.enable_dual_filter(),
+            enable_cdef: seq.enable_cdef(),
+            enable_restoration: seq.enable_restoration(),
+        },
+        order: SeqOrder {
+            enable_order_hint: seq.enable_order_hint(),
+            enable_jnt_comp: seq.enable_jnt_comp(),
+            enable_ref_frame_mvs: seq.enable_ref_frame_mvs(),
+        },
+        seq_force_screen_content_tools: seq.force_screen_content_tools,
+        seq_force_integer_mv: seq.force_integer_mv,
+        order_hint_bits_minus_1: seq.order_hint_bits_minus1,
+        enable_superres: seq.enable_superres(),
+        color: ColorConfig {
+            depth: ColorDepth {
+                high_bitdepth: seq.flags & shared::SEQ_HIGH_BITDEPTH != 0,
+                twelve_bit: seq.flags & shared::SEQ_TWELVE_BIT != 0,
+                mono_chrome: seq.mono_chrome(),
+            },
+            color_description_present: seq.color_description_present(),
+            color_primaries: seq.color_primaries,
+            transfer_characteristics: seq.transfer_characteristics,
+            matrix_coefficients: seq.matrix_coefficients,
+            color_range: seq.flags & shared::SEQ_COLOR_RANGE != 0,
+            subsampling_x: u8::from(seq.subsampling_x()),
+            subsampling_y: u8::from(seq.subsampling_y()),
+            chroma_sample_position: seq.chroma_sample_position,
+            separate_uv_delta_q: seq.separate_uv_delta_q(),
+        },
+        film_grain_params_present: seq.film_grain_params_present(),
+        bit_depth: seq.bit_depth(),
+    })
 }
 
-/// True when the frame may signal skip mode.
-fn skip_mode_allowed(
-    seq: &SequenceHeader,
-    header: &FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> bool {
-    if header.is_intra() || !header.prediction.reference_select || !seq.enable_order_hint() {
-        return false;
+/// Shared segmentation parameters matching `seg`.
+fn to_shared_seg(seg: &SegParams) -> ([[bool; 8]; 8], [[i16; 8]; 8]) {
+    (seg.feature_enabled, seg.feature_value)
+}
+
+/// Tier segmentation parameters matching shared `enabled` and `value`.
+fn from_shared_seg(
+    enabled: [[bool; 8]; 8],
+    value: [[i16; 8]; 8],
+    header: &shared::FrameHeader,
+) -> SegParams {
+    SegParams {
+        enabled: header.segmentation_enabled(),
+        update: SegUpdate {
+            update_map: header.segmentation_update_map(),
+            temporal_update: header.segmentation_temporal_update(),
+            update_data: header.segmentation_update_data(),
+        },
+        feature_enabled: enabled,
+        feature_value: value,
     }
-    let (forward, backward) = skip_mode_refs(seq, header, views);
-    let Some(first) = forward else {
-        return false;
+}
+
+/// Value/scaling pairs of one grain plane.
+fn join_points<const N: usize>(values: &[u8; N], scalings: &[u8; N]) -> [[u8; 2]; N] {
+    core::array::from_fn(|index| [values[index], scalings[index]])
+}
+
+/// Shared film grain parameters matching `grain`.
+fn to_shared_grain(grain: &FilmGrainParams) -> shared::FilmGrain {
+    let mut flags = 0u8;
+    if grain.apply_grain {
+        flags |= shared::FG_APPLY;
+    }
+    if grain.chroma_scaling_from_luma {
+        flags |= shared::FG_CHROMA_FROM_LUMA;
+    }
+    if grain.clip.overlap_flag {
+        flags |= shared::FG_OVERLAP;
+    }
+    if grain.clip.clip_to_restricted_range {
+        flags |= shared::FG_RESTRICTED_RANGE;
+    }
+    shared::FilmGrain {
+        flags,
+        update_grain: grain.update_grain,
+        ref_idx: grain.ref_idx,
+        grain_seed: grain.grain_seed,
+        scaling_points_y: join_points(&grain.point_y_value, &grain.point_y_scaling),
+        num_y_points: grain.num_y_points,
+        scaling_points_cb: join_points(&grain.point_cb_value, &grain.point_cb_scaling),
+        num_cb_points: grain.num_cb_points,
+        scaling_points_cr: join_points(&grain.point_cr_value, &grain.point_cr_scaling),
+        num_cr_points: grain.num_cr_points,
+        ar_coeffs_y: grain.ar_coeffs_y,
+        ar_coeffs_cb: grain.ar_coeffs_cb,
+        ar_coeffs_cr: grain.ar_coeffs_cr,
+        grain_scaling_minus_8: grain.grain_scaling_minus_8,
+        ar_coeff_lag: grain.ar_coeff_lag,
+        ar_coeff_shift_minus_6: grain.ar_coeff_shift_minus_6,
+        grain_scale_shift: grain.grain_scale_shift,
+        cb_mult: grain.cb_mult,
+        cb_luma_mult: grain.cb_luma_mult,
+        cr_mult: grain.cr_mult,
+        cr_luma_mult: grain.cr_luma_mult,
+        cb_offset: grain.cb_offset,
+        cr_offset: grain.cr_offset,
+    }
+}
+
+/// Tier film grain parameters matching shared `grain`.
+fn from_shared_grain(grain: &shared::FilmGrain) -> FilmGrainParams {
+    let mut params = FilmGrainParams {
+        apply_grain: grain.apply_grain(),
+        update_grain: grain.update_grain,
+        grain_seed: grain.grain_seed,
+        ref_idx: grain.ref_idx,
+        num_y_points: grain.num_y_points,
+        chroma_scaling_from_luma: grain.chroma_scaling_from_luma(),
+        num_cb_points: grain.num_cb_points,
+        num_cr_points: grain.num_cr_points,
+        grain_scaling_minus_8: grain.grain_scaling_minus_8,
+        ar_coeff_lag: grain.ar_coeff_lag,
+        ar_coeffs_y: grain.ar_coeffs_y,
+        ar_coeffs_cb: grain.ar_coeffs_cb,
+        ar_coeffs_cr: grain.ar_coeffs_cr,
+        ar_coeff_shift_minus_6: grain.ar_coeff_shift_minus_6,
+        grain_scale_shift: grain.grain_scale_shift,
+        cb_mult: grain.cb_mult,
+        cb_luma_mult: grain.cb_luma_mult,
+        cb_offset: grain.cb_offset,
+        cr_mult: grain.cr_mult,
+        cr_luma_mult: grain.cr_luma_mult,
+        cr_offset: grain.cr_offset,
+        clip: GrainClip {
+            overlap_flag: grain.overlap_flag(),
+            clip_to_restricted_range: grain.clip_to_restricted_range(),
+        },
+        ..FilmGrainParams::default()
     };
-    if backward.is_some() {
-        return true;
+    for (index, point) in grain.scaling_points_y.iter().enumerate() {
+        params.point_y_value[index] = point[0];
+        params.point_y_scaling[index] = point[1];
     }
-    let forward_hint = views[usize::from(header.refs.ref_frame_idx[first])].order_hint;
-    for index in 0..REFS_PER_FRAME {
-        let hint = views[usize::from(header.refs.ref_frame_idx[index])].order_hint;
-        if relative_dist(seq, hint, forward_hint) < 0 {
-            return true;
+    for (index, point) in grain.scaling_points_cb.iter().enumerate() {
+        params.point_cb_value[index] = point[0];
+        params.point_cb_scaling[index] = point[1];
+    }
+    for (index, point) in grain.scaling_points_cr.iter().enumerate() {
+        params.point_cr_value[index] = point[0];
+        params.point_cr_scaling[index] = point[1];
+    }
+    params
+}
+
+/// Shared reference slots matching `slots`.
+fn to_shared_slots(
+    slots: &[SlotView; TOTAL_REFS],
+) -> Result<[shared::RefInfo; TOTAL_REFS], ParseError> {
+    let mut refs: [shared::RefInfo; TOTAL_REFS] =
+        core::array::from_fn(|_| shared::RefInfo::default());
+    for (view, slot) in slots.iter().zip(refs.iter_mut()) {
+        let (seg_enabled, seg_value) = to_shared_seg(&view.segmentation);
+        let mut gm_params = [[0i32; 6]; 7];
+        for (name, params) in gm_params.iter_mut().enumerate() {
+            *params = view.gm_params[name + 1];
+        }
+        *slot = shared::RefInfo {
+            valid: view.valid,
+            frame_type: shared::FrameType::new::<ParseError>(u32::from(view.frame_type))?,
+            frame_width: view.upscaled_width,
+            frame_height: view.frame_height,
+            upscaled_width: view.upscaled_width,
+            render_width: view.render_width,
+            render_height: view.render_height,
+            order_hint: view.order_hint,
+            frame_id: view.frame_id,
+            loop_ref_deltas: view.loop_filter.ref_deltas,
+            loop_mode_deltas: view.loop_filter.mode_deltas,
+            seg_enabled,
+            seg_value,
+            gm_params,
+            grain: to_shared_grain(&view.grain),
+        };
+    }
+    Ok(refs)
+}
+
+/// Tier tile layout matching shared `header`.
+fn from_shared_tiles(header: &shared::FrameHeader) -> Result<TileLayout, ParseError> {
+    let cols = usize::from(header.tile_cols);
+    let rows = usize::from(header.tile_rows);
+    let mut layout = TileLayout {
+        uniform: header.uniform_tile_spacing,
+        cols: header.tile_cols,
+        rows: header.tile_rows,
+        context_update_tile_id: header.context_update_tile_id,
+        size_bytes_minus_1: header.tile_size_bytes.saturating_sub(1),
+        ..TileLayout::default()
+    };
+    let mut at = 0u32;
+    for index in 0..cols {
+        layout.start_col_sb[index] = narrow_u8(at, "frame tile col")?;
+        let width = u32::from(header.width_in_sbs_minus_1[index]);
+        layout.width_in_sbs_minus_1[index] = narrow_u8(width, "frame tile width")?;
+        at += width + 1;
+    }
+    at = 0;
+    for index in 0..rows {
+        layout.start_row_sb[index] = narrow_u8(at, "frame tile row")?;
+        let height = u32::from(header.height_in_sbs_minus_1[index]);
+        layout.height_in_sbs_minus_1[index] = narrow_u8(height, "frame tile height")?;
+        at += height + 1;
+    }
+    Ok(layout)
+}
+
+/// Tier show-existing header over the shown `view`.
+fn show_existing_header(
+    header: &shared::FrameHeader,
+    seq: &SequenceHeader,
+    slots: &[SlotView; TOTAL_REFS],
+) -> FrameHeader {
+    let view = &slots[usize::from(header.frame_to_show_map_idx)];
+    FrameHeader {
+        show: FrameShow {
+            show_existing: true,
+            map_idx: header.frame_to_show_map_idx,
+            presentation_time: header.presentation_time,
+            display_frame_id: header.display_frame_id,
+        },
+        frame_type: header.frame_type.id(),
+        order_hint: if seq.enable_order_hint() {
+            header.order_hint
+        } else {
+            0
+        },
+        refresh_frame_flags: header.refresh_frame_flags,
+        sizes: FrameSizes {
+            width_minus_1: view.upscaled_width.saturating_sub(1),
+            height_minus_1: view.frame_height.saturating_sub(1),
+            render_width_minus_1: view.render_width.saturating_sub(1),
+            render_height_minus_1: view.render_height.saturating_sub(1),
+            frame_width: view.upscaled_width,
+            frame_height: view.frame_height,
+            upscaled_width: view.upscaled_width,
+            render_width: view.render_width,
+            render_height: view.render_height,
+        },
+        ..FrameHeader::default()
+    }
+}
+
+/// Tier frame sizes matching shared `header`.
+fn frame_sizes(header: &shared::FrameHeader) -> FrameSizes {
+    FrameSizes {
+        width_minus_1: header.upscaled_width.saturating_sub(1),
+        height_minus_1: header.frame_height.saturating_sub(1),
+        render_width_minus_1: header.render_width.saturating_sub(1),
+        render_height_minus_1: header.render_height.saturating_sub(1),
+        frame_width: header.frame_width,
+        frame_height: header.frame_height,
+        upscaled_width: header.upscaled_width,
+        render_width: header.render_width,
+        render_height: header.render_height,
+    }
+}
+
+/// Tier reference selection matching shared `header`.
+fn frame_refs(header: &shared::FrameHeader) -> FrameRefs {
+    FrameRefs {
+        short_signaling: header.frame_refs_short_signaling(),
+        last_idx: header.short_last_idx,
+        golden_idx: header.short_golden_idx,
+        ref_frame_idx: header.ref_frame_idx,
+        delta_frame_id_minus1: header.delta_frame_id_minus1,
+        found_ref: header.found_ref,
+    }
+}
+
+/// Tier quantizer matching shared `header`.
+fn frame_quant(header: &shared::FrameHeader) -> QuantParams {
+    QuantParams {
+        base_q_idx: header.base_q_idx,
+        delta_q_y_dc: header.delta_q_y_dc,
+        delta_q_u_dc: header.delta_q_u_dc,
+        delta_q_u_ac: header.delta_q_u_ac,
+        delta_q_v_dc: header.delta_q_v_dc,
+        delta_q_v_ac: header.delta_q_v_ac,
+        using_qmatrix: header.using_qmatrix(),
+        diff_uv_delta: header.diff_uv_delta(),
+        qm_y: header.qm_y,
+        qm_u: header.qm_u,
+        qm_v: header.qm_v,
+    }
+}
+
+/// Tier loop filter matching shared `header`.
+fn frame_loop_filter(header: &shared::FrameHeader) -> LoopFilterParams {
+    LoopFilterParams {
+        level: header.loop_filter_level,
+        sharpness: header.loop_filter_sharpness,
+        delta_enabled: header.loop_filter_delta_enabled(),
+        delta_update: header.loop_filter_delta_update(),
+        ref_deltas: header.loop_ref_deltas,
+        mode_deltas: header.loop_mode_deltas,
+    }
+}
+
+/// Tier CDEF matching shared `header`.
+fn frame_cdef(header: &shared::FrameHeader) -> CdefParams {
+    CdefParams {
+        damping_minus_3: header.cdef_damping_minus_3,
+        bits: header.cdef_bits,
+        y_pri: header.cdef_y_pri,
+        y_sec: header.cdef_y_sec,
+        uv_pri: header.cdef_uv_pri,
+        uv_sec: header.cdef_uv_sec,
+    }
+}
+
+/// Tier restoration matching shared `header`.
+fn frame_restoration(header: &shared::FrameHeader) -> RestorationParams {
+    RestorationParams {
+        lr_type: header.lr_type,
+        unit_shift: header.lr_unit_shift,
+        uv_shift: header.lr_uv_shift,
+    }
+}
+
+/// Tier frame header matching shared `header`.
+fn from_shared_header(
+    header: &shared::FrameHeader,
+    seq: &SequenceHeader,
+    slots: &[SlotView; TOTAL_REFS],
+) -> Result<FrameHeader, ParseError> {
+    if header.show_existing_frame() {
+        return Ok(show_existing_header(header, seq, slots));
+    }
+    let use_superres = header.superres_denom != shared::SUPERRES_NUM;
+    let mut gm_type = [0u8; TOTAL_REFS];
+    let mut gm_params = [[0i32; 6]; TOTAL_REFS];
+    for (name, motion) in header.global_motion.iter().enumerate() {
+        gm_type[name + 1] = motion.warp_type;
+        gm_params[name + 1] = motion.params;
+    }
+    let mut converted = FrameHeader {
+        show: FrameShow {
+            show_existing: false,
+            map_idx: 0,
+            presentation_time: header.presentation_time,
+            display_frame_id: 0,
+        },
+        frame_type: header.frame_type.id(),
+        display: FrameDisplay {
+            show_frame: header.show_frame(),
+            showable_frame: header.showable_frame(),
+        },
+        resilience: FrameResilience {
+            error_resilient_mode: header.error_resilient_mode(),
+            disable_cdf_update: header.disable_cdf_update(),
+            frame_end_update_disabled: header.disable_frame_end_update_cdf(),
+        },
+        content: FrameContent {
+            allow_screen_content_tools: header.allow_screen_content_tools(),
+            force_integer_mv: header.force_integer_mv(),
+            allow_intrabc: header.allow_intrabc(),
+        },
+        current_frame_id: header.current_frame_id,
+        sizing: FrameSizing {
+            frame_size_override_flag: header.frame_size_override_flag(),
+            use_superres,
+            render_and_frame_size_different: header.render_and_frame_size_different(),
+        },
+        order_hint: header.order_hint,
+        primary_ref_frame: header.primary_ref_frame,
+        buffer_removal_time_present_flag: header.buffer_removal_time_present,
+        refresh_frame_flags: header.refresh_frame_flags,
+        sizes: frame_sizes(header),
+        coded_denom: if use_superres {
+            header
+                .superres_denom
+                .saturating_sub(shared::SUPERRES_DENOM_MIN)
+        } else {
+            0
+        },
+        refs: frame_refs(header),
+        motion: FrameMotion {
+            allow_high_precision_mv: header.allow_high_precision_mv(),
+            is_motion_mode_switchable: header.is_motion_mode_switchable(),
+            use_ref_frame_mvs: header.use_ref_frame_mvs(),
+        },
+        interpolation_filter: header.interp_filter,
+        prediction: FramePrediction {
+            is_filter_switchable: header.interp_filter == shared::INTERP_SWITCHABLE,
+            allow_warped_motion: header.allow_warped_motion(),
+            reference_select: header.reference_select(),
+        },
+        reduced_tx_set: header.reduced_tx_set(),
+        tx_mode: header.tx_mode,
+        skip_mode_present: header.skip_mode_present(),
+        tiles: from_shared_tiles(header)?,
+        quant: frame_quant(header),
+        segmentation: from_shared_seg(header.seg_enabled, header.seg_value, header),
+        delta: FrameDelta {
+            delta_q_present: header.delta_q_present(),
+            delta_lf_present: header.delta_lf_present(),
+            delta_lf_multi: header.delta_lf_multi(),
+        },
+        delta_q_res: header.delta_q_res,
+        delta_lf_res: header.delta_lf_res,
+        loop_filter: frame_loop_filter(header),
+        cdef: frame_cdef(header),
+        restoration: frame_restoration(header),
+        global: GlobalMotionSyntax::default(),
+        grain: from_shared_grain(&header.film_grain),
+        gm_type,
+        gm_params,
+        ..FrameHeader::default()
+    };
+    derive_skip_mode(seq, &mut converted, slots)?;
+    Ok(converted)
+}
+
+/// Tier parsed frame matching shared `header`.
+fn convert_parsed(
+    header: &shared::FrameHeader,
+    seq: &SequenceHeader,
+    slots: &[SlotView; TOTAL_REFS],
+    refs: &[shared::RefInfo; TOTAL_REFS],
+    before: [bool; TOTAL_REFS],
+) -> Result<ParsedFrame, ParseError> {
+    let reset_all = header.frame_type == shared::FrameType::Key && header.show_frame();
+    let mut invalidated = [false; TOTAL_REFS];
+    if !reset_all {
+        for (index, slot) in refs.iter().enumerate() {
+            invalidated[index] = before[index] && !slot.valid;
         }
     }
-    false
+    let converted = from_shared_header(header, seq, slots)?;
+    Ok(ParsedFrame {
+        header: converted,
+        reset_all,
+        invalidated,
+    })
 }
 
 /// Forward and backward skip mode reference indices.
@@ -2897,288 +2331,12 @@ fn skip_mode_refs(
     (forward, backward)
 }
 
-/// Global motion syntax into `header`.
-fn parse_global_motion_syntax(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    if header.is_intra() {
-        return Ok(());
-    }
-    for name in 1..TOTAL_REFS {
-        header.global.is_global[name] = reader.bit("frame global")?;
-        if !header.global.is_global[name] {
-            continue;
-        }
-        header.global.is_rot_zoom[name] = reader.bit("frame rotzoom")?;
-        let model = if header.global.is_rot_zoom[name] {
-            2
-        } else {
-            header.global.is_translation[name] = reader.bit("frame translation")?;
-            if header.global.is_translation[name] {
-                1
-            } else {
-                3
-            }
-        };
-        if model >= 2 {
-            parse_gm_param(reader, header, model, name, 2)?;
-            parse_gm_param(reader, header, model, name, 3)?;
-            if model == 3 {
-                parse_gm_param(reader, header, model, name, 4)?;
-                parse_gm_param(reader, header, model, name, 5)?;
-            }
-        }
-        if model >= 1 {
-            parse_gm_param(reader, header, model, name, 0)?;
-            parse_gm_param(reader, header, model, name, 1)?;
-        }
-    }
-    Ok(())
-}
-
-/// One raw global motion parameter into `header`.
-fn parse_gm_param(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-    model: u8,
-    name: usize,
-    index: usize,
-) -> Result<(), ParseError> {
-    let abs_bits = if index < 2 {
-        if model == 1 && !header.motion.allow_high_precision_mv {
-            GM_ABS_TRANS_ONLY_BITS - 1
-        } else if model == 1 {
-            GM_ABS_TRANS_ONLY_BITS
-        } else {
-            GM_ABS_TRANS_BITS
-        }
-    } else {
-        GM_ABS_ALPHA_BITS
-    };
-    let symbols = 2 * (1 << abs_bits) + 1;
-    header.global.params[name][index] = reader.subexp("frame gm param", symbols)?;
-    Ok(())
-}
-
-/// Film grain parameters into `header`.
-fn parse_film_grain(
-    reader: &mut BitReader<'_>,
+/// Skip mode reference names into `header`.
+fn derive_skip_mode(
     seq: &SequenceHeader,
     header: &mut FrameHeader,
     views: &[SlotView; TOTAL_REFS],
 ) -> Result<(), ParseError> {
-    if !seq.film_grain_params_present()
-        || (!header.display.show_frame && !header.display.showable_frame)
-    {
-        return Ok(());
-    }
-    header.grain.apply_grain = reader.bit("frame grain apply")?;
-    if !header.grain.apply_grain {
-        return Ok(());
-    }
-    header.grain.grain_seed = narrow_u16(reader.bits("frame grain seed", 16)?, "frame grain seed")?;
-    if header.frame_type == FRAME_INTER {
-        header.grain.update_grain = reader.bit("frame grain update")?;
-    } else {
-        header.grain.update_grain = true;
-    }
-    if !header.grain.update_grain {
-        header.grain.ref_idx = narrow_u8(reader.bits("frame grain ref", 3)?, "frame grain ref")?;
-        let stored = views[usize::from(header.grain.ref_idx)].grain;
-        let seed = header.grain.grain_seed;
-        header.grain = stored;
-        header.grain.grain_seed = seed;
-        header.grain.apply_grain = true;
-        header.grain.update_grain = false;
-        return Ok(());
-    }
-    parse_grain_points(reader, seq, header)?;
-    parse_grain_coeffs(reader, header)?;
-    header.grain.clip.overlap_flag = reader.bit("frame grain overlap")?;
-    header.grain.clip.clip_to_restricted_range = reader.bit("frame grain clip")?;
-    Ok(())
-}
-
-/// Film grain scaling points into `header`.
-fn parse_grain_points(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.grain.num_y_points = narrow_u8(
-        reader.bits("frame grain y points", 4)?,
-        "frame grain y points",
-    )?;
-    if header.grain.num_y_points > 14 {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame grain y points",
-        });
-    }
-    for index in 0..usize::from(header.grain.num_y_points) {
-        header.grain.point_y_value[index] = narrow_u8(
-            reader.bits("frame grain y value", 8)?,
-            "frame grain y value",
-        )?;
-        header.grain.point_y_scaling[index] = narrow_u8(
-            reader.bits("frame grain y scaling", 8)?,
-            "frame grain y scaling",
-        )?;
-        if index > 0 && header.grain.point_y_value[index] <= header.grain.point_y_value[index - 1] {
-            return Err(ParseError::OutOfRange {
-                syntax: "frame grain y value",
-            });
-        }
-    }
-    if seq.color().depth.mono_chrome {
-        header.grain.chroma_scaling_from_luma = false;
-    } else {
-        header.grain.chroma_scaling_from_luma = reader.bit("frame grain chroma luma")?;
-    }
-    if seq.color().depth.mono_chrome
-        || header.grain.chroma_scaling_from_luma
-        || (seq.color().subsampling_x == 1
-            && seq.color().subsampling_y == 1
-            && header.grain.num_y_points == 0)
-    {
-        return Ok(());
-    }
-    header.grain.num_cb_points = narrow_u8(
-        reader.bits("frame grain cb points", 4)?,
-        "frame grain cb points",
-    )?;
-    if header.grain.num_cb_points > 10 {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame grain cb points",
-        });
-    }
-    for index in 0..usize::from(header.grain.num_cb_points) {
-        header.grain.point_cb_value[index] = narrow_u8(
-            reader.bits("frame grain cb value", 8)?,
-            "frame grain cb value",
-        )?;
-        header.grain.point_cb_scaling[index] = narrow_u8(
-            reader.bits("frame grain cb scaling", 8)?,
-            "frame grain cb scaling",
-        )?;
-        if index > 0 && header.grain.point_cb_value[index] <= header.grain.point_cb_value[index - 1]
-        {
-            return Err(ParseError::OutOfRange {
-                syntax: "frame grain cb value",
-            });
-        }
-    }
-    header.grain.num_cr_points = narrow_u8(
-        reader.bits("frame grain cr points", 4)?,
-        "frame grain cr points",
-    )?;
-    if header.grain.num_cr_points > 10 {
-        return Err(ParseError::OutOfRange {
-            syntax: "frame grain cr points",
-        });
-    }
-    for index in 0..usize::from(header.grain.num_cr_points) {
-        header.grain.point_cr_value[index] = narrow_u8(
-            reader.bits("frame grain cr value", 8)?,
-            "frame grain cr value",
-        )?;
-        header.grain.point_cr_scaling[index] = narrow_u8(
-            reader.bits("frame grain cr scaling", 8)?,
-            "frame grain cr scaling",
-        )?;
-        if index > 0 && header.grain.point_cr_value[index] <= header.grain.point_cr_value[index - 1]
-        {
-            return Err(ParseError::OutOfRange {
-                syntax: "frame grain cr value",
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Film grain autoregressive coefficients into `header`.
-fn parse_grain_coeffs(
-    reader: &mut BitReader<'_>,
-    header: &mut FrameHeader,
-) -> Result<(), ParseError> {
-    header.grain.grain_scaling_minus_8 = narrow_u8(
-        reader.bits("frame grain scaling", 2)?,
-        "frame grain scaling",
-    )?;
-    header.grain.ar_coeff_lag = narrow_u8(reader.bits("frame grain lag", 2)?, "frame grain lag")?;
-    let lag = u32::from(header.grain.ar_coeff_lag);
-    let luma = usize::try_from(2 * lag * (lag + 1)).map_err(|_| ParseError::OutOfRange {
-        syntax: "frame grain lag",
-    })?;
-    let chroma = if header.grain.num_y_points > 0 {
-        for coeff in header.grain.ar_coeffs_y.iter_mut().take(luma) {
-            *coeff = narrow_u8(
-                reader.bits("frame grain coeff y", 8)?,
-                "frame grain coeff y",
-            )?;
-        }
-        luma + 1
-    } else {
-        luma
-    };
-    if header.grain.chroma_scaling_from_luma || header.grain.num_cb_points > 0 {
-        for coeff in header.grain.ar_coeffs_cb.iter_mut().take(chroma) {
-            *coeff = narrow_u8(
-                reader.bits("frame grain coeff cb", 8)?,
-                "frame grain coeff cb",
-            )?;
-        }
-    }
-    if header.grain.chroma_scaling_from_luma || header.grain.num_cr_points > 0 {
-        for coeff in header.grain.ar_coeffs_cr.iter_mut().take(chroma) {
-            *coeff = narrow_u8(
-                reader.bits("frame grain coeff cr", 8)?,
-                "frame grain coeff cr",
-            )?;
-        }
-    }
-    header.grain.ar_coeff_shift_minus_6 =
-        narrow_u8(reader.bits("frame grain shift", 2)?, "frame grain shift")?;
-    header.grain.grain_scale_shift =
-        narrow_u8(reader.bits("frame grain scale", 2)?, "frame grain scale")?;
-    if header.grain.num_cb_points > 0 {
-        header.grain.cb_mult = narrow_u8(
-            reader.bits("frame grain cb mult", 8)?,
-            "frame grain cb mult",
-        )?;
-        header.grain.cb_luma_mult = narrow_u8(
-            reader.bits("frame grain cb luma", 8)?,
-            "frame grain cb luma",
-        )?;
-        header.grain.cb_offset = narrow_u16(
-            reader.bits("frame grain cb offset", 9)?,
-            "frame grain cb offset",
-        )?;
-    }
-    if header.grain.num_cr_points > 0 {
-        header.grain.cr_mult = narrow_u8(
-            reader.bits("frame grain cr mult", 8)?,
-            "frame grain cr mult",
-        )?;
-        header.grain.cr_luma_mult = narrow_u8(
-            reader.bits("frame grain cr luma", 8)?,
-            "frame grain cr luma",
-        )?;
-        header.grain.cr_offset = narrow_u16(
-            reader.bits("frame grain cr offset", 9)?,
-            "frame grain cr offset",
-        )?;
-    }
-    Ok(())
-}
-
-/// Derived per-frame state: global motion parameters plus skip mode names.
-fn derive_frame_state(
-    seq: &SequenceHeader,
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    derive_global_motion(header, views)?;
     if header.is_intra() || !header.prediction.reference_select || !seq.enable_order_hint() {
         return Ok(());
     }
@@ -3223,314 +2381,10 @@ fn derive_frame_state(
     Ok(())
 }
 
-/// Derived global motion types and parameters into `header`.
-fn derive_global_motion(
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-) -> Result<(), ParseError> {
-    for name in 1..TOTAL_REFS {
-        header.gm_type[name] = 0;
-        for (index, param) in header.gm_params[name].iter_mut().enumerate() {
-            *param = if index % 3 == 2 {
-                1 << WARPEDMODEL_PREC_BITS
-            } else {
-                0
-            };
-        }
-    }
-    if header.is_intra() {
-        return Ok(());
-    }
-    for name in 1..TOTAL_REFS {
-        let model = if !header.global.is_global[name] {
-            0
-        } else if header.global.is_rot_zoom[name] {
-            2
-        } else if header.global.is_translation[name] {
-            1
-        } else {
-            3
-        };
-        header.gm_type[name] = model;
-        if model >= 2 {
-            derive_gm_param(header, views, name, 2)?;
-            derive_gm_param(header, views, name, 3)?;
-            if model == 3 {
-                derive_gm_param(header, views, name, 4)?;
-                derive_gm_param(header, views, name, 5)?;
-            } else {
-                header.gm_params[name][4] = -header.gm_params[name][3];
-                header.gm_params[name][5] = header.gm_params[name][2];
-            }
-        }
-        if model >= 1 {
-            derive_gm_param(header, views, name, 0)?;
-            derive_gm_param(header, views, name, 1)?;
-        }
-    }
-    Ok(())
-}
-
-/// One derived global motion parameter into `header`.
-fn derive_gm_param(
-    header: &mut FrameHeader,
-    views: &[SlotView; TOTAL_REFS],
-    name: usize,
-    index: usize,
-) -> Result<(), ParseError> {
-    let model = header.gm_type[name];
-    let precise = header.motion.allow_high_precision_mv;
-    let (abs_bits, prec_bits) = if index < 2 {
-        if model == 1 && !precise {
-            (GM_ABS_TRANS_ONLY_BITS - 1, TRANS_ONLY_PREC_BITS - 1)
-        } else if model == 1 {
-            (GM_ABS_TRANS_ONLY_BITS, TRANS_ONLY_PREC_BITS)
-        } else {
-            (GM_ABS_TRANS_BITS, TRANS_PREC_BITS)
-        }
-    } else {
-        (GM_ABS_ALPHA_BITS, ALPHA_PREC_BITS)
-    };
-    let prior = if header.primary_ref_frame == PRIMARY_REF_NONE {
-        header.gm_params[name][index]
-    } else {
-        let slot = header.refs.ref_frame_idx[usize::from(header.primary_ref_frame)];
-        views[usize::from(slot)].gm_params[name][index]
-    };
-    let prec_diff = WARPEDMODEL_PREC_BITS - prec_bits;
-    let sub = if index % 3 == 2 { 1 << prec_bits } else { 0 };
-    let round = if index % 3 == 2 {
-        1 << WARPEDMODEL_PREC_BITS
-    } else {
-        0
-    };
-    let mx = 1_i64 << abs_bits;
-    let reference = i64::from(prior) / (1_i64 << prec_diff) - sub;
-    let decoded = decode_signed_subexp(header.global.params[name][index], -mx, mx + 1, reference);
-    header.gm_params[name][index] =
-        i32::try_from(decoded * (1_i64 << prec_diff) + round).map_err(|_| {
-            ParseError::OutOfRange {
-                syntax: "frame gm param",
-            }
-        })?;
-    Ok(())
-}
-
-/// Signed sub-exponential value around `reference` within `low` and `high`.
-fn decode_signed_subexp(sub_exp: u32, low: i64, high: i64, reference: i64) -> i64 {
-    let range = high - low;
-    let centered = reference - low;
-    let value = if centered * 2 <= range {
-        inverse_recenter(centered, i64::from(sub_exp))
-    } else {
-        range - 1 - inverse_recenter(range - 1 - centered, i64::from(sub_exp))
-    };
-    value + low
-}
-
-/// Recentering of `value` around `anchor`.
-fn inverse_recenter(anchor: i64, value: i64) -> i64 {
-    if value > 2 * anchor {
-        value
-    } else if value & 1 == 1 {
-        anchor - ((value + 1) >> 1)
-    } else {
-        anchor + (value >> 1)
-    }
-}
-
-/// Tile group tile ranges over one OBU payload.
-pub(crate) struct ParsedTileGroup<'a> {
-    /// First tile index of the group.
-    pub start: u32,
-    /// Last tile index of the group.
-    pub end: u32,
-    /// Tile data past the group header.
-    pub data: &'a [u8],
-    /// Byte offset and size of each tile within `data`.
-    pub tiles: Vec<(usize, usize)>,
-}
-
-/// Tile group of one OBU payload expecting tiles from `expect_start`.
-pub(crate) fn parse_tile_group_obu<'a>(
-    payload: &'a [u8],
-    tiles: &TileLayout,
-    expect_start: u32,
-) -> Result<ParsedTileGroup<'a>, ParseError> {
-    let mut reader = BitReader::new(payload);
-    let count = u32::from(tiles.cols) * u32::from(tiles.rows);
-    let mut start = 0;
-    let mut end = count.saturating_sub(1);
-    if count > 1 && reader.bit("tile group present")? {
-        let width = tile_log2(1, u32::from(tiles.cols)) + tile_log2(1, u32::from(tiles.rows));
-        start = reader.bits("tile group start", width)?;
-        end = reader.bits("tile group end", width)?;
-        if start < expect_start || start >= count || end < start || end >= count {
-            return Err(ParseError::OutOfRange {
-                syntax: "tile group range",
-            });
-        }
-    } else if expect_start > 0 {
-        return Err(ParseError::OutOfRange {
-            syntax: "tile group range",
-        });
-    }
-    align_zero(&mut reader)?;
-    let data = &payload[reader.consumed() / 8..];
-    let tiles = split_tiles(data, start, end, tiles.size_bytes_minus_1)?;
-    Ok(ParsedTileGroup {
-        start,
-        end,
-        data,
-        tiles,
-    })
-}
-
-/// Consume bit padding, rejecting nonzero bits.
-fn align_zero(reader: &mut BitReader<'_>) -> Result<(), ParseError> {
-    while !reader.consumed().is_multiple_of(8) {
-        if reader.bit("tile group align")? {
-            return Err(ParseError::OutOfRange {
-                syntax: "tile group align",
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Tile ranges of `data` for tiles `start` through `end`.
-fn split_tiles(
-    data: &[u8],
-    start: u32,
-    end: u32,
-    size_bytes_minus_1: u8,
-) -> Result<Vec<(usize, usize)>, ParseError> {
-    let width = usize::from(size_bytes_minus_1) + 1;
-    let mut tiles = Vec::new();
-    let mut at = 0;
-    for tile in start..=end {
-        if tile == end {
-            tiles.push((at, data.len().saturating_sub(at)));
-            return Ok(tiles);
-        }
-        if data.len() < at + width {
-            return Err(ParseError::Truncated {
-                syntax: "tile size",
-            });
-        }
-        let mut size = 0_usize;
-        for index in 0..width {
-            size |= usize::from(data[at + index]) << (8 * index);
-        }
-        size += 1;
-        at += width;
-        if data.len() < at + size {
-            return Err(ParseError::Truncated {
-                syntax: "tile data",
-            });
-        }
-        tiles.push((at, size));
-        at += size;
-    }
-    Ok(tiles)
-}
-
-/// Frame OBU: header plus its tile group over one OBU payload.
-pub(crate) fn parse_frame_obu<'a>(
-    payload: &'a [u8],
-    seq: &SequenceHeader,
-    slots: &[SlotView; TOTAL_REFS],
-    expect_start: u32,
-) -> Result<(ParsedFrame, Option<ParsedTileGroup<'a>>), ParseError> {
-    let mut reader = BitReader::new(payload);
-    let parsed = parse_frame_header_with(&mut reader, seq, slots)?;
-    if parsed.header.show.show_existing {
-        return Ok((parsed, None));
-    }
-    align_zero(&mut reader)?;
-    let rest = &payload[reader.consumed() / 8..];
-    let group = parse_tile_group_obu(rest, parsed.header.tiles(), expect_start)?;
-    Ok((parsed, Some(group)))
-}
-
-/// Frame header over a shared reader, leaving the tile group unread.
-fn parse_frame_header_with(
-    reader: &mut BitReader<'_>,
-    seq: &SequenceHeader,
-    slots: &[SlotView; TOTAL_REFS],
-) -> Result<ParsedFrame, ParseError> {
-    let mut header = FrameHeader::default();
-    let mut views = *slots;
-    let mut invalidated = [false; TOTAL_REFS];
-    parse_show_frame(reader, seq, &mut header, &views)?;
-    if header.show.show_existing {
-        return Ok(show_existing_frame(seq, &views, header));
-    }
-    if header.frame_type == FRAME_KEY && header.display.show_frame {
-        for view in &mut views {
-            *view = SlotView::default();
-        }
-    }
-    let reset_all = header.frame_type == FRAME_KEY && header.display.show_frame;
-    parse_tools(reader, seq, &mut header)?;
-    parse_frame_id(reader, seq, &mut header, &mut views, &mut invalidated)?;
-    parse_order_hint(reader, seq, &mut header)?;
-    parse_buffer_removal(reader, seq)?;
-    parse_refresh(reader, &mut header)?;
-    parse_ref_order_hints(reader, seq, &mut header, &mut views, &mut invalidated)?;
-    if header.is_intra() {
-        parse_frame_size(reader, seq, &mut header)?;
-        parse_render_size(reader, &mut header)?;
-        header.content.allow_intrabc = header.content.allow_screen_content_tools
-            && header.sizes.upscaled_width == header.sizes.frame_width
-            && reader.bit("frame intrabc")?;
-    } else {
-        parse_inter_refs(reader, seq, &mut header, &views)?;
-        if header.sizing.frame_size_override_flag && !header.resilience.error_resilient_mode {
-            parse_frame_size_with_refs(reader, seq, &mut header, &views)?;
-        } else {
-            parse_frame_size(reader, seq, &mut header)?;
-            parse_render_size(reader, &mut header)?;
-        }
-        parse_inter_tools(reader, seq, &mut header)?;
-    }
-    if seq.reduced() || header.resilience.disable_cdf_update {
-        header.resilience.frame_end_update_disabled = true;
-    } else {
-        header.resilience.frame_end_update_disabled = reader.bit("frame end cdf")?;
-    }
-    let lossless = parse_tiles_quant_seg(reader, seq, &mut header, &views)?;
-    parse_loop_filter(reader, seq, &mut header, &views, lossless)?;
-    parse_cdef(reader, seq, &mut header, lossless)?;
-    parse_restoration(reader, seq, &mut header, lossless)?;
-    parse_tx_mode(reader, &mut header, lossless)?;
-    if header.is_intra() {
-        header.prediction.reference_select = false;
-    } else {
-        header.prediction.reference_select = reader.bit("frame ref select")?;
-    }
-    parse_skip_mode(reader, seq, &mut header, &views)?;
-    if header.is_intra() || header.resilience.error_resilient_mode || !seq.enable_warped_motion() {
-        header.prediction.allow_warped_motion = false;
-    } else {
-        header.prediction.allow_warped_motion = reader.bit("frame warped")?;
-    }
-    header.reduced_tx_set = reader.bit("frame reduced tx")?;
-    parse_global_motion_syntax(reader, &mut header)?;
-    parse_film_grain(reader, seq, &mut header, &views)?;
-    derive_frame_state(seq, &mut header, &views)?;
-    Ok(ParsedFrame {
-        header,
-        reset_all,
-        invalidated,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        inverse_recenter, relative_dist, split_obus, split_tiles, temporal_units, tile_log2,
-        uleb128, SequenceHeader,
+        relative_dist, split_obus, split_tiles, temporal_units, tile_log2, SequenceHeader,
     };
 
     /// Sequence header with 3-bit order hints for distance tests.
@@ -3563,15 +2417,7 @@ mod tests {
             color: super::ColorConfig::default(),
             film_grain_params_present: false,
             bit_depth: 8,
-            num_planes: 3,
         }
-    }
-
-    #[test]
-    fn uleb128_decodes_multibyte() {
-        assert_eq!(uleb128(&[0x05], "t").expect("one"), (5, 1));
-        assert_eq!(uleb128(&[0x81, 0x01], "t").expect("two"), (129, 2));
-        assert!(uleb128(&[0x80], "t").is_err());
     }
 
     #[test]
@@ -3640,21 +2486,6 @@ mod tests {
     }
 
     #[test]
-    fn inverse_recenter_round_trips_small_deltas() {
-        assert_eq!(inverse_recenter(8, 0), 8);
-        assert_eq!(inverse_recenter(8, 1), 7);
-        assert_eq!(inverse_recenter(8, 2), 9);
-        assert_eq!(inverse_recenter(8, 17), 17);
-    }
-
-    #[test]
-    fn signed_subexp_decodes_around_reference() {
-        assert_eq!(super::decode_signed_subexp(0, -8, 9, 0), 0);
-        assert_eq!(super::decode_signed_subexp(1, -8, 9, 0), -1);
-        assert_eq!(super::decode_signed_subexp(2, -8, 9, 0), 1);
-    }
-
-    #[test]
     fn libaom_sequence_header_pins_geometry() {
         let payload = crate::parse::test_support::hex("000000043cffbcfaf98040");
         let seq = super::parse_sequence_header(&payload).expect("seq");
@@ -3690,27 +2521,6 @@ mod tests {
     }
 
     #[test]
-    fn set_frame_refs_assigns_by_hint_distance() {
-        let seq = seq_with_hints();
-        let mut header = super::FrameHeader {
-            order_hint: 4,
-            refs: super::FrameRefs {
-                last_idx: 1,
-                golden_idx: 2,
-                ..super::FrameRefs::default()
-            },
-            ..super::FrameHeader::default()
-        };
-        let mut views = [super::SlotView::default(); super::TOTAL_REFS];
-        for (index, view) in views.iter_mut().enumerate() {
-            view.valid = true;
-            view.order_hint = u8::try_from(index).expect("slot");
-        }
-        super::set_frame_refs(&seq, &mut header, &views);
-        assert_eq!(header.refs.ref_frame_idx, [1, 3, 0, 2, 4, 5, 7]);
-    }
-
-    #[test]
     fn skip_mode_refs_span_current_hint() {
         let seq = seq_with_hints();
         let header = super::FrameHeader {
@@ -3729,37 +2539,5 @@ mod tests {
         let (forward, backward) = super::skip_mode_refs(&seq, &header, &views);
         assert_eq!(forward, Some(3));
         assert_eq!(backward, Some(5));
-    }
-
-    #[test]
-    fn global_motion_derives_identity_and_translation() {
-        let mut header = super::FrameHeader {
-            frame_type: 1,
-            primary_ref_frame: 7,
-            global: super::GlobalMotionSyntax {
-                is_global: [false, true, true, false, false, false, false, false],
-                is_rot_zoom: [false, false, true, false, false, false, false, false],
-                is_translation: [false, true, false, false, false, false, false, false],
-                params: [
-                    [0; 6],
-                    [2, 0, 0, 0, 0, 0],
-                    [0; 6],
-                    [0; 6],
-                    [0; 6],
-                    [0; 6],
-                    [0; 6],
-                    [0; 6],
-                ],
-            },
-            ..super::FrameHeader::default()
-        };
-        let views = [super::SlotView::default(); super::TOTAL_REFS];
-        super::derive_global_motion(&mut header, &views).expect("derive");
-        assert_eq!(header.gm_type()[1], 1);
-        assert_eq!(header.gm_params()[1][0], 16384);
-        assert_eq!(header.gm_params()[1][1], 0);
-        assert_eq!(header.gm_type()[2], 2);
-        assert_eq!(header.gm_params()[2], [0, 0, 65536, 0, 0, 65536]);
-        assert_eq!(header.gm_params()[3], [0, 0, 65536, 0, 0, 65536]);
     }
 }

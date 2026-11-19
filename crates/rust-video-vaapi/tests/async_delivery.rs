@@ -4,15 +4,10 @@
 
 #![cfg(target_os = "linux")]
 
-use std::num::NonZeroUsize;
-
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, ReceiveFrames};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets};
 use rust_video_vaapi::{
     Av1Decoder, DecoderPump, H264Decoder, H265Decoder, VaApiDevice, VaApiError, VaApiFrame,
 };
@@ -28,19 +23,17 @@ fn device(name: &str) -> Option<VaApiDevice> {
     }
 }
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
-/// Packets over `raws`, built once outside the pump.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+/// One in-flight frame into `frames`, freeing send room.
+fn drain<P>(pump: &mut P, frames: &mut Vec<P::Frame>)
+where
+    P: ReceiveFrames,
+    P::Error: std::fmt::Debug,
+{
+    frames.push(
+        pump.receive()
+            .expect("in-flight frame completes")
+            .expect("input unfinished"),
+    );
 }
 
 /// Sent packets return as owned frames; blocking receive drains the tail.
@@ -49,19 +42,10 @@ fn loopback(
     packets: &[Packet],
     name: &str,
 ) -> Vec<VaApiFrame> {
-    let mut pump = DecoderPump::open(decoder, config(32, DropPolicy::DropOldest));
-    for packet in packets {
-        pump.try_send(packet.clone()).expect("queue room");
-    }
-    let mut frames = Vec::new();
-    while let Some(frame) = pump.try_receive().expect("poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("finish drains");
+    let mut pump = DecoderPump::open(decoder, Drive::channel(32, DropPolicy::DropOldest));
+    let (mut frames, _) = Drive::send_all(&mut pump, packets, drain);
+    frames.extend(Drive::finish_all(&mut pump));
     assert!(pump.is_finished());
-    while let Some(frame) = pump.receive().expect("trailing drain") {
-        frames.push(frame);
-    }
     assert!(!frames.is_empty(), "{name}: loopback decoded no frames");
     let generations: Vec<u64> = frames
         .iter()
@@ -86,7 +70,7 @@ fn av1_send_poll_loopback_returns_own_frames() {
         return;
     };
     let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
-    let packets = packets(&[bytes]);
+    let packets = Packets::from_raws(&[bytes]);
     loopback(Av1Decoder::open(&device), &packets, "av1");
 }
 
@@ -98,7 +82,7 @@ fn h264_send_poll_loopback_returns_own_frames() {
         return;
     };
     let raws = H264Synth::annex_b_h264_packets();
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let frames = loopback(H264Decoder::open(&device), &packets, "h264");
     assert_eq!(frames.len(), 1, "synth vector holds one picture");
     assert_eq!(frames[0].nv12().len(), FRAME_BYTES, "tight NV12 bytes");
@@ -114,6 +98,6 @@ fn h265_send_poll_loopback_returns_own_frames() {
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     loopback(H265Decoder::open(&device), &packets, "h265");
 }

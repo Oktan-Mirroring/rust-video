@@ -6,8 +6,6 @@
 use std::fs;
 #[cfg(feature = "ffmpeg")]
 use std::hint::black_box;
-#[cfg(feature = "ffmpeg")]
-use std::num::NonZeroUsize;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use std::time::Instant;
 
@@ -16,9 +14,7 @@ use bytes::Bytes;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::common::PictureSize;
 #[cfg(feature = "ffmpeg")]
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::frame::GpuExport;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
@@ -32,7 +28,7 @@ use rust_video_caps::traits::Encoder;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_harness::Synth;
 #[cfg(feature = "ffmpeg")]
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets};
 #[cfg(all(feature = "h264-openh264", nasm_available))]
 use rust_video_sw::H264Encoder;
 #[cfg(feature = "gpl")]
@@ -61,25 +57,13 @@ const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 
 #[cfg(feature = "ffmpeg")]
-/// Packets over `raws`.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
-#[cfg(feature = "ffmpeg")]
 /// Measured fps of `ITERS` 1080p decode passes through `decoder`.
 fn decode_fps<D>(decoder: &mut D, packets: &[Packet]) -> f64
 where
     D: Decoder<Frame = CpuFrame>,
     D::Error: std::fmt::Debug,
 {
-    let mut warm = 0;
-    for packet in packets {
-        warm += decoder.decode(packet).expect("warmup decode").len();
-    }
-    warm += decoder.flush().expect("warmup flush").len();
+    let warm = Drive::decode_all(decoder, packets).len();
     assert!(warm > 0, "vector decodes");
     let mut frames: u32 = 0;
     let start = Instant::now();
@@ -94,13 +78,6 @@ where
     let elapsed = start.elapsed().as_secs_f64();
     assert!(frames > 0);
     f64::from(frames) / elapsed
-}
-
-#[cfg(feature = "ffmpeg")]
-/// Queue bound behind the surface benches; polled eager, never near full.
-fn surface_config() -> ChannelConfig {
-    let bound = NonZeroUsize::new(1024).expect("queue bound");
-    ChannelConfig::new(bound, DropPolicy::DropOldest)
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -158,7 +135,7 @@ where
     D: Decoder<Frame = CpuFrame>,
     D::Error: std::fmt::Debug,
 {
-    let mut pump = DecoderPump::open(decoder, surface_config());
+    let mut pump = DecoderPump::open(decoder, Drive::channel(1024, DropPolicy::DropOldest));
     let mut warm = 0u32;
     for packet in packets {
         pump.try_send(packet.clone()).expect("warmup send");
@@ -258,7 +235,7 @@ fn h264_decode_1080p_measures_realtime() {
         }
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let measured = decode_fps(&mut decoder, &packets(&raws));
+    let measured = decode_fps(&mut decoder, &Packets::from_raws(&raws));
     println!("sw h264 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -279,7 +256,7 @@ fn h265_decode_1080p_measures_realtime() {
     };
     let bytes = fs::read(bench_dir().join("h265-1080p-nvenc.h265")).expect("h265 vector readable");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
-    let measured = decode_fps(&mut decoder, &packets(&raws));
+    let measured = decode_fps(&mut decoder, &Packets::from_raws(&raws));
     println!("sw h265 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -299,7 +276,7 @@ fn vp8_decode_1080p_measures_realtime() {
         }
     };
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
-    let measured = decode_fps(&mut decoder, &packets(&raws));
+    let measured = decode_fps(&mut decoder, &Packets::from_raws(&raws));
     println!("sw vp8 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -319,7 +296,7 @@ fn vp9_decode_1080p_measures_realtime() {
         }
     };
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
-    let measured = decode_fps(&mut decoder, &packets(&raws));
+    let measured = decode_fps(&mut decoder, &Packets::from_raws(&raws));
     println!("sw vp9 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -360,7 +337,7 @@ fn h264_surface_1080p_measures_realtime() {
         }
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let measured = surface_fps(decoder, &packets(&raws));
+    let measured = surface_fps(decoder, &Packets::from_raws(&raws));
     println!("sw h264 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -381,7 +358,7 @@ fn h265_surface_1080p_measures_realtime() {
     };
     let bytes = fs::read(bench_dir().join("h265-1080p-nvenc.h265")).expect("h265 vector readable");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
-    let measured = surface_fps(decoder, &packets(&raws));
+    let measured = surface_fps(decoder, &Packets::from_raws(&raws));
     println!("sw h265 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -401,7 +378,7 @@ fn vp8_surface_1080p_measures_realtime() {
         }
     };
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
-    let measured = surface_fps(decoder, &packets(&raws));
+    let measured = surface_fps(decoder, &Packets::from_raws(&raws));
     println!("sw vp8 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -421,7 +398,7 @@ fn vp9_surface_1080p_measures_realtime() {
         }
     };
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
-    let measured = surface_fps(decoder, &packets(&raws));
+    let measured = surface_fps(decoder, &Packets::from_raws(&raws));
     println!("sw vp9 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,

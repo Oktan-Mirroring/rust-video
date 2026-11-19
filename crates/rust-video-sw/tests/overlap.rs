@@ -4,53 +4,20 @@
 
 #![cfg(feature = "ffmpeg")]
 
-use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets, TrySendError,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, H264Synth, Ivf};
+use rust_video_harness::{bench_dir, Drive, H264Synth, Ivf, Packets, Parity};
 use rust_video_sw::{
     H264Decoder, PhaseStats, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource,
     SplitDecoder, SwError, Vp9Decoder,
 };
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
-/// Packets over `raws`, built once outside the pump.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
-/// Frames decoded straight through `decoder`, the pump oracle.
-fn oracle<D>(decoder: &mut D, packets: &[Packet]) -> Vec<CpuFrame>
-where
-    D: Decoder<Frame = CpuFrame>,
-    D::Error: std::fmt::Debug,
-{
-    let mut frames = Vec::new();
-    for packet in packets {
-        frames.extend(decoder.decode(packet).expect("oracle decode"));
-    }
-    frames.extend(decoder.flush().expect("oracle flush"));
-    frames
-}
-
 /// Ready frames moved into `frames`, waiting for one when empty.
-fn drain_ready<D>(pump: &mut PipelinedPump<D>, frames: &mut Vec<CpuFrame>)
+fn drain<D>(pump: &mut PipelinedPump<D>, frames: &mut Vec<CpuFrame>)
 where
     D: SplitDecoder<Frame = CpuFrame>,
     D::Error: std::fmt::Debug,
@@ -76,23 +43,12 @@ where
     D: RawSource<Frame = CpuFrame, Error = SwError>,
 {
     let decoder = PipelinedDecoder::open(inner, PipelineConfig::default().with_pace(pace));
-    let mut pump = PipelinedPump::open(decoder, config(packets.len() + 8, DropPolicy::DropOldest));
-    let mut frames = Vec::new();
-    let mut at = 0;
-    while at < packets.len() {
-        match pump.try_send(packets[at].clone()) {
-            Ok(()) => at += 1,
-            Err(TrySendError::Full { .. }) => drain_ready(&mut pump, &mut frames),
-            Err(TrySendError::Failed { error }) => panic!("submit failed: {error}"),
-        }
-    }
-    while let Some(frame) = pump.try_receive().expect("poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("drain") {
-        frames.push(frame);
-    }
+    let mut pump = PipelinedPump::open(
+        decoder,
+        Drive::channel(packets.len() + 8, DropPolicy::DropOldest),
+    );
+    let (mut frames, _) = Drive::send_all(&mut pump, packets, drain);
+    frames.extend(Drive::finish_all(&mut pump));
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
     let stats = pump.stats();
     (frames, stats)
@@ -123,7 +79,7 @@ fn vp9_or_skip() -> Option<impl Fn() -> Vp9Decoder> {
 /// One synth IDR repeated into `count` packets.
 fn repeated_idr(count: usize) -> Vec<Packet> {
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let one = packets(&raws);
+    let one = Packets::from_raws(&raws);
     assert_eq!(one.len(), 1, "synth holds one IDR");
     one.iter().cycle().take(count).cloned().collect()
 }
@@ -135,10 +91,10 @@ fn pipelined_matches_sync_bytes_h264() {
         return;
     };
     let packets = repeated_idr(1);
-    let expected = oracle(&mut open(), &packets);
+    let expected = Drive::decode_all(&mut open(), &packets);
     assert!(!expected.is_empty(), "h264 vector decodes");
     let (frames, stats) = pipelined(open(), Duration::ZERO, &packets);
-    assert_same_frames(&frames, &expected, "h264");
+    Parity::assert_cpu_frames("h264", &frames, &expected);
     assert!(stats.max_inflight() >= 1, "conversions ran");
     println!(
         "sw h264 overlap: max_inflight={} overlap={} frames={}",
@@ -155,11 +111,11 @@ fn pipelined_matches_sync_bytes_vp9_bench() {
         return;
     };
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
-    let packets = packets(&raws);
-    let expected = oracle(&mut open(), &packets);
+    let packets = Packets::from_raws(&raws);
+    let expected = Drive::decode_all(&mut open(), &packets);
     assert!(!expected.is_empty(), "vp9 vector decodes");
     let (frames, stats) = pipelined(open(), Duration::ZERO, &packets);
-    assert_same_frames(&frames, &expected, "vp9");
+    Parity::assert_cpu_frames("vp9", &frames, &expected);
     println!(
         "sw vp9 overlap: frames={} max_inflight={} overlap={} submit_ms={:.3} engine_ms={:.3} copy_ms={:.3}",
         frames.len(),
@@ -178,10 +134,10 @@ fn paced_overlap_observes_depth_above_one() {
         return;
     };
     let packets = repeated_idr(32);
-    let expected = oracle(&mut open(), &packets);
+    let expected = Drive::decode_all(&mut open(), &packets);
     assert!(!expected.is_empty(), "h264 vector decodes");
     let (frames, stats) = pipelined(open(), Duration::from_millis(20), &packets);
-    assert_same_frames(&frames, &expected, "h264");
+    Parity::assert_cpu_frames("h264", &frames, &expected);
     assert!(stats.max_inflight() > 1, "depth observed above one");
     assert!(stats.overlap_observed(), "submit shared conversion time");
     let serial = stats.submit_total() + stats.engine_total() + stats.copy_total();
@@ -199,15 +155,11 @@ fn phase_table_shows_latency_parity() {
         return;
     };
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
-    let packets = packets(&raws);
-    let mut warm = 0;
-    {
+    let packets = Packets::from_raws(&raws);
+    let warm = {
         let mut decoder = open();
-        for packet in &packets {
-            warm += decoder.decode(packet).expect("warmup decode").len();
-        }
-        warm += decoder.flush().expect("warmup flush").len();
-    }
+        Drive::decode_all(&mut decoder, &packets).len()
+    };
     assert!(warm > 0, "vp9 vector decodes");
     let (warmed, _) = pipelined(open(), Duration::ZERO, &packets);
     assert!(!warmed.is_empty(), "pipelined warmup decodes");
@@ -260,35 +212,4 @@ fn phase_table_shows_latency_parity() {
         first_pipe <= first_sync.mul_f64(2.0),
         "first-frame parity: pipe {first_pipe:?} vs sync {first_sync:?}"
     );
-}
-
-/// Same geometry, format, and plane bytes at `index` of `codec`.
-fn assert_same_frame(left: &CpuFrame, right: &CpuFrame, index: usize, codec: &str) {
-    assert_eq!(left.size(), right.size(), "{codec} frame {index} size");
-    assert_eq!(
-        left.format(),
-        right.format(),
-        "{codec} frame {index} format"
-    );
-    assert_eq!(
-        left.planes().len(),
-        right.planes().len(),
-        "{codec} frame {index} plane count"
-    );
-    for (plane, (l, r)) in left.planes().iter().zip(right.planes().iter()).enumerate() {
-        assert_eq!(
-            l.stride(),
-            r.stride(),
-            "{codec} frame {index} plane {plane}"
-        );
-        assert_eq!(l.data(), r.data(), "{codec} frame {index} plane {plane}");
-    }
-}
-
-/// Same frames in order.
-fn assert_same_frames(frames: &[CpuFrame], expected: &[CpuFrame], codec: &str) {
-    assert_eq!(frames.len(), expected.len(), "{codec} frame count");
-    for (index, (frame, want)) in frames.iter().zip(expected.iter()).enumerate() {
-        assert_same_frame(frame, want, index, codec);
-    }
 }

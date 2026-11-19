@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, decode_dir, AnnexB, Ivf};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB, Drive, Ivf};
 use rust_video_mediacodec::{
     FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, SubmitOutcome,
 };
@@ -142,21 +142,14 @@ fn check_matched(name: &str, decoder: &MediaCodecDecoder) {
 
 /// Surfaces decoded straight through sync `decode`, plus the flush drain.
 fn sync_run(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, Vec<u8>) {
+    let frames = Drive::decode_all(decoder, coded);
     let mut bytes = Vec::new();
-    let mut count = 0;
-    for packet in coded {
-        let surfaces = decoder.decode(packet).expect("sync decode");
-        count += surfaces.len();
-        push_bytes(&mut bytes, &surfaces);
-    }
-    let tail = decoder.flush().expect("sync drain");
-    count += tail.len();
-    push_bytes(&mut bytes, &tail);
-    (count, bytes)
+    push_bytes(&mut bytes, &frames);
+    (frames.len(), bytes)
 }
 
 /// Surfaces decoded through batched pipelined submits, plus the drain.
-fn pipelined_run(mut decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, Vec<u8>) {
+fn pipelined_run(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, Vec<u8>) {
     let mut bytes = Vec::new();
     let mut count = 0;
     for packet in coded {
@@ -167,10 +160,10 @@ fn pipelined_run(mut decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usiz
             if outcome == SubmitOutcome::Queued {
                 break;
             }
-            count += drain_bytes(&mut decoder, &mut bytes);
+            count += drain_bytes(decoder, &mut bytes);
         }
     }
-    count += drain_bytes(&mut decoder, &mut bytes);
+    count += drain_bytes(decoder, &mut bytes);
     let tail = decoder.flush().expect("pipelined drain");
     count += tail.len();
     push_bytes(&mut bytes, &tail);

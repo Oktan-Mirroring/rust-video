@@ -7,10 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth};
+use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Parity};
 use rust_video_vaapi::{
     Av1Decoder, H264Decoder, H265Decoder, PhaseStats, SubmitStats, VaApiDevice, VaApiFrame,
 };
@@ -27,13 +26,6 @@ fn device(name: &str) -> Option<VaApiDevice> {
             None
         }
     }
-}
-
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
 }
 
 /// Overlapped depth under test: env override or three.
@@ -120,16 +112,9 @@ fn run(
 
 /// Byte-exact frames across both legs.
 fn assert_parity(name: &str, sync: &[VaApiFrame], pipelined: &[VaApiFrame]) {
-    assert_eq!(sync.len(), pipelined.len(), "{name}: frame count");
     assert!(!sync.is_empty(), "{name}: legs decoded no frames");
-    for (index, (left, right)) in sync.iter().zip(pipelined.iter()).enumerate() {
-        assert_eq!(
-            left.identity().generation(),
-            right.identity().generation(),
-            "{name}: frame {index} generation"
-        );
-        assert_eq!(left.nv12(), right.nv12(), "{name}: frame {index} bytes");
-    }
+    Parity::assert_bytes(name, sync, pipelined, VaApiFrame::nv12);
+    Parity::assert_generations(name, sync, pipelined, |frame| frame.identity().generation());
     println!(
         "vaapi {name} pipeline parity: {} frames byte-exact",
         sync.len()
@@ -170,7 +155,7 @@ fn h264_pipeline_matches_sync_bytes() {
         return;
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut sync = H264Decoder::open(&device);
     sync.set_depth(1);
     let (sync_frames, _) = run(&mut sync, &packets, PASSES);
@@ -187,7 +172,7 @@ fn h264_pipeline_overlaps_copy_with_engine() {
         return;
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H264Decoder::open(&device);
     decoder.set_depth(depth());
     let (frames, wall) = run(&mut decoder, &packets, PASSES);
@@ -208,7 +193,7 @@ fn h264_pipeline_keeps_per_frame_latency() {
         return;
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut sync = H264Decoder::open(&device);
     sync.set_depth(1);
     let (sync_frames, sync_wall) = run(&mut sync, &packets, PASSES);
@@ -249,7 +234,7 @@ fn h265_pipeline_matches_sync_bytes() {
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut sync = H265Decoder::open(&device);
     sync.set_depth(1);
     let (sync_frames, _) = run(&mut sync, &packets, 1);
@@ -269,7 +254,7 @@ fn h265_pipeline_overlaps_copy_with_engine() {
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H265Decoder::open(&device);
     decoder.set_depth(depth());
     let (frames, wall) = run(&mut decoder, &packets, 1);
@@ -290,7 +275,7 @@ fn av1_pipeline_matches_sync_bytes() {
         return;
     };
     let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
-    let packets = packets(&[bytes]);
+    let packets = Packets::from_raws(&[bytes]);
     let mut sync = Av1Decoder::open(&device);
     sync.set_depth(1);
     let (sync_frames, _) = run(&mut sync, &packets, PASSES);
@@ -307,7 +292,7 @@ fn av1_pipeline_overlaps_copy_with_engine() {
         return;
     };
     let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
-    let packets = packets(&[bytes]);
+    let packets = Packets::from_raws(&[bytes]);
     let mut decoder = Av1Decoder::open(&device);
     decoder.set_depth(depth());
     let (frames, wall) = run(&mut decoder, &packets, PASSES);

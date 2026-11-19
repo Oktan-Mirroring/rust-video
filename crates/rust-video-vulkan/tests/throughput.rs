@@ -2,26 +2,18 @@
 //!
 //! Skips without hardware; a hardware run fails below the bar.
 
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rust_video_vulkan::{
     Av1Decoder, CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, OverlapPump,
     OverlappedDecode, ParseError, VulkanDevice, VulkanError, VulkanFrame,
 };
 
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets, TrySendError,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf, Synth};
-
-// Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
-static SERIAL: Mutex<()> = Mutex::new(());
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
 
 /// Iters timed after warmup.
 const ITERS: u32 = 30;
@@ -49,13 +41,6 @@ fn device_or_skip(op: CodecOp) -> Option<VulkanDevice> {
     }
 }
 
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
 /// True when `error` is the tier declining the vector's PTL profile.
 fn profile_gap(error: &VulkanError) -> bool {
     matches!(
@@ -72,8 +57,8 @@ fn decode_fps(
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
 ) -> Result<f64, VulkanError> {
-    let warmup = packets(warmup);
-    let raws = packets(raws);
+    let warmup = Packets::from_raws(warmup);
+    let raws = Packets::from_raws(raws);
     for packet in &warmup {
         decoder.decode(packet)?;
     }
@@ -141,8 +126,8 @@ fn decode_surface_fps(
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
 ) -> Result<f64, VulkanError> {
-    let warmup = packets(warmup);
-    let raws = packets(raws);
+    let warmup = Packets::from_raws(warmup);
+    let raws = Packets::from_raws(raws);
     for packet in &warmup {
         decoder.decode_surface(packet)?;
     }
@@ -191,7 +176,7 @@ fn encode_fps(encoder: &mut impl Encoder<Error = VulkanError>, frames: &[CpuFram
 /// 1080p H.264 decode measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Decode) else {
         return;
     };
@@ -214,7 +199,7 @@ fn decode_h264_1080p_measures_realtime() {
 /// 1080p H.265 decode measured against the realtime bar.
 #[test]
 fn decode_h265_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Decode) else {
         return;
     };
@@ -247,7 +232,7 @@ fn decode_h265_1080p_measures_realtime() {
 /// 1080p AV1 decode measured against the realtime bar.
 #[test]
 fn decode_av1_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
         return;
     };
@@ -270,7 +255,7 @@ fn decode_av1_1080p_measures_realtime() {
 /// 1080p H.264 surface decode measured against the realtime bar.
 #[test]
 fn surface_h264_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Decode) else {
         return;
     };
@@ -300,7 +285,7 @@ fn surface_h264_1080p_measures_realtime() {
 /// 1080p H.265 surface decode measured against the realtime bar.
 #[test]
 fn surface_h265_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Decode) else {
         return;
     };
@@ -337,7 +322,7 @@ fn surface_h265_1080p_measures_realtime() {
 /// 1080p AV1 surface decode measured against the realtime bar.
 #[test]
 fn surface_av1_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
         return;
     };
@@ -367,7 +352,7 @@ fn surface_av1_1080p_measures_realtime() {
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Encode) else {
         return;
     };
@@ -390,7 +375,7 @@ fn encode_h264_1080p_measures_realtime() {
 /// 1080p H.265 encode measured against the realtime bar.
 #[test]
 fn encode_h265_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Encode) else {
         return;
     };
@@ -410,46 +395,16 @@ fn encode_h265_1080p_measures_realtime() {
     );
 }
 
-/// Bound of `capacity` frames under `policy`.
-fn overlap_config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
-/// Send `packet`, retaining every frame surfacing under backpressure.
-fn overlap_send<D: OverlappedDecode>(
-    pump: &mut OverlapPump<D>,
-    packet: Packet,
-    frames: &mut Vec<VulkanFrame>,
-) {
-    let mut pending = packet;
-    loop {
-        match pump.try_send(pending) {
-            Ok(()) => return,
-            Err(TrySendError::Full { packet }) => {
-                pending = packet;
-                while let Some(frame) = pump.try_receive().expect("poll") {
-                    frames.push(frame);
-                }
-                if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
-                    match pump.receive_timeout(Duration::from_secs(10)) {
-                        Ok(frame) => frames.extend(frame),
-                        Err(error) => panic!("completions stall: {error:?}"),
-                    }
-                }
-            }
-            Err(TrySendError::Failed { error }) => panic!("submit runs: {error}"),
-        }
-    }
-}
-
-/// Finish `pump`, draining every trailing frame through blocking receive.
-fn overlap_drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("drain") {
+/// Frames surfacing under backpressure into `frames`, freeing send room.
+fn drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
+    while let Some(frame) = pump.try_receive().expect("poll") {
         frames.push(frame);
+    }
+    if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
+        match pump.receive_timeout(Duration::from_secs(10)) {
+            Ok(frame) => frames.extend(frame),
+            Err(error) => panic!("completions stall: {error:?}"),
+        }
     }
 }
 
@@ -457,24 +412,17 @@ fn overlap_drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Ve
 fn sustained_fps<D: OverlappedDecode>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize) {
     let mut pump = OverlapPump::open(
         decoder,
-        overlap_config(raws.len() + 16, DropPolicy::DropOldest),
+        Drive::channel(raws.len() + 16, DropPolicy::DropOldest),
     );
-    let mut frames = Vec::new();
-    let start = Instant::now();
-    for packet in packets(raws) {
-        overlap_send(&mut pump, packet, &mut frames);
-    }
-    overlap_drain(&mut pump, &mut frames);
-    let wall = start.elapsed();
+    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(raws), drain);
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    let total = u32::try_from(frames.len()).expect("frame count fits");
-    (f64::from(total) / wall.as_secs_f64(), frames.len())
+    (measured, count)
 }
 
 /// Sustained 1080p H.264 overlap throughput against its bar.
 #[test]
 fn sustained_h264_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Decode) else {
         return;
     };
@@ -500,7 +448,7 @@ fn sustained_h264_1080p_measures_realtime() {
 /// Sustained 1080p H.265 overlap throughput against its bar.
 #[test]
 fn sustained_h265_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Decode) else {
         return;
     };
@@ -526,7 +474,7 @@ fn sustained_h265_1080p_measures_realtime() {
 /// Sustained 1080p AV1 overlap throughput against its bar.
 #[test]
 fn sustained_av1_1080p_measures_realtime() {
-    let _guard = SERIAL.lock().expect("bench lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
         return;
     };

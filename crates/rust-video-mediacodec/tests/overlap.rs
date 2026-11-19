@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{AnnexB, H264Synth};
+use rust_video_harness::{AnnexB, Drive, H264Synth};
 use rust_video_mediacodec::{
     FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, PipelineLedger,
     SubmitOutcome,
@@ -129,6 +129,28 @@ fn h264_case() -> (FormatSpec, Vec<Packet>) {
     (spec, packets(&raws))
 }
 
+/// Surface count plus plane bytes for `coded` through the pipelined path.
+fn pipelined_bytes(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, Vec<u8>) {
+    let mut bytes = Vec::new();
+    let mut count = 0;
+    for packet in coded {
+        loop {
+            let (outcome, surfaces) = decoder.submit_nowait(packet).expect("queue attempt");
+            count += surfaces.len();
+            push_bytes(&mut bytes, &surfaces);
+            if outcome == SubmitOutcome::Queued {
+                break;
+            }
+            count += drain_bytes(decoder, &mut bytes);
+        }
+    }
+    count += drain_bytes(decoder, &mut bytes);
+    let tail = decoder.flush().expect("pipelined drain");
+    count += tail.len();
+    push_bytes(&mut bytes, &tail);
+    (count, bytes)
+}
+
 /// Batched submits observe more than one frame in flight on hardware.
 #[test]
 fn pipelined_decode_overlaps_inputs_on_device() {
@@ -139,23 +161,7 @@ fn pipelined_decode_overlaps_inputs_on_device() {
     let Some(mut decoder) = open_or_decline("h264", &spec) else {
         return;
     };
-    let mut bytes = Vec::new();
-    let mut count = 0;
-    for packet in &coded {
-        loop {
-            let (outcome, surfaces) = decoder.submit_nowait(packet).expect("queue attempt");
-            count += surfaces.len();
-            push_bytes(&mut bytes, &surfaces);
-            if outcome == SubmitOutcome::Queued {
-                break;
-            }
-            count += drain_bytes(&mut decoder, &mut bytes);
-        }
-    }
-    count += drain_bytes(&mut decoder, &mut bytes);
-    let tail = decoder.flush().expect("flush drains");
-    count += tail.len();
-    push_bytes(&mut bytes, &tail);
+    let (count, _bytes) = pipelined_bytes(&mut decoder, &coded);
     print_ledger("h264-overlap", &decoder);
     assert!(count > 0, "h264: pipelined run decodes");
     assert!(
@@ -179,37 +185,15 @@ fn pipelined_bytes_match_sync_decode_on_device() {
     let Some(mut sync) = open_or_decline("h264", &spec) else {
         return;
     };
+    let sync_frames = Drive::decode_all(&mut sync, &coded);
+    let sync_count = sync_frames.len();
     let mut sync_bytes = Vec::new();
-    let mut sync_count = 0;
-    for packet in &coded {
-        let surfaces = sync.decode(packet).expect("sync decode");
-        sync_count += surfaces.len();
-        push_bytes(&mut sync_bytes, &surfaces);
-    }
-    let tail = sync.flush().expect("sync drain");
-    sync_count += tail.len();
-    push_bytes(&mut sync_bytes, &tail);
+    push_bytes(&mut sync_bytes, &sync_frames);
 
     let Some(mut pipelined) = open_or_decline("h264", &spec) else {
         return;
     };
-    let mut pipe_bytes = Vec::new();
-    let mut pipe_count = 0;
-    for packet in &coded {
-        loop {
-            let (outcome, surfaces) = pipelined.submit_nowait(packet).expect("queue attempt");
-            pipe_count += surfaces.len();
-            push_bytes(&mut pipe_bytes, &surfaces);
-            if outcome == SubmitOutcome::Queued {
-                break;
-            }
-            pipe_count += drain_bytes(&mut pipelined, &mut pipe_bytes);
-        }
-    }
-    pipe_count += drain_bytes(&mut pipelined, &mut pipe_bytes);
-    let tail = pipelined.flush().expect("pipelined drain");
-    pipe_count += tail.len();
-    push_bytes(&mut pipe_bytes, &tail);
+    let (pipe_count, pipe_bytes) = pipelined_bytes(&mut pipelined, &coded);
 
     print_ledger("h264-sync", &sync);
     print_ledger("h264-pipelined", &pipelined);

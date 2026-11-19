@@ -4,12 +4,11 @@
 
 #![cfg(target_os = "linux")]
 
-use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Synth};
+use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Synth};
 use rust_video_vaapi::{
     Av1Decoder, EncodeCodec, H264Decoder, H265Decoder, VaApiDevice, VaApiEncoder, VaApiError,
     VaApiFrame,
@@ -137,13 +136,6 @@ fn encode_fps(encoder: &mut impl Encoder<Error = VaApiError>, frames: &[CpuFrame
     f64::from(coded) / elapsed
 }
 
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
 /// VA-API AV1 1080p decode measured against the realtime bar.
 #[test]
 fn av1_decode_1080p_measures_realtime() {
@@ -155,7 +147,7 @@ fn av1_decode_1080p_measures_realtime() {
         }
     };
     let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
-    let packets = packets(&[bytes]);
+    let packets = Packets::from_raws(&[bytes]);
     let mut decoder = Av1Decoder::open(&device);
     let measured = decode_fps(&mut decoder, &packets);
     println!("vaapi av1 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
@@ -176,7 +168,7 @@ fn h264_decode_1080p_measures_realtime() {
         }
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H264Decoder::open(&device);
     let measured = decode_fps(&mut decoder, &packets);
     println!("vaapi h264 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
@@ -232,7 +224,7 @@ fn h265_decode_1080p_measures_realtime() {
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H265Decoder::open(&device);
     let measured = decode_fps(&mut decoder, &packets);
     println!("vaapi h265 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
@@ -285,7 +277,7 @@ fn av1_decode_surface_1080p_measures_realtime() {
         }
     };
     let bytes = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("bench obu readable");
-    let packets = packets(&[bytes]);
+    let packets = Packets::from_raws(&[bytes]);
     let mut decoder = Av1Decoder::open(&device);
     let measured = surface_fps(&mut decoder, &packets);
     println!(
@@ -308,7 +300,7 @@ fn h264_decode_surface_1080p_measures_realtime() {
         }
     };
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H264Decoder::open(&device);
     let measured = surface_fps(&mut decoder, &packets);
     println!(
@@ -334,7 +326,7 @@ fn h265_decode_surface_1080p_measures_realtime() {
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut decoder = H265Decoder::open(&device);
     let measured = surface_fps(&mut decoder, &packets);
     println!(

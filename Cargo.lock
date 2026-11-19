@@ -332,6 +332,9 @@ dependencies = [
 [[package]]
 name = "rust-video-av1"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "rust-video-av2"
@@ -349,8 +352,12 @@ name = "rust-video-d3d11"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rust-video-av1",
  "rust-video-caps",
+ "rust-video-h264",
+ "rust-video-h265",
  "rust-video-harness",
+ "rust-video-vp9",
  "thiserror",
  "windows",
  "windows-core",
@@ -361,7 +368,10 @@ name = "rust-video-d3d12"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rust-video-av1",
  "rust-video-caps",
+ "rust-video-h264",
+ "rust-video-h265",
  "rust-video-harness",
  "thiserror",
  "windows",
@@ -426,6 +436,9 @@ dependencies = [
 [[package]]
 name = "rust-video-vp9"
 version = "0.1.0"
+dependencies = [
+ "rust-video-harness",
+]
 
 [[package]]
 name = "rust-video-vulkan"
@@ -436,7 +449,10 @@ dependencies = [
  "log",
  "memchr",
  "rust-video",
+ "rust-video-av1",
  "rust-video-caps",
+ "rust-video-h264",
+ "rust-video-h265",
  "rust-video-harness",
  "thiserror",
 ]

@@ -12,6 +12,8 @@ use crate::parse::av1;
 use crate::parse::h264;
 use crate::parse::h265;
 
+use rust_video_caps::dpb::PocTracker;
+
 /// Optional reference lists of one picture, L0 then L1.
 type RefLists = (Option<Vec<RefPicture>>, Option<Vec<RefPicture>>);
 
@@ -367,10 +369,8 @@ pub(crate) struct H264Context {
     prev_frame_num: u16,
     /// Previous frame-number offset.
     prev_offset: i32,
-    /// Previous POC most significant bits.
-    prev_msb: i64,
-    /// Previous POC least significant bits.
-    prev_lsb: u32,
+    /// Previous reference POC behind MSB derivation.
+    poc: PocTracker,
     /// Previous reference picture ran MMCO 5.
     prev_mmco5: bool,
     /// Highest long-term index in use.
@@ -390,8 +390,7 @@ impl H264Context {
             next_id: ReferenceId::default(),
             prev_frame_num: 0,
             prev_offset: 0,
-            prev_msb: 0,
-            prev_lsb: 0,
+            poc: PocTracker::new(),
             prev_mmco5: false,
             max_long_term: None,
             waiting_idr: false,
@@ -556,8 +555,8 @@ impl H264Context {
         if sps.pic_order_cnt_type() == 0 {
             let delta = i64::from(header.delta_pic_order_cnt_bottom());
             let top = i64::from(poc) - delta.min(0);
-            self.prev_msb = top - i64::from(header.pic_order_cnt_lsb());
-            self.prev_lsb = header.pic_order_cnt_lsb();
+            let lsb = header.pic_order_cnt_lsb();
+            self.poc.observe(top - i64::from(lsb), lsb);
         }
         assigned
     }
@@ -886,15 +885,10 @@ fn poc_type0(
 ) -> Option<i32> {
     let max = 1_i64 << sps.pic_order_cnt_lsb_bits();
     let lsb = i64::from(header.pic_order_cnt_lsb());
-    let prev_lsb = i64::from(context.prev_lsb);
     let msb = if is_idr || context.prev_mmco5 || context.first {
         0
-    } else if lsb < prev_lsb && prev_lsb - lsb >= max / 2 {
-        context.prev_msb + max
-    } else if lsb > prev_lsb && lsb - prev_lsb > max / 2 {
-        context.prev_msb - max
     } else {
-        context.prev_msb
+        context.poc.msb_for(lsb, max)
     };
     let top = msb + lsb;
     let bottom = top + i64::from(header.delta_pic_order_cnt_bottom());

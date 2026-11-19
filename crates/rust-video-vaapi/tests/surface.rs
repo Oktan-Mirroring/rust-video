@@ -4,20 +4,11 @@
 
 #![cfg(target_os = "linux")]
 
-use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{GpuExport, PixelFormat};
-use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
-use rust_video_harness::H264Synth;
+use rust_video_harness::{Drive, H264Synth, Packets};
 use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaSeam};
-
-/// Packets over raw Annex B payloads.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
 
 /// Open device, skipping `test` loudly without hardware.
 fn device(test: &str) -> Option<VaApiDevice> {
@@ -42,7 +33,7 @@ fn native_handles_are_exposed() {
     assert_eq!(decoder.device().name(), device.name());
     assert!(decoder.context().is_none());
     let raws = H264Synth::annex_b_packets();
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     for packet in &packets {
         decoder.decode(packet).expect("synth decodes");
     }
@@ -59,12 +50,8 @@ fn readback_frames_carry_surface_metadata() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws = H264Synth::annex_b_h264_packets();
-    let packets = packets(&raws);
-    let mut frames = Vec::new();
-    for packet in &packets {
-        frames.extend(decoder.decode(packet).expect("synth decodes"));
-    }
-    frames.extend(decoder.flush().expect("flush drains"));
+    let packets = Packets::from_raws(&raws);
+    let frames = Drive::decode_all(&mut decoder, &packets);
     assert_eq!(frames.len(), 1);
     let frame = &frames[0];
     assert_eq!(frame.size(), PictureSize::new(320, 240).expect("extent"));
@@ -89,12 +76,8 @@ fn cropped_frames_separate_visible_from_coded() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws = H264Synth::annex_b_h264_packets_cropped();
-    let packets = packets(&raws);
-    let mut frames = Vec::new();
-    for packet in &packets {
-        frames.extend(decoder.decode(packet).expect("synth decodes"));
-    }
-    frames.extend(decoder.flush().expect("flush drains"));
+    let packets = Packets::from_raws(&raws);
+    let frames = Drive::decode_all(&mut decoder, &packets);
     assert_eq!(frames.len(), 1);
     let frame = &frames[0];
     assert_eq!(frame.size(), PictureSize::new(320, 224).expect("extent"));
@@ -111,7 +94,7 @@ fn device_frames_wait_and_name_their_surface() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws = H264Synth::annex_b_h264_packets();
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut frames = Vec::new();
     for packet in &packets {
         frames.extend(decoder.decode_surface(packet).expect("synth decodes"));
@@ -139,7 +122,7 @@ fn exhausted_pool_fails_loud_with_no_free_slot() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws = H264Synth::annex_b_packets();
-    let packets = packets(&raws);
+    let packets = Packets::from_raws(&raws);
     let mut held = Vec::new();
     for _ in 0..32 {
         for packet in &packets {

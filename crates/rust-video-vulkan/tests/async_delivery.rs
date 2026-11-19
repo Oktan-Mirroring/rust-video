@@ -2,23 +2,14 @@
 //!
 //! Skips without hardware; fails when the contract breaks.
 
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
-
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets};
 use rust_video_vulkan::{
     Av1Decoder, CodecOp, DecoderPump, H264Decoder, H265Decoder, ParseError, VulkanDevice,
     VulkanError, VulkanFrame,
 };
-
-// Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Device for `op`, skipping loud when the tier declines.
 fn device_or_skip(op: CodecOp) -> Option<VulkanDevice> {
@@ -33,21 +24,6 @@ fn device_or_skip(op: CodecOp) -> Option<VulkanDevice> {
             None
         }
     }
-}
-
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
-/// Packets over `raws`, built once outside the pump.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
 }
 
 /// True when `error` is the tier declining the vector's PTL profile.
@@ -128,7 +104,7 @@ fn check_trailing(
 /// H.264 loopback: two synth packets return two owned frames.
 #[test]
 fn h264_send_poll_loopback_returns_own_frames() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Decode) else {
         return;
     };
@@ -136,16 +112,16 @@ fn h264_send_poll_loopback_returns_own_frames() {
         println!("vulkan skipped: h264 decode open failed");
         return;
     };
-    let mut pump = DecoderPump::open(decoder, config(8, DropPolicy::DropOldest));
+    let mut pump = DecoderPump::open(decoder, Drive::channel(8, DropPolicy::DropOldest));
     let raws = H264Synth::annex_b_packets();
     assert_eq!(raws.len(), 2, "synth holds sets plus two pictures");
-    check_loopback(&mut pump, &packets(&raws), 2);
+    check_loopback(&mut pump, &Packets::from_raws(&raws), 2);
 }
 
 /// H.264 trailing frame arrives over blocking receive.
 #[test]
 fn h264_blocking_receive_gets_trailing_frame() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H264Decode) else {
         return;
     };
@@ -153,15 +129,15 @@ fn h264_blocking_receive_gets_trailing_frame() {
         println!("vulkan skipped: h264 decode open failed");
         return;
     };
-    let mut pump = DecoderPump::open(decoder, config(8, DropPolicy::DropOldest));
+    let mut pump = DecoderPump::open(decoder, Drive::channel(8, DropPolicy::DropOldest));
     let raws = H264Synth::annex_b_packets();
-    check_trailing(&mut pump, &packets(&raws), 2);
+    check_trailing(&mut pump, &Packets::from_raws(&raws), 2);
 }
 
 /// H.265 loopback: bench pictures return as owned frames.
 #[test]
 fn h265_send_poll_loopback_returns_own_frames() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Decode) else {
         return;
     };
@@ -169,14 +145,14 @@ fn h265_send_poll_loopback_returns_own_frames() {
         println!("vulkan skipped: h265 decode open failed");
         return;
     };
-    let mut pump = DecoderPump::open(decoder, config(32, DropPolicy::DropOldest));
+    let mut pump = DecoderPump::open(decoder, Drive::channel(32, DropPolicy::DropOldest));
     let raws = AnnexB::picture_packets(
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
     let expected = raws.len();
     assert!(!raws.is_empty(), "bench vector holds pictures");
-    for packet in packets(&raws) {
+    for packet in Packets::from_raws(&raws) {
         match pump.try_send(packet) {
             Ok(()) => {}
             Err(rust_video_caps::delivery::TrySendError::Failed { error })
@@ -205,7 +181,7 @@ fn h265_send_poll_loopback_returns_own_frames() {
 /// H.265 trailing frame arrives over blocking receive.
 #[test]
 fn h265_blocking_receive_gets_trailing_frame() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::H265Decode) else {
         return;
     };
@@ -213,14 +189,14 @@ fn h265_blocking_receive_gets_trailing_frame() {
         println!("vulkan skipped: h265 decode open failed");
         return;
     };
-    let mut pump = DecoderPump::open(decoder, config(32, DropPolicy::DropOldest));
+    let mut pump = DecoderPump::open(decoder, Drive::channel(32, DropPolicy::DropOldest));
     let raws = AnnexB::picture_packets(
         &bench_dir().join("h265-1080p-nvenc.h265"),
         AnnexB::is_hevc_vcl,
     );
     let expected = raws.len();
     assert!(!raws.is_empty(), "bench vector holds pictures");
-    for packet in packets(&raws) {
+    for packet in Packets::from_raws(&raws) {
         match pump.try_send(packet) {
             Ok(()) => {}
             Err(rust_video_caps::delivery::TrySendError::Failed { error })
@@ -249,7 +225,7 @@ fn h265_blocking_receive_gets_trailing_frame() {
 /// AV1 loopback: bench pictures return as owned frames.
 #[test]
 fn av1_send_poll_loopback_returns_own_frames() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
         return;
     };
@@ -257,9 +233,9 @@ fn av1_send_poll_loopback_returns_own_frames() {
         println!("vulkan skipped: av1 decode open failed");
         return;
     };
-    let mut pump = DecoderPump::open(decoder, config(32, DropPolicy::DropOldest));
+    let mut pump = DecoderPump::open(decoder, Drive::channel(32, DropPolicy::DropOldest));
     let raws = vec![std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable")];
-    let sent = packets(&raws);
+    let sent = Packets::from_raws(&raws);
     for packet in &sent {
         pump.try_send(packet.clone()).expect("queue room");
     }
@@ -279,7 +255,7 @@ fn av1_send_poll_loopback_returns_own_frames() {
 /// AV1 trailing frame arrives over blocking receive.
 #[test]
 fn av1_blocking_receive_gets_trailing_frame() {
-    let _guard = SERIAL.lock().expect("pump lock");
+    let _guard = Drive::serial();
     let Some(device) = device_or_skip(CodecOp::Av1Decode) else {
         return;
     };
@@ -288,11 +264,11 @@ fn av1_blocking_receive_gets_trailing_frame() {
         return;
     }
     let raws = vec![std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable")];
-    let sent = packets(&raws);
+    let sent = Packets::from_raws(&raws);
     let expected = {
         let mut probe = DecoderPump::open(
             Av1Decoder::open(&device).expect("decode opens"),
-            config(32, DropPolicy::DropOldest),
+            Drive::channel(32, DropPolicy::DropOldest),
         );
         for packet in &sent {
             probe.try_send(packet.clone()).expect("queue room");
@@ -302,7 +278,7 @@ fn av1_blocking_receive_gets_trailing_frame() {
     assert!(expected > 0, "bench vector emits frames");
     let mut pump = DecoderPump::open(
         Av1Decoder::open(&device).expect("decode opens"),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     check_trailing(&mut pump, &sent, expected);
 }

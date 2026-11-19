@@ -5,15 +5,9 @@
 
 #![cfg(target_os = "android")]
 
-use std::num::NonZeroUsize;
-
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::frame::GpuExport;
-use rust_video_caps::packet::Packet;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets};
 use rust_video_mediacodec::{
     DecoderPump, FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface,
 };
@@ -39,21 +33,6 @@ fn open_or_decline(name: &str, spec: &FormatSpec) -> Option<MediaCodecDecoder> {
         }
         Err(error) => panic!("{name}: unexpected open failure: {error}"),
     }
-}
-
-/// Bound of 32 frames under drop-oldest.
-fn config() -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(32).expect("nonzero capacity"),
-        DropPolicy::DropOldest,
-    )
-}
-
-/// Packets over `raws`, built once outside the send loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
 }
 
 /// Spec carrying the first SPS/PPS pair in `packet`.
@@ -113,9 +92,9 @@ fn run_loopback(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
     let Some(decoder) = open_or_decline(name, spec) else {
         return;
     };
-    let coded = packets(raws);
+    let coded = Packets::from_raws(raws);
     assert!(!coded.is_empty(), "{name}: vector holds a packet");
-    let mut pump = DecoderPump::open(decoder, config());
+    let mut pump = DecoderPump::open(decoder, Drive::channel(32, DropPolicy::DropOldest));
     for packet in &coded {
         pump.try_send(packet.clone()).expect("queue room");
     }

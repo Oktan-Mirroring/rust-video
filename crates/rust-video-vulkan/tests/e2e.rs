@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(have_corpus)]
 use std::process::Command;
 #[cfg(have_corpus)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 #[cfg(have_corpus)]
 use std::time::Instant;
 
@@ -25,16 +25,12 @@ use rust_video_caps::traits::{Decoder, Encoder};
 #[cfg(have_corpus)]
 use rust_video_caps::transcode::Route;
 #[cfg(have_corpus)]
-use rust_video_harness::{Case, Error, FrameHash, Golden, Oracle, Suite};
+use rust_video_harness::{Case, Drive, Error, FrameHash, Golden, Oracle, Suite};
 #[cfg(have_corpus)]
 use rust_video_vulkan::{
     CodecOp, Gop, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, SubmitStats,
     Transcoder, VulkanDevice, VulkanError, VulkanFrame,
 };
-
-#[cfg(have_corpus)]
-// Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 #[cfg(have_corpus)]
 /// Harness oracle over a Vulkan decoder.
@@ -190,7 +186,7 @@ where
 #[cfg(have_corpus)]
 #[test]
 fn h264_matches_goldens() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     let Some(device) = device_or_decline(CodecOp::H264Decode) else {
         return;
     };
@@ -204,7 +200,7 @@ fn h264_matches_goldens() {
 #[cfg(have_corpus)]
 #[test]
 fn h265_matches_goldens() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     let Some(device) = device_or_decline(CodecOp::H265Decode) else {
         return;
     };
@@ -219,7 +215,7 @@ fn h265_matches_goldens() {
 /// Synthetic OOM through the decline helpers: decline, never panic.
 #[test]
 fn oom_helpers_decline_synthetic_oom() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     let Some(device) = device_or_decline(CodecOp::H264Decode) else {
         return;
     };
@@ -408,7 +404,7 @@ fn decode_all(
 #[cfg(have_corpus)]
 #[test]
 fn pipelined_decode_overlaps_frames() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     for (codec, op) in [
         (VideoCodec::H264, CodecOp::H264Decode),
         (VideoCodec::H265, CodecOp::H265Decode),
@@ -520,7 +516,7 @@ fn recovery_case(
 #[cfg(have_corpus)]
 #[test]
 fn reset_after_failure_recovers() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     for (codec, op) in [
         (VideoCodec::H264, CodecOp::H264Decode),
         (VideoCodec::H265, CodecOp::H265Decode),
@@ -615,7 +611,7 @@ fn transcode_case(
 #[cfg(have_corpus)]
 #[test]
 fn gpu_transcode_runs_multi_frame() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     transcode_case(
         VideoCodec::H264,
         CodecOp::H264Decode,
@@ -753,7 +749,7 @@ fn steady_h265(guard: &MutexGuard<'_, ()>) {
 #[cfg(have_corpus)]
 #[test]
 fn steady_state_runs_without_timeout() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     steady_h264(&guard);
     steady_h265(&guard);
 }
@@ -938,7 +934,7 @@ fn determinism_case(
 #[cfg(have_corpus)]
 #[test]
 fn encode_deterministic_packets() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     determinism_case(
         VideoCodec::H264,
         CodecOp::H264Decode,
@@ -1066,7 +1062,7 @@ fn roundtrip_case(
 #[cfg(have_corpus)]
 #[test]
 fn encode_p_stream_decodes_clean() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     roundtrip_case(
         VideoCodec::H264,
         CodecOp::H264Decode,
@@ -1177,7 +1173,7 @@ fn gop_case(codec: VideoCodec, decode_op: CodecOp, encode_op: CodecOp, guard: &M
 #[cfg(have_corpus)]
 #[test]
 fn encode_gop_boundary_exact() {
-    let guard = SERIAL.lock().unwrap();
+    let guard = Drive::serial();
     gop_case(
         VideoCodec::H264,
         CodecOp::H264Decode,

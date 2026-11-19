@@ -5,20 +5,16 @@
 //! Vector-gated: H.265 and AV1 read no-reorder vectors from the environment.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use bytes::Bytes;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{AnnexB, H264Synth};
+use rust_video_harness::{AnnexB, Drive, H264Synth};
 use rust_video_vulkan::{
     Av1Decoder, CodecOp, H264Decoder, H265Decoder, SkipReason, VulkanDevice, VulkanError,
     VulkanFrame,
 };
-
-// Parallel VkDevice teardown deadlocks in driver join; guard serializes it.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Env gate: `RUST_VIDEO_VULKAN_SURFACE_TESTS=1` runs, else declines.
 fn gated() -> bool {
@@ -86,7 +82,7 @@ fn check_surface(frame: &VulkanFrame) {
 /// uncropped; the parser-level shape is proven GPU-free in the crate.
 #[test]
 fn h264_no_reorder_emits_per_call() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     if !gated() {
         return;
     }
@@ -128,7 +124,7 @@ fn h264_no_reorder_emits_per_call() {
 /// sets declare zero reorder pictures with one slice per picture.
 #[test]
 fn h265_no_reorder_emits_per_call() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     if !gated() {
         return;
     }
@@ -169,7 +165,7 @@ fn h265_no_reorder_emits_per_call() {
 /// `RUST_VIDEO_VULKAN_AV1_NOREORDER` points at the `.obu` file.
 #[test]
 fn av1_no_reorder_emits_per_call() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     if !gated() {
         return;
     }
@@ -228,7 +224,7 @@ fn decode_surfaces(
 /// Needs platform export behind the device; declines without it.
 #[test]
 fn gpu_surfaces_pin_export_slots() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = Drive::serial();
     if !gated() {
         return;
     }
