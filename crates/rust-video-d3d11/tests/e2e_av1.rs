@@ -3,25 +3,20 @@
 //!
 //! Shared vector `valid_320x240.obu` holds 15 ffmpeg
 //! testsrc2 frames (320x240, reordered with show-existing
-//! display); `examples/common/av1.rs` splits it.
+//! display); the harness `Obu` splitter groups it.
 //! `tiled_320x240.obu` and `grain_320x240.obu` cover tiled
 //! frames and film grain through parity.
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-
 use std::path::PathBuf;
 
-use av1::{split_obus, tu_packets};
 use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
-use rust_video_harness::decode_dir;
+use rust_video_harness::{decode_dir, Obu};
 
 /// Shared vector path.
 fn vector() -> PathBuf {
@@ -94,7 +89,7 @@ fn steady_state_never_resets() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert!(!raws.is_empty(), "vector holds temporal units");
     let mut decoder = Av1Decoder::open(&device);
     let total = decode_all(&mut decoder, &raws);
@@ -114,8 +109,8 @@ fn reset_after_failure_recovers() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = tu_packets(&data);
-    let obus = split_obus(&data);
+    let raws = Obu::tu_packets(&data);
+    let obus = Obu::split_obus(&data);
     let mut decoder = Av1Decoder::open(&device);
     for (unit_type, obu) in obus.iter().take(2) {
         assert_ne!(*unit_type, 6, "prefix holds no frame");
@@ -156,7 +151,7 @@ fn hardware_matches_software_oracle() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert!(!raws.is_empty(), "vector holds temporal units");
     let mut decoder = Av1Decoder::open(&device);
     let mut frames = Vec::new();

@@ -4,13 +4,6 @@
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-#[path = "../examples/common/hevc.rs"]
-#[allow(dead_code)]
-mod hevc;
-
 use bytes::Bytes;
 use rust_video_caps::frame::{GpuExport, PixelFormat};
 use rust_video_caps::packet::Packet;
@@ -18,7 +11,7 @@ use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, GpuSurface, H264Decoder, HevcDecoder,
 };
-use rust_video_harness::{decode_dir, AnnexB, H264Synth, Synth};
+use rust_video_harness::{decode_dir, AnnexB, H264Synth, Obu, Synth};
 
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d11Device> {
@@ -159,7 +152,7 @@ fn hevc_reorder_holds_back_unchanged() {
         return;
     };
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
-    let raws = hevc::picture_packets(&data);
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
     let mut counts = Vec::new();
@@ -184,7 +177,7 @@ fn av1_reorder_holds_back_unchanged() {
         return;
     };
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let raws = av1::tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
     let mut counts = Vec::new();
@@ -242,7 +235,7 @@ fn hevc_surfaces_match_frames() {
         return;
     };
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
-    let raws = hevc::picture_packets(&data);
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
     let mut total = 0;
@@ -271,7 +264,7 @@ fn av1_surfaces_match_frames() {
         return;
     };
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let raws = av1::tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
     let mut total = 0;

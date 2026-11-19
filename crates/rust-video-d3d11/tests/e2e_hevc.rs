@@ -3,25 +3,20 @@
 //!
 //! Shared vector `inter_320x240.hevc` holds 15 ffmpeg
 //! testsrc2 pictures (320x240, IDR at 0 and CRA at 8 with B
-//! reordering); `examples/common/hevc.rs` splits it.
+//! reordering); the harness `AnnexB` splitter groups it.
 //! `mslice_320x240.hevc` and `sl_320x240.hevc` cover
 //! multi-slice pictures and scaling lists through parity.
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/hevc.rs"]
-#[allow(dead_code)]
-mod hevc;
-
 use std::path::PathBuf;
 
-use hevc::picture_packets;
 use rust_video_d3d11::{Codec, D3d11Device, HevcDecoder};
 
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
-use rust_video_harness::decode_dir;
+use rust_video_harness::{decode_dir, AnnexB};
 
 /// Shared vector path.
 fn vector() -> PathBuf {
@@ -94,7 +89,7 @@ fn steady_state_never_resets() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = picture_packets(&data);
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
     let total = decode_all(&mut decoder, &raws);
@@ -114,7 +109,7 @@ fn reset_after_failure_recovers() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = picture_packets(&data);
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
     let first = Packet::new(Bytes::copy_from_slice(&raws[0]));
@@ -146,7 +141,7 @@ fn hardware_matches_software_oracle() {
         return;
     };
     let data = std::fs::read(vector()).expect("vector readable");
-    let raws = picture_packets(&data);
+    let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per picture");
     let mut decoder = HevcDecoder::open(&device);
     let mut frames = Vec::new();

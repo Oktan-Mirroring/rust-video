@@ -4,49 +4,25 @@
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-#[path = "../examples/common/hevc.rs"]
-#[allow(dead_code)]
-mod hevc;
 #[path = "../examples/common/vp9.rs"]
 #[allow(dead_code)]
 mod vp9;
 
-use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets, TrySendError,
-};
+use rust_video_caps::delivery::{DropPolicy, ReceiveFrames};
 use rust_video_caps::packet::Packet;
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Frame, DecoderPump, H264Decoder, HevcDecoder,
-    OverlappedPump, PhaseCapture, SplitDecoder, Vp9Decoder,
+    OverlappedPump, PhaseCapture, Vp9Decoder,
 };
-use rust_video_harness::{decode_dir, AnnexB};
+use rust_video_harness::{decode_dir, AnnexB, Drive, Obu, Packets, Parity};
 
 /// Pictures in the committed H.264 vector.
 const PICTURES: usize = 15;
 
 /// Tight NV12 bytes of one 320x240 frame.
 const FRAME_BYTES: usize = 320 * 240 * 3 / 2;
-
-/// Serialized overlap tests: one test at a time per binary.
-///
-/// Parallel overlap tests share the decode engines and the CPU; contention
-/// inside the timed sections reads as flake in the phase table. Every test
-/// holds the lock for its whole body.
-static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Whole-test serial guard, poison-tolerant.
-fn measure() -> std::sync::MutexGuard<'static, ()> {
-    MEASURE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d11Device> {
@@ -74,114 +50,56 @@ fn h264_vector() -> std::path::PathBuf {
     decode_dir().join("valid_320x240.h264")
 }
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
 /// One packet per H.264 picture in order.
 fn h264_packets() -> Vec<Packet> {
-    AnnexB::picture_packets(&h264_vector(), AnnexB::is_h264_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&AnnexB::picture_packets(
+        &h264_vector(),
+        AnnexB::is_h264_vcl,
+    ))
 }
 
 /// One packet per HEVC picture in order.
 fn hevc_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
-    hevc::picture_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl))
 }
 
 /// One packet per AV1 temporal unit in order.
 fn av1_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    av1::tu_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&Obu::tu_packets(&data))
 }
 
 /// One packet per VP9 frame in order.
 fn vp9_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("valid_320x240.ivf")).expect("vector readable");
-    vp9::frame_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&vp9::frame_packets(&data))
 }
 
-/// Every packet sent; one blocking receive per refusal into `frames`.
-///
-/// Returns refusal count.
-fn send_all<D: SplitDecoder<Frame = D3d11Frame>>(
-    pump: &mut OverlappedPump<D>,
-    packets: &[Packet],
-    frames: &mut Vec<D3d11Frame>,
-) -> u64 {
-    let mut fulls = 0;
-    for packet in packets {
-        let mut packet = packet.clone();
-        loop {
-            match pump.try_send(packet) {
-                Ok(()) => break,
-                Err(TrySendError::Full { packet: back }) => {
-                    fulls += 1;
-                    packet = back;
-                    let frame = pump
-                        .receive()
-                        .expect("in-flight frame completes")
-                        .expect("input unfinished");
-                    frames.push(frame);
-                }
-                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
-            }
-        }
-    }
-    while let Some(frame) = pump.try_receive().expect("poll") {
-        frames.push(frame);
-    }
-    fulls
-}
-
-/// Input finished, every trailing frame into `frames`.
-fn drain_all<D: SplitDecoder<Frame = D3d11Frame>>(
-    pump: &mut OverlappedPump<D>,
-    frames: &mut Vec<D3d11Frame>,
-) {
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("drain") {
-        frames.push(frame);
-    }
+/// One in-flight frame into `frames`, freeing send room.
+fn drain<P>(pump: &mut P, frames: &mut Vec<P::Frame>)
+where
+    P: ReceiveFrames,
+    P::Error: std::fmt::Debug,
+{
+    frames.push(
+        pump.receive()
+            .expect("in-flight frame completes")
+            .expect("input unfinished"),
+    );
 }
 
 /// Frames hold tight NV12 in generation order.
 fn check_frames(frames: &[D3d11Frame], count: usize, tag: &str) {
-    assert_eq!(frames.len(), count, "{tag} yields every frame");
-    for (index, frame) in frames.iter().enumerate() {
-        assert_eq!(
-            frame.nv12().len(),
-            FRAME_BYTES,
-            "{tag} frame {index} holds tight NV12"
-        );
-        assert_eq!(
-            frame.identity().generation(),
-            index as u64,
-            "{tag} frame {index} keeps order"
-        );
-    }
+    Parity::assert_ordered(tag, frames, count, FRAME_BYTES, D3d11Frame::nv12, |frame| {
+        frame.identity().generation()
+    });
 }
 
 /// Back-to-back sends overlap on hardware.
 #[test]
 fn overlap_depth_above_one() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -192,10 +110,9 @@ fn overlap_depth_above_one() {
         "vector holds one packet per picture"
     );
     let mut pump = OverlappedPump::open(H264Decoder::open(&device));
-    let mut frames = Vec::new();
-    let fulls = send_all(&mut pump, &packets, &mut frames);
+    let (mut frames, fulls) = Drive::send_all(&mut pump, &packets, drain);
     let depth = pump.max_depth();
-    drain_all(&mut pump, &mut frames);
+    frames.extend(Drive::finish_all(&mut pump));
     println!(
         "overlap: max_depth={depth} fulls={fulls} frames={}",
         frames.len()
@@ -208,7 +125,7 @@ fn overlap_depth_above_one() {
 /// In-flight bound refuses instead of growing without limit.
 #[test]
 fn send_bound_refuses_past_depth() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -219,10 +136,9 @@ fn send_bound_refuses_past_depth() {
         "vector holds one packet per picture"
     );
     let mut pump = OverlappedPump::open(H264Decoder::open(&device));
-    let mut frames = Vec::new();
-    let fulls = send_all(&mut pump, &packets, &mut frames);
+    let (mut frames, fulls) = Drive::send_all(&mut pump, &packets, drain);
     let depth = pump.max_depth();
-    drain_all(&mut pump, &mut frames);
+    frames.extend(Drive::finish_all(&mut pump));
     println!(
         "bound: max_depth={depth} fulls={fulls} frames={}",
         frames.len()
@@ -239,7 +155,7 @@ fn send_bound_refuses_past_depth() {
 /// Same H.264 bytes through sync and overlapped decode.
 #[test]
 fn byte_parity_sync_vs_overlapped() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -251,39 +167,23 @@ fn byte_parity_sync_vs_overlapped() {
     );
     let mut sync = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
-    for packet in &packets {
-        sync.try_send(packet.clone()).expect("queue room");
-    }
-    let mut sync_frames = Vec::new();
-    while let Some(frame) = sync.try_receive().expect("poll") {
-        sync_frames.push(frame);
-    }
-    sync.finish().expect("finish drains");
-    while let Some(frame) = sync.receive().expect("drained") {
-        sync_frames.push(frame);
-    }
+    let (mut sync_frames, _) = Drive::send_all(&mut sync, &packets, drain);
+    sync_frames.extend(Drive::finish_all(&mut sync));
     let mut overlapped = OverlappedPump::open(H264Decoder::open(&device));
-    let mut overlapped_frames = Vec::new();
-    send_all(&mut overlapped, &packets, &mut overlapped_frames);
-    drain_all(&mut overlapped, &mut overlapped_frames);
+    let (mut overlapped_frames, _) = Drive::send_all(&mut overlapped, &packets, drain);
+    overlapped_frames.extend(Drive::finish_all(&mut overlapped));
     check_frames(&sync_frames, PICTURES, "sync");
     check_frames(&overlapped_frames, PICTURES, "overlapped");
-    for (index, (left, right)) in sync_frames.iter().zip(overlapped_frames.iter()).enumerate() {
-        assert_eq!(
-            left.nv12(),
-            right.nv12(),
-            "frame {index} bytes match across paths"
-        );
-    }
+    Parity::assert_bytes("parity", &sync_frames, &overlapped_frames, D3d11Frame::nv12);
     println!("parity: {PICTURES} frames, {FRAME_BYTES} bytes each, 0 mismatches");
 }
 
 /// Same HEVC bytes through sync and overlapped decode.
 #[test]
 fn hevc_byte_parity_sync_vs_overlapped() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device_for(Codec::Hevc) else {
         return;
     };
@@ -295,39 +195,23 @@ fn hevc_byte_parity_sync_vs_overlapped() {
     );
     let mut sync = DecoderPump::open(
         HevcDecoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
-    for packet in &packets {
-        sync.try_send(packet.clone()).expect("queue room");
-    }
-    let mut sync_frames = Vec::new();
-    while let Some(frame) = sync.try_receive().expect("poll") {
-        sync_frames.push(frame);
-    }
-    sync.finish().expect("finish drains");
-    while let Some(frame) = sync.receive().expect("drained") {
-        sync_frames.push(frame);
-    }
+    let (mut sync_frames, _) = Drive::send_all(&mut sync, &packets, drain);
+    sync_frames.extend(Drive::finish_all(&mut sync));
     let mut overlapped = OverlappedPump::open(HevcDecoder::open(&device));
-    let mut overlapped_frames = Vec::new();
-    send_all(&mut overlapped, &packets, &mut overlapped_frames);
-    drain_all(&mut overlapped, &mut overlapped_frames);
+    let (mut overlapped_frames, _) = Drive::send_all(&mut overlapped, &packets, drain);
+    overlapped_frames.extend(Drive::finish_all(&mut overlapped));
     check_frames(&sync_frames, PICTURES, "sync");
     check_frames(&overlapped_frames, PICTURES, "overlapped");
-    for (index, (left, right)) in sync_frames.iter().zip(overlapped_frames.iter()).enumerate() {
-        assert_eq!(
-            left.nv12(),
-            right.nv12(),
-            "frame {index} bytes match across paths"
-        );
-    }
+    Parity::assert_bytes("parity", &sync_frames, &overlapped_frames, D3d11Frame::nv12);
     println!("parity: {PICTURES} frames, {FRAME_BYTES} bytes each, 0 mismatches");
 }
 
 /// Same AV1 bytes through sync and overlapped decode.
 #[test]
 fn av1_byte_parity_sync_vs_overlapped() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device_for(Codec::Av1) else {
         return;
     };
@@ -335,39 +219,23 @@ fn av1_byte_parity_sync_vs_overlapped() {
     assert_eq!(packets.len(), 16, "vector holds one packet per unit");
     let mut sync = DecoderPump::open(
         Av1Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
-    for packet in &packets {
-        sync.try_send(packet.clone()).expect("queue room");
-    }
-    let mut sync_frames = Vec::new();
-    while let Some(frame) = sync.try_receive().expect("poll") {
-        sync_frames.push(frame);
-    }
-    sync.finish().expect("finish drains");
-    while let Some(frame) = sync.receive().expect("drained") {
-        sync_frames.push(frame);
-    }
+    let (mut sync_frames, _) = Drive::send_all(&mut sync, &packets, drain);
+    sync_frames.extend(Drive::finish_all(&mut sync));
     let mut overlapped = OverlappedPump::open(Av1Decoder::open(&device));
-    let mut overlapped_frames = Vec::new();
-    send_all(&mut overlapped, &packets, &mut overlapped_frames);
-    drain_all(&mut overlapped, &mut overlapped_frames);
+    let (mut overlapped_frames, _) = Drive::send_all(&mut overlapped, &packets, drain);
+    overlapped_frames.extend(Drive::finish_all(&mut overlapped));
     check_frames(&sync_frames, PICTURES, "sync");
     check_frames(&overlapped_frames, PICTURES, "overlapped");
-    for (index, (left, right)) in sync_frames.iter().zip(overlapped_frames.iter()).enumerate() {
-        assert_eq!(
-            left.nv12(),
-            right.nv12(),
-            "frame {index} bytes match across paths"
-        );
-    }
+    Parity::assert_bytes("parity", &sync_frames, &overlapped_frames, D3d11Frame::nv12);
     println!("parity: {PICTURES} frames, {FRAME_BYTES} bytes each, 0 mismatches");
 }
 
 /// Same VP9 bytes through sync and overlapped decode.
 #[test]
 fn vp9_byte_parity_sync_vs_overlapped() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device_for(Codec::Vp9) else {
         return;
     };
@@ -375,32 +243,16 @@ fn vp9_byte_parity_sync_vs_overlapped() {
     assert_eq!(packets.len(), PICTURES, "vector holds one packet per frame");
     let mut sync = DecoderPump::open(
         Vp9Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
-    for packet in &packets {
-        sync.try_send(packet.clone()).expect("queue room");
-    }
-    let mut sync_frames = Vec::new();
-    while let Some(frame) = sync.try_receive().expect("poll") {
-        sync_frames.push(frame);
-    }
-    sync.finish().expect("finish drains");
-    while let Some(frame) = sync.receive().expect("drained") {
-        sync_frames.push(frame);
-    }
+    let (mut sync_frames, _) = Drive::send_all(&mut sync, &packets, drain);
+    sync_frames.extend(Drive::finish_all(&mut sync));
     let mut overlapped = OverlappedPump::open(Vp9Decoder::open(&device));
-    let mut overlapped_frames = Vec::new();
-    send_all(&mut overlapped, &packets, &mut overlapped_frames);
-    drain_all(&mut overlapped, &mut overlapped_frames);
+    let (mut overlapped_frames, _) = Drive::send_all(&mut overlapped, &packets, drain);
+    overlapped_frames.extend(Drive::finish_all(&mut overlapped));
     check_frames(&sync_frames, PICTURES, "sync");
     check_frames(&overlapped_frames, PICTURES, "overlapped");
-    for (index, (left, right)) in sync_frames.iter().zip(overlapped_frames.iter()).enumerate() {
-        assert_eq!(
-            left.nv12(),
-            right.nv12(),
-            "frame {index} bytes match across paths"
-        );
-    }
+    Parity::assert_bytes("parity", &sync_frames, &overlapped_frames, D3d11Frame::nv12);
     println!("parity: {PICTURES} frames, {FRAME_BYTES} bytes each, 0 mismatches");
 }
 
@@ -409,7 +261,7 @@ fn vp9_byte_parity_sync_vs_overlapped() {
 fn phase_timing_parity_and_overlap() {
     use rust_video_caps::traits::Decoder;
 
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -434,9 +286,8 @@ fn phase_timing_parity_and_overlap() {
     let mut overlapped = OverlappedPump::open(H264Decoder::open(&device));
     overlapped.capture_phases(true);
     let overlapped_start = Instant::now();
-    let mut frames = Vec::new();
-    let fulls = send_all(&mut overlapped, &packets, &mut frames);
-    drain_all(&mut overlapped, &mut frames);
+    let (mut frames, fulls) = Drive::send_all(&mut overlapped, &packets, drain);
+    frames.extend(Drive::finish_all(&mut overlapped));
     let overlapped_wall = overlapped_start.elapsed();
     check_frames(&frames, PICTURES, "overlapped");
     let overlapped_phases = overlapped.phases().to_vec();

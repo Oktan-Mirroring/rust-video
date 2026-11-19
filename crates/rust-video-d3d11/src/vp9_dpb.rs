@@ -15,6 +15,8 @@ use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::pins::SlotPins;
 use crate::vp9::{Frame, FrameHeader, FrameType, NUM_REF_FRAMES, REFS_PER_FRAME};
 
+use rust_video_caps::dpb::ViewAlloc;
+
 /// Session view count behind current view selection.
 const VIEWS: u8 = 16;
 
@@ -103,11 +105,8 @@ impl Vp9Dpb {
 
     /// View outside the reference map and live surface pins.
     fn free_view(&self) -> Result<u8, D3d11Error> {
-        (0..VIEWS)
-            .find(|view| {
-                !self.pins.is_pinned(usize::from(*view))
-                    && !self.slots.iter().flatten().any(|slot| slot.view == *view)
-            })
+        self.slots
+            .free_view(VIEWS, |slot| slot.view, |index| self.pins.is_pinned(index))
             .ok_or(D3d11Error::NoFreeSlot)
     }
 

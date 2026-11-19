@@ -8,8 +8,6 @@ mod av1;
 #[cfg(target_os = "windows")]
 mod av1_dpb;
 #[cfg(target_os = "windows")]
-mod bits;
-#[cfg(target_os = "windows")]
 mod decoder;
 #[cfg(target_os = "windows")]
 mod delivery;

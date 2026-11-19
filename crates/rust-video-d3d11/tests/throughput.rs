@@ -10,12 +10,12 @@ use rust_video_d3d11::{
 };
 
 use bytes::Bytes;
-use rust_video_caps::delivery::{ReceiveFrames, SendPackets, TrySendError};
+use rust_video_caps::delivery::ReceiveFrames;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Ivf, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
 
 /// Hops timed after warmup.
 const HOPS: u32 = 30;
@@ -34,24 +34,6 @@ const WARMUP: u64 = 4;
 
 /// Timed runs behind the VP9 median.
 const VP9_REPEATS: usize = 3;
-
-/// Serialized benches: one test at a time per binary.
-///
-/// Parallel benches share NVDEC/NVENC engines, CPU, and the software
-/// VP9 MFT; contention inside the timed loop reads as flake
-/// (`encode_vp9_1080p` passes isolated, fails in-suite at ~57fps even
-/// with timed-section-only serialization, because sibling warmups and
-/// noise generation overlap the measurement). Every test holds the
-/// lock for its whole body, so the bar and the measured path are
-/// unchanged and the measurement sees a quiet binary.
-static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Whole-test serial guard, poison-tolerant.
-fn measure() -> std::sync::MutexGuard<'static, ()> {
-    MEASURE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Surface decode behind the surface benches.
 trait SurfaceDecode {
@@ -102,17 +84,10 @@ impl SurfaceDecode for Vp9Decoder<'_> {
     }
 }
 
-/// Packets over `raws`, built once outside the timed loop.
-fn packets(raws: &[Vec<u8>]) -> Vec<Packet> {
-    raws.iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
-}
-
 /// Measured fps of `HOPS` 1080p hops through `transcoder`.
 fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64 {
-    let warmup = packets(warmup);
-    let raws = packets(raws);
+    let warmup = Packets::from_raws(warmup);
+    let raws = Packets::from_raws(raws);
     for packet in &warmup {
         let outcome = transcoder.transcode(packet).expect("warmup transcode");
         assert!(matches!(outcome.plan().route(), Route::Gpu));
@@ -143,8 +118,8 @@ fn decode_fps(
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
 ) -> f64 {
-    let warmup = packets(warmup);
-    let raws = packets(raws);
+    let warmup = Packets::from_raws(warmup);
+    let raws = Packets::from_raws(raws);
     for packet in &warmup {
         decoder.decode(packet).expect("warmup decode");
     }
@@ -192,8 +167,8 @@ fn decode_surface_fps(
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
 ) -> f64 {
-    let warmup = packets(warmup);
-    let raws = packets(raws);
+    let warmup = Packets::from_raws(warmup);
+    let raws = Packets::from_raws(raws);
     for packet in &warmup {
         for surface in decoder.decode_surface(packet).expect("warmup decode") {
             surface.wait().expect("warmup wait");
@@ -284,7 +259,7 @@ fn surface_1080p(device: &D3d11Device) -> GpuSurface {
 /// 1080p GPU hops measured against the realtime bar.
 #[test]
 fn xcode_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -292,7 +267,7 @@ fn xcode_1080p_measures_realtime() {
             return;
         }
     };
-    let small = packets(&H264Synth::annex_b_packets());
+    let small = Packets::from_raws(&H264Synth::annex_b_packets());
     let mut decoder = H264Decoder::open(&device);
     let mut small_frames = 0;
     for packet in &small {
@@ -323,7 +298,7 @@ fn xcode_1080p_measures_realtime() {
 /// 1080p H.264 decode measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -344,7 +319,7 @@ fn decode_h264_1080p_measures_realtime() {
 /// 1080p HEVC decode measured against the realtime bar.
 #[test]
 fn decode_hevc_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -371,7 +346,7 @@ fn decode_hevc_1080p_measures_realtime() {
 /// 1080p AV1 decode measured against the realtime bar.
 #[test]
 fn decode_av1_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -397,7 +372,7 @@ fn decode_av1_1080p_measures_realtime() {
 /// 1080p VP9 decode measured against the realtime bar.
 #[test]
 fn decode_vp9_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -423,7 +398,7 @@ fn decode_vp9_1080p_measures_realtime() {
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -450,7 +425,7 @@ fn encode_h264_1080p_measures_realtime() {
 /// 1080p HEVC encode measured against the realtime bar.
 #[test]
 fn encode_hevc_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -481,7 +456,7 @@ fn encode_hevc_1080p_measures_realtime() {
 #[test]
 #[ignore = "runs alone under just benches"]
 fn encode_vp9_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -513,7 +488,7 @@ fn encode_vp9_1080p_measures_realtime() {
 /// 1080p AV1 encode measured against the realtime bar.
 #[test]
 fn encode_av1_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -540,7 +515,7 @@ fn encode_av1_1080p_measures_realtime() {
 /// 1080p H.264 surface decode measured against the realtime bar.
 #[test]
 fn decode_surface_h264_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -563,7 +538,7 @@ fn decode_surface_h264_1080p_measures_realtime() {
 /// 1080p HEVC surface decode measured against the realtime bar.
 #[test]
 fn decode_surface_hevc_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -592,7 +567,7 @@ fn decode_surface_hevc_1080p_measures_realtime() {
 /// 1080p AV1 surface decode measured against the realtime bar.
 #[test]
 fn decode_surface_av1_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -618,7 +593,7 @@ fn decode_surface_av1_1080p_measures_realtime() {
 /// 1080p VP9 surface decode measured against the realtime bar.
 #[test]
 fn decode_surface_vp9_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -644,7 +619,7 @@ fn decode_surface_vp9_1080p_measures_realtime() {
 /// 1080p H.264 surface encode measured against the realtime bar.
 #[test]
 fn encode_surface_h264_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -677,7 +652,7 @@ fn encode_surface_h264_1080p_measures_realtime() {
 /// 1080p HEVC surface encode measured against the realtime bar.
 #[test]
 fn encode_surface_hevc_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -710,7 +685,7 @@ fn encode_surface_hevc_1080p_measures_realtime() {
 /// 1080p VP9 surface encode measured against the realtime bar.
 #[test]
 fn encode_surface_vp9_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -741,7 +716,7 @@ fn encode_surface_vp9_1080p_measures_realtime() {
 /// 1080p AV1 surface encode measured against the realtime bar.
 #[test]
 fn encode_surface_av1_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -769,46 +744,33 @@ fn encode_surface_av1_1080p_measures_realtime() {
     );
 }
 
+/// One in-flight frame into `frames`, freeing send room.
+fn drain<P>(pump: &mut P, frames: &mut Vec<P::Frame>)
+where
+    P: ReceiveFrames,
+    P::Error: std::fmt::Debug,
+{
+    frames.push(
+        pump.receive()
+            .expect("in-flight frame completes")
+            .expect("input unfinished"),
+    );
+}
+
 /// Measured fps of one sustained overlap pass of `raws`, plus frame count and peak depth.
 fn sustained_fps<D>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize, usize)
 where
     D: SplitDecoder<Frame = D3d11Frame>,
 {
-    let packets = packets(raws);
     let mut pump = OverlappedPump::open(decoder);
-    let mut frames = Vec::new();
-    let start = std::time::Instant::now();
-    for packet in packets {
-        let mut pending = packet;
-        loop {
-            match pump.try_send(pending) {
-                Ok(()) => break,
-                Err(TrySendError::Full { packet }) => {
-                    pending = packet;
-                    let frame = pump
-                        .receive()
-                        .expect("in-flight frame completes")
-                        .expect("input unfinished");
-                    frames.push(frame);
-                }
-                Err(TrySendError::Failed { error }) => panic!("send failed: {error}"),
-            }
-        }
-    }
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("drain") {
-        frames.push(frame);
-    }
-    let wall = start.elapsed();
-    let depth = pump.max_depth();
-    let total = u32::try_from(frames.len()).expect("frame count fits");
-    (f64::from(total) / wall.as_secs_f64(), frames.len(), depth)
+    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(raws), drain);
+    (measured, count, pump.max_depth())
 }
 
 /// Sustained 1080p H.264 overlap throughput against its bar.
 #[test]
 fn sustained_h264_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -836,7 +798,7 @@ fn sustained_h264_1080p_measures_realtime() {
 /// Sustained 1080p HEVC overlap throughput against its bar.
 #[test]
 fn sustained_hevc_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -864,7 +826,7 @@ fn sustained_hevc_1080p_measures_realtime() {
 /// Sustained 1080p AV1 overlap throughput against its bar.
 #[test]
 fn sustained_av1_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {
@@ -891,7 +853,7 @@ fn sustained_av1_1080p_measures_realtime() {
 /// Sustained 1080p VP9 overlap throughput against its bar.
 #[test]
 fn sustained_vp9_1080p_measures_realtime() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let device = match D3d11Device::open() {
         Ok(device) => device,
         Err(error) => {

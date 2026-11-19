@@ -4,22 +4,10 @@
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-#[path = "../examples/common/hevc.rs"]
-#[allow(dead_code)]
-mod hevc;
-
-use std::num::NonZeroUsize;
-
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
 use rust_video_d3d11::{Av1Decoder, Codec, D3d11Device, DecoderPump, H264Decoder, HevcDecoder};
-use rust_video_harness::{decode_dir, AnnexB};
+use rust_video_harness::{decode_dir, AnnexB, Drive, Obu, Packets};
 
 /// Open device, loud skip without hardware.
 fn device() -> Option<D3d11Device> {
@@ -47,38 +35,24 @@ fn h264_vector() -> std::path::PathBuf {
     decode_dir().join("valid_320x240.h264")
 }
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
 /// One packet per picture in order.
 fn picture_packets() -> Vec<Packet> {
-    AnnexB::picture_packets(&h264_vector(), AnnexB::is_h264_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&AnnexB::picture_packets(
+        &h264_vector(),
+        AnnexB::is_h264_vcl,
+    ))
 }
 
 /// One packet per HEVC picture in order.
 fn hevc_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
-    hevc::picture_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl))
 }
 
 /// One packet per AV1 temporal unit in order.
 fn av1_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    av1::tu_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect()
+    Packets::from_raws(&Obu::tu_packets(&data))
 }
 
 /// Sent packets return as owned frames, then end of stream.
@@ -92,7 +66,7 @@ fn send_poll_loopback_returns_own_frames() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -128,7 +102,7 @@ fn blocking_receive_gets_trailing_frame() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -155,7 +129,7 @@ fn slow_consumer_drop_oldest_keeps_latest() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(2, DropPolicy::DropOldest),
+        Drive::channel(2, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("policy absorbs");
@@ -180,7 +154,7 @@ fn slow_consumer_drop_incoming_keeps_first() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(2, DropPolicy::DropIncoming),
+        Drive::channel(2, DropPolicy::DropIncoming),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("policy absorbs");
@@ -205,7 +179,7 @@ fn callback_drain_collects_queued_frames() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -232,7 +206,7 @@ fn hevc_send_poll_loopback_returns_own_frames() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         HevcDecoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -270,7 +244,7 @@ fn hevc_blocking_receive_gets_trailing_frames() {
     assert_eq!(packets.len(), 15, "vector holds one packet per picture");
     let mut pump = DecoderPump::open(
         HevcDecoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -299,7 +273,7 @@ fn av1_send_poll_loopback_returns_own_frames() {
     assert_eq!(packets.len(), 16, "vector holds one packet per unit");
     let mut pump = DecoderPump::open(
         Av1Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -337,7 +311,7 @@ fn av1_blocking_receive_gets_trailing_frame() {
     assert_eq!(packets.len(), 16, "vector holds one packet per unit");
     let mut pump = DecoderPump::open(
         Av1Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");

@@ -13,6 +13,8 @@ use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason, UnsupportedRe
 use crate::h264::{Marking, Mmco, Picture, PocType, Pps, RefMod, SlicePoc, Sps, Weights};
 use crate::pins::SlotPins;
 
+use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+
 /// DPB slot count.
 const SLOTS: usize = 16;
 
@@ -33,6 +35,29 @@ struct Occupant {
     reference: bool,
     /// Already output.
     displayed: bool,
+}
+
+impl SlotState for Occupant {
+    fn poc(&self) -> i32 {
+        self.poc
+    }
+
+    fn is_reference(&self) -> bool {
+        self.reference
+    }
+
+    fn is_displayed(&self) -> bool {
+        self.displayed
+    }
+
+    fn mark_displayed(&mut self) {
+        self.displayed = true;
+    }
+
+    fn release(&mut self) {
+        self.reference = false;
+        self.long_term = false;
+    }
 }
 
 /// Reference picture behind list construction.
@@ -103,10 +128,8 @@ pub(crate) struct Dpb {
     max_long_idx: i32,
     /// Next transmitted frame number.
     expected_frame_num: Option<u32>,
-    /// Previous reference POC MSB.
-    prev_poc_msb: i64,
-    /// Previous reference POC LSB.
-    prev_poc_lsb: u32,
+    /// Previous reference POC behind MSB derivation.
+    poc: PocTracker,
     /// Previous reference frame number.
     prev_ref_frame_num: u32,
     /// Previous frame number offset.
@@ -129,8 +152,7 @@ impl Dpb {
             max_frame_num: sps.max_frame_num(),
             max_long_idx: -1,
             expected_frame_num: None,
-            prev_poc_msb: 0,
-            prev_poc_lsb: 0,
+            poc: PocTracker::new(),
             prev_ref_frame_num: 0,
             prev_frame_num_offset: 0,
             has_prev_ref: false,
@@ -192,7 +214,7 @@ impl Dpb {
         self.close_picture(picture, frame_num, poc);
         self.bump(&mut emits);
         if sps.poc_type == PocType::FrameNum {
-            self.emit_current(slot, poc, &mut emits);
+            self.emit_current(slot, &mut emits);
         }
         let submission = self.submit(picture, sps, pps, &refs, slot, poc)?;
         emits.sort_unstable();
@@ -209,15 +231,8 @@ impl Dpb {
     /// Undisplayed pictures in display order.
     pub(crate) fn drain(&mut self) -> Vec<Output> {
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(occupant) = slot {
-                if !occupant.displayed {
-                    emits.push((occupant.poc, index));
-                    occupant.displayed = true;
-                }
-            }
-        }
-        self.free_displayed_non_refs();
+        self.slots.emit_undisplayed(&mut emits);
+        self.slots.free_displayed_non_refs();
         emits.sort_unstable();
         emits
             .into_iter()
@@ -276,8 +291,7 @@ impl Dpb {
             let Some(occupant) = slot.as_mut() else {
                 continue;
             };
-            occupant.reference = false;
-            occupant.long_term = false;
+            occupant.release();
             if occupant.displayed {
                 *slot = None;
             } else {
@@ -288,8 +302,7 @@ impl Dpb {
             }
         }
         self.max_long_idx = -1;
-        self.prev_poc_msb = 0;
-        self.prev_poc_lsb = 0;
+        self.poc.reset();
         self.prev_ref_frame_num = 0;
         self.prev_frame_num_offset = 0;
         self.has_prev_ref = false;
@@ -325,12 +338,7 @@ impl Dpb {
         if !picture.ref_pic() {
             return Ok(());
         }
-        let refs = self
-            .slots
-            .iter()
-            .flatten()
-            .filter(|slot| slot.reference)
-            .count();
+        let refs = self.slots.references();
         if refs < usize::from(self.max_refs) {
             return Ok(());
         }
@@ -352,7 +360,7 @@ impl Dpb {
                 BrokenReferenceReason::NoShortTermToSlide,
             ));
         };
-        self.evict(victim, emits);
+        self.slots.evict(victim, emits);
         Ok(())
     }
 
@@ -418,23 +426,23 @@ impl Dpb {
                     }
                 }
                 for victim in victims {
-                    self.evict(victim, emits);
+                    self.slots.evict(victim, emits);
                 }
             }
             Mmco::MarkAllUnused => {
                 self.max_long_idx = -1;
                 for slot in self.slots.iter_mut().flatten() {
-                    slot.reference = false;
-                    slot.long_term = false;
+                    slot.release();
                 }
             }
-            Mmco::CurrentToLong => {
+            Mmco::CurrentToLong(index) => {
+                let index = index_u8(index)?;
                 let _ = self.forget_where(
-                    |occupant| occupant.long_term && occupant.long_term_idx == 0,
+                    |occupant| occupant.long_term && occupant.long_term_idx == index,
                     emits,
                 );
-                if self.max_long_idx < 0 {
-                    self.max_long_idx = 0;
+                if self.max_long_idx < i32::from(index) {
+                    self.max_long_idx = i32::from(index);
                 }
             }
         }
@@ -471,53 +479,19 @@ impl Dpb {
             ));
         }
         for victim in victims {
-            self.evict(victim, emits);
+            self.slots.evict(victim, emits);
         }
         Ok(())
     }
 
-    /// Slot contents out of the reference set, emitted when undisplayed.
-    fn evict(&mut self, index: usize, emits: &mut Vec<(i32, usize)>) {
-        let Some(occupant) = self.slots[index].as_mut() else {
-            return;
-        };
-        occupant.reference = false;
-        occupant.long_term = false;
-        if occupant.displayed {
-            self.slots[index] = None;
-        } else {
-            occupant.displayed = true;
-            emits.push((occupant.poc, index));
-        }
-    }
-
-    /// Free displayed pictures held without reference.
-    fn free_displayed_non_refs(&mut self) {
-        for slot in &mut self.slots {
-            if slot
-                .as_ref()
-                .is_some_and(|occupant| occupant.displayed && !occupant.reference)
-            {
-                *slot = None;
-            }
-        }
-    }
-
     /// First free slot outside live surface pins.
     fn alloc(&self) -> Result<usize, D3d11Error> {
-        if let Some(free) = self
-            .slots
-            .iter()
-            .enumerate()
-            .position(|(index, slot)| slot.is_none() && !self.pins.is_pinned(index))
-        {
-            return Ok(free);
-        }
-        if self.slots.iter().any(Option::is_none) {
-            Err(D3d11Error::NoFreeSlot)
-        } else {
-            Err(D3d11Error::DpbFull)
-        }
+        self.slots
+            .alloc_where(|index| self.pins.is_pinned(index))
+            .map_err(|failure| match failure {
+                SlotAllocFailure::PinnedBlocked => D3d11Error::NoFreeSlot,
+                SlotAllocFailure::Full => D3d11Error::DpbFull,
+            })
     }
 
     /// Wrapped frame number for the current picture.
@@ -539,8 +513,13 @@ impl Dpb {
                 Marking::Idr {
                     long_term: true, ..
                 } => return (true, 0),
-                Marking::Adaptive(operations) if operations.contains(&Mmco::CurrentToLong) => {
-                    return (true, 0)
+                Marking::Adaptive(operations) => {
+                    if let Some(index) = operations.iter().find_map(|op| match op {
+                        Mmco::CurrentToLong(index) => Some(*index),
+                        _ => None,
+                    }) {
+                        return (true, u8::try_from(index).unwrap_or(0));
+                    }
                 }
                 _ => {}
             }
@@ -552,8 +531,7 @@ impl Dpb {
     fn close_picture(&mut self, picture: &Picture, frame_num: u32, poc: i32) {
         self.expected_frame_num = Some((frame_num + 1) % self.max_frame_num);
         if has_mmco5(picture) {
-            self.prev_poc_msb = 0;
-            self.prev_poc_lsb = 0;
+            self.poc.reset();
             self.prev_ref_frame_num = 0;
             self.prev_frame_num_offset = 0;
             self.has_prev_ref = true;
@@ -568,7 +546,7 @@ impl Dpb {
         }
         let first = &picture.slices[0].header;
         match (sps.poc_type, &first.poc) {
-            (PocType::Lsb, SlicePoc::Lsb(lsb)) => self.poc_lsb(*lsb, sps, picture.ref_pic()),
+            (PocType::Lsb, SlicePoc::Lsb(lsb, _)) => self.poc_lsb(*lsb, sps, picture.ref_pic()),
             (PocType::Delta, SlicePoc::Deltas(first_delta, second)) => {
                 self.poc_delta(picture, sps, *first_delta, *second)
             }
@@ -590,8 +568,7 @@ impl Dpb {
             })
         })?;
         if ref_pic {
-            self.prev_poc_msb = msb;
-            self.prev_poc_lsb = lsb;
+            self.poc.observe(msb, lsb);
             self.has_prev_ref = true;
         }
         Ok(poc)
@@ -602,15 +579,7 @@ impl Dpb {
         if !self.has_prev_ref {
             return 0;
         }
-        let half = max_lsb / 2;
-        let previous = i64::from(self.prev_poc_lsb);
-        if wide < previous && previous - wide >= half {
-            self.prev_poc_msb + max_lsb
-        } else if wide > previous && wide - previous > half {
-            self.prev_poc_msb - max_lsb
-        } else {
-            self.prev_poc_msb
-        }
+        self.poc.msb_for(wide, max_lsb)
     }
 
     /// Type 1 POC from slice deltas.
@@ -699,41 +668,17 @@ impl Dpb {
         let Some(max) = self.max_decoded_poc else {
             return;
         };
-        loop {
-            let mut next: Option<(i32, usize)> = None;
-            for (index, slot) in self.slots.iter().enumerate() {
-                if let Some(occupant) = slot {
-                    if !occupant.displayed && occupant.poc < max {
-                        let candidate = (occupant.poc, index);
-                        if next.is_none_or(|best| candidate < best) {
-                            next = Some(candidate);
-                        }
-                    }
-                }
-            }
-            let Some((poc, index)) = next else {
-                break;
-            };
-            emits.push((poc, index));
-            if let Some(occupant) = self.slots[index].as_mut() {
-                occupant.displayed = true;
-            }
-        }
-        self.free_displayed_non_refs();
+        while self.slots.pop_earliest(emits, Some(max)) {}
+        self.slots.free_displayed_non_refs();
     }
 
     /// Current picture out on no-reorder streams.
     ///
     /// Type 2 POC doubles the frame number, so display order matches decode
     /// order and the picture completes on its own decode call.
-    fn emit_current(&mut self, slot: usize, poc: i32, emits: &mut Vec<(i32, usize)>) {
-        if let Some(occupant) = self.slots[slot].as_mut() {
-            if !occupant.displayed {
-                occupant.displayed = true;
-                emits.push((poc, slot));
-            }
-        }
-        self.free_displayed_non_refs();
+    fn emit_current(&mut self, slot: usize, emits: &mut Vec<(i32, usize)>) {
+        self.slots.emit_slot(slot, emits);
+        self.slots.free_displayed_non_refs();
     }
 
     /// Submission payload for the stored picture.
@@ -772,7 +717,7 @@ impl Dpb {
         let params = Self::fill_params(picture, sps, pps, slot, poc, &pp_refs)?;
         let qmatrix = QmatrixH264 {
             lists_4x4: pps.scaling.four,
-            lists_8x8: pps.scaling.eight,
+            lists_8x8: [pps.scaling.eight[0], pps.scaling.eight[1]],
         };
         let frame_num = picture.frame_num();
         let context = RefContext {
@@ -1235,8 +1180,8 @@ mod tests {
         BITS_REF_PIC,
     };
     use crate::h264::{
-        Marking, Mmco, PendingSlice, Picture, PocType, Pps, ScalingSets, SliceHeader, SlicePoc,
-        SliceType, Sps, Weights, PPS_DEBLOCKING,
+        FidelityRange, Marking, Mmco, PendingSlice, Picture, PocType, Pps, ScalingSets,
+        SliceHeader, SlicePoc, SliceType, Sps, Weights, PPS_DEBLOCKING,
     };
 
     /// Sequence set with type 0 POC and four references.
@@ -1244,9 +1189,19 @@ mod tests {
         Sps {
             level_idc: 30,
             seq_parameter_set_id: 0,
+            profile_idc: 66,
+            constraints: 0,
             scaling: ScalingSets {
                 four: [[16; 16]; 6],
-                eight: [[16; 64]; 2],
+                eight: [[16; 64]; 6],
+            },
+            scaling_map: None,
+            fidelity: FidelityRange {
+                chroma_format_idc: 1,
+                separate_plane: false,
+                bit_depth_luma_minus8: 0,
+                bit_depth_chroma_minus8: 0,
+                transform_bypass: false,
             },
             log2_max_frame_num_minus4: 0,
             poc_type: PocType::Lsb,
@@ -1262,7 +1217,9 @@ mod tests {
             width_in_mbs_minus1: 119,
             height_in_mbs_minus1: 67,
             direct_8x8: true,
+            crop_offsets: None,
             crop: None,
+            vui: None,
         }
     }
 
@@ -1274,14 +1231,16 @@ mod tests {
             flags: PPS_DEBLOCKING,
             num_ref_l0: 0,
             num_ref_l1: 0,
+            weighted_bipred_idc: 0,
             pic_init_qp: 0,
             pic_init_qs: 0,
             chroma_qp: 0,
             second_chroma_qp: 0,
             scaling: ScalingSets {
                 four: [[7; 16]; 6],
-                eight: [[9; 64]; 2],
+                eight: [[9; 64]; 6],
             },
+            scaling_map: None,
         }
     }
 
@@ -1310,6 +1269,7 @@ mod tests {
                     ref_mod_l1: Vec::new(),
                     weights: Weights::default(),
                     marking,
+                    redundant_pic_cnt: 0,
                     cabac_init_idc: 0,
                     qp_delta: 0,
                     deblocking_idc: 0,
@@ -1331,7 +1291,7 @@ mod tests {
             true,
             2,
             frame_num,
-            SlicePoc::Lsb(lsb),
+            SlicePoc::Lsb(lsb, 0),
             Marking::Idr {
                 no_output: false,
                 long_term: false,
@@ -1346,7 +1306,7 @@ mod tests {
             false,
             2,
             frame_num,
-            SlicePoc::Lsb(lsb),
+            SlicePoc::Lsb(lsb, 0),
             Marking::Silent,
             SliceType::P,
         )
@@ -1400,7 +1360,14 @@ mod tests {
         let mut dpb = Dpb::new(&sps());
         dpb.decode(&idr(0, 0), &sps(), &pps()).expect("idr");
         dpb.decode(&p(1, 4), &sps(), &pps()).expect("p");
-        let b = picture(false, 0, 2, SlicePoc::Lsb(2), Marking::Silent, SliceType::B);
+        let b = picture(
+            false,
+            0,
+            2,
+            SlicePoc::Lsb(2, 0),
+            Marking::Silent,
+            SliceType::B,
+        );
         let decoded = dpb.decode(&b, &sps(), &pps()).expect("b");
         assert_eq!(slots(&decoded.outputs), vec![2]);
         assert_eq!(slots(&dpb.drain()), vec![1]);
@@ -1415,7 +1382,7 @@ mod tests {
             false,
             2,
             2,
-            SlicePoc::Lsb(4),
+            SlicePoc::Lsb(4, 0),
             Marking::Adaptive(vec![Mmco::MarkAllUnused]),
             SliceType::P,
         );
@@ -1499,7 +1466,7 @@ mod tests {
                 false,
                 0,
                 frame_num,
-                SlicePoc::Lsb(2),
+                SlicePoc::Lsb(2, 0),
                 Marking::Silent,
                 SliceType::P,
             );
@@ -1517,13 +1484,20 @@ mod tests {
                 false,
                 0,
                 frame_num,
-                SlicePoc::Lsb(0),
+                SlicePoc::Lsb(0, 0),
                 Marking::Silent,
                 SliceType::P,
             );
             dpb.decode(&non_ref, &sps(), &pps()).expect("fills");
         }
-        let wrapped = picture(false, 0, 0, SlicePoc::Lsb(0), Marking::Silent, SliceType::P);
+        let wrapped = picture(
+            false,
+            0,
+            0,
+            SlicePoc::Lsb(0, 0),
+            Marking::Silent,
+            SliceType::P,
+        );
         let error = dpb.decode(&wrapped, &sps(), &pps()).unwrap_err();
         assert!(matches!(error, crate::error::D3d11Error::DpbFull));
     }
@@ -1623,7 +1597,7 @@ mod tests {
                     true,
                     2,
                     *frame_num,
-                    SlicePoc::Lsb(*lsb),
+                    SlicePoc::Lsb(*lsb, 0),
                     Marking::Idr {
                         no_output: false,
                         long_term: false,
@@ -1649,7 +1623,7 @@ mod tests {
             true,
             2,
             2,
-            SlicePoc::Lsb(0),
+            SlicePoc::Lsb(0, 0),
             Marking::Idr {
                 no_output: true,
                 long_term: false,

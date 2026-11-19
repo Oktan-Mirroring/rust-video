@@ -947,11 +947,17 @@ impl<'a> HevcDecoder<'a> {
             .pps(picture.pps_id())
             .ok_or(D3d11Error::NoSession)?;
         let sps = self.ingest.sps(pps.sps_id).ok_or(D3d11Error::NoSession)?;
+        let crop = sps.crop.map(|crop| Crop {
+            left: crop.left,
+            right: crop.right,
+            top: crop.top,
+            bottom: crop.bottom,
+        });
         Active::new(
             sps.id,
             sps.width,
             sps.height,
-            sps.crop,
+            crop,
             sps.visible_width(),
             sps.visible_height(),
         )

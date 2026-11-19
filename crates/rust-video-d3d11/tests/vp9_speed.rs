@@ -7,7 +7,7 @@
 
 use rust_video_caps::traits::Encoder;
 use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder};
-use rust_video_harness::Synth;
+use rust_video_harness::{Drive, Synth};
 
 /// Timed frames per fps observation.
 const HOPS: u32 = 30;
@@ -20,19 +20,6 @@ const REPEATS: u32 = 3;
 
 /// Validity frames behind the ffmpeg decode.
 const VALIDITY_FRAMES: u64 = 8;
-
-/// Serialized VP9 tests: one test at a time per binary.
-///
-/// Parallel VP9 encoders share the software MFT and the CPU; every test
-/// holds the lock for its whole body.
-static MEASURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Whole-test serial guard, poison-tolerant.
-fn measure() -> std::sync::MutexGuard<'static, ()> {
-    MEASURE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Tuned VP9 encoder plus its first frame bytes.
 ///
@@ -80,7 +67,7 @@ fn tuned(width: u32, height: u32) -> Option<(D3d11Encoder, Vec<u8>)> {
 /// Encoder tuned before its first frame.
 #[test]
 fn vp9_tuning_lands_fastest_level() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some((encoder, _)) = tuned(320, 240) else {
         return;
     };
@@ -91,7 +78,7 @@ fn vp9_tuning_lands_fastest_level() {
 /// Tuned VP9 output decodes clean under ffmpeg.
 #[test]
 fn vp9_tuned_output_decodes_clean() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some((mut encoder, first)) = tuned(320, 240) else {
         return;
     };
@@ -122,7 +109,7 @@ fn vp9_tuned_output_decodes_clean() {
 /// Tuned VP9 calls each return their own stamped packet.
 #[test]
 fn vp9_tuned_latency_returns_own_frames() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some((mut encoder, _)) = tuned(320, 240) else {
         return;
     };
@@ -156,7 +143,7 @@ fn vp9_tuned_latency_returns_own_frames() {
 /// Contended 1080p fps observations with repeats, reported only.
 #[test]
 fn vp9_contended_fps_observations() {
-    let _serial = measure();
+    let _serial = Drive::serial();
     let Some((mut encoder, _)) = tuned(1920, 1080) else {
         return;
     };
