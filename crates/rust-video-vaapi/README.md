@@ -1,33 +1,23 @@
 # rust-video-vaapi
 
-VA-API tier for Linux: H.264, H.265, VP9, and AV1 decode, H.264 and H.265 encode (all-intra or low-delay IPPP), and GPU transcode behind the caps traits. Off Linux the public API vanishes while the portable syntax modules still compile; only the OS modules are Linux-gated at the root.
+VA-API video over DRM render nodes: H.264, H.265, AV1, and VP9 decode with H.264 and H.265 encode, plus GPU transcode. Each decoder opens over a probed device.
 
-## Decode
-
-`VaApiDevice::open` sorts the render nodes under `/dev/dri` and keeps the first display that initializes with H.264 VLD into NV12. Each decoder submits one begun picture at a time through a four-deep `BufferSet` ring and syncs at consumption with `vaSyncSurface`; a failed submit quiets its target and returns the error on that call with the context still usable. `decode` copies pixels and releases its slot at once, `decode_surface` leases its slot until the frame drops. `Vp8Decoder` is a staged handle: every packet declines with typed `Unsupported` until its frontend wires.
+## Usage
 
 ```rust
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError};
+use rust_video_vaapi::{H264Decoder, VaApiDevice};
 
-fn run(packet: &Packet) -> Result<usize, VaApiError> {
-    let device = VaApiDevice::open()?;
+fn run(packet: &Packet) -> usize {
+    let device = VaApiDevice::open().unwrap();
     let mut decoder = H264Decoder::open(&device);
-    let mut total = decoder.decode(packet)?.len();
-    total += decoder.flush()?.len();
-    Ok(total)
+    decoder.decode(packet).unwrap().len() + decoder.flush().unwrap().len()
 }
 ```
 
-## Encode and transcode
+## Requirements
 
-`VaApiEncoder` codes H.264 High profile or H.265 Main at CQP 26 with packed headers, all-intra by default or low-delay IPPP via `with_gop`, one picture in flight behind a two-slot upload ring. `Transcoder` runs `decode_surface` into the encoder from H.264 sources, with an on-device scale hop on a size miss and the encoder opening lazily on first frame size, all-intra by default or low-delay IPPP via `with_gop`. `export` syncs the surface and yields two NV12 DMA-BUF planes; import checks same display then session size, with no format check in the path.
+Rust 1.87 or later, on Linux, with a DRM render node offering the codec profile.
 
-## Proof
-
-`../../docs/vaapi.md` records a 60/60 byte-exact decode of `corpus/synth/h264/h264-high.mp4` over `/dev/dri/renderD128` (Mesa radeonsi, `VAProfileH264High` plus VLD plus NV12) against an independent ffmpeg software decode, YUV420P planar SHA-256 per frame. VP9 carries a 600/600 byte-exact decode of a real WebM vector against the same oracle. H.265 and AV1 hardware fps is pending Linux runs. Syntax sources are assimilated from `cros-codecs` 0.0.6 with provenance in `../../docs/vaapi.md`; there is no `cros-codecs` dependency.
-
-## Docs
-
-The binding architecture is in `../../docs/vaapi-arch.md` with the ops companion in `../../docs/vaapi.md`. Decode one H.264 stream with `cargo run -p rust-video-vaapi --example decode_h264_vaapi`; the runner skips loud without hardware.
+Tier notes live in `../../docs/vaapi.md`.

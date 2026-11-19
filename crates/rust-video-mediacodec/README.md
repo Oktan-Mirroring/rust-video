@@ -1,29 +1,23 @@
 # rust-video-mediacodec
 
-Android MediaCodec tier: H.264, H.265, AV1, VP9, and VP8 byte-buffer decode plus H.264, H.265, and AV1 byte-buffer encode behind the caps traits. Off Android the native handles compile out and the pure pieces stand alone.
+Android platform video: H.264, H.265, AV1, VP9, and VP8 decode with H.264, H.265, and AV1 encode, each answered by the device codec behind its mime. Decoders open from a format spec; the snippet runs on Android.
 
-## Decode
-
-`MediaCodecDecoder::open` takes a `FormatSpec` and refuses below the device floor with `BelowMinSdk`. Lookup answers by mime or fails with `NoDecoder` naming it. API 28 and up register all four async callback slots into one `EventQueue`; lower levels use sync dequeue with bounded waits. Each queued packet copies once into an input buffer and each output drains into refcounted bytes behind a `MediaCodecSurface`; `export` answers `GpuExport::Opaque` and there is no import path.
+## Usage
 
 ```rust
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError};
+use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder};
 
-fn run(packet: &Packet) -> Result<usize, MediaCodecError> {
-    let spec = FormatSpec::h264(1920, 1080).expect("dims");
-    let mut decoder = MediaCodecDecoder::open(&spec)?;
-    let mut total = decoder.decode(packet)?.len();
-    total += decoder.flush()?.len();
-    Ok(total)
+fn run(packet: &Packet) -> usize {
+    let spec = FormatSpec::h264(64, 64).unwrap();
+    let mut decoder = MediaCodecDecoder::open(&spec).unwrap();
+    decoder.decode(packet).unwrap().len() + decoder.flush().unwrap().len()
 }
 ```
 
-## Encode and gates
+## Requirements
 
-`MediaCodecEncoder::open` takes an `EncodeSpec` with width, height, bitrate, frame rate, and keyframe interval; `encode` queues one `CpuFrame` and drains packets, `flush` drains without new input. Device floor is API 21, async callbacks need API 28, AV1 needs API 29. A color value outside planar 19 and semi-planar 21 fails typed as `UnsupportedColorFormat`. The snippet above is Android-only: `open` is gated on the target OS.
+Rust 1.87 or later, building for Android with NDK API 28; devices run API 21 and up.
 
-## Docs
-
-The binding architecture is in `../../docs/mediacodec-arch.md` with the ops companion in `../../docs/mediacodec.md`. Probe the device matrix with `cargo run -p rust-video-mediacodec --example decode_matrix_mc`.
+Tier notes live in `../../docs/mediacodec.md`.
