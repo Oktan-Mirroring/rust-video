@@ -5,13 +5,12 @@ use rust_video_h264::{H264Error, ParseKind, StrictGate, UnsupportedKind};
 use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 
 pub(crate) use rust_video_h264::{
-    Crop, Marking, Mmco, Picture, PocType, Pps, RefMod, SliceHeader, SlicePoc, Sps, Weights,
+    Crop, Marking, Mmco, Picture, PocType, Pps, RefMod, SliceHeader, SlicePoc, SliceType, Sps,
+    Weights,
 };
 
 #[cfg(test)]
-pub(crate) use rust_video_h264::{
-    FidelityRange, PendingSlice, ScalingSets, SliceType, PPS_DEBLOCKING,
-};
+pub(crate) use rust_video_h264::{FidelityRange, PendingSlice, ScalingSets, PPS_DEBLOCKING};
 
 /// Annex B ingest over the tier gate.
 pub(crate) type Ingest = rust_video_h264::Ingest<D3d11Error, StrictGate>;

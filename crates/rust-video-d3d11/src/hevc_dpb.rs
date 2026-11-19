@@ -20,7 +20,8 @@ use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::h265::{LtSpec, Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
 
-use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
+use rust_video_h265::{anchors_tid0, is_slnr};
 
 /// DPB slot count.
 const SLOTS: usize = 16;
@@ -85,12 +86,8 @@ pub(crate) struct HevcDpb {
     capacity: u8,
     /// Reorder limit.
     max_reorder: u8,
-    /// Maximum POC LSB.
-    max_poc_lsb: u32,
-    /// Previous temporal-zero POC behind MSB derivation.
-    poc: PocTracker,
-    /// True past the first temporal-zero picture.
-    has_prev_tid0: bool,
+    /// POC anchor of the last temporal-zero picture.
+    poc_tid0: Option<i32>,
     /// Driver-echoed picture serial.
     feedback: u32,
 }
@@ -103,9 +100,7 @@ impl HevcDpb {
             pins: Arc::new(SlotPins::new()),
             capacity: sps.max_dec_pic_buffering_minus1 + 1,
             max_reorder: sps.max_num_reorder_pics,
-            max_poc_lsb: sps.max_poc_lsb(),
-            poc: PocTracker::new(),
-            has_prev_tid0: false,
+            poc_tid0: None,
             feedback: 1,
         }
     }
@@ -191,29 +186,10 @@ impl HevcDpb {
         let lsb = picture
             .poc_lsb()
             .ok_or(D3d11Error::Parse(ParseReason::PictureWithoutPoc))?;
-        if is_bla(picture) {
-            return i32::try_from(lsb).map_err(|_| {
-                D3d11Error::Parse(ParseReason::Range {
-                    syntax: "pic_order_cnt",
-                })
-            });
-        }
-        let _ = sps;
-        let msb = self.poc_msb(i64::from(lsb));
-        let poc = msb + i64::from(lsb);
-        i32::try_from(poc).map_err(|_| {
-            D3d11Error::Parse(ParseReason::Range {
+        sps.poc_from_lsb(self.poc_tid0, lsb, is_bla(picture))
+            .ok_or(D3d11Error::Parse(ParseReason::Range {
                 syntax: "pic_order_cnt",
-            })
-        })
-    }
-
-    /// POC MSB against the previous temporal-zero picture.
-    fn poc_msb(&self, lsb: i64) -> i64 {
-        if !self.has_prev_tid0 {
-            return 0;
-        }
-        self.poc.msb_for(lsb, i64::from(self.max_poc_lsb))
+            }))
     }
 
     /// Undisplayed priors emitted, references kept for set marking.
@@ -293,16 +269,12 @@ impl HevcDpb {
 
     /// POC state after storing the current picture.
     fn close_picture(&mut self, picture: &Picture, poc: i32) {
-        if picture.temporal_id() != 0 {
+        let Some(slice) = picture.slices.first() else {
             return;
-        }
-        let lsb = if picture.idr {
-            0
-        } else {
-            picture.poc_lsb().unwrap_or(0)
         };
-        self.poc.observe(i64::from(poc) - i64::from(lsb), lsb);
-        self.has_prev_tid0 = true;
+        if anchors_tid0(slice.nal_type, picture.temporal_id()) {
+            self.poc_tid0 = Some(poc);
+        }
     }
 
     /// First free slot outside live surface pins.
@@ -491,7 +463,7 @@ fn is_bla(picture: &Picture) -> bool {
     picture
         .slices
         .first()
-        .is_some_and(|slice| matches!(slice.nal_type, 16..=18))
+        .is_some_and(|slice| rust_video_h265::is_bla(slice.nal_type))
 }
 
 /// True when the picture is used for reference, H.265 7.4.2.2.
@@ -499,7 +471,7 @@ fn ref_pic(picture: &Picture) -> bool {
     picture
         .slices
         .first()
-        .is_some_and(|slice| slice.nal_type >= 16 || slice.nal_type % 2 == 1)
+        .is_some_and(|slice| !is_slnr(slice.nal_type))
 }
 
 /// Set membership of a stored POC.
@@ -567,22 +539,24 @@ fn curr_pocs(rps: &ShortTermRps, lt_pocs: &[(i32, bool)], current: i32) -> Vec<i
 
 /// Long-term POC from its description against the current picture.
 fn lt_poc(spec: &LtSpec, poc: i32, max_lsb: u32) -> Result<i32, D3d11Error> {
+    if spec.msb_present {
+        return spec
+            .poc_msb_present(poc, max_lsb)
+            .ok_or(D3d11Error::Parse(ParseReason::Range {
+                syntax: "long_term poc",
+            }));
+    }
     let max_lsb = i64::from(max_lsb);
     let lsb = i64::from(spec.poc_lsb);
     let current = i64::from(poc);
-    let derived = if spec.msb_present {
-        let cycle_pos = current.rem_euclid(max_lsb);
-        current - i64::from(spec.msb_cycle) * max_lsb - cycle_pos + lsb
+    let cycle_base = current - current.rem_euclid(max_lsb);
+    let cycle_pos = current.rem_euclid(max_lsb);
+    let derived = if lsb < cycle_pos && cycle_pos - lsb >= max_lsb / 2 {
+        cycle_base + max_lsb + lsb
+    } else if lsb > cycle_pos && lsb - cycle_pos > max_lsb / 2 {
+        cycle_base - max_lsb + lsb
     } else {
-        let cycle_base = current - current.rem_euclid(max_lsb);
-        let cycle_pos = current.rem_euclid(max_lsb);
-        if lsb < cycle_pos && cycle_pos - lsb >= max_lsb / 2 {
-            cycle_base + max_lsb + lsb
-        } else if lsb > cycle_pos && lsb - cycle_pos > max_lsb / 2 {
-            cycle_base - max_lsb + lsb
-        } else {
-            cycle_base + lsb
-        }
+        cycle_base + lsb
     };
     i32::try_from(derived).map_err(|_| {
         D3d11Error::Parse(ParseReason::Range {

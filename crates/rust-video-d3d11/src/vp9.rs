@@ -43,55 +43,10 @@ mod tests {
     use super::Ingest;
     use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 
-    /// Bit writer behind synthetic headers.
-    struct Writer {
-        /// Finished bytes.
-        bytes: Vec<u8>,
-        /// Open byte.
-        open: u8,
-        /// Bits filled in the open byte.
-        filled: u32,
-    }
-
-    impl Writer {
-        /// Empty writer.
-        fn new() -> Self {
-            Self {
-                bytes: Vec::new(),
-                open: 0,
-                filled: 0,
-            }
-        }
-
-        /// Single bit.
-        fn bit(&mut self, on: bool) {
-            self.open = (self.open << 1) | u8::from(on);
-            self.filled += 1;
-            if self.filled == 8 {
-                self.bytes.push(self.open);
-                self.open = 0;
-                self.filled = 0;
-            }
-        }
-
-        /// Low `count` bits of `value`, high to low.
-        fn bits(&mut self, value: u32, count: u32) {
-            for shift in (0..count).rev() {
-                self.bit(value >> shift & 1 != 0);
-            }
-        }
-
-        /// Finished bytes with zero padding.
-        fn bytes(mut self) -> Vec<u8> {
-            if self.filled > 0 {
-                self.bytes.push(self.open << (8 - self.filled));
-            }
-            self.bytes
-        }
-    }
+    use rust_video_harness::Bits;
 
     /// Profile 0 keyframe head through segmentation at `width` x `height`.
-    fn key_head(writer: &mut Writer, width: u32, height: u32) {
+    fn key_head(writer: &mut Bits, width: u32, height: u32) {
         writer.bits(2, 2);
         writer.bit(false);
         writer.bit(false);
@@ -153,7 +108,7 @@ mod tests {
 
     /// Synthetic keyframe, 4096x16 with 4x2 tiles.
     fn tiled_4096x16() -> Vec<u8> {
-        let mut writer = Writer::new();
+        let mut writer = Bits::new();
         key_head(&mut writer, 4096, 16);
         writer.bit(true);
         writer.bit(true);
@@ -161,7 +116,7 @@ mod tests {
         writer.bit(true);
         writer.bit(false);
         writer.bits(0, 16);
-        let mut bytes = writer.bytes();
+        let mut bytes = writer.finish_raw();
         for tile in 0..7u8 {
             let size = u32::from(tile) + 1;
             bytes.extend_from_slice(&size.to_be_bytes());
