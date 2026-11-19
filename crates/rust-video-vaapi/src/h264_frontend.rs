@@ -38,6 +38,45 @@ impl SurfaceSlot {
     pub fn index(self) -> u32 {
         self.index
     }
+
+    /// First pool slot outside the held, leased, and skipped sets.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - surface count; indices scan `0..pool`.
+    /// * `except` - index to skip, if any.
+    /// * `held` - true when the frontend pins `index`.
+    /// * `live` - true when a live frame leases `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoFreeSlot` when live frames pin every frontend-free
+    /// slot, or when `pool` exceeds `u32`; `DpbFull` when no slot is
+    /// frontend-free.
+    pub fn acquire_free(
+        pool: usize,
+        except: Option<u32>,
+        held: impl Fn(u32) -> bool,
+        live: impl Fn(u32) -> bool,
+    ) -> Result<Self, VaApiError> {
+        let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
+        let mut pinned = false;
+        for index in 0..end {
+            if Some(index) == except || held(index) {
+                continue;
+            }
+            if live(index) {
+                pinned = true;
+                continue;
+            }
+            return Ok(Self::new(index));
+        }
+        Err(if pinned {
+            VaApiError::NoFreeSlot
+        } else {
+            VaApiError::DpbFull
+        })
+    }
 }
 
 /// One coded slice: parsed header plus its NAL bytes.
@@ -1226,6 +1265,50 @@ mod tests {
             slices: Vec::new(),
             initial: ReferencePicLists::default(),
         }
+    }
+
+    #[test]
+    fn acquire_free_skips_held_leased_and_except() {
+        let held = |index| index == 0;
+        let live = |index| index == 1;
+        assert_eq!(
+            SurfaceSlot::acquire_free(4, Some(2), held, live).expect("slot 3 free"),
+            SurfaceSlot::new(3)
+        );
+        assert_eq!(
+            SurfaceSlot::acquire_free(4, None, held, live).expect("slot 2 free"),
+            SurfaceSlot::new(2)
+        );
+    }
+
+    #[test]
+    fn acquire_free_reports_pinned_before_full() {
+        assert!(matches!(
+            SurfaceSlot::acquire_free(2, None, |_| false, |index| index < 2),
+            Err(VaApiError::NoFreeSlot)
+        ));
+        assert!(matches!(
+            SurfaceSlot::acquire_free(2, None, |_| true, |_| false),
+            Err(VaApiError::DpbFull)
+        ));
+        assert!(matches!(
+            SurfaceSlot::acquire_free(0, None, |_| false, |_| false),
+            Err(VaApiError::DpbFull)
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn acquire_free_rejects_pools_past_u32() {
+        assert!(matches!(
+            SurfaceSlot::acquire_free(
+                usize::try_from(u64::from(u32::MAX) + 1).expect("fits on 64-bit"),
+                None,
+                |_| false,
+                |_| false
+            ),
+            Err(VaApiError::NoFreeSlot)
+        ));
     }
 
     #[test]

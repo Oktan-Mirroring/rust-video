@@ -236,28 +236,16 @@ impl<'a> Av1Decoder<'a> {
     /// `DpbFull` when no slot is reference-free.
     fn acquire_slot(&self, except: Option<u32>) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
-        let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
-        let mut pinned = false;
-        for index in 0..end {
-            let slot = SurfaceSlot::new(index);
-            if Some(slot.index()) == except || self.frontend.slot_in_use(slot.index()) {
-                continue;
-            }
-            if self
-                .backend
-                .as_ref()
-                .is_some_and(|backend| backend.surface_live(slot.index()))
-            {
-                pinned = true;
-                continue;
-            }
-            return Ok(slot);
-        }
-        Err(if pinned {
-            VaApiError::NoFreeSlot
-        } else {
-            VaApiError::DpbFull
-        })
+        SurfaceSlot::acquire_free(
+            pool,
+            except,
+            |index| self.frontend.slot_in_use(index),
+            |index| {
+                self.backend
+                    .as_ref()
+                    .is_some_and(|backend| backend.surface_live(index))
+            },
+        )
     }
 
     /// Free pool slot past `except`, emitting staged reads when pinned.

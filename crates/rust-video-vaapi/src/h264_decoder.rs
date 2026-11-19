@@ -246,28 +246,16 @@ impl<'a> H264Decoder<'a> {
     /// `DpbFull` when no slot is DPB-free.
     fn acquire_slot(&self) -> Result<SurfaceSlot, VaApiError> {
         let pool = self.backend.as_ref().map_or(0, Backend::pool_size);
-        let end = u32::try_from(pool).map_err(|_| VaApiError::NoFreeSlot)?;
-        let mut pinned = false;
-        for index in 0..end {
-            let slot = SurfaceSlot::new(index);
-            if self.frontend.slot_in_use(slot.index()) {
-                continue;
-            }
-            if self
-                .backend
-                .as_ref()
-                .is_some_and(|backend| backend.surface_live(slot.index()))
-            {
-                pinned = true;
-                continue;
-            }
-            return Ok(slot);
-        }
-        Err(if pinned {
-            VaApiError::NoFreeSlot
-        } else {
-            VaApiError::DpbFull
-        })
+        SurfaceSlot::acquire_free(
+            pool,
+            None,
+            |index| self.frontend.slot_in_use(index),
+            |index| {
+                self.backend
+                    .as_ref()
+                    .is_some_and(|backend| backend.surface_live(index))
+            },
+        )
     }
 
     /// Free pool slot, emitting staged reads when the pool is pinned.
