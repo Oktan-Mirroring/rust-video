@@ -1,4 +1,4 @@
-//! HEVC encode on the D3D12 tier, from synthetic NV12 to packets.
+//! H.265 encode on the D3D12 tier, from synthetic NV12 to packets.
 
 #[cfg(target_os = "windows")]
 use rust_video_harness::Synth;
@@ -21,7 +21,7 @@ fn main() {
     let mut encoder = match D3d12Encoder::open(&device, Codec::Hevc) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("SKIP: no hevc encoder ({error})");
+            println!("SKIP: no h265 encoder ({error})");
             return;
         }
     };
@@ -52,7 +52,7 @@ fn main() {
         }
     }
     if packets == 0 || bytes == 0 {
-        println!("ERROR: hevc encode produced no bitstream");
+        println!("ERROR: h265 encode produced no bitstream");
         std::process::exit(1);
     }
     println!("encoded {packets} packet(s), {bytes} byte(s) (flat input only)");

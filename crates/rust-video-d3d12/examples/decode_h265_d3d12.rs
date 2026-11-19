@@ -1,4 +1,4 @@
-//! HEVC decode on the D3D12 tier, from synthetic Annex B to frames.
+//! H.265 decode on the D3D12 tier, from synthetic Annex B to frames.
 //!
 //! Encode stays a named miss until the args builder lands.
 
@@ -30,7 +30,7 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    println!("supports hevc: {}", device.supports(Codec::Hevc));
+    println!("supports h265: {}", device.supports(Codec::Hevc));
     let mut decoder = HevcDecoder::open(&device);
     let mut total = 0;
     for (index, bytes) in annex_b_packets().into_iter().enumerate() {
@@ -63,7 +63,7 @@ fn main() {
         }
     }
     if total == 0 {
-        println!("ERROR: hevc decode produced no frames");
+        println!("ERROR: h265 decode produced no frames");
         std::process::exit(1);
     }
     println!("total: {total} frame(s)");
@@ -91,13 +91,13 @@ fn report(frame: &D3d12Frame) {
     }
 }
 
-/// HEVC encode attempt; names the miss when the box declines it.
+/// H.265 encode attempt; names the miss when the box declines it.
 #[cfg(target_os = "windows")]
 fn probe_encode_miss(device: &D3d12Device) {
     let mut encoder = match D3d12Encoder::open(device, Codec::Hevc) {
         Ok(encoder) => encoder,
         Err(error) => {
-            println!("MISS: hevc encode unavailable ({error})");
+            println!("MISS: h265 encode unavailable ({error})");
             return;
         }
     };
@@ -105,9 +105,9 @@ fn probe_encode_miss(device: &D3d12Device) {
     match encoder.encode(&frame) {
         Ok(packets) => {
             let bytes: usize = packets.iter().map(|packet| packet.data().len()).sum();
-            println!("hevc encode: 320x240 bitstream {bytes}B");
+            println!("h265 encode: 320x240 bitstream {bytes}B");
         }
-        Err(error) => println!("MISS: hevc encode miss ({error})"),
+        Err(error) => println!("MISS: h265 encode miss ({error})"),
     }
 }
 
