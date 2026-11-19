@@ -4,18 +4,13 @@
 
 #![cfg(target_os = "windows")]
 
-use std::num::NonZeroUsize;
-
-use bytes::Bytes;
-use rust_video_caps::delivery::{
-    ChannelConfig, DropPolicy, PollFrames, ReceiveFrames, SendPackets,
-};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_d3d12::{
     Codec, D3d12Device, D3d12Error, D3d12Frame, DecoderPump, H264Decoder, HevcDecoder,
 };
-use rust_video_harness::{decode_dir, AnnexB};
+use rust_video_harness::{decode_dir, AnnexB, Drive, Packets, Parity};
 
 /// Pictures in each shared vector.
 const PICTURES: usize = 15;
@@ -31,21 +26,10 @@ fn device() -> Option<D3d12Device> {
     }
 }
 
-/// Bound of `capacity` frames under `policy`.
-fn config(capacity: usize, policy: DropPolicy) -> ChannelConfig {
-    ChannelConfig::new(
-        NonZeroUsize::new(capacity).expect("nonzero capacity"),
-        policy,
-    )
-}
-
 /// Shared H.264 vector, one packet per picture in order.
 fn h264_packets() -> Vec<Packet> {
     let path = decode_dir().join("valid_320x240.h264");
-    let packets: Vec<Packet> = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect();
+    let packets = Packets::from_raws(&AnnexB::picture_packets(&path, AnnexB::is_h264_vcl));
     assert_eq!(
         packets.len(),
         PICTURES,
@@ -58,10 +42,7 @@ fn h264_packets() -> Vec<Packet> {
 fn hevc_packets() -> Vec<Packet> {
     let path = decode_dir().join("intra_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
-    let packets: Vec<Packet> = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect();
+    let packets = Packets::from_raws(&AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl));
     assert_eq!(
         packets.len(),
         PICTURES,
@@ -70,37 +51,40 @@ fn hevc_packets() -> Vec<Packet> {
     packets
 }
 
+/// One in-flight frame into `frames`, freeing send room.
+fn drain<P>(pump: &mut P, frames: &mut Vec<P::Frame>)
+where
+    P: ReceiveFrames,
+    P::Error: std::fmt::Debug,
+{
+    frames.push(
+        pump.receive()
+            .expect("in-flight frame completes")
+            .expect("input unfinished"),
+    );
+}
+
 /// Every frame from `packets` through `pump`, tail via blocking receive.
 fn drive<D>(pump: &mut DecoderPump<D>, packets: &[Packet]) -> Vec<D3d12Frame>
 where
     D: Decoder<Frame = D3d12Frame, Error = D3d12Error>,
 {
-    for packet in packets {
-        pump.try_send(packet.clone()).expect("queue room");
-    }
-    let mut frames = Vec::new();
-    while let Some(frame) = pump.try_receive().expect("poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("finish drains");
-    while let Some(frame) = pump.receive().expect("tail") {
-        frames.push(frame);
-    }
+    let (mut frames, _) = Drive::send_all(pump, packets, drain);
+    frames.extend(Drive::finish_all(pump));
     frames
 }
 
 /// Frames hold tight NV12 in send order.
 fn assert_own_frames(frames: &[D3d12Frame]) {
     const FRAME_BYTES: usize = 320 * 240 * 3 / 2;
-    assert_eq!(frames.len(), PICTURES, "every picture completes");
-    for (index, frame) in frames.iter().enumerate() {
-        assert_eq!(
-            frame.nv12().len(),
-            FRAME_BYTES,
-            "frame {index} holds tight NV12"
-        );
-        assert_eq!(frame.identity().generation(), index as u64);
-    }
+    Parity::assert_ordered(
+        "d3d12",
+        frames,
+        PICTURES,
+        FRAME_BYTES,
+        D3d12Frame::nv12,
+        |frame| frame.identity().generation(),
+    );
 }
 
 /// Sent H.264 packets return as owned frames, then end of stream.
@@ -112,7 +96,7 @@ fn h264_loopback_returns_own_frames() {
     let packets = h264_packets();
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     let frames = drive(&mut pump, &packets);
     assert_own_frames(&frames);
@@ -131,7 +115,7 @@ fn h264_blocking_receive_drains_tail() {
     let packets = h264_packets();
     let mut pump = DecoderPump::open(
         H264Decoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");
@@ -161,7 +145,7 @@ fn hevc_loopback_returns_own_frames() {
     let packets = hevc_packets();
     let mut pump = DecoderPump::open(
         HevcDecoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     let frames = drive(&mut pump, &packets);
     assert_own_frames(&frames);
@@ -183,7 +167,7 @@ fn hevc_blocking_receive_drains_tail() {
     let packets = hevc_packets();
     let mut pump = DecoderPump::open(
         HevcDecoder::open(&device),
-        config(32, DropPolicy::DropOldest),
+        Drive::channel(32, DropPolicy::DropOldest),
     );
     for packet in &packets {
         pump.try_send(packet.clone()).expect("queue room");

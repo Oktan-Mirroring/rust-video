@@ -1497,8 +1497,8 @@ mod tests {
         ]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
         let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         let decoded = dpb.decode(&pictures[0], &sps, &pps).expect("submission");
         assert!(decoded.outputs.is_empty());
@@ -1524,8 +1524,8 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::bits::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::bits::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert_eq!(pps.pic_init_qp, -3);
         let picture = &pictures[0];
@@ -1569,8 +1569,8 @@ mod tests {
         let data = packet(&[sps_nal.clone(), pps_nal.clone(), slice_nal]);
         let pictures = ingest(&data);
         assert_eq!(pictures.len(), 1);
-        let sps = parse_sps(&crate::bits::rbsp(&sps_nal)[1..]).expect("sps");
-        let pps = parse_pps(&crate::bits::rbsp(&pps_nal)[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::rbsp(&sps_nal)[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::rbsp(&pps_nal)[1..], &sps).expect("pps");
         assert_eq!((sps.visible_width(), sps.visible_height()), (320, 240));
         assert!(pps.transform_8x8());
         assert!(!pps.entropy());
@@ -1612,8 +1612,8 @@ mod tests {
         let mut live = Ingest::new();
         let idr = live.ingest_packet(&idr).expect("idr");
         assert_eq!(idr.len(), 1);
-        let sps = parse_sps(&crate::bits::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
-        let pps = parse_pps(&crate::bits::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
+        let sps = parse_sps(&crate::h264::rbsp(&nal(7, 3, &sps_body()))[1..]).expect("sps");
+        let pps = parse_pps(&crate::h264::rbsp(&nal(8, 3, &pps_body()))[1..], &sps).expect("pps");
         let mut dpb = crate::dpb::Dpb::new(&sps, pins());
         dpb.decode(&idr[0], &sps, &pps).expect("idr");
         let pictures = live.ingest_packet(&next).expect("p");

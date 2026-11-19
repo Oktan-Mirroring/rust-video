@@ -1847,8 +1847,7 @@ impl EncodeSession {
 mod tests {
     use super::{pad_nv12, H264Headers, HevcHeaders};
 
-    use crate::bits::rbsp;
-    use crate::h264::{parse_pps, parse_sps, split_nals};
+    use crate::h264::{parse_pps, parse_sps, rbsp, split_nals};
     use crate::hevc;
 
     #[test]
@@ -1937,7 +1936,7 @@ mod tests {
         assert_eq!(nals.len(), 3);
         let kinds: Vec<u8> = nals.iter().map(|nal| nal[0] >> 1).collect();
         assert_eq!(kinds, vec![32, 33, 34]);
-        let sps = hevc::parse_sps(&crate::bits::rbsp(nals[1])[2..]).expect("sps");
+        let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
         assert_eq!((sps.width(), sps.height()), (64, 48));
         assert!(sps.crop.is_none());
         assert_eq!(sps.min_cb(), 8);
@@ -1946,7 +1945,7 @@ mod tests {
         assert_eq!(sps.log2_diff_max_min_tb, 3);
         assert!(!sps.amp());
         assert!(!sps.sao());
-        hevc::parse_pps(&crate::bits::rbsp(nals[2])[2..], &sps).expect("pps");
+        hevc::parse_pps(&rust_video_h265::rbsp(nals[2])[2..], &sps).expect("pps");
     }
 
     #[test]
@@ -1957,7 +1956,7 @@ mod tests {
         let bytes = headers.into_bytes();
         let nals = hevc::split_nals(&bytes);
         assert_eq!(nals.len(), 3);
-        let sps = hevc::parse_sps(&crate::bits::rbsp(nals[1])[2..]).expect("sps");
+        let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
         assert_eq!((sps.width(), sps.height()), (640, 368));
         assert_eq!((sps.visible_width(), sps.visible_height()), (640, 360));
     }

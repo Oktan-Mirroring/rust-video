@@ -4,13 +4,8 @@
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-
 use std::time::Duration;
 
-use av1::tu_packets;
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Error, D3d12Frame, H264Decoder, HevcDecoder,
     OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump, PhaseTiming,
@@ -22,7 +17,7 @@ use rust_video_caps::delivery::{
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{decode_dir, AnnexB, H264Synth};
+use rust_video_harness::{decode_dir, AnnexB, Drive, H264Synth, Obu, Packets};
 
 /// Pictures in the shared vector.
 const PICTURES: usize = 15;
@@ -38,16 +33,6 @@ const DEPTH_PICTURES: usize = 6;
 
 /// Pictures behind the depth drive, warmup plus measured.
 const PROBE_PICTURES: usize = WARMUP_PICTURES + DEPTH_PICTURES;
-
-/// Serializes overlap probes sharing one adapter.
-static OVERLAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Overlap guard, poison-tolerant past a failed probe.
-fn overlap_guard() -> std::sync::MutexGuard<'static, ()> {
-    OVERLAP_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Overlap margin floor in microseconds behind the depth probe.
 const OVERLAP_FLOOR_US: u128 = 200;
@@ -66,10 +51,7 @@ fn device() -> Option<D3d12Device> {
 /// Shared H.264 vector, one packet per picture in order.
 fn h264_packets() -> Vec<Packet> {
     let path = decode_dir().join("valid_320x240.h264");
-    let packets: Vec<Packet> = AnnexB::picture_packets(&path, AnnexB::is_h264_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect();
+    let packets = Packets::from_raws(&AnnexB::picture_packets(&path, AnnexB::is_h264_vcl));
     assert_eq!(
         packets.len(),
         PICTURES,
@@ -82,10 +64,7 @@ fn h264_packets() -> Vec<Packet> {
 fn hevc_packets() -> Vec<Packet> {
     let path = decode_dir().join("inter_320x240.hevc");
     let data = std::fs::read(path).expect("vector readable");
-    let packets: Vec<Packet> = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect();
+    let packets = Packets::from_raws(&AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl));
     assert_eq!(
         packets.len(),
         PICTURES,
@@ -97,10 +76,7 @@ fn hevc_packets() -> Vec<Packet> {
 /// Shared AV1 vector, one packet per temporal unit in order.
 fn av1_packets() -> Vec<Packet> {
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let packets: Vec<Packet> = tu_packets(&data)
-        .iter()
-        .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
-        .collect();
+    let packets = Packets::from_raws(&Obu::tu_packets(&data));
     assert_eq!(
         packets.len(),
         AV1_PACKETS,
@@ -196,36 +172,26 @@ fn drive_sync(device: &D3d12Device, packets: &[Packet]) -> SyncRun {
     }
 }
 
+/// One in-flight frame into `frames`, freeing send room within five seconds.
+fn drain<P>(pump: &mut P, frames: &mut Vec<P::Frame>)
+where
+    P: ReceiveFrames,
+    P::Error: std::error::Error,
+{
+    frames.push(
+        pump.receive_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|error| panic!("bound drain: {error}"))
+            .expect("bound drain completes"),
+    );
+}
+
 /// Overlapped frames plus timings for `packets` through a fresh bound pump.
 fn drive_overlapped(device: &D3d12Device, bound: usize, packets: &[Packet]) -> OverlapRun {
     let mut pump = OverlappedH264Pump::open(device, bound);
     assert_eq!(pump.bound(), bound);
-    let mut frames = Vec::new();
     let start = std::time::Instant::now();
-    for (index, packet) in packets.iter().enumerate() {
-        let mut packet = packet.clone();
-        loop {
-            match pump.try_send(packet) {
-                Ok(()) => break,
-                Err(TrySendError::Full { packet: back }) => {
-                    let frame = pump
-                        .receive_timeout(Duration::from_secs(5))
-                        .unwrap_or_else(|error| panic!("bound drain {index}: {error}"))
-                        .expect("bound drain completes");
-                    frames.push(frame);
-                    packet = back;
-                }
-                Err(TrySendError::Failed { error }) => panic!("overlap packet {index}: {error}"),
-            }
-        }
-    }
-    while let Some(frame) = pump.try_receive().expect("overlap poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("overlap finish drains");
-    while let Some(frame) = pump.receive().expect("overlap tail") {
-        frames.push(frame);
-    }
+    let (mut frames, _) = Drive::send_all(&mut pump, packets, drain);
+    frames.extend(Drive::finish_all(&mut pump));
     let total_us = micros(start.elapsed());
     let (max_depth, resets) = (pump.max_depth(), pump.resets());
     let timings = pump.timings().to_vec();
@@ -247,16 +213,7 @@ fn drive_sync_with(
     decoder: &mut impl Decoder<Frame = D3d12Frame, Error = D3d12Error>,
     packets: &[Packet],
 ) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
-    for (index, packet) in packets.iter().enumerate() {
-        frames.extend(
-            decoder
-                .decode(packet)
-                .unwrap_or_else(|error| panic!("sync packet {index}: {error}")),
-        );
-    }
-    frames.extend(decoder.flush().expect("sync flush drains"));
-    frames
+    Drive::decode_all(decoder, packets)
         .into_iter()
         .map(|frame| frame.nv12().to_vec())
         .collect()
@@ -269,31 +226,8 @@ fn drive_pump_with(
               + ReceiveFrames<Frame = D3d12Frame, Error = D3d12Error>),
     packets: &[Packet],
 ) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
-    for (index, packet) in packets.iter().enumerate() {
-        let mut packet = packet.clone();
-        loop {
-            match pump.try_send(packet) {
-                Ok(()) => break,
-                Err(TrySendError::Full { packet: back }) => {
-                    let frame = pump
-                        .receive_timeout(Duration::from_secs(5))
-                        .unwrap_or_else(|error| panic!("bound drain {index}: {error}"))
-                        .expect("bound drain completes");
-                    frames.push(frame);
-                    packet = back;
-                }
-                Err(TrySendError::Failed { error }) => panic!("overlap packet {index}: {error}"),
-            }
-        }
-    }
-    while let Some(frame) = pump.try_receive().expect("overlap poll") {
-        frames.push(frame);
-    }
-    pump.finish().expect("overlap finish drains");
-    while let Some(frame) = pump.receive().expect("overlap tail") {
-        frames.push(frame);
-    }
+    let (mut frames, _) = Drive::send_all(pump, packets, drain);
+    frames.extend(Drive::finish_all(pump));
     frames
         .into_iter()
         .map(|frame| frame.nv12().to_vec())
@@ -336,7 +270,7 @@ fn print_phase_table(name: &str, timings: &[PhaseTiming]) {
 /// Same vector bytes through sync and overlapped decode match exactly.
 #[test]
 fn overlap_matches_sync_bytes() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -388,7 +322,7 @@ fn overlap_matches_sync_bytes() {
 /// 1080p back-to-back sends hold two pictures in flight with overlapping windows.
 #[test]
 fn overlap_observes_depth_above_one() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -439,7 +373,7 @@ fn overlap_observes_depth_above_one() {
 /// Bound-1 stage latency matches the sync path per frame.
 #[test]
 fn overlap_keeps_stage_parity() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -474,7 +408,7 @@ fn overlap_keeps_stage_parity() {
 /// Blocking receive ends the stream; idle receive times out.
 #[test]
 fn overlap_receive_endpoints() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -504,7 +438,7 @@ fn overlap_receive_endpoints() {
 /// Same HEVC inter bytes through sync and overlapped decode match exactly.
 #[test]
 fn overlap_hevc_matches_sync_bytes() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };
@@ -537,7 +471,7 @@ fn overlap_hevc_matches_sync_bytes() {
 /// Same AV1 bytes through sync and overlapped decode match exactly.
 #[test]
 fn overlap_av1_matches_sync_bytes() {
-    let _guard = overlap_guard();
+    let _guard = Drive::serial();
     let Some(device) = device() else {
         return;
     };

@@ -19,6 +19,8 @@ use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedRe
 use crate::hevc::{Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
 
+use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+
 /// DPB slot count.
 const SLOTS: usize = 16;
 
@@ -34,6 +36,28 @@ struct Occupant {
     reference: bool,
     /// Already output or never needed for output.
     displayed: bool,
+}
+
+impl SlotState for Occupant {
+    fn poc(&self) -> i32 {
+        self.poc
+    }
+
+    fn is_reference(&self) -> bool {
+        self.reference
+    }
+
+    fn is_displayed(&self) -> bool {
+        self.displayed
+    }
+
+    fn mark_displayed(&mut self) {
+        self.displayed = true;
+    }
+
+    fn release(&mut self) {
+        self.reference = false;
+    }
 }
 
 /// Reference picture behind parameter construction.
@@ -57,10 +81,8 @@ pub(crate) struct HevcDpb {
     max_reorder: u8,
     /// Maximum POC LSB.
     max_poc_lsb: u32,
-    /// Previous temporal-zero POC LSB.
-    prev_poc_lsb: u32,
-    /// Previous temporal-zero POC MSB.
-    prev_poc_msb: i64,
+    /// Previous temporal-zero POC behind MSB derivation.
+    poc: PocTracker,
     /// True past the first temporal-zero picture.
     has_prev_tid0: bool,
     /// Driver-echoed picture serial.
@@ -76,8 +98,7 @@ impl HevcDpb {
             capacity: sps.max_dec_pic_buffering_minus1 + 1,
             max_reorder: sps.max_num_reorder_pics,
             max_poc_lsb: sps.max_poc_lsb(),
-            prev_poc_lsb: 0,
-            prev_poc_msb: 0,
+            poc: PocTracker::new(),
             has_prev_tid0: false,
             feedback: 1,
         }
@@ -136,15 +157,8 @@ impl HevcDpb {
     /// Undisplayed pictures in display order.
     pub(crate) fn drain(&mut self) -> Vec<Output> {
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(occupant) = slot {
-                if !occupant.displayed {
-                    emits.push((occupant.poc, index));
-                    occupant.displayed = true;
-                }
-            }
-        }
-        self.free_unneeded();
+        self.slots.emit_undisplayed(&mut emits);
+        self.slots.free_displayed_non_refs();
         outputs_sorted(emits)
     }
 
@@ -177,40 +191,23 @@ impl HevcDpb {
         if !self.has_prev_tid0 {
             return 0;
         }
-        let max_lsb = i64::from(self.max_poc_lsb);
-        let previous = i64::from(self.prev_poc_lsb);
-        if lsb < previous && previous - lsb >= max_lsb / 2 {
-            self.prev_poc_msb + max_lsb
-        } else if lsb > previous && lsb - previous > max_lsb / 2 {
-            self.prev_poc_msb - max_lsb
-        } else {
-            self.prev_poc_msb
-        }
+        self.poc.msb_for(lsb, i64::from(self.max_poc_lsb))
     }
 
     /// Undisplayed priors emitted, references kept for set marking.
     fn emit_priors(&mut self, emits: &mut Vec<(i32, usize)>) {
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(occupant) = slot {
-                if !occupant.displayed {
-                    emits.push((occupant.poc, index));
-                    occupant.displayed = true;
-                }
-            }
-        }
+        self.slots.emit_undisplayed(emits);
     }
 
     /// Every picture out of the reference set.
     fn empty_refs(&mut self) {
-        for slot in self.slots.iter_mut().flatten() {
-            slot.reference = false;
-        }
-        self.free_unneeded();
+        self.slots.release_all();
+        self.slots.free_displayed_non_refs();
     }
 
     /// Every picture dropped without output.
     fn empty_silent(&mut self) {
-        self.slots = core::array::from_fn(|_| None);
+        self.slots.clear_slots();
     }
 
     /// Reference set marking for pictures carrying a set.
@@ -220,7 +217,7 @@ impl HevcDpb {
                 continue;
             }
             if !short_term_member(slot.poc, rps, poc) {
-                slot.reference = false;
+                slot.release();
             }
         }
         for curr in curr_pocs(rps, poc) {
@@ -230,33 +227,18 @@ impl HevcDpb {
                 ));
             }
         }
-        self.free_unneeded();
+        self.slots.free_displayed_non_refs();
         Ok(())
     }
 
     /// Room for the next picture, emitting the lowest undisplayed POC first.
     fn make_room(&mut self, emits: &mut Vec<(i32, usize)>) -> Result<(), D3d12Error> {
-        self.free_unneeded();
-        while self.stored() >= usize::from(self.capacity) {
-            let mut next: Option<(i32, usize)> = None;
-            for (index, slot) in self.slots.iter().enumerate() {
-                if let Some(occupant) = slot {
-                    if !occupant.displayed {
-                        let candidate = (occupant.poc, index);
-                        if next.is_none_or(|best| candidate < best) {
-                            next = Some(candidate);
-                        }
-                    }
-                }
-            }
-            let Some((poc, index)) = next else {
+        self.slots.free_displayed_non_refs();
+        while self.slots.stored() >= usize::from(self.capacity) {
+            if !self.slots.pop_earliest(emits, None) {
                 return Err(D3d12Error::DpbFull);
-            };
-            emits.push((poc, index));
-            if let Some(occupant) = self.slots[index].as_mut() {
-                occupant.displayed = true;
             }
-            self.free_unneeded();
+            self.slots.free_displayed_non_refs();
         }
         Ok(())
     }
@@ -264,35 +246,14 @@ impl HevcDpb {
     /// Undisplayed pictures past the reorder limit, lowest POC first.
     fn reorder_bump(&mut self, emits: &mut Vec<(i32, usize)>) {
         loop {
-            let buffered = self
-                .slots
-                .iter()
-                .flatten()
-                .filter(|slot| !slot.displayed)
-                .count();
-            if buffered <= usize::from(self.max_reorder) {
+            if self.slots.buffered() <= usize::from(self.max_reorder) {
                 break;
             }
-            let mut next: Option<(i32, usize)> = None;
-            for (index, slot) in self.slots.iter().enumerate() {
-                if let Some(occupant) = slot {
-                    if !occupant.displayed {
-                        let candidate = (occupant.poc, index);
-                        if next.is_none_or(|best| candidate < best) {
-                            next = Some(candidate);
-                        }
-                    }
-                }
-            }
-            let Some((poc, index)) = next else {
+            if !self.slots.pop_earliest(emits, None) {
                 break;
-            };
-            emits.push((poc, index));
-            if let Some(occupant) = self.slots[index].as_mut() {
-                occupant.displayed = true;
             }
         }
-        self.free_unneeded();
+        self.slots.free_displayed_non_refs();
     }
 
     /// POC state after storing the current picture.
@@ -305,45 +266,18 @@ impl HevcDpb {
         } else {
             picture.poc_lsb().unwrap_or(0)
         };
-        self.prev_poc_lsb = lsb;
-        self.prev_poc_msb = i64::from(poc) - i64::from(lsb);
+        self.poc.observe(i64::from(poc) - i64::from(lsb), lsb);
         self.has_prev_tid0 = true;
-    }
-
-    /// Stored picture count.
-    fn stored(&self) -> usize {
-        self.slots.iter().flatten().count()
-    }
-
-    /// Free displayed pictures held without reference.
-    fn free_unneeded(&mut self) {
-        for slot in &mut self.slots {
-            if slot
-                .as_ref()
-                .is_some_and(|occupant| !occupant.reference && occupant.displayed)
-            {
-                *slot = None;
-            }
-        }
     }
 
     /// First free slot no live surface pins.
     fn alloc(&self) -> Result<usize, D3d12Error> {
-        let mut pinned = false;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.is_none() {
-                if self.pins.pinned(slot_u8(index)?) {
-                    pinned = true;
-                } else {
-                    return Ok(index);
-                }
-            }
-        }
-        if pinned {
-            Err(D3d12Error::NoFreeSlot)
-        } else {
-            Err(D3d12Error::DpbFull)
-        }
+        self.slots
+            .alloc_where(|index| u8::try_from(index).is_ok_and(|slot| self.pins.pinned(slot)))
+            .map_err(|failure| match failure {
+                SlotAllocFailure::PinnedBlocked => D3d12Error::NoFreeSlot,
+                SlotAllocFailure::Full => D3d12Error::DpbFull,
+            })
     }
 
     /// Reference pictures behind parameter construction.
@@ -774,6 +708,7 @@ mod tests {
             explicit: true,
             bits: 12,
             ref_num_delta_pocs: 0,
+            table_idx: None,
         }
     }
 

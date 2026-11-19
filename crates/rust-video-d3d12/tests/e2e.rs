@@ -10,17 +10,12 @@
 //! (320x240 main profile, IDR at 0 and CRA at 8 with B
 //! reordering). Shared vector `valid_320x240.obu` holds 15
 //! ffmpeg testsrc2 frames (320x240, reordered with show-existing
-//! display); `examples/common/av1.rs` splits it.
+//! display); the harness `Obu` splitter groups it.
 
 #![cfg(target_os = "windows")]
 
-#[path = "../examples/common/av1.rs"]
-#[allow(dead_code)]
-mod av1;
-
 use std::path::PathBuf;
 
-use av1::{split_obus, tu_packets};
 use rust_video_d3d12::{
     Av1Decoder, Codec, D3d12Device, D3d12Frame, H264Decoder, HevcDecoder, Transcoder,
 };
@@ -29,7 +24,7 @@ use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device};
 use rust_video_caps::transcode::Route;
-use rust_video_harness::{bench_dir, decode_dir, AnnexB};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB, Obu};
 
 /// Pictures in the shared vector.
 const PICTURES: usize = 15;
@@ -201,7 +196,7 @@ fn av1_vector_decodes_on_gpu() {
         return;
     };
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let raws = tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
     let total = decode_all(&mut decoder, &raws);
@@ -246,8 +241,8 @@ fn av1_reset_after_failure_recovers() {
         return;
     };
     let data = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let raws = tu_packets(&data);
-    let obus = split_obus(&data);
+    let raws = Obu::tu_packets(&data);
+    let obus = Obu::split_obus(&data);
     let mut decoder = Av1Decoder::open(&device);
     for (unit_type, obu) in obus.iter().take(2) {
         assert_ne!(*unit_type, 6, "prefix holds no frame");
@@ -287,7 +282,7 @@ fn av1_hardware_matches_software_oracle() {
     };
     let path = decode_dir().join("valid_320x240.obu");
     let data = std::fs::read(&path).expect("vector readable");
-    let raws = tu_packets(&data);
+    let raws = Obu::tu_packets(&data);
     assert_eq!(raws.len(), 16, "vector holds one packet per unit");
     let mut decoder = Av1Decoder::open(&device);
     let mut frames = Vec::new();

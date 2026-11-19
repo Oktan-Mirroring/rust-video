@@ -31,6 +31,8 @@ use crate::dxva::{
 use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason};
 use crate::pins::SlotPins;
 
+use rust_video_caps::dpb::ViewAlloc;
+
 /// Session view count behind current view selection.
 const VIEWS: u8 = 16;
 
@@ -118,11 +120,12 @@ impl Av1Dpb {
 
     /// View outside the reference map and live surface pins.
     fn free_view(&self) -> Result<u8, D3d12Error> {
-        (0..VIEWS)
-            .find(|view| {
-                !self.pins.pinned(*view)
-                    && !self.slots.iter().flatten().any(|slot| slot.view == *view)
-            })
+        self.slots
+            .free_view(
+                VIEWS,
+                |slot| slot.view,
+                |index| u8::try_from(index).is_ok_and(|view| self.pins.pinned(view)),
+            )
             .ok_or(D3d12Error::NoFreeSlot)
     }
 
@@ -567,7 +570,11 @@ mod tests {
             profile: 0,
             flags: SEQ_ORDER_HINT | SEQ_SUBSAMPLING_X | SEQ_SUBSAMPLING_Y | SEQ_CDEF,
             operating: Vec::new(),
+            num_units_in_display_tick: 0,
+            time_scale: 0,
+            num_ticks_per_picture_minus1: 0,
             buffer_delay_length_minus1: 0,
+            num_units_in_decoding_tick: 0,
             buffer_removal_length_minus1: 0,
             presentation_length_minus1: 0,
             frame_width_bits_minus1: 8,

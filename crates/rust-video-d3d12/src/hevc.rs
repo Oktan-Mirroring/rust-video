@@ -1,68 +1,21 @@
-//! H.265 Annex B ingest: parameter sets plus slice headers.
+//! H.265 ingest over the shared grammar, mapped onto tier errors.
 //!
-//! Progressive pictures; the HEVC DPB owns ordering and output.
+//! Grammar in `rust-video-h265`; submit builders in `hevc_dpb`.
 
-use crate::bits::{rbsp, BitReader};
+use rust_video_h265::{
+    HevcError, HevcGate, NalAction, ParseKind, UnsupportedKind, MAX_PPS, MAX_SPS,
+};
+
+#[cfg(test)]
+use rust_video_h265::{ConstraintFlags, ProfileTierLevel, ScalingLists, SourceFlags};
+
 use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
 use crate::h264::Crop;
 
-/// Sequence set count, H.265 7.4.3.2.1.
-pub(crate) const MAX_SPS: usize = 16;
-
-/// Picture set count, H.265 7.4.3.3.1.
-pub(crate) const MAX_PPS: usize = 64;
-
-/// Reference set count, H.265 7.4.8.
-pub(crate) const MAX_RPS: usize = 64;
-
-/// Pictures per reference set, H.265 7.4.8.
-pub(crate) const MAX_RPS_PICS: usize = 16;
-
-/// Pictures per resolved reference set.
-const MAX_RESOLVED_RPS: u8 = 15;
-
-/// First random access NAL type.
-const IRAP_FIRST: u8 = 16;
-
-/// Last random access NAL type.
-const IRAP_LAST: u8 = 23;
-
-/// First IDR NAL type.
-const IDR_FIRST: u8 = 19;
-
-/// Last IDR NAL type.
-const IDR_LAST: u8 = 20;
-
-/// First RASL NAL type.
-const RASL_FIRST: u8 = 8;
-
-/// Last RASL NAL type.
-const RASL_LAST: u8 = 9;
-
-/// CRA NAL type.
-const NAL_CRA: u8 = 21;
-
-/// True for random access NAL types.
-fn is_irap(nal_type: u8) -> bool {
-    (IRAP_FIRST..=IRAP_LAST).contains(&nal_type)
-}
-
-/// True for IDR NAL types.
-fn is_idr(nal_type: u8) -> bool {
-    (IDR_FIRST..=IDR_LAST).contains(&nal_type)
-}
-
-/// True for RASL NAL types.
-fn is_rasl(nal_type: u8) -> bool {
-    (RASL_FIRST..=RASL_LAST).contains(&nal_type)
-}
-
-/// True for CRA and BLA NAL types.
-fn is_cra_bla(nal_type: u8) -> bool {
-    matches!(nal_type, 16..=18 | NAL_CRA)
-}
+pub(crate) use rust_video_h265::{RpsBits, ShortTermRps, SliceType};
 
 /// NAL units in one Annex B packet, start codes stripped.
+#[cfg(test)]
 pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut start = 0;
@@ -87,280 +40,6 @@ pub(crate) fn split_nals(data: &[u8]) -> Vec<&[u8]> {
         nals.push(&data[start..]);
     }
     nals
-}
-
-/// Short-term reference picture set with resolved delta POCs.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ShortTermRps {
-    /// Negative delta POCs, nearest first.
-    pub(crate) negative: [i32; MAX_RPS_PICS],
-    /// Negative used-by-current flags.
-    pub(crate) negative_used: [bool; MAX_RPS_PICS],
-    /// Negative picture count.
-    pub(crate) negative_count: u8,
-    /// Positive delta POCs, nearest first.
-    pub(crate) positive: [i32; MAX_RPS_PICS],
-    /// Positive used-by-current flags.
-    pub(crate) positive_used: [bool; MAX_RPS_PICS],
-    /// Positive picture count.
-    pub(crate) positive_count: u8,
-}
-
-impl ShortTermRps {
-    /// Total delta POC count.
-    pub(crate) fn num_delta_pocs(&self) -> u8 {
-        self.negative_count + self.positive_count
-    }
-
-    /// Used negative count behind list modification gating.
-    pub(crate) fn used_negative(&self) -> usize {
-        self.negative_used
-            .iter()
-            .take(usize::from(self.negative_count))
-            .filter(|used| **used)
-            .count()
-    }
-
-    /// Used positive count behind list modification gating.
-    pub(crate) fn used_positive(&self) -> usize {
-        self.positive_used
-            .iter()
-            .take(usize::from(self.positive_count))
-            .filter(|used| **used)
-            .count()
-    }
-}
-
-/// Reference set with its prediction provenance.
-struct ResolvedRps {
-    /// Resolved set.
-    set: ShortTermRps,
-    /// Delta POC count of the prediction source.
-    ref_num_delta_pocs: u8,
-}
-
-/// Short-term reference set `index` against `table` of `num_sps` entries.
-fn parse_short_term_rps(
-    reader: &mut BitReader,
-    index: usize,
-    num_sps: usize,
-    table: &[ShortTermRps],
-) -> Result<ResolvedRps, D3d12Error> {
-    let predicted = index != 0 && reader.read_bit("inter_ref_pic_set_prediction_flag")?;
-    if !predicted {
-        return Ok(ResolvedRps {
-            set: parse_explicit_rps(reader)?,
-            ref_num_delta_pocs: 0,
-        });
-    }
-    let ref_idx = predict_source(reader, index, num_sps)?;
-    let reference = table.get(ref_idx).ok_or({
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "inter_ref_pic_set_prediction",
-        })
-    })?;
-    let delta_rps = parse_delta_rps(reader)?;
-    let flags = parse_predict_flags(reader, usize::from(reference.num_delta_pocs()))?;
-    let set = apply_prediction(reference, delta_rps, &flags)?;
-    Ok(ResolvedRps {
-        set,
-        ref_num_delta_pocs: reference.num_delta_pocs(),
-    })
-}
-
-/// Prediction source index for set `index`.
-fn predict_source(
-    reader: &mut BitReader,
-    index: usize,
-    num_sps: usize,
-) -> Result<usize, D3d12Error> {
-    let delta = if index == num_sps {
-        reader.read_ue("delta_idx_minus1")?
-    } else {
-        0
-    };
-    let delta = usize::try_from(delta).unwrap_or(usize::MAX);
-    if delta >= index {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "inter_ref_pic_set_prediction",
-        }));
-    }
-    Ok(index - delta - 1)
-}
-
-/// Delta RPS value behind prediction.
-fn parse_delta_rps(reader: &mut BitReader) -> Result<i32, D3d12Error> {
-    let sign = reader.read_bit("delta_rps_sign")?;
-    let abs = reader.read_ue("abs_delta_rps_minus1")?;
-    if abs > 32767 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "abs_delta_rps_minus1",
-        }));
-    }
-    let magnitude = i32::try_from(abs + 1).map_err(|_| {
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "abs_delta_rps_minus1",
-        })
-    })?;
-    Ok(if sign { -magnitude } else { magnitude })
-}
-
-/// Per-candidate used and delta flags behind prediction.
-fn parse_predict_flags(
-    reader: &mut BitReader,
-    num_delta_pocs: usize,
-) -> Result<Vec<(bool, bool)>, D3d12Error> {
-    let mut flags = Vec::with_capacity(num_delta_pocs + 1);
-    for _ in 0..=num_delta_pocs {
-        let used = reader.read_bit("used_by_curr_pic_flag")?;
-        let delta = if used {
-            true
-        } else {
-            reader.read_bit("use_delta_flag")?
-        };
-        flags.push((used, delta));
-    }
-    Ok(flags)
-}
-
-/// Predicted set from `reference`, H.265 7.4.8.
-fn apply_prediction(
-    reference: &ShortTermRps,
-    delta_rps: i32,
-    flags: &[(bool, bool)],
-) -> Result<ShortTermRps, D3d12Error> {
-    let negative_count = usize::from(reference.negative_count);
-    let positive_count = usize::from(reference.positive_count);
-    let mut set = ShortTermRps::default();
-    for (delta, flag) in reference.positive[..positive_count]
-        .iter()
-        .zip(flags[negative_count..].iter())
-        .rev()
-    {
-        push_shifted(&mut set, *delta, delta_rps, *flag, true)?;
-    }
-    if delta_rps != 0 {
-        let edge = flags[flags.len() - 1];
-        push_shifted(&mut set, 0, delta_rps, edge, delta_rps < 0)?;
-    }
-    for (delta, flag) in reference.negative[..negative_count]
-        .iter()
-        .zip(flags.iter())
-    {
-        push_shifted(&mut set, *delta, delta_rps, *flag, true)?;
-    }
-    for (delta, flag) in reference.negative[..negative_count]
-        .iter()
-        .zip(flags.iter())
-        .rev()
-    {
-        push_shifted(&mut set, *delta, delta_rps, *flag, false)?;
-    }
-    for (delta, flag) in reference.positive[..positive_count]
-        .iter()
-        .zip(flags[negative_count..].iter())
-    {
-        push_shifted(&mut set, *delta, delta_rps, *flag, false)?;
-    }
-    Ok(set)
-}
-
-/// Shifted candidate into the negative or positive list when kept.
-fn push_shifted(
-    set: &mut ShortTermRps,
-    delta: i32,
-    shift: i32,
-    flag: (bool, bool),
-    negative: bool,
-) -> Result<(), D3d12Error> {
-    let (used, keep) = flag;
-    if !keep {
-        return Ok(());
-    }
-    let poc = delta.checked_add(shift).ok_or({
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "delta_poc",
-        })
-    })?;
-    if negative && poc >= 0 || !negative && poc <= 0 {
-        return Ok(());
-    }
-    if set.num_delta_pocs() >= MAX_RESOLVED_RPS {
-        return Err(D3d12Error::Parse(ParseReason::ShortTermRefPicSetSize));
-    }
-    if negative {
-        let at = usize::from(set.negative_count);
-        set.negative[at] = poc;
-        set.negative_used[at] = used;
-        set.negative_count += 1;
-    } else {
-        let at = usize::from(set.positive_count);
-        set.positive[at] = poc;
-        set.positive_used[at] = used;
-        set.positive_count += 1;
-    }
-    Ok(())
-}
-
-/// Explicitly coded reference set.
-fn parse_explicit_rps(reader: &mut BitReader) -> Result<ShortTermRps, D3d12Error> {
-    let negative = parse_rps_count(reader, "num_negative_pics")?;
-    let positive = parse_rps_count(reader, "num_positive_pics")?;
-    if usize::from(negative) + usize::from(positive) >= MAX_RPS_PICS {
-        return Err(D3d12Error::Parse(ParseReason::ShortTermRefPicSetSize));
-    }
-    let mut set = ShortTermRps {
-        negative_count: negative,
-        positive_count: positive,
-        ..ShortTermRps::default()
-    };
-    let mut poc = 0i32;
-    for index in 0..usize::from(negative) {
-        poc = parse_rps_step(reader, poc, false, "delta_poc_s0_minus1")?;
-        set.negative[index] = poc;
-        set.negative_used[index] = reader.read_bit("used_by_curr_pic_s0_flag")?;
-    }
-    poc = 0;
-    for index in 0..usize::from(positive) {
-        poc = parse_rps_step(reader, poc, true, "delta_poc_s1_minus1")?;
-        set.positive[index] = poc;
-        set.positive_used[index] = reader.read_bit("used_by_curr_pic_s1_flag")?;
-    }
-    Ok(set)
-}
-
-/// Reference set picture count below the set ceiling.
-fn parse_rps_count(reader: &mut BitReader, syntax: &'static str) -> Result<u8, D3d12Error> {
-    let value = reader.read_ue(syntax)?;
-    if usize::try_from(value).is_ok_and(|count| count >= MAX_RPS_PICS) {
-        return Err(D3d12Error::Parse(ParseReason::Range { syntax }));
-    }
-    u8::try_from(value).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))
-}
-
-/// Next explicit delta POC from a minus-one step.
-fn parse_rps_step(
-    reader: &mut BitReader,
-    poc: i32,
-    positive: bool,
-    syntax: &'static str,
-) -> Result<i32, D3d12Error> {
-    let step = reader.read_ue(syntax)?;
-    if step > 32767 {
-        return Err(D3d12Error::Parse(ParseReason::Range { syntax }));
-    }
-    let step =
-        i32::try_from(step + 1).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))?;
-    if positive {
-        poc.checked_add(step)
-    } else {
-        poc.checked_sub(step)
-    }
-    .ok_or({
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "delta_poc",
-        })
-    })
 }
 
 /// Parsed sequence parameter set.
@@ -440,21 +119,6 @@ impl Sps {
         1 << (self.log2_max_poc_lsb_minus4 + 4)
     }
 
-    /// Luma coding tree block edge in samples.
-    pub(crate) fn ctb_size(&self) -> u32 {
-        self.min_cb() << self.log2_diff_max_min_cb
-    }
-
-    /// Luma coding tree block columns.
-    pub(crate) fn width_in_ctbs(&self) -> u32 {
-        self.width.div_ceil(self.ctb_size())
-    }
-
-    /// Luma coding tree block rows.
-    pub(crate) fn height_in_ctbs(&self) -> u32 {
-        self.height.div_ceil(self.ctb_size())
-    }
-
     /// True for asymmetric motion partitions.
     pub(crate) const fn amp(&self) -> bool {
         self.flags & FLAG_AMP != 0
@@ -474,362 +138,6 @@ impl Sps {
     pub(crate) const fn strong_intra_smoothing(&self) -> bool {
         self.flags & FLAG_STRONG_INTRA != 0
     }
-}
-
-/// Sequence parameter set from RBSP `rbsp`.
-pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d12Error> {
-    let mut reader = BitReader::new(rbsp);
-    reader.read_bits(4, "sps_video_parameter_set_id")?;
-    if reader.read_bits(3, "sps_max_sub_layers_minus1")? != 0 {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::Sublayers));
-    }
-    reader.read_bit("sps_temporal_id_nesting_flag")?;
-    parse_profile_tier(&mut reader)?;
-    let sps_id = parse_id(&mut reader, "seq_parameter_set_id", MAX_SPS)?;
-    if reader.read_ue("chroma_format_idc")? != 1 {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::ChromaOutside420));
-    }
-    let width = reader.read_ue("pic_width_in_luma_samples")?;
-    let height = reader.read_ue("pic_height_in_luma_samples")?;
-    if width == 0 || height == 0 {
-        return Err(D3d12Error::Parse(ParseReason::EmptyCodedSize));
-    }
-    let crop = parse_window(&mut reader, width, height)?;
-    if reader.read_ue("bit_depth_luma_minus8")? != 0 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::LumaDepthAbove8Bit,
-        ));
-    }
-    if reader.read_ue("bit_depth_chroma_minus8")? != 0 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::ChromaDepthAbove8Bit,
-        ));
-    }
-    let log2_max_poc_lsb_minus4 = parse_small(&mut reader, "log2_max_pic_order_cnt_lsb")?;
-    if log2_max_poc_lsb_minus4 > 12 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "log2_max_pic_order_cnt_lsb",
-        }));
-    }
-    let (max_dec_pic_buffering_minus1, max_num_reorder_pics) = parse_buffering(&mut reader)?;
-    let coding_block_min = parse_small(&mut reader, "log2_min_luma_coding_block_size")?;
-    let coding_block_range = parse_small(&mut reader, "log2_diff_max_min_luma_coding_block")?;
-    let transform_min = parse_small(&mut reader, "log2_min_luma_transform_block_size")?;
-    let transform_range = parse_small(&mut reader, "log2_diff_max_min_luma_transform")?;
-    let max_depth_inter = parse_small(&mut reader, "max_transform_hierarchy_depth_inter")?;
-    let max_depth_intra = parse_small(&mut reader, "max_transform_hierarchy_depth_intra")?;
-    if reader.read_bit("scaling_list_enabled_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::ScalingListsPending,
-        ));
-    }
-    let mut flags = 0;
-    set_flag(&mut flags, FLAG_AMP, reader.read_bit("amp_enabled_flag")?);
-    set_flag(
-        &mut flags,
-        FLAG_SAO,
-        reader.read_bit("sample_adaptive_offset_enabled_flag")?,
-    );
-    if reader.read_bit("pcm_enabled_flag")? {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::PcmPending));
-    }
-    let rps = parse_rps_table(&mut reader)?;
-    if reader.read_bit("long_term_ref_pics_present_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::LongTermRefsPending,
-        ));
-    }
-    set_flag(
-        &mut flags,
-        FLAG_TEMPORAL_MVP,
-        reader.read_bit("sps_temporal_mvp_enabled_flag")?,
-    );
-    set_flag(
-        &mut flags,
-        FLAG_STRONG_INTRA,
-        reader.read_bit("strong_intra_smoothing_enabled_flag")?,
-    );
-    if reader.read_bit("vui_parameters_present_flag")? {
-        skip_vui(&mut reader)?;
-    }
-    if reader.read_bit("sps_extension_present_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::SpsExtensionPending,
-        ));
-    }
-    Ok(Sps {
-        seq_parameter_set_id: sps_id,
-        width,
-        height,
-        crop,
-        log2_max_poc_lsb_minus4,
-        max_dec_pic_buffering_minus1,
-        max_num_reorder_pics,
-        rps,
-        log2_min_cb_minus3: coding_block_min,
-        log2_diff_max_min_cb: coding_block_range,
-        log2_min_tb_minus2: transform_min,
-        log2_diff_max_min_tb: transform_range,
-        max_depth_inter,
-        max_depth_intra,
-        flags,
-    })
-}
-
-/// Buffering and reorder limits, single sublayer.
-fn parse_buffering(reader: &mut BitReader) -> Result<(u8, u8), D3d12Error> {
-    reader.read_bit("sps_sub_layer_ordering_info_present_flag")?;
-    let buffering = parse_small(&mut *reader, "sps_max_dec_pic_buffering_minus1")?;
-    if buffering > 15 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "sps_max_dec_pic_buffering_minus1",
-        }));
-    }
-    let reorder = parse_small(&mut *reader, "sps_max_num_reorder_pics")?;
-    if reorder > 16 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "sps_max_num_reorder_pics",
-        }));
-    }
-    reader.read_ue("sps_max_latency_increase_plus1")?;
-    Ok((buffering, reorder))
-}
-
-/// Short-term reference set table.
-fn parse_rps_table(reader: &mut BitReader) -> Result<Vec<ShortTermRps>, D3d12Error> {
-    let count = reader.read_ue("num_short_term_ref_pic_sets")?;
-    if usize::try_from(count).is_ok_and(|count| count > MAX_RPS) {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "num_short_term_ref_pic_sets",
-        }));
-    }
-    let mut table = Vec::new();
-    for index in 0..count {
-        let index = usize::try_from(index).unwrap_or(usize::MAX);
-        let total = usize::try_from(count).unwrap_or(usize::MAX);
-        let resolved = parse_short_term_rps(reader, index, total, &table)?;
-        table.push(resolved.set);
-    }
-    Ok(table)
-}
-
-/// Flag bit set in `flags` when `set`.
-fn set_flag(flags: &mut u8, bit: u8, set: bool) {
-    if set {
-        *flags |= bit;
-    }
-}
-
-/// General profile, tier, and level.
-fn parse_profile_tier(reader: &mut BitReader) -> Result<(), D3d12Error> {
-    reader.read_bits(2, "general_profile_space")?;
-    reader.read_bit("general_tier_flag")?;
-    let profile_idc = reader.read_bits(5, "general_profile_idc")?;
-    let compat = reader.read_bits(32, "general_profile_compatibility_flags")?;
-    let progressive = reader.read_bit("general_progressive_source_flag")?;
-    let interlaced = reader.read_bit("general_interlaced_source_flag")?;
-    reader.read_bit("general_non_packed_constraint_flag")?;
-    reader.read_bit("general_frame_only_constraint_flag")?;
-    reader.read_bits(32, "general_reserved_zero_bits")?;
-    reader.read_bits(11, "general_reserved_zero_bits")?;
-    reader.read_bit("general_reserved_zero_bit")?;
-    if profile_idc != 1 && compat & 0x4000_0000 == 0 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::ProfileOutsideMain,
-        ));
-    }
-    if interlaced && !progressive {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::Interlaced));
-    }
-    let level = reader.read_bits(8, "general_level_idc")?;
-    if !matches!(
-        level,
-        30 | 60 | 63 | 90 | 93 | 120 | 123 | 150 | 153 | 156 | 180 | 183 | 186 | 210
-    ) {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "general_level_idc",
-        }));
-    }
-    Ok(())
-}
-
-/// Set id below `max`.
-fn parse_id(reader: &mut BitReader, syntax: &'static str, max: usize) -> Result<u8, D3d12Error> {
-    let id = reader.read_ue(syntax)?;
-    let id = u8::try_from(id).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))?;
-    if usize::from(id) >= max {
-        return Err(D3d12Error::Parse(ParseReason::Range { syntax }));
-    }
-    Ok(id)
-}
-
-/// Small unsigned field below 32.
-fn parse_small(reader: &mut BitReader, syntax: &'static str) -> Result<u8, D3d12Error> {
-    let value = reader.read_ue(syntax)?;
-    if value > 31 {
-        return Err(D3d12Error::Parse(ParseReason::Range { syntax }));
-    }
-    u8::try_from(value).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))
-}
-
-/// Conformance window in luma samples, validated against the coded size.
-fn parse_window(
-    reader: &mut BitReader,
-    width: u32,
-    height: u32,
-) -> Result<Option<Crop>, D3d12Error> {
-    if !reader.read_bit("conformance_window_flag")? {
-        return Ok(None);
-    }
-    let left = reader.read_ue("conf_win_left_offset")?;
-    let right = reader.read_ue("conf_win_right_offset")?;
-    let top = reader.read_ue("conf_win_top_offset")?;
-    let bottom = reader.read_ue("conf_win_bottom_offset")?;
-    let horizontal = left.checked_add(right).and_then(|sum| sum.checked_mul(2));
-    let vertical = top.checked_add(bottom).and_then(|sum| sum.checked_mul(2));
-    match (horizontal, vertical) {
-        (Some(consumed), Some(rows)) if consumed < width && rows < height => Ok(Some(Crop {
-            left: left * 2,
-            right: right * 2,
-            top: top * 2,
-            bottom: bottom * 2,
-        })),
-        _ => Err(D3d12Error::Parse(ParseReason::ConfWinOutsideCodedSize)),
-    }
-}
-
-/// Video usability information, H.265 E.2.1.
-fn skip_vui(reader: &mut BitReader) -> Result<(), D3d12Error> {
-    if reader.read_bit("aspect_ratio_info_present_flag")?
-        && reader.read_bits(8, "aspect_ratio_idc")? == 255
-    {
-        reader.read_bits(16, "sar_width")?;
-        reader.read_bits(16, "sar_height")?;
-    }
-    if reader.read_bit("overscan_info_present_flag")? {
-        reader.read_bit("overscan_appropriate_flag")?;
-    }
-    if reader.read_bit("video_signal_type_present_flag")? {
-        reader.read_bits(3, "video_format")?;
-        reader.read_bit("video_full_range_flag")?;
-        if reader.read_bit("colour_description_present_flag")? {
-            reader.read_bits(8, "colour_primaries")?;
-            reader.read_bits(8, "transfer_characteristics")?;
-            reader.read_bits(8, "matrix_coeffs")?;
-        }
-    }
-    if reader.read_bit("chroma_loc_info_present_flag")? {
-        reader.read_ue("chroma_sample_loc_type_top_field")?;
-        reader.read_ue("chroma_sample_loc_type_bottom_field")?;
-    }
-    reader.read_bit("neutral_chroma_indication_flag")?;
-    reader.read_bit("field_seq_flag")?;
-    reader.read_bit("frame_field_info_present_flag")?;
-    if reader.read_bit("default_display_window_flag")? {
-        reader.read_ue("def_disp_win_left_offset")?;
-        reader.read_ue("def_disp_win_right_offset")?;
-        reader.read_ue("def_disp_win_top_offset")?;
-        reader.read_ue("def_disp_win_bottom_offset")?;
-    }
-    if reader.read_bit("vui_timing_info_present_flag")? {
-        reader.read_bits(32, "vui_num_units_in_tick")?;
-        reader.read_bits(32, "vui_time_scale")?;
-        if reader.read_bit("vui_poc_proportional_to_timing_flag")? {
-            reader.read_ue("vui_num_ticks_poc_diff_one_minus1")?;
-        }
-        if reader.read_bit("vui_hrd_parameters_present_flag")? {
-            parse_hrd(reader)?;
-        }
-    }
-    if reader.read_bit("bitstream_restriction_flag")? {
-        reader.read_bit("tiles_fixed_structure_flag")?;
-        reader.read_bit("motion_vectors_over_pic_boundaries_flag")?;
-        reader.read_bit("restricted_ref_pic_lists_flag")?;
-        reader.read_ue("min_spatial_segmentation_idc")?;
-        reader.read_ue("max_bytes_per_pic_denom")?;
-        reader.read_ue("max_bits_per_min_cu_denom")?;
-        reader.read_ue("log2_max_mv_length_horizontal")?;
-        reader.read_ue("log2_max_mv_length_vertical")?;
-    }
-    Ok(())
-}
-
-/// Hypothetical reference decoder parameters, H.265 E.2.2, single sublayer.
-fn parse_hrd(reader: &mut BitReader) -> Result<(), D3d12Error> {
-    let nal = reader.read_bit("nal_hrd_parameters_present_flag")?;
-    let vcl = reader.read_bit("vcl_hrd_parameters_present_flag")?;
-    let mut sub_pic = false;
-    if nal || vcl {
-        sub_pic = parse_hrd_common(reader)?;
-    }
-    let count = parse_hrd_layer(reader)?;
-    for _ in 0..=count {
-        if nal {
-            parse_hrd_sublayer(reader, sub_pic)?;
-        }
-        if vcl {
-            parse_hrd_sublayer(reader, sub_pic)?;
-        }
-    }
-    Ok(())
-}
-
-/// HRD common information, returning the sub-picture flag.
-fn parse_hrd_common(reader: &mut BitReader) -> Result<bool, D3d12Error> {
-    let sub_pic = reader.read_bit("sub_pic_hrd_params_present_flag")?;
-    if sub_pic {
-        reader.read_bits(8, "tick_divisor_minus2")?;
-        reader.read_bits(5, "du_cpb_removal_delay_increment_length_minus1")?;
-        reader.read_bit("sub_pic_cpb_params_in_pic_timing_sei_flag")?;
-        reader.read_bits(5, "dpb_output_delay_du_length_minus1")?;
-    }
-    reader.read_bits(4, "bit_rate_scale")?;
-    reader.read_bits(4, "cpb_size_scale")?;
-    if sub_pic {
-        reader.read_bits(4, "cpb_size_du_scale")?;
-    }
-    reader.read_bits(5, "initial_cpb_removal_delay_length_minus1")?;
-    reader.read_bits(5, "au_cpb_removal_delay_length_minus1")?;
-    reader.read_bits(5, "dpb_output_delay_length_minus1")?;
-    Ok(sub_pic)
-}
-
-/// HRD sublayer schedule, returning the CPB count minus one.
-fn parse_hrd_layer(reader: &mut BitReader) -> Result<u32, D3d12Error> {
-    let fixed_general = reader.read_bit("fixed_pic_rate_general_flag")?;
-    let fixed_within = if fixed_general {
-        true
-    } else {
-        reader.read_bit("fixed_pic_rate_within_cvs_flag")?
-    };
-    let low_delay = if fixed_within {
-        reader.read_ue("elemental_duration_in_tc_minus1")?;
-        false
-    } else {
-        reader.read_bit("low_delay_hrd_flag")?
-    };
-    if low_delay {
-        return Ok(0);
-    }
-    let count = reader.read_ue("cpb_cnt_minus1")?;
-    if count > 31 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "cpb_cnt_minus1",
-        }));
-    }
-    Ok(count)
-}
-
-/// One HRD coded picture buffer description.
-fn parse_hrd_sublayer(reader: &mut BitReader, sub_pic: bool) -> Result<(), D3d12Error> {
-    reader.read_ue("bit_rate_value_minus1")?;
-    reader.read_ue("cpb_size_value_minus1")?;
-    if sub_pic {
-        reader.read_ue("cpb_size_du_value_minus1")?;
-        reader.read_ue("bit_rate_du_value_minus1")?;
-    }
-    reader.read_bit("cbr_flag")?;
-    Ok(())
 }
 
 /// Parsed picture parameter set.
@@ -1014,363 +322,6 @@ impl Pps {
     }
 }
 
-/// Picture set ids, flags, and scalars ahead of the tile section.
-struct PpsHeader {
-    /// Set id.
-    pps_id: u8,
-    /// Sequence set id.
-    sps_id: u8,
-    /// Packed flags.
-    flags: u32,
-    /// Reserved slice header bits.
-    num_extra_slice_header_bits: u8,
-    /// Default L0 reference count minus one.
-    num_ref_l0: u8,
-    /// Default L1 reference count minus one.
-    num_ref_l1: u8,
-    /// Luma QP init delta.
-    init_qp_minus26: i8,
-    /// CU QP delta depth.
-    diff_cu_qp_delta_depth: u8,
-    /// Cb QP offset.
-    cb_qp_offset: i8,
-    /// Cr QP offset.
-    cr_qp_offset: i8,
-}
-
-/// Picture set ids, flags, and scalars ahead of the tile section.
-fn parse_pps_header(reader: &mut BitReader, sps: &Sps) -> Result<PpsHeader, D3d12Error> {
-    let pps_id = parse_id(reader, "pic_parameter_set_id", MAX_PPS)?;
-    let raw_sps = reader.read_ue("pps_seq_parameter_set_id")?;
-    let sps_id = u8::try_from(raw_sps).map_err(|_| {
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "pps_seq_parameter_set_id",
-        })
-    })?;
-    if sps_id != sps.seq_parameter_set_id {
-        return Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps));
-    }
-    let mut flags = 0;
-    set_wide_flag(
-        &mut flags,
-        P_DEPENDENT_SLICES,
-        reader.read_bit("dependent_slice_segments_enabled_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_OUTPUT_FLAG,
-        reader.read_bit("output_flag_present_flag")?,
-    );
-    let num_extra_slice_header_bits =
-        u8::try_from(reader.read_bits(3, "num_extra_slice_header_bits")?).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "num_extra_slice_header_bits",
-            })
-        })?;
-    set_wide_flag(
-        &mut flags,
-        P_SIGN_HIDING,
-        reader.read_bit("sign_data_hiding_enabled_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_CABAC_INIT,
-        reader.read_bit("cabac_init_present_flag")?,
-    );
-    let num_ref_l0 = parse_small(&mut *reader, "num_ref_idx_l0_default_active_minus1")?;
-    let num_ref_l1 = parse_small(&mut *reader, "num_ref_idx_l1_default_active_minus1")?;
-    let init_qp_minus26 = parse_qp(&mut *reader, "init_qp_minus26")?;
-    set_wide_flag(
-        &mut flags,
-        P_CONSTRAINED_INTRA,
-        reader.read_bit("constrained_intra_pred_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_TRANSFORM_SKIP,
-        reader.read_bit("transform_skip_enabled_flag")?,
-    );
-    let cu_qp_delta = reader.read_bit("cu_qp_delta_enabled_flag")?;
-    set_wide_flag(&mut flags, P_CU_QP_DELTA, cu_qp_delta);
-    let diff_cu_qp_delta_depth = if cu_qp_delta {
-        parse_small(&mut *reader, "diff_cu_qp_delta_depth")?
-    } else {
-        0
-    };
-    let cb_qp_offset = parse_qp(&mut *reader, "pps_cb_qp_offset")?;
-    let cr_qp_offset = parse_qp(&mut *reader, "pps_cr_qp_offset")?;
-    set_wide_flag(
-        &mut flags,
-        P_CHROMA_QP_OFFSETS,
-        reader.read_bit("pps_slice_chroma_qp_offsets_present_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_WEIGHTED_PRED,
-        reader.read_bit("weighted_pred_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_WEIGHTED_BIPRED,
-        reader.read_bit("weighted_bipred_flag")?,
-    );
-    set_wide_flag(
-        &mut flags,
-        P_TRANSQUANT_BYPASS,
-        reader.read_bit("transquant_bypass_enabled_flag")?,
-    );
-    Ok(PpsHeader {
-        pps_id,
-        sps_id,
-        flags,
-        num_extra_slice_header_bits,
-        num_ref_l0,
-        num_ref_l1,
-        init_qp_minus26,
-        diff_cu_qp_delta_depth,
-        cb_qp_offset,
-        cr_qp_offset,
-    })
-}
-
-/// Picture parameter set from RBSP `rbsp` against sequence set `sps`.
-pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d12Error> {
-    let mut reader = BitReader::new(rbsp);
-    let header = parse_pps_header(&mut reader, sps)?;
-    let mut pps = Pps {
-        pic_parameter_set_id: header.pps_id,
-        seq_parameter_set_id: header.sps_id,
-        flags: header.flags,
-        num_extra_slice_header_bits: header.num_extra_slice_header_bits,
-        num_ref_l0: header.num_ref_l0,
-        num_ref_l1: header.num_ref_l1,
-        init_qp_minus26: header.init_qp_minus26,
-        diff_cu_qp_delta_depth: header.diff_cu_qp_delta_depth,
-        cb_qp_offset: header.cb_qp_offset,
-        cr_qp_offset: header.cr_qp_offset,
-        tile_columns_minus1: 0,
-        tile_rows_minus1: 0,
-        column_width_minus1: [0; 19],
-        row_height_minus1: [0; 21],
-        beta_offset_div2: 0,
-        tc_offset_div2: 0,
-        log2_parallel_merge_level_minus2: 0,
-    };
-    parse_pps_tiles(&mut reader, sps, &mut pps)?;
-    parse_pps_deblocking(&mut reader, &mut pps)?;
-    if reader.read_bit("pps_scaling_list_data_present_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::ScalingListsPending,
-        ));
-    }
-    set_wide_flag(
-        &mut pps.flags,
-        P_LISTS_MOD,
-        reader.read_bit("lists_modification_present_flag")?,
-    );
-    let merge_level = parse_small(&mut reader, "log2_parallel_merge_level_minus2")?;
-    let ctb_log2 = sps
-        .log2_min_cb_minus3
-        .saturating_add(3)
-        .saturating_add(sps.log2_diff_max_min_cb);
-    if merge_level > ctb_log2.saturating_sub(2) {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "log2_parallel_merge_level",
-        }));
-    }
-    pps.log2_parallel_merge_level_minus2 = merge_level;
-    set_wide_flag(
-        &mut pps.flags,
-        P_SLICE_EXT,
-        reader.read_bit("slice_segment_header_extension_present_flag")?,
-    );
-    if reader.read_bit("pps_extension_present_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::PpsExtensionPending,
-        ));
-    }
-    Ok(pps)
-}
-
-/// QP delta field.
-fn parse_qp(reader: &mut BitReader, syntax: &'static str) -> Result<i8, D3d12Error> {
-    let value = reader.read_se(syntax)?;
-    i8::try_from(value).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))
-}
-
-/// Tile layout section of a picture set.
-fn parse_pps_tiles(reader: &mut BitReader, sps: &Sps, pps: &mut Pps) -> Result<(), D3d12Error> {
-    set_wide_flag(
-        &mut pps.flags,
-        P_TILES,
-        reader.read_bit("tiles_enabled_flag")?,
-    );
-    set_wide_flag(
-        &mut pps.flags,
-        P_ENTROPY_SYNC,
-        reader.read_bit("entropy_coding_sync_enabled_flag")?,
-    );
-    if !pps.tiles() {
-        set_wide_flag(
-            &mut pps.flags,
-            P_LOOP_SLICES,
-            reader.read_bit("pps_loop_filter_across_slices_enabled_flag")?,
-        );
-        return Ok(());
-    }
-    pps.tile_columns_minus1 = parse_small(&mut *reader, "num_tile_columns_minus1")?;
-    pps.tile_rows_minus1 = parse_small(&mut *reader, "num_tile_rows_minus1")?;
-    if pps.tile_columns_minus1 >= 19 || pps.tile_rows_minus1 >= 21 {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::TileGridPending));
-    }
-    set_wide_flag(
-        &mut pps.flags,
-        P_UNIFORM_SPACING,
-        reader.read_bit("uniform_spacing_flag")?,
-    );
-    if pps.uniform_spacing() {
-        uniform_tiles(sps, pps)?;
-    } else {
-        for index in 0..pps.tile_columns_minus1 {
-            pps.column_width_minus1[usize::from(index)] =
-                parse_tile_extent(reader, "column_width_minus1")?;
-        }
-        for index in 0..pps.tile_rows_minus1 {
-            pps.row_height_minus1[usize::from(index)] =
-                parse_tile_extent(reader, "row_height_minus1")?;
-        }
-    }
-    set_wide_flag(
-        &mut pps.flags,
-        P_LOOP_TILES,
-        reader.read_bit("loop_filter_across_tiles_enabled_flag")?,
-    );
-    set_wide_flag(
-        &mut pps.flags,
-        P_LOOP_SLICES,
-        reader.read_bit("pps_loop_filter_across_slices_enabled_flag")?,
-    );
-    Ok(())
-}
-
-/// Wide flag bit set in `flags` when `set`.
-fn set_wide_flag(flags: &mut u32, bit: u32, set: bool) {
-    if set {
-        *flags |= bit;
-    }
-}
-
-/// Tile extent below the coding tree grid.
-fn parse_tile_extent(reader: &mut BitReader, syntax: &'static str) -> Result<u16, D3d12Error> {
-    let value = reader.read_ue(syntax)?;
-    u16::try_from(value).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))
-}
-
-/// Uniform tile widths and heights from the coding tree grid.
-fn uniform_tiles(sps: &Sps, pps: &mut Pps) -> Result<(), D3d12Error> {
-    let ctb = sps.min_cb() << sps.log2_diff_max_min_cb;
-    let ctbs_w = sps.width.div_ceil(ctb).max(1);
-    let ctbs_h = sps.height.div_ceil(ctb).max(1);
-    let columns = u32::from(pps.tile_columns_minus1) + 1;
-    let rows = u32::from(pps.tile_rows_minus1) + 1;
-    for (index, slot) in pps.column_width_minus1.iter_mut().enumerate() {
-        let i = u32::try_from(index).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "tile column",
-            })
-        })?;
-        if i >= columns {
-            break;
-        }
-        let width = (i + 1) * ctbs_w / columns - i * ctbs_w / columns;
-        *slot = u16::try_from(width.saturating_sub(1)).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "tile column",
-            })
-        })?;
-    }
-    for (index, slot) in pps.row_height_minus1.iter_mut().enumerate() {
-        let i = u32::try_from(index)
-            .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "tile row" }))?;
-        if i >= rows {
-            break;
-        }
-        let height = (i + 1) * ctbs_h / rows - i * ctbs_h / rows;
-        *slot = u16::try_from(height.saturating_sub(1))
-            .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "tile row" }))?;
-    }
-    Ok(())
-}
-
-/// Deblocking section of a picture set.
-fn parse_pps_deblocking(reader: &mut BitReader, pps: &mut Pps) -> Result<(), D3d12Error> {
-    if !reader.read_bit("deblocking_filter_control_present_flag")? {
-        return Ok(());
-    }
-    set_wide_flag(
-        &mut pps.flags,
-        P_DEBLOCK_OVERRIDE,
-        reader.read_bit("deblocking_filter_override_enabled_flag")?,
-    );
-    set_wide_flag(
-        &mut pps.flags,
-        P_DEBLOCK_DISABLED,
-        reader.read_bit("pps_deblocking_filter_disabled_flag")?,
-    );
-    if pps.deblocking_disabled() {
-        return Ok(());
-    }
-    pps.beta_offset_div2 = parse_qp(&mut *reader, "pps_beta_offset_div2")?;
-    pps.tc_offset_div2 = parse_qp(&mut *reader, "pps_tc_offset_div2")?;
-    Ok(())
-}
-
-/// Slice coding type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SliceType {
-    /// Bi-predictive.
-    B,
-    /// Predictive.
-    P,
-    /// Intra.
-    I,
-}
-
-impl SliceType {
-    /// Type for the `slice_type` value.
-    fn new(value: u32) -> Result<Self, D3d12Error> {
-        match value {
-            0 => Ok(Self::B),
-            1 => Ok(Self::P),
-            2 => Ok(Self::I),
-            _ => Err(D3d12Error::Parse(ParseReason::Range {
-                syntax: "slice_type",
-            })),
-        }
-    }
-
-    /// True for intra slices.
-    pub(crate) const fn is_intra(self) -> bool {
-        matches!(self, Self::I)
-    }
-
-    /// True for bi-predictive slices.
-    pub(crate) const fn is_b(self) -> bool {
-        matches!(self, Self::B)
-    }
-}
-
-/// Short-term set provenance behind the DXVA hints.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RpsBits {
-    /// True when the slice carries an explicit set.
-    pub(crate) explicit: bool,
-    /// Bit length of the set syntax.
-    pub(crate) bits: u16,
-    /// Delta POC count of the prediction source.
-    pub(crate) ref_num_delta_pocs: u8,
-}
-
 /// Parsed slice segment header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SliceHeader {
@@ -1392,438 +343,6 @@ pub(crate) struct SliceHeader {
     pub(crate) rps: Option<ShortTermRps>,
     /// Short-term set provenance, absent on IDR.
     pub(crate) rps_bits: Option<RpsBits>,
-}
-
-/// Slice header prefix: first flag, prior-output flag, set id.
-fn parse_slice_prefix(
-    reader: &mut BitReader,
-    nal_type: u8,
-) -> Result<(bool, bool, u8), D3d12Error> {
-    let first = reader.read_bit("first_slice_segment_in_pic_flag")?;
-    let no_output_prior = if is_irap(nal_type) {
-        reader.read_bit("no_output_of_prior_pics_flag")?
-    } else {
-        false
-    };
-    let pps_id = reader.read_ue("slice_pic_parameter_set_id")?;
-    let pps_id = u8::try_from(pps_id).map_err(|_| {
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "slice_pic_parameter_set_id",
-        })
-    })?;
-    Ok((first, no_output_prior, pps_id))
-}
-
-/// Slice header against its parameter sets.
-fn parse_slice_rest(
-    reader: &mut BitReader,
-    prefix: (bool, bool, u8),
-    nal_type: u8,
-    sps: &Sps,
-    pps: &Pps,
-) -> Result<SliceHeader, D3d12Error> {
-    let (first, no_output_prior, pps_id) = prefix;
-    let address = parse_slice_address(reader, first, sps, pps)?;
-    for _ in 0..pps.num_extra_slice_header_bits {
-        reader.read_bit("slice_reserved_flag")?;
-    }
-    let slice_type = SliceType::new(reader.read_ue("slice_type")?)?;
-    if is_idr(nal_type) && !slice_type.is_intra() {
-        return Err(D3d12Error::Parse(ParseReason::NonIntraSliceInIdr));
-    }
-    let pic_output = if pps.output_flag_present() {
-        reader.read_bit("pic_output_flag")?
-    } else {
-        true
-    };
-    let sets = parse_slice_rps(reader, nal_type, sps)?;
-    let temporal_mvp = !is_idr(nal_type)
-        && sps.temporal_mvp()
-        && reader.read_bit("slice_temporal_mvp_enabled_flag")?;
-    let sao = parse_slice_sao(reader, sps)?;
-    parse_slice_inter(reader, slice_type, temporal_mvp, pps, sets.rps.as_ref())?;
-    parse_slice_qp(reader, pps)?;
-    let deblocking_disabled = parse_slice_deblocking(reader, pps)?;
-    parse_slice_loop_across(reader, pps, sao, deblocking_disabled)?;
-    parse_entry_points(reader, pps)?;
-    parse_slice_extension(reader, pps)?;
-    Ok(SliceHeader {
-        pps_id,
-        slice_type,
-        address,
-        first,
-        pic_output,
-        no_output_prior,
-        poc_lsb: sets.poc_lsb,
-        rps: sets.rps,
-        rps_bits: sets.rps_bits,
-    })
-}
-
-/// Slice segment address, declining dependent segments.
-fn parse_slice_address(
-    reader: &mut BitReader,
-    first: bool,
-    sps: &Sps,
-    pps: &Pps,
-) -> Result<u32, D3d12Error> {
-    if first {
-        return Ok(0);
-    }
-    if pps.dependent_slices() && reader.read_bit("dependent_slice_segment_flag")? {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::DependentSlicesPending,
-        ));
-    }
-    let ctbs = sps.width_in_ctbs() * sps.height_in_ctbs();
-    if ctbs <= 1 {
-        return Ok(0);
-    }
-    let width = 32 - (ctbs - 1).leading_zeros();
-    let address = reader.read_bits(width, "slice_segment_address")?;
-    if address >= ctbs {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "slice_segment_address",
-        }));
-    }
-    Ok(address)
-}
-
-/// Slice order count plus reference sets.
-struct SliceRefSets {
-    /// Picture order count LSB.
-    poc_lsb: Option<u32>,
-    /// Resolved short-term set.
-    rps: Option<ShortTermRps>,
-    /// Short-term set provenance.
-    rps_bits: Option<RpsBits>,
-}
-
-/// Slice POC LSB plus the short-term reference set.
-fn parse_slice_rps(
-    reader: &mut BitReader,
-    nal_type: u8,
-    sps: &Sps,
-) -> Result<SliceRefSets, D3d12Error> {
-    if is_idr(nal_type) {
-        return Ok(SliceRefSets {
-            poc_lsb: None,
-            rps: None,
-            rps_bits: None,
-        });
-    }
-    let width = u32::from(sps.log2_max_poc_lsb_minus4) + 4;
-    let poc_lsb = reader.read_bits(width, "slice_pic_order_cnt_lsb")?;
-    let (rps, rps_bits) = parse_slice_short_term(reader, sps)?;
-    Ok(SliceRefSets {
-        poc_lsb: Some(poc_lsb),
-        rps: Some(rps),
-        rps_bits: Some(rps_bits),
-    })
-}
-
-/// Short-term set: explicit slice syntax or a table entry.
-fn parse_slice_short_term(
-    reader: &mut BitReader,
-    sps: &Sps,
-) -> Result<(ShortTermRps, RpsBits), D3d12Error> {
-    if !reader.read_bit("short_term_ref_pic_set_sps_flag")? {
-        let start = reader.position();
-        let num = sps.rps.len();
-        let resolved = parse_short_term_rps(reader, num, num, &sps.rps)?;
-        let bits = reader
-            .position()
-            .checked_sub(start)
-            .and_then(|bits| u16::try_from(bits).ok())
-            .ok_or(D3d12Error::Parse(ParseReason::ShortTermRefPicSetSize))?;
-        return Ok((
-            resolved.set,
-            RpsBits {
-                explicit: true,
-                bits,
-                ref_num_delta_pocs: resolved.ref_num_delta_pocs,
-            },
-        ));
-    }
-    let index = if sps.rps.len() > 1 {
-        let width = 32
-            - u32::try_from(sps.rps.len() - 1)
-                .unwrap_or(u32::MAX)
-                .leading_zeros();
-        usize::try_from(reader.read_bits(width, "short_term_ref_pic_set_idx")?).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "short_term_ref_pic_set_idx",
-            })
-        })?
-    } else {
-        0
-    };
-    let set = sps.rps.get(index).cloned().ok_or({
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "short_term_ref_pic_set_idx",
-        })
-    })?;
-    Ok((
-        set,
-        RpsBits {
-            explicit: false,
-            bits: 0,
-            ref_num_delta_pocs: 0,
-        },
-    ))
-}
-
-/// Slice sample adaptive offset flags.
-fn parse_slice_sao(reader: &mut BitReader, sps: &Sps) -> Result<(bool, bool), D3d12Error> {
-    if !sps.sao() {
-        return Ok((false, false));
-    }
-    let luma = reader.read_bit("slice_sao_luma_flag")?;
-    let chroma = reader.read_bit("slice_sao_chroma_flag")?;
-    Ok((luma, chroma))
-}
-
-/// Inter section: counts, list modification, collocated, weights, merge.
-fn parse_slice_inter(
-    reader: &mut BitReader,
-    slice_type: SliceType,
-    temporal_mvp: bool,
-    pps: &Pps,
-    rps: Option<&ShortTermRps>,
-) -> Result<(), D3d12Error> {
-    if slice_type.is_intra() {
-        return Ok(());
-    }
-    let (num_l0, num_l1) = parse_ref_override(reader, slice_type, pps)?;
-    let total_curr = poc_total_curr(rps);
-    if pps.lists_modification_present() && total_curr > 1 {
-        parse_lists_modification(reader, slice_type, num_l0, num_l1, total_curr)?;
-    }
-    if slice_type.is_b() {
-        reader.read_bit("mvd_l1_zero_flag")?;
-    }
-    if pps.cabac_init_present() {
-        reader.read_bit("cabac_init_flag")?;
-    }
-    parse_collocated(reader, slice_type, temporal_mvp, num_l0, num_l1)?;
-    if (pps.weighted_pred() && !slice_type.is_b()) || (pps.weighted_bipred() && slice_type.is_b()) {
-        parse_weight_table(reader, slice_type, num_l0, num_l1)?;
-    }
-    if reader.read_ue("five_minus_max_num_merge_cand")? > 4 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "five_minus_max_num_merge_cand",
-        }));
-    }
-    Ok(())
-}
-
-/// Current-picture reference count behind list modification gating.
-fn poc_total_curr(rps: Option<&ShortTermRps>) -> usize {
-    rps.map_or(0, |rps| rps.used_negative() + rps.used_positive())
-}
-
-/// Reference count field below the 14 ceiling.
-fn parse_ref_count(reader: &mut BitReader, syntax: &'static str) -> Result<u8, D3d12Error> {
-    let value = reader.read_ue(syntax)?;
-    if value > 14 {
-        return Err(D3d12Error::Parse(ParseReason::Range { syntax }));
-    }
-    u8::try_from(value).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax }))
-}
-
-/// Active reference counts with slice override.
-fn parse_ref_override(
-    reader: &mut BitReader,
-    slice_type: SliceType,
-    pps: &Pps,
-) -> Result<(u8, u8), D3d12Error> {
-    if !reader.read_bit("num_ref_idx_active_override_flag")? {
-        return Ok((pps.num_ref_l0, pps.num_ref_l1));
-    }
-    let num_l0 = parse_ref_count(reader, "num_ref_idx_l0_active_minus1")?;
-    let num_l1 = if slice_type.is_b() {
-        parse_ref_count(reader, "num_ref_idx_l1_active_minus1")?
-    } else {
-        pps.num_ref_l1
-    };
-    Ok((num_l0, num_l1))
-}
-
-/// Reference list modification entries.
-fn parse_lists_modification(
-    reader: &mut BitReader,
-    slice_type: SliceType,
-    num_l0: u8,
-    num_l1: u8,
-    total_curr: usize,
-) -> Result<(), D3d12Error> {
-    let width = 32 - u32::try_from(total_curr - 1).unwrap_or(0).leading_zeros();
-    if reader.read_bit("ref_pic_list_modification_flag_l0")? {
-        for _ in 0..=num_l0 {
-            let entry = reader.read_bits(width, "list_entry_l0")?;
-            if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(D3d12Error::Parse(ParseReason::Range {
-                    syntax: "list_entry_l0",
-                }));
-            }
-        }
-    }
-    if slice_type.is_b() && reader.read_bit("ref_pic_list_modification_flag_l1")? {
-        for _ in 0..=num_l1 {
-            let entry = reader.read_bits(width, "list_entry_l1")?;
-            if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(D3d12Error::Parse(ParseReason::Range {
-                    syntax: "list_entry_l1",
-                }));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Collocated picture description.
-fn parse_collocated(
-    reader: &mut BitReader,
-    slice_type: SliceType,
-    temporal_mvp: bool,
-    num_l0: u8,
-    num_l1: u8,
-) -> Result<(), D3d12Error> {
-    if !temporal_mvp {
-        return Ok(());
-    }
-    let from_l0 = if slice_type.is_b() {
-        reader.read_bit("collocated_from_l0_flag")?
-    } else {
-        true
-    };
-    let ceiling = if from_l0 { num_l0 } else { num_l1 };
-    if ceiling > 0 {
-        let index = reader.read_ue("collocated_ref_idx")?;
-        if index > u32::from(ceiling) {
-            return Err(D3d12Error::Parse(ParseReason::Range {
-                syntax: "collocated_ref_idx",
-            }));
-        }
-    }
-    Ok(())
-}
-
-/// Prediction weight table.
-fn parse_weight_table(
-    reader: &mut BitReader,
-    slice_type: SliceType,
-    num_l0: u8,
-    num_l1: u8,
-) -> Result<(), D3d12Error> {
-    if reader.read_ue("luma_log2_weight_denom")? > 7 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "luma_log2_weight_denom",
-        }));
-    }
-    reader.read_se("delta_chroma_log2_weight_denom")?;
-    parse_weight_list(reader, num_l0)?;
-    if slice_type.is_b() {
-        parse_weight_list(reader, num_l1)?;
-    }
-    Ok(())
-}
-
-/// One reference weight list.
-fn parse_weight_list(reader: &mut BitReader, count_minus1: u8) -> Result<(), D3d12Error> {
-    let mut luma = Vec::new();
-    let mut chroma = Vec::new();
-    for _ in 0..=count_minus1 {
-        luma.push(reader.read_bit("luma_weight_flag")?);
-    }
-    for _ in 0..=count_minus1 {
-        chroma.push(reader.read_bit("chroma_weight_flag")?);
-    }
-    for index in 0..=usize::from(count_minus1) {
-        if luma[index] {
-            reader.read_se("delta_luma_weight")?;
-            reader.read_se("luma_offset")?;
-        }
-        if chroma[index] {
-            for _ in 0..2 {
-                reader.read_se("delta_chroma_weight")?;
-                reader.read_se("chroma_offset")?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Slice quantization deltas.
-fn parse_slice_qp(reader: &mut BitReader, pps: &Pps) -> Result<(), D3d12Error> {
-    reader.read_se("slice_qp_delta")?;
-    if pps.slice_chroma_qp_offsets_present() {
-        reader.read_se("slice_cb_qp_offset")?;
-        reader.read_se("slice_cr_qp_offset")?;
-    }
-    Ok(())
-}
-
-/// Slice deblocking description, returning the disabled state.
-fn parse_slice_deblocking(reader: &mut BitReader, pps: &Pps) -> Result<bool, D3d12Error> {
-    if !pps.deblocking_override() {
-        return Ok(pps.deblocking_disabled());
-    }
-    if !reader.read_bit("deblocking_filter_override_flag")? {
-        return Ok(pps.deblocking_disabled());
-    }
-    if reader.read_bit("slice_deblocking_filter_disabled_flag")? {
-        return Ok(true);
-    }
-    reader.read_se("slice_beta_offset_div2")?;
-    reader.read_se("slice_tc_offset_div2")?;
-    Ok(false)
-}
-
-/// Slice loop filter flag across slices.
-fn parse_slice_loop_across(
-    reader: &mut BitReader,
-    pps: &Pps,
-    sao: (bool, bool),
-    deblocking_disabled: bool,
-) -> Result<(), D3d12Error> {
-    if pps.loop_across_slices() && (sao.0 || sao.1 || !deblocking_disabled) {
-        reader.read_bit("slice_loop_filter_across_slices_enabled_flag")?;
-    }
-    Ok(())
-}
-
-/// Tile and wavefront entry point offsets.
-fn parse_entry_points(reader: &mut BitReader, pps: &Pps) -> Result<(), D3d12Error> {
-    if !pps.tiles() && !pps.entropy_sync() {
-        return Ok(());
-    }
-    let count = reader.read_ue("num_entry_point_offsets")?;
-    if count == 0 {
-        return Ok(());
-    }
-    let length_minus1 = reader.read_ue("offset_len_minus1")?;
-    if length_minus1 > 31 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
-            syntax: "offset_len_minus1",
-        }));
-    }
-    for _ in 0..count {
-        reader.read_bits(length_minus1 + 1, "entry_point_offset_minus1")?;
-    }
-    Ok(())
-}
-
-/// Slice extension bytes.
-fn parse_slice_extension(reader: &mut BitReader, pps: &Pps) -> Result<(), D3d12Error> {
-    if !pps.slice_ext_present() {
-        return Ok(());
-    }
-    let length = reader.read_ue("slice_segment_header_extension_length")?;
-    for _ in 0..length {
-        reader.read_bits(8, "slice_segment_header_extension_data_byte")?;
-    }
-    Ok(())
 }
 
 /// One coded slice: header plus its NAL bytes.
@@ -1876,29 +395,555 @@ impl Picture {
     }
 }
 
-/// Annex B ingest: parameter sets plus picture assembly.
+/// Tier capability gates over shared grammar output.
+pub(crate) struct Gate;
+
+/// Stream levels the tier runs, H.265 A.4.1.
+const LEVELS: [u8; 14] = [
+    30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186, 210,
+];
+
+impl HevcError for D3d12Error {
+    /// Parse failure of `kind`.
+    fn parse(kind: ParseKind) -> Self {
+        match kind {
+            ParseKind::EmptyCodedSize => Self::Parse(ParseReason::EmptyCodedSize),
+            ParseKind::ConformanceOutside => Self::Parse(ParseReason::ConfWinOutsideCodedSize),
+            ParseKind::RpsTableOversize => Self::Parse(ParseReason::Range {
+                syntax: "num_short_term_ref_pic_sets",
+            }),
+            ParseKind::LtSpsOversize => Self::Parse(ParseReason::Range {
+                syntax: "num_long_term_ref_pics_sps",
+            }),
+            ParseKind::LtTotalOversize => Self::Parse(ParseReason::Range {
+                syntax: "num_long_term_pics",
+            }),
+            ParseKind::EmptySpsRps => Self::Parse(ParseReason::Range {
+                syntax: "short_term_ref_pic_set_idx",
+            }),
+            ParseKind::Range { syntax } => Self::Parse(ParseReason::Range {
+                syntax: remap_syntax(syntax),
+            }),
+            ParseKind::Truncated { syntax } => Self::Parse(ParseReason::Truncated { syntax }),
+            ParseKind::OverflowU32 { syntax } => Self::Parse(ParseReason::OverflowU32 { syntax }),
+            ParseKind::OverflowI32 { syntax } => Self::Parse(ParseReason::OverflowI32 { syntax }),
+            ParseKind::TooWide { syntax } => Self::Parse(ParseReason::TooWide { syntax }),
+            ParseKind::NalForbiddenBit => Self::Parse(ParseReason::NalForbiddenBit),
+            ParseKind::NalTemporalId => Self::Parse(ParseReason::NalTemporalId),
+            ParseKind::VpsWithoutBody | ParseKind::SpsWithoutBody => {
+                Self::Parse(ParseReason::SpsWithoutBody)
+            }
+            ParseKind::PpsWithoutBody => Self::Parse(ParseReason::PpsWithoutBody),
+            ParseKind::SliceWithoutHeader => Self::Parse(ParseReason::SliceWithoutHeader),
+            ParseKind::PpsCitesUnknownSps => Self::Parse(ParseReason::PpsCitesUnknownSps),
+            ParseKind::SliceCitesUnknownPps => Self::Parse(ParseReason::SliceCitesUnknownPps),
+            ParseKind::SliceCitesUnknownSps => Self::Parse(ParseReason::SliceCitesUnknownSps),
+            ParseKind::PictureSlicesDisagree => Self::Parse(ParseReason::PictureSlicesDisagree),
+            ParseKind::NonIntraSliceInIdr => Self::Parse(ParseReason::NonIntraSliceInIdr),
+            ParseKind::ShortTermRefPicSetSize => Self::Parse(ParseReason::ShortTermRefPicSetSize),
+        }
+    }
+
+    /// Tier-declined construct of `kind`.
+    fn unsupported(kind: UnsupportedKind) -> Self {
+        match kind {
+            UnsupportedKind::DependentSlices => {
+                Self::Unsupported(UnsupportedReason::DependentSlicesPending)
+            }
+            UnsupportedKind::ArbitrarySliceOrder => {
+                Self::Unsupported(UnsupportedReason::ArbitrarySliceOrder)
+            }
+            UnsupportedKind::Multilayer => Self::Unsupported(UnsupportedReason::Multilayer),
+        }
+    }
+}
+
+/// Shared syntax label behind the tier label.
+fn remap_syntax(syntax: &'static str) -> &'static str {
+    match syntax {
+        "log2_max_pic_order_cnt_lsb_minus4" => "log2_max_pic_order_cnt_lsb",
+        "log2_min_luma_coding_block_size_minus3" => "log2_min_luma_coding_block_size",
+        "log2_diff_max_min_luma_coding_block_size" => "log2_diff_max_min_luma_coding_block",
+        "log2_min_luma_transform_block_size_minus2" => "log2_min_luma_transform_block_size",
+        "log2_diff_max_min_luma_transform_block_size" => "log2_diff_max_min_luma_transform",
+        "pic_init_qp_minus26" => "init_qp_minus26",
+        _ => syntax,
+    }
+}
+
+impl HevcGate<D3d12Error> for Gate {
+    /// Sequence set against tier caps.
+    fn check_sps(sps: &rust_video_h265::Sps) -> Result<(), D3d12Error> {
+        if sps.max_sub_layers != 1 {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Sublayers));
+        }
+        if sps.chroma_format != 1 {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::ChromaOutside420));
+        }
+        if sps.bit_depth_luma != 0 {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::LumaDepthAbove8Bit,
+            ));
+        }
+        if sps.bit_depth_chroma != 0 {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::ChromaDepthAbove8Bit,
+            ));
+        }
+        if sps.scaling_enabled() {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::ScalingListsPending,
+            ));
+        }
+        if sps.pcm() {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::PcmPending));
+        }
+        if sps.long_term_present() {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::LongTermRefsPending,
+            ));
+        }
+        if sps.ptl.profile_idc != 1 && sps.ptl.compat & 0x4000_0000 == 0 {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::ProfileOutsideMain,
+            ));
+        }
+        if sps.ptl.source.interlaced && !sps.ptl.source.progressive {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Interlaced));
+        }
+        if !LEVELS.contains(&sps.ptl.level_idc) {
+            return Err(D3d12Error::Parse(ParseReason::Range {
+                syntax: "general_level_idc",
+            }));
+        }
+        if sps.sps_extension_present {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::SpsExtensionPending,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Picture set against tier caps with its sequence set, absent for orphans.
+    fn check_pps(
+        pps: &rust_video_h265::Pps,
+        sps: Option<&rust_video_h265::Sps>,
+    ) -> Result<(), D3d12Error> {
+        let Some(sps) = sps else {
+            return Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps));
+        };
+        if pps.sps_id != sps.id {
+            return Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps));
+        }
+        if pps.flags & rust_video_h265::PPS_SCALING != 0 {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::ScalingListsPending,
+            ));
+        }
+        if pps.diff_cu_qp_delta_depth > 31 {
+            return Err(D3d12Error::Parse(ParseReason::Range {
+                syntax: "diff_cu_qp_delta_depth",
+            }));
+        }
+        check_tile_grid(pps.num_tile_columns, pps.num_tile_rows)?;
+        let ctb_log2 = sps
+            .log2_min_cb_size_minus3
+            .saturating_add(3)
+            .saturating_add(sps.log2_diff_max_min_cb_size);
+        if pps.log2_parallel_merge_minus2 > ctb_log2.saturating_sub(2) {
+            return Err(D3d12Error::Parse(ParseReason::Range {
+                syntax: "log2_parallel_merge_level",
+            }));
+        }
+        if pps.pps_extension_present {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::PpsExtensionPending,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Slice order of one picture: treeblock addresses with first flags.
+    fn check_slice_order(addrs: &[u32], firsts: &[bool]) -> Result<(), D3d12Error> {
+        let Some(first_first) = firsts.first() else {
+            return Ok(());
+        };
+        if !first_first {
+            return Err(D3d12Error::Parse(ParseReason::PictureWithoutFirstSlice));
+        }
+        let mut previous = 0u32;
+        for (addr, first) in addrs.iter().zip(firsts.iter()).skip(1) {
+            if *first || *addr <= previous {
+                return Err(D3d12Error::Unsupported(
+                    UnsupportedReason::ArbitrarySliceOrder,
+                ));
+            }
+            previous = *addr;
+        }
+        Ok(())
+    }
+
+    /// NAL unit action for `nal_type` on layer `layer_id`.
+    fn classify_nal(nal_type: u8, layer_id: u16) -> Result<NalAction, D3d12Error> {
+        if layer_id != 0 {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Multilayer));
+        }
+        match nal_type {
+            0..=9 | 16..=21 => Ok(NalAction::Vcl),
+            10..=15 => Err(D3d12Error::Unsupported(
+                UnsupportedReason::ReservedSliceType,
+            )),
+            33 => Ok(NalAction::Sps),
+            34 => Ok(NalAction::Pps),
+            35..=37 => Ok(NalAction::Complete),
+            _ => Ok(NalAction::Ignore),
+        }
+    }
+}
+
+/// Tile grid counts against the tier grid.
+fn check_tile_grid(columns: u8, rows: u8) -> Result<(), D3d12Error> {
+    let columns_minus1 = columns.saturating_sub(1);
+    let rows_minus1 = rows.saturating_sub(1);
+    if columns_minus1 > 31 {
+        return Err(D3d12Error::Parse(ParseReason::Range {
+            syntax: "num_tile_columns_minus1",
+        }));
+    }
+    if rows_minus1 > 31 {
+        return Err(D3d12Error::Parse(ParseReason::Range {
+            syntax: "num_tile_rows_minus1",
+        }));
+    }
+    if columns_minus1 >= 19 || rows_minus1 >= 21 {
+        return Err(D3d12Error::Unsupported(UnsupportedReason::TileGridPending));
+    }
+    Ok(())
+}
+
+/// Sequence parameter set from RBSP `rbsp`.
+#[cfg(test)]
+pub(crate) fn parse_sps(rbsp: &[u8]) -> Result<Sps, D3d12Error> {
+    Ok(sps_from_shared(&rust_video_h265::parse_sps::<
+        D3d12Error,
+        Gate,
+    >(rbsp)?))
+}
+
+/// Picture parameter set from RBSP `rbsp` against sequence set `sps`.
+#[cfg(test)]
+pub(crate) fn parse_pps(rbsp: &[u8], sps: &Sps) -> Result<Pps, D3d12Error> {
+    let shared_sps = approx_shared_sps(sps);
+    let shared = rust_video_h265::parse_pps::<D3d12Error, Gate>(rbsp, Some(&shared_sps))?;
+    pps_from_shared(&shared, &shared_sps)
+}
+
+/// Lean sequence set from the shared set.
+fn sps_from_shared(shared: &rust_video_h265::Sps) -> Sps {
+    let mut flags = 0;
+    if shared.amp() {
+        flags |= FLAG_AMP;
+    }
+    if shared.sao() {
+        flags |= FLAG_SAO;
+    }
+    if shared.temporal_mvp() {
+        flags |= FLAG_TEMPORAL_MVP;
+    }
+    if shared.smoothing() {
+        flags |= FLAG_STRONG_INTRA;
+    }
+    Sps {
+        seq_parameter_set_id: shared.id,
+        width: shared.width,
+        height: shared.height,
+        crop: shared.crop.map(|crop| Crop {
+            left: crop.left,
+            right: crop.right,
+            top: crop.top,
+            bottom: crop.bottom,
+        }),
+        log2_max_poc_lsb_minus4: shared.log2_max_poc_lsb_minus4,
+        max_dec_pic_buffering_minus1: shared.max_dec_pic_buffering_minus1,
+        max_num_reorder_pics: shared.max_num_reorder_pics,
+        rps: shared.rps.clone(),
+        log2_min_cb_minus3: shared.log2_min_cb_size_minus3,
+        log2_diff_max_min_cb: shared.log2_diff_max_min_cb_size,
+        log2_min_tb_minus2: shared.log2_min_tb_size_minus2,
+        log2_diff_max_min_tb: shared.log2_diff_max_min_tb_size,
+        max_depth_inter: shared.max_transform_depth_inter,
+        max_depth_intra: shared.max_transform_depth_intra,
+        flags,
+    }
+}
+
+/// Lean picture set from the shared set against its sequence set.
+fn pps_from_shared(
+    shared: &rust_video_h265::Pps,
+    sps: &rust_video_h265::Sps,
+) -> Result<Pps, D3d12Error> {
+    let mut flags = 0;
+    set_wide_flag(&mut flags, P_DEPENDENT_SLICES, shared.dependent_slices());
+    set_wide_flag(&mut flags, P_OUTPUT_FLAG, shared.output_flag_present());
+    set_wide_flag(&mut flags, P_SIGN_HIDING, shared.sign_hiding());
+    set_wide_flag(&mut flags, P_CABAC_INIT, shared.cabac_init_present());
+    set_wide_flag(&mut flags, P_CONSTRAINED_INTRA, shared.constrained_intra());
+    set_wide_flag(&mut flags, P_TRANSFORM_SKIP, shared.transform_skip());
+    set_wide_flag(&mut flags, P_CU_QP_DELTA, shared.cu_qp_delta());
+    set_wide_flag(
+        &mut flags,
+        P_CHROMA_QP_OFFSETS,
+        shared.chroma_offsets_present(),
+    );
+    set_wide_flag(&mut flags, P_WEIGHTED_PRED, shared.weighted_pred());
+    set_wide_flag(&mut flags, P_WEIGHTED_BIPRED, shared.weighted_bipred());
+    set_wide_flag(&mut flags, P_TRANSQUANT_BYPASS, shared.transquant_bypass());
+    set_wide_flag(&mut flags, P_TILES, shared.tiles_enabled());
+    set_wide_flag(&mut flags, P_UNIFORM_SPACING, shared.uniform_spacing());
+    set_wide_flag(&mut flags, P_LOOP_TILES, shared.loop_across_tiles());
+    set_wide_flag(&mut flags, P_ENTROPY_SYNC, shared.entropy_sync());
+    set_wide_flag(&mut flags, P_LOOP_SLICES, shared.loop_across_slices());
+    set_wide_flag(&mut flags, P_DEBLOCK_OVERRIDE, shared.deblocking_override());
+    set_wide_flag(&mut flags, P_DEBLOCK_DISABLED, shared.deblocking_disabled());
+    set_wide_flag(&mut flags, P_LISTS_MOD, shared.lists_modification_present());
+    set_wide_flag(&mut flags, P_SLICE_EXT, shared.slice_ext_present());
+    let (column_width_minus1, row_height_minus1) = tile_arrays(shared, sps)?;
+    Ok(Pps {
+        pic_parameter_set_id: shared.id,
+        seq_parameter_set_id: shared.sps_id,
+        flags,
+        num_extra_slice_header_bits: shared.num_extra_slice_header_bits,
+        num_ref_l0: shared.num_ref_l0,
+        num_ref_l1: shared.num_ref_l1,
+        init_qp_minus26: shared.pic_init_qp_minus26,
+        diff_cu_qp_delta_depth: shared.diff_cu_qp_delta_depth,
+        cb_qp_offset: shared.cb_qp_offset,
+        cr_qp_offset: shared.cr_qp_offset,
+        tile_columns_minus1: shared.num_tile_columns.saturating_sub(1),
+        tile_rows_minus1: shared.num_tile_rows.saturating_sub(1),
+        column_width_minus1,
+        row_height_minus1,
+        beta_offset_div2: shared.beta_offset_div2,
+        tc_offset_div2: shared.tc_offset_div2,
+        log2_parallel_merge_level_minus2: shared.log2_parallel_merge_minus2,
+    })
+}
+
+/// Wide flag bit set in `flags` when `set`.
+fn set_wide_flag(flags: &mut u32, bit: u32, set: bool) {
+    if set {
+        *flags |= bit;
+    }
+}
+
+/// Lean tile arrays from the shared grid against its sequence set.
+fn tile_arrays(
+    shared: &rust_video_h265::Pps,
+    sps: &rust_video_h265::Sps,
+) -> Result<([u16; 19], [u16; 21]), D3d12Error> {
+    if !shared.tiles_enabled() {
+        return Ok(([0; 19], [0; 21]));
+    }
+    if shared.uniform_spacing() {
+        return uniform_grid(
+            sps.width,
+            sps.height,
+            sps.log2_min_cb_size_minus3,
+            sps.log2_diff_max_min_cb_size,
+            shared.num_tile_columns,
+            shared.num_tile_rows,
+        );
+    }
+    let mut columns = [0u16; 19];
+    for (index, width) in shared.column_width.iter().enumerate() {
+        if index + 1 >= shared.column_width.len() {
+            break;
+        }
+        columns[index] = width
+            .checked_sub(1)
+            .ok_or(D3d12Error::Parse(ParseReason::Range {
+                syntax: "column_width_minus1",
+            }))?;
+    }
+    let mut rows = [0u16; 21];
+    for (index, height) in shared.row_height.iter().enumerate() {
+        if index + 1 >= shared.row_height.len() {
+            break;
+        }
+        rows[index] = height
+            .checked_sub(1)
+            .ok_or(D3d12Error::Parse(ParseReason::Range {
+                syntax: "row_height_minus1",
+            }))?;
+    }
+    Ok((columns, rows))
+}
+
+/// Uniform tile widths and heights from the coding tree grid.
+fn uniform_grid(
+    width: u32,
+    height: u32,
+    log2_min_cb_minus3: u8,
+    log2_diff: u8,
+    columns: u8,
+    rows: u8,
+) -> Result<([u16; 19], [u16; 21]), D3d12Error> {
+    let shift = log2_min_cb_minus3
+        .saturating_add(3)
+        .saturating_add(log2_diff);
+    let ctb = 1u32
+        .checked_shl(u32::from(shift))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let ctbs_w = width.div_ceil(ctb).max(1);
+    let ctbs_h = height.div_ceil(ctb).max(1);
+    let columns = u32::from(columns);
+    let rows = u32::from(rows);
+    let mut column_width_minus1 = [0u16; 19];
+    for (index, slot) in column_width_minus1.iter_mut().enumerate() {
+        let i = u32::try_from(index).map_err(|_| {
+            D3d12Error::Parse(ParseReason::Range {
+                syntax: "tile column",
+            })
+        })?;
+        if i >= columns {
+            break;
+        }
+        let width = (i + 1) * ctbs_w / columns - i * ctbs_w / columns;
+        *slot = u16::try_from(width.saturating_sub(1)).map_err(|_| {
+            D3d12Error::Parse(ParseReason::Range {
+                syntax: "tile column",
+            })
+        })?;
+    }
+    let mut row_height_minus1 = [0u16; 21];
+    for (index, slot) in row_height_minus1.iter_mut().enumerate() {
+        let i = u32::try_from(index)
+            .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "tile row" }))?;
+        if i >= rows {
+            break;
+        }
+        let height = (i + 1) * ctbs_h / rows - i * ctbs_h / rows;
+        *slot = u16::try_from(height.saturating_sub(1))
+            .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "tile row" }))?;
+    }
+    Ok((column_width_minus1, row_height_minus1))
+}
+
+/// Lean slice header from the shared header with set id `pps_id`.
+fn slice_from_shared(shared: &rust_video_h265::SliceHeader, pps_id: u8) -> SliceHeader {
+    SliceHeader {
+        pps_id,
+        slice_type: shared.slice_type,
+        address: shared.address,
+        first: shared.first,
+        pic_output: shared.pic_output,
+        no_output_prior: shared.no_output_prior,
+        poc_lsb: shared.poc_lsb,
+        rps: shared.rps.clone(),
+        rps_bits: shared.rps_bits,
+    }
+}
+
+/// Lean picture from the shared picture.
+fn picture_from_shared(shared: &rust_video_h265::Picture) -> Picture {
+    Picture {
+        slices: shared
+            .slices
+            .iter()
+            .map(|slice| PendingSlice {
+                header: slice_from_shared(&slice.header, slice.pps_id),
+                nal: slice.nal.clone(),
+                nal_type: slice.nal_type,
+                temporal_id: slice.temporal_id,
+            })
+            .collect(),
+        idr: shared.idr,
+        irap: shared.irap,
+        rasl: shared.rasl,
+    }
+}
+
+/// Approximate shared sequence set behind picture set derivation.
+///
+/// Carries the exact grid behind tile derivation; Gates check the lean
+/// values, so the remaining fields stay dummy.
+#[cfg(test)]
+fn approx_shared_sps(sps: &Sps) -> rust_video_h265::Sps {
+    rust_video_h265::Sps {
+        id: sps.seq_parameter_set_id,
+        flags: 0,
+        max_sub_layers: 1,
+        level_idc: 120,
+        width: sps.width,
+        height: sps.height,
+        crop: None,
+        log2_max_poc_lsb_minus4: sps.log2_max_poc_lsb_minus4,
+        max_dec_pic_buffering_minus1: sps.max_dec_pic_buffering_minus1,
+        max_num_reorder_pics: sps.max_num_reorder_pics,
+        log2_min_cb_size_minus3: sps.log2_min_cb_minus3,
+        log2_diff_max_min_cb_size: sps.log2_diff_max_min_cb,
+        log2_min_tb_size_minus2: sps.log2_min_tb_minus2,
+        log2_diff_max_min_tb_size: sps.log2_diff_max_min_tb,
+        max_transform_depth_inter: sps.max_depth_inter,
+        max_transform_depth_intra: sps.max_depth_intra,
+        scaling: ScalingLists::default(),
+        pcm_depth_luma: 0,
+        pcm_depth_chroma: 0,
+        pcm_log2_min_minus3: 0,
+        pcm_log2_diff: 0,
+        rps: Vec::new(),
+        lt_poc_lsb: Vec::new(),
+        lt_used_by_curr: Vec::new(),
+        vps_id: 0,
+        ptl: ProfileTierLevel {
+            tier: false,
+            profile_idc: 1,
+            compat: 0x4000_0000,
+            source: SourceFlags {
+                progressive: true,
+                interlaced: false,
+            },
+            constraints: ConstraintFlags {
+                non_packed: true,
+                frame_only: true,
+            },
+            level_idc: 120,
+            sub_layers: Vec::new(),
+        },
+        chroma_format: 1,
+        separate_colour_plane: false,
+        bit_depth_luma: 0,
+        bit_depth_chroma: 0,
+        ordering_buffering: Vec::new(),
+        ordering_reorder: Vec::new(),
+        ordering_latency: Vec::new(),
+        vui: None,
+        sps_extension_present: false,
+        sps_extension_flags: [false; 4],
+    }
+}
+
+/// Annex B ingest over the shared grammar with lean mirrors.
 pub(crate) struct Ingest {
+    /// Shared ingest behind picture assembly.
+    inner: rust_video_h265::Ingest<D3d12Error, Gate>,
     /// Stored sequence sets by id.
     sps: [Option<Sps>; MAX_SPS],
     /// Stored picture sets by id.
     pps: [Option<Pps>; MAX_PPS],
-    /// Slices of the open picture.
-    pending: Vec<PendingSlice>,
-    /// Completed pictures in decode order.
-    pictures: u64,
-    /// Leading pictures of the open random access point undecodable.
-    rasl_undecodable: bool,
+    /// Mirrored store versions.
+    versions: (u64, u64),
 }
 
 impl Ingest {
     /// Empty ingest.
     pub(crate) fn new() -> Self {
         Self {
+            inner: rust_video_h265::Ingest::new(),
             sps: core::array::from_fn(|_| None),
             pps: core::array::from_fn(|_| None),
-            pending: Vec::new(),
-            pictures: 0,
-            rasl_undecodable: false,
+            versions: (0, 0),
         }
     }
 
@@ -1914,189 +959,246 @@ impl Ingest {
 
     /// Pictures completed by `data`; trailing slices complete the picture.
     pub(crate) fn ingest_packet(&mut self, data: &[u8]) -> Result<Vec<Picture>, D3d12Error> {
-        let mut pictures = Vec::new();
-        for nal in split_nals(data) {
-            self.ingest_nal(nal, &mut pictures)?;
-        }
-        if let Some(picture) = self.complete_picture()? {
-            pictures.push(picture);
-        }
-        Ok(pictures)
+        let pictures = self.inner.ingest_packet(data)?;
+        self.sync_mirrors()?;
+        Ok(pictures.iter().map(picture_from_shared).collect())
     }
 
     /// Open picture, if any slices arrived without a boundary.
     pub(crate) fn finish(&mut self) -> Result<Option<Picture>, D3d12Error> {
-        self.complete_picture()
+        let picture = self.inner.finish()?;
+        self.sync_mirrors()?;
+        Ok(picture.as_ref().map(picture_from_shared))
     }
 
-    /// One NAL unit into the ingest state.
-    fn ingest_nal(&mut self, nal: &[u8], pictures: &mut Vec<Picture>) -> Result<(), D3d12Error> {
-        let Some(header) = nal.get(..2) else {
+    /// Lean mirrors behind the shared stores.
+    fn sync_mirrors(&mut self) -> Result<(), D3d12Error> {
+        let versions = self.inner.versions();
+        if versions == self.versions {
             return Ok(());
-        };
-        if header[0] >> 7 != 0 {
-            return Err(D3d12Error::Parse(ParseReason::NalForbiddenBit));
         }
-        let nal_type = (header[0] >> 1) & 0x3F;
-        let layer_id = ((u16::from(header[0]) & 1) << 5) | (u16::from(header[1]) >> 3);
-        if layer_id != 0 {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::Multilayer));
+        self.sync_sets()?;
+        self.versions = versions;
+        Ok(())
+    }
+
+    /// Lean sets behind the shared stores.
+    fn sync_sets(&mut self) -> Result<(), D3d12Error> {
+        for (index, slot) in self.sps.iter_mut().enumerate() {
+            let id = u8::try_from(index).map_err(|_| {
+                D3d12Error::Parse(ParseReason::Range {
+                    syntax: "seq_parameter_set_id",
+                })
+            })?;
+            *slot = self.inner.sps(id).map(sps_from_shared);
         }
-        let temporal_plus1 = header[1] & 7;
-        if temporal_plus1 == 0 {
-            return Err(D3d12Error::Parse(ParseReason::NalTemporalId));
-        }
-        let temporal_id = temporal_plus1 - 1;
-        match nal_type {
-            0..=21 => self.ingest_vcl(nal, nal_type, temporal_id, pictures),
-            33 => self.ingest_sps(nal),
-            34 => self.ingest_pps(nal),
-            35..=37 => {
-                if let Some(picture) = self.complete_picture()? {
-                    pictures.push(picture);
+        for (index, slot) in self.pps.iter_mut().enumerate() {
+            let id = u8::try_from(index).map_err(|_| {
+                D3d12Error::Parse(ParseReason::Range {
+                    syntax: "pic_parameter_set_id",
+                })
+            })?;
+            *slot = match self.inner.pps(id) {
+                Some(shared) => {
+                    let sps = self
+                        .inner
+                        .sps(shared.sps_id)
+                        .ok_or(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps))?;
+                    Some(pps_from_shared(shared, sps)?)
                 }
-                Ok(())
-            }
-            _ => Ok(()),
+                None => None,
+            };
         }
-    }
-
-    /// Coded slice into the open picture.
-    fn ingest_vcl(
-        &mut self,
-        nal: &[u8],
-        nal_type: u8,
-        temporal_id: u8,
-        pictures: &mut Vec<Picture>,
-    ) -> Result<(), D3d12Error> {
-        if (10..=15).contains(&nal_type) {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::ReservedSliceType,
-            ));
-        }
-        let bytes = rbsp(nal);
-        let Some(body) = bytes.get(2..) else {
-            return Err(D3d12Error::Parse(ParseReason::SliceWithoutHeader));
-        };
-        let pps_id = peek_pps_id(body, nal_type)?;
-        let pps = self
-            .pps(pps_id)
-            .ok_or(D3d12Error::Parse(ParseReason::SliceCitesUnknownPps))?
-            .clone();
-        let sps = self
-            .sps(pps.seq_parameter_set_id)
-            .ok_or(D3d12Error::Parse(ParseReason::SliceCitesUnknownSps))?
-            .clone();
-        let mut reader = BitReader::new(body);
-        let prefix = parse_slice_prefix(&mut reader, nal_type)?;
-        let parsed = parse_slice_rest(&mut reader, prefix, nal_type, &sps, &pps)?;
-        if parsed.first && !self.pending.is_empty() {
-            if let Some(picture) = self.complete_picture()? {
-                pictures.push(picture);
-            }
-        }
-        self.pending.push(PendingSlice {
-            header: parsed,
-            nal: nal.to_vec(),
-            nal_type,
-            temporal_id,
-        });
         Ok(())
-    }
-
-    /// Sequence set into the store.
-    fn ingest_sps(&mut self, nal: &[u8]) -> Result<(), D3d12Error> {
-        let bytes = rbsp(nal);
-        let Some(body) = bytes.get(2..) else {
-            return Err(D3d12Error::Parse(ParseReason::SpsWithoutBody));
-        };
-        let sps = parse_sps(body)?;
-        let id = sps.seq_parameter_set_id;
-        self.sps[usize::from(id)] = Some(sps);
-        Ok(())
-    }
-
-    /// Picture set into the store.
-    fn ingest_pps(&mut self, nal: &[u8]) -> Result<(), D3d12Error> {
-        let bytes = rbsp(nal);
-        let Some(body) = bytes.get(2..) else {
-            return Err(D3d12Error::Parse(ParseReason::PpsWithoutBody));
-        };
-        let mut probe = BitReader::new(body);
-        probe.read_ue("pic_parameter_set_id")?;
-        let sps_id = probe.read_ue("seq_parameter_set_id")?;
-        let sps_id = u8::try_from(sps_id).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
-                syntax: "seq_parameter_set_id",
-            })
-        })?;
-        let sps = self
-            .sps(sps_id)
-            .ok_or(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps))?
-            .clone();
-        let pps = parse_pps(body, &sps)?;
-        let id = pps.pic_parameter_set_id;
-        self.pps[usize::from(id)] = Some(pps);
-        Ok(())
-    }
-
-    /// Open slices as one validated picture.
-    fn complete_picture(&mut self) -> Result<Option<Picture>, D3d12Error> {
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
-        let slices = core::mem::take(&mut self.pending);
-        let first = &slices[0];
-        if !first.header.first {
-            return Err(D3d12Error::Parse(ParseReason::PictureWithoutFirstSlice));
-        }
-        for slice in &slices {
-            if slice.header.pps_id != first.header.pps_id || slice.nal_type != first.nal_type {
-                return Err(D3d12Error::Parse(ParseReason::PictureSlicesDisagree));
-            }
-        }
-        let mut previous = 0;
-        for slice in slices.iter().skip(1) {
-            if slice.header.first || slice.header.address <= previous {
-                return Err(D3d12Error::Unsupported(
-                    UnsupportedReason::ArbitrarySliceOrder,
-                ));
-            }
-            previous = slice.header.address;
-        }
-        let nal_type = first.nal_type;
-        let picture = Picture {
-            idr: is_idr(nal_type),
-            irap: is_irap(nal_type),
-            rasl: is_rasl(nal_type),
-            slices,
-        };
-        if is_cra_bla(nal_type) {
-            self.rasl_undecodable = self.pictures == 0;
-        } else if is_idr(nal_type) {
-            self.rasl_undecodable = false;
-        }
-        self.pictures += 1;
-        if picture.rasl && self.rasl_undecodable {
-            return Ok(None);
-        }
-        Ok(Some(picture))
     }
 }
 
-/// Picture set id behind a slice body prefix.
-fn peek_pps_id(body: &[u8], nal_type: u8) -> Result<u8, D3d12Error> {
-    let mut reader = BitReader::new(body);
-    reader.read_bit("first_slice_segment_in_pic_flag")?;
-    if is_irap(nal_type) {
-        reader.read_bit("no_output_of_prior_pics_flag")?;
+#[cfg(test)]
+mod gate_tests {
+    use rust_video_h265::{HevcGate, Pps as SharedPps, Sps as SharedSps};
+
+    use super::{approx_shared_sps, Gate, Sps};
+    use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
+
+    /// Lean sequence set with 64x48 and Main blocks.
+    fn lean_sps() -> Sps {
+        Sps {
+            seq_parameter_set_id: 0,
+            width: 64,
+            height: 48,
+            crop: None,
+            log2_max_poc_lsb_minus4: 0,
+            max_dec_pic_buffering_minus1: 0,
+            max_num_reorder_pics: 0,
+            rps: Vec::new(),
+            log2_min_cb_minus3: 0,
+            log2_diff_max_min_cb: 3,
+            log2_min_tb_minus2: 0,
+            log2_diff_max_min_tb: 0,
+            max_depth_inter: 1,
+            max_depth_intra: 1,
+            flags: 0,
+        }
     }
-    let id = reader.read_ue("slice_pic_parameter_set_id")?;
-    u8::try_from(id).map_err(|_| {
-        D3d12Error::Parse(ParseReason::Range {
-            syntax: "slice_pic_parameter_set_id",
-        })
-    })
+
+    /// Shared sequence set with Main profile and one sublayer.
+    fn sps() -> SharedSps {
+        approx_shared_sps(&lean_sps())
+    }
+
+    #[test]
+    fn gate_accepts_test_sets() {
+        let sps = sps();
+        assert!(Gate::check_sps(&sps).is_ok());
+    }
+
+    #[test]
+    fn gate_refuses_pending_constructs() {
+        let mut set = sps();
+        set.max_sub_layers = 2;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(UnsupportedReason::Sublayers))
+        ));
+        let mut set = sps();
+        set.flags |= rust_video_h265::SPS_SCALING;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::ScalingListsPending
+            ))
+        ));
+        let mut set = sps();
+        set.flags |= rust_video_h265::SPS_PCM;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(UnsupportedReason::PcmPending))
+        ));
+        let mut set = sps();
+        set.flags |= rust_video_h265::SPS_LONG_TERM;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::LongTermRefsPending
+            ))
+        ));
+        let mut set = sps();
+        set.ptl.profile_idc = 2;
+        set.ptl.compat = 0;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::ProfileOutsideMain
+            ))
+        ));
+        let mut set = sps();
+        set.ptl.level_idc = 121;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+        ));
+        let mut set = sps();
+        set.sps_extension_present = true;
+        assert!(matches!(
+            Gate::check_sps(&set),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::SpsExtensionPending
+            ))
+        ));
+    }
+
+    #[test]
+    fn gate_refuses_picture_pending_constructs() {
+        let sps = sps();
+        let mut pps = SharedPps {
+            id: 0,
+            sps_id: 0,
+            flags: 0,
+            num_extra_slice_header_bits: 0,
+            num_ref_l0: 0,
+            num_ref_l1: 0,
+            pic_init_qp_minus26: 0,
+            diff_cu_qp_delta_depth: 0,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            num_tile_columns: 1,
+            num_tile_rows: 1,
+            column_width: Vec::new(),
+            row_height: Vec::new(),
+            beta_offset_div2: 0,
+            tc_offset_div2: 0,
+            scaling: rust_video_h265::ScalingLists::default(),
+            log2_parallel_merge_minus2: 0,
+            deblock_control_present: false,
+            pps_extension_present: false,
+            pps_extension_flags: [false; 4],
+        };
+        assert!(Gate::check_pps(&pps, Some(&sps)).is_ok());
+        pps.sps_id = 1;
+        assert!(matches!(
+            Gate::check_pps(&pps, Some(&sps)),
+            Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps))
+        ));
+        pps.sps_id = 0;
+        pps.diff_cu_qp_delta_depth = 32;
+        assert!(matches!(
+            Gate::check_pps(&pps, Some(&sps)),
+            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+        ));
+        pps.diff_cu_qp_delta_depth = 0;
+        pps.num_tile_columns = 20;
+        assert!(matches!(
+            Gate::check_pps(&pps, Some(&sps)),
+            Err(D3d12Error::Unsupported(UnsupportedReason::TileGridPending))
+        ));
+        pps.num_tile_columns = 1;
+        pps.log2_parallel_merge_minus2 = 5;
+        assert!(matches!(
+            Gate::check_pps(&pps, Some(&sps)),
+            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+        ));
+        pps.log2_parallel_merge_minus2 = 0;
+        pps.pps_extension_present = true;
+        assert!(matches!(
+            Gate::check_pps(&pps, Some(&sps)),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::PpsExtensionPending
+            ))
+        ));
+    }
+
+    #[test]
+    fn gate_orders_slices_behind_first() {
+        assert!(Gate::check_slice_order(&[0, 4], &[true, false]).is_ok());
+        assert!(matches!(
+            Gate::check_slice_order(&[4], &[false]),
+            Err(D3d12Error::Parse(ParseReason::PictureWithoutFirstSlice))
+        ));
+        assert!(matches!(
+            Gate::check_slice_order(&[0, 0], &[true, false]),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::ArbitrarySliceOrder
+            ))
+        ));
+    }
+
+    #[test]
+    fn gate_classifies_reserved_slices() {
+        assert!(matches!(
+            Gate::classify_nal(1, 0),
+            Ok(rust_video_h265::NalAction::Vcl)
+        ));
+        assert!(matches!(
+            Gate::classify_nal(12, 0),
+            Err(D3d12Error::Unsupported(
+                UnsupportedReason::ReservedSliceType
+            ))
+        ));
+        assert!(matches!(
+            Gate::classify_nal(1, 1),
+            Err(D3d12Error::Unsupported(UnsupportedReason::Multilayer))
+        ));
+    }
 }
 
 /// Synthetic inputs behind submission tests.
@@ -2383,12 +1485,11 @@ mod tests {
         b_body, idr_body, nal, p_body, p_body_table, packet, pps_body, pps_body_merge, sps_body,
         sps_body_rps,
     };
-    use super::skip_vui;
-    use super::{parse_pps, parse_sps, rbsp, split_nals, Ingest, SliceType};
-    use crate::bits::BitReader;
+    use super::{parse_pps, parse_sps, split_nals, Ingest, SliceType};
+    use rust_video_h265::rbsp;
 
     #[test]
-    fn skip_vui_skips_hrd_payload() {
+    fn vui_parses_timing_and_hrd() {
         let mut writer = super::fixtures::BitWriter::new();
         for _ in 0..8 {
             writer.bit(false);
@@ -2413,11 +1514,32 @@ mod tests {
         writer.ue(0);
         writer.bit(false);
         writer.bit(false);
-        let body = rbsp(&writer.finish());
-        let mut hrd = BitReader::new(&body);
-        skip_vui(&mut hrd).expect("hrd skipped");
-        let mut bare = BitReader::new(&[0x00, 0x10]);
-        skip_vui(&mut bare).expect("vui without timing");
+        let body = rbsp(&writer.finish()).into_owned();
+        let mut reader = rust_video_h265::BitReader::<crate::error::D3d12Error>::new(&body);
+        let vui = rust_video_h265::parse_vui(&mut reader, 1).expect("hrd parsed");
+        assert!(vui.timing.present);
+        assert_eq!(
+            (
+                vui.timing.num_units_in_tick,
+                vui.timing.time_scale,
+                vui.timing.proportional
+            ),
+            (1, 1, false)
+        );
+        let hrd = vui.hrd.expect("hrd parameters");
+        assert!(hrd.streams.nal);
+        assert!(!hrd.streams.vcl);
+        assert!(!hrd.sub_pic);
+        assert_eq!(hrd.fixed_rate, vec![true]);
+        assert_eq!(hrd.cpb_count_minus1, vec![0]);
+        assert_eq!(hrd.nal_layers[0].bitrate_minus1, vec![0]);
+        assert_eq!(hrd.nal_layers[0].cbr, vec![false]);
+        assert!(hrd.vcl_layers[0].bitrate_minus1.is_empty(), "no vcl data");
+        assert!(vui.restriction.is_none());
+        let mut bare = rust_video_h265::BitReader::<crate::error::D3d12Error>::new(&[0x00, 0x10]);
+        let bare = rust_video_h265::parse_vui(&mut bare, 1).expect("vui without timing");
+        assert!(!bare.timing.present);
+        assert!(bare.hrd.is_none());
     }
 
     #[test]
