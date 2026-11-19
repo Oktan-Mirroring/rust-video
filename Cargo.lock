@@ -349,12 +349,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-video-core"
+version = "0.1.0"
+
+[[package]]
 name = "rust-video-d3d11"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "rust-video-av1",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",
@@ -371,6 +376,7 @@ dependencies = [
  "bytes",
  "rust-video-av1",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",
@@ -414,6 +420,7 @@ dependencies = [
  "ndk",
  "ndk-sys",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-harness",
  "thiserror",
 ]
@@ -437,6 +444,7 @@ dependencies = [
  "log",
  "rust-video-av1",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",
@@ -462,6 +470,7 @@ dependencies = [
  "rust-video",
  "rust-video-av1",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-h264",
  "rust-video-h265",
  "rust-video-harness",

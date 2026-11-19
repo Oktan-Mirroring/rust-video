@@ -1,0 +1,10 @@
+[package]
+name = "rust-video-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared backend mechanics behind the video tiers"
+
+[lints]
+workspace = true
