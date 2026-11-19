@@ -1,11 +1,11 @@
 //! D3D11 hardware encode over `MediaFoundation` encoder MFTs.
 
-use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
+use crate::encode::{Session, Vp9Tuning};
 use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
-use crate::mf::{Session, Vp9Tuning};
 use crate::scale::ScaledSurface;
+use crate::texture::GpuSurface;
 
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
@@ -364,7 +364,7 @@ mod tests {
         let caps = encoder.caps();
         assert_eq!(caps.share().is_some(), caps.encode_import());
         assert!(!caps.decode_export());
-        let mut decoder = crate::decoder::H264Decoder::open(&device);
+        let mut decoder = crate::H264Decoder::open(&device);
         let frame = rust_video_harness::Synth::noise(320, 240, 0);
         let mut surfaces = Vec::new();
         for packet in encoder.encode(&frame).expect("encode runs") {

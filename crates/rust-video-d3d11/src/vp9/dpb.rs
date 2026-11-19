@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::dpb::Output;
-use crate::dxva::{
+use super::params::{
     PicEntryVpx, PicParamsVp9, SliceVpxShort, VP9_CONTROL_DELTA_ENABLED, VP9_CONTROL_DELTA_UPDATE,
     VP9_FORMAT_CONTEXT_SHIFT, VP9_FORMAT_ERROR_RESILIENT, VP9_FORMAT_FRAME_PARALLEL,
     VP9_FORMAT_FRAME_TYPE, VP9_FORMAT_HIGH_PRECISION_MV, VP9_FORMAT_INTRA_ONLY,
@@ -11,6 +10,8 @@ use crate::dxva::{
     VP9_FORMAT_SUBSAMPLING_X, VP9_FORMAT_SUBSAMPLING_Y, VP9_SEG_ABS_DELTA, VP9_SEG_ENABLED,
     VP9_SEG_TEMPORAL_UPDATE, VP9_SEG_UPDATE_MAP,
 };
+use super::picture::SubmittedVp9;
+use crate::dpb::Output;
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::pins::SlotPins;
 use crate::vp9::{Frame, FrameHeader, FrameType, NUM_REF_FRAMES, REFS_PER_FRAME};
@@ -327,19 +328,6 @@ fn fill_segmentation(params: &mut PicParamsVp9, header: &FrameHeader) {
         }
         params.segmentation.feature_mask[segment] = mask;
     }
-}
-
-/// Driver submission for one decoded frame.
-#[derive(Debug)]
-pub(crate) struct SubmittedVp9 {
-    /// Picture parameters buffer.
-    pub(crate) params: PicParamsVp9,
-    /// Slice control buffer, one entry per tile.
-    pub(crate) slices: Vec<SliceVpxShort>,
-    /// Coded frame bytes behind the slice offsets.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output surface view.
-    pub(crate) slot: u8,
 }
 
 /// Submission plus display-order outputs.

@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::dpb::{Decoded, Dpb};
-use crate::decoder::{emit_surface, Active, GpuSurface};
+use crate::decoder::{emit_surface, Active};
 use crate::device::D3d11Device;
 use crate::dpb::Output;
 use crate::error::{D3d11Error, UnsupportedReason};
@@ -13,6 +13,7 @@ use crate::h264::{Ingest, Picture};
 use crate::overlap::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
 use crate::readback::Readback;
 use crate::session::Session;
+use crate::texture::GpuSurface;
 
 use rust_video_caps::delivery::TrySendError;
 use rust_video_caps::packet::Packet;

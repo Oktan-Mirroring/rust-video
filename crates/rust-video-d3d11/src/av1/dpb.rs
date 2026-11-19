@@ -2,12 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::av1::{
-    Frame, FrameHeader, FrameType, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES, REFS_PER_FRAME,
-    SEG_LEVELS,
-};
-use crate::dpb::Output;
-use crate::dxva::{
+use super::params::{
     PicEntryAv1, PicParamsAv1, TileAv1, AV1_CDEF_BITS_SHIFT, AV1_CDEF_DAMPING_SHIFT,
     AV1_CDEF_SECONDARY_SHIFT, AV1_CODING_CDEF, AV1_CODING_DUAL_FILTER, AV1_CODING_FILM_GRAIN,
     AV1_CODING_FILTER_INTRA, AV1_CODING_HIGH_PRECISION_MV, AV1_CODING_INTEGER_MV,
@@ -25,6 +20,12 @@ use crate::dxva::{
     AV1_MOTION_INVALID, AV1_MOTION_TYPE_SHIFT, AV1_Q_DELTA_PRESENT, AV1_Q_DELTA_RES_SHIFT,
     AV1_SEG_ENABLED, AV1_SEG_TEMPORAL_UPDATE, AV1_SEG_UPDATE_DATA, AV1_SEG_UPDATE_MAP,
 };
+use super::picture::SubmittedAv1;
+use crate::av1::{
+    Frame, FrameHeader, FrameType, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES, REFS_PER_FRAME,
+    SEG_LEVELS,
+};
+use crate::dpb::Output;
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::pins::SlotPins;
 
@@ -538,19 +539,6 @@ fn fill_film_grain(params: &mut PicParamsAv1, seq: &SequenceHeader, header: &Fra
     params.film_grain.cr_luma_mult = grain.cr_luma_mult;
     params.film_grain.cb_offset = grain.cb_offset.cast_signed();
     params.film_grain.cr_offset = grain.cr_offset.cast_signed();
-}
-
-/// Driver submission for one decoded frame.
-#[derive(Debug)]
-pub(crate) struct SubmittedAv1 {
-    /// Picture parameters buffer.
-    pub(crate) params: PicParamsAv1,
-    /// Tile control buffer.
-    pub(crate) tiles: Vec<TileAv1>,
-    /// Concatenated tile payloads, padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output surface view.
-    pub(crate) slot: u8,
 }
 
 /// Submission plus display-order outputs.

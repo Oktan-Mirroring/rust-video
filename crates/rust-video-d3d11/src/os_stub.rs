@@ -1,48 +1,14 @@
-//! D3D11 device view without hardware: profiles, level, and name.
+//! Off-target OS state: portable handles carry no platform resources.
 
-use crate::guid::{Codec, Profile};
-
-use rust_video_caps::traits::Device;
-
-/// D3D11 device with enumerated decoder profiles.
-pub struct D3d11Device {
-    /// Matched decoder profiles.
-    profiles: Vec<Profile>,
-    /// Negotiated feature level.
-    level: i32,
-    /// Adapter description.
-    name: String,
-}
-
-impl D3d11Device {
-    /// True when the adapter exposes a `codec` profile.
-    #[must_use]
-    pub fn supports(&self, codec: Codec) -> bool {
-        self.profiles.iter().any(|profile| profile.codec() == codec)
-    }
-
-    /// Matched decoder profiles on the adapter.
-    #[must_use]
-    pub fn profiles(&self) -> &[Profile] {
-        &self.profiles
-    }
-
-    /// Negotiated feature level.
-    #[must_use]
-    pub fn feature_level(&self) -> i32 {
-        self.level
-    }
-}
-
-impl Device for D3d11Device {
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
+/// Device OS state off-target: no resources.
+///
+/// The device type keeps its shape on every target; only Windows
+/// constructs it.
+pub(crate) type DeviceOs = ();
 
 #[cfg(test)]
 mod tests {
-    use super::D3d11Device;
+    use crate::device::D3d11Device;
     use crate::guid::{Codec, Profile};
 
     use rust_video_caps::traits::Device;
@@ -53,6 +19,7 @@ mod tests {
             profiles,
             level,
             name: name.to_owned(),
+            os: (),
         }
     }
 

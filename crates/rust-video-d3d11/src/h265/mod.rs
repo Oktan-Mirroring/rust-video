@@ -3,12 +3,14 @@
 mod decoder;
 mod dpb;
 mod frontend;
+mod params;
+mod picture;
 
 pub use decoder::HevcDecoder;
-pub(crate) use dpb::SubmittedHevc;
 #[cfg(test)]
 pub(crate) use frontend::{
     ConstraintFlags, PendingSlice, ProfileTierLevel, RpsBits, ScalingLists, SliceHeader, SliceType,
     SourceFlags, SPS_SAO, SPS_SCALING, SPS_TEMPORAL_MVP,
 };
 pub(crate) use frontend::{Ingest, LtSpec, Picture, Pps, ShortTermRps, Sps};
+pub(crate) use picture::SubmittedHevc;

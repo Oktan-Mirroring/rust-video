@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use crate::dpb::Output;
-use crate::dxva::{
+use super::params::{
     PicEntryH264, PicParamsH264, QmatrixH264, SliceLongH264, BITS_CHROMA_420,
     BITS_CONSTRAINED_INTRA, BITS_FRAME_MBS_ONLY, BITS_INTRA_PIC, BITS_MBS_CONSECUTIVE,
     BITS_MIN_LUMA_BIPRED_8X8, BITS_REF_PIC, BITS_TRANSFORM_8X8, BITS_WEIGHTED_BIPRED_SHIFT,
     BITS_WEIGHTED_PRED,
 };
+use super::picture::SubmittedPicture;
+use crate::dpb::Output;
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason, UnsupportedReason};
 use crate::h264::{
     Marking, Mmco, Picture, PocType, Pps, RefMod, SlicePoc, SliceType, Sps, Weights,
@@ -975,20 +976,6 @@ fn slot_u8(slot: usize) -> Result<u8, D3d11Error> {
     u8::try_from(slot).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "slot" }))
 }
 
-/// Driver submission for one decoded picture.
-#[derive(Debug)]
-pub(crate) struct SubmittedPicture {
-    /// Picture parameters buffer.
-    pub(crate) params: PicParamsH264,
-    /// Quantization matrix buffer.
-    pub(crate) qmatrix: QmatrixH264,
-    /// Slice control buffer.
-    pub(crate) slices: Vec<SliceLongH264>,
-    /// Concatenated slices with start codes, padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output surface slot.
-    pub(crate) slot: u8,
-}
 /// Submission plus display-order outputs.
 #[derive(Debug)]
 pub(crate) struct Decoded {
@@ -1002,7 +989,7 @@ pub(crate) struct Decoded {
 mod tests {
     use super::Dpb;
     use crate::dpb::Output;
-    use crate::dxva::{
+    use crate::h264::params::{
         BITS_CHROMA_420, BITS_FRAME_MBS_ONLY, BITS_MBS_CONSECUTIVE, BITS_MIN_LUMA_BIPRED_8X8,
         BITS_REF_PIC,
     };

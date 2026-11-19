@@ -3,9 +3,10 @@
 mod decoder;
 mod dpb;
 mod frontend;
+mod params;
+mod picture;
 
 pub use decoder::Av1Decoder;
-pub(crate) use dpb::SubmittedAv1;
 #[cfg(test)]
 pub(crate) use frontend::{
     FilmGrain, GlobalMotion, TileData, FG_APPLY, FG_OVERLAP, FH_SHOW_EXISTING, FH_SHOW_FRAME,
@@ -15,3 +16,4 @@ pub(crate) use frontend::{
     Frame, FrameHeader, FrameType, Ingest, SequenceHeader, MAX_SEGMENTS, NUM_REF_FRAMES,
     REFS_PER_FRAME, SEG_LEVELS,
 };
+pub(crate) use picture::SubmittedAv1;

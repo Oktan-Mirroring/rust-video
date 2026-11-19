@@ -2,13 +2,14 @@
 //!
 //! Export probe over COM/D3D11: live descriptors, checked handles.
 
-use crate::decoder::GpuSurface;
-use crate::decoder::H264Decoder;
 use crate::device::D3d11Device;
 use crate::encoder::D3d11Encoder;
 use crate::error::{D3d11Error, UnsupportedReason};
 use crate::guid::Codec;
 use crate::scale::{ScaledSurface, Scaler};
+use crate::texture::GpuSurface;
+// Crate root re-exports the codec decoder; the module path differs.
+use crate::H264Decoder;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
@@ -225,7 +226,7 @@ mod tests {
     ) -> Option<super::Transcoder<'_>> {
         let encoder = crate::encoder::D3d11Encoder::open(device, crate::guid::Codec::H264).ok()?;
         Some(super::Transcoder {
-            decoder: Box::new(crate::decoder::H264Decoder::open(device)),
+            decoder: Box::new(crate::H264Decoder::open(device)),
             encoder,
             caps,
             scale: Scale::passthrough(),

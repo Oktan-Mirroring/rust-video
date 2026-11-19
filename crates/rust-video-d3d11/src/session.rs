@@ -23,11 +23,11 @@ use windows::Win32::Media::DirectShow::DXVA_NoEncrypt;
 use crate::av1::SubmittedAv1;
 use crate::device::D3d11Device;
 use crate::error::{BrokenReferenceReason, D3d11Error, SkipReason, UnsupportedReason};
-use crate::frame::FrameExport;
 use crate::guid::Codec;
 use crate::h264::Crop;
 use crate::h264::SubmittedPicture;
 use crate::h265::SubmittedHevc;
+use crate::seam::FrameExport;
 use crate::submit::flag_word;
 use crate::submit::{CopySlot, SubmitLock, SurfaceFence};
 use crate::vp9::SubmittedVp9;
@@ -134,10 +134,10 @@ impl Session {
         height: u32,
     ) -> Result<Self, D3d11Error> {
         let guid = match codec {
-            Codec::H264 => crate::device::h264_guid(),
-            Codec::Hevc => crate::device::hevc_guid(),
-            Codec::Av1 => crate::device::av1_guid(),
-            Codec::Vp9 => crate::device::vp9_guid(),
+            Codec::H264 => crate::device_os::h264_guid(),
+            Codec::Hevc => crate::device_os::hevc_guid(),
+            Codec::Av1 => crate::device_os::av1_guid(),
+            Codec::Vp9 => crate::device_os::vp9_guid(),
             _ => {
                 return Err(D3d11Error::Unsupported(
                     UnsupportedReason::NoSessionForCodec { codec },
@@ -739,7 +739,7 @@ fn slice_slice<T>(values: &[T]) -> &[u8] {
 }
 
 /// Short slice controls with cleared trailing pad.
-fn short_bytes(slices: &[crate::dxva::SliceLongH264]) -> Vec<u8> {
+fn short_bytes(slices: &[crate::h264::SliceLongH264]) -> Vec<u8> {
     let mut out = Vec::with_capacity(slices.len() * 12);
     for slice in slices {
         out.extend_from_slice(&slice.location.to_le_bytes());

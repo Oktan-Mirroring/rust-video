@@ -2,8 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::dpb::Output;
-use crate::dxva::{
+use super::params::{
     PicEntryHevc, PicParamsHevc, QmatrixHevc, SliceShortHevc, HEVC_FORMAT_CHROMA_420,
     HEVC_FORMAT_POC_SHIFT, HEVC_PIC_CHROMA_OFFSETS, HEVC_PIC_CONSTRAINED_INTRA,
     HEVC_PIC_CU_QP_DELTA, HEVC_PIC_DEBLOCK_DISABLED, HEVC_PIC_DEBLOCK_OVERRIDE, HEVC_PIC_IDR,
@@ -16,6 +15,8 @@ use crate::dxva::{
     HEVC_TOOL_PCM_LOOP_DISABLED, HEVC_TOOL_PCM_LUMA_SHIFT, HEVC_TOOL_PCM_MIN_SHIFT, HEVC_TOOL_SAO,
     HEVC_TOOL_SCALING, HEVC_TOOL_SIGN_HIDING, HEVC_TOOL_SMOOTHING, HEVC_TOOL_TEMPORAL_MVP,
 };
+use super::picture::SubmittedHevc;
+use crate::dpb::Output;
 use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::h265::{LtSpec, Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
@@ -765,21 +766,6 @@ fn slot_u8(slot: usize) -> Result<u8, D3d11Error> {
     u8::try_from(slot).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "slot" }))
 }
 
-/// Driver submission for one decoded picture.
-#[derive(Debug)]
-pub(crate) struct SubmittedHevc {
-    /// Picture parameters buffer.
-    pub(crate) params: PicParamsHevc,
-    /// Quantization matrix buffer, absent without scaling lists.
-    pub(crate) qmatrix: Option<QmatrixHevc>,
-    /// Slice control buffer.
-    pub(crate) slices: Vec<SliceShortHevc>,
-    /// Concatenated slices with start codes, padded to 128 bytes.
-    pub(crate) bitstream: Vec<u8>,
-    /// Output surface slot.
-    pub(crate) slot: u8,
-}
-
 /// Submission plus display-order outputs.
 #[derive(Debug)]
 pub(crate) struct HevcDecoded {
@@ -795,7 +781,7 @@ pub(crate) struct HevcDecoded {
 mod tests {
     use super::{lt_poc, HevcDpb};
     use crate::dpb::Output;
-    use crate::dxva::{HEVC_PIC_IDR, HEVC_PIC_INTRA, HEVC_PIC_IRAP};
+    use crate::h265::params::{HEVC_PIC_IDR, HEVC_PIC_INTRA, HEVC_PIC_IRAP};
     use crate::h265::{
         ConstraintFlags, LtSpec, PendingSlice, Picture, Pps, ProfileTierLevel, RpsBits,
         ScalingLists, ShortTermRps, SliceHeader, SliceType, SourceFlags, Sps, SPS_SAO,

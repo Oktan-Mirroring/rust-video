@@ -9,11 +9,11 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
-use crate::decoder::GpuSurface;
 use crate::device::D3d11Device;
 use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
 use crate::submit::flag_word;
 use crate::submit::SubmitLock;
+use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
 #[cfg(test)]
@@ -352,7 +352,7 @@ mod tests {
         let Ok(device) = crate::device::D3d11Device::open() else {
             return;
         };
-        let mut decoder = crate::decoder::H264Decoder::open(&device);
+        let mut decoder = crate::H264Decoder::open(&device);
         let mut surfaces = Vec::new();
         for raw in super::H264Synth::annex_b_packets()
             .into_iter()

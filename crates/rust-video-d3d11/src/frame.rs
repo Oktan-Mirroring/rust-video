@@ -4,11 +4,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame};
 use rust_video_caps::traits::Lease;
 
-/// Shared-texture export behind one decoded frame.
-pub(crate) trait FrameExport: Send + Sync {
-    /// Platform export handle for the frame.
-    fn export(&self) -> GpuExport;
-}
+use crate::seam::FrameExport;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
 pub struct D3d11Frame {
