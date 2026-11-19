@@ -21,6 +21,7 @@ use crate::seam::{ContextId, SurfaceId, VaSeam};
 use crate::sys;
 
 use rust_video_caps::delivery::SubmitStats;
+use rust_video_core::micros;
 
 /// VA-API decode context over a surface pool.
 ///
@@ -683,7 +684,7 @@ impl StatsInner {
     pub(crate) fn note_submit(&self, target: SurfaceId, started: Instant) {
         let ended = Instant::now();
         self.submit_us.fetch_add(
-            Self::micros(ended.saturating_duration_since(started)),
+            micros(ended.saturating_duration_since(started)),
             Ordering::Relaxed,
         );
         self.lock_phases().submits.insert(target, ended);
@@ -698,10 +699,8 @@ impl StatsInner {
         copy: Duration,
     ) {
         self.frames.fetch_add(1, Ordering::Relaxed);
-        self.wait_us
-            .fetch_add(Self::micros(wait), Ordering::Relaxed);
-        self.copy_us
-            .fetch_add(Self::micros(copy), Ordering::Relaxed);
+        self.wait_us.fetch_add(micros(wait), Ordering::Relaxed);
+        self.copy_us.fetch_add(micros(copy), Ordering::Relaxed);
         if ready {
             self.polled_ready.fetch_add(1, Ordering::Relaxed);
         }
@@ -709,7 +708,7 @@ impl StatsInner {
         let copy_end = Instant::now();
         if let Some(submitted) = phases.submits.get(&surface).copied() {
             self.latency_us.fetch_add(
-                Self::micros(copy_end.saturating_duration_since(submitted)),
+                micros(copy_end.saturating_duration_since(submitted)),
                 Ordering::Relaxed,
             );
             if !ready && phases.last_copy_end.is_some_and(|end| end > submitted) {
@@ -717,11 +716,6 @@ impl StatsInner {
             }
         }
         phases.last_copy_end = Some(copy_end);
-    }
-
-    /// Whole microseconds, saturating.
-    fn micros(duration: Duration) -> u64 {
-        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
     }
 
     /// Submit stamps plus overlap proof, poison-tolerant.

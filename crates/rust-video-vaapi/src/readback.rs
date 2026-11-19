@@ -20,6 +20,8 @@ use crate::ffi;
 use crate::seam::SurfaceId;
 use crate::sys;
 
+use rust_video_core::micros;
+
 /// Copied transfer answer route.
 enum Complete {
     /// Insert under the key for a later collect.
@@ -183,7 +185,7 @@ impl Readback {
                     let done = Done {
                         bytes,
                         release: Some(job.mapped.release),
-                        copy_us: Reader::micros(started.elapsed()),
+                        copy_us: micros(started.elapsed()),
                         surface: job.mapped.surface,
                         ready: job.mapped.ready,
                         waited: job.mapped.waited,
@@ -347,7 +349,7 @@ impl Readback {
     fn finish(&self, done: Done) -> Result<Vec<u8>, VaApiError> {
         let mut unmap_us = 0;
         if let Some(release) = done.release {
-            unmap_us = Reader::micros(self.local.release(release));
+            unmap_us = micros(self.local.release(release));
         }
         self.local.gauges.note_read(
             done.surface,
@@ -434,11 +436,6 @@ impl Reader {
         sys::status(unsafe { sys::vaSyncSurface(display, surface) })
     }
 
-    /// Whole microseconds, saturating.
-    fn micros(duration: Duration) -> u64 {
-        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-    }
-
     /// Synced mapping of `surface` cropped to `crop`.
     fn prepare(
         &self,
@@ -483,7 +480,7 @@ impl Reader {
             surface,
             ready,
             waited,
-            map_us: Self::micros(started.elapsed()),
+            map_us: micros(started.elapsed()),
             release: Release {
                 buf: image.buf,
                 image_id: image.image_id,
@@ -523,7 +520,7 @@ impl Reader {
         Done {
             bytes,
             release: Some(mapped.release),
-            copy_us: Self::micros(started.elapsed()),
+            copy_us: micros(started.elapsed()),
             surface: mapped.surface,
             ready: mapped.ready,
             waited: mapped.waited,
