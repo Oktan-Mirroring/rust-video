@@ -111,6 +111,22 @@ impl GpuSurface {
         &self.resource
     }
 
+    /// Surface over a caller-owned shader target at `size`.
+    ///
+    /// The target leaves no pool slot, fence, or share behind: it reads
+    /// back through the encoder only, never through pool accounting.
+    #[must_use]
+    pub fn wrap(resource: ID3D12Resource, size: PictureSize) -> Self {
+        Self {
+            identity: GpuFrame::new(size, PixelFormat::Nv12, 0),
+            resource,
+            layout: SurfaceLayout::new(size, size, (0, 0), 0),
+            pin: None,
+            wait: None,
+            shared: None,
+        }
+    }
+
     /// Surface completion through the fence event.
     ///
     /// # Errors

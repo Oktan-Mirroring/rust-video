@@ -397,10 +397,7 @@ impl H264Encoder {
     ///
     /// Returns `Err` when the frame has no device export, misses the
     /// session size, or the backend refuses the picture.
-    pub(crate) fn encode_export(
-        &mut self,
-        frame: &VulkanFrame,
-    ) -> Result<Vec<Packet>, VulkanError> {
+    pub fn encode_export(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
         Ok(vec![self.engine.encode_export(frame)?])
     }
 }
@@ -493,10 +490,7 @@ impl H265Encoder {
     ///
     /// Returns `Err` when the frame has no device export, misses the
     /// session size, or the backend refuses the picture.
-    pub(crate) fn encode_export(
-        &mut self,
-        frame: &VulkanFrame,
-    ) -> Result<Vec<Packet>, VulkanError> {
+    pub fn encode_export(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
         Ok(vec![self.engine.encode_export(frame)?])
     }
 }

@@ -78,6 +78,22 @@ impl<'a> D3d12Encoder<'a> {
 
     /// Packets coded from `surface`, possibly none.
     ///
+    /// The caller completes its GPU work on the surface first: the copy
+    /// waits on no foreign queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the surface misses the session extent or the
+    /// backend cannot encode it.
+    pub fn encode_surface(
+        &mut self,
+        surface: &crate::texture::GpuSurface,
+    ) -> Result<Vec<Packet>, D3d12Error> {
+        self.encode_texture(surface)
+    }
+
+    /// Packets coded from `surface`, possibly none.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when the surface misses the session extent or the
