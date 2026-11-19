@@ -3,7 +3,7 @@
 use crate::Fault;
 
 /// Bit reader over frame bytes.
-pub(crate) struct BitReader<'a> {
+pub struct BitReader<'a> {
     /// Frame bytes under read.
     data: &'a [u8],
     /// Bit offset of the next read.
@@ -12,17 +12,23 @@ pub(crate) struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     /// Reader over `data`.
-    pub(crate) fn new(data: &'a [u8]) -> Self {
+    #[must_use]
+    pub fn new(data: &'a [u8]) -> Self {
         Self { data, bit: 0 }
     }
 
     /// Bits consumed so far.
-    pub(crate) fn position(&self) -> usize {
+    #[must_use]
+    pub fn position(&self) -> usize {
         self.bit
     }
 
     /// Next `count` bits as an unsigned value.
-    pub(crate) fn read_bits<E: From<Fault>>(
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `count` exceeds 32 or fewer bits remain.
+    pub fn read_bits<E: From<Fault>>(
         &mut self,
         count: u32,
         syntax: &'static str,
@@ -38,7 +44,11 @@ impl<'a> BitReader<'a> {
     }
 
     /// Single bit.
-    pub(crate) fn read_bit<E: From<Fault>>(&mut self, syntax: &'static str) -> Result<bool, E> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no bits remain.
+    pub fn read_bit<E: From<Fault>>(&mut self, syntax: &'static str) -> Result<bool, E> {
         let total = self.data.len() * 8;
         if self.bit >= total {
             return Err(E::from(Fault::Truncated { syntax }));
