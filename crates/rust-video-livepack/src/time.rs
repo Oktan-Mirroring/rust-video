@@ -175,7 +175,7 @@ impl ClockTracker {
     /// Extended timestamp for a raw 33-bit observation.
     ///
     /// A backward jump past half the wrap interval counts as a wrap;
-    /// smaller backward steps are treated as reorder, not time travel.
+    /// smaller backward steps count as reorder.
     pub fn observe(&mut self, raw: u64) -> u64 {
         let raw = raw & (STC_WRAP - 1);
         if let Some(last) = self.last {

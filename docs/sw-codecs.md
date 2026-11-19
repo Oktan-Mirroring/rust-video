@@ -104,7 +104,7 @@ of 1080p, ~347 fps at 1 thread, `cmp`-clean against the oracle
 including film grain. The wrapper keeps dav1d's default frame
 pipelining, which is where the 4-thread scaling comes from.
 
-Two traps were found and are encoded in the code. First, the true
+Two traps are encoded in the code. First, the true
 native `av1` decoder is hardware-only: opening it succeeds, then
 every decode fails with "Your platform doesn't support hardware
 accelerated AV1 decoding" / "Failed to get pixel format". There is
@@ -116,9 +116,7 @@ fails closed when the build lacks it.
 
 ## System vs vendored, relitigated across all codecs
 
-The H.264 verdict picked the system link; the question was whether
-five codecs change the answer. They don't. A full-set minimal build
-from the 7.1.5 tarball:
+A full-set minimal build from the 7.1.5 tarball:
 
 ```bash
 ./configure --disable-everything --disable-programs --disable-doc \
@@ -130,10 +128,9 @@ make -j4   # 30 s clean, 310 translation units
 
 Out: 6.2 MB `libavcodec.a` + 1.4 MB `libavutil.a`, and configure's
 own summary line reads "License: LGPL version 2.1 or later" with no
-`--enable-gpl`. Honest cost, but it still buys nothing over the
-system link on Unix: same sys layer either way, plus re-vendoring on
+`--enable-gpl`. Same sys layer either way, plus re-vendoring on
 every security update and a `configure` step alien to the cargo
-build. Rejected on maintenance, not on build minutes. The one place
+build. Rejected on maintenance. The one place
 vendoring stays live is Windows, where there is no system library;
 see below.
 
@@ -146,7 +143,7 @@ holding `avcodec.lib`/`avutil.lib`, panicking with the install
 command when it is unset. Verified: targeting
 `x86_64-pc-windows-msvc` without the variable fails with that
 message, and with it set `cargo check` for the `ffmpeg` feature is
-green (hand sys, no bindgen, nothing host-specific in the surface).
+green (hand sys, portable surface).
 
 The concrete install is vcpkg, read from the port manifests
 (2026-10-11): `ffmpeg` 9.0.2 builds LGPL by default (GPL and nonfree
@@ -163,18 +160,17 @@ $env:FFMPEG_LIB_DIR = "<vcpkg>\installed\x64-windows\lib"
 libvpx in the install line feeds ffmpeg's own wrapper build; the crate
 links avcodec/avutil only.
 
-Two honest boundaries. First, vcpkg's ffmpeg 9.x is a newer ABI than
+Two boundaries. First, vcpkg's ffmpeg 9.x is a newer ABI than
 the bound major 61, so the major guard fails closed on it until the
 sys layer is re-read against the newer headers (same ~23-function
-surface, offsets re-probed); that is the guard working as designed,
-not a hole. Second, only `cargo check` for the `ffmpeg` feature is
+surface, offsets re-probed). Second, only `cargo check` for the `ffmpeg` feature is
 verified on this machine; a real Windows link is unverified here.
-H.264 encode needs nothing: openh264 builds vendored from the crate.
+H.264 encode builds on vendored openh264.
 
 ## Version drift: one guard pattern per linked lib
 
 Every `open` fails closed unless the linked library reports the
-bound major; there is no silent fallback to a drifted ABI:
+bound major:
 
 | Linked lib | Guard | Bound | Binds it protects |
 |---|---|---|---|
@@ -203,7 +199,7 @@ here is native (no `lib*` external; `ffmpeg -h decoder=X` shows
 frame and slice threading) except AV1, which is the BSD dav1d.
 Exception: the `gpl` feature's `libx265` path is GPL-2+ by x265's
 license and flips an ffmpeg build GPL; it stays opt-in only.
-Caveat, unchanged: the Debian system library itself is an
+Caveat: the Debian system library itself is an
 `--enable-gpl` build; the default path invokes no GPL component, but a
 distributable LGPL product links an LGPL-built libavcodec (vcpkg
 default, or the minimal configure above), not Debian's.
@@ -223,8 +219,8 @@ majors, and every encoded offset carries a compile-time
 run through the libavcodec parser; framed codecs (VP8, VP9, AV1)
 send one IVF frame per packet, exactly as ffmpeg's own demuxers do.
 
-The layouts were read from the installed headers with a C probe, not
-copied from memory: `AV_CODEC_ID_H264` 27, `AV_CODEC_ID_VP8` 139,
+The layouts were read from the installed headers with a C probe:
+`AV_CODEC_ID_H264` 27, `AV_CODEC_ID_VP8` 139,
 `AV_CODEC_ID_VP9` 167, `AV_CODEC_ID_HEVC` 173, `AV_CODEC_ID_AV1`
 225, `AV_PIX_FMT_YUV420P` 0, packet `data`@24 `size`@32 size 104,
 frame `data`@0 `linesize`@64 `width`@104 `height`@108 `format`@116
@@ -237,7 +233,7 @@ re-feeds the same input instead of dropping it.
 The alternative was gated out: `ffmpeg-sys-next` fails condition 2
 (the hand surface took under a day, ~200 lines for five codecs, with
 no ongoing maintenance beyond the major-version guard) and drags a
-build script plus pkg-config coupling. Default-no held.
+build script plus pkg-config coupling.
 
 **Scope.** 8-bit 4:2:0 only: `h264-high422` and `h264-high444`
 decode inside libavcodec but the wrapper returns `SwError::BadFrame`.
@@ -257,7 +253,7 @@ docs warn the thread knob "will probably segfault". It also cannot
 decode the 4:2:2/4:4:4 goldens at all (I420 output only). Throughput
 (127 fps) clears the bar; correctness fails it.
 
-## Golden findings (harness-owned, not fixed here)
+## Golden findings
 
 - `golden_gen.rs` hashes MJPEG bytes, not raw pixels: it passes `-f
   image2` without `-c:v rawvideo`, so image2's default mjpeg encoder
@@ -266,7 +262,6 @@ decode the 4:2:2/4:4:4 goldens at all (I420 output only). Throughput
 - The MJPEG link is color-metadata sensitive: raw bytes `cmp`-clean
   against ffmpeg still hash differently after re-transcode because the
   range tag (`tv` vs `unknown`) changes encoder behavior/headers.
-  Primary evidence above is therefore raw `cmp`, which is stronger.
 - The `vp9/vp80-00-comprehensive-001.sha256` header names
   `corpus/vp9/...`, but the vector lives at `corpus/vp8/...`.
 - The `goldens/` tree was being regenerated live during this evaluation

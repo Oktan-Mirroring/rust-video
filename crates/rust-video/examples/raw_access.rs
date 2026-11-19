@@ -1,11 +1,7 @@
 //! Raw image access: decode one clip, touch every frame.
 //!
-//! Each run reports decoder caps, then every frame's metadata (extent,
-//! format), its NV12 bytes through a checksum, and its export handle.
-//!
-//! Usage: `raw_access [tier] [codec] [file]`. The tier defaults to the
-//! first that opens, the codec to `h264`, the file to the codec's bench
-//! vector. Anything missing declines by name.
+//! Usage: `raw_access [tier] [codec] [file]`. Defaults: first tier that
+//! opens, `h264`, the codec's bench vector. Gaps decline by name.
 
 use bytes::Bytes;
 use rust_video::Packet;

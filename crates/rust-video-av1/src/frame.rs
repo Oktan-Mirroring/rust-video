@@ -2294,6 +2294,11 @@ impl<'a> HeaderReader<'a> {
 
 /// Frame header plus consumed bit count.
 ///
+/// # Errors
+///
+/// Returns `Err` on truncated or out-of-range syntax, or when a
+/// reference names an empty slot.
+///
 /// # Arguments
 ///
 /// * `payload` - frame header OBU payload.
@@ -2301,11 +2306,6 @@ impl<'a> HeaderReader<'a> {
 /// * `refs` - reference slots behind inheritance and validation.
 /// * `temporal_id` - temporal id of the header OBU.
 /// * `spatial_id` - spatial id of the header OBU.
-///
-/// # Errors
-///
-/// Returns `Err` on truncated or out-of-range syntax, or when a
-/// reference names an empty slot.
 pub fn parse_frame_header<E: From<Error>>(
     payload: &[u8],
     seq: &SequenceHeader,

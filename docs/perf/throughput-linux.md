@@ -1,6 +1,6 @@
 # Linux throughput vs FFmpeg
 
-rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%; sw encode took all 11 comparable legs, +2.4% to +80.4%. rv-vaapi on the Radeon took all four surfaces (+2.9% to +88.6%) plus h264 readback (+2.9%); h265 readback trails 5.2%. VA-API encode lands at h264 -4.7% to -4.3% and h265 +1.9% to +2.0%. Vulkan ran on the RTX 5080; most ffmpeg Vulkan legs timed out or wrote nothing, leaving rv-only rows.
+rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%; sw encode took all 11 comparable legs, +2.4% to +80.4%. rv-vaapi on the Radeon took all four surfaces (+2.9% to +88.6%) plus h264 readback (+2.9%); h265 readback trails 5.2%. VA-API encode lands at h264 -4.7% to -4.3% and h265 +1.9% to +2.0%. Vulkan ran on the RTX 5080; most ffmpeg Vulkan legs timed out or produced empty output, leaving rv-only rows.
 
 Release build, 600-frame decode streams, 300-frame encode streams, median of 5, run 2026-11-18 on a 32-core LMDE 7 box.
 
@@ -25,7 +25,7 @@ Release build, 600-frame decode streams, 300-frame encode streams, median of 5, 
 - Median of 5 runs each side, no warmup either side, livepack included.
 - VA-API: ffmpeg pins renderD128; rv opens the first render node in sorted path order that initializes with H.264 caps, renderD128 on this box.
 - Vulkan: rv negotiates one device, the first enumerated adapter that passes the op; ffmpeg runs each GPU. Every rv Vulkan leg below ran on the RTX 5080: RADV rejects the combined usage the tier decodes with and its encode session creation fails ([vulkan](../vulkan.md)), leaving NVIDIA as the only adapter that can complete a leg. Percents compare against the RTX 5080 ffmpeg column.
-- TIMEOUT marks a leg that never finished; ERR marks one that errored.
+- TIMEOUT marks an unfinished leg; ERR marks one that errored.
 - Compare against `just benches` or the Windows sheet on counting discipline only: builds, corpora, and vectors differ.
 
 ## Software
@@ -101,7 +101,7 @@ Vulkan, RTX 5080:
 | av1 surface | 446.3 | 1708.3 | +282.8% |
 | av1 readback | 433.6 | 1638.1 | +277.8% |
 
-FFmpeg on RADV for context, never percented: h264 surface 579.2, readback 524.6; h265 surface TIMEOUT, readback 432.5; av1 surface 443.0, readback 373.4; both encodes ERR. No h264 surface leg ran on the IP stream. RADV h264 surface and h265 transcode vary run to run with no ffmpeg-side code change.
+FFmpeg on RADV for context, unpercented: h264 surface 579.2, readback 524.6; h265 surface TIMEOUT, readback 432.5; av1 surface 443.0, readback 373.4; both encodes ERR. No h264 surface leg ran on the IP stream. RADV h264 surface and h265 transcode vary run to run with no ffmpeg-side code change.
 
 ### Encode, fps
 
@@ -122,8 +122,8 @@ Vulkan encodes ran rv-only; see One-sided reference.
 
 ## One-sided reference, fps
 
-- Vulkan h264 encode via rv, ffmpeg wrote nothing: 543.9 at 77.6 Mbps actual vs 75 nominal.
-- Vulkan h265 encode via rv, ffmpeg wrote nothing: 236.8 at 83.1 Mbps actual vs 75 nominal.
+- Vulkan h264 encode via rv, ffmpeg produced empty output: 543.9 at 77.6 Mbps actual vs 75 nominal.
+- Vulkan h265 encode via rv, ffmpeg produced empty output: 236.8 at 83.1 Mbps actual vs 75 nominal.
 - NVENC via ffmpeg, no rv tier: h264 499.2, h265 557.3, av1 511.5.
 - h264 openh264 via rv, absent from the ffmpeg build: 857.6 at 4t, 846.7 at 8t.
 - Livepack via rv, no ffmpeg counterpart: TsMux 2039204.4, TsDemux 1552162.4, FragMux 428935.8.

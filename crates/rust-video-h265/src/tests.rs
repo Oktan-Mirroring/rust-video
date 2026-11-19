@@ -50,13 +50,13 @@ impl HevcGate<TestError> for LayerGate {
         Ok(NalAction::Ignore)
     }
 
-    /// Unused: layer pin never stores sets.
+    /// SPS check hook.
     fn check_sps(sps: &Sps) -> Result<(), TestError> {
         let _ = sps;
         Ok(())
     }
 
-    /// Unused: layer pin never stores sets.
+    /// PPS check hook.
     fn check_pps(pps: &Pps, sps: Option<&Sps>) -> Result<(), TestError> {
         let _ = (pps, sps);
         Ok(())

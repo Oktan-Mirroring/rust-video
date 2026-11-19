@@ -41,7 +41,7 @@ pub enum GpuExport {
     /// NT handle descriptor; the exporter owns and closes the handle.
     #[cfg(windows)]
     NtHandle {
-        /// Borrowed handle value, valid while the source frame lives; the importer must not close it.
+        /// Borrowed handle value, valid while the source frame lives; closing stays with the exporter.
         handle: isize,
     },
     /// Opaque backend descriptor.

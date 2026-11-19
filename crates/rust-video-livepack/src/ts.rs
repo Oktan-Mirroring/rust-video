@@ -1,10 +1,7 @@
 //! MPEG-TS mux and demux for H.264/H.265.
 //!
-//! AV1/VP9/VP8/AV2 have no registered `stream_type` and decline with
-//! [`TsMuxError::CodecNotMappable`]; the demuxer skips their PMT
-//! entries as unknown.
-//!
-//! [ITU-T H.222.0](https://www.itu.int/rec/T-REC-H.222.0) section 2.4.
+//! Only H.264/H.265 map to a `stream_type`; other codecs decline with
+//! [`TsMuxError::CodecNotMappable`]. See H.222.0 §2.4.
 
 use std::fmt;
 
@@ -169,20 +166,23 @@ impl TsMux {
 
     /// Packetize one access unit into `out`.
     ///
-    /// Emits PAT/PMT before the first and every keyframe unit, stamps PCR
-    /// from DTS on the first packet, and sets `random_access_indicator`
-    /// on keyframes.
-    ///
-    /// # Arguments
-    ///
-    /// * `unit` - access unit to packetize.
-    /// * `gate` - keyframe gate; a held unit appends nothing.
-    /// * `out` - packet bytes sink.
-    ///
     /// # Errors
     ///
     /// Returns `Err` on AV1/VP9/VP8/AV2 payloads, empty payloads, and
     /// payloads past `max_pes_bytes`.
+    ///
+    /// # Arguments
+    ///
+    /// * `unit` - access unit to packetize.
+    /// * `gate` - keyframe gate; a held unit holds output and sequence
+    ///   numbers.
+    /// * `out` - packet bytes sink.
+    ///
+    /// # Usage Notes
+    ///
+    /// Emits PAT/PMT before the first and every keyframe unit, stamps PCR
+    /// from DTS on the first packet, and sets `random_access_indicator`
+    /// on keyframes.
     pub fn push(
         &mut self,
         unit: &AccessUnit,
@@ -466,8 +466,8 @@ impl TsDemux {
 
     /// End-of-stream flush: the trailing open unit, if it has payload.
     ///
-    /// Real muxers leave the final PES unbounded; that frame completes
-    /// only here.
+    /// Real muxers leave the final PES unbounded; `finish` completes
+    /// that frame.
     pub fn finish(&mut self) -> Option<AccessUnit> {
         let (_, codec) = self.video?;
         let unit = self.pes.take(codec);
@@ -512,7 +512,7 @@ impl TsDemux {
     /// Offset of the next trusted sync byte; `None` wants more data.
     ///
     /// Two buffered packets demand double sync; a lone trailing packet
-    /// is trusted, else clean EOF holds one packet back forever.
+    /// is trusted, releasing the last packet at clean EOF.
     fn sync_at(stash: &[u8]) -> Option<usize> {
         let mut i = 0;
         while i < stash.len() {
@@ -736,7 +736,7 @@ impl PesAsm {
     /// Payload bytes in; completed units appended to `out`.
     ///
     /// A unit completes when its declared length lands or the next
-    /// header arrives with nothing outstanding; a short arrival errors.
+    /// header arrives with all bytes in; a short arrival errors.
     /// One packet can complete two units: the old at the new header
     /// plus the new when its declared bytes land in the same packet.
     fn feed(

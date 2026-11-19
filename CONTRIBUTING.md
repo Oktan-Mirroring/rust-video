@@ -4,7 +4,7 @@
 
 Every change passes `just ci` before review: format check, clippy with warnings
 denied, debug build, tests, docs, and the spec-table diff. Fix the cause of a
-failure, never weaken the gate.
+failure.
 
 `just test` covers default, no-default, and sw-codec features; the livepack ffmpeg oracle
 (`fmp4_ffmpeg`, behind `--features rust-video-livepack/oracle`) stays out of it

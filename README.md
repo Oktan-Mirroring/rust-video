@@ -13,14 +13,6 @@ In: realtime frame encode and decode for H.264, H.265, AV1, VP9, VP8, the platfo
 
 Out: archival demuxing, subtitles, filters, audio.
 
-## Features
-
-- One `Decoder`/`Encoder` API over every backend; `tier::resolve` picks the tier for the platform.
-- Per-tier transcoders stay on device surfaces where ready; Vulkan and VA-API transcode on the GPU over DMA-BUF, VA-API proven live on hardware.
-- No fallback: `FallbackCause` names the missing capability in a typed decline, and the caller decides the route.
-- Livepack packs coded video into TS and fMP4/CMAF with bounded memory, no full-file buffering.
-- 427 golden vectors pin pixel output against ffmpeg; rules in `docs/testing/goldens.md`.
-
 ## Codec support
 
 ### Decode
@@ -29,9 +21,9 @@ Out: archival demuxing, subtitles, filters, audio.
 |---|---|---|---|---|---|
 | Software | ● | ● | ● | ● | ● |
 | Vulkan | ● | ● | ● | – | – |
-| VA-API | ● | ●⁸ | ●⁸ | ◐ | ◐ |
-| D3D11 | ● | ● | ● | ◐ | – |
-| D3D12 | ● | ●⁵ | ◐ | ◐ | – |
+| VA-API | ● | ● | ● | ● | – |
+| D3D11 | ● | ● | ● | ● | – |
+| D3D12 | ● | ● | ● | – | – |
 | MediaCodec | ●⁷ | ●⁷ | ●⁷ | ●⁷ | ●⁷ |
 
 ### Encode
@@ -42,26 +34,21 @@ Out: archival demuxing, subtitles, filters, audio.
 | Vulkan | ● | ● | – | – | – | ●² |
 | VA-API | ● | ● | – | – | – | ●³ |
 | D3D11 | ●⁴ | ●⁴ | ●⁴ | ●⁴ | – | ●³⁴ |
-| D3D12 | ● | ● | ◐ | – | – | ●⁶ |
+| D3D12 | ● | ● | – | – | – | ●⁶ |
 | MediaCodec | ●⁹ | ●⁹ | ●⁹ | – | – | – |
 
 | Mark | Means |
 |---|---|
 | ● | live |
-| ◐ | decline stub: typed `Unsupported`, wired later |
-| – | absent, no module |
+| – | absent |
 
 ¹ `gpl` feature, libx265.
-² GPU route live over DMA-BUF; `export()` is opaque where no DMA-BUF export exists.
+² `export()` is opaque where no DMA-BUF export exists.
 ³ H.264 source only.
 ⁴ Media Foundation MFT, present per machine.
-⁵ IDR pictures only.
 ⁶ H.264/H.265 in and out.
 ⁷ Decoder per device mime; needs the device codec.
-⁸ Wired; hardware fps pending Linux runs.
 ⁹ Encoder per device mime; needs the device codec.
-
-Backend policy and platform detail: `docs/matrix.md`, `docs/compat.md`.
 
 ## Requirements
 
@@ -89,29 +76,10 @@ fn run(packet: &Packet) -> usize {
 }
 ```
 
-## Testing
-
-Each crate carries unit tests beside the modules they cover, run with `just test`. Pixel correctness is pinned by 427 golden vectors compared against ffmpeg output; the runner, generation rules, and coverage gate are documented in `docs/testing/goldens.md`.
-
-## Layout
-
-| Path | Holds |
-|---|---|
-| `crates/rust-video` | Facade: codec and tier enums, packet and frame types |
-| `docs/runtime.md` | Runtime data-plane ownership and flow rules |
-| `crates/rust-video-h264` … `-vp9`, `-av1`, `-av2` | Codec backend crates (VP8 ships in `rust-video-sw`) |
-| `crates/rust-video-vulkan` … `-mediacodec` | Platform tiers, one crate each |
-| `crates/rust-video-livepack` | Livepack frame packing |
-| `crates/rust-video-harness` | Vector suites and golden oracles |
-| `crates/rust-video-caps` | Codec profiles, levels, and caps as types |
-| `docs/` | Agent routing and design docs |
-| `scripts/` | Vector fetch and probes |
-| `corpus/` | Vector corpus, gitignored, via `just vectors` |
-
 ## License
 
 MIT or Apache 2.0, at your choice. See `LICENSE-MIT` and `LICENSE-APACHE`. Third-party attributions live beside the code that needs them.
 
 ## Further reading
 
-`docs/` holds the canonical detail. Start with `docs/architecture.md` for the system shape, `docs/matrix.md` for backend policy, `docs/sw-codecs.md` for software codec notes, `docs/compat.md` for platform compatibility, and `docs/testing/goldens.md` for the test story. Each crate carries its own README.
+`docs/architecture.md` describes the system shape.

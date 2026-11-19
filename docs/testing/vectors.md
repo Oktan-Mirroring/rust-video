@@ -2,8 +2,8 @@
 <!-- date: 2026-10-11; author: rust-video -->
 # Vector sources
 
-The corpus lives in `corpus/<codec>/`, fetched by `just vectors`, never
-committed. Each source below carries its verification state.
+The corpus lives in `corpus/<codec>/`, fetched by `just vectors`, kept
+out of git. Each source below carries its verification state.
 
 | Codec | Source | State |
 |---|---|---|

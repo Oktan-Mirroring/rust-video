@@ -272,7 +272,7 @@ impl Profile {
     }
 }
 
-/// Tier flag, not a boolean (A.4.1).
+/// Tier flag (A.4.1).
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Tier {
     /// Main tier, flag 0.

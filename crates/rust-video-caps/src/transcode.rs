@@ -61,7 +61,7 @@ impl std::error::Error for FallbackCause {}
 /// Transcode execution route.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Route {
-    /// Device-resident textures, pixels never mapped.
+    /// Device-resident textures.
     Gpu,
     /// Caller-built CPU route.
     Cpu,

@@ -263,7 +263,7 @@ pub fn inter_scale_valid(width: u32, ref_width: u32) -> bool {
     u64::from(width) * 2 >= u64::from(ref_width) && u64::from(width) <= u64::from(ref_width) * 16
 }
 
-/// Plain coded frame final byte must not contain the marker (B.4).
+/// Plain coded frame final bytes exclude the marker (B.4).
 #[must_use]
 pub fn plain_final_byte_valid(byte: u8) -> bool {
     byte & 0b1110_0000 != SUPERFRAME_MARKER << 5

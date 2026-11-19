@@ -11,14 +11,14 @@ where marked.
 
 - Decode: native ffmpeg over the hand sys layer (`H264Decoder`).
   openh264 decode loses: 27/60 vs ffmpeg on B-frame content.
-  rusty_h264 is rejected for now: single-threaded and far off realtime.
+  rusty_h264 is rejected: single-threaded and far off realtime.
 - Encode: openh264 CBR path (`H264Encoder`), behind the `h264-openh264`
   feature.
 
 ## H.265
 
 - Decode: native ffmpeg over the hand sys layer (`H265Decoder`).
-  rusty_h265 is rejected for now: decode-only, single-threaded, far off
+  rusty_h265 is rejected: decode-only, single-threaded, far off
   realtime.
 - Encode: ffmpeg `libx265` wrapper (`H265Encoder`), behind the `gpl`
   feature.
@@ -40,26 +40,25 @@ where marked.
 ## AV2
 
 - Decode: no backend ships. rusty_av2d 0.2.11 is the candidate,
-  gated behind measurement; no promise until it holds the budget.
-  Fenced for untrusted input regardless.
+  gated behind measurement. Fenced for untrusted input regardless.
 
 ## VP8
 
 - Decode: native ffmpeg over the hand sys layer (`Vp8Decoder`).
 - Encode: ffmpeg `libvpx` wrapper (`Vp8Encoder`), throughput
-  unmeasured until Linux CI runs it.
+  unmeasured.
 
 ## Hardware tiers
 
 Vulkan, VA-API, D3D11, D3D12, and MediaCodec carry their platform's own
-implementation. No software politics apply: the driver is the fast path.
+implementation; the driver is the fast path.
 
 Live now: Vulkan decodes H.264/H.265/AV1, encodes H.264/H.265, and
 transcodes on the GPU from all three decode codecs; VA-API decodes
-H.264/H.265/VP9/AV1 (hardware fps pending), encodes H.264/H.265, and
-transcodes from H.264; D3D11 decodes H.264/H.265/AV1 (8-bit 4:2:0 NV12) and
-encodes H.264/H.265/VP9/AV1 over Media Foundation MFTs; D3D12 decodes H.264 plus IDR-only H.265 and
-encodes both; MediaCodec decodes all five codecs and encodes H.264/H.265/AV1. The README matrix
+H.264/H.265/VP9/AV1, encodes H.264/H.265, and
+transcodes from H.264; D3D11 decodes H.264/H.265/AV1/VP9 and
+encodes H.264/H.265/VP9/AV1 over Media Foundation MFTs; D3D12 decodes H.264/H.265/AV1 and
+encodes H.264/H.265; MediaCodec decodes all five codecs and encodes H.264/H.265/AV1. The README matrix
 names every cell.
 
 ## Measured numbers

@@ -1,15 +1,13 @@
 # rust-video-vp9
 
-VP9 grammar shared by every tier: uncompressed frame headers plus tile assembly.
+VP9 grammar shared by every tier: uncompressed frame headers plus tile assembly. `Ingest` parses frame headers and splits tiles, generic over the tier error type; each `Fault` converts into it through `From`. Software decode and encode ship in `rust-video-sw`.
 
-## Decode
+```rust
+use rust_video_vp9::{Fault, Ingest};
 
-`Ingest` parses frame headers and splits tiles, generic over the tier error type: each `Fault` converts into it through `From`. Tiers map faults into their own errors and build submit structures locally.
+fn frames(data: &[u8]) -> usize {
+    Ingest::<Fault>::new().ingest_packet(data).unwrap().len()
+}
+```
 
-## Encode and software decode
-
-VP9 software decode and encode ship in `../rust-video-sw`, behind its `ffmpeg` feature. The facade exposes this crate as the `vp9` feature.
-
-## Docs
-
-Codec matrix in `../../README.md`, backend policy in `../../docs/matrix.md`.
+Backend policy lives in `../../docs/matrix.md`.

@@ -2,9 +2,7 @@
 
 Live MPEG-TS and fMP4/CMAF packaging for coded video. Streaming first: bounded memory, no full-file buffering. It depends on no other workspace crate.
 
-## Packaging
-
-`TsMux` packetizes access units into TS bytes and `TsDemux` parses them back; `FragmentMux` writes fragmented MP4 over per-codec track configs. TS carries H.264 and H.265 only: AV1, VP9, VP8, and AV2 have no registered `stream_type` and muxing them fails with `TsMuxError::CodecNotMappable`. `KeyframeGate` holds output until the first keyframe when the caller passes one.
+`TsMux` packetizes access units into TS bytes and `TsDemux` parses them back; `FragmentMux` writes fragmented MP4 over per-codec track configs. TS carries H.264 and H.265 only: any other codec muxes fail with `TsMuxError::CodecNotMappable`.
 
 ```rust
 use rust_video_livepack::{AccessUnit, Codec, TsDemux, TsMux, TsMuxConfig};
@@ -23,10 +21,4 @@ fn roundtrip() -> usize {
 }
 ```
 
-## Clocks and queues
-
-One clock everywhere: 90 kHz, tracked by `Ts90k` and `ClockTracker` with `Pcr` carrying the program reference. `BoundedQueue` enforces the memory bound under a caller-chosen `Policy`: `DropOldest` evicts and reports the oldest entry, `Block` refuses a push on a full queue and the caller retries.
-
-## Docs
-
-Container shapes, timestamp discipline, and spec pins live in `../../docs/livepack-ts-fmp4.md`.
+Container shapes and timestamp discipline live in `../../docs/livepack-ts-fmp4.md`.

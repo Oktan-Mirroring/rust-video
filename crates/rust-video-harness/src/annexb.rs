@@ -102,9 +102,8 @@ impl AnnexB {
 
     /// Owned NAL units without start codes, preamble dropped.
     ///
-    /// Unlike [`split_nals`](Self::split_nals), bytes before the first
-    /// start code never surface, empty units stay, and input without a
-    /// start code yields nothing.
+    /// Empty units stay, and input without a start code yields an empty
+    /// vec.
     #[must_use]
     pub fn split_owned(data: &[u8]) -> Vec<Vec<u8>> {
         let mut starts = Vec::new();

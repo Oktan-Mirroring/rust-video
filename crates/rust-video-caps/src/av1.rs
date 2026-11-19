@@ -1,9 +1,7 @@
 //! AV1 profile, level, color, and OBU enforcement.
 //!
 //! Values from the `AOMedia` AV1 specification; cites name the section.
-//!
-//! Film grain applies after decode and never reaches references (S7.18).
-//! Switch frames overwrite all references without forcing intra (S3).
+//! References hold pre-grain pixels: grain applies after decode (S7.18).
 
 use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};
 
@@ -22,7 +20,7 @@ pub enum FrameType {
     Inter,
     /// Intra-only frame, 2.
     IntraOnly,
-    /// Switch frame, 3.
+    /// Switch frame, 3; overwrites all references (S3).
     Switch,
 }
 

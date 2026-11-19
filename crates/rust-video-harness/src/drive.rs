@@ -79,16 +79,24 @@ impl Drive {
 
     /// Every packet sent; `drain` frees room on each refusal.
     ///
-    /// Polls ready frames after the last send; the caller finishes the
-    /// pump.
-    ///
     /// # Panics
     ///
     /// Panics when `pump` rejects a packet or a ready poll fails.
     ///
+    /// # Arguments
+    ///
+    /// * `pump` - split-phase pump under test.
+    /// * `packets` - packets to send.
+    /// * `drain` - refusal drain; frees room per refusal.
+    ///
     /// # Returns
     ///
     /// Frames surfaced so far, plus the refusal count.
+    ///
+    /// # Usage Notes
+    ///
+    /// Polls ready frames after the last send; the caller finishes the
+    /// pump.
     #[must_use]
     pub fn send_all<P, F, E>(
         pump: &mut P,

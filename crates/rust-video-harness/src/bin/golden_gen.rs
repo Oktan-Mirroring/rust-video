@@ -1,17 +1,7 @@
 //! Golden generator over the vector corpus.
 //!
-//! ffmpeg oracle: probe, decode, hash, cover. See
-//! `docs/testing/goldens.md` for the coverage rule and
-//! `.tmp/coverage-baseline.md` for the binding matrix.
-//!
-//! Every vector derives from one of the two canonical clips (motion,
-//! noise: 120 frames of 1080p30); matrix encodes keep all 120 frames
-//! and vary only scale, pixel format, encoder, and container. `--synth`
-//! first proves both clips deterministic (render twice, compare hashes;
-//! the recipe is rejected on mismatch), then encodes every synth vector,
-//! derives every craft (byte-level edits of synth outputs), and writes
-//! goldens fresh-path. The required-matrix gate fails on any matrix line
-//! without a vector.
+//! ffmpeg oracle: probe, decode, hash, cover. Coverage rules live in
+//! `docs/testing/goldens.md`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -89,12 +79,10 @@ enum Craft {
     /// Complete sets plus a poison slice NAL (`slice_type` out of
     /// range): the stream ends in a broken NAL.
     TruncateAnnexB,
-    /// Complete VPS plus a poison SPS (luma width out of range):
-    /// the parameter sets never complete validly.
+    /// Complete VPS plus a poison SPS tail (luma width out of range).
     TruncateSets,
     /// Fixed pseudorandom bytes (LCG over `seed`) after `prefix`;
-    /// Annex B garbage carries a slice start code so parsers engage
-    /// the NAL path instead of idling on zero frames.
+    /// Annex B garbage carries a slice start code engaging the NAL path.
     Garbage { seed: u64, prefix: &'static [u8] },
     /// Valid SPS/PPS plus a hand-built SI slice (`slice_type` 8).
     SiSlice,
@@ -166,7 +154,7 @@ struct Synth {
     pix_fmt: &'static str,
     encoder: &'static str,
     extra: &'static [&'static str],
-    /// Derivation from other vectors instead of a fresh encode.
+    /// Derivation from other vectors.
     derive: Option<Derive>,
     /// Sources for [`Derive::Craft`] (stems in the same codec dir).
     craft_src: &'static [&'static str],
@@ -2393,7 +2381,7 @@ fn craft_h264_set_ids(mp4: &Path) -> Result<Vec<u8>, String> {
     bw.copy(&BitReader::strip_trailing(tail));
     let new_sps = AnnexB::insert_emulation(&bw.finish_rbsp());
     // Active sets use SPS id 2 (gap over 0-1); an inert PPS id 3
-    // rides along parsed but never referenced. Active non-zero PPS
+    // rides along parsed and unreferenced. Active non-zero PPS
     // ids stay out: libav corrupts such decodes (MB errors on
     // bit-exact rewrites), so the gap shape keeps PPS id 0 active.
     let mut out = Vec::with_capacity(nals.len());
@@ -2437,8 +2425,8 @@ fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
         .ok_or("no SPS found")?;
     let info = parse_h264_sps(sps_nal)?;
     let sps = info.sps;
-    // Legal gap, not loss: x264 forbids gaps, so the craft flips the
-    // SPS flag on (single bit, emulation recomputed).
+    // Flip the SPS gaps flag on: x264 forbids gaps (single bit,
+    // emulation recomputed).
     let mut sps_rbsp = info.rbsp;
     sps_rbsp[info.gaps_flag_at / 8] |= 1u8 << (7 - info.gaps_flag_at % 8);
     let gaps_sps = AnnexB::insert_emulation(&sps_rbsp);
@@ -2453,11 +2441,8 @@ fn craft_h264_frame_num_gap(mp4: &Path) -> Result<Vec<u8>, String> {
     ordered.sort_unstable();
     let target = *ordered.get(1).ok_or("fewer than two frame_nums")?;
     // A legal gap shifts every following number forward (IDRs keep 0
-    // and re-arm the shift); bumping one frame alone would run the
-    // numbering backwards. The jump is 2: gap frames occupy DPB slots
-    // as non-existing pictures, and the level-limited DPB here holds
-    // 4, so a wider gap would evict live references instead of merely
-    // testing gap filling.
+    // and re-arm the shift). The jump is 2: gap frames occupy DPB slots
+    // as non-existing pictures, and the level-limited DPB here holds 4.
     let mut shifting = false;
     let mut patched = 0;
     let mut out = Vec::with_capacity(nals.len());
@@ -3104,8 +3089,7 @@ fn oracle_decodes(path: &Path) -> bool {
 }
 
 /// Every synth vector is oracle-verified at build time: valid vectors
-/// must decode, decline vectors must fail. Anything else is a recipe
-/// bug, reported loudly instead of landing a hollow golden.
+/// decode, decline vectors fail. Anything else is a recipe bug.
 fn verify_vector(synth: &Synth, path: &Path) -> Result<(), String> {
     let decodes = oracle_decodes(path);
     match synth.expect {
@@ -3136,7 +3120,7 @@ fn run_synth(corpus: &Path, synth: &Synth) -> Result<PathBuf, String> {
         Some(Derive::Bsf(filter) | Derive::AnnexB(filter)) => run_bsf(corpus, synth, filter)?,
         Some(Derive::Craft(craft)) => run_craft(corpus, synth, craft)?,
     };
-    // Re-verify cached vectors too: a stale corpus must never pass.
+    // Re-verify cached vectors too: a stale corpus fails here.
     verify_vector(synth, &out)?;
     Ok(out)
 }

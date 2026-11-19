@@ -18,5 +18,5 @@ Header lines:
 
 Vectors are rebuilt by `just vectors` (one pinned fetch) plus `just
 goldens --synth` (canonical clips, encoder recipes, byte crafts) and
-are never committed. The generator preserves non-`.sha256` files in
+stay out of git. The generator preserves non-`.sha256` files in
 this directory across regens.

@@ -1,14 +1,13 @@
 # rust-video-h264
 
-H.264 grammar: sets, slices, and picture description. One parser behind
-every tier, generic over the tier error; tier caps arrive as gates.
+H.264 grammar: sets, slices, and picture description. One parser behind every tier, generic over the tier error; tier caps arrive as gates. Software decode and encode ship in `rust-video-sw`.
 
-## Decode and encode
+```rust
+use rust_video_h264::split_nals;
 
-H.264 software decode and encode ship in `../rust-video-sw`, behind its
-`ffmpeg` and `h264-openh264` features. The facade exposes this crate as
-the `h264` feature.
+fn units(data: &[u8]) -> usize {
+    split_nals(data).len()
+}
+```
 
-## Docs
-
-Codec matrix in `../../README.md`, backend policy in `../../docs/matrix.md`.
+Backend policy lives in `../../docs/matrix.md`.

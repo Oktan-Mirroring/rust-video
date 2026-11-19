@@ -1,11 +1,13 @@
 # rust-video-h265
 
-H.265 codec namespace: the `H265` unit struct and nothing else. No modules, no dependencies, no behavior.
+H.265 grammar: sets, slices, and picture description. One parser behind every tier, generic over the tier error; tier caps arrive as gates. Software decode and encode ship in `rust-video-sw`.
 
-## Decode and encode
+```rust
+use rust_video_h265::split_nals;
 
-H.265 software decode and encode ship in `../rust-video-sw`, behind its `ffmpeg` and `gpl` features. The facade exposes this crate as the `h265` feature.
+fn units(data: &[u8]) -> usize {
+    split_nals(data).len()
+}
+```
 
-## Docs
-
-Codec matrix in `../../README.md`, backend policy in `../../docs/matrix.md`.
+Backend policy lives in `../../docs/matrix.md`.

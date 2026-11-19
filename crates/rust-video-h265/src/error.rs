@@ -213,7 +213,7 @@ pub enum ParseKind {
     LtSpsOversize,
     /// Slice long-term pictures past their size.
     LtTotalOversize,
-    /// Slice cites a short-term table the sequence never coded.
+    /// Slice cites a short-term table missing from the sequence.
     EmptySpsRps,
 }
 

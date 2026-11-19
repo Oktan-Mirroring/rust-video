@@ -18,9 +18,8 @@ CORPUS = ROOT / "corpus"
 DOWNLOAD_URL = "http://downloads.webmproject.org/test_data/libvpx/{}"
 
 # (file, sha1, codec dir): the golden matrix's fetched vectors.
-# Superframes: real encoder-emitted multi-frame packets; the synth
-# crafts could not reproduce a decodable superframe index, so the
-# conformance vector stands in (remuxed to IVF below, stream copy).
+# Superframes: real encoder-emitted multi-frame packets, remuxed to
+# IVF below (stream copy).
 PINNED = [
     (
         "vp90-2-20-big_superframe-01.webm",
@@ -94,7 +93,7 @@ def main() -> int:
             fail = True
             continue
         # Canonical vector form for vp9/av1 is IVF (the sw runner's
-        # framed path); the remux is a stream copy, packets preserved.
+        # framed path); the remux is a stream copy.
         if dest.suffix == ".webm" and not remux_ivf(dest, final):
             fail = True
             continue

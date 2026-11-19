@@ -752,13 +752,10 @@ pub struct SliceTail {
 
 /// Slice tail over an RBSP `body` with the NAL header stripped.
 ///
-/// Reads mirror `parse_slice_rest` exactly, collecting what that path
-/// discards; keep the two in sync. Rejects dependent slices like the
-/// header path.
-///
 /// # Errors
 ///
-/// Returns `Err` on malformed syntax or out-of-range tail values.
+/// Returns `Err` on malformed syntax, out-of-range tail values, or
+/// dependent slices.
 ///
 /// # Arguments
 ///
@@ -766,6 +763,10 @@ pub struct SliceTail {
 /// * `nal_type` - NAL unit type.
 /// * `sps` - sequence set behind the header.
 /// * `pps` - picture set behind the header.
+///
+/// # Usage Notes
+///
+/// Reads mirror `parse_slice_rest` exactly; keep the two in sync.
 pub fn parse_slice_tail<E: HevcError>(
     body: &[u8],
     nal_type: u8,

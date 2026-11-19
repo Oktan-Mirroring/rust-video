@@ -220,9 +220,6 @@ impl Pps {
 
 /// Picture parameter set from RBSP `rbsp` against sequence set `sps`.
 ///
-/// Tile extents stay explicit without `sps`; the trailing entry derives only
-/// against the sequence grid.
-///
 /// # Errors
 ///
 /// Returns `Err` on malformed syntax or tier-declined constructs.
@@ -230,7 +227,8 @@ impl Pps {
 /// # Arguments
 ///
 /// * `rbsp` - RBSP bytes with the NAL header stripped.
-/// * `sps` - sequence set behind derivation.
+/// * `sps` - sequence set behind derivation; without it tile extents stay
+///   explicit and the trailing entry is absent.
 pub fn parse_pps<E: HevcError, G: HevcGate<E>>(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, E> {
     let mut reader = BitReader::new(rbsp);
     let id = parse_pps_id(&mut reader)?;
@@ -377,12 +375,13 @@ fn parse_pps_sps_id<E: HevcError>(reader: &mut BitReader<'_, E>) -> Result<u8, E
 
 /// Picture and sequence ids behind a picture set.
 ///
-/// Reads only the leading ids without enforcing set counts; `parse_pps`
-/// enforces them.
-///
 /// # Errors
 ///
 /// Returns `Err` on truncated or out-of-range ids.
+///
+/// # Returns
+///
+/// Leading ids with set counts unenforced.
 pub fn parse_pps_ids<E: HevcError>(rbsp: &[u8]) -> Result<(u8, u8), E> {
     let mut reader = BitReader::new(rbsp);
     let pps_id = reader.read_ue("pic_parameter_set_id")?;
@@ -490,7 +489,7 @@ fn parse_tile_count<E: HevcError>(
 
 /// Explicit tile extents with the last entry derived from `total`.
 ///
-/// The trailing entry derives only against a known grid; without `total`
+/// The trailing entry derives against a known grid; without `total`
 /// the extents stay explicit and unvalidated.
 fn parse_tile_widths<E: HevcError>(
     reader: &mut BitReader<'_, E>,

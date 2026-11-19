@@ -4,8 +4,8 @@
 
 93 committed hash files pin decode output for four codecs. Each file
 traces to exactly one required-matrix line. A tier claiming a codec
-matches those hashes byte-exact or declines with a typed error. No
-third outcome exists: silent wrong output and panics both fail.
+matches those hashes byte-exact or declines with a typed error.
+Silent wrong output and panics both fail.
 
 The binding matrix lives in `crates/rust-video-harness/src/bin/golden_gen.rs`.
 `just goldens --list-required` prints every line, its clause, and how
@@ -42,7 +42,7 @@ superframes, remuxed stream-copy to IVF and kept as
 `corpus/vp9/vp90-2-20-big_superframe-01.ivf`. Everything else is
 synthesized by `just goldens --synth`: lavfi encodes plus byte-level
 crafts derived from them (Annex B surgery, IVF/OBU edits,
-concatenations). Vectors are never committed; `corpus/` is gitignored.
+concatenations). Vectors stay uncommitted; `corpus/` is gitignored.
 
 Three crafts carry verified constraints worth knowing before touching
 them. Set-id gaps keep PPS id 0 active with SPS id 2 plus an inert
@@ -88,7 +88,7 @@ stem and fails listing every uncovered line with its fix. Encoder
 versions also shift bits, so the header records the ffmpeg version
 that produced each golden; a toolchain upgrade means regenerating
 and recommitting the set in the same change. Blocked
-lines print with reasons and never fail: 20 today across encoder gaps
+lines print with reasons and pass: encoder gaps
 (no MMCO/PAFF/BLA/long-term/Rext/SVC options here), craft gaps
 (switch frames, show-existing, non-uniform tiles, explicit spacing,
 deblock override, conformance-adjacent work), and oracle findings

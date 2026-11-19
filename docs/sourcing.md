@@ -10,13 +10,13 @@ tier decides what gets built.
 | Tier | Meaning | May encode |
 |---|---|---|
 | 1 | spec states it, or measured with the method recorded | the value, with its source at the call site |
-| 2 | independent sources agree on shape, none publishes the figure | a tunable default, never a precise constant |
-| 3 | unpublished and unverifiable | nothing; build the control that lets the user supply it |
+| 2 | independent sources agree on shape, none publishes the figure | a tunable default |
+| 3 | unpublished and unverifiable | build the control that lets the user supply it |
 
 ## Provenance headers
 
 Every file under `docs/specs/` opens with a header naming the spec, its
-version, and the fetch date. No header, no table.
+version, and the fetch date. Files without headers carry no tables.
 
 ## Two copies, one gate
 
@@ -28,9 +28,9 @@ sequences. A drifted row fails the gate.
 
 ## Refusals
 
-- No unsourced numbers. A value without a spec section does not land.
-- No invented constants. A gap stays labeled `unmapped`, never filled.
-- No restated numbers outside the two gated copies. Docs narrate structure;
-  prose never repeats a figure the tables hold.
-- Tier 3 stays out of `const`. Hardware caps the vendor does not publish are
-  runtime queries, not constants.
+- Every number cites its spec section.
+- Gaps stay labeled `unmapped`.
+- Numbers live only in the two gated copies. Docs narrate structure;
+  prose repeats no figure the tables hold.
+- `const` holds no Tier 3 values. Hardware caps the vendor leaves
+  unpublished are runtime queries.

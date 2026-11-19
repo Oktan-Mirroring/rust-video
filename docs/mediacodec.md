@@ -2,13 +2,9 @@
 <!-- date: 2026-10-11; author: rust-video -->
 # MediaCodec tier
 
-`rust-video-mediacodec` decodes H.264, H.265, AV1, VP9, and VP8 through the
-platform `MediaCodec` on Android, behind the facade `Decoder` trait.
-Byte buffers in, `MediaCodecSurface` out; each surface carries its
-`CpuFrame` plus slot pinning.
+`rust-video-mediacodec` decodes H.264, H.265, AV1, VP9, and VP8 through the platform `MediaCodec` on Android, behind the facade `Decoder` trait. Byte buffers in, `MediaCodecSurface` out; each surface carries its `CpuFrame` plus slot pinning.
 
-Source tiers: **[T1]** read from the artifact, **[T2]** consistent
-secondary, **[?]** unresolved, never filled.
+Source tiers: **[T1]** read from the artifact, **[T2]** consistent secondary, **[?]** unresolved.
 
 ## Gates
 
@@ -19,13 +15,7 @@ secondary, **[?]** unresolved, never filled.
 | AV1 decode | API 29, first platform AV1 codecs [T2] | Android 10 behavior notes |
 | Bindings | ndk `0.9.0`, ndk-sys `0.6.0` [T1] | docs/compat.md pins |
 
-`open` reads the live level through `android_get_device_api_level`
-[T1, ndk-sys 0.6] and refuses below the floor with `BelowMinSdk`.
-Level 28 and up drains through async callbacks bridged into a polled
-`EventQueue`; older devices use sync dequeue with a bounded wait.
-The API-28 entry points are never called below 28; the loader binds
-function symbols lazily, so referencing them does not break API-21
-startup [T2].
+`open` reads the live level through `android_get_device_api_level` [T1, ndk-sys 0.6] and refuses below the floor with `BelowMinSdk`. Level 28 and up drains through async callbacks bridged into a polled queue; older devices use sync dequeue with a bounded wait. The API-28 entry points run only at 28 and up; the loader binds function symbols lazily, so referencing them keeps API-21 startup working [T2].
 
 ## Formats
 
@@ -39,48 +29,28 @@ One builder per codec, all pure and host-tested:
 | `FormatSpec::vp9` | `video/x-vnd.on2.vp9` | 21 |
 | `FormatSpec::vp8` | `video/x-vnd.on2.vp8` | 21 |
 
-Keys (`mime`, `width`, `height`, `frame-rate`, `csd-0`, `csd-1`,
-`color-format`, `stride`, `slice-height`), the five mimes above, the
-color values 19 (planar) / 21 (semi-planar), and the buffer flags 2
-(codec-config) / 4 (end-of-stream) / 32 (decode-only) were read from
-the installed platform, not copied from memory [T1]:
+Keys (`mime`, `width`, `height`, `frame-rate`, `csd-0`, `csd-1`, `color-format`, `stride`, `slice-height`), the five mimes above, the color values 19 (planar) / 21 (semi-planar), and the buffer flags 2 (codec-config) / 4 (end-of-stream) / 32 (decode-only) were read from the installed platform [T1]:
 
 ```sh
 javap -classpath "$ANDROID_HOME/platforms/android-36.1/android.jar" \
   -constants android.media.MediaFormat | grep -E 'KEY_|MIMETYPE_VIDEO'
 ```
 
-Output layout comes from the live output format on every
-`FormatChanged`, with `width`/`height` as the stride fallback. Color
-values outside 19/21 fail typed as `UnsupportedColorFormat`.
+Output layout comes from the live output format on every `FormatChanged`, with `width`/`height` as the stride fallback. Color values outside 19/21 fail typed as `UnsupportedColorFormat`.
 
 ## Bridge
 
-`EventQueue` is the async-to-poll joint. On API 28+ all four ndk
-callback slots push `CodecEvent`s; `decode` and `flush` drain them.
-All four slots stay set even when a handler is a no-op: leaving one
-unset while any other is set faults on Android 12 and earlier
-[T1, ndk 0.9.0 `AsyncNotifyCallback` docs, NdkMediaCodec.cpp].
-Input indices the current call cannot use go back on the queue;
-frames are never dropped to make progress.
+The event queue is the async-to-poll joint. On API 28+ all four ndk callback slots push events; `decode` and `flush` drain them. All four slots stay set even when a handler is a no-op: leaving one unset while any other is set faults on Android 12 and earlier [T1, ndk 0.9.0 docs, NdkMediaCodec.cpp]. Input indices the current call cannot use wait on the queue; frames stay queued until consumed.
 
 ## Host behavior
 
-Off Android everything native is compiled out: `open`, `reset`,
-and the `Decoder` impl exist on Android only. Format builders,
-the `DecodeState` machine, plane splitting, and
-the event queue all run as host unit tests (57 tests).
-Device-only code is covered by
-`cargo check --target aarch64-linux-android`.
+Off Android everything native is compiled out: `open`, `reset`, and the `Decoder` impl exist on Android only. Format builders, the state machine, plane splitting, and the event queue all run as host unit tests. Device-only code is covered by `cargo check --target aarch64-linux-android`.
 
 ## Limits
 
-- No end-of-stream API: the facade `Packet` carries no EOS signal,
-  so trailing frames that need one stay inside the codec.
-- No timestamps out: `CpuFrame` has no timing field, so output PTS
-  is dropped after queueing.
+- No end-of-stream API: the facade `Packet` carries no EOS signal, so trailing frames that need one stay inside the codec.
+- No timestamps out: `CpuFrame` has no timing field, so output PTS is dropped after queueing.
 - Byte-buffer copies: one copy per frame from codec buffers.
-  A zero-copy surface path is future work, not this tier.
 
 ## References
 

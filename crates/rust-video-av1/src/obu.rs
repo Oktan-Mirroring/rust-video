@@ -39,9 +39,6 @@ const MAX_TILES: usize = 256;
 
 /// Byte offset of the tile group past frame-header alignment, 5.10.
 ///
-/// The alignment bit and padding are unconditional in frame OBUs;
-/// validates both.
-///
 /// # Errors
 ///
 /// Returns `Err` on truncated payload or invalid alignment bits.
@@ -191,17 +188,17 @@ pub struct TileGroupHead<'a> {
 
 /// Tile range plus data behind the tile group header.
 ///
+/// # Errors
+///
+/// Returns `Err` on a range outside the grid or data short of
+/// the alignment.
+///
 /// # Arguments
 ///
 /// * `payload` - tile group OBU payload.
 /// * `tile_count` - tiles of the frame grid.
 /// * `cols_log2` - tile column shift.
 /// * `rows_log2` - tile row shift.
-///
-/// # Errors
-///
-/// Returns `Err` on a range outside the grid or data short of
-/// the alignment.
 pub fn tile_group_range<E: From<Error>>(
     payload: &[u8],
     tile_count: usize,
@@ -238,20 +235,21 @@ pub fn tile_group_range<E: From<Error>>(
 
 /// Byte offset and length of tiles `start` through `end` in `data`.
 ///
-/// The last tile runs to the data end; earlier tiles carry a
-/// little-endian size field of `size_bytes` bytes holding one less
-/// than the tile length.
+/// # Errors
+///
+/// Returns `Err` when a size field or tile body runs past `data`.
 ///
 /// # Arguments
 ///
 /// * `data` - tile data past the group header.
 /// * `start` - first tile index of the group.
 /// * `end` - last tile index of the group.
-/// * `size_bytes` - tile size field width in bytes.
+/// * `size_bytes` - little-endian tile size field width in bytes; each
+///   holds one less than the tile length.
 ///
-/// # Errors
+/// # Returns
 ///
-/// Returns `Err` when a size field or tile body runs past `data`.
+/// Offsets with lengths; the last tile runs to the data end.
 pub fn split_tiles<E: From<Error>>(
     data: &[u8],
     start: usize,

@@ -312,11 +312,11 @@ impl<E: From<Fault>> Ingest<E> {
         Ok(frames)
     }
 
-    /// Open frame, never any behind inline completion.
+    /// Open frame, if any; inline completion buffers none.
     ///
     /// # Errors
     ///
-    /// Never fails; `Ok` lets tiers flush every codec through one call.
+    /// Infallible; `Ok` lets tiers flush every codec through one call.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     pub fn finish(&mut self) -> Result<Option<Frame>, E> {
         Ok(None)

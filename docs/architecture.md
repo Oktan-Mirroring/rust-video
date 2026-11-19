@@ -45,19 +45,16 @@ Tiers own devices, submit, and frames. Models own spec
 values. The six platform and software tiers
 (`rust-video-sw`, `rust-video-vulkan`, `rust-video-vaapi`,
 `rust-video-d3d11`, `rust-video-d3d12`,
-`rust-video-mediacodec`) depend on `rust-video-caps` and on
-nothing else in the workspace outside dev-dependencies; no
-tier depends on another tier or on the facade. Codec models
+`rust-video-mediacodec`) depend on `rust-video-caps` alone
+in the workspace outside dev-dependencies. Codec models
 live two places: the six caps modules (`h264`, `h265`,
 `av1`, `av2`, `vp8`, `vp9`) with `Params` plus level tables
 read from the specifications, and the five namespace crates
 (`rust-video-h264`, `rust-video-h265`, `rust-video-av1`,
 `rust-video-av2`, `rust-video-vp9`), each one unit struct
 with no behavior; software behavior for those codecs lives
-in `rust-video-sw`. The models stay centralized rather than
-splitting one per codec crate: they version as one
-spec-checked set that no tier imports today, and a split
-fans tier dependencies out sixfold for no isolation gain. `rust-video-harness` drives tiers under
+in `rust-video-sw`. The models stay centralized as one
+spec-checked set. `rust-video-harness` drives tiers under
 test (vectors, oracles, synth inputs) and depends on the
 facade plus caps. `rust-video-livepack` packs coded video
 into TS and fMP4 and depends on no workspace crate. The
@@ -66,8 +63,8 @@ codec matrix in `../README.md` names every live cell.
 ## Data-plane ownership
 
 Packet and plane bytes are refcounted (`bytes::Bytes`); a
-clone shares the backing. The caller keeps the packet; the
-decoder never stores it. Each decoder owns its `FramePool`;
+clone shares the backing. The caller keeps the packet.
+Each decoder owns its `FramePool`;
 frames carry no pool handle, and shared buffers drop instead
 of rejoining the pool. GPU frames pin their device resources
 until dropped: a live Vulkan frame pins its export pair and
@@ -77,8 +74,8 @@ refcounted copies with no codec handle. Queues are bounded
 and explicit: livepack `BoundedQueue` under `DropOldest`
 evicts and reports, under `Block` refuses with `WouldBlock`
 for the caller to retry. Pools recycle instead of
-reallocating, leases account every byte, and nothing drops
-silently. Full rules: `runtime.md`.
+reallocating, and leases account every byte.
+Full rules: `runtime.md`.
 
 ## Threading
 
@@ -93,14 +90,13 @@ signal. D3D12: no shared lock, sessions take `&mut self`,
 fence waits park on the caller thread. MediaCodec: no handle
 crosses threads; platform callback threads push through
 `Send` senders and the driving thread polls. Software:
-`FfmpegDecoder` is `Send`, never `Sync`. No tier spawns a
-background thread; waits are per-stream and bounded, and one
-stalled stream never blocks another.
+`FfmpegDecoder` is `Send` without `Sync`. Every tier runs
+on the calling thread; waits are per-stream and bounded,
+and each stream owns its queue.
 
 ## Decline policy
 
-Selection happens up front; no tier reroutes past a miss on
-its own. `tier::resolve` fails typed when no tier fits.
+Selection happens up front. `tier::resolve` fails typed when no tier fits.
 Each `open` declines machines it cannot run on instead of
 erroring: Vulkan returns `Ok(None)` with `open_or_skip`
 naming the rung through `SkipReason`; VA-API declines with
@@ -117,13 +113,13 @@ tests skip loud without hardware or input.
 
 | Document | Owns |
 |---|---|
-| `vulkan-arch.md` | Vulkan tier binding, per-tier skeleton |
+| `vulkan-arch.md` | Vulkan tier architecture |
 | `vulkan.md` | Vulkan ops companion |
-| `vaapi-arch.md` | VA-API tier binding |
-| `vaapi.md` | VA-API port record, RPS audit, proof |
-| `d3d11-arch.md` | D3D11 ops binding |
-| `d3d12-arch.md` | D3D12 ops binding |
-| `mediacodec-arch.md` | MediaCodec tier binding |
+| `vaapi-arch.md` | VA-API tier architecture |
+| `vaapi.md` | VA-API scope, provenance, audit, proof |
+| `d3d11-arch.md` | D3D11 tier architecture |
+| `d3d12-arch.md` | D3D12 tier architecture |
+| `mediacodec-arch.md` | MediaCodec tier architecture |
 | `mediacodec.md` | MediaCodec gates reference |
 | `sw-codecs.md` | Software verdicts, figures, license |
 | `matrix.md` | Backend policy matrix |

@@ -1,12 +1,7 @@
 //! Coded-video access units and keyframe hooks.
 //!
-//! NAL types: [FFmpeg n7.1 `h264.h`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavcodec/h264.h)
-//! and [`hevc.h`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavcodec/hevc/hevc.h).
-//! OBU types: [FFmpeg n7.1 `av1.h`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavcodec/av1.h);
-//! frame-header bit order: [dav1d 1.5.1 `obu.c`](https://github.com/videolan/dav1d/blob/1.5.1/src/obu.c).
-//! VP8 tag: [RFC 6386 §9.1](https://datatracker.ietf.org/doc/html/rfc6386#section-9.1).
-//! VP9 header: [VP9 spec §6.2/§7.2](https://www.webmproject.org/vp9/); sync
-//! `0x498342`, bit order: [FFmpeg master `vpcc.c`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/vpcc.c).
+//! Types and bit orders follow `FFmpeg` n7.1, dav1d 1.5.1, RFC 6386,
+//! and the VP9 spec.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -122,8 +117,7 @@ impl Codec {
 
     /// ISO BMFF sample entry fourcc.
     ///
-    /// `Av2` never reaches a mux: no `TrackConfig` carries it, so this
-    /// arm is BLOCKED and pinned by decline tests, not by bytes.
+    /// `Av2` lacks a mux path; decline tests pin this arm.
     #[must_use]
     pub fn sample_entry(self) -> [u8; 4] {
         match self {
@@ -179,8 +173,13 @@ impl Codec {
     ///
     /// Reads `show_existing_frame` then `frame_type` at the frame header
     /// start; key iff bits are `0,00`. Streams using
-    /// `reduced_still_picture_header` omit the first bit and always
-    /// classify `false`; that shape never appears on the live path.
+    /// `reduced_still_picture_header` omit the first bit and classify
+    /// `false`.
+    ///
+    /// # Usage Notes
+    ///
+    /// Reduced still-picture headers classify `false`; keep them off the
+    /// live path.
     fn av1_frame_is_key(payload: &[u8]) -> bool {
         let mut rest = payload;
         while !rest.is_empty() {

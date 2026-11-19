@@ -1,11 +1,7 @@
 //! Fragmented MP4 / CMAF mux for H.264/H.265/AV1/VP9/VP8.
 //!
-//! Boxes: ISO/IEC 14496-12; `avcC`/`hvcC`: 14496-15; `av1C`:
-//! [AV1-ISOBMFF §2.3](https://aomediacodec.github.io/av1-isobmff/#av1codecconfigurationbox-section).
-//! `vpcC`: [VP9 MP4](https://www.webmproject.org/vp9/mp4/);
-//! [FFmpeg master `vpcc.c`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/vpcc.c).
-//! `cmfc`/`iso6` brands follow
-//! [FFmpeg n7.1 `movenc.c`](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/movenc.c).
+//! Boxes: ISO/IEC 14496-12; `avcC`/`hvcC`: 14496-15; `av1C`: AV1-ISOBMFF;
+//! `vpcC`: VP9 MP4. Spec pins live in `docs/livepack-ts-fmp4.md`.
 
 use std::fmt;
 
@@ -342,8 +338,8 @@ impl HevcConfig {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the record is short, not version 1, or uses
-    /// NALU lengths other than 4 bytes.
+    /// Returns `Err` when the record is short, carries another version,
+    /// or uses NALU lengths other than 4 bytes.
     pub fn from_hvcc_record(record: Vec<u8>) -> Result<Self, ConfigError> {
         if record.len() < 23 {
             return Err(ConfigError::BadHvcc("short record"));
@@ -537,20 +533,19 @@ impl FragmentMux {
 
     /// One access unit as a CMAF chunk: `moof` plus `mdat`.
     ///
-    /// H.264/H.265 payloads convert annex-B to 4-byte lengths;
-    /// AV1/VP9/VP8 payloads pass through untouched.
-    ///
-    /// # Arguments
-    ///
-    /// * `unit` - access unit to fragment.
-    /// * `duration_90k` - sample duration in 90 kHz ticks.
-    /// * `gate` - keyframe gate; a held unit advances nothing.
-    /// * `out` - chunk bytes sink.
-    ///
     /// # Errors
     ///
     /// Returns `Err` on codec mismatch, empty samples, oversized
     /// samples, zero duration, and NALU-less H.264/H.265 payloads.
+    ///
+    /// # Arguments
+    ///
+    /// * `unit` - access unit to fragment; H.264/H.265 payloads convert
+    ///   annex-B to 4-byte lengths, AV1/VP9/VP8 pass through.
+    /// * `duration_90k` - sample duration in 90 kHz ticks.
+    /// * `gate` - keyframe gate; a held unit holds output and sequence
+    ///   numbers.
+    /// * `out` - chunk bytes sink.
     pub fn push_sample(
         &mut self,
         unit: &AccessUnit,

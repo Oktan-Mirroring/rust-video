@@ -12,7 +12,7 @@ types in `crates/rust-video-caps/src/`, slots and queues in
 - Packet and plane bytes are refcounted (`bytes::Bytes`). A clone shares
   the backing; only `try_into_mut` on a unique handle reuses the buffer.
 - `Decoder::decode` borrows the packet and returns owned frames. The
-  caller keeps the packet; the decoder never stores it.
+  caller keeps the packet.
 - `GpuFrame` carries identity only (size, format, generation). It has no
   bytes accessor. CPU access is the explicit `try_to_cpu` call, which
   fails until a backend lands.
@@ -28,13 +28,11 @@ types in `crates/rust-video-caps/src/`, slots and queues in
 - Queues are bounded and explicit. `FrameSlot` holds the latest value;
   `BoundedQueue` under `DropOldest` evicts the oldest entry and returns
   it to the caller; under `Block` a full queue fails with `WouldBlock`
-  and the caller retries. Nothing is unbounded, nothing drops silently.
-- One stalled stream never blocks the pipeline: a full queue refuses or
-  evicts, it never parks the producer, and each stream owns its queue.
+  and the caller retries. Every queue is bounded.
+- A full queue refuses or evicts, and each stream owns its queue.
 - Sync is per-stream timeline semaphores: each stream advances its own
-  counter, and a wait names its stream plus value. No idle wait exists:
-  a wait always names the value it needs, and a stalled stream waits on
-  its own timeline only.
+  counter, and a wait names its stream plus value. A stalled stream
+  waits on its own timeline only.
 
 ## Export matrix
 
@@ -50,15 +48,13 @@ Variants are `cfg`-gated per target; behavior arrives with the tiers.
 Until a backend attaches, `export` and `try_to_cpu` return
 `BackendAbsent`.
 
-An unavailable export declines with the missing capability named;
-no tier reroutes past a miss on its own. Tier choice stays with the
-caller through `tier::resolve`: selection up front, never fallback
-afterward.
+An unavailable export declines with the missing capability named.
+Tier choice stays with the caller through `tier::resolve`:
+selection up front.
 
 ## VRAM budget
 
 - Each `SharedDevice` carries a byte budget. `try_acquire` leases bytes
   against it or fails with `OverBudget` naming requested and available.
 - A `Lease` releases on drop. Cloned handles share one budget.
-- Tier crates attach real devices later; the facade rule stands now:
-  no allocation beyond budget, no silent overrun.
+- No allocation runs past budget.

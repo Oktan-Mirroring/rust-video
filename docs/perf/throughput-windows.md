@@ -13,7 +13,7 @@ Debug test profile, ITERS=30 sync legs, 120-frame IP sustained legs, median of 3
 | FFmpeg | 9.0-full_build-www.gyan.dev (binaries only); +libx264 +libx265 +libvpx +libsvtav1 +libdav1d +cuvid +nvenc +d3d11va; no libopenh264, no linkable libav* |
 | rustc | 1.100.0 (0ef1bc386 2026-11-09) |
 | NVIDIA GPU | GeForce RTX 5080, driver 621.24, Vulkan 1.4.357, idle 30-32C unrestrained |
-| AMD GPU | Radeon integrated, Vulkan 1.3.287 (present, never selected) |
+| AMD GPU | Radeon integrated, Vulkan 1.3.287 (present, unselected) |
 
 ## Method
 
@@ -107,7 +107,7 @@ Sustained overlap, 120-frame IP both sides:
 
 Every leg shares gold's exact bytes; gold stays resident while rv legs hand CPU frames back: each percent favors gold. Downloaded pairs per codec are the shape-matched d3d legs: gold 861/831/846/873 against rv d3d11 sustained 1086/957/1108/883 (h264/h265/av1/vp9), gold with a 373 MB file write, rv with CPU frames in hand.
 
-Sync, rv legs with gold alongside (shapes never match, no percents):
+Sync, rv legs with gold alongside (shapes differ; unpercented):
 
 | Leg | FFmpeg resident | rv sync |
 |---|---|---|

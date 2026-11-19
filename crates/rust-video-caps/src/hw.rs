@@ -1,8 +1,7 @@
 //! Hardware tier capability queries.
 //!
-//! No vendor publishes fixed caps, so this module holds queried values,
-//! never constants: Vulkan maxCodedExtent, VA-API driver limits, D3D11
-//! per-adapter profiles, `MediaCodec` supported ranges.
+//! Runtime-queried values: Vulkan maxCodedExtent, VA-API driver limits,
+//! D3D11 per-adapter profiles, `MediaCodec` supported ranges.
 
 use crate::common::Violation;
 

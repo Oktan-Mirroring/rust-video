@@ -454,7 +454,7 @@ impl<F> FrameChannel<F> {
 ///
 /// `try_send` decodes now and queues output through the bound plus policy;
 /// consumers poll, block, or drain through a callback. Slow consumers drop
-/// frames per policy instead of growing memory.
+/// frames per policy; memory stays bounded.
 pub struct DecoderPump<D: Decoder> {
     /// Sync decode behind sends.
     decoder: D,

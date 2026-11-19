@@ -2,8 +2,8 @@
 """Every tests/throughput.rs needs serial legs in the justfile.
 
 Throughput binaries stay out of parallel `cargo test` (test = false in
-each manifest) and run one at a time under the benches recipe, so bars
-measure an unloaded box. A tier without legs never runs its bars.
+each manifest) and run one at a time under the benches recipe. A tier
+without legs skips its bars.
 """
 import sys
 from pathlib import Path

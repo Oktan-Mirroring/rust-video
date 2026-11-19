@@ -64,14 +64,14 @@ Monochrome only in profiles 0 and 2. Plane count is 1 for monochrome,
 
 ## Quirks
 
-Film grain (S6.8.20, S7.18) synthesizes onto output arrays after decode
-and is never stored to references; absent grain parameters require
+Film grain (S6.8.20, S7.18) synthesizes onto output arrays after decode;
+references hold the pre-grain pixels. Absent grain parameters require
 bit-identical output. Superres (S5.9.8, S6.8.7) scales horizontally
 only with denominator 9-16 over 8; level constraints use the upscaled
 width; rightmost tile minimum width is 128 with superres, 64 without;
 each tile covers at most 4096x2304. Switch frames (type 3, S6.8.2)
 overwrite all references without forcing intra. Eight reference slots
-(S4); no HEVC-style DPB size table. Parallelism guard:
+(S4). Parallelism guard:
 MaxTileSize x NumHeaders x TPden / TPnum at most 588251136 (Annex A.3).
 Max luma tile width 4096 samples (S4).
 

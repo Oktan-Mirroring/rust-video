@@ -244,7 +244,7 @@ impl Nalu {
 /// Start-code scanner buffering partial NAL units across pushes.
 #[derive(Default)]
 pub struct NaluSplitter {
-    /// Bytes not yet emitted.
+    /// Bytes awaiting emission.
     buffer: Vec<u8>,
     /// Rescan floor; keeps a split start code reparseable.
     floor: usize,

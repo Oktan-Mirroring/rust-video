@@ -14,7 +14,7 @@ Three tiers. What the behaviour reaches picks the tier.
 `just ci` stays network-free: it runs unit gates only. Pixel proof lives in
 `just e2e`, which needs the vector corpus from `just vectors` and fails loudly
 without it. Corpus-gated tests compile out when the corpus is absent (the
-facade build script sets `have_corpus`); nothing skips silently.
+facade build script sets `have_corpus`).
 
 `docs/testing/manifest.toml` registers every capability. `docs/testing/vectors.md`
 names the vector sources and their verification state. `docs/testing/oracles.toml`

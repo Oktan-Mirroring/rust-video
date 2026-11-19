@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
 //! Allocation counting for zero-copy tests.
 //!
-//! Install [`CountingAlloc`] as the test binary allocator, then assert the
-//! measured path allocates nothing.
+//! Install [`CountingAlloc`] as the test binary allocator, then assert
+//! zero allocations on the measured path.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -58,7 +58,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
 /// # Arguments
 ///
 /// * `warmup` - one unlabeled run settling caches and lazy state.
-/// * `measured` - the path under test; must not allocate.
+/// * `measured` - the path under test; allocates zero.
 ///
 /// # Panics
 ///

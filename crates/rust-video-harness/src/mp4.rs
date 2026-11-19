@@ -259,7 +259,7 @@ struct Track {
     length_size: usize,
     /// Extradata sets with start codes.
     extradata: Vec<u8>,
-    /// HEVC NAL headers, not H.264.
+    /// True for HEVC NAL headers.
     hevc: bool,
     /// `(first_chunk_1based, samples_per_chunk)` runs.
     chunks: Vec<(usize, usize)>,

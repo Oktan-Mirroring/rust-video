@@ -3,9 +3,9 @@
 # Compatibility
 
 One binary spans every driver, OS release, and device it can run on.
-Build time varies what compiles; runtime varies what runs. Never both
-for one axis. Tier tags: **[T1]** fetched primary, **[T2]** consistent
-secondary, **[?]** unresolved, never filled. All fetches 2026-10-11;
+Build time varies what compiles; runtime varies what runs; each axis
+varies exactly one way. Tier tags: **[T1]** fetched primary, **[T2]**
+consistent secondary, **[?]** unresolved, left blank. All fetches 2026-10-11;
 ash, ndk-crate, libva, NDK, and CDD pins re-verified 2026-10-15.
 
 ## Pins
@@ -27,19 +27,19 @@ ash, ndk-crate, libva, NDK, and CDD pins re-verified 2026-10-15.
 
 Headers 1.3.281 via ash 0.38, latest ash release [T1]. Device floor
 for any video op is Vulkan 1.3: `video_queue` requires 1.3 in the
-registry, and all video ops remain KHR extensions, never promoted
+registry, and all video ops remain KHR extensions
 [T1, vk.xml]. Missing from ash: `encode_av1` (spec 1.3.302),
 `decode_vp9` (spec 1.4.317), `maintenance2`, quantization-map and
 intra-refresh extensions [T1, Khronos news].
 
-Rules: dlopen the loader, never link it (`vulkan-1.dll` /
+Rules: dlopen the loader (`vulkan-1.dll` /
 `libvulkan.so.1` per the loader interface doc) [T1]. Create the
 instance at API 1.0 for maximum driver inclusion, then negotiate up
 per device: instance version, device properties, extension strings,
 then video capabilities and format properties per codec op [T1,
 docs.vulkan.org]. Query before every use. Missing loader, pre-1.3
 drivers, or absent video extensions mean the tier declines with its
-cause named, never degraded video: video cannot exist below 1.3, so
+cause named: video cannot exist below 1.3, so
 a miss is decline-only and `tier::resolve` selects another tier.
 Hand-write the two missing ash extension modules against
 registry vk.xml inside `rust-video-vulkan`, each behind its
@@ -51,7 +51,7 @@ coverage is [?].
 minSdk 21. NDK ladder from `NdkMediaCodec.h` [T1]: 21 sync
 create/configure/buffers/queue; 26 input surfaces and parameters;
 28 async callbacks; 31 low-latency and HDR keys; 33 frame-rendered
-callbacks; nothing above 33 exists, so ndk 0.9.0 covers the whole
+callbacks; 33 is the top rung, so ndk 0.9.0 covers the whole
 surface [T1]. Vulkan tier needs API 24+ (CDD 7.0 lists `libvulkan.so`
 for android-24; CDD 14 section 3.3.1 retains it) [T1]. Certified
 handhelds from API 34 must decode H.264/H.265/VP8/VP9/AV1 and
@@ -61,8 +61,8 @@ attempt creation and handle absence.
 Rules: `ndk 0.9.0` with `media` plus fixed `api-level-28`, NDK
 r30, plain `cargo check --target` (no `cargo-ndk`). Every call above
 21 sits behind an `ApiLevel` gate over
-`ndk_sys::android_get_device_api_level`; missing API skips that op,
-never crashes, never silently degrades. NDK has no codec-list API,
+`ndk_sys::android_get_device_api_level`; missing API skips that op.
+NDK has no codec-list API,
 so codec choice over JNI `MediaCodecList` is planned [?]. Quirk
 table `quirks.toml` keys `(soc, codec)` to entries and ships 4
 (2 confirmed, 2 suspected), loader tested. Emulator CI over
@@ -81,8 +81,8 @@ D3D11: floor is Windows 8 desktop, the `ID3D11VideoDevice` minimum
 [T1, MS Learn]. The tier decodes H.264 over `ID3D11VideoDevice` /
 `ID3D11VideoContext` with the `windows` binding at pin 0.62.2 [T1].
 Decoder GUIDs come from the windows-crate constants only
-(H.264, HEVC, VP9, AV1 profiles matched [T1]); never
-hand-copy hex. Runtime enumeration per adapter covers hardware
+(H.264, HEVC, VP9, AV1 profiles matched [T1]).
+Runtime enumeration per adapter covers hardware
 with WARP and the basic adapter declining; HEVC, VP9, AV1, MPEG-2,
 and VC-1 profiles probe while their picture builders stay pending.
 Encode runs over MediaFoundation encoder MFTs probed at runtime:
@@ -92,8 +92,7 @@ without an MFT [T1, MS Learn].
 D3D12: floor is Windows 10, the `ID3D12VideoDevice` minimum [T1, MS Learn].
 The tier probes decode profiles and encode support per adapter over
 `CheckFeatureSupport` with the `windows` binding at pin 0.62.2 [T1];
-decoder GUIDs come from the windows-crate constants only, never hand-copy
-hex. Video encode probes H.264, HEVC, and AV1 per adapter; sessions open H.264 and HEVC while the AV1 args builder stays pending, and other codecs decline loudly.
+decoder GUIDs come from the windows-crate constants only. Video encode probes H.264, HEVC, and AV1 per adapter; sessions open H.264 and HEVC while the AV1 args builder stays pending, and other codecs decline loudly.
 D3D12 H.264 encode on NVIDIA 596.36 emits corrupt IDR slices on
 noise-like input (2026-10-15 inquest, RTX 3060 Laptop): byte-identical
 corruption through this tier and ffmpeg `h264_d3d12va`, parameter sets
@@ -101,9 +100,7 @@ exonerated; retest on 617.42 or later.
 D3D12 HEVC encode on NVIDIA 596.36 reports codec support but fails the
 codec-configuration support query, so the runtime rejects encoder
 creation with a loud over-caps miss; retest on 617.42 or later.
-HEVC decode is IDR-only: inter pictures miss loud (`inter picture needs
-references`) and non-IDR intra pictures miss loud (`non-IDR intra needs POC
-tracking`); H.264 carries a full decoded picture buffer. Cropped streams
+Cropped streams
 decode to visible-size GPU textures; encode sessions pad the visible
 extent to the macroblock grid and signal the visible rectangle (frame
 crop, conformance window), pixels staying device-resident. H.264 encode
@@ -113,7 +110,7 @@ without a validation message otherwise.
 wgpu is not a decode tier: its `Backends` list has no D3D11 and no
 video API [T1, docs.rs]. Allowed roles are upload/render interop
 behind a facade feature only, backend chosen at runtime. No consumer
-exists, so the dependency stays out and nothing is pinned; the
+exists, so the dependency stays out; the
 30.0.1 pin above applies only if it lands.
 
 ## MSRV
@@ -122,8 +119,7 @@ Floor 1.87, declared as workspace `rust-version`. Every pin
 satisfies it [T1]. CI enforces with the `msrv` job running the `just
 msrv` recipe (clippy plus test) on the pinned 1.87.0 toolchain.
 Any dependency whose `rust_version` exceeds the floor is rejected at
-review. A bump is a minor-version decision with a changelog note,
-never silent.
+review. A bump is a minor-version decision with a changelog note.
 
 ## Features vs runtime
 
@@ -141,7 +137,7 @@ never silent.
 
 Anti-rule: no `cfg` on driver versions, no `cfg` on OS API levels,
 no build script baking host GPU state into the binary. The corpus
-script gates tests only, never behavior.
+script gates tests only.
 
 ## CI matrix
 
@@ -168,8 +164,8 @@ gates name the feature directly. Codecs, `d3d11`, and `d3d12` stay
 opt-in. No
 `vp8`, no `sw` wiring, no `wgpu-interop` (planned [?]).
 Shared vocabulary (frames, packets, backend traits) lives in the
-leaf `rust-video-caps`; tier crates build on it, never on the
-facade outside dev-dependencies, and never on each other. The
+leaf `rust-video-caps`; tier crates build on caps alone,
+plus the facade in dev-dependencies. The
 facade resolves tiers over caller-supplied `Capabilities` so users
 write one code path. Adding a tier is minor; removing is major.
 

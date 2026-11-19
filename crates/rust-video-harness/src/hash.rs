@@ -18,7 +18,7 @@ impl FrameHash {
     ///
     /// # Panics
     ///
-    /// Never panics: writing to a `String` cannot fail.
+    /// Panics if `String` writing fails.
     #[must_use]
     pub fn hex(&self) -> String {
         use std::fmt::Write as _;

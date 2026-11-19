@@ -1,4 +1,4 @@
-//! Corpus-backed facade checks; host builds without a corpus compile this file to nothing.
+//! Corpus-backed facade checks; host builds without a corpus compile this file empty.
 
 #[cfg(have_corpus)]
 use std::path::PathBuf;
