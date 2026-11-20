@@ -1,5 +1,6 @@
 //! AV1 decoder over a negotiated Vulkan device.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ use crate::dpb::ReferenceId;
 use crate::error::{ParseError, VulkanError};
 use crate::ladder::CodecOp;
 use crate::raw::ExportPair;
-use crate::session::decode::{reference_slot, DpbMeta, Session};
+use crate::session::decode::{as_extent, reference_slot, DpbMeta, Session};
 use crate::session::geometry::SessionGeometry;
 use crate::session::params::ParamsTemplate;
 
@@ -93,6 +94,34 @@ impl ShowStore {
     }
 }
 
+/// Held show-existing display, built now or when its frame lands.
+enum HeldKind {
+    /// Display frames built at the replay.
+    Ready(Vec<VulkanFrame>),
+    /// Frame to show, unlanded at the replay.
+    Pending {
+        /// Stable identity of the stored frame.
+        id: ReferenceId,
+        /// Display frames skip the readback on the GPU path.
+        gpu: bool,
+        /// Display order count of the replay.
+        poc: i32,
+    },
+}
+
+/// Show-existing display held past earlier-submitted pictures.
+///
+/// Arrival order is display order at reorder depth zero, so the replay
+/// emits only after everything submitted before it lands.
+struct HeldReplay {
+    /// Display payload, ready or awaiting its frame.
+    kind: HeldKind,
+    /// Ids leaving the DPB with this display.
+    releases: Vec<ReferenceId>,
+    /// Submit order at the replay; smaller orders precede it.
+    seq: u64,
+}
+
 /// AV1 decoder over a negotiated Vulkan device.
 ///
 /// Thread-local: parser state holds `Rc` tables, so the decoder stays on
@@ -130,6 +159,14 @@ pub struct Av1Decoder<'a> {
     shown: ShowStore,
     /// Display order counter for show-existing frames.
     show_seq: i32,
+    /// Store evictions withheld for outstanding replays.
+    deferred_evicts: Vec<ReferenceId>,
+    /// Submit order counter behind holdback.
+    submit_seq: u64,
+    /// Replays awaiting earlier-submitted pictures.
+    held: VecDeque<HeldReplay>,
+    /// Landed frames newer than an outstanding replay, by submit order.
+    emit_buf: BTreeMap<u64, Vec<VulkanFrame>>,
     /// Accumulated submit-core gauges.
     stats: SubmitStats,
     /// Armed fault for the next submit, applied once a session runs.
@@ -176,6 +213,10 @@ impl<'a> Av1Decoder<'a> {
             ready: Vec::new(),
             shown: ShowStore::new(),
             show_seq: 0,
+            deferred_evicts: Vec::new(),
+            submit_seq: 0,
+            held: VecDeque::new(),
+            emit_buf: BTreeMap::new(),
             stats: SubmitStats::new(),
             fault: false,
         })
@@ -323,6 +364,9 @@ impl<'a> Av1Decoder<'a> {
             ref_bufs,
             pending,
             shown,
+            submit_seq,
+            held,
+            deferred_evicts,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -330,24 +374,18 @@ impl<'a> Av1Decoder<'a> {
         };
         let body = picture.picture();
         let header = picture.header();
-        release_ids(session, shown, picture.pre());
+        Self::evict_partitioned(
+            &mut *session,
+            &mut *shown,
+            &mut *deferred_evicts,
+            held,
+            picture.pre(),
+        );
         let setup_id = body.id().unwrap_or_else(|| scratch.next());
         let setup_slot = claim_slot(session.slots_mut(), setup_id)?;
-        let extent = {
-            let (width, height) = session.geometry().coded();
-            vk::Extent2D { width, height }
-        };
-        let refs = collect_av1_refs(session, picture)?;
-        let ref_entries = fill_av1_refs(session, &refs);
-        let begin_entries = begin_av1_entries(session);
-        let dpb_of = |std| vk::VideoDecodeAV1DpbSlotInfoKHR {
-            p_std_reference_info: std,
-            ..Default::default()
-        };
-        ref_bufs.fill(&ref_entries, extent, "decode slot", dpb_of)?;
-        begin_bufs.fill(&begin_entries, extent, "begin slot", dpb_of)?;
-        let ref_slots = ref_bufs.slots(&ref_entries, "decode slot")?;
-        let begin_slots = begin_bufs.slots(&begin_entries, "begin slot")?;
+        let extent = as_extent(session.geometry().coded());
+        let (ref_slots, begin_slots) =
+            fill_av1_chains(session, picture, ref_bufs, begin_bufs, extent)?;
         let setup_std = fill_reference(
             header.order_hint,
             header.frame_type.id(),
@@ -396,8 +434,14 @@ impl<'a> Av1Decoder<'a> {
             gpu,
         )
         .inspect_err(|_| release_ids(session, shown, picture.post()))?;
-        release_ids(session, shown, picture.post());
-        pending.push(submitted);
+        Self::evict_partitioned(
+            &mut *session,
+            &mut *shown,
+            &mut *deferred_evicts,
+            held,
+            picture.post(),
+        );
+        Self::enqueue(submit_seq, pending, submitted);
         Ok(())
     }
 
@@ -448,6 +492,7 @@ impl<'a> Av1Decoder<'a> {
                     if changed {
                         self.session = None;
                         self.shown.clear();
+                        self.deferred_evicts.clear();
                     }
                     self.seq = Some(seq);
                 }
@@ -476,37 +521,54 @@ impl<'a> Av1Decoder<'a> {
                             what: "av1 show-existing across cpu/gpu paths".to_owned(),
                         });
                     }
-                    let drained = self.drain()?;
-                    out.extend(drained);
-                    if let Some(session) = self.session.as_mut() {
-                        for release in &releases {
-                            if let Some(slot) = session.slots().slot_of(*release) {
-                                session.set_meta(slot, None);
-                            }
-                            session.slots_mut().release(*release);
+                    if releases.contains(&id) {
+                        out.extend(self.drain()?);
+                        if let Some(session) = self.session.as_mut() {
+                            release_ids(session, &mut self.shown, &releases);
+                        } else {
+                            self.shown.evict(&releases);
                         }
-                    }
-                    self.shown.evict(&releases);
-                    let Some(stored) = self.shown.get(id) else {
                         return Err(ParseError::MissingSet {
                             id: u32::try_from(id.0).unwrap_or(0),
                         }
                         .into());
-                    };
+                    }
+                    let stored = self.shown.get(id).map(|stored| {
+                        (
+                            stored.size,
+                            stored.cpu.clone(),
+                            stored.gpu.clone(),
+                            stored.layout,
+                        )
+                    });
                     let poc = self.show_seq;
                     self.show_seq = self.show_seq.wrapping_add(1);
-                    let (cpu, pair) = if gpu {
-                        (None, stored.gpu.as_ref())
+                    let seq = self.submit_seq;
+                    if let Some((size, cpu, gpu_pair, layout)) = stored {
+                        let (cpu, pair) = if gpu {
+                            (None, gpu_pair.as_ref())
+                        } else {
+                            (cpu.as_ref(), None)
+                        };
+                        let frames = self.sink.emit_stored(size, cpu, pair, poc, layout)?;
+                        self.held.push_back(HeldReplay {
+                            kind: HeldKind::Ready(frames),
+                            releases,
+                            seq,
+                        });
+                    } else if self.inflight_has(id) {
+                        self.held.push_back(HeldReplay {
+                            kind: HeldKind::Pending { id, gpu, poc },
+                            releases,
+                            seq,
+                        });
                     } else {
-                        (stored.cpu.as_ref(), None)
-                    };
-                    out.extend(self.sink.emit_stored(
-                        stored.size,
-                        cpu,
-                        pair,
-                        poc,
-                        stored.layout,
-                    )?);
+                        return Err(ParseError::MissingSet {
+                            id: u32::try_from(id.0).unwrap_or(0),
+                        }
+                        .into());
+                    }
+                    out.extend(self.release_ready()?);
                 }
             }
         }
@@ -547,6 +609,13 @@ impl<'a> Av1Decoder<'a> {
     ///
     /// Empty when nothing is submitted.
     fn collect_one(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = self.collect_one_inner()?;
+        out.extend(self.release_ready()?);
+        Ok(out)
+    }
+
+    /// Oldest submitted picture without releasing held replays.
+    fn collect_one_inner(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         if self.pending.is_empty() && self.sink.launched.is_empty() {
             return Ok(Vec::new());
         }
@@ -560,6 +629,7 @@ impl<'a> Av1Decoder<'a> {
             return self.collect_launched_one();
         }
         let picture = self.pending.remove(0);
+        let seq = picture.seq;
         let start = Instant::now();
         session.wait_pending(picture.pending)?;
         let engine_wait = start.elapsed();
@@ -574,11 +644,12 @@ impl<'a> Av1Decoder<'a> {
             engine_wait,
         )?;
         // Inline surface landings retain like launched copies.
-        let mut out = if pair.is_some() {
+        let landed = if pair.is_some() {
             self.finish_retained(emit, show_id, pair.as_ref(), frames)
         } else {
             frames
         };
+        let mut out = self.emit_or_buffer(seq, landed);
         if !out.is_empty() || self.sink.launched.is_empty() {
             return Ok(out);
         }
@@ -600,7 +671,9 @@ impl<'a> Av1Decoder<'a> {
         };
         let (bytes, release, copy) = done.into_parts();
         release.unmap();
-        self.land_retained(launched, bytes, copy).map(Some)
+        let seq = launched.picture.seq;
+        self.land_retained(launched, bytes, copy)
+            .map(|frames| Some(self.emit_or_buffer(seq, frames)))
     }
 
     /// Oldest launched copy into display frames, waiting for it.
@@ -611,7 +684,9 @@ impl<'a> Av1Decoder<'a> {
         if let Some(done) = self.sink.readback.collect() {
             let (bytes, release, copy) = done.into_parts();
             release.unmap();
-            return self.land_retained(launched, bytes, copy);
+            let seq = launched.picture.seq;
+            let frames = self.land_retained(launched, bytes, copy)?;
+            return Ok(self.emit_or_buffer(seq, frames));
         }
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
@@ -620,10 +695,12 @@ impl<'a> Av1Decoder<'a> {
         if let Some(release) = launched.release.take() {
             release.unmap();
         }
+        let seq = launched.picture.seq;
         let mut buffer = self.sink.pooled(launched.size, launched.coded);
         let copy_start = Instant::now();
         session.copy_pending_into(launched.picture.pending, &mut buffer)?;
-        self.land_retained(launched, buffer, copy_start.elapsed())
+        let frames = self.land_retained(launched, buffer, copy_start.elapsed())?;
+        Ok(self.emit_or_buffer(seq, frames))
     }
 
     /// Land one launched copy, retaining reference frames.
@@ -675,6 +752,20 @@ impl<'a> Av1Decoder<'a> {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
+        match self.collect_one_timeout_inner(timeout)? {
+            Some(mut frames) => {
+                frames.extend(self.release_ready()?);
+                Ok(Some(frames))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Oldest submitted picture within `timeout`, without held replays.
+    fn collect_one_timeout_inner(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
         if self.pending.is_empty() && self.sink.launched.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -694,12 +785,15 @@ impl<'a> Av1Decoder<'a> {
             };
             let (bytes, release, copy) = done.into_parts();
             release.unmap();
-            return Ok(Some(self.land_retained(launched, bytes, copy)?));
+            let seq = launched.picture.seq;
+            let frames = self.land_retained(launched, bytes, copy)?;
+            return Ok(Some(self.emit_or_buffer(seq, frames)));
         }
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
         };
         let picture = self.pending.remove(0);
+        let seq = picture.seq;
         let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         let start = Instant::now();
         if !session.wait_pending_timeout(picture.pending, budget)? {
@@ -718,11 +812,12 @@ impl<'a> Av1Decoder<'a> {
             engine_wait,
         )?;
         // Inline surface landings retain like launched copies.
-        let frames = if pair.is_some() {
+        let landed = if pair.is_some() {
             self.finish_retained(emit, show_id, pair.as_ref(), frames)
         } else {
             frames
         };
+        let frames = self.emit_or_buffer(seq, landed);
         if !frames.is_empty() {
             return Ok(Some(frames));
         }
@@ -737,7 +832,9 @@ impl<'a> Av1Decoder<'a> {
         };
         let (bytes, release, copy) = done.into_parts();
         release.unmap();
-        Ok(Some(self.land_retained(launched, bytes, copy)?))
+        let seq = launched.picture.seq;
+        let frames = self.land_retained(launched, bytes, copy)?;
+        Ok(Some(self.emit_or_buffer(seq, frames)))
     }
 
     /// Collect signaled pictures in order, stopping at the first pending one.
@@ -759,8 +856,166 @@ impl<'a> Av1Decoder<'a> {
     /// Collect every submitted picture, retaining reference frames.
     fn drain(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         let mut out = Vec::new();
-        while !self.pending.is_empty() || !self.sink.launched.is_empty() {
+        while !self.pending.is_empty() || !self.sink.launched.is_empty() || !self.held.is_empty() {
+            if self.pending.is_empty() && self.sink.launched.is_empty() {
+                out.extend(self.release_ready()?);
+                continue;
+            }
             out.extend(self.collect_one()?);
+        }
+        Ok(out)
+    }
+
+    /// Landed `frames` of submit order `seq`, buffered past held replays.
+    ///
+    /// Older than every outstanding replay emits at once; newer waits in
+    /// submit order until the replays ahead of it release.
+    fn emit_or_buffer(&mut self, seq: u64, frames: Vec<VulkanFrame>) -> Vec<VulkanFrame> {
+        if frames.is_empty() {
+            return frames;
+        }
+        let newer = self.held.front().is_some_and(|head| seq >= head.seq);
+        if !newer {
+            return frames;
+        }
+        self.emit_buf.entry(seq).or_default().extend(frames);
+        Vec::new()
+    }
+
+    /// Evict `ids`, withholding store bytes awaited by held replays.
+    ///
+    /// Slots release at once; bytes stay until the last awaiting replay
+    /// resolves, so a land between hold and resolve still finds them.
+    fn evict_partitioned(
+        session: &mut Session,
+        shown: &mut ShowStore,
+        deferred: &mut Vec<ReferenceId>,
+        held: &VecDeque<HeldReplay>,
+        ids: &[ReferenceId],
+    ) {
+        let (awaited, free): (Vec<ReferenceId>, Vec<ReferenceId>) =
+            ids.iter().copied().partition(|id| held_awaits(held, *id));
+        release_ids(session, shown, &free);
+        release_slots(session, &awaited);
+        deferred.extend(awaited);
+    }
+
+    /// Store-evict deferred ids no held replay awaits.
+    fn sweep_deferred(&mut self) {
+        let mut drop = Vec::new();
+        for id in &self.deferred_evicts {
+            if !held_awaits(&self.held, *id) {
+                drop.push(*id);
+            }
+        }
+        if !drop.is_empty() {
+            self.deferred_evicts.retain(|id| !drop.contains(id));
+            self.shown.evict(&drop);
+        }
+    }
+
+    /// Tag `submitted` in submit order and queue it.
+    fn enqueue(
+        submit_seq: &mut u64,
+        pending: &mut Vec<PendingPicture>,
+        mut submitted: PendingPicture,
+    ) {
+        submitted.seq = *submit_seq;
+        *submit_seq = submit_seq.wrapping_add(1);
+        pending.push(submitted);
+    }
+
+    /// True when `id` rides an unlanded picture.
+    fn inflight_has(&self, id: ReferenceId) -> bool {
+        self.pending
+            .iter()
+            .any(|picture| picture.show_id == Some(id))
+            || self
+                .sink
+                .launched
+                .iter()
+                .any(|launched| launched.picture.show_id == Some(id))
+    }
+
+    /// Replays whose earlier-submitted pictures all landed, in order.
+    ///
+    /// Each release applies its deferred DPB eviction, then emits its
+    /// frames with buffered newer frames in submit order.
+    fn release_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = Vec::new();
+        loop {
+            let Some(replay) = self.held.pop_front() else {
+                break;
+            };
+            let HeldReplay {
+                kind,
+                releases,
+                seq,
+            } = replay;
+            let older = self.pending.iter().any(|picture| picture.seq < seq)
+                || self
+                    .sink
+                    .launched
+                    .iter()
+                    .any(|launched| launched.picture.seq < seq);
+            if older {
+                self.held.push_front(HeldReplay {
+                    kind,
+                    releases,
+                    seq,
+                });
+                break;
+            }
+            let frames = match kind {
+                HeldKind::Ready(frames) => frames,
+                HeldKind::Pending { id, gpu, poc } => {
+                    let stored = self.shown.get(id).map(|stored| {
+                        (
+                            stored.size,
+                            stored.cpu.clone(),
+                            stored.gpu.clone(),
+                            stored.layout,
+                        )
+                    });
+                    let Some((size, cpu, gpu_pair, layout)) = stored else {
+                        if self.inflight_has(id) {
+                            self.held.push_front(HeldReplay {
+                                kind: HeldKind::Pending { id, gpu, poc },
+                                releases,
+                                seq,
+                            });
+                            break;
+                        }
+                        return Err(ParseError::MissingSet {
+                            id: u32::try_from(id.0).unwrap_or(0),
+                        }
+                        .into());
+                    };
+                    let (cpu, pair) = if gpu {
+                        (None, gpu_pair.as_ref())
+                    } else {
+                        (cpu.as_ref(), None)
+                    };
+                    self.sink.emit_stored(size, cpu, pair, poc, layout)?
+                }
+            };
+            if let Some(session) = self.session.as_mut() {
+                release_ids(session, &mut self.shown, &releases);
+            } else {
+                self.shown.evict(&releases);
+            }
+            self.emit_buf.insert(seq, frames);
+            let next = self.held.front().map_or(u64::MAX, |head| head.seq);
+            let ready: Vec<u64> = self
+                .emit_buf
+                .keys()
+                .copied()
+                .take_while(|order| *order < next)
+                .collect();
+            for order in ready {
+                out.extend(self.emit_buf.remove(&order).unwrap_or_default());
+            }
+            self.sweep_deferred();
         }
         Ok(out)
     }
@@ -882,15 +1137,26 @@ impl SplitDecode for Av1Decoder<'_> {
     }
 }
 
-/// Release `ids` from the session DPB, clearing metadata and retained frames.
-fn release_ids(session: &mut Session, shown: &mut ShowStore, ids: &[ReferenceId]) {
-    shown.evict(ids);
+/// True when a held replay awaits the landing frame of `id`.
+fn held_awaits(held: &VecDeque<HeldReplay>, id: ReferenceId) -> bool {
+    held.iter()
+        .any(|held| matches!(&held.kind, HeldKind::Pending { id: want, .. } if *want == id))
+}
+
+/// Release `ids` from the session DPB, clearing metadata.
+fn release_slots(session: &mut Session, ids: &[ReferenceId]) {
     for id in ids {
         if let Some(slot) = session.slots().slot_of(*id) {
             session.set_meta(slot, None);
         }
         session.slots_mut().release(*id);
     }
+}
+
+/// Release `ids` from the session DPB, clearing metadata and retained frames.
+fn release_ids(session: &mut Session, shown: &mut ShowStore, ids: &[ReferenceId]) {
+    shown.evict(ids);
+    release_slots(session, ids);
 }
 
 /// Reference name slot indices of `picture`, negative when unclaimed.
@@ -946,6 +1212,41 @@ fn av1_codec_info<'a>(
 ///
 /// Returns `Err` when a cited reference left the session; the caller
 /// resyncs instead of submitting a dangling `-1`.
+/// Reference plus begin slot chains over the live DPB.
+fn fill_av1_chains<'b>(
+    session: &Session,
+    picture: &Av1Picture,
+    ref_bufs: &'b mut ChainBufs<
+        ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+        vk::VideoDecodeAV1DpbSlotInfoKHR<'static>,
+    >,
+    begin_bufs: &'b mut ChainBufs<
+        ash::vk::native::StdVideoDecodeAV1ReferenceInfo,
+        vk::VideoDecodeAV1DpbSlotInfoKHR<'static>,
+    >,
+    extent: vk::Extent2D,
+) -> Result<
+    (
+        Vec<vk::VideoReferenceSlotInfoKHR<'b>>,
+        Vec<vk::VideoReferenceSlotInfoKHR<'b>>,
+    ),
+    VulkanError,
+> {
+    let refs = collect_av1_refs(session, picture)?;
+    let ref_entries = fill_av1_refs(session, &refs);
+    let begin_entries = begin_av1_entries(session);
+    let dpb_of = |std| vk::VideoDecodeAV1DpbSlotInfoKHR {
+        p_std_reference_info: std,
+        ..Default::default()
+    };
+    ref_bufs.fill(&ref_entries, extent, "decode slot", dpb_of)?;
+    begin_bufs.fill(&begin_entries, extent, "begin slot", dpb_of)?;
+    Ok((
+        ref_bufs.slots(&ref_entries, "decode slot")?,
+        begin_bufs.slots(&begin_entries, "begin slot")?,
+    ))
+}
+
 fn collect_av1_refs(
     session: &Session,
     picture: &Av1Picture,

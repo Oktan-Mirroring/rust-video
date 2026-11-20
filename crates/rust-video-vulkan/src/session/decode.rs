@@ -649,7 +649,7 @@ fn check_crop_window(geometry: &SessionGeometry) -> Result<(), VulkanError> {
 }
 
 /// `(u32, u32)` as a Vulkan extent.
-fn as_extent(extent: (u32, u32)) -> vk::Extent2D {
+pub(crate) fn as_extent(extent: (u32, u32)) -> vk::Extent2D {
     vk::Extent2D {
         width: extent.0,
         height: extent.1,

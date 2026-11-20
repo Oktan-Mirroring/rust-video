@@ -977,6 +977,8 @@ pub(crate) struct PendingPicture {
     pub(crate) show_id: Option<ReferenceId>,
     /// Export lease behind a GPU submit, absent on the CPU path.
     pub(crate) lease: Option<ExportLease>,
+    /// Submit order behind AV1 show-existing holdback.
+    pub(crate) seq: u64,
 }
 
 /// Queue-submit one picture without waiting.
@@ -1033,6 +1035,7 @@ pub(crate) fn plan_submit(
         emit: plan.emit,
         show_id: body.is_reference().then_some(plan.setup_id),
         lease,
+        seq: 0,
     })
 }
 
