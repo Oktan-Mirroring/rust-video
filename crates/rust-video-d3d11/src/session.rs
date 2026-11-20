@@ -332,8 +332,7 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views or when the driver
-    /// refuses the copy.
+    /// Returns `Err` for a slot outside the views.
     pub(crate) fn copy_slot(&self, slot: u8) -> Result<(), D3d11Error> {
         let lane = self
             .slots
@@ -341,9 +340,29 @@ impl Session {
             .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
                 BrokenCore::SlotOutsidePool,
             )))?;
-        let list = lane.record(&self.texture, slot)?;
         let _submit = self.submit.enter()?;
-        lane.complete(&self.context, &list);
+        lane.copy(&self.context, &self.texture, slot);
+        Ok(())
+    }
+
+    /// Lane marker of array `slot` ordered behind the video decode.
+    ///
+    /// Moves only the mark region; staging bytes outside it keep their
+    /// previous contents, so reads need [`copy_slot`](Self::copy_slot)
+    /// first. Surface handoffs use this; readback uses the full copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the views.
+    pub(crate) fn copy_slot_light(&self, slot: u8) -> Result<(), D3d11Error> {
+        let lane = self
+            .slots
+            .get(usize::from(slot))
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
+        let _submit = self.submit.enter()?;
+        lane.copy_light(&self.context, &self.texture, slot);
         Ok(())
     }
 

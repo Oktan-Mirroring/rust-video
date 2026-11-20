@@ -296,7 +296,7 @@ impl<'a> H264Decoder<'a> {
             // Submit before any surface handoff: outputs may name the submission slot.
             if let Err(error) = session.submit(&decoded.submission) {
                 failed = Some(error);
-            } else if let Err(error) = session.copy_slot(decoded.submission.slot) {
+            } else if let Err(error) = session.copy_slot_light(decoded.submission.slot) {
                 failed = Some(error);
             } else {
                 for output in &decoded.outputs {

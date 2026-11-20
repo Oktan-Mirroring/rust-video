@@ -332,7 +332,7 @@ impl<'a> Av1Decoder<'a> {
             if let Some(submission) = decoded.submission.as_ref() {
                 if let Err(error) = session.submit_av1(submission) {
                     failed = Some(error);
-                } else if let Err(error) = session.copy_slot(submission.slot) {
+                } else if let Err(error) = session.copy_slot_light(submission.slot) {
                     failed = Some(error);
                 }
             }

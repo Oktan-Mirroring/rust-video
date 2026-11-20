@@ -1,4 +1,4 @@
-//! Immediate-context submit lock plus per-slot deferred copy lanes.
+//! Immediate-context submit lock plus per-slot staging copy lanes.
 //!
 //! <https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-render-multi-thread-render>
 //! <https://docs.rs/windows/0.62.2/windows/Win32/Graphics/Direct3D11/>
@@ -16,10 +16,9 @@ use bytes::Bytes;
 use windows::core::Interface;
 use windows::Win32::Foundation::{FALSE, S_FALSE, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Asynchronous, ID3D11CommandList, ID3D11Device, ID3D11DeviceContext, ID3D11Query,
-    ID3D11Texture2D, D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_CPU_ACCESS_READ,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Asynchronous, ID3D11Device, ID3D11DeviceContext, ID3D11Query, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
@@ -58,10 +57,8 @@ impl SubmitLock {
     }
 }
 
-/// Per-slot copy lane: deferred recorder, staging, completion query.
+/// Per-slot copy lane: staging plus completion query.
 pub(crate) struct CopySlot {
-    /// Deferred recorder behind the copy command list.
-    deferred: ID3D11DeviceContext,
     /// CPU-visible copy target.
     staging: ID3D11Texture2D,
     /// Event query behind completion waits.
@@ -77,20 +74,8 @@ impl CopySlot {
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the driver refuses the deferred context,
-    /// the staging texture, or the event query.
+    /// Returns `Err` when the driver refuses the staging texture or the event query.
     pub(crate) fn open(device: &ID3D11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
-        let mut deferred = None;
-        // Sound: the out-pointer stays live for the call; flags are zero.
-        unsafe { device.CreateDeferredContext(0, Some(std::ptr::addr_of_mut!(deferred))) }
-            .map_err(|error| D3d11Error::Call {
-                call: "CreateDeferredContext",
-                hresult: error.code().0,
-            })?;
-        let deferred = deferred.ok_or(D3d11Error::Call {
-            call: "CreateDeferredContext",
-            hresult: windows::Win32::Foundation::E_FAIL.0,
-        })?;
         let staging = create_staging(device, width, height)?;
         let desc = D3D11_QUERY_DESC {
             Query: D3D11_QUERY_EVENT,
@@ -118,7 +103,6 @@ impl CopySlot {
             hresult: error.code().0,
         })?;
         Ok(Self {
-            deferred,
             staging,
             signal,
             width,
@@ -126,19 +110,40 @@ impl CopySlot {
         })
     }
 
-    /// Command list copying array `slot` into the staging texture.
+    /// Array `slot` into staging through the immediate context, ending the completion query.
+    pub(crate) fn copy(&self, context: &ID3D11DeviceContext, array: &ID3D11Texture2D, slot: u8) {
+        // Sound: both textures are live with matching extents; the slot is a
+        // valid slice; the query is live; the caller holds the submit lock.
+        unsafe {
+            context.CopySubresourceRegion(&self.staging, 0, 0, 0, 0, array, u32::from(slot), None);
+            context.End(&self.signal);
+        }
+    }
+
+    /// Mark region of array `slot` into staging, ending the completion query.
     ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the driver refuses the command list.
-    pub(crate) fn record(
+    /// Orders the marker behind the video decode like [`copy`](Self::copy)
+    /// without moving the frame; staging bytes outside the mark region keep
+    /// their previous contents.
+    pub(crate) fn copy_light(
         &self,
+        context: &ID3D11DeviceContext,
         array: &ID3D11Texture2D,
         slot: u8,
-    ) -> Result<ID3D11CommandList, D3d11Error> {
-        // Sound: both textures are live with matching extents; the slot is a valid slice.
+    ) {
+        let mark = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: self.width.min(16),
+            bottom: self.height.min(16),
+            back: 1,
+        };
+        // Sound: both textures are live; the slot is a valid slice; the mark
+        // box fits the lane extent; the query is live; the caller holds the
+        // submit lock.
         unsafe {
-            self.deferred.CopySubresourceRegion(
+            context.CopySubresourceRegion(
                 &self.staging,
                 0,
                 0,
@@ -146,35 +151,13 @@ impl CopySlot {
                 0,
                 array,
                 u32::from(slot),
-                None,
+                Some(std::ptr::addr_of!(mark)),
             );
-        }
-        let mut list = None;
-        // Sound: the out-pointer stays live for the call.
-        unsafe {
-            self.deferred
-                .FinishCommandList(false, Some(std::ptr::addr_of_mut!(list)))
-        }
-        .map_err(|error| D3d11Error::Call {
-            call: "FinishCommandList",
-            hresult: error.code().0,
-        })?;
-        list.ok_or(D3d11Error::Call {
-            call: "FinishCommandList",
-            hresult: windows::Win32::Foundation::E_FAIL.0,
-        })
-    }
-
-    /// `list` through the immediate context, ending the completion query.
-    pub(crate) fn complete(&self, context: &ID3D11DeviceContext, list: &ID3D11CommandList) {
-        // Sound: the list and query are live; the caller holds the submit lock.
-        unsafe {
-            context.ExecuteCommandList(list, true);
             context.End(&self.signal);
         }
     }
 
-    /// Completion of the last list, outside the submit lock.
+    /// Completion of the last copy, outside the submit lock.
     ///
     /// # Errors
     ///
@@ -183,7 +166,7 @@ impl CopySlot {
         wait_for_query(context, &self.signal)
     }
 
-    /// True once the GPU passes the last list marker, without waiting.
+    /// True once the GPU passes the last copy marker, without waiting.
     ///
     /// # Errors
     ///
