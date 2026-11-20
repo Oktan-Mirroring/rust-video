@@ -102,7 +102,7 @@ impl Bits {
     }
 }
 
-/// Test bit reader over RBSP bytes.
+/// Test-only bit reader over RBSP bytes, not a grammar reader.
 #[derive(Clone, Copy, Debug)]
 pub struct BitReader<'a> {
     /// Bytes behind the read position.
