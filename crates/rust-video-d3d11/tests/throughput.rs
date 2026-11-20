@@ -125,17 +125,94 @@ fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64
     f64::from(HOPS) / elapsed
 }
 
+/// Phase-split timing behind the sync benches.
+trait SyncPhases {
+    /// Phase-split timing per collected frame, oldest first.
+    fn sync_timings(&self) -> &[rust_video_caps::delivery::PhaseTiming];
+}
+
+impl SyncPhases for H264Decoder<'_> {
+    fn sync_timings(&self) -> &[rust_video_caps::delivery::PhaseTiming] {
+        self.timings()
+    }
+}
+
+impl SyncPhases for HevcDecoder<'_> {
+    fn sync_timings(&self) -> &[rust_video_caps::delivery::PhaseTiming] {
+        self.timings()
+    }
+}
+
+impl SyncPhases for Av1Decoder<'_> {
+    fn sync_timings(&self) -> &[rust_video_caps::delivery::PhaseTiming] {
+        self.timings()
+    }
+}
+
+impl SyncPhases for Vp9Decoder<'_> {
+    fn sync_timings(&self) -> &[rust_video_caps::delivery::PhaseTiming] {
+        self.timings()
+    }
+}
+
+/// Median submit/engine/copy phases behind `tag` printed as one line.
+fn print_sync_phases(tag: &str, timings: &[rust_video_caps::delivery::PhaseTiming]) {
+    let mut submit: Vec<u64> = timings
+        .iter()
+        .map(rust_video_caps::delivery::PhaseTiming::submit_us)
+        .collect();
+    let mut engine: Vec<u64> = timings
+        .iter()
+        .map(rust_video_caps::delivery::PhaseTiming::engine_wait_us)
+        .collect();
+    let mut copy: Vec<u64> = timings
+        .iter()
+        .map(rust_video_caps::delivery::PhaseTiming::copy_us)
+        .collect();
+    submit.sort_unstable();
+    engine.sort_unstable();
+    copy.sort_unstable();
+    let at = |sorted: &[u64]| sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+    println!(
+        "{tag} phases: submit={} engine={} copy={} over {} frames",
+        at(&submit),
+        at(&engine),
+        at(&copy),
+        timings.len(),
+    );
+}
+
+/// Untimed warmup ahead of the sync and surface legs.
+///
+/// Covers first-touch plus clock ramp: a fixed pass count leaves the
+/// first timed frames ramping after idle, while 100ms lands the timed
+/// window on the steady pace the stretches sustain.
+const STEADY_WARMUP: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Measured fps decoding `HOPS` passes over `raws` after `warmup`.
+///
+/// Warmup runs until steady plus a flush: short warmups leave slow
+/// ramp frames inside the timed window. The timed window covers the
+/// decode loop only; the trailing flush runs untimed for correctness,
+/// since its fixed drain cost would otherwise dominate the 30-hop pace.
 fn decode_fps(
-    decoder: &mut impl Decoder<Frame = D3d11Frame, Error = D3d11Error>,
+    decoder: &mut (impl Decoder<Frame = D3d11Frame, Error = D3d11Error> + SyncPhases),
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
+    tag: &str,
 ) -> f64 {
     let warmup = Packets::from_raws(warmup);
     let raws = Packets::from_raws(raws);
-    for packet in &warmup {
-        decoder.decode(packet).expect("warmup decode");
+    let steady = std::time::Instant::now();
+    loop {
+        for packet in &warmup {
+            decoder.decode(packet).expect("warmup decode");
+        }
+        if steady.elapsed() >= STEADY_WARMUP {
+            break;
+        }
     }
+    decoder.flush().expect("warmup drain");
     let mut frames = 0;
     let start = std::time::Instant::now();
     for _ in 0..HOPS {
@@ -143,9 +220,10 @@ fn decode_fps(
             frames += decoder.decode(packet).expect("timed decode").len();
         }
     }
-    frames += decoder.flush().expect("timed flush").len();
     let elapsed = start.elapsed().as_secs_f64();
+    decoder.flush().expect("timed drain");
     assert!(frames > 0);
+    print_sync_phases(tag, decoder.sync_timings());
     let total = u32::try_from(frames).expect("frame count fits");
     f64::from(total) / elapsed
 }
@@ -175,6 +253,9 @@ fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFram
 /// Every surface waits for GPU completion inside the timed loop, so the
 /// number paces engine-plus-fence cost without any CPU readback. Each
 /// surface drops after its wait, keeping the 16 decoder slots free.
+/// Warmup runs until steady plus a flush: short warmups leave slow
+/// ramp frames inside the timed window. The timed window covers the
+/// decode loop only; the trailing flush waits untimed for correctness.
 fn decode_surface_fps(
     decoder: &mut impl SurfaceDecode,
     warmup: &[Vec<u8>],
@@ -182,10 +263,19 @@ fn decode_surface_fps(
 ) -> f64 {
     let warmup = Packets::from_raws(warmup);
     let raws = Packets::from_raws(raws);
-    for packet in &warmup {
-        for surface in decoder.decode_surface(packet).expect("warmup decode") {
-            surface.try_wait().expect("warmup wait");
+    let steady = std::time::Instant::now();
+    loop {
+        for packet in &warmup {
+            for surface in decoder.decode_surface(packet).expect("warmup decode") {
+                surface.try_wait().expect("warmup wait");
+            }
         }
+        if steady.elapsed() >= STEADY_WARMUP {
+            break;
+        }
+    }
+    for surface in decoder.flush_surface().expect("warmup drain") {
+        surface.try_wait().expect("warmup wait");
     }
     let mut surfaces = 0;
     let start = std::time::Instant::now();
@@ -197,11 +287,10 @@ fn decode_surface_fps(
             }
         }
     }
-    for surface in decoder.flush_surface().expect("timed flush") {
-        surface.try_wait().expect("timed wait");
-        surfaces += 1;
-    }
     let elapsed = start.elapsed().as_secs_f64();
+    for surface in decoder.flush_surface().expect("timed drain") {
+        surface.try_wait().expect("timed wait");
+    }
     assert!(surfaces > 0);
     f64::from(surfaces) / elapsed
 }
@@ -321,7 +410,7 @@ fn decode_h264_1080p_measures_realtime() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    let measured = decode_fps(&mut decoder, &raws, &raws);
+    let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 h264 sync");
     println!("d3d11 h264 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -348,7 +437,7 @@ fn decode_hevc_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut decoder = HevcDecoder::open(&device);
-    let measured = decode_fps(&mut decoder, &raws, &raws);
+    let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 hevc sync");
     println!("d3d11 hevc decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -374,7 +463,7 @@ fn decode_av1_1080p_measures_realtime() {
     let data = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
     let raws = vec![data];
     let mut decoder = Av1Decoder::open(&device);
-    let measured = decode_fps(&mut decoder, &raws, &raws);
+    let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 av1 sync");
     println!("d3d11 av1 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -400,7 +489,7 @@ fn decode_vp9_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let mut decoder = Vp9Decoder::open(&device);
-    let measured = decode_fps(&mut decoder, &raws, &raws);
+    let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 vp9 sync");
     println!("d3d11 vp9 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
