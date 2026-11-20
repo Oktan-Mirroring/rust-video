@@ -5,14 +5,13 @@ use std::time::{Duration, Instant};
 
 use super::dpb::{Decoded, Dpb};
 use super::frontend::{Ingest, Picture};
-use crate::decoder::{emit_frame, session_surface_export, surface_layout, Active};
+use crate::decoder::{emit_frame, session_surface_export, surface_layout, Active, SyncPending};
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, ParseReason, SkipReason};
 use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::pins::SlotPins;
 use crate::session::{DecodeQueues, DecodeSession};
-use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
@@ -47,6 +46,12 @@ pub struct H264Decoder<'a> {
     pins: Arc<SlotPins>,
     /// Phase-split timing per submitted surface picture, oldest first.
     surface_timings: Vec<PhaseTiming>,
+    /// Phase-split timing per sync output, oldest first.
+    sync_timings: Vec<PhaseTiming>,
+    /// Staging map plus tighten per sync output, oldest first.
+    sync_readback: Vec<Duration>,
+    /// Export plus frame wrap per sync output, oldest first.
+    sync_emit: Vec<Duration>,
 }
 
 impl<'a> H264Decoder<'a> {
@@ -65,6 +70,9 @@ impl<'a> H264Decoder<'a> {
             inflight_max: 0,
             pins: Arc::new(SlotPins::new()),
             surface_timings: Vec::new(),
+            sync_timings: Vec::new(),
+            sync_readback: Vec::new(),
+            sync_emit: Vec::new(),
         }
     }
 
@@ -111,13 +119,32 @@ impl<'a> H264Decoder<'a> {
         &self.surface_timings
     }
 
+    /// Phase-split timing per sync output, oldest first.
+    #[must_use]
+    pub fn sync_timings(&self) -> &[PhaseTiming] {
+        &self.sync_timings
+    }
+
+    /// Staging map plus tighten per sync output, oldest first.
+    #[must_use]
+    pub fn sync_readback(&self) -> &[Duration] {
+        &self.sync_readback
+    }
+
+    /// Export plus frame wrap per sync output, oldest first.
+    #[must_use]
+    pub fn sync_emit(&self) -> &[Duration] {
+        &self.sync_emit
+    }
+
     /// Decode `picture`, queueing its outputs for readback into `pending`.
     fn submit_picture(
         &mut self,
         picture: &Picture,
-        pending: &mut Vec<(u8, Ticket, Active)>,
+        pending: &mut Vec<SyncPending>,
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
+        let submitted_at = Instant::now();
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
             self.consume_pending(pending, frames)?;
@@ -142,19 +169,32 @@ impl<'a> H264Decoder<'a> {
             // under the engine wait. The wait still serializes submits.
             match session.submit(&decoded.submission) {
                 Ok(video) => {
+                    let mut tickets = Vec::with_capacity(decoded.outputs.len());
                     for output in &decoded.outputs {
                         match session.start_download_after(output.slot(), video) {
-                            Ok(ticket) => pending.push((output.slot(), ticket, active)),
+                            Ok(ticket) => tickets.push((output.slot(), ticket)),
                             Err(error) => {
                                 failed = Some(error);
                                 break;
                             }
                         }
                     }
+                    let recorded = Instant::now();
                     if failed.is_none() {
                         if let Err(error) = session.wait_video(video) {
                             failed = Some(error);
                         }
+                    }
+                    if failed.is_none() {
+                        let signaled = Instant::now();
+                        pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
+                            slot,
+                            ticket,
+                            active,
+                            submitted_at,
+                            submit: recorded.duration_since(submitted_at),
+                            engine: signaled.duration_since(recorded),
+                        }));
                     }
                 }
                 Err(error) => failed = Some(error),
@@ -170,7 +210,7 @@ impl<'a> H264Decoder<'a> {
     /// Readback for queued `pending` outputs into `frames`.
     fn consume_pending(
         &mut self,
-        pending: &[(u8, Ticket, Active)],
+        pending: &[SyncPending],
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         if pending.is_empty() {
@@ -179,10 +219,22 @@ impl<'a> H264Decoder<'a> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
-        for (slot, ticket, active) in pending {
-            let nv12 = session.finish_download(*slot, *ticket)?;
-            let export = session.shared_handle(*slot);
-            let frame = emit_frame(&self.shared, nv12, export, active, self.generation)?;
+        for output in pending {
+            let (waited, read, nv12) = session.finish_download_split(output.slot, output.ticket)?;
+            let emit_at = Instant::now();
+            let export = session.shared_handle(output.slot);
+            let frame = emit_frame(&self.shared, nv12, export, &output.active, self.generation)?;
+            let collected_at = Instant::now();
+            self.sync_timings.push(PhaseTiming::new(
+                self.generation,
+                output.submit,
+                output.engine,
+                waited,
+                output.submitted_at,
+                collected_at,
+            ));
+            self.sync_readback.push(read);
+            self.sync_emit.push(collected_at.duration_since(emit_at));
             self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }

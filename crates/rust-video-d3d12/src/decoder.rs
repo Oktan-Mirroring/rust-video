@@ -1,10 +1,13 @@
 //! Shared sequence state behind the live codec decoders.
 
+use std::time::{Duration, Instant};
+
 use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
 use crate::frame::D3d12Frame;
 use crate::h264::frontend::Crop;
 use crate::os::FrameOs;
 use crate::session::{DecodeSession, SharedExport};
+use crate::submit::Ticket;
 use crate::texture::SurfaceLayout;
 
 use bytes::Bytes;
@@ -33,6 +36,22 @@ impl Active {
     pub(crate) fn same_extent(self, other: Active) -> bool {
         self.width == other.width && self.height == other.height
     }
+}
+
+/// Queued sync output with its submit-side phases.
+pub(crate) struct SyncPending {
+    /// Pool slot behind the output.
+    pub(crate) slot: u8,
+    /// Copy ticket behind the queued download.
+    pub(crate) ticket: Ticket,
+    /// Sequence behind the output.
+    pub(crate) active: Active,
+    /// Submit instant.
+    pub(crate) submitted_at: Instant,
+    /// Frontend plus submit plus download-record CPU.
+    pub(crate) submit: Duration,
+    /// Video engine wait.
+    pub(crate) engine: Duration,
 }
 
 /// Surface layout for pool `slot` under `active`.

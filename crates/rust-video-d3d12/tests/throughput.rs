@@ -197,8 +197,10 @@ where
 {
     let warmup = Packets::from_raws(warmup);
     let raws = Packets::from_raws(raws);
-    for packet in &warmup {
-        decoder.decode(packet)?;
+    for _ in 0..WARMUP_PASSES {
+        for packet in &warmup {
+            decoder.decode(packet)?;
+        }
     }
     decoder.flush()?;
     let mut frames = 0;
@@ -321,7 +323,15 @@ fn decode_h264_1080p_measures_realtime() {
         }
         Err(error) => panic!("warmup decode: {error}"),
     };
+    let timings = decoder.sync_timings();
     println!("d3d12 h264 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    print_phase_medians("d3d12 h264 sync", "pictures", timings);
+    print_median(
+        "d3d12 h264 sync readback",
+        "frames",
+        decoder.sync_readback(),
+    );
+    print_median("d3d12 h264 sync emit", "frames", decoder.sync_emit());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
@@ -362,7 +372,15 @@ fn decode_hevc_1080p_measures_realtime() {
         }
         Err(error) => panic!("warmup decode: {error}"),
     };
+    let timings = decoder.sync_timings();
     println!("d3d12 hevc decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    print_phase_medians("d3d12 hevc sync", "pictures", timings);
+    print_median(
+        "d3d12 hevc sync readback",
+        "frames",
+        decoder.sync_readback(),
+    );
+    print_median("d3d12 hevc sync emit", "frames", decoder.sync_emit());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
@@ -400,7 +418,11 @@ fn decode_av1_1080p_measures_realtime() {
         }
         Err(error) => panic!("warmup decode: {error}"),
     };
+    let timings = decoder.sync_timings();
     println!("d3d12 av1 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    print_phase_medians("d3d12 av1 sync", "pictures", timings);
+    print_median("d3d12 av1 sync readback", "frames", decoder.sync_readback());
+    print_median("d3d12 av1 sync emit", "frames", decoder.sync_emit());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"

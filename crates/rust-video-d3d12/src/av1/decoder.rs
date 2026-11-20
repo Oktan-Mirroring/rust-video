@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use super::dpb::{Av1Decoded, Av1Dpb};
 use super::frontend::{Frame as Av1Frame, Ingest as Av1Ingest};
-use crate::decoder::{emit_frame, session_surface_export, surface_layout, visible_nv12, Active};
+use crate::decoder::{
+    emit_frame, session_surface_export, surface_layout, visible_nv12, Active, SyncPending,
+};
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, ParseReason, SkipReason, UnsupportedReason};
 use crate::frame::D3d12Frame;
@@ -13,7 +15,6 @@ use crate::guid::Codec;
 use crate::h264::frontend::Crop;
 use crate::pins::SlotPins;
 use crate::session::{DecodeQueues, DecodeSession};
-use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
@@ -48,6 +49,12 @@ pub struct Av1Decoder<'a> {
     pins: Arc<SlotPins>,
     /// Phase-split timing per submitted surface picture, oldest first.
     surface_timings: Vec<PhaseTiming>,
+    /// Phase-split timing per sync output, oldest first.
+    sync_timings: Vec<PhaseTiming>,
+    /// Staging map plus tighten per sync output, oldest first.
+    sync_readback: Vec<Duration>,
+    /// Export plus frame wrap per sync output, oldest first.
+    sync_emit: Vec<Duration>,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -66,6 +73,9 @@ impl<'a> Av1Decoder<'a> {
             inflight_max: 0,
             pins: Arc::new(SlotPins::new()),
             surface_timings: Vec::new(),
+            sync_timings: Vec::new(),
+            sync_readback: Vec::new(),
+            sync_emit: Vec::new(),
         }
     }
 
@@ -112,13 +122,32 @@ impl<'a> Av1Decoder<'a> {
         &self.surface_timings
     }
 
+    /// Phase-split timing per sync output, oldest first.
+    #[must_use]
+    pub fn sync_timings(&self) -> &[PhaseTiming] {
+        &self.sync_timings
+    }
+
+    /// Staging map plus tighten per sync output, oldest first.
+    #[must_use]
+    pub fn sync_readback(&self) -> &[Duration] {
+        &self.sync_readback
+    }
+
+    /// Export plus frame wrap per sync output, oldest first.
+    #[must_use]
+    pub fn sync_emit(&self) -> &[Duration] {
+        &self.sync_emit
+    }
+
     /// Decode `frame`, queueing its outputs for readback into `pending`.
     fn submit_frame(
         &mut self,
         frame: &Av1Frame,
-        pending: &mut Vec<(u8, Ticket, Active)>,
+        pending: &mut Vec<SyncPending>,
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
+        let submitted_at = Instant::now();
         let active = self.sequence(frame)?;
         let live = self.active;
         if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
@@ -138,7 +167,7 @@ impl<'a> Av1Decoder<'a> {
                 return Err(error);
             }
         };
-        if let Err(error) = self.submit_downloads(&decoded, active, pending) {
+        if let Err(error) = self.submit_downloads(&decoded, active, submitted_at, pending) {
             self.reset_stream();
             return Err(error);
         }
@@ -150,7 +179,8 @@ impl<'a> Av1Decoder<'a> {
         &mut self,
         decoded: &Av1Decoded,
         active: Active,
-        pending: &mut Vec<(u8, Ticket, Active)>,
+        submitted_at: Instant,
+        pending: &mut Vec<SyncPending>,
     ) -> Result<(), D3d12Error> {
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
         // Downloads queue behind the video ticket: the copy runs at
@@ -158,16 +188,37 @@ impl<'a> Av1Decoder<'a> {
         // under the engine wait. The wait still serializes submits.
         if let Some(submission) = decoded.submission.as_ref() {
             let video = session.submit_av1(submission)?;
+            let mut tickets = Vec::with_capacity(decoded.outputs.len());
             for output in &decoded.outputs {
                 let ticket = session.start_download_after(output.slot(), video)?;
-                pending.push((output.slot(), ticket, active));
+                tickets.push((output.slot(), ticket));
             }
+            let recorded = Instant::now();
             session.wait_video(video)?;
+            let signaled = Instant::now();
+            pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
+                slot,
+                ticket,
+                active,
+                submitted_at,
+                submit: recorded.duration_since(submitted_at),
+                engine: signaled.duration_since(recorded),
+            }));
         } else {
+            let mut tickets = Vec::with_capacity(decoded.outputs.len());
             for output in &decoded.outputs {
                 let ticket = session.start_download(output.slot())?;
-                pending.push((output.slot(), ticket, active));
+                tickets.push((output.slot(), ticket));
             }
+            let recorded = Instant::now();
+            pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
+                slot,
+                ticket,
+                active,
+                submitted_at,
+                submit: recorded.duration_since(submitted_at),
+                engine: Duration::ZERO,
+            }));
         }
         Ok(())
     }
@@ -175,7 +226,7 @@ impl<'a> Av1Decoder<'a> {
     /// Readback for queued `pending` outputs into `frames`.
     fn consume_pending(
         &mut self,
-        pending: &[(u8, Ticket, Active)],
+        pending: &[SyncPending],
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         if pending.is_empty() {
@@ -184,11 +235,25 @@ impl<'a> Av1Decoder<'a> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
-        for (slot, ticket, active) in pending {
-            let nv12 = session.finish_download(*slot, *ticket)?;
-            let nv12 = visible_nv12(nv12, active)?;
-            let export = session.shared_handle(*slot);
-            let frame = emit_frame(&self.shared, nv12, export, active, self.generation)?;
+        for output in pending {
+            let (waited, read, nv12) = session.finish_download_split(output.slot, output.ticket)?;
+            let shaped_at = Instant::now();
+            let nv12 = visible_nv12(nv12, &output.active)?;
+            let shaped = shaped_at.elapsed();
+            let emit_at = Instant::now();
+            let export = session.shared_handle(output.slot);
+            let frame = emit_frame(&self.shared, nv12, export, &output.active, self.generation)?;
+            let collected_at = Instant::now();
+            self.sync_timings.push(PhaseTiming::new(
+                self.generation,
+                output.submit,
+                output.engine,
+                waited,
+                output.submitted_at,
+                collected_at,
+            ));
+            self.sync_readback.push(read + shaped);
+            self.sync_emit.push(collected_at.duration_since(emit_at));
             self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }

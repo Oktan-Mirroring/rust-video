@@ -10,7 +10,7 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::av1::params::{PicParamsAv1, TileAv1};
 use crate::av1::picture::Av1Submission;
@@ -655,8 +655,29 @@ impl DecodeSession {
     /// Returns `Err` for a slot outside the pool, when the GPU misses
     /// the wait budget, or when staging falls short of the layout.
     pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Vec<u8>, D3d12Error> {
+        Ok(self.finish_download_split(slot, ticket)?.2)
+    }
+
+    /// Copy wait, staging readback, and tight NV12 bytes for a started `slot`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for a slot outside the pool, when the GPU misses
+    /// the wait budget, or when staging falls short of the layout.
+    pub(crate) fn finish_download_split(
+        &self,
+        slot: u8,
+        ticket: Ticket,
+    ) -> Result<(Duration, Duration, Vec<u8>), D3d12Error> {
+        let copy_at = Instant::now();
         self.copy_fence.wait(ticket)?;
-        self.readback(slot)
+        let mapped_at = Instant::now();
+        let bytes = self.readback(slot)?;
+        Ok((
+            mapped_at.duration_since(copy_at),
+            mapped_at.elapsed(),
+            bytes,
+        ))
     }
 
     /// Tight NV12 bytes mapped from the staging buffer behind `slot`.
