@@ -256,7 +256,7 @@ impl Nv12Layout {
 }
 
 /// Visible rectangle in luma samples under `crop`.
-fn visible_rect(
+pub(crate) fn visible_rect(
     width: u32,
     height: u32,
     crop: Option<crate::h264::frontend::Crop>,
