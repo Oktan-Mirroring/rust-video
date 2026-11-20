@@ -311,12 +311,12 @@ fn match_profile(guid: &GUID) -> Option<Profile> {
             H264_PROFILE,
         ),
         (
-            Codec::Hevc,
+            Codec::H265,
             D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
             "hevc-main",
         ),
         (
-            Codec::Hevc,
+            Codec::H265,
             D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
             "hevc-main10",
         ),
@@ -368,10 +368,7 @@ fn match_profile(guid: &GUID) -> Option<Profile> {
     TABLE
         .iter()
         .find(|entry| entry.1 == *guid)
-        .map(|entry| Profile {
-            codec: entry.0,
-            name: entry.2,
-        })
+        .map(|entry| Profile::new(entry.0, entry.2))
 }
 
 /// H.264 profile GUID the tier decodes.
@@ -405,7 +402,7 @@ mod tests {
     fn match_profile_names_table_entries() {
         let profile =
             super::match_profile(&D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10).expect("hevc main10");
-        assert_eq!(profile.codec(), super::Codec::Hevc);
+        assert_eq!(profile.codec(), super::Codec::H265);
         assert_eq!(profile.name(), "hevc-main10");
         let profile = super::match_profile(&D3D11_DECODER_PROFILE_VC1_VLD).expect("vc1 vld");
         assert_eq!(profile.codec(), super::Codec::Vc1);

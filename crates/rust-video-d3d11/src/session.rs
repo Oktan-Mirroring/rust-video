@@ -135,7 +135,7 @@ impl Session {
     ) -> Result<Self, D3d11Error> {
         let guid = match codec {
             Codec::H264 => crate::device_os::h264_guid(),
-            Codec::Hevc => crate::device_os::hevc_guid(),
+            Codec::H265 => crate::device_os::hevc_guid(),
             Codec::Av1 => crate::device_os::av1_guid(),
             Codec::Vp9 => crate::device_os::vp9_guid(),
             _ => {
@@ -763,7 +763,7 @@ mod tests {
         let Ok(device) = D3d11Device::open() else {
             return;
         };
-        for codec in [Codec::Hevc, Codec::Av1] {
+        for codec in [Codec::H265, Codec::Av1] {
             if !device.supports(codec) {
                 println!("d3d11 skipped: no {codec} decoder profile");
                 continue;

@@ -30,7 +30,7 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    println!("supports h265: {}", device.supports(Codec::Hevc));
+    println!("supports h265: {}", device.supports(Codec::H265));
     let mut decoder = HevcDecoder::open(&device);
     let mut total = 0;
     for (index, bytes) in annex_b_packets().into_iter().enumerate() {
@@ -94,7 +94,7 @@ fn report(frame: &D3d12Frame) {
 /// H.265 encode attempt; names the miss when the box declines it.
 #[cfg(target_os = "windows")]
 fn probe_encode_miss(device: &D3d12Device) {
-    let mut encoder = match D3d12Encoder::open(device, Codec::Hevc) {
+    let mut encoder = match D3d12Encoder::open(device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("MISS: h265 encode unavailable ({error})");

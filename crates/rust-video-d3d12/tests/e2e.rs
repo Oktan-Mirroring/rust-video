@@ -413,7 +413,7 @@ fn gpu_transcode_hevc_stays_ffmpeg_clean() {
     let Some(device) = device() else {
         return;
     };
-    let mut transcoder = match Transcoder::open(&device, Codec::Hevc, Codec::Hevc) {
+    let mut transcoder = match Transcoder::open(&device, Codec::H265, Codec::H265) {
         Ok(transcoder) => transcoder,
         Err(error) => {
             println!("SKIP: no hevc transcode ({error})");
@@ -582,14 +582,14 @@ fn pictures_hold_frames_and_bitstreams() {
     );
     drive_encode_roundtrip(
         &device,
-        Codec::Hevc,
+        Codec::H265,
         320,
         240,
         &[0, 0, 0, 1, 0x40, 0x01],
         HevcDecoder::open(&device),
     );
     for codec in [
-        Codec::Hevc,
+        Codec::H265,
         Codec::Vp9,
         Codec::Av1,
         Codec::Mpeg2,
@@ -637,7 +637,7 @@ fn probe_reports_or_skips() {
     );
     assert!(h264.flush().expect("flush").is_empty());
 
-    probe_drive_shell(&mut HevcDecoder::open(&device), Codec::Hevc);
+    probe_drive_shell(&mut HevcDecoder::open(&device), Codec::H265);
     probe_drive_shell(&mut Vp9Decoder::open(&device), Codec::Vp9);
     probe_drive_shell(&mut Av1Decoder::open(&device), Codec::Av1);
     probe_drive_shell(&mut Mpeg2Decoder::open(&device), Codec::Mpeg2);

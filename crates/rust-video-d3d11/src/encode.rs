@@ -1199,10 +1199,10 @@ fn missing_encoder(codec: Codec) -> D3d11Error {
 fn subtypes(codec: Codec) -> &'static [GUID] {
     match codec {
         Codec::H264 => &[MFVideoFormat_H264],
-        Codec::Hevc => &[MFVideoFormat_HEVC, MFVideoFormat_H265],
+        Codec::H265 => &[MFVideoFormat_HEVC, MFVideoFormat_H265],
         Codec::Vp9 => &[MFVideoFormat_VP90],
         Codec::Av1 => &[MFVideoFormat_AV1],
-        Codec::Mpeg2 | Codec::Vc1 => &[],
+        Codec::Vp8 | Codec::Av2 | Codec::Mpeg2 | Codec::Vc1 => &[],
     }
 }
 

@@ -76,10 +76,10 @@ fn h264_no_reorder_returns_per_call() {
 /// No-reorder HEVC emits each picture on its completing call.
 #[test]
 fn hevc_loopback_no_reorder_returns_per_call() {
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
+    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("hevc skipped: {error}");
@@ -148,7 +148,7 @@ fn av1_loopback_no_reorder_returns_per_call() {
 /// Reorder HEVC holds back exactly as before.
 #[test]
 fn hevc_reorder_holds_back_unchanged() {
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");
@@ -231,7 +231,7 @@ fn h264_surfaces_match_frames() {
 /// HEVC surfaces match frames with contract metadata.
 #[test]
 fn hevc_surfaces_match_frames() {
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
     let data = std::fs::read(decode_dir().join("inter_320x240.hevc")).expect("vector readable");

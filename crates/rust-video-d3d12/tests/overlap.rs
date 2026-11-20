@@ -434,7 +434,7 @@ fn overlap_hevc_matches_sync_bytes() {
     let Some(device) = device() else {
         return;
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }

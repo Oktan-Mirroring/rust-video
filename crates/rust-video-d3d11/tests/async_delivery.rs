@@ -199,7 +199,7 @@ fn callback_drain_collects_queued_frames() {
 #[test]
 fn hevc_send_poll_loopback_returns_own_frames() {
     const FRAME_BYTES: usize = 320 * 240 * 3 / 2;
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
     let packets = hevc_packets();
@@ -237,7 +237,7 @@ fn hevc_send_poll_loopback_returns_own_frames() {
 /// Blocking receive returns the trailing HEVC frames, then end of stream.
 #[test]
 fn hevc_blocking_receive_gets_trailing_frames() {
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
     let packets = hevc_packets();

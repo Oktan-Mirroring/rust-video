@@ -248,7 +248,7 @@ impl OverlapFront for HevcFront {
     type Ingest = HevcIngest;
     type Slots = HevcDpb;
     type Submission = HevcSubmission;
-    const CODEC: Codec = Codec::Hevc;
+    const CODEC: Codec = Codec::H265;
 
     fn ingest() -> HevcIngest {
         HevcIngest::new()

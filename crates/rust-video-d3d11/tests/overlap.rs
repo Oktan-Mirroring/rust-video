@@ -184,7 +184,7 @@ fn byte_parity_sync_vs_overlapped() {
 #[test]
 fn hevc_byte_parity_sync_vs_overlapped() {
     let _serial = Drive::serial();
-    let Some(device) = device_for(Codec::Hevc) else {
+    let Some(device) = device_for(Codec::H265) else {
         return;
     };
     let packets = hevc_packets();

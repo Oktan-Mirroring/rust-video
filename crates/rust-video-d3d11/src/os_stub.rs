@@ -26,14 +26,11 @@ mod tests {
     #[test]
     fn supports_matches_profile_codec() {
         let device = device(
-            vec![Profile {
-                codec: Codec::Hevc,
-                name: "hevc-main",
-            }],
+            vec![Profile::new(Codec::H265, "hevc-main")],
             0xb100,
             "adapter",
         );
-        assert!(device.supports(Codec::Hevc));
+        assert!(device.supports(Codec::H265));
         assert!(!device.supports(Codec::H264));
         assert_eq!(device.profiles().len(), 1);
     }

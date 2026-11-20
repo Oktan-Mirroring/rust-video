@@ -336,7 +336,7 @@ fn decode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("d3d11 skipped: no hevc decoder profile");
         return;
     }
@@ -442,7 +442,7 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
+    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no hevc encoder MFT ({error})");
@@ -555,7 +555,7 @@ fn decode_surface_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("d3d11 skipped: no hevc decoder profile");
         return;
     }
@@ -669,7 +669,7 @@ fn encode_surface_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
+    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no hevc encoder MFT ({error})");
@@ -815,7 +815,7 @@ fn sustained_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("d3d11 skipped: no hevc decoder profile");
         return;
     }
@@ -936,7 +936,7 @@ fn audit_own_frames(codec: Codec, tag: &str) {
 #[test]
 fn encode_returns_own_frames() {
     audit_own_frames(Codec::H264, "h264");
-    audit_own_frames(Codec::Hevc, "hevc");
+    audit_own_frames(Codec::H265, "hevc");
     audit_own_frames(Codec::Av1, "av1");
     audit_own_frames(Codec::Vp9, "vp9");
 }

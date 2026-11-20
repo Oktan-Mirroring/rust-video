@@ -412,8 +412,8 @@ impl<'a> HevcDecoder<'a> {
     ///
     /// * `packet` - compressed picture data.
     pub fn decode_surface(&mut self, packet: &Packet) -> Result<Vec<GpuSurface>, D3d12Error> {
-        if !self.device.supports(Codec::Hevc) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Hevc }.into());
+        if !self.device.supports(Codec::H265) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::H265 }.into());
         }
         let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut surfaces = Vec::new();
@@ -454,8 +454,8 @@ impl Decoder for HevcDecoder<'_> {
     }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d12Frame>, D3d12Error> {
-        if !self.device.supports(Codec::Hevc) {
-            return Err(SkipReason::ProfileUnsupported { codec: Codec::Hevc }.into());
+        if !self.device.supports(Codec::H265) {
+            return Err(SkipReason::ProfileUnsupported { codec: Codec::H265 }.into());
         }
         let pictures = self.ingest.ingest_packet(packet.data())?;
         let mut frames = Vec::new();
@@ -518,7 +518,7 @@ pub(crate) fn open_sequence_hevc(
 ) -> Result<(DecodeSession, HevcDpb), D3d12Error> {
     let session = DecodeSession::open(
         device,
-        Codec::Hevc,
+        Codec::H265,
         next.width,
         next.height,
         next.crop,

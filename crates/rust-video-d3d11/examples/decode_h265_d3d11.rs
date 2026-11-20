@@ -20,7 +20,7 @@ fn main() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no h265 decoder profile");
         return;
     }

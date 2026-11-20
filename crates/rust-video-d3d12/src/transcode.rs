@@ -74,7 +74,7 @@ impl<'a> Transcoder<'a> {
     pub fn open(device: &'a D3d12Device, decode: Codec, encode: Codec) -> Result<Self, D3d12Error> {
         let source = match decode {
             Codec::H264 => Source::H264(Box::new(H264Decoder::open(device))),
-            Codec::Hevc => Source::Hevc(Box::new(HevcDecoder::open(device))),
+            Codec::H265 => Source::Hevc(Box::new(HevcDecoder::open(device))),
             codec => {
                 return Err(D3d12Error::Unsupported(UnsupportedReason::DecodePending {
                     codec,

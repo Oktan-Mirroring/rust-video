@@ -186,7 +186,7 @@ impl<'a> HevcDecoder<'a> {
 
     /// Session plus picture buffer for `active`.
     fn open_session(&mut self, active: Active) -> Result<(), D3d11Error> {
-        let session = Session::open_codec(self.device, Codec::Hevc, active.width, active.height)?;
+        let session = Session::open_codec(self.device, Codec::H265, active.width, active.height)?;
         self.shared = Some(self.device.shared().clone());
         self.session = Some(session);
         let sps = self

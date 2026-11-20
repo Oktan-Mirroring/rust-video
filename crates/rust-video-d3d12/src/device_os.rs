@@ -62,27 +62,27 @@ const H264_PROFILE: &str = "h264";
 const TABLE: &[(Codec, windows::core::GUID, &str)] = &[
     (Codec::H264, D3D12_VIDEO_DECODE_PROFILE_H264, H264_PROFILE),
     (
-        Codec::Hevc,
+        Codec::H265,
         D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN,
         "hevc-main",
     ),
     (
-        Codec::Hevc,
+        Codec::H265,
         D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10,
         "hevc-main10",
     ),
     (
-        Codec::Hevc,
+        Codec::H265,
         D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN12,
         "hevc-main12",
     ),
     (
-        Codec::Hevc,
+        Codec::H265,
         D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN12_422,
         "hevc-main12-422",
     ),
     (
-        Codec::Hevc,
+        Codec::H265,
         D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN12_444,
         "hevc-main12-444",
     ),
@@ -196,7 +196,7 @@ impl D3d12Device {
         }
         match codec {
             Codec::H264 => self.supports_h264_config(),
-            Codec::Hevc => self.supports_hevc_config(),
+            Codec::H265 => self.supports_hevc_config(),
             _ => true,
         }
     }
@@ -419,9 +419,9 @@ fn check_nv12(video: &ID3D12VideoDevice) -> Result<(), D3d12Error> {
 fn encoder_codec(codec: Codec) -> Option<D3D12_VIDEO_ENCODER_CODEC> {
     match codec {
         Codec::H264 => Some(D3D12_VIDEO_ENCODER_CODEC_H264),
-        Codec::Hevc => Some(D3D12_VIDEO_ENCODER_CODEC_HEVC),
+        Codec::H265 => Some(D3D12_VIDEO_ENCODER_CODEC_HEVC),
         Codec::Av1 => Some(D3D12_VIDEO_ENCODER_CODEC_AV1),
-        Codec::Vp9 | Codec::Mpeg2 | Codec::Vc1 => None,
+        Codec::Vp8 | Codec::Av2 | Codec::Vp9 | Codec::Mpeg2 | Codec::Vc1 => None,
     }
 }
 
@@ -633,14 +633,6 @@ pub(crate) fn profile_desc_hevc(
     }
 }
 
-impl Profile {
-    /// Profile of `codec` named `name`.
-    #[must_use]
-    pub(crate) const fn new(codec: Codec, name: &'static str) -> Self {
-        Self { codec, name }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Codec, Profile};
@@ -653,7 +645,7 @@ mod tests {
     fn match_profile_names_table_entries() {
         let profile =
             super::match_profile(&D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10).expect("hevc main10");
-        assert_eq!(profile.codec(), Codec::Hevc);
+        assert_eq!(profile.codec(), Codec::H265);
         assert_eq!(profile.name(), "hevc-main10");
         let profile = super::match_profile(&D3D12_VIDEO_DECODE_PROFILE_VC1).expect("vc1");
         assert_eq!(profile.codec(), Codec::Vc1);
@@ -662,8 +654,8 @@ mod tests {
 
     #[test]
     fn profile_reports_fields() {
-        let profile = Profile::new(Codec::Hevc, "hevc-main10");
-        assert_eq!(profile.codec(), Codec::Hevc);
+        let profile = Profile::new(Codec::H265, "hevc-main10");
+        assert_eq!(profile.codec(), Codec::H265);
         assert_eq!(profile.name(), "hevc-main10");
     }
 }

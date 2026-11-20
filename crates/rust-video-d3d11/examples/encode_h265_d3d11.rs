@@ -17,7 +17,7 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Hevc) {
+    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no h265 encoder ({error})");

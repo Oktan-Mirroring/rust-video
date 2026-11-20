@@ -413,7 +413,7 @@ fn device_hevc() -> Option<D3d11Device> {
             return None;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("d3d11 skipped: no hevc decoder profile");
         return None;
     }

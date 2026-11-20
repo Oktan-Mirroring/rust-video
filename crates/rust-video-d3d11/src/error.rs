@@ -516,9 +516,9 @@ mod tests {
     #[test]
     fn reasons_carry_values() {
         assert_eq!(
-            D3d11Error::Unsupported(UnsupportedReason::DecodePending { codec: Codec::Hevc })
+            D3d11Error::Unsupported(UnsupportedReason::DecodePending { codec: Codec::H265 })
                 .to_string(),
-            "unsupported stream: hevc decode pending"
+            "unsupported stream: h265 decode pending"
         );
         assert_eq!(
             D3d11Error::Unsupported(UnsupportedReason::NoEncoderMft { codec: Codec::Av1 })

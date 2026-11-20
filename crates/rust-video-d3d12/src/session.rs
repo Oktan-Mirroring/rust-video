@@ -330,7 +330,7 @@ impl DecodeSession {
         queues: Option<DecodeQueues>,
     ) -> Result<Self, D3d12Error> {
         if codec != crate::guid::Codec::H264
-            && codec != crate::guid::Codec::Hevc
+            && codec != crate::guid::Codec::H265
             && codec != crate::guid::Codec::Av1
         {
             return Err(D3d12Error::Unsupported(

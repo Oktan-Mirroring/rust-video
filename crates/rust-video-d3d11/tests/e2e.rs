@@ -109,7 +109,7 @@ fn probe_reports_or_skips() {
     drive_encoder(&device, Codec::H264, 1280, 720, true);
     drive_encoder(&device, Codec::H264, 64, 48, true);
     for codec in [
-        Codec::Hevc,
+        Codec::H265,
         Codec::Av1,
         Codec::Vp9,
         Codec::Mpeg2,

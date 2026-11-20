@@ -240,7 +240,7 @@ fn decode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }
@@ -361,7 +361,7 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d12Encoder::open(&device, Codec::Hevc) {
+    let mut encoder = match D3d12Encoder::open(&device, Codec::H265) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no hevc encoder ({error})");
@@ -446,7 +446,7 @@ fn decode_hevc_surface_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }
@@ -566,7 +566,7 @@ fn sustained_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }

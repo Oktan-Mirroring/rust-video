@@ -807,7 +807,7 @@ impl EncodeSession {
         height: u32,
         queues: Option<EncodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::Hevc {
+        if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::H265 {
             return Err(D3d12Error::Unsupported(
                 UnsupportedReason::EncodeArgsPending { codec },
             ));
@@ -892,7 +892,7 @@ impl EncodeSession {
                 });
                 Ok((Box::new(descriptors), headers.into_bytes()))
             }
-            crate::guid::Codec::Hevc => {
+            crate::guid::Codec::H265 => {
                 let headers = HevcHeaders::build(width, height)?;
                 let level = Self::level_hevc(headers.level_idc())?;
                 let (coded_width, coded_height) = headers.coded();
@@ -1611,7 +1611,7 @@ impl EncodeSession {
     /// `EncodeFrame` plus metadata resolve through the video queue.
     fn submit_video(&mut self, input: &ID3D12Resource) -> Result<Ticket, D3d12Error> {
         self.video.reset()?;
-        let hevc = matches!(self.codec, crate::guid::Codec::Hevc);
+        let hevc = matches!(self.codec, crate::guid::Codec::H265);
         let mut pic_h264 = Self::pic_h264(self.idr_pic_id);
         let mut pic_hevc = Self::pic_hevc();
         let codec_data = if hevc {

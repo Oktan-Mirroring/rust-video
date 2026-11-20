@@ -136,7 +136,7 @@ fn hevc_loopback_returns_own_frames() {
     let Some(device) = device() else {
         return;
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }
@@ -158,7 +158,7 @@ fn hevc_blocking_receive_drains_tail() {
     let Some(device) = device() else {
         return;
     };
-    if !device.supports(Codec::Hevc) {
+    if !device.supports(Codec::H265) {
         println!("SKIP: no hevc decoder profile");
         return;
     }
