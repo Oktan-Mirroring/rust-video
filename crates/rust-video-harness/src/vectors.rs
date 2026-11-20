@@ -3,13 +3,23 @@ use std::path::PathBuf;
 /// Committed bench-vector directory.
 #[must_use]
 pub fn bench_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors/bench")
+    vectors_root().join("bench")
 }
 
 /// Committed decode-vector directory: shared 320x240 corpus.
 #[must_use]
 pub fn decode_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors/decode")
+    vectors_root().join("decode")
+}
+
+/// Vector root: `$RUST_VIDEO_VECTORS` when set, else the committed directory.
+fn vectors_root() -> PathBuf {
+    root_with(std::env::var_os("RUST_VIDEO_VECTORS").map(PathBuf::from))
+}
+
+/// Vector root over an explicit override.
+fn root_with(over: Option<PathBuf>) -> PathBuf {
+    over.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vectors"))
 }
 
 #[cfg(test)]
@@ -26,6 +36,17 @@ mod tests {
         ] {
             assert!(bench_dir().join(name).is_file(), "missing {name}");
         }
+    }
+
+    #[test]
+    fn override_replaces_manifest_root() {
+        use super::root_with;
+        use std::path::PathBuf;
+        assert_eq!(
+            root_with(Some(PathBuf::from("/data/local/tmp/vectors"))),
+            PathBuf::from("/data/local/tmp/vectors")
+        );
+        assert!(root_with(None).join("bench").is_dir());
     }
 
     #[test]
