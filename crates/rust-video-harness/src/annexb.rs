@@ -72,6 +72,40 @@ impl AnnexB {
         nal.first().map(|head| (head >> 1) & 0x3f)
     }
 
+    /// First SPS/PPS pair in `packet`, absent without both.
+    #[must_use]
+    pub fn avc_csd(packet: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut sps = None;
+        let mut pps = None;
+        for nal in Self::split_nals(packet) {
+            match Self::h264_nal_type(nal) {
+                Some(7) if sps.is_none() => sps = Some(nal.to_vec()),
+                Some(8) if pps.is_none() => pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+        Some((sps?, pps?))
+    }
+
+    /// VPS plus SPS/PPS pair in `packet`, absent without all three.
+    #[must_use]
+    pub fn hevc_csd(packet: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut vps = None;
+        let mut sps = None;
+        let mut pps = None;
+        for nal in Self::split_nals(packet) {
+            match Self::h265_nal_type(nal) {
+                Some(32) if vps.is_none() => vps = Some(nal.to_vec()),
+                Some(33) if sps.is_none() => sps = Some(nal.to_vec()),
+                Some(34) if pps.is_none() => pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+        let mut sets = sps?;
+        sets.extend_from_slice(&pps?);
+        Some((vps?, sets))
+    }
+
     /// NAL units without start codes.
     #[must_use]
     pub fn split_nals(data: &[u8]) -> Vec<&[u8]> {
@@ -279,5 +313,18 @@ mod tests {
         let ebsp = AnnexB::insert_emulation(&rbsp);
         assert_eq!(ebsp, vec![0, 0, 3, 1, 0x67, 0, 0, 3, 0, 0x80]);
         assert_eq!(AnnexB::remove_emulation(&ebsp), rbsp);
+    }
+
+    #[test]
+    fn csd_finds_first_sets() {
+        let avc = [0, 0, 1, 0x67, 9, 0, 0, 1, 0x68, 7, 0, 0, 1, 0x65, 1];
+        assert_eq!(AnnexB::avc_csd(&avc), Some((vec![0x67, 9], vec![0x68, 7])));
+        assert_eq!(AnnexB::avc_csd(&[0, 0, 1, 0x65, 1]), None);
+        let hevc = [0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1];
+        assert_eq!(
+            AnnexB::hevc_csd(&hevc),
+            Some((vec![0x40, 1], vec![0x42, 1, 0x44, 1]))
+        );
+        assert_eq!(AnnexB::hevc_csd(&[0, 0, 1, 0x42, 1]), None);
     }
 }
