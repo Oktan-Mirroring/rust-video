@@ -747,9 +747,24 @@ pub(crate) trait NalFrontend {
         }
         match mode {
             DrainMode::Sync => {
+                // Pipeline one deep: the kept submit overlaps the next
+                // call instead of draining fully here.
+                while self.core().pending.len() > 1 {
+                    let core = self.core();
+                    out.extend(collect_oldest(
+                        core.session,
+                        core.sink,
+                        core.pending,
+                        core.stats,
+                    )?);
+                }
                 let core = self.core();
-                let drained = drain_pending(core.session, core.sink, core.pending, core.stats)?;
-                out.extend(drained);
+                out.extend(collect_ready(
+                    core.session,
+                    core.sink,
+                    core.pending,
+                    core.stats,
+                )?);
             }
             DrainMode::Overlap => {
                 let core = self.core();
@@ -933,7 +948,7 @@ pub(crate) struct SubmitPlan<'a, 'b, 'c> {
 /// Drain contract behind a decode call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DrainMode {
-    /// Wait every submitted picture out before returning.
+    /// Collect down to one held picture per call; `flush` releases all.
     Sync,
     /// Submit without waiting; collect signaled completions only.
     Overlap,

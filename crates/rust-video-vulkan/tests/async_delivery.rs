@@ -65,7 +65,13 @@ fn check_loopback(
     for packet in packets {
         pump.try_send(packet.clone()).expect("queue room");
     }
-    let generations = polled_generations(pump).expect("poll");
+    let mut generations = polled_generations(pump).expect("poll");
+    assert!(
+        generations.len() + 1 >= expected,
+        "at most one picture held back"
+    );
+    pump.finish().expect("finish drains");
+    generations.extend(polled_generations(pump).expect("poll"));
     assert_eq!(generations.len(), expected, "every picture completes");
     assert_eq!(
         generations,
@@ -73,7 +79,6 @@ fn check_loopback(
         "frames arrive in display order"
     );
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    pump.finish().expect("finish drains");
     assert!(pump.is_finished());
     assert!(pump.try_receive().expect("drained").is_none());
     assert!(pump.receive().expect("drained").is_none());
@@ -89,14 +94,11 @@ fn check_trailing(
     for packet in packets {
         pump.try_send(packet.clone()).expect("queue room");
     }
-    let mut generations = Vec::new();
-    for _ in 0..expected - 1 {
-        let frame = pump.try_receive().expect("poll").expect("frame queued");
-        generations.push(frame.identity().generation());
-    }
+    let mut generations = polled_generations(pump).expect("poll");
     pump.finish().expect("finish drains");
     let trailing = pump.receive().expect("trailing").expect("trailing queued");
     generations.push(trailing.identity().generation());
+    generations.extend(polled_generations(pump).expect("poll"));
     assert_eq!(generations, (0..expected as u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
@@ -166,7 +168,13 @@ fn h265_send_poll_loopback_returns_own_frames() {
             Err(error) => panic!("queue room: {error}"),
         }
     }
-    let generations = polled_generations(&mut pump).expect("poll");
+    let mut generations = polled_generations(&mut pump).expect("poll");
+    assert!(
+        generations.len() + 1 >= expected,
+        "at most one picture held back"
+    );
+    pump.finish().expect("finish drains");
+    generations.extend(polled_generations(&mut pump).expect("poll"));
     assert_eq!(generations.len(), expected, "every picture completes");
     assert_eq!(
         generations,
@@ -174,7 +182,6 @@ fn h265_send_poll_loopback_returns_own_frames() {
         "frames arrive in display order"
     );
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    pump.finish().expect("finish drains");
     assert!(pump.receive().expect("drained").is_none());
 }
 
@@ -210,14 +217,11 @@ fn h265_blocking_receive_gets_trailing_frame() {
             Err(error) => panic!("queue room: {error}"),
         }
     }
-    let mut generations = Vec::new();
-    for _ in 0..expected - 1 {
-        let frame = pump.try_receive().expect("poll").expect("frame queued");
-        generations.push(frame.identity().generation());
-    }
+    let mut generations = polled_generations(&mut pump).expect("poll");
     pump.finish().expect("finish drains");
     let trailing = pump.receive().expect("trailing").expect("trailing queued");
     generations.push(trailing.identity().generation());
+    generations.extend(polled_generations(&mut pump).expect("poll"));
     assert_eq!(generations, (0..expected as u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
@@ -239,7 +243,9 @@ fn av1_send_poll_loopback_returns_own_frames() {
     for packet in &sent {
         pump.try_send(packet.clone()).expect("queue room");
     }
-    let generations = polled_generations(&mut pump).expect("poll");
+    let mut generations = polled_generations(&mut pump).expect("poll");
+    pump.finish().expect("finish drains");
+    generations.extend(polled_generations(&mut pump).expect("poll"));
     assert!(!generations.is_empty(), "bench vector emits frames");
     let expected = generations.len();
     assert_eq!(
@@ -248,7 +254,6 @@ fn av1_send_poll_loopback_returns_own_frames() {
         "frames arrive in display order"
     );
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    pump.finish().expect("finish drains");
     assert!(pump.receive().expect("drained").is_none());
 }
 
@@ -273,7 +278,10 @@ fn av1_blocking_receive_gets_trailing_frame() {
         for packet in &sent {
             probe.try_send(packet.clone()).expect("queue room");
         }
-        polled_generations(&mut probe).expect("poll").len()
+        let mut generations = polled_generations(&mut probe).expect("poll");
+        probe.finish().expect("finish drains");
+        generations.extend(polled_generations(&mut probe).expect("poll"));
+        generations.len()
     };
     assert!(expected > 0, "bench vector emits frames");
     let mut pump = DecoderPump::open(

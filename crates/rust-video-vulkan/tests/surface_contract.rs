@@ -76,12 +76,13 @@ fn check_surface(frame: &VulkanFrame) {
     frame.wait();
 }
 
-/// No-reorder H.264 emits each picture on its completing `decode` call.
+/// No-reorder H.264 pipelines one deep across `decode` calls.
 ///
 /// The synth carries no VUI, so the reorder depth is zero and 64x64
 /// uncropped; the parser-level shape is proven GPU-free in the crate.
+/// Each picture completes on the following call while one stays held.
 #[test]
-fn h264_no_reorder_emits_per_call() {
+fn h264_no_reorder_pipelines_one_deep() {
     let _guard = Drive::serial();
     if !gated() {
         return;
@@ -99,31 +100,31 @@ fn h264_no_reorder_emits_per_call() {
     let Some(first) = unwrap_or_oom(decoder.decode(&packet), "decode runs", &device) else {
         return;
     };
-    assert_eq!(first.len(), 1, "IDR emits on its completing call");
-    let idr = &first[0];
+    assert!(first.is_empty(), "first call holds its picture back");
+    let packet = Packet::new(Bytes::copy_from_slice(&packets[1]));
+    let Some(second) = unwrap_or_oom(decoder.decode(&packet), "decode runs", &device) else {
+        return;
+    };
+    assert_eq!(second.len(), 1, "IDR completes on the following call");
+    let idr = &second[0];
     check_surface(idr);
     assert_eq!((idr.size().width(), idr.size().height()), (64, 64));
     assert_eq!((idr.coded().width(), idr.coded().height()), (64, 64));
     assert_eq!(idr.origin(), (0, 0));
     assert_eq!(idr.slice(), 0);
-    let packet = Packet::new(Bytes::copy_from_slice(&packets[1]));
-    let Some(second) = unwrap_or_oom(decoder.decode(&packet), "decode runs", &device) else {
-        return;
-    };
-    assert_eq!(second.len(), 1, "P picture emits on its completing call");
-    check_surface(&second[0]);
     let Some(flushed) = unwrap_or_oom(decoder.flush(), "flush runs", &device) else {
         return;
     };
-    assert!(flushed.is_empty(), "no-reorder stream holds nothing back");
+    assert_eq!(flushed.len(), 1, "flush releases the held tail");
+    check_surface(&flushed[0]);
 }
 
-/// No-reorder H.265 emits each picture on its completing `decode` call.
+/// No-reorder H.265 pipelines one deep across `decode` calls.
 ///
 /// `RUST_VIDEO_VULKAN_H265_NOREORDER` points at a stream whose sequence
 /// sets declare zero reorder pictures with one slice per picture.
 #[test]
-fn h265_no_reorder_emits_per_call() {
+fn h265_no_reorder_pipelines_one_deep() {
     let _guard = Drive::serial();
     if !gated() {
         return;
@@ -143,28 +144,33 @@ fn h265_no_reorder_emits_per_call() {
     let bytes = std::fs::read(&path).expect("vector reads");
     let raws = AnnexB::group_pictures(&bytes, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "no pictures in {}", path.display());
+    let mut count = 0;
     for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
         let Some(frames) = unwrap_or_oom(decoder.decode(&packet), "decode runs", &device) else {
             return;
         };
-        assert_eq!(frames.len(), 1, "each picture emits on its completing call");
         for frame in &frames {
             check_surface(frame);
         }
+        count += frames.len();
     }
     let Some(flushed) = unwrap_or_oom(decoder.flush(), "flush runs", &device) else {
         return;
     };
-    assert!(flushed.is_empty(), "no-reorder stream holds nothing back");
+    for frame in &flushed {
+        check_surface(frame);
+    }
+    count += flushed.len();
+    assert_eq!(count, raws.len(), "every picture completes once");
 }
 
-/// AV1 emits every shown picture on its completing `decode` call.
+/// AV1 emits every shown picture across `decode` plus `flush`.
 ///
 /// The reorder depth is always zero, so any vector proves it;
 /// `RUST_VIDEO_VULKAN_AV1_NOREORDER` points at the `.obu` file.
 #[test]
-fn av1_no_reorder_emits_per_call() {
+fn av1_no_reorder_pipelines_one_deep() {
     let _guard = Drive::serial();
     if !gated() {
         return;
@@ -186,14 +192,17 @@ fn av1_no_reorder_emits_per_call() {
     let Some(frames) = unwrap_or_oom(decoder.decode(&packet), "decode runs", &device) else {
         return;
     };
-    assert!(!frames.is_empty(), "no pictures in {}", path.display());
-    for frame in &frames {
-        check_surface(frame);
-    }
     let Some(flushed) = unwrap_or_oom(decoder.flush(), "flush runs", &device) else {
         return;
     };
-    assert!(flushed.is_empty(), "av1 holds nothing back");
+    assert!(
+        !frames.is_empty() || !flushed.is_empty(),
+        "no pictures in {}",
+        path.display()
+    );
+    for frame in frames.iter().chain(flushed.iter()) {
+        check_surface(frame);
+    }
 }
 
 /// Surfaces decoded from `raw`, declining loud on missing export or VRAM.
@@ -243,13 +252,17 @@ fn gpu_surfaces_pin_export_slots() {
     let Some(first) = decode_surfaces(&mut decoder, &device, &packets[0]) else {
         return;
     };
-    assert_eq!(first.len(), 1);
+    assert!(first.is_empty(), "first call holds its picture back");
     let Some(second) = decode_surfaces(&mut decoder, &device, &packets[1]) else {
         return;
     };
-    assert_eq!(second.len(), 1);
-    let held_a = first[0].planes().expect("gpu planes");
-    let held_b = second[0].planes().expect("gpu planes");
+    assert_eq!(second.len(), 1, "first surface completes next call");
+    let Some(flushed) = unwrap_or_oom(decoder.flush_surface(), "flush runs", &device) else {
+        return;
+    };
+    assert_eq!(flushed.len(), 1, "flush releases the held tail");
+    let held_a = second[0].planes().expect("gpu planes");
+    let held_b = flushed[0].planes().expect("gpu planes");
     assert_ne!(held_a.y_image(), held_a.uv_image());
     assert_ne!(held_b.y_image(), held_b.uv_image());
     assert_ne!(
@@ -263,14 +276,18 @@ fn gpu_surfaces_pin_export_slots() {
         "held surfaces share no slot"
     );
     let freed = held_a.y_image();
-    drop(first);
     drop(second);
+    drop(flushed);
     let Some(third) = decode_surfaces(&mut decoder, &device, &packets[0]) else {
         return;
     };
-    assert_eq!(third.len(), 1);
+    assert!(third.is_empty(), "resubmitted picture stays held");
+    let Some(recycled) = unwrap_or_oom(decoder.flush_surface(), "flush runs", &device) else {
+        return;
+    };
+    assert_eq!(recycled.len(), 1);
     assert_eq!(
-        third[0].planes().expect("gpu planes").y_image(),
+        recycled[0].planes().expect("gpu planes").y_image(),
         freed,
         "freed slot recycles"
     );

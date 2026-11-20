@@ -991,6 +991,16 @@ impl<'a> Av1Decoder<'a> {
                         }
                         .into());
                     };
+                    let foreign = if gpu {
+                        gpu_pair.is_none()
+                    } else {
+                        cpu.is_none()
+                    };
+                    if foreign {
+                        return Err(VulkanError::Unsupported {
+                            what: "av1 show-existing across cpu/gpu paths".to_owned(),
+                        });
+                    }
                     let (cpu, pair) = if gpu {
                         (None, gpu_pair.as_ref())
                     } else {
@@ -1033,7 +1043,14 @@ impl<'a> Av1Decoder<'a> {
             out.extend(self.run_unit(&unit, gpu, mode)?);
         }
         match mode {
-            DrainMode::Sync => out.extend(self.drain()?),
+            DrainMode::Sync => {
+                // Pipeline one deep: the kept submit overlaps the next
+                // call instead of draining fully here.
+                while self.pending.len() > 1 {
+                    out.extend(self.collect_one()?);
+                }
+                out.extend(self.collect_ready_pictures()?);
+            }
             DrainMode::Overlap => out.extend(self.collect_ready_pictures()?),
         }
         Ok(out)
@@ -1554,6 +1571,8 @@ mod tests {
         };
         let mut count = 0;
         let mut variants = std::collections::HashSet::new();
+        let mut saw_surface = false;
+        let mut saw_trait = false;
         for (gpu, raw) in pattern.iter().zip(packets.iter()) {
             let packet = Packet::new(Bytes::copy_from_slice(raw));
             let frames = if *gpu {
@@ -1576,11 +1595,12 @@ mod tests {
                 }
             };
             for frame in &frames {
-                if *gpu {
-                    check_surface_frame(frame);
+                check_either_frame(frame);
+                if frame.planes().is_some() {
+                    saw_surface = true;
                     variants.insert(export_tag(frame));
                 } else {
-                    check_trait_frame(frame);
+                    saw_trait = true;
                 }
             }
             count += frames.len();
@@ -1607,11 +1627,24 @@ mod tests {
         for frame in &flushed {
             check_either_frame(frame);
             if frame.planes().is_some() {
+                saw_surface = true;
                 variants.insert(export_tag(frame));
+            } else {
+                saw_trait = true;
             }
         }
         count += flushed.len();
         assert!(variants.len() <= 1, "surface exports stay consistent");
+        assert_eq!(
+            saw_surface,
+            pattern.iter().any(|gpu| *gpu),
+            "surface arrivals follow surface submits"
+        );
+        assert_eq!(
+            saw_trait,
+            pattern.iter().any(|gpu| !*gpu),
+            "trait arrivals follow trait submits"
+        );
         Some(count)
     }
 
