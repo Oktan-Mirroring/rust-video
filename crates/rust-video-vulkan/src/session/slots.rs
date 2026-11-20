@@ -12,6 +12,9 @@ use crate::raw::{CommandPool, VkFence};
 use ash::vk;
 use rust_video_caps::delivery::SubmitStats;
 
+/// Submit slots per session, at most: one bitstream plus one readback buffer each.
+pub(crate) const MAX_SUBMIT_SLOTS: usize = 8;
+
 /// Retries of one submit after a reset, before the error surfaces.
 pub(crate) const SUBMIT_RETRIES: u32 = 1;
 
@@ -95,10 +98,30 @@ impl SubmitSlots {
         queue: vk::Queue,
         queue_lock: Arc<Mutex<()>>,
     ) -> Result<Self, VulkanError> {
+        Self::open_depth(device, family, queue, queue_lock, SUBMIT_SLOTS)
+    }
+
+    /// Ring over `queue` with `depth` slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when pool, command buffer, or fence creation fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - ring slots; clamped to `1..=MAX_SUBMIT_SLOTS`.
+    pub(crate) fn open_depth(
+        device: &ash::Device,
+        family: u32,
+        queue: vk::Queue,
+        queue_lock: Arc<Mutex<()>>,
+        depth: usize,
+    ) -> Result<Self, VulkanError> {
+        let depth = depth.clamp(1, MAX_SUBMIT_SLOTS);
         let pool = CommandPool::create(device, family)?;
-        let mut slots = Vec::with_capacity(SUBMIT_SLOTS);
+        let mut slots = Vec::with_capacity(depth);
         let mut creates = 1;
-        for _ in 0..SUBMIT_SLOTS {
+        for _ in 0..depth {
             slots.push(SubmitSlot {
                 cmd: pool.allocate()?,
                 fence: Arc::new(VkFence::new(device, false)?),
@@ -397,7 +420,7 @@ impl Drop for SubmitSlots {
 
 #[cfg(test)]
 mod tests {
-    use super::{SubmitSlots, SUBMIT_RETRIES, SUBMIT_SLOTS};
+    use super::{SubmitSlots, MAX_SUBMIT_SLOTS, SUBMIT_RETRIES, SUBMIT_SLOTS};
 
     /// Live device plus ring; the ring binding drops first, idling live work.
     fn ring() -> Option<(crate::device::VulkanDevice, SubmitSlots)> {
@@ -427,6 +450,34 @@ mod tests {
             super::SubmitStats::snapshot(0, 0, 0, 0)
         );
         assert_eq!(super::SubmitStats::default(), super::SubmitStats::new());
+    }
+
+    #[test]
+    fn ring_depth_clamps_to_bounds() {
+        let negotiated = crate::device::VulkanDevice::open(crate::ladder::CodecOp::H264Decode)
+            .expect("negotiation runs");
+        let Some(device) = negotiated else {
+            println!("declined: submit ring needs a video device");
+            return;
+        };
+        let mut one = SubmitSlots::open_depth(
+            device.vk_device(),
+            device.queue_family(),
+            device.queue(),
+            device.queue_lock().clone(),
+            0,
+        )
+        .expect("ring opens");
+        assert_eq!(one.take_creates(), 3);
+        let mut full = SubmitSlots::open_depth(
+            device.vk_device(),
+            device.queue_family(),
+            device.queue(),
+            device.queue_lock().clone(),
+            usize::MAX,
+        )
+        .expect("ring opens");
+        assert_eq!(full.take_creates(), 1 + 2 * MAX_SUBMIT_SLOTS as u64);
     }
 
     #[test]

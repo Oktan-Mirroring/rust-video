@@ -15,7 +15,7 @@ use crate::raw::{
     SessionParameters, VideoSession,
 };
 use crate::session::geometry::SessionGeometry;
-use crate::session::slots::{SubmitSlots, SUBMIT_SLOTS};
+use crate::session::slots::{SubmitSlots, MAX_SUBMIT_SLOTS};
 
 use rust_video_caps::delivery::SubmitStats;
 
@@ -112,8 +112,10 @@ impl Session {
         profile: &vk::VideoProfileInfoKHR<'_>,
         std_version: &vk::ExtensionProperties,
         template: &mut crate::session::params::ParamsTemplate<'_>,
+        depth: usize,
     ) -> Result<Self, VulkanError> {
         check_crop_window(geometry)?;
+        let depth = depth.clamp(1, MAX_SUBMIT_SLOTS);
         let raw = device.raw().device();
         let properties =
             crate::raw::RawDevice::memory_properties(device.backend(), device.adapter());
@@ -163,33 +165,20 @@ impl Session {
         for layer in 0..geometry.dpb_slots() {
             dpb_views.push(dpb.layer_view(layer)?);
         }
-        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let mut bitstreams = Vec::with_capacity(SUBMIT_SLOTS);
-        let mut readbacks = Vec::with_capacity(SUBMIT_SLOTS);
-        for _ in 0..SUBMIT_SLOTS {
-            bitstreams.push(GpuBuffer::create(
-                raw,
-                &properties,
-                BITSTREAM_BYTES,
-                vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
-                host,
-                profiles,
-            )?);
-            readbacks.push(GpuBuffer::create_readback(
-                raw,
-                &properties,
-                nv12_bytes(as_extent(geometry.coded())),
-                vk::BufferUsageFlags::TRANSFER_DST,
-                host,
-                &[],
-            )?);
-        }
+        let (bitstreams, readbacks) = Self::stage_buffers(
+            raw,
+            &properties,
+            profiles,
+            nv12_bytes(as_extent(geometry.coded())),
+            depth,
+        )?;
         let decode = DecodeQueue::new(device.backend().instance(), raw);
-        let submit = SubmitSlots::open(
+        let submit = SubmitSlots::open_depth(
             raw,
             device.queue_family(),
             device.queue(),
             device.queue_lock().clone(),
+            depth,
         )?;
         let (bitstream_maps, readback_maps) = Self::stage_maps(&bitstreams, &readbacks)?;
         let ext = device.ext();
@@ -214,6 +203,42 @@ impl Session {
         })
     }
 
+    /// Staging bitstream plus readback buffers, `depth` pairs of `frame` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when buffer creation fails.
+    fn stage_buffers(
+        raw: &ash::Device,
+        properties: &vk::PhysicalDeviceMemoryProperties,
+        profiles: &[vk::VideoProfileInfoKHR<'_>],
+        frame: u64,
+        depth: usize,
+    ) -> Result<(Vec<GpuBuffer>, Vec<GpuBuffer>), VulkanError> {
+        let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut bitstreams = Vec::with_capacity(depth);
+        let mut readbacks = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            bitstreams.push(GpuBuffer::create(
+                raw,
+                properties,
+                BITSTREAM_BYTES,
+                vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
+                host,
+                profiles,
+            )?);
+            readbacks.push(GpuBuffer::create_readback(
+                raw,
+                properties,
+                frame,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                host,
+                &[],
+            )?);
+        }
+        Ok((bitstreams, readbacks))
+    }
+
     /// Session-life maps over staging `bitstreams` plus `readbacks`.
     ///
     /// # Errors
@@ -223,9 +248,9 @@ impl Session {
         bitstreams: &[GpuBuffer],
         readbacks: &[GpuBuffer],
     ) -> Result<(Vec<PersistentMap>, Vec<PersistentMap>), VulkanError> {
-        let mut bitstream_maps = Vec::with_capacity(SUBMIT_SLOTS);
-        let mut readback_maps = Vec::with_capacity(SUBMIT_SLOTS);
-        for slot in 0..SUBMIT_SLOTS {
+        let mut bitstream_maps = Vec::with_capacity(bitstreams.len());
+        let mut readback_maps = Vec::with_capacity(readbacks.len());
+        for slot in 0..bitstreams.len() {
             bitstream_maps.push(bitstreams[slot].memory().map_persistent()?);
             readback_maps.push(readbacks[slot].memory().map_persistent()?);
         }

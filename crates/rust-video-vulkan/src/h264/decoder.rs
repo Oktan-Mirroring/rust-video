@@ -27,6 +27,7 @@ use crate::session::geometry::{h264_profile_to_std, SessionGeometry};
 use crate::session::params::{
     h264_params_add, h264_params_create, H264ProfileChain, ParamsTemplate, H264_DECODE_STD_NAME,
 };
+use crate::session::slots::{MAX_SUBMIT_SLOTS, SUBMIT_SLOTS};
 
 /// H.264 decoder over a negotiated Vulkan device.
 ///
@@ -73,6 +74,8 @@ pub struct H264Decoder<'a> {
     stats: SubmitStats,
     /// Armed fault for the next submit, applied once a session runs.
     fault: bool,
+    /// Submitted pictures before sends refuse.
+    depth: usize,
 }
 
 impl Drop for H264Decoder<'_> {
@@ -82,12 +85,31 @@ impl Drop for H264Decoder<'_> {
 }
 
 impl<'a> H264Decoder<'a> {
+    /// Submitted pictures before sends refuse, by default.
+    pub const DEFAULT_DEPTH: usize = SUBMIT_SLOTS;
+    /// Submitted pictures before sends refuse, at most.
+    pub const MAX_DEPTH: usize = MAX_SUBMIT_SLOTS;
+
     /// Decoder over `device`, negotiated for H.264 decode.
     ///
     /// # Errors
     ///
     /// Returns `Err` when `device` negotiated a different operation.
     pub fn open(device: &'a VulkanDevice) -> Result<Self, VulkanError> {
+        Self::open_depth(device, Self::DEFAULT_DEPTH)
+    }
+
+    /// Decoder over `device` submitting at most `depth` pictures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `device` negotiated a different operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - Vulkan device behind decode sessions.
+    /// * `depth` - submitted pictures before sends refuse; clamped to `1..=MAX_DEPTH`.
+    pub fn open_depth(device: &'a VulkanDevice, depth: usize) -> Result<Self, VulkanError> {
         if device.op() != CodecOp::H264Decode {
             return Err(VulkanError::OverCaps { what: "codec op" });
         }
@@ -109,6 +131,7 @@ impl<'a> H264Decoder<'a> {
             ready: Vec::new(),
             stats: SubmitStats::new(),
             fault: false,
+            depth: depth.clamp(1, Self::MAX_DEPTH),
         })
     }
 
@@ -183,6 +206,7 @@ impl<'a> H264Decoder<'a> {
             &chain.base(),
             &std_version,
             &mut template,
+            self.depth,
         )?;
         let mut seq_stds = Vec::new();
         let mut pic_stds = Vec::new();
@@ -260,6 +284,7 @@ impl NalFrontend for H264Decoder<'_> {
             sink: &mut self.sink,
             pending: &mut self.pending,
             stats: &mut self.stats,
+            depth: self.depth,
         }
     }
 
@@ -437,7 +462,7 @@ impl SplitDecode for H264Decoder<'_> {
     type Error = VulkanError;
 
     fn try_submit(&mut self, packet: &Packet) -> Result<bool, VulkanError> {
-        if self.pending.len() + self.sink.launched_len() >= crate::session::slots::SUBMIT_SLOTS {
+        if self.pending.len() + self.sink.launched_len() >= self.depth {
             return Ok(false);
         }
         let frames = self.run_bytes(packet.data(), false, DrainMode::Overlap)?;

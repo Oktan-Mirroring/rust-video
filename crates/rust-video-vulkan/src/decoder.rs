@@ -629,6 +629,8 @@ pub(crate) struct RunCore<'a> {
     pub(crate) pending: &'a mut Vec<PendingPicture>,
     /// Accumulated submit-core gauges.
     pub(crate) stats: &'a mut SubmitStats,
+    /// Submitted pictures before sends refuse.
+    pub(crate) depth: usize,
 }
 
 /// NAL/AU front end behind the shared H.26x run path.
@@ -674,18 +676,20 @@ pub(crate) trait NalFrontend {
         let mut out = Vec::new();
         if mode == DrainMode::Overlap {
             let core = self.core();
+            let depth = core.depth;
             out.extend(backpressure_to_depth(
                 core.session,
                 core.sink,
                 core.pending,
                 core.stats,
+                depth,
             )?);
         }
         self.submit_picture(picture, gpu)?;
         match mode {
             DrainMode::Sync => {
-                if self.core().pending.len() >= crate::session::slots::SUBMIT_SLOTS {
-                    let core = self.core();
+                let core = self.core();
+                if core.pending.len() >= core.depth {
                     out.extend(drain_pending(
                         core.session,
                         core.sink,
@@ -1370,15 +1374,16 @@ pub(crate) fn claim_slot(slots: &mut SlotBook, id: ReferenceId) -> Result<usize,
     slots.claim(id).map_err(|_| VulkanError::NoFreeSlot)
 }
 
-/// Wait oldest pictures out until the submitted count fits the ring.
+/// Wait oldest pictures out until the submitted count fits `depth`.
 fn backpressure_to_depth(
     session: &mut Option<Session>,
     sink: &mut FrameSink,
     pending: &mut Vec<PendingPicture>,
     stats: &mut SubmitStats,
+    depth: usize,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
     let mut out = Vec::new();
-    while pending.len() >= crate::session::slots::SUBMIT_SLOTS {
+    while pending.len() >= depth {
         out.extend(collect_oldest(session, sink, pending, stats)?);
     }
     Ok(out)
