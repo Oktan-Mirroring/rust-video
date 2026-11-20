@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+/// Video codec.
+pub use rust_video_core::Codec as VideoCodec;
+
 /// Host operating system family.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -143,24 +146,6 @@ impl TierPreference {
     }
 }
 
-/// Video codec.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum VideoCodec {
-    /// H.264 codec.
-    H264,
-    /// H.265 codec.
-    H265,
-    /// AV1 codec.
-    Av1,
-    /// VP9 codec.
-    Vp9,
-    /// VP8 codec.
-    Vp8,
-    /// AV2 codec.
-    Av2,
-}
-
 /// Tier availability on one machine.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Capabilities {
@@ -241,7 +226,7 @@ pub struct TierError {
 impl TierError {
     /// Resolution failure for `codec` under `preference`.
     #[must_use]
-    pub(crate) fn new(codec: VideoCodec, preference: TierPreference) -> Self {
+    pub fn new(codec: VideoCodec, preference: TierPreference) -> Self {
         Self { codec, preference }
     }
 

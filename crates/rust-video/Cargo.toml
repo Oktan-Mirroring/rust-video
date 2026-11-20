@@ -40,6 +40,7 @@ bytes = "1"
 rust-video-av1 = { version = "0.1.0", path = "../rust-video-av1", optional = true }
 rust-video-av2 = { version = "0.1.0", path = "../rust-video-av2", optional = true }
 rust-video-caps = { version = "0.1.0", path = "../rust-video-caps" }
+rust-video-core = { version = "0.1.0", path = "../rust-video-core" }
 rust-video-d3d11 = { version = "0.1.0", path = "../rust-video-d3d11", optional = true }
 rust-video-d3d12 = { version = "0.1.0", path = "../rust-video-d3d12", optional = true }
 rust-video-h264 = { version = "0.1.0", path = "../rust-video-h264", optional = true }
