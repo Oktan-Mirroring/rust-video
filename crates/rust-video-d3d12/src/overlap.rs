@@ -28,6 +28,7 @@ use crate::readback::{Done, Readback};
 use crate::session::{DecodeQueues, DecodeSession};
 use crate::submit::Ticket;
 
+use bytes::Bytes;
 use rust_video_caps::delivery::{
     PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SplitDecode, SubmitStats,
     TrySendError,
@@ -90,7 +91,7 @@ pub(crate) trait OverlapFront {
         submission: &Self::Submission,
     ) -> Result<Ticket, D3d12Error>;
     /// Readback bytes behind `active`, cropped per output when the session runs uncropped.
-    fn finish_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
+    fn finish_nv12(nv12: Bytes, active: &Active) -> Result<Bytes, D3d12Error> {
         let _ = active;
         Ok(nv12)
     }
@@ -171,7 +172,7 @@ impl OverlapFront for Av1Front {
         session.submit_av1(submission)
     }
 
-    fn finish_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
+    fn finish_nv12(nv12: Bytes, active: &Active) -> Result<Bytes, D3d12Error> {
         visible_nv12(nv12, active)
     }
 }
@@ -855,7 +856,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             .and_then(|session| session.shared_handle(output.pin.slot()));
         let frame = emit_frame(
             &self.shared,
-            F::finish_nv12(bytes?, &output.active)?,
+            F::finish_nv12(Bytes::from(bytes?), &output.active)?,
             export,
             &output.active,
             output.generation,

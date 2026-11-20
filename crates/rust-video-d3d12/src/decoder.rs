@@ -86,7 +86,7 @@ pub(crate) fn session_surface_export(session: &DecodeSession, slot: u8) -> Optio
 ///
 /// Returns `Err` past the picture cap, or when `nv12` falls short of
 /// the coded extent.
-pub(crate) fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3d12Error> {
+pub(crate) fn visible_nv12(nv12: Bytes, active: &Active) -> Result<Bytes, D3d12Error> {
     let too_large = || D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge);
     let short = || D3d12Error::Unsupported(UnsupportedReason::ReadbackShortOfExtent);
     let visible_width = usize::try_from(active.visible.width()).map_err(|_| too_large())?;
@@ -109,13 +109,13 @@ pub(crate) fn visible_nv12(nv12: Vec<u8>, active: &Active) -> Result<Vec<u8>, D3
         let start = luma + row.checked_mul(coded_width).ok_or_else(short)?;
         visible.extend_from_slice(nv12.get(start..start + visible_width).ok_or_else(short)?);
     }
-    Ok(visible)
+    Ok(Bytes::from(visible))
 }
 
-/// Frame for NV12 `nv12` at `generation`.
+/// Frame over tight NV12 `bytes` at `generation`.
 pub(crate) fn emit_frame(
     budget: &SharedDevice,
-    nv12: Vec<u8>,
+    bytes: Bytes,
     export: Option<SharedExport>,
     active: &Active,
     generation: u64,
@@ -123,13 +123,12 @@ pub(crate) fn emit_frame(
     let luma = u64::from(active.visible.width()) * u64::from(active.visible.height());
     let y_len = usize::try_from(luma)
         .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-    if nv12.len() != y_len + y_len / 2 {
+    if bytes.len() != y_len + y_len / 2 {
         return Err(D3d12Error::Unsupported(
             UnsupportedReason::ReadbackShortOfExtent,
         ));
     }
     let identity = GpuFrame::new(active.visible, PixelFormat::Nv12, generation);
-    let bytes = Bytes::from(nv12);
     let lease = budget.try_acquire(bytes.len() as u64)?;
     Ok(D3d12Frame::new(
         identity,

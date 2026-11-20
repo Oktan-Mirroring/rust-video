@@ -4,12 +4,14 @@
 #![allow(unsafe_code)]
 
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::D3d12Error;
 use crate::h264::frontend::Crop;
 use crate::submit::Nv12Layout;
 
+use bytes::Bytes;
 use rust_video_core::{CopyPump, InlineCopy};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -163,5 +165,83 @@ impl Done {
     /// Slot, copied bytes, mapping release, and copy time.
     pub(crate) fn into_parts(self) -> (u8, Result<Vec<u8>, D3d12Error>, Release, Duration) {
         (self.slot, self.bytes, self.release, self.copy)
+    }
+}
+
+/// Returned buffers kept per session.
+const POOL_CAP: usize = 16;
+
+/// Pooled frame-byte buffers behind sync readback.
+pub(crate) struct BufferPool {
+    /// Returned buffers awaiting reuse.
+    free: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    /// Empty pool.
+    pub(crate) fn new() -> Self {
+        Self {
+            free: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Buffer holding `len`, from the pool or fresh.
+    pub(crate) fn take(&self, len: usize) -> Vec<u8> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = free.iter().rposition(|buf| buf.capacity() >= len) {
+            return free.swap_remove(index);
+        }
+        Vec::with_capacity(len)
+    }
+
+    /// `buf` as shared bytes returning to `pool` on last drop.
+    pub(crate) fn wrap(pool: &Arc<Self>, buf: Vec<u8>) -> Bytes {
+        Bytes::from_owner(Pooled::new(buf, Arc::clone(pool)))
+    }
+
+    /// `buf` returned for reuse, past the cap dropped.
+    fn give(&self, buf: Vec<u8>) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.len() < POOL_CAP {
+            free.push(buf);
+        }
+    }
+}
+
+/// Pooled owner behind frame bytes; the buffer returns on last drop.
+struct Pooled {
+    /// Packed bytes, absent after the return.
+    buf: Option<Vec<u8>>,
+    /// Pool behind the buffer.
+    pool: Arc<BufferPool>,
+}
+
+impl Pooled {
+    /// Owner of `buf` returning to `pool`.
+    fn new(buf: Vec<u8>, pool: Arc<BufferPool>) -> Self {
+        Self {
+            buf: Some(buf),
+            pool,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Pooled {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref().map_or(&[], Vec::as_slice)
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.give(buf);
+        }
     }
 }

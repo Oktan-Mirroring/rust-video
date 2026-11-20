@@ -148,6 +148,23 @@ pub(crate) struct Nv12Layout {
 }
 
 impl Nv12Layout {
+    /// Tight byte count under `crop` at `width` by `height`.
+    pub(crate) fn tight_len(
+        width: u32,
+        height: u32,
+        crop: Option<crate::h264::frontend::Crop>,
+    ) -> usize {
+        let (_, _, visible_width, visible_height) = visible_rect(width, height, crop);
+        usize::try_from(
+            u64::from(visible_width)
+                .saturating_mul(u64::from(visible_height))
+                .saturating_mul(3)
+                / 2,
+        )
+        .unwrap_or(usize::MAX)
+        .min(isize::MAX as usize)
+    }
+
     /// Tight NV12 bytes from pitched `staged` bytes under `crop`.
     pub(crate) fn tighten(
         &self,
@@ -156,10 +173,25 @@ impl Nv12Layout {
         height: u32,
         crop: Option<crate::h264::frontend::Crop>,
     ) -> Result<Vec<u8>, D3d12Error> {
+        let mut out = Vec::with_capacity(Self::tight_len(width, height, crop));
+        self.tighten_into(staged, width, height, crop, &mut out)?;
+        Ok(out)
+    }
+
+    /// Pitched `staged` bytes tightened into `out` under `crop`.
+    pub(crate) fn tighten_into(
+        &self,
+        staged: &[u8],
+        width: u32,
+        height: u32,
+        crop: Option<crate::h264::frontend::Crop>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), D3d12Error> {
         let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
         let y_len = usize::try_from(u64::from(visible_width) * u64::from(visible_height))
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let mut out = Vec::with_capacity(y_len + y_len / 2);
+        out.clear();
+        out.reserve(y_len + y_len / 2);
         for (plane, index) in self.planes.iter().zip([0, 1]) {
             let (plane_left, plane_top, plane_width, plane_rows) = if index == 0 {
                 (left, top, visible_width, visible_height)
@@ -173,10 +205,10 @@ impl Nv12Layout {
                 plane_top,
                 plane_width,
                 plane_rows,
-                &mut out,
+                &mut *out,
             )?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Tight `nv12` bytes pitched into `staged`.

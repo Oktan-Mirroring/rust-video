@@ -10,6 +10,7 @@
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::av1::params::{PicParamsAv1, TileAv1};
@@ -18,9 +19,11 @@ use crate::error::{BrokenReferenceReason, D3d12Error, UnsupportedReason};
 use crate::h264::frontend::Crop;
 use crate::h264::picture::H264Submission;
 use crate::h265::picture::HevcSubmission;
+use crate::readback::BufferPool;
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 use crate::texture::SurfaceWait;
 
+use bytes::Bytes;
 use rust_video_caps::reason::BrokenReferenceReason as SharedBroken;
 use windows::core::Interface;
 use windows::core::PCWSTR;
@@ -204,6 +207,8 @@ pub(crate) struct DecodeQueues {
     copy_queue: ID3D12CommandQueue,
     /// Download slots, one per pool texture.
     copy_slots: Vec<CommandSlot<ID3D12GraphicsCommandList>>,
+    /// Frame-byte buffers reused across session rebuilds.
+    pool: Arc<BufferPool>,
 }
 
 impl DecodeQueues {
@@ -230,6 +235,7 @@ impl DecodeQueues {
             video_slots,
             copy_queue,
             copy_slots,
+            pool: Arc::new(BufferPool::new()),
         })
     }
 }
@@ -280,6 +286,8 @@ pub(crate) struct DecodeSession {
     height: u32,
     /// Visible rectangle, absent when uncropped.
     crop: Option<Crop>,
+    /// Frame-byte buffers behind readback.
+    pool: Arc<BufferPool>,
 }
 
 impl DecodeSession {
@@ -318,6 +326,7 @@ impl DecodeSession {
             video_slots: self.video_slots,
             copy_queue: self.copy_queue,
             copy_slots: self.copy_slots,
+            pool: self.pool,
         }
     }
 
@@ -354,6 +363,7 @@ impl DecodeSession {
             video_slots,
             copy_queue,
             copy_slots,
+            pool,
         } = queues;
         let video_fence = Fence::open(device.device())?;
         let copy_fence = Fence::open(device.device())?;
@@ -424,6 +434,7 @@ impl DecodeSession {
             width,
             height,
             crop,
+            pool,
         })
     }
 
@@ -654,7 +665,7 @@ impl DecodeSession {
     ///
     /// Returns `Err` for a slot outside the pool, when the GPU misses
     /// the wait budget, or when staging falls short of the layout.
-    pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Vec<u8>, D3d12Error> {
+    pub(crate) fn finish_download(&self, slot: u8, ticket: Ticket) -> Result<Bytes, D3d12Error> {
         Ok(self.finish_download_split(slot, ticket)?.2)
     }
 
@@ -668,7 +679,7 @@ impl DecodeSession {
         &self,
         slot: u8,
         ticket: Ticket,
-    ) -> Result<(Duration, Duration, Vec<u8>), D3d12Error> {
+    ) -> Result<(Duration, Duration, Bytes), D3d12Error> {
         let copy_at = Instant::now();
         self.copy_fence.wait(ticket)?;
         let mapped_at = Instant::now();
@@ -686,7 +697,7 @@ impl DecodeSession {
     ///
     /// Returns `Err` for a slot outside the pool, or when
     /// staging falls short of the layout.
-    fn readback(&self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
+    fn readback(&self, slot: u8) -> Result<Bytes, D3d12Error> {
         let index = usize::from(slot);
         let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
             BrokenReferenceReason::Broken(SharedBroken::SlotOutsidePool),
@@ -694,10 +705,14 @@ impl DecodeSession {
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
+        let mut buf = self
+            .pool
+            .take(Nv12Layout::tight_len(self.width, self.height, self.crop));
         DeviceResources::with_readback(staging, total, |mapped| {
             self.layout
-                .tighten(mapped, self.width, self.height, self.crop)
-        })
+                .tighten_into(mapped, self.width, self.height, self.crop, &mut buf)
+        })?;
+        Ok(BufferPool::wrap(&self.pool, buf))
     }
 
     /// Mapped staging of `slot` for a worker copy.
