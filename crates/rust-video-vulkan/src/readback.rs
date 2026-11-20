@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use crate::raw::GpuMemory;
 
-use ash::vk;
 use bytes::BytesMut;
 use rust_video_core::{CopyPump, InlineCopy};
 
@@ -19,25 +18,14 @@ use rust_video_core::{CopyPump, InlineCopy};
 pub(crate) struct Done {
     /// Filled staging bytes.
     bytes: BytesMut,
-    /// Mapping behind the copy, released by the collect thread.
-    release: Release,
     /// Copy time.
     copy: Duration,
 }
 
-/// Mapping release: unmap on the collect thread.
-#[derive(Clone)]
-pub(crate) struct Release {
-    /// Device behind the map.
-    device: ash::Device,
-    /// Memory behind the map.
-    memory: vk::DeviceMemory,
-}
-
 /// Mapped readback buffer awaiting its copy.
 ///
-/// Single owner at a time: the collect thread maps, the worker
-/// copies, the collect thread releases.
+/// Single owner at a time: the launch hands the session-life map
+/// to the worker, which copies; the collect then lands the bytes.
 pub(crate) struct Mapped {
     /// Staging bytes to fill.
     out: BytesMut,
@@ -45,15 +33,12 @@ pub(crate) struct Mapped {
     data: *const u8,
     /// Copy length in bytes.
     len: usize,
-    /// Mapping behind the copy.
-    release: Release,
     /// Not auto-Send: the mapping outlives the transfer by handoff.
     _send: PhantomData<*const ()>,
 }
 
-// Sound: the map outlives the transfer; each hop moves sole
-// ownership, unmap runs on the collect thread after the copy lands,
-// and only the worker dereferences the pointer.
+// Sound: the session-life map outlives the transfer; each hop
+// moves sole ownership, and only the worker dereferences the pointer.
 unsafe impl Send for Mapped {}
 
 /// Readback handle with a copy worker behind one decoder.
@@ -82,7 +67,6 @@ impl Readback {
                     }
                     Done {
                         bytes: out,
-                        release: mapped.release,
                         copy: started.elapsed(),
                     }
                 },
@@ -120,9 +104,9 @@ impl Readback {
         self.pump.collect_timeout(timeout)
     }
 
-    /// Queued copies drain, the worker joins, orphaned maps release.
+    /// Queued copies drain and the worker joins.
     pub(crate) fn shutdown(&mut self) {
-        self.pump.shutdown_with(|done| done.release.unmap());
+        self.pump.shutdown_with(|_done| {});
     }
 }
 
@@ -132,38 +116,22 @@ impl Drop for Readback {
     }
 }
 
-impl Release {
-    /// Device plus memory behind the map.
-    pub(crate) fn new(device: ash::Device, memory: vk::DeviceMemory) -> Self {
-        Self { device, memory }
-    }
-
-    /// Release the mapping on the calling thread.
-    pub(crate) fn unmap(self) {
-        // Sound: the memory mapped on this thread.
-        unsafe {
-            self.device.unmap_memory(self.memory);
-        }
-    }
-}
-
 impl Mapped {
-    /// Mapped staging bytes plus their release.
-    pub(crate) fn new(out: BytesMut, data: *const u8, len: usize, release: Release) -> Self {
+    /// Mapped staging bytes over the session-life map.
+    pub(crate) fn new(out: BytesMut, data: *const u8, len: usize) -> Self {
         Self {
             out,
             data,
             len,
-            release,
             _send: PhantomData,
         }
     }
 }
 
 impl Done {
-    /// Filled bytes, mapping release, and copy time.
-    pub(crate) fn into_parts(self) -> (BytesMut, Release, Duration) {
-        (self.bytes, self.release, self.copy)
+    /// Filled bytes and copy time.
+    pub(crate) fn into_parts(self) -> (BytesMut, Duration) {
+        (self.bytes, self.copy)
     }
 }
 

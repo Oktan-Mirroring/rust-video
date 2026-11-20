@@ -1127,12 +1127,6 @@ impl GpuMemory {
         self.memory
     }
 
-    /// Device behind the allocation.
-    #[must_use]
-    pub fn device(&self) -> ash::Device {
-        self.device.clone()
-    }
-
     /// Copy `bytes` into the allocation at offset zero.
     ///
     /// Maps `bytes.len`, never the allocation size.
@@ -1157,92 +1151,6 @@ impl GpuMemory {
             self.device.unmap_memory(self.memory);
         }
         Ok(())
-    }
-
-    /// Copy `bytes` into the allocation, zeroing through `total`.
-    ///
-    /// Maps `total`, never the allocation size.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when `total` overruns the allocation, `bytes` overruns
-    /// `total`, or mapping fails.
-    pub fn fill_padded(&self, bytes: &[u8], total: u64) -> Result<(), VulkanError> {
-        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if total > self.size {
-            return Err(VulkanError::OutOfBounds {
-                len: total,
-                capacity: self.size,
-            });
-        }
-        if len > total {
-            return Err(VulkanError::OutOfBounds {
-                len,
-                capacity: total,
-            });
-        }
-        // SAFETY: the memory is host-visible and owned; writes stay in range.
-        unsafe {
-            let ptr = self
-                .device
-                .map_memory(self.memory, 0, total, vk::MemoryMapFlags::empty())?;
-            let dst = ptr.cast::<u8>();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-            let pad = usize::try_from(total - len).map_err(|_| VulkanError::OutOfBounds {
-                len: total - len,
-                capacity: self.size,
-            })?;
-            std::ptr::write_bytes(dst.add(bytes.len()), 0, pad);
-            self.device.unmap_memory(self.memory);
-        }
-        Ok(())
-    }
-
-    /// Copy the allocation prefix of `len` bytes into `out`, reusing it.
-    ///
-    /// Maps `len`, never the allocation size; skips the zero-fill a
-    /// `resize` would write before the overwrite.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when `len` overruns the allocation or mapping fails.
-    pub fn read_to_buf(&self, out: &mut bytes::BytesMut, len: usize) -> Result<(), VulkanError> {
-        let src = self.map_prefix(len)?;
-        // Sound: the mapping spans `len` bytes; unmap follows the copy.
-        unsafe {
-            Self::copy_mapped(out, src, len);
-        }
-        self.unmap();
-        Ok(())
-    }
-
-    /// Mapped prefix pointer behind `len` bytes, released separately.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when `len` overruns the allocation or mapping fails.
-    pub fn map_prefix(&self, len: usize) -> Result<*const u8, VulkanError> {
-        let want = u64::try_from(len).unwrap_or(u64::MAX);
-        if want > self.size {
-            return Err(VulkanError::OutOfBounds {
-                len: want,
-                capacity: self.size,
-            });
-        }
-        // Sound: the memory is host-visible and owned.
-        let ptr = unsafe {
-            self.device
-                .map_memory(self.memory, 0, want, vk::MemoryMapFlags::empty())
-        }?;
-        Ok(ptr.cast_const().cast::<u8>())
-    }
-
-    /// Release a mapping from [`map_prefix`](Self::map_prefix).
-    pub fn unmap(&self) {
-        // Sound: a mapping from `map_prefix` is live.
-        unsafe {
-            self.device.unmap_memory(self.memory);
-        }
     }
 
     /// `len` mapped bytes into `out`, reusing it.
@@ -1305,12 +1213,113 @@ impl GpuMemory {
         }
         Ok(())
     }
+
+    /// Whole-allocation mapping held until dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when mapping fails.
+    pub fn map_persistent(&self) -> Result<PersistentMap, VulkanError> {
+        // SAFETY: the memory is host-visible and owned; the map unmaps on drop.
+        let ptr = unsafe {
+            self.device
+                .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
+        }?;
+        Ok(PersistentMap {
+            device: self.device.clone(),
+            memory: self.memory,
+            ptr: ptr.cast::<u8>(),
+            size: self.size,
+        })
+    }
 }
 
 impl Drop for GpuMemory {
     fn drop(&mut self) {
         // SAFETY: the memory is live and owned by this device.
         unsafe { self.device.free_memory(self.memory, None) };
+    }
+}
+
+/// Host mapping held for a session's life; unmaps on drop.
+pub(crate) struct PersistentMap {
+    /// Device behind the mapping.
+    device: ash::Device,
+    /// Mapped memory.
+    memory: vk::DeviceMemory,
+    /// Mapping base.
+    ptr: *mut u8,
+    /// Mapped bytes.
+    size: u64,
+}
+
+impl PersistentMap {
+    /// Mapping base.
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Mapped bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Copy `bytes` at offset zero, zeroing through `total`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `total` overruns the mapping or `bytes` overruns `total`.
+    pub fn write_padded(&self, bytes: &[u8], total: u64) -> Result<(), VulkanError> {
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if total > self.size {
+            return Err(VulkanError::OutOfBounds {
+                len: total,
+                capacity: self.size,
+            });
+        }
+        if len > total {
+            return Err(VulkanError::OutOfBounds {
+                len,
+                capacity: total,
+            });
+        }
+        // SAFETY: the map spans the allocation; writes stay in range.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr, bytes.len());
+            let pad = usize::try_from(total - len).map_err(|_| VulkanError::OutOfBounds {
+                len: total - len,
+                capacity: self.size,
+            })?;
+            std::ptr::write_bytes(self.ptr.add(bytes.len()), 0, pad);
+        }
+        Ok(())
+    }
+
+    /// Copy the map prefix of `len` bytes into `out`, reusing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when `len` overruns the mapping.
+    pub fn read_into(&self, out: &mut bytes::BytesMut, len: usize) -> Result<(), VulkanError> {
+        let want = u64::try_from(len).unwrap_or(u64::MAX);
+        if want > self.size {
+            return Err(VulkanError::OutOfBounds {
+                len: want,
+                capacity: self.size,
+            });
+        }
+        // Sound: the map spans `len` bytes.
+        unsafe {
+            GpuMemory::copy_mapped(out, self.ptr.cast_const(), len);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PersistentMap {
+    fn drop(&mut self) {
+        // SAFETY: the mapping is live and owned.
+        unsafe { self.device.unmap_memory(self.memory) };
     }
 }
 

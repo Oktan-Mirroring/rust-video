@@ -11,8 +11,8 @@ use crate::device::VulkanDevice;
 use crate::dpb::SlotBook;
 use crate::error::VulkanError;
 use crate::raw::{
-    DecodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView, SessionParameters,
-    VideoSession,
+    DecodeQueue, ExportPair, ExtDevice, GpuBuffer, GpuImage, GpuView, PersistentMap,
+    SessionParameters, VideoSession,
 };
 use crate::session::geometry::SessionGeometry;
 use crate::session::slots::{SubmitSlots, SUBMIT_SLOTS};
@@ -52,11 +52,16 @@ impl<'a> ExportTarget<'a> {
 /// Owned decode session over a negotiated device.
 ///
 /// Field order is the drop order: the submit ring idles the device
-/// before dependents free, parameters free before the session they
-/// belong to, and GPU objects free before the device clone.
+/// before dependents free, session-life maps unmap before their
+/// buffers free, parameters free before the session they belong to,
+/// and GPU objects free before the device clone.
 pub(crate) struct Session {
     /// Submit-slot ring; drops first, idling the device.
     submit: SubmitSlots,
+    /// Session-life maps over the bitstream buffers, one per slot.
+    bitstream_maps: Vec<PersistentMap>,
+    /// Session-life maps over the readback buffers, one per slot.
+    readback_maps: Vec<PersistentMap>,
     /// Logical device.
     device: ash::Device,
     /// Decode queue functions.
@@ -99,7 +104,8 @@ impl Session {
     /// # Errors
     ///
     /// Returns `Err` when the display window escapes the coded extent,
-    /// or when session, image, buffer, pool, or fence creation fails.
+    /// when session, image, buffer, pool, or fence creation fails,
+    /// or when a staging map fails.
     pub(crate) fn open(
         device: &VulkanDevice,
         geometry: &SessionGeometry,
@@ -185,9 +191,12 @@ impl Session {
             device.queue(),
             device.queue_lock().clone(),
         )?;
+        let (bitstream_maps, readback_maps) = Self::stage_maps(&bitstreams, &readbacks)?;
         let ext = device.ext();
         Ok(Self {
             submit,
+            bitstream_maps,
+            readback_maps,
             device: raw.clone(),
             decode,
             params,
@@ -203,6 +212,24 @@ impl Session {
             props: properties,
             ext,
         })
+    }
+
+    /// Session-life maps over staging `bitstreams` plus `readbacks`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a mapping fails.
+    fn stage_maps(
+        bitstreams: &[GpuBuffer],
+        readbacks: &[GpuBuffer],
+    ) -> Result<(Vec<PersistentMap>, Vec<PersistentMap>), VulkanError> {
+        let mut bitstream_maps = Vec::with_capacity(SUBMIT_SLOTS);
+        let mut readback_maps = Vec::with_capacity(SUBMIT_SLOTS);
+        for slot in 0..SUBMIT_SLOTS {
+            bitstream_maps.push(bitstreams[slot].memory().map_persistent()?);
+            readback_maps.push(readbacks[slot].memory().map_persistent()?);
+        }
+        Ok((bitstream_maps, readback_maps))
     }
 
     /// Validated session sizing.
@@ -260,7 +287,7 @@ impl Session {
             .map(|ext| (&self.device, ext, &self.props))
     }
 
-    /// Upload `bytes` to the bitstream staging buffer of `slot`.
+    /// Upload `bytes` to the bitstream staging map of `slot`.
     ///
     /// Zero-pads through the aligned range the decode consumes.
     ///
@@ -277,7 +304,7 @@ impl Session {
                 what: "access unit",
             });
         }
-        self.bitstreams[slot].memory().fill_padded(bytes, total)?;
+        self.bitstream_maps[slot].write_padded(bytes, total)?;
         Ok(total)
     }
 
@@ -334,7 +361,7 @@ impl Session {
 
     /// Wait `pending` out, freeing its ring slot.
     ///
-    /// Readback pixels stay mapped after the wait; follow with
+    /// The slot frees for reuse on return; follow with
     /// `copy_pending_into` before the next submit reuses the slot.
     ///
     /// # Errors
@@ -383,31 +410,36 @@ impl Session {
                 syntax: "readback size",
             }
         })?;
-        self.readbacks[pending.slot].memory().read_to_buf(out, len)
+        self.readback_maps[pending.slot].read_into(out, len)
     }
 
-    /// Mapped readback behind `pending` for a worker copy.
+    /// Session-life readback map behind `pending` for a worker copy.
     ///
-    /// Call only after the slot's fence signaled; the caller releases
-    /// the mapping after its copy lands.
+    /// Call only after the slot's fence signaled; the map lives with
+    /// the session, so no release runs after the copy lands.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when sizing overflows or the map fails.
+    /// Returns `Err` when sizing overflows or overruns the readback.
     pub(crate) fn map_pending(
         &self,
         pending: PendingDecode,
-    ) -> Result<(*const u8, usize, crate::readback::Release), VulkanError> {
-        use crate::readback::Release;
+    ) -> Result<(*const u8, usize), VulkanError> {
         let display = as_extent(self.geometry.display());
         let len = usize::try_from(nv12_bytes(display)).map_err(|_| {
             crate::error::ParseError::OutOfRange {
                 syntax: "readback size",
             }
         })?;
-        let memory = self.readbacks[pending.slot].memory();
-        let data = memory.map_prefix(len)?;
-        Ok((data, len, Release::new(memory.device(), memory.memory())))
+        let map = &self.readback_maps[pending.slot];
+        let want = u64::try_from(len).unwrap_or(u64::MAX);
+        if want > map.size() {
+            return Err(VulkanError::OutOfBounds {
+                len: want,
+                capacity: map.size(),
+            });
+        }
+        Ok((map.ptr().cast_const(), len))
     }
 
     /// Submit-core gauges snapshot.
