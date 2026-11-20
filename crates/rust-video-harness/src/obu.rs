@@ -32,6 +32,15 @@ impl Obu {
         Some((unit_type, offset + size))
     }
 
+    /// First sequence-header OBU bytes, absent without one.
+    #[must_use]
+    pub fn sequence_header(data: &[u8]) -> Option<Vec<u8>> {
+        Self::split_obus(data)
+            .into_iter()
+            .find(|(unit_type, _)| *unit_type == 1)
+            .map(|(_, bytes)| bytes)
+    }
+
     /// OBU type plus bytes in order.
     #[must_use]
     pub fn split_obus(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
