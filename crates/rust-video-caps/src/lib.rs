@@ -5,9 +5,11 @@
 
 pub mod av1;
 pub mod av2;
+pub mod color;
 pub mod common;
 pub mod delivery;
 pub mod dpb;
+pub mod encode;
 pub mod frame;
 pub mod h264;
 pub mod h265;

@@ -473,6 +473,64 @@ pub fn slice_rate(level: Level) -> Option<u16> {
     }
 }
 
+/// H.264 encode profile: realtime encoder subset.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeProfile {
+    /// Baseline profile.
+    Baseline,
+    /// Main profile.
+    Main,
+    /// High profile.
+    High,
+    /// High 10 profile.
+    High10,
+}
+
+impl EncodeProfile {
+    /// Decode profile backing validation.
+    #[must_use]
+    pub fn profile(self) -> Profile {
+        match self {
+            Self::Baseline => Profile::Baseline,
+            Self::Main => Profile::Main,
+            Self::High => Profile::High,
+            Self::High10 => Profile::High10,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        self.profile().max_bit_depth()
+    }
+
+    /// Depth and chroma allowed together.
+    #[must_use]
+    pub fn allows(self, depth: u8, chroma: ChromaSampling) -> bool {
+        depth <= self.max_bit_depth() && self.profile().allows_chroma(chroma)
+    }
+}
+
+/// H.264 encode level: tier-picked or pinned.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeLevel {
+    /// Tier picks the level from size and rate.
+    Auto,
+    /// Pinned spec level.
+    Pinned(Level),
+}
+
+impl EncodeLevel {
+    /// Pinned level, absent for auto.
+    #[must_use]
+    pub fn level(self) -> Option<Level> {
+        match self {
+            Self::Auto => None,
+            Self::Pinned(level) => Some(level),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};

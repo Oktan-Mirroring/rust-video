@@ -269,6 +269,67 @@ pub fn plain_final_byte_valid(byte: u8) -> bool {
     byte & 0b1110_0000 != SUPERFRAME_MARKER << 5
 }
 
+/// VP9 encode profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeProfile {
+    /// P0 profile.
+    P0,
+    /// P1 profile.
+    P1,
+    /// P2 profile.
+    P2,
+    /// P3 profile.
+    P3,
+}
+
+impl EncodeProfile {
+    /// Decode profile backing validation.
+    #[must_use]
+    pub fn profile(self) -> Profile {
+        match self {
+            Self::P0 => Profile::P0,
+            Self::P1 => Profile::P1,
+            Self::P2 => Profile::P2,
+            Self::P3 => Profile::P3,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        match self {
+            Self::P0 | Self::P1 => 8,
+            Self::P2 | Self::P3 => 12,
+        }
+    }
+
+    /// Depth and chroma allowed together.
+    #[must_use]
+    pub fn allows(self, depth: u8, chroma: ChromaSampling) -> bool {
+        self.profile().allows(depth, chroma)
+    }
+}
+
+/// VP9 encode level: tier-picked or pinned.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeLevel {
+    /// Tier picks the level from size and rate.
+    Auto,
+    /// Pinned spec level.
+    Pinned(Level),
+}
+
+impl EncodeLevel {
+    /// Pinned level, absent for auto.
+    #[must_use]
+    pub fn level(self) -> Option<Level> {
+        match self {
+            Self::Auto => None,
+            Self::Pinned(level) => Some(level),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};

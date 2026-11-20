@@ -448,6 +448,65 @@ impl Superres {
     }
 }
 
+/// AV1 encode profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeProfile {
+    /// Main profile.
+    Main,
+    /// High profile.
+    High,
+    /// Professional profile.
+    Professional,
+}
+
+impl EncodeProfile {
+    /// Decode profile backing validation.
+    #[must_use]
+    pub fn profile(self) -> Profile {
+        match self {
+            Self::Main => Profile::Main,
+            Self::High => Profile::High,
+            Self::Professional => Profile::Professional,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        match self {
+            Self::Main | Self::High => 10,
+            Self::Professional => 12,
+        }
+    }
+
+    /// Depth and chroma allowed together.
+    #[must_use]
+    pub fn allows(self, depth: u8, chroma: ChromaSampling) -> bool {
+        self.profile()
+            .allows(depth, chroma, chroma == ChromaSampling::Mono)
+    }
+}
+
+/// AV1 encode level: tier-picked or pinned.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeLevel {
+    /// Tier picks the level from size and rate.
+    Auto,
+    /// Pinned spec level.
+    Pinned(Level),
+}
+
+impl EncodeLevel {
+    /// Pinned level, absent for auto.
+    #[must_use]
+    pub fn level(self) -> Option<Level> {
+        match self {
+            Self::Auto => None,
+            Self::Pinned(level) => Some(level),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};

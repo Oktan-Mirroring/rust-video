@@ -429,6 +429,58 @@ impl Validate for Params {
     }
 }
 
+/// H.265 encode profile: realtime encoder subset.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeProfile {
+    /// Main profile.
+    Main,
+    /// Main 10 profile.
+    Main10,
+}
+
+impl EncodeProfile {
+    /// Decode profile backing validation.
+    #[must_use]
+    pub fn profile(self) -> Profile {
+        match self {
+            Self::Main => Profile::Main,
+            Self::Main10 => Profile::Main10,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        self.profile().max_bit_depth()
+    }
+
+    /// Depth and chroma allowed together.
+    #[must_use]
+    pub fn allows(self, depth: u8, chroma: ChromaSampling) -> bool {
+        depth <= self.max_bit_depth() && self.profile().allows_chroma(chroma)
+    }
+}
+
+/// H.265 encode level: tier-picked or pinned.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EncodeLevel {
+    /// Tier picks the level from size and rate.
+    Auto,
+    /// Pinned spec level.
+    Pinned(Level),
+}
+
+impl EncodeLevel {
+    /// Pinned level, absent for auto.
+    #[must_use]
+    pub fn level(self) -> Option<Level> {
+        match self {
+            Self::Auto => None,
+            Self::Pinned(level) => Some(level),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::{BitDepth, ChromaSampling, PictureSize, Validate, Violation};
