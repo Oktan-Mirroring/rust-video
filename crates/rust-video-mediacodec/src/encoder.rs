@@ -1555,6 +1555,7 @@ mod tests {
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::h264;
     use rust_video_caps::h265;
+    #[cfg(not(target_os = "android"))]
     use rust_video_caps::traits::Encoder;
     use rust_video_caps::vp9;
 

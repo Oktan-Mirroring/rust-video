@@ -868,6 +868,7 @@ mod tests {
     use rust_video_caps::delivery::SplitDecode;
     use rust_video_caps::frame::PixelFormat;
     use rust_video_caps::packet::Packet;
+    #[cfg(not(target_os = "android"))]
     use rust_video_caps::traits::Decoder;
 
     fn layout_16x16_nv12() -> OutputLayout {
