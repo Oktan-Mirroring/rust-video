@@ -143,14 +143,21 @@ impl<'a> Av1Decoder<'a> {
         pending: &mut Vec<(u8, Ticket, Active)>,
     ) -> Result<(), D3d12Error> {
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-        // Submit before any copy: outputs may name the submission slot.
+        // Downloads queue behind the video ticket: the copy runs at
+        // video-signal without a CPU wakeup gap, and the record hides
+        // under the engine wait. The wait still serializes submits.
         if let Some(submission) = decoded.submission.as_ref() {
-            let ticket = session.submit_av1(submission)?;
-            session.wait_video(ticket)?;
-        }
-        for output in &decoded.outputs {
-            let ticket = session.start_download(output.slot())?;
-            pending.push((output.slot(), ticket, active));
+            let video = session.submit_av1(submission)?;
+            for output in &decoded.outputs {
+                let ticket = session.start_download_after(output.slot(), video)?;
+                pending.push((output.slot(), ticket, active));
+            }
+            session.wait_video(video)?;
+        } else {
+            for output in &decoded.outputs {
+                let ticket = session.start_download(output.slot())?;
+                pending.push((output.slot(), ticket, active));
+            }
         }
         Ok(())
     }

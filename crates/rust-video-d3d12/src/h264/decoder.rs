@@ -127,20 +127,23 @@ impl<'a> H264Decoder<'a> {
         let mut failed = None;
         {
             let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
-            // Submit before any copy: outputs may name the submission slot.
+            // Downloads queue behind the video ticket: the copy runs at
+            // video-signal without a CPU wakeup gap, and the record hides
+            // under the engine wait. The wait still serializes submits.
             match session.submit(&decoded.submission) {
-                Ok(ticket) => {
-                    if let Err(error) = session.wait_video(ticket) {
-                        failed = Some(error);
-                    } else {
-                        for output in &decoded.outputs {
-                            match session.start_download(output.slot()) {
-                                Ok(ticket) => pending.push((output.slot(), ticket, active)),
-                                Err(error) => {
-                                    failed = Some(error);
-                                    break;
-                                }
+                Ok(video) => {
+                    for output in &decoded.outputs {
+                        match session.start_download_after(output.slot(), video) {
+                            Ok(ticket) => pending.push((output.slot(), ticket, active)),
+                            Err(error) => {
+                                failed = Some(error);
+                                break;
                             }
+                        }
+                    }
+                    if failed.is_none() {
+                        if let Err(error) = session.wait_video(video) {
+                            failed = Some(error);
                         }
                     }
                 }
