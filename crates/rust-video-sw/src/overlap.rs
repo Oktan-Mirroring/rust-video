@@ -395,16 +395,25 @@ impl PipelineConfig {
     /// Default conversions in flight.
     pub const DEFAULT_DEPTH: usize = 4;
 
+    /// Conversions in flight, at most: one frame held each.
+    pub const MAX_DEPTH: usize = 16;
+
     /// Bounds holding at most `depth` conversions in flight.
     ///
     /// Sends refuse while outstanding conversions reach `depth`;
     /// completions already freed post regardless.
     ///
+    /// # Panics
+    ///
+    /// Panics when the clamped depth is zero.
+    ///
     /// # Arguments
     ///
-    /// * `depth` - conversions in flight before sends refuse.
+    /// * `depth` - conversions in flight before sends refuse; clamped to `MAX_DEPTH`.
     #[must_use]
     pub fn new(depth: NonZeroUsize) -> Self {
+        let depth = NonZeroUsize::new(depth.get().min(Self::MAX_DEPTH))
+            .expect("clamped depth stays nonzero");
         Self {
             depth,
             pace: Duration::ZERO,
@@ -1060,6 +1069,18 @@ mod tests {
         assert_eq!(stats.copy_spans().len(), 6);
         assert!(stats.first_frame().is_some());
         assert!(stats.wall().is_some());
+    }
+
+    #[test]
+    fn config_depth_clamps_to_max() {
+        let one = PipelineConfig::new(NonZeroUsize::new(1).expect("nonzero"));
+        assert_eq!(one.depth().get(), 1);
+        let full = PipelineConfig::new(NonZeroUsize::new(usize::MAX).expect("nonzero"));
+        assert_eq!(full.depth().get(), PipelineConfig::MAX_DEPTH);
+        assert_eq!(
+            PipelineConfig::default().depth().get(),
+            PipelineConfig::DEFAULT_DEPTH
+        );
     }
 
     #[test]
