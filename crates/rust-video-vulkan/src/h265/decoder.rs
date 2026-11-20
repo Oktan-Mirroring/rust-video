@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ash::vk;
-use rust_video_caps::delivery::{PhaseTiming, SubmitStats};
+use rust_video_caps::delivery::{PhaseTiming, SplitDecode, SubmitStats};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_caps::transcode::GpuCaps;
@@ -13,9 +13,9 @@ use rust_video_caps::transcode::GpuCaps;
 use super::dpb::{H265Context, H265Instruction, H265Picture, RpsEcho};
 use crate::au::{AccessUnit, AuSplitter};
 use crate::decoder::{
-    apply_armed_fault, claim_slot, collect_oldest, collect_oldest_timeout, collect_ready,
-    drain_pending, plan_submit, ref_poc, retire_slots, setup_target, ChainBufs, DrainMode,
-    FrameSink, NalFrontend, OverlappedDecode, PendingPicture, RunCore, SubmitPlan, VulkanFrame,
+    apply_armed_fault, claim_slot, collect_oldest_timeout, collect_ready, drain_pending,
+    plan_submit, ref_poc, retire_slots, setup_target, ChainBufs, DrainMode, FrameSink, NalFrontend,
+    PendingPicture, RunCore, SubmitPlan, VulkanFrame,
 };
 use crate::device::VulkanDevice;
 use crate::dpb::ReferenceId;
@@ -138,6 +138,8 @@ pub struct H265Decoder<'a> {
     >,
     /// Submitted but uncollected pictures.
     pending: Vec<PendingPicture>,
+    /// Completions queued by submits, drained by polls.
+    ready: Vec<VulkanFrame>,
     /// Accumulated submit-core gauges.
     stats: SubmitStats,
     /// Armed fault for the next submit, applied once a session runs.
@@ -176,6 +178,7 @@ impl<'a> H265Decoder<'a> {
             begin_bufs: ChainBufs::new(),
             ref_bufs: ChainBufs::new(),
             pending: Vec::new(),
+            ready: Vec::new(),
             stats: SubmitStats::new(),
             fault: false,
         })
@@ -185,6 +188,17 @@ impl<'a> H265Decoder<'a> {
     #[must_use]
     pub fn submit_stats(&self) -> SubmitStats {
         self.stats
+    }
+
+    /// Submitted but uncollected picture count.
+    #[must_use]
+    pub fn inflight_len(&self) -> usize {
+        self.pending.len() + self.sink.launched_len()
+    }
+
+    /// Logged phase timings, oldest first, clearing the log.
+    pub fn take_timings(&mut self) -> Vec<PhaseTiming> {
+        self.sink.take_timings()
     }
 
     /// Fail the next submit once, exercising the reset path.
@@ -537,51 +551,70 @@ impl Decoder for H265Decoder<'_> {
     }
 }
 
-impl OverlappedDecode for H265Decoder<'_> {
-    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.run_bytes(packet.data(), false, DrainMode::Overlap)
+impl SplitDecode for H265Decoder<'_> {
+    type Frame = VulkanFrame;
+    type Error = VulkanError;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, VulkanError> {
+        if self.pending.len() + self.sink.launched_len() >= crate::session::slots::SUBMIT_SLOTS {
+            return Ok(false);
+        }
+        let frames = self.run_bytes(packet.data(), false, DrainMode::Overlap)?;
+        self.ready.extend(frames);
+        Ok(true)
     }
 
-    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        collect_ready(
+    fn poll(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = std::mem::take(&mut self.ready);
+        out.extend(collect_ready(
             &mut self.session,
             &mut self.sink,
             &mut self.pending,
             &mut self.stats,
-        )
+        )?);
+        Ok(out)
     }
 
-    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        collect_oldest(
+    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = std::mem::take(&mut self.ready);
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        out.extend(collect_ready(
             &mut self.session,
             &mut self.sink,
             &mut self.pending,
             &mut self.stats,
-        )
-    }
-
-    fn collect_next_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
-        collect_oldest_timeout(
+        )?);
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        if self.pending.is_empty() && self.sink.launched_len() == 0 {
+            std::thread::sleep(timeout);
+            return Ok(out);
+        }
+        match collect_oldest_timeout(
             &mut self.session,
             &mut self.sink,
             &mut self.pending,
             &mut self.stats,
             timeout,
-        )
+        )? {
+            Some(frames) => {
+                out.extend(frames);
+                Ok(out)
+            }
+            None => Ok(out),
+        }
     }
 
-    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
-        self.flush_inner(false)
+    fn flush_split(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
+        let mut out = std::mem::take(&mut self.ready);
+        out.extend(self.flush_inner(false)?);
+        Ok(out)
     }
 
-    fn inflight_len(&self) -> usize {
-        self.pending.len() + self.sink.launched_len()
-    }
-
-    fn take_timings(&mut self) -> Vec<PhaseTiming> {
-        self.sink.take_timings()
+    fn stats(&self) -> SubmitStats {
+        self.stats
     }
 }

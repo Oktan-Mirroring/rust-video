@@ -5,13 +5,13 @@
 use std::time::{Duration, Instant};
 
 use rust_video_caps::delivery::{
-    DropPolicy, PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SubmitStats,
-    TrySendError,
+    DropPolicy, PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SplitDecode,
+    SubmitStats, TrySendError,
 };
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Packets, Parity};
 use rust_video_vulkan::{
-    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, OverlappedDecode, VulkanDevice,
+    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, VulkanDevice, VulkanError,
     VulkanFrame,
 };
 
@@ -31,11 +31,16 @@ fn device_or_skip(op: CodecOp) -> Option<VulkanDevice> {
 }
 
 /// Frames surfacing under backpressure into `frames`, freeing send room.
-fn drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
+fn drain<D>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>)
+where
+    D: SplitDecode<Frame = VulkanFrame, Error = VulkanError>,
+{
+    let mut surfaced = false;
     while let Some(frame) = pump.try_receive().expect("poll") {
         frames.push(frame);
+        surfaced = true;
     }
-    if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
+    if !surfaced {
         match pump.receive_timeout(Duration::from_secs(10)) {
             Ok(frame) => frames.extend(frame),
             Err(error) => panic!("completions stall: {error:?}"),
@@ -172,7 +177,7 @@ fn run_overlap_h264(
     assert!(pump.is_finished());
     let wall = start.elapsed();
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    let timings = pump.take_timings();
+    let timings = pump.decoder_mut().take_timings();
     (frames, timings, pump.decoder().submit_stats(), wall)
 }
 
@@ -246,7 +251,7 @@ fn h264_overlap_depth_exceeds_one() {
                 Err(TrySendError::Failed { error }) => panic!("submit runs: {error}"),
             }
         }
-        peak = peak.max(pump.inflight_len());
+        peak = peak.max(pump.decoder().inflight_len());
     }
     frames.extend(Drive::finish_all(&mut pump));
     assert!(pump.is_finished());
@@ -358,7 +363,7 @@ fn h265_overlap_matches_sync_bytes() {
     assert!(pump.is_finished());
     let overlap_wall = start.elapsed();
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    let overlap_timings = pump.take_timings();
+    let overlap_timings = pump.decoder_mut().take_timings();
     let overlap_stats = pump.decoder().submit_stats();
 
     assert_byte_parity("h265", &sync_frames, &overlap_frames);
@@ -414,7 +419,7 @@ fn av1_overlap_matches_sync_bytes() {
     assert!(pump.is_finished());
     let overlap_wall = start.elapsed();
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    let overlap_timings = pump.take_timings();
+    let overlap_timings = pump.decoder_mut().take_timings();
     let overlap_stats = pump.decoder().submit_stats();
 
     assert_byte_parity("av1", &sync_frames, &overlap_frames);

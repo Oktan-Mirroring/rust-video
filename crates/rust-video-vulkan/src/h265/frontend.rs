@@ -20,6 +20,7 @@ pub(crate) use rust_video_h265::{
 };
 
 /// Tier capability gates over shared grammar output.
+#[derive(Default)]
 struct Gate;
 
 impl HevcError for ParseError {

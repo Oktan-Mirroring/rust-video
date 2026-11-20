@@ -7,9 +7,10 @@
 use bytes::Bytes;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile};
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::traits::Encoder;
-use rust_video_vulkan::{CodecOp, Gop, H265Encoder, VulkanDevice};
+use rust_video_vulkan::{CodecOp, H265Encoder, VulkanDevice};
 
 fn main() {
     let width: u32 = std::env::var("VK_WIDTH")
@@ -32,11 +33,21 @@ fn main() {
             .to_string_lossy()
             .into_owned()
     });
-    let gop = std::env::var("VK_GOP")
+    let keyint: u32 = std::env::var("VK_GOP")
         .ok()
         .and_then(|text| text.parse().ok())
-        .map(Gop::interval)
-        .unwrap_or_default();
+        .map_or(30, |keyint: u32| keyint.max(1));
+    let config = EncodeConfig {
+        gop: Gop {
+            keyint,
+            min_keyint: keyint,
+            b_frames: 0,
+            refs: 1,
+        },
+        profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+        level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ..Default::default()
+    };
     let Ok(bytes) = std::fs::read(&vector) else {
         println!("encode_h265_vk: no vector at {vector}; skipped");
         return;
@@ -52,7 +63,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut encoder = match H265Encoder::open_with_gop(&device, width, height, gop) {
+    let mut encoder = match H265Encoder::open(&device, width, height, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             eprintln!("encode_h265_vk: open failed ({error})");

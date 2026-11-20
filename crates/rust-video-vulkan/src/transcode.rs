@@ -7,9 +7,10 @@ use crate::error::VulkanError;
 use crate::ladder::CodecOp;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, RateControl};
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Route, Scale};
 
 /// Encoder behind one transcode route.
@@ -21,12 +22,30 @@ enum Encode {
 }
 
 impl Encode {
-    /// Packets coded from the device export behind `frame`.
-    fn encode_export(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
+    /// Packets coded from the GPU surface behind `frame`.
+    fn encode_surface(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
         match self {
-            Self::H264(encoder) => encoder.encode_export(frame),
-            Self::H265(encoder) => encoder.encode_export(frame),
+            Self::H264(encoder) => encoder.encode_surface(frame),
+            Self::H265(encoder) => encoder.encode_surface(frame),
         }
+    }
+}
+
+/// Legacy H.264 encode config: auto rate over the defaults.
+fn legacy_h264() -> EncodeConfig {
+    EncodeConfig {
+        rate_control: RateControl::Auto,
+        ..Default::default()
+    }
+}
+
+/// Legacy H.265 encode config: auto rate over the codec defaults.
+fn legacy_h265() -> EncodeConfig {
+    EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile: rust_video_caps::encode::Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+        level: rust_video_caps::encode::Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ..Default::default()
     }
 }
 
@@ -223,7 +242,7 @@ impl<'a> Transcoder<'a> {
                 });
             }
             let encoder = self.encoder_for(frame.identity().size())?;
-            packets.append(&mut encoder.encode_export(frame)?);
+            packets.append(&mut encoder.encode_surface(frame)?);
         }
         Ok(packets)
     }
@@ -243,12 +262,18 @@ impl<'a> Transcoder<'a> {
         };
         if !matches {
             let encoder = match self.encode_op {
-                CodecOp::H264Encode => {
-                    Encode::H264(H264Encoder::open(self.encode_device, width, height)?)
-                }
-                CodecOp::H265Encode => {
-                    Encode::H265(H265Encoder::open(self.encode_device, width, height)?)
-                }
+                CodecOp::H264Encode => Encode::H264(H264Encoder::open(
+                    self.encode_device,
+                    width,
+                    height,
+                    legacy_h264(),
+                )?),
+                CodecOp::H265Encode => Encode::H265(H265Encoder::open(
+                    self.encode_device,
+                    width,
+                    height,
+                    legacy_h265(),
+                )?),
                 CodecOp::H264Decode | CodecOp::H265Decode | CodecOp::Av1Decode => {
                     return Err(VulkanError::OverCaps { what: "codec op" });
                 }

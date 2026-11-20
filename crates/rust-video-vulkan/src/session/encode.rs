@@ -16,15 +16,16 @@ use ash::vk::native::{
     StdVideoH264PocType_STD_VIDEO_H264_POC_TYPE_0,
     StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_BASELINE,
     StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH, StdVideoH264SequenceParameterSet,
-    StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I,
-    StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P,
+    StdVideoH264SequenceParameterSetVui, StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_I,
+    StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P, StdVideoH264SpsVuiFlags,
     StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT,
     StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420, StdVideoH265DecPicBufMgr,
     StdVideoH265PictureParameterSet, StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_IDR,
     StdVideoH265PictureType_STD_VIDEO_H265_PICTURE_TYPE_P, StdVideoH265ProfileTierLevel,
-    StdVideoH265SequenceParameterSet, StdVideoH265ShortTermRefPicSet,
-    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
-    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P, StdVideoH265VideoParameterSet,
+    StdVideoH265SequenceParameterSet, StdVideoH265SequenceParameterSetVui,
+    StdVideoH265ShortTermRefPicSet, StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_I,
+    StdVideoH265SliceType_STD_VIDEO_H265_SLICE_TYPE_P, StdVideoH265SpsVuiFlags,
+    StdVideoH265VideoParameterSet,
 };
 use rust_video_caps::transcode::ShareMechanism;
 
@@ -53,10 +54,10 @@ use rust_video_caps::delivery::SubmitStats;
 pub(crate) const BITSTREAM_BYTES: u64 = 16 << 20;
 
 /// Rate-control frame rate numerator in frames per second.
-const RC_FPS: u32 = 60;
+pub(crate) const RC_FPS: u32 = 60;
 
 /// Rate-control frame rate denominator.
-const RC_FPS_DENOM: u32 = 1;
+pub(crate) const RC_FPS_DENOM: u32 = 1;
 
 /// DPB slots of a P-capable encode session: one reference plus one reconstructed.
 const ENCODE_DPB_SLOTS: u32 = 2;
@@ -66,6 +67,9 @@ const ENCODE_DPB_SLOTS: u32 = 2;
 /// `STD_VIDEO_H264_NO_REFERENCE_PICTURE` and
 /// `STD_VIDEO_H265_NO_REFERENCE_PICTURE` share the value; ash exports neither.
 const NO_REF_PICTURE: u8 = 0xFF;
+
+/// VUI video format behind both encode VUI builders: Table E-2 unspecified.
+const VUI_VIDEO_FORMAT: u8 = 5;
 
 /// Encode codec behind one session.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -119,13 +123,23 @@ struct EncodeMeta {
     idr: bool,
 }
 
-/// CBR rate control for one extent.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// Rate control behind one encode layer.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct RateControl {
+    /// Rate control mode behind the session.
+    mode: vk::VideoEncodeRateControlModeFlagsKHR,
     /// Average bitrate in bits per second.
     average_bitrate: u64,
     /// Peak bitrate in bits per second.
     max_bitrate: u64,
+    /// Layer frame rate numerator and denominator.
+    fps: (u32, u32),
+    /// Virtual buffer window in milliseconds.
+    virtual_ms: u32,
+    /// Initial virtual buffer fullness in milliseconds.
+    initial_ms: u32,
+    /// Constant QP behind the layer clamp and slice constant.
+    qp: Option<u8>,
 }
 
 impl RateControl {
@@ -135,22 +149,58 @@ impl RateControl {
         let frame_bits = u64::from(extent.width) * u64::from(extent.height) * 3 / 2 * 8;
         let average = (frame_bits * u64::from(RC_FPS) / 20).max(64_000);
         Self {
+            mode: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
             average_bitrate: average,
             max_bitrate: average,
+            fps: (RC_FPS, RC_FPS_DENOM),
+            virtual_ms: VIRTUAL_BUFFER_MS,
+            initial_ms: INITIAL_BUFFER_MS,
+            qp: None,
         }
+    }
+
+    /// Control over the mapped rate.
+    #[must_use]
+    pub(crate) fn mapped(rate: &crate::encode_config::MappedRate) -> Self {
+        Self {
+            mode: rate.mode,
+            average_bitrate: rate.average,
+            max_bitrate: rate.max,
+            fps: rate.fps,
+            virtual_ms: rate.virtual_ms,
+            initial_ms: rate.initial_ms,
+            qp: rate.qp,
+        }
+    }
+
+    /// Average bitrate in bits per second.
+    #[must_use]
+    pub(crate) fn average(&self) -> u64 {
+        self.average_bitrate
+    }
+
+    /// Peak bitrate in bits per second.
+    #[must_use]
+    pub(crate) fn peak(&self) -> u64 {
+        self.max_bitrate
     }
 }
 
 /// Standard parameter sets of one encode session.
 pub(crate) enum EncodeSets {
-    /// H.264 sets without heap pointers.
+    /// H.264 sets with owned VUI storage.
     H264 {
         /// Sequence set.
         sps: StdVideoH264SequenceParameterSet,
         /// Picture set.
         pps: StdVideoH264PictureParameterSet,
+        /// Color VUI behind the sequence view, absent under legacy control.
+        ///
+        /// Keep-alive only: the sequence set borrows it.
+        #[allow(dead_code)]
+        vui: Option<Box<StdVideoH264SequenceParameterSetVui>>,
     },
-    /// H.265 sets with owned profile and DPB storage.
+    /// H.265 sets with owned profile, DPB, and VUI storage.
     H265 {
         /// Profile tier level behind the set views.
         ptl: Box<StdVideoH265ProfileTierLevel>,
@@ -166,16 +216,29 @@ pub(crate) enum EncodeSets {
         crop_right: u32,
         /// Conformance bottom offset in chroma samples.
         crop_bottom: u32,
+        /// Picture init QP minus 26 behind the picture view.
+        init_qp: i8,
+        /// Color VUI behind the sequence view, absent under legacy control.
+        vui: Option<Box<StdVideoH265SequenceParameterSetVui>>,
     },
 }
 
 impl EncodeSets {
     /// H.264 sets for `width`x`height` under `profile` and `level`.
     ///
+    /// `qp` seeds the picture init QP; `vui` links the color signal.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when no level covers the extent.
-    pub fn h264(width: u32, height: u32, profile: u32, level: u8) -> Result<Self, VulkanError> {
+    pub fn h264(
+        width: u32,
+        height: u32,
+        profile: u32,
+        level: u8,
+        qp: Option<u8>,
+        vui: Option<crate::encode_config::MappedVui>,
+    ) -> Result<Self, VulkanError> {
         let padded_w = width.div_ceil(16) * 16;
         let padded_h = height.div_ceil(16) * 16;
         let std_level =
@@ -189,7 +252,7 @@ impl EncodeSets {
         flags.set_frame_mbs_only_flag(1);
         let cropping = padded_w != width || padded_h != height;
         flags.set_frame_cropping_flag(u32::from(cropping));
-        let sps = StdVideoH264SequenceParameterSet {
+        let mut sps = StdVideoH264SequenceParameterSet {
             flags,
             profile_idc: profile,
             level_idc: std_level,
@@ -236,21 +299,34 @@ impl EncodeSets {
             num_ref_idx_l1_default_active_minus1: 0,
             weighted_bipred_idc:
                 StdVideoH264WeightedBipredIdc_STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT,
-            pic_init_qp_minus26: 0,
+            pic_init_qp_minus26: init_qp_minus26(qp)?,
             pic_init_qs_minus26: 0,
             chroma_qp_index_offset: 0,
             second_chroma_qp_index_offset: 0,
             pScalingLists: std::ptr::null(),
         };
-        Ok(Self::H264 { sps, pps })
+        let vui = vui.map(|vui| Box::new(h264_encode_vui(vui)));
+        sps.pSequenceParameterSetVui = vui
+            .as_ref()
+            .map_or(std::ptr::null(), |vui| std::ptr::from_ref(vui.as_ref()));
+        Ok(Self::H264 { sps, pps, vui })
     }
 
     /// H.265 sets for `width`x`height` under `profile` and `level`.
     ///
+    /// `qp` seeds the picture init QP; `vui` links the color signal.
+    ///
     /// # Errors
     ///
     /// Returns `Err` when no level covers the extent.
-    pub fn h265(width: u32, height: u32, profile: u32, level: u8) -> Result<Self, VulkanError> {
+    pub fn h265(
+        width: u32,
+        height: u32,
+        profile: u32,
+        level: u8,
+        qp: Option<u8>,
+        vui: Option<crate::encode_config::MappedVui>,
+    ) -> Result<Self, VulkanError> {
         let padded_w = width.div_ceil(8) * 8;
         let padded_h = height.div_ceil(8) * 8;
         let std_level = h265_level_to_std(level).ok_or(VulkanError::OverCaps { what: "level" })?;
@@ -300,6 +376,8 @@ impl EncodeSets {
             conformance: padded_w != width || padded_h != height,
             crop_right: (padded_w - width) / 2,
             crop_bottom: (padded_h - height) / 2,
+            init_qp: init_qp_minus26(qp)?,
+            vui: vui.map(|vui| Box::new(h265_encode_vui(vui))),
         })
     }
 
@@ -339,6 +417,8 @@ impl EncodeSets {
             conformance,
             crop_right,
             crop_bottom,
+            init_qp: _,
+            vui,
         } = self
         else {
             return None;
@@ -388,14 +468,16 @@ impl EncodeSets {
             pScalingLists: std::ptr::null(),
             pShortTermRefPicSet: std::ptr::from_ref(&rps[0]),
             pLongTermRefPicsSps: std::ptr::null(),
-            pSequenceParameterSetVui: std::ptr::null(),
+            pSequenceParameterSetVui: vui
+                .as_ref()
+                .map_or(std::ptr::null(), |vui| std::ptr::from_ref(vui.as_ref())),
             pPredictorPaletteEntries: std::ptr::null(),
         })
     }
 
     /// H.265 picture set view; no heap pointers.
     fn h265_pps(&self) -> Option<StdVideoH265PictureParameterSet> {
-        let Self::H265 { .. } = self else {
+        let Self::H265 { init_qp, .. } = self else {
             return None;
         };
         let flags = ash::vk::native::StdVideoH265PpsFlags {
@@ -410,7 +492,7 @@ impl EncodeSets {
             num_extra_slice_header_bits: 0,
             num_ref_idx_l0_default_active_minus1: 0,
             num_ref_idx_l1_default_active_minus1: 0,
-            init_qp_minus26: 0,
+            init_qp_minus26: *init_qp,
             diff_cu_qp_delta_depth: 0,
             pps_cb_qp_offset: 0,
             pps_cr_qp_offset: 0,
@@ -443,6 +525,88 @@ impl EncodeSets {
     }
 }
 
+/// Picture init QP minus 26 for `qp`, 0 without CQP.
+///
+/// # Errors
+///
+/// Returns `Err` when `qp` escapes the `i8` range.
+fn init_qp_minus26(qp: Option<u8>) -> Result<i8, VulkanError> {
+    qp.map(|qp| i8::try_from(qp).map(|qp| qp - 26))
+        .transpose()
+        .map(|qp| qp.unwrap_or(0))
+        .map_err(|_| crate::error::ParseError::OutOfRange { syntax: "init qp" }.into())
+}
+
+/// H.264 encode VUI over the mapped color signal.
+fn h264_encode_vui(vui: crate::encode_config::MappedVui) -> StdVideoH264SequenceParameterSetVui {
+    let mut flags = StdVideoH264SpsVuiFlags {
+        _bitfield_align_1: [],
+        _bitfield_1: __BindgenBitfieldUnit::new([0; 2]),
+        __bindgen_padding_0: 0,
+    };
+    flags.set_video_signal_type_present_flag(1);
+    flags.set_video_full_range_flag(u32::from(vui.full_range));
+    flags.set_color_description_present_flag(1);
+    StdVideoH264SequenceParameterSetVui {
+        flags,
+        aspect_ratio_idc: 0,
+        sar_width: 0,
+        sar_height: 0,
+        video_format: VUI_VIDEO_FORMAT,
+        colour_primaries: vui.primaries,
+        transfer_characteristics: vui.transfer,
+        matrix_coefficients: vui.matrix,
+        num_units_in_tick: 0,
+        time_scale: 0,
+        max_num_reorder_frames: 0,
+        max_dec_frame_buffering: 0,
+        chroma_sample_loc_type_top_field: 0,
+        chroma_sample_loc_type_bottom_field: 0,
+        reserved1: 0,
+        pHrdParameters: std::ptr::null(),
+    }
+}
+
+/// H.265 encode VUI over the mapped color signal.
+fn h265_encode_vui(vui: crate::encode_config::MappedVui) -> StdVideoH265SequenceParameterSetVui {
+    let mut flags = StdVideoH265SpsVuiFlags {
+        _bitfield_align_1: [],
+        _bitfield_1: __BindgenBitfieldUnit::new([0; 3]),
+        __bindgen_padding_0: 0,
+    };
+    flags.set_video_signal_type_present_flag(1);
+    flags.set_video_full_range_flag(u32::from(vui.full_range));
+    flags.set_colour_description_present_flag(1);
+    StdVideoH265SequenceParameterSetVui {
+        flags,
+        aspect_ratio_idc: 0,
+        sar_width: 0,
+        sar_height: 0,
+        video_format: VUI_VIDEO_FORMAT,
+        colour_primaries: vui.primaries,
+        transfer_characteristics: vui.transfer,
+        matrix_coeffs: vui.matrix,
+        chroma_sample_loc_type_top_field: 0,
+        chroma_sample_loc_type_bottom_field: 0,
+        reserved1: 0,
+        reserved2: 0,
+        def_disp_win_left_offset: 0,
+        def_disp_win_right_offset: 0,
+        def_disp_win_top_offset: 0,
+        def_disp_win_bottom_offset: 0,
+        vui_num_units_in_tick: 0,
+        vui_time_scale: 0,
+        vui_num_ticks_poc_diff_one_minus1: 0,
+        min_spatial_segmentation_idc: 0,
+        reserved3: 0,
+        max_bytes_per_pic_denom: 0,
+        max_bits_per_min_cu_denom: 0,
+        log2_max_mv_length_horizontal: 0,
+        log2_max_mv_length_vertical: 0,
+        pHrdParameters: std::ptr::null(),
+    }
+}
+
 /// Even nonzero `width`x`height` inside the caps extent.
 ///
 /// # Errors
@@ -464,13 +628,14 @@ fn check_extent(
     Ok(())
 }
 
-/// Encode feedback plus CBR rate control behind `facts`.
+/// Encode feedback behind `facts`.
+///
+/// The config mapping owns the rate-control mode check.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the adapter reports neither the coded-size
-/// feedback flag nor the CBR control mode.
-fn check_caps(facts: &crate::ladder::EncodeFacts) -> Result<(), VulkanError> {
+/// Returns `Err` when the adapter reports no coded-size feedback flag.
+fn check_feedback(facts: &crate::ladder::EncodeFacts) -> Result<(), VulkanError> {
     if !facts
         .feedback
         .contains(vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN)
@@ -479,60 +644,50 @@ fn check_caps(facts: &crate::ladder::EncodeFacts) -> Result<(), VulkanError> {
             what: "encode feedback",
         });
     }
-    if !facts
-        .rate_control_modes
-        .contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-    {
-        return Err(VulkanError::OverCaps {
-            what: "rate control",
-        });
-    }
     Ok(())
 }
 
-/// Standard sets of `codec` for `width`x`height` under `facts`.
-///
-/// # Errors
-///
-/// Returns `Err` when no level covers the extent.
+/// Standard sets of `codec` for `width`x`height` under `mapped`.
 fn build_sets(
     codec: EncodeCodec,
-    facts: &crate::ladder::EncodeFacts,
+    mapped: &crate::encode_config::MappedEncode,
     width: u32,
     height: u32,
 ) -> Result<EncodeSets, VulkanError> {
     match codec {
-        EncodeCodec::H264 => {
-            let mbs = width.div_ceil(16) * height.div_ceil(16);
-            let level = h264_level_for(mbs).ok_or(VulkanError::OverCaps {
-                what: "coded extent",
-            })?;
-            EncodeSets::h264(width, height, facts.profile, level)
-        }
-        EncodeCodec::H265 => {
-            let samples = u64::from(width) * u64::from(height);
-            let level = h265_level_for(samples).ok_or(VulkanError::OverCaps {
-                what: "coded extent",
-            })?;
-            EncodeSets::h265(width, height, facts.profile, level)
-        }
+        EncodeCodec::H264 => EncodeSets::h264(
+            width,
+            height,
+            mapped.profile,
+            mapped.level,
+            mapped.rate.qp,
+            mapped.vui,
+        ),
+        EncodeCodec::H265 => EncodeSets::h265(
+            width,
+            height,
+            mapped.profile,
+            mapped.level,
+            mapped.rate.qp,
+            mapped.vui,
+        ),
     }
 }
 
-/// CBR layer of `rate` at the session frame rate.
+/// Rate layer of `rate` at the mapped frame rate.
 fn rc_layer(rate: &RateControl) -> vk::VideoEncodeRateControlLayerInfoKHR<'static> {
     vk::VideoEncodeRateControlLayerInfoKHR::default()
         .average_bitrate(rate.average_bitrate)
         .max_bitrate(rate.max_bitrate)
-        .frame_rate_numerator(RC_FPS)
-        .frame_rate_denominator(RC_FPS_DENOM)
+        .frame_rate_numerator(rate.fps.0)
+        .frame_rate_denominator(rate.fps.1)
 }
 
 /// Virtual buffer window in milliseconds behind CBR control.
-const VIRTUAL_BUFFER_MS: u32 = 1_000;
+pub(crate) const VIRTUAL_BUFFER_MS: u32 = 1_000;
 
 /// Initial virtual buffer fullness in milliseconds behind CBR control.
-const INITIAL_BUFFER_MS: u32 = 500;
+pub(crate) const INITIAL_BUFFER_MS: u32 = 500;
 
 /// Encode-rate-control bit of the coding control flags.
 ///
@@ -541,18 +696,55 @@ const INITIAL_BUFFER_MS: u32 = 500;
 const ENCODE_RATE_CONTROL: vk::VideoCodingControlFlagsKHR =
     vk::VideoCodingControlFlagsKHR::from_raw(0x0000_0002);
 
-/// CBR control over `layer`.
+/// Rate control over `layer` under `rate`.
 fn rc_control<'a>(
+    rate: &RateControl,
     layer: &'a vk::VideoEncodeRateControlLayerInfoKHR<'_>,
 ) -> vk::VideoEncodeRateControlInfoKHR<'a> {
     vk::VideoEncodeRateControlInfoKHR {
-        rate_control_mode: vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+        rate_control_mode: rate.mode,
         layer_count: 1,
         p_layers: std::ptr::from_ref(layer),
-        virtual_buffer_size_in_ms: VIRTUAL_BUFFER_MS,
-        initial_virtual_buffer_size_in_ms: INITIAL_BUFFER_MS,
+        virtual_buffer_size_in_ms: rate.virtual_ms,
+        initial_virtual_buffer_size_in_ms: rate.initial_ms,
         ..Default::default()
     }
+}
+
+/// H.264 layer info clamping QP to `qp` when set.
+fn h264_qp_layer(qp: Option<u8>) -> vk::VideoEncodeH264RateControlLayerInfoKHR<'static> {
+    let mut layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default();
+    if let Some(qp) = qp {
+        let qp = vk::VideoEncodeH264QpKHR {
+            qp_i: i32::from(qp),
+            qp_p: i32::from(qp),
+            qp_b: i32::from(qp),
+        };
+        layer = layer
+            .use_min_qp(true)
+            .min_qp(qp)
+            .use_max_qp(true)
+            .max_qp(qp);
+    }
+    layer
+}
+
+/// H.265 layer info clamping QP to `qp` when set.
+fn h265_qp_layer(qp: Option<u8>) -> vk::VideoEncodeH265RateControlLayerInfoKHR<'static> {
+    let mut layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default();
+    if let Some(qp) = qp {
+        let qp = vk::VideoEncodeH265QpKHR {
+            qp_i: i32::from(qp),
+            qp_p: i32::from(qp),
+            qp_b: i32::from(qp),
+        };
+        layer = layer
+            .use_min_qp(true)
+            .min_qp(qp)
+            .use_max_qp(true)
+            .max_qp(qp);
+    }
+    layer
 }
 
 /// H.264 single-reference L0 list over `ref_slot`.
@@ -926,10 +1118,12 @@ pub(crate) struct EncodeSession {
     bitstream: GpuBuffer,
     /// Coded-size feedback pool.
     feedback: EncodeFeedback,
-    /// CBR rate control.
+    /// Rate control behind the session.
     rate: RateControl,
     /// Rate control configured on the session.
     rc_configured: bool,
+    /// Driver quality level, absent under legacy control.
+    quality: Option<u32>,
     /// Frames between IDR pictures.
     idr_period: u32,
     /// Driver-encoded parameter sets prepended to keyframe packets.
@@ -953,9 +1147,7 @@ struct EncodePlan {
 }
 
 impl EncodeSession {
-    /// Session over `device` for `codec` at `width`x`height`.
-    ///
-    /// `idr_period` counts frames between IDR pictures; 0 clamps to 1.
+    /// Session over `device` for `codec` at `width`x`height` under `mapped`.
     ///
     /// # Errors
     ///
@@ -966,18 +1158,18 @@ impl EncodeSession {
         codec: EncodeCodec,
         width: u32,
         height: u32,
-        idr_period: u32,
+        mapped: &crate::encode_config::MappedEncode,
     ) -> Result<Self, VulkanError> {
         let crate::ladder::OpCaps::Encode(facts) = device.caps() else {
             return Err(VulkanError::OverCaps { what: "codec op" });
         };
         check_extent(&facts, width, height)?;
-        check_caps(&facts)?;
+        check_feedback(&facts)?;
         let raw = device.raw().device();
         let properties =
             crate::raw::RawDevice::memory_properties(device.backend(), device.adapter());
         let extent = vk::Extent2D { width, height };
-        let sets = build_sets(codec, &facts, width, height)?;
+        let sets = build_sets(codec, mapped, width, height)?;
         let h264_chain = H264EncodeProfileChain::new(facts.profile);
         let h265_chain = H265EncodeProfileChain::new(facts.profile);
         let profile = match codec {
@@ -1000,7 +1192,7 @@ impl EncodeSession {
         let format = crate::raw::pick_video_format(&formats).ok_or(VulkanError::NoVideoFormat)?;
         let p_capable = facts.dpb_slots >= ENCODE_DPB_SLOTS && facts.active_refs >= 1;
         let dpb_count = if p_capable { ENCODE_DPB_SLOTS } else { 1 };
-        let idr_period = if p_capable { idr_period.max(1) } else { 1 };
+        let idr_period = if p_capable { mapped.gop.period() } else { 1 };
         let resources =
             Self::open_resources(device, &properties, format, extent, &profile, dpb_count)?;
         let desc = crate::raw::VideoSessionDesc {
@@ -1013,20 +1205,7 @@ impl EncodeSession {
             std_version: &std_version,
         };
         let session = VideoSession::create(raw, device.backend().instance(), &properties, &desc)?;
-        let mut template = match codec {
-            EncodeCodec::H264 => {
-                crate::session::params::ParamsTemplate::H264Encode(h264_encode_params_create())
-            }
-            EncodeCodec::H265 => {
-                crate::session::params::ParamsTemplate::H265Encode(h265_encode_params_create())
-            }
-        };
-        let mut params = Self::create_params(&session, &mut template)?;
-        Self::register_sets(&sets, &mut params)?;
-        let headers = match codec {
-            EncodeCodec::H264 => resources.encode.encoded_parameters_h264(params.params())?,
-            EncodeCodec::H265 => resources.encode.encoded_parameters_h265(params.params())?,
-        };
+        let (params, headers) = Self::open_params(&session, codec, &sets, &resources.encode)?;
         let submit = SubmitSlots::open(
             raw,
             device.queue_family(),
@@ -1063,11 +1242,36 @@ impl EncodeSession {
             staging: resources.staging,
             bitstream: resources.bitstream,
             feedback: resources.feedback,
-            rate: RateControl::cbr_for(extent),
+            rate: RateControl::mapped(&mapped.rate),
             rc_configured: false,
+            quality: mapped.quality,
             idr_period,
             headers,
         })
+    }
+
+    /// Session parameters plus driver-encoded sets headers.
+    fn open_params(
+        session: &VideoSession,
+        codec: EncodeCodec,
+        sets: &EncodeSets,
+        encode: &EncodeQueue,
+    ) -> Result<(SessionParameters, Vec<u8>), VulkanError> {
+        let mut template = match codec {
+            EncodeCodec::H264 => {
+                crate::session::params::ParamsTemplate::H264Encode(h264_encode_params_create())
+            }
+            EncodeCodec::H265 => {
+                crate::session::params::ParamsTemplate::H265Encode(h265_encode_params_create())
+            }
+        };
+        let mut params = Self::create_params(session, &mut template)?;
+        Self::register_sets(sets, &mut params)?;
+        let headers = match codec {
+            EncodeCodec::H264 => encode.encoded_parameters_h264(params.params())?,
+            EncodeCodec::H265 => encode.encoded_parameters_h265(params.params())?,
+        };
+        Ok((params, headers))
     }
 
     /// Images, buffers, and feedback queries for `profile` at `extent`.
@@ -1196,7 +1400,7 @@ impl EncodeSession {
     /// Register the session sets through one parameters update.
     fn register_sets(sets: &EncodeSets, params: &mut SessionParameters) -> Result<(), VulkanError> {
         match sets {
-            EncodeSets::H264 { sps, pps } => {
+            EncodeSets::H264 { sps, pps, .. } => {
                 let mut add =
                     h264_encode_params_add(std::slice::from_ref(sps), std::slice::from_ref(pps))?;
                 let update = vk::VideoSessionParametersUpdateInfoKHR::default().push_next(&mut add);
@@ -1632,8 +1836,8 @@ impl EncodeSession {
             recorder.barrier(&vk::DependencyInfo::default().image_memory_barriers(&head));
         }
         recorder.reset_queries(self.feedback.pool(), query, 1);
-        let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default();
-        let mut h265_layer = vk::VideoEncodeH265RateControlLayerInfoKHR::default();
+        let mut h264_layer = h264_qp_layer(self.rate.qp);
+        let mut h265_layer = h265_qp_layer(self.rate.qp);
         let mut layer = rc_layer(&self.rate);
         match self.codec {
             EncodeCodec::H264 => {
@@ -1643,7 +1847,7 @@ impl EncodeSession {
                 layer.p_next = std::ptr::from_mut(&mut h265_layer).cast();
             }
         }
-        let mut control = rc_control(&layer);
+        let mut control = rc_control(&self.rate, &layer);
         let mut h264_rc = vk::VideoEncodeH264RateControlInfoKHR {
             gop_frame_count: self.idr_period,
             idr_period: self.idr_period,
@@ -1678,7 +1882,8 @@ impl EncodeSession {
     /// Begin one coding scope, configuring rate control on the first.
     ///
     /// The first begin carries no rate control; the control command
-    /// configures it. Later begins declare it to match session state.
+    /// configures it, with the quality level when mapped. Later begins
+    /// declare it to match session state.
     /// VUID-vkCmdBeginVideoCodingKHR-pBeginInfo-08254.
     fn begin_scope(
         &self,
@@ -1689,9 +1894,18 @@ impl EncodeSession {
     ) {
         if first {
             self.video.begin_coding(cmd, &begin);
-            let control_info = vk::VideoCodingControlInfoKHR::default()
+            let mut quality =
+                self.quality
+                    .map(|quality_level| vk::VideoEncodeQualityLevelInfoKHR {
+                        quality_level,
+                        ..Default::default()
+                    });
+            let mut control_info = vk::VideoCodingControlInfoKHR::default()
                 .flags(vk::VideoCodingControlFlagsKHR::RESET | ENCODE_RATE_CONTROL)
                 .push_next(control);
+            if let Some(quality) = quality.as_mut() {
+                control_info = control_info.push_next(quality);
+            }
             self.video.control_coding(cmd, &control_info);
         } else {
             let begin = begin.push_next(control);
@@ -1776,7 +1990,7 @@ impl EncodeSession {
         );
         let slice_header = h264_encode_slice(!idr);
         let slice = vk::VideoEncodeH264NaluSliceInfoKHR {
-            constant_qp: 0,
+            constant_qp: self.rate.qp.map_or(0, i32::from),
             p_std_slice_header: std::ptr::from_ref(&slice_header),
             ..Default::default()
         };
@@ -1867,7 +2081,7 @@ impl EncodeSession {
             h265_encode_picture(idr, pic_type, stamp.poc, ref_lists.as_ref(), rps_ref);
         let slice_header = h265_encode_slice(!idr);
         let slice = vk::VideoEncodeH265NaluSliceSegmentInfoKHR {
-            constant_qp: 0,
+            constant_qp: self.rate.qp.map_or(0, i32::from),
             p_std_slice_segment_header: std::ptr::from_ref(&slice_header),
             ..Default::default()
         };
@@ -1934,8 +2148,8 @@ mod tests {
 
     #[test]
     fn h264_sets_pad_to_macroblocks() {
-        let sets = EncodeSets::h264(320, 240, 100, 31).expect("covered");
-        let super::EncodeSets::H264 { sps, pps } = &sets else {
+        let sets = EncodeSets::h264(320, 240, 100, 31, None, None).expect("covered");
+        let super::EncodeSets::H264 { sps, pps, .. } = &sets else {
             panic!("want h264 sets");
         };
         assert_eq!(sps.pic_width_in_mbs_minus1, 19);
@@ -1948,7 +2162,7 @@ mod tests {
 
     #[test]
     fn h264_sets_crop_odd_extents() {
-        let sets = EncodeSets::h264(322, 242, 100, 31).expect("covered");
+        let sets = EncodeSets::h264(322, 242, 100, 31, None, None).expect("covered");
         let super::EncodeSets::H264 { sps, .. } = &sets else {
             panic!("want h264 sets");
         };
@@ -1959,7 +2173,7 @@ mod tests {
 
     #[test]
     fn h265_sets_pad_to_coding_blocks() {
-        let sets = EncodeSets::h265(320, 240, 1, 93).expect("covered");
+        let sets = EncodeSets::h265(320, 240, 1, 93, None, None).expect("covered");
         let sps = sets.h265_sps().expect("h265 sps");
         assert_eq!(sps.pic_width_in_luma_samples, 320);
         assert_eq!(sps.pic_height_in_luma_samples, 240);
@@ -1973,7 +2187,7 @@ mod tests {
 
     #[test]
     fn h265_sets_crop_odd_extents() {
-        let sets = EncodeSets::h265(322, 242, 1, 93).expect("covered");
+        let sets = EncodeSets::h265(322, 242, 1, 93, None, None).expect("covered");
         let sps = sets.h265_sps().expect("h265 sps");
         assert_eq!(sps.pic_width_in_luma_samples, 328);
         assert_eq!(sps.pic_height_in_luma_samples, 248);
@@ -2017,5 +2231,70 @@ mod tests {
         let frame_bits = 320 * 240 * 3 / 2 * 8;
         assert_eq!(rate.average_bitrate, frame_bits * 60 / 20);
         assert_eq!(rate.max_bitrate, rate.average_bitrate);
+    }
+
+    #[test]
+    fn sets_carry_cqp_init() {
+        let sets = EncodeSets::h264(320, 240, 100, 31, Some(23), None).expect("covered");
+        let super::EncodeSets::H264 { pps, .. } = &sets else {
+            panic!("want h264 sets");
+        };
+        assert_eq!(pps.pic_init_qp_minus26, -3);
+        let sets = EncodeSets::h265(320, 240, 1, 93, Some(23), None).expect("covered");
+        let pps = sets.h265_pps().expect("h265 pps");
+        assert_eq!(pps.init_qp_minus26, -3);
+    }
+
+    #[test]
+    fn sets_link_color_vui() {
+        let vui = crate::encode_config::MappedVui {
+            primaries: 1,
+            transfer: 1,
+            matrix: 1,
+            full_range: true,
+        };
+        let sets = EncodeSets::h264(320, 240, 100, 31, None, Some(vui)).expect("covered");
+        let super::EncodeSets::H264 {
+            sps, vui: linked, ..
+        } = &sets
+        else {
+            panic!("want h264 sets");
+        };
+        assert!(!sps.pSequenceParameterSetVui.is_null());
+        let linked = linked.as_ref().expect("vui stored");
+        assert_eq!(linked.colour_primaries, 1);
+        assert_eq!(linked.transfer_characteristics, 1);
+        assert_eq!(linked.matrix_coefficients, 1);
+        let sets = EncodeSets::h265(320, 240, 1, 93, None, Some(vui)).expect("covered");
+        let sps = sets.h265_sps().expect("h265 sps");
+        assert!(!sps.pSequenceParameterSetVui.is_null());
+        let super::EncodeSets::H265 { vui: linked, .. } = &sets else {
+            panic!("want h265 sets");
+        };
+        let linked = linked.as_ref().expect("vui stored");
+        assert_eq!(linked.colour_primaries, 1);
+        assert_eq!(linked.transfer_characteristics, 1);
+        assert_eq!(linked.matrix_coeffs, 1);
+        let bare = EncodeSets::h264(320, 240, 100, 31, None, None).expect("covered");
+        let super::EncodeSets::H264 { sps: bare_sps, .. } = &bare else {
+            panic!("want h264 sets");
+        };
+        assert!(bare_sps.pSequenceParameterSetVui.is_null());
+    }
+
+    #[test]
+    fn qp_layers_clamp_when_set() {
+        let bare = super::h264_qp_layer(None);
+        assert_eq!(bare.use_min_qp, ash::vk::FALSE);
+        assert_eq!(bare.use_max_qp, ash::vk::FALSE);
+        let clamped = super::h264_qp_layer(Some(23));
+        assert_eq!(clamped.use_min_qp, ash::vk::TRUE);
+        assert_eq!(clamped.min_qp.qp_i, 23);
+        assert_eq!(clamped.max_qp.qp_p, 23);
+        let bare = super::h265_qp_layer(None);
+        assert_eq!(bare.use_min_qp, ash::vk::FALSE);
+        let clamped = super::h265_qp_layer(Some(23));
+        assert_eq!(clamped.use_max_qp, ash::vk::TRUE);
+        assert_eq!(clamped.min_qp.qp_b, 23);
     }
 }

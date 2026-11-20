@@ -176,6 +176,9 @@ pub enum VulkanError {
         /// Allocation byte count.
         capacity: u64,
     },
+    /// Encode config the tier declines.
+    #[error("encode config declined: {0}")]
+    Declined(#[from] rust_video_caps::encode::Decline),
 }
 
 impl VulkanError {
@@ -364,6 +367,17 @@ mod tests {
             capacity: 8
         }
         .is_out_of_device_memory());
+    }
+
+    #[test]
+    fn declined_carries_caps_reason() {
+        let decline = rust_video_caps::encode::Decline::BFramesUnsupported { actual: 2, max: 0 };
+        let error = VulkanError::from(decline);
+        assert!(matches!(error, VulkanError::Declined(_)));
+        assert_eq!(
+            error.to_string(),
+            "encode config declined: 2 B-frames above tier maximum 0"
+        );
     }
 
     #[test]

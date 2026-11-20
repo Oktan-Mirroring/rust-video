@@ -8,8 +8,7 @@ use ash::vk;
 use bytes::{Bytes, BytesMut};
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::delivery::{PhaseTiming, SubmitStats};
-use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat};
-use rust_video_caps::packet::Packet;
+use rust_video_caps::frame::{CpuFrame, FramePool, GpuExport, GpuFrame, PixelFormat, Surface};
 use rust_video_caps::traits::{Lease, SharedDevice};
 
 use crate::au::{AccessUnit, AuBoundary};
@@ -246,6 +245,32 @@ impl VulkanFrame {
     #[must_use]
     pub fn to_cpu(&self) -> Option<CpuFrame> {
         CpuFrame::from_nv12(self.identity.size(), &self.data)
+    }
+}
+
+impl Surface for VulkanFrame {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
     }
 }
 
@@ -592,69 +617,6 @@ impl FrameSink {
             planes: None,
         })
     }
-}
-
-/// Split-phase decode: submit without waiting, poll completions in order.
-///
-/// `submit_packet` queues pictures and returns the frames already
-/// complete; `poll_ready` collects further completions without waiting;
-/// `collect_next` waits the oldest picture out. Completions hand off in
-/// submit order: same-queue execution completes in order, and every
-/// collect matches the pending picture explicitly.
-pub trait OverlappedDecode {
-    /// Queue `packet` pictures without waiting on their completion.
-    ///
-    /// Collects completions already signaled; back-pressures past the
-    /// ring depth only inside multi-picture packets.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot decode `packet`.
-    fn submit_packet(&mut self, packet: &Packet) -> Result<Vec<VulkanFrame>, VulkanError>;
-
-    /// Completed pictures, oldest first, without waiting.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its ready frames.
-    fn poll_ready(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
-
-    /// Oldest submitted picture, waiting it out.
-    ///
-    /// Empty when nothing is submitted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its oldest picture.
-    fn collect_next(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
-
-    /// Oldest submitted picture, waiting up to `timeout` for it.
-    ///
-    /// `None` reports the lapsed budget with the picture still pending.
-    /// Empty when nothing is submitted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its oldest picture.
-    fn collect_next_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Option<Vec<VulkanFrame>>, VulkanError>;
-
-    /// Trailing frames, then end of stream.
-    ///
-    /// Waits every submitted picture out, like `flush`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the backend cannot release its held frames.
-    fn finish_overlapped(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
-
-    /// Submitted but uncollected picture count.
-    fn inflight_len(&self) -> usize;
-
-    /// Logged phase timings, oldest first, clearing the log.
-    fn take_timings(&mut self) -> Vec<PhaseTiming>;
 }
 
 /// Run core behind the shared run path: session, sink, queue, gauges.
@@ -1297,7 +1259,8 @@ pub(crate) fn collect_oldest(
 /// Collect the oldest submitted picture, waiting up to `timeout` for it.
 ///
 /// `None` reports the lapsed budget with the picture still pending.
-/// Empty when nothing is submitted.
+/// Empty when nothing is submitted. Launched-only work waits for the
+/// oldest copy within the budget instead of returning at once.
 pub(crate) fn collect_oldest_timeout(
     session: &mut Option<Session>,
     sink: &mut FrameSink,
@@ -1305,9 +1268,6 @@ pub(crate) fn collect_oldest_timeout(
     stats: &mut SubmitStats,
     timeout: Duration,
 ) -> Result<Option<Vec<VulkanFrame>>, VulkanError> {
-    if pending.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
     if pending.is_empty() && sink.launched.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -1316,7 +1276,20 @@ pub(crate) fn collect_oldest_timeout(
     };
     let mut out = harvest_landed(session, sink, stats)?;
     if pending.is_empty() {
-        return Ok(Some(out));
+        if !out.is_empty() || sink.launched.is_empty() {
+            return Ok(Some(out));
+        }
+        if let Some(done) = sink.readback.collect_timeout(timeout) {
+            let Some(launched) = sink.launched.pop_front() else {
+                debug_assert!(false, "landed copy without launched picture");
+                return Ok(Some(out));
+            };
+            let (bytes, release, copy) = done.into_parts();
+            release.unmap();
+            out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
+            return Ok(Some(out));
+        }
+        return Ok(if out.is_empty() { None } else { Some(out) });
     }
     let picture = pending.remove(0);
     let budget = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
@@ -1547,6 +1520,43 @@ mod tests {
         assert_eq!(held.origin(), (0, 0));
         assert!(held.planes().is_none());
         held.wait();
+    }
+
+    #[test]
+    fn surface_trait_matches_inherents() {
+        use rust_video_caps::frame::Surface;
+        fn assert_surface<T: Surface>() {}
+        let shared = SharedDevice::new("vulkan", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        assert_surface::<VulkanFrame>();
+        assert_eq!(Surface::size(&held), held.size());
+        assert_eq!(Surface::format(&held), held.format());
+        assert_eq!(Surface::slice(&held), held.slice());
+        assert_eq!(Surface::coded(&held), held.coded());
+        assert_eq!(Surface::origin(&held), held.origin());
+        assert!(matches!(
+            (Surface::export(&held), held.export()),
+            (
+                GpuExport::Opaque { name: "vulkan" },
+                GpuExport::Opaque { name: "vulkan" }
+            )
+        ));
+    }
+
+    #[test]
+    fn wait_stays_infallible() {
+        let shared = SharedDevice::new("vulkan", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        let _: () = held.wait();
+    }
+
+    #[test]
+    fn decoders_implement_split_decode() {
+        use rust_video_caps::delivery::SplitDecode;
+        fn assert_split<D: SplitDecode>() {}
+        assert_split::<crate::h264::H264Decoder<'static>>();
+        assert_split::<crate::h265::H265Decoder<'static>>();
+        assert_split::<crate::av1::Av1Decoder<'static>>();
     }
 
     #[test]

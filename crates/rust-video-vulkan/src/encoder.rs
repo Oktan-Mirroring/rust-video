@@ -2,62 +2,22 @@
 
 use crate::decoder::VulkanFrame;
 use crate::device::VulkanDevice;
+use crate::encode_config::MappedEncode;
 use crate::error::VulkanError;
 use crate::ladder::CodecOp;
 use crate::session::encode::{EncodeCodec, EncodeSession, PictureStamp};
 
 use bytes::Bytes;
 use rust_video_caps::delivery::SubmitStats;
+use rust_video_caps::encode::EncodeConfig;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
-use rust_video_core::planes;
+use rust_video_core::{planes, Gop};
 
 /// H.264 frame-number modulus: `log2_max_frame_num_minus4` is 0.
 const MAX_FRAME_NUM: u16 = 16;
-
-/// IDR cadence of one encode session.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Gop {
-    /// Frames between IDR pictures, at least 1.
-    interval: u32,
-}
-
-impl Gop {
-    /// Cadence coding an IDR every `frames` pictures.
-    ///
-    /// `0` clamps to 1, coding every picture as IDR.
-    #[must_use]
-    pub fn interval(frames: u32) -> Self {
-        Self {
-            interval: frames.max(1),
-        }
-    }
-
-    /// Cadence coding every picture as IDR.
-    #[must_use]
-    pub fn all_intra() -> Self {
-        Self { interval: 1 }
-    }
-
-    /// Frames between IDR pictures.
-    pub(crate) fn period(self) -> u32 {
-        self.interval
-    }
-
-    /// True when picture `index` codes as IDR.
-    fn is_idr(self, index: u64) -> bool {
-        index.is_multiple_of(u64::from(self.interval))
-    }
-}
-
-impl Default for Gop {
-    /// Short low-latency GOP: an IDR every 30 pictures.
-    fn default() -> Self {
-        Self { interval: 30 }
-    }
-}
 
 /// Shared GOP encode engine over one session.
 struct Engine {
@@ -82,9 +42,9 @@ struct Engine {
 }
 
 impl Engine {
-    /// Engine over `device` for `op` at `width`x`height` with `gop` cadence.
+    /// Engine over `device` for `op` at `width`x`height` under `mapped`.
     ///
-    /// A session without P support codes all-intra whatever `gop` holds.
+    /// A session without P support codes all-intra whatever `mapped` holds.
     ///
     /// # Errors
     ///
@@ -97,14 +57,14 @@ impl Engine {
         width: u32,
         height: u32,
         poc_step: i32,
-        gop: Gop,
+        mapped: &MappedEncode,
     ) -> Result<Self, VulkanError> {
         if device.op() != op {
             return Err(VulkanError::OverCaps { what: "codec op" });
         }
-        let session = EncodeSession::open(device, codec, width, height, gop.period())?;
+        let session = EncodeSession::open(device, codec, width, height, mapped)?;
         let gop = if session.supports_p_frames() {
-            gop
+            mapped.gop
         } else {
             Gop::all_intra()
         };
@@ -219,7 +179,7 @@ impl Engine {
 
     /// Stamp for the next picture, advancing the counters.
     fn next_stamp(&mut self) -> PictureStamp {
-        let is_idr = self.gop.is_idr(self.index);
+        let is_idr = self.index.is_multiple_of(u64::from(self.gop.period()));
         if is_idr {
             self.frame_num = 0;
         } else {
@@ -329,30 +289,26 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    /// Encoder over `device` at `width`x`height`, negotiated for H.264 encode.
+    /// Encoder over `device` at `width`x`height` under `config`.
     ///
-    /// Codes the default GOP cadence.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when `device` negotiated another operation or the
-    /// session fails to open.
-    pub fn open(device: &VulkanDevice, width: u32, height: u32) -> Result<Self, VulkanError> {
-        Self::open_with_gop(device, width, height, Gop::default())
-    }
-
-    /// Encoder over `device` at `width`x`height` with `gop` cadence.
+    /// `Auto` rate control keeps the tier legacy recipe: an IDR every
+    /// 30 pictures with extent-derived CBR. Explicit modes map the
+    /// config knobs and decline the unmappable ones typed.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `device` negotiated another operation or the
-    /// session fails to open.
-    pub fn open_with_gop(
+    /// Returns `Err` when `device` negotiated another operation, the
+    /// config declines, or the session fails to open.
+    pub fn open(
         device: &VulkanDevice,
         width: u32,
         height: u32,
-        gop: Gop,
+        config: EncodeConfig,
     ) -> Result<Self, VulkanError> {
+        let crate::ladder::OpCaps::Encode(facts) = device.caps() else {
+            return Err(VulkanError::OverCaps { what: "codec op" });
+        };
+        let mapped = MappedEncode::map(CodecOp::H264Encode, &facts, width, height, &config)?;
         Ok(Self {
             engine: Engine::open(
                 device,
@@ -361,7 +317,7 @@ impl H264Encoder {
                 width,
                 height,
                 2,
-                gop,
+                &mapped,
             )?,
         })
     }
@@ -387,16 +343,6 @@ impl H264Encoder {
     /// Fail the next submit once, exercising the reset path.
     pub fn inject_submit_fault(&mut self) {
         self.engine.inject_submit_fault();
-    }
-
-    /// Packets coded from the device export behind `frame`, possibly none.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the frame has no device export, misses the
-    /// session size, or the backend refuses the picture.
-    pub fn encode_export(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
-        Ok(vec![self.engine.encode_export(frame)?])
     }
 }
 
@@ -417,6 +363,15 @@ impl Encoder for H264Encoder {
     }
 }
 
+impl EncodeSurface for H264Encoder {
+    type Surface = VulkanFrame;
+    type Error = VulkanError;
+
+    fn encode_surface(&mut self, surface: &Self::Surface) -> Result<Vec<Packet>, Self::Error> {
+        Ok(vec![self.engine.encode_export(surface)?])
+    }
+}
+
 /// H.265 GOP encoder over a negotiated Vulkan device.
 ///
 /// Thread-local: the session submits on its creating thread while
@@ -427,30 +382,26 @@ pub struct H265Encoder {
 }
 
 impl H265Encoder {
-    /// Encoder over `device` at `width`x`height`, negotiated for H.265 encode.
+    /// Encoder over `device` at `width`x`height` under `config`.
     ///
-    /// Codes the default GOP cadence.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when `device` negotiated another operation or the
-    /// session fails to open.
-    pub fn open(device: &VulkanDevice, width: u32, height: u32) -> Result<Self, VulkanError> {
-        Self::open_with_gop(device, width, height, Gop::default())
-    }
-
-    /// Encoder over `device` at `width`x`height` with `gop` cadence.
+    /// `Auto` rate control keeps the tier legacy recipe: an IDR every
+    /// 30 pictures with extent-derived CBR. Explicit modes map the
+    /// config knobs and decline the unmappable ones typed.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when `device` negotiated another operation or the
-    /// session fails to open.
-    pub fn open_with_gop(
+    /// Returns `Err` when `device` negotiated another operation, the
+    /// config declines, or the session fails to open.
+    pub fn open(
         device: &VulkanDevice,
         width: u32,
         height: u32,
-        gop: Gop,
+        config: EncodeConfig,
     ) -> Result<Self, VulkanError> {
+        let crate::ladder::OpCaps::Encode(facts) = device.caps() else {
+            return Err(VulkanError::OverCaps { what: "codec op" });
+        };
+        let mapped = MappedEncode::map(CodecOp::H265Encode, &facts, width, height, &config)?;
         Ok(Self {
             engine: Engine::open(
                 device,
@@ -459,7 +410,7 @@ impl H265Encoder {
                 width,
                 height,
                 1,
-                gop,
+                &mapped,
             )?,
         })
     }
@@ -486,16 +437,6 @@ impl H265Encoder {
     pub fn inject_submit_fault(&mut self) {
         self.engine.inject_submit_fault();
     }
-
-    /// Packets coded from the device export behind `frame`, possibly none.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the frame has no device export, misses the
-    /// session size, or the backend refuses the picture.
-    pub fn encode_export(&mut self, frame: &VulkanFrame) -> Result<Vec<Packet>, VulkanError> {
-        Ok(vec![self.engine.encode_export(frame)?])
-    }
 }
 
 impl Encoder for H265Encoder {
@@ -512,6 +453,15 @@ impl Encoder for H265Encoder {
 
     fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
         Ok(Vec::new())
+    }
+}
+
+impl EncodeSurface for H265Encoder {
+    type Surface = VulkanFrame;
+    type Error = VulkanError;
+
+    fn encode_surface(&mut self, surface: &Self::Surface) -> Result<Vec<Packet>, Self::Error> {
+        Ok(vec![self.engine.encode_export(surface)?])
     }
 }
 
@@ -536,25 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn gop_idr_cadence_exact() {
-        let gop = super::Gop::interval(4);
-        let marks: Vec<bool> = (0..10).map(|index| gop.is_idr(index)).collect();
-        assert_eq!(
-            marks,
-            vec![true, false, false, false, true, false, false, false, true, false]
-        );
-    }
-
-    #[test]
-    fn gop_all_intra_and_default() {
-        let intra = super::Gop::all_intra();
-        assert!((0..4).all(|index| intra.is_idr(index)));
-        let clamped = super::Gop::interval(0);
-        assert!((0..4).all(|index| clamped.is_idr(index)));
-        let default = super::Gop::default();
-        assert!(default.is_idr(0));
-        assert!(default.is_idr(30));
-        assert!(!default.is_idr(29));
+    fn encoders_implement_encode_surface() {
+        use rust_video_caps::traits::EncodeSurface;
+        fn assert_encode_surface<T: EncodeSurface>() {}
+        assert_encode_surface::<super::H264Encoder>();
+        assert_encode_surface::<super::H265Encoder>();
     }
 
     #[test]
@@ -620,7 +556,11 @@ mod tests {
             }
             Err(error) => panic!("negotiation failed: {error}"),
         };
-        let encoder = match super::H264Encoder::open(&device, 320, 240) {
+        let config = rust_video_caps::encode::EncodeConfig {
+            rate_control: rust_video_caps::encode::RateControl::Auto,
+            ..Default::default()
+        };
+        let encoder = match super::H264Encoder::open(&device, 320, 240, config) {
             Ok(encoder) => encoder,
             Err(error) if error.is_out_of_device_memory() => {
                 println!("declined:OOM h264 encode open: {error}");

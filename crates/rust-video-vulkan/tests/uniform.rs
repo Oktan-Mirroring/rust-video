@@ -10,13 +10,13 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SplitDecode};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{decode_dir, AnnexB, Drive, Packets, Parity};
 use rust_video_vulkan::{
-    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, OverlappedDecode, VulkanDevice,
-    VulkanError, VulkanFrame,
+    Av1Decoder, CodecOp, H264Decoder, H265Decoder, OverlapPump, VulkanDevice, VulkanError,
+    VulkanFrame,
 };
 
 /// Pictures in each shared vector.
@@ -88,11 +88,16 @@ fn assert_oracle(path: &Path, frames: &[VulkanFrame], codec: &str) {
 }
 
 /// Frames surfacing under backpressure into `frames`, freeing send room.
-fn drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
+fn drain<D>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>)
+where
+    D: SplitDecode<Frame = VulkanFrame, Error = VulkanError>,
+{
+    let mut surfaced = false;
     while let Some(frame) = pump.try_receive().expect("poll") {
         frames.push(frame);
+        surfaced = true;
     }
-    if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
+    if !surfaced {
         match pump.receive_timeout(Duration::from_secs(10)) {
             Ok(frame) => frames.extend(frame),
             Err(error) => panic!("completions stall: {error:?}"),
@@ -109,7 +114,8 @@ fn assert_byte_parity(codec: &str, sync: &[VulkanFrame], overlap: &[VulkanFrame]
 /// Sync and overlapped bytes match over `packets`.
 fn assert_parity<D>(open: impl Fn() -> D, packets: &[Packet], codec: &str)
 where
-    D: Decoder<Frame = VulkanFrame, Error = VulkanError> + OverlappedDecode,
+    D: Decoder<Frame = VulkanFrame, Error = VulkanError>
+        + SplitDecode<Frame = VulkanFrame, Error = VulkanError>,
 {
     let sync_frames = Drive::decode_all(&mut open(), packets);
     assert_eq!(

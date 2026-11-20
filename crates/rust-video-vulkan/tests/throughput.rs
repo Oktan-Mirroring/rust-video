@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use rust_video_vulkan::{
     Av1Decoder, CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, OverlapPump,
-    OverlappedDecode, ParseError, VulkanDevice, VulkanError, VulkanFrame,
+    ParseError, VulkanDevice, VulkanError, VulkanFrame,
 };
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SplitDecode};
+use rust_video_caps::encode::{EncodeConfig, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
@@ -356,7 +357,11 @@ fn encode_h264_1080p_measures_realtime() {
     let Some(device) = device_or_skip(CodecOp::H264Encode) else {
         return;
     };
-    let mut encoder = match H264Encoder::open(&device, 1920, 1080) {
+    let config = EncodeConfig {
+        rate_control: RateControl::Auto,
+        ..Default::default()
+    };
+    let mut encoder = match H264Encoder::open(&device, 1920, 1080, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("vulkan skipped: h264 encode open failed: {error}");
@@ -379,7 +384,13 @@ fn encode_h265_1080p_measures_realtime() {
     let Some(device) = device_or_skip(CodecOp::H265Encode) else {
         return;
     };
-    let mut encoder = match H265Encoder::open(&device, 1920, 1080) {
+    let config = EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile: rust_video_caps::encode::Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+        level: rust_video_caps::encode::Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ..Default::default()
+    };
+    let mut encoder = match H265Encoder::open(&device, 1920, 1080, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("vulkan skipped: h265 encode open failed: {error}");
@@ -396,11 +407,16 @@ fn encode_h265_1080p_measures_realtime() {
 }
 
 /// Frames surfacing under backpressure into `frames`, freeing send room.
-fn drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>) {
+fn drain<D>(pump: &mut OverlapPump<D>, frames: &mut Vec<VulkanFrame>)
+where
+    D: SplitDecode<Frame = VulkanFrame, Error = VulkanError>,
+{
+    let mut surfaced = false;
     while let Some(frame) = pump.try_receive().expect("poll") {
         frames.push(frame);
+        surfaced = true;
     }
-    if pump.inflight_len() >= OverlapPump::<D>::MAX_INFLIGHT {
+    if !surfaced {
         match pump.receive_timeout(Duration::from_secs(10)) {
             Ok(frame) => frames.extend(frame),
             Err(error) => panic!("completions stall: {error:?}"),
@@ -409,7 +425,10 @@ fn drain<D: OverlappedDecode>(pump: &mut OverlapPump<D>, frames: &mut Vec<Vulkan
 }
 
 /// Measured fps of one sustained overlap pass of `raws`, plus the frame count.
-fn sustained_fps<D: OverlappedDecode>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize) {
+fn sustained_fps<D>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize)
+where
+    D: SplitDecode<Frame = VulkanFrame, Error = VulkanError>,
+{
     let mut pump = OverlapPump::open(
         decoder,
         Drive::channel(raws.len() + 16, DropPolicy::DropOldest),

@@ -19,7 +19,11 @@ use rust_video::VideoCodec;
 #[cfg(have_corpus)]
 use rust_video_caps::delivery::SubmitStats;
 #[cfg(have_corpus)]
+use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
+#[cfg(have_corpus)]
 use rust_video_caps::frame::CpuFrame;
+#[cfg(have_corpus)]
+use rust_video_caps::h265;
 #[cfg(have_corpus)]
 use rust_video_caps::packet::Packet;
 #[cfg(have_corpus)]
@@ -30,7 +34,7 @@ use rust_video_caps::transcode::Route;
 use rust_video_harness::{Case, Drive, Error, FrameHash, Golden, Oracle, Suite};
 #[cfg(have_corpus)]
 use rust_video_vulkan::{
-    CodecOp, Gop, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, Transcoder,
+    CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, Transcoder,
     VulkanDevice, VulkanError, VulkanFrame,
 };
 
@@ -924,7 +928,12 @@ fn steady_h264(guard: &MutexGuard<'_, ()>) {
         paths[0].display()
     );
     let size = frames[0].identity().size();
-    let opened = H264Encoder::open(&encode_device, size.width(), size.height());
+    let opened = H264Encoder::open(
+        &encode_device,
+        size.width(),
+        size.height(),
+        legacy_config(VideoCodec::H264),
+    );
     let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &encode_device) else {
         return;
     };
@@ -992,7 +1001,12 @@ fn steady_h265(guard: &MutexGuard<'_, ()>) {
         paths[0].display()
     );
     let size = frames[0].identity().size();
-    let opened = H265Encoder::open(&encode_device, size.width(), size.height());
+    let opened = H265Encoder::open(
+        &encode_device,
+        size.width(),
+        size.height(),
+        legacy_config(VideoCodec::H265),
+    );
     let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &encode_device) else {
         return;
     };
@@ -1102,6 +1116,46 @@ fn encode_source(
 }
 
 #[cfg(have_corpus)]
+/// Legacy encode config: auto rate over the codec defaults.
+fn legacy_config(codec: VideoCodec) -> EncodeConfig {
+    match codec {
+        VideoCodec::H265 => EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile: Profile::H265(h265::EncodeProfile::Main),
+            level: Level::H265(h265::EncodeLevel::Auto),
+            ..Default::default()
+        },
+        _ => EncodeConfig {
+            rate_control: RateControl::Auto,
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(have_corpus)]
+/// Encode config with a `keyint` IDR cadence over the codec defaults.
+fn cadence_config(codec: VideoCodec, keyint: u32) -> EncodeConfig {
+    let gop = Gop {
+        keyint,
+        min_keyint: keyint,
+        b_frames: 0,
+        refs: 1,
+    };
+    match codec {
+        VideoCodec::H265 => EncodeConfig {
+            gop,
+            profile: Profile::H265(h265::EncodeProfile::Main),
+            level: Level::H265(h265::EncodeLevel::Auto),
+            ..Default::default()
+        },
+        _ => EncodeConfig {
+            gop,
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(have_corpus)]
 /// Packets coded from `frames` through `encoder`.
 fn encode_run(
     encoder: &mut impl Encoder<Error = VulkanError>,
@@ -1131,10 +1185,10 @@ fn determinism_case(
         return;
     };
     let size = frames[0].size();
-    let gop = Gop::interval(4);
+    let config = cadence_config(codec, 4);
     let (first, second) = match codec {
         VideoCodec::H264 => {
-            let opened = H264Encoder::open_with_gop(&device, size.width(), size.height(), gop);
+            let opened = H264Encoder::open(&device, size.width(), size.height(), config);
             let Some(mut first_encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
                 return;
             };
@@ -1142,7 +1196,7 @@ fn determinism_case(
                 println!("declined: {codec:?} determinism without P frames");
                 return;
             }
-            let opened = H264Encoder::open_with_gop(&device, size.width(), size.height(), gop);
+            let opened = H264Encoder::open(&device, size.width(), size.height(), config);
             let Some(mut second_encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
                 return;
             };
@@ -1163,7 +1217,7 @@ fn determinism_case(
             (first, second)
         }
         VideoCodec::H265 => {
-            let opened = H265Encoder::open_with_gop(&device, size.width(), size.height(), gop);
+            let opened = H265Encoder::open(&device, size.width(), size.height(), config);
             let Some(mut first_encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
                 return;
             };
@@ -1171,7 +1225,7 @@ fn determinism_case(
                 println!("declined: {codec:?} determinism without P frames");
                 return;
             }
-            let opened = H265Encoder::open_with_gop(&device, size.width(), size.height(), gop);
+            let opened = H265Encoder::open(&device, size.width(), size.height(), config);
             let Some(mut second_encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
                 return;
             };
@@ -1244,11 +1298,10 @@ fn roundtrip_case(
         return;
     };
     let size = frames[0].size();
-    let gop = Gop::interval(4);
+    let config = cadence_config(codec, 4);
     let packets = match codec {
         VideoCodec::H264 => {
-            let opened =
-                H264Encoder::open_with_gop(&encode_device, size.width(), size.height(), gop);
+            let opened = H264Encoder::open(&encode_device, size.width(), size.height(), config);
             let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &encode_device) else {
                 return;
             };
@@ -1266,8 +1319,7 @@ fn roundtrip_case(
             packets
         }
         VideoCodec::H265 => {
-            let opened =
-                H265Encoder::open_with_gop(&encode_device, size.width(), size.height(), gop);
+            let opened = H265Encoder::open(&encode_device, size.width(), size.height(), config);
             let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &encode_device) else {
                 return;
             };
@@ -1357,6 +1409,66 @@ fn encode_p_stream_decodes_clean() {
 }
 
 #[cfg(have_corpus)]
+/// H.264 keyframe flags over `frames`, asserting all-intra alongside.
+fn gop_marks_h264(device: &VulkanDevice, frames: &[CpuFrame]) -> Option<Vec<bool>> {
+    let size = frames[0].size();
+    let opened = H264Encoder::open(
+        device,
+        size.width(),
+        size.height(),
+        cadence_config(VideoCodec::H264, 4),
+    );
+    let mut encoder = unwrap_or_oom(opened, "encoder opens", device)?;
+    if !encoder.supports_p_frames() {
+        println!("declined: H264 GOP boundary without P frames");
+        return None;
+    }
+    let run = unwrap_or_oom(encode_run(&mut encoder, frames), "encode runs", device)?;
+    let marks: Vec<bool> = run.iter().map(Packet::is_keyframe).collect();
+    let opened = H264Encoder::open(
+        device,
+        size.width(),
+        size.height(),
+        cadence_config(VideoCodec::H264, 1),
+    );
+    let mut intra = unwrap_or_oom(opened, "encoder opens", device)?;
+    let intra_run = unwrap_or_oom(encode_run(&mut intra, &frames[..4]), "encode runs", device)?;
+    let intra_marks: Vec<bool> = intra_run.iter().map(Packet::is_keyframe).collect();
+    assert_eq!(intra_marks, vec![true; 4], "all-intra missed a keyframe");
+    Some(marks)
+}
+
+#[cfg(have_corpus)]
+/// H.265 keyframe flags over `frames`, asserting all-intra alongside.
+fn gop_marks_h265(device: &VulkanDevice, frames: &[CpuFrame]) -> Option<Vec<bool>> {
+    let size = frames[0].size();
+    let opened = H265Encoder::open(
+        device,
+        size.width(),
+        size.height(),
+        cadence_config(VideoCodec::H265, 4),
+    );
+    let mut encoder = unwrap_or_oom(opened, "encoder opens", device)?;
+    if !encoder.supports_p_frames() {
+        println!("declined: H265 GOP boundary without P frames");
+        return None;
+    }
+    let run = unwrap_or_oom(encode_run(&mut encoder, frames), "encode runs", device)?;
+    let marks: Vec<bool> = run.iter().map(Packet::is_keyframe).collect();
+    let opened = H265Encoder::open(
+        device,
+        size.width(),
+        size.height(),
+        cadence_config(VideoCodec::H265, 1),
+    );
+    let mut intra = unwrap_or_oom(opened, "encoder opens", device)?;
+    let intra_run = unwrap_or_oom(encode_run(&mut intra, &frames[..4]), "encode runs", device)?;
+    let intra_marks: Vec<bool> = intra_run.iter().map(Packet::is_keyframe).collect();
+    assert_eq!(intra_marks, vec![true; 4], "all-intra missed a keyframe");
+    Some(marks)
+}
+
+#[cfg(have_corpus)]
 /// Keyframe flags land on the IDR cadence exactly, plus all-intra mode.
 fn gop_case(codec: VideoCodec, decode_op: CodecOp, encode_op: CodecOp, guard: &MutexGuard<'_, ()>) {
     const FRAMES: usize = 10;
@@ -1366,77 +1478,13 @@ fn gop_case(codec: VideoCodec, decode_op: CodecOp, encode_op: CodecOp, guard: &M
     let Some(device) = device_or_decline(encode_op) else {
         return;
     };
-    let size = frames[0].size();
     let marks = match codec {
-        VideoCodec::H264 => {
-            let opened =
-                H264Encoder::open_with_gop(&device, size.width(), size.height(), Gop::interval(4));
-            let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
-                return;
-            };
-            if !encoder.supports_p_frames() {
-                println!("declined: {codec:?} GOP boundary without P frames");
-                return;
-            }
-            let Some(run) =
-                unwrap_or_oom(encode_run(&mut encoder, &frames), "encode runs", &device)
-            else {
-                return;
-            };
-            let marks: Vec<bool> = run.iter().map(Packet::is_keyframe).collect();
-            let opened =
-                H264Encoder::open_with_gop(&device, size.width(), size.height(), Gop::all_intra());
-            let Some(mut intra) = unwrap_or_oom(opened, "encoder opens", &device) else {
-                return;
-            };
-            let Some(intra_run) =
-                unwrap_or_oom(encode_run(&mut intra, &frames[..4]), "encode runs", &device)
-            else {
-                return;
-            };
-            let intra_marks: Vec<bool> = intra_run.iter().map(Packet::is_keyframe).collect();
-            assert_eq!(
-                intra_marks,
-                vec![true; 4],
-                "all-intra missed a keyframe in {codec:?}"
-            );
-            marks
-        }
-        VideoCodec::H265 => {
-            let opened =
-                H265Encoder::open_with_gop(&device, size.width(), size.height(), Gop::interval(4));
-            let Some(mut encoder) = unwrap_or_oom(opened, "encoder opens", &device) else {
-                return;
-            };
-            if !encoder.supports_p_frames() {
-                println!("declined: {codec:?} GOP boundary without P frames");
-                return;
-            }
-            let Some(run) =
-                unwrap_or_oom(encode_run(&mut encoder, &frames), "encode runs", &device)
-            else {
-                return;
-            };
-            let marks: Vec<bool> = run.iter().map(Packet::is_keyframe).collect();
-            let opened =
-                H265Encoder::open_with_gop(&device, size.width(), size.height(), Gop::all_intra());
-            let Some(mut intra) = unwrap_or_oom(opened, "encoder opens", &device) else {
-                return;
-            };
-            let Some(intra_run) =
-                unwrap_or_oom(encode_run(&mut intra, &frames[..4]), "encode runs", &device)
-            else {
-                return;
-            };
-            let intra_marks: Vec<bool> = intra_run.iter().map(Packet::is_keyframe).collect();
-            assert_eq!(
-                intra_marks,
-                vec![true; 4],
-                "all-intra missed a keyframe in {codec:?}"
-            );
-            marks
-        }
+        VideoCodec::H264 => gop_marks_h264(&device, &frames),
+        VideoCodec::H265 => gop_marks_h265(&device, &frames),
         _ => return,
+    };
+    let Some(marks) = marks else {
+        return;
     };
     assert_eq!(
         marks,
