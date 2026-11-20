@@ -18,7 +18,7 @@ On-device run 2026-11-20, POCO F5 Pro, rv debug test profile single 30-iter legs
 
 - rv legs run on-device (adb shell, vectors at /data/local/tmp/vectors), one 30-iteration run per leg; fps comes from the harness print, 10 of 13 legs clear the 60fps bar.
 - Gold decode: static gold binary, `-benchmark`, `-f null -`; SW decoders on 30f concats, MediaCodec decoders on 120f _ip inputs (vp8 30f).
-- Gold encode: enc-helper sibling binary on noise-30.mkv (30f 1080p yuv420p), `-g 30`, one MediaCodec encoder per codec.
+- Gold encode: enc-helper sibling binary on noise-30.mkv (30f 1080p yuv420p), `-g 30`, one MediaCodec encoder per codec. That file is not rv's bytes: rv encodes Synth noise seeds 1..=4, dumped by `dump_vectors` (`encode-mc-nv12-30f.yuv`, recipe in bench PROVENANCE). Phone re-run on the dump is pending; encode values below predate it.
 - fps divides output frames by wall both sides; gold takes the median of 3 timed runs (warmup discarded, 1s settle after warmup, 2s between runs), rv reports one run each.
 - Short phone runs vary with DVFS; medians and settles contain it, they do not remove it.
 
@@ -58,7 +58,7 @@ Both av1 legs miss 60 by distance at software speed. rv ships no vp8/vp9 encode 
 
 ## Comparability notes
 
-- Content: gold SW legs run 30f concats of the vectors rv submits 30x, identical bytes. HW legs are _ip-adjacent: gold needs multi-frame _ip (its single-frame HW flush asserts), rv submits its own vectors.
+- Content: gold SW legs run 30f concats of the vectors rv submits 30x, identical bytes. HW legs are _ip-adjacent: gold needs multi-frame _ip (its single-frame HW flush asserts), rv submits its own vectors. Encode legs are not same-bytes yet (gold noise-30.mkv vs rv Synth seeds 1..=4).
 - Shape: gold HW to null downloads frames, which matches the rv sync leg; surface legs stay one-sided.
 - Gaps: round-1 single-frame runs discarded (setup noise, HW flush-assert edge); rv has no vp8/vp9 encode legs; gold has no SW av1 decoder.
 - Cross-OS: the Windows sheet differs in build, corpus, and vectors: counting discipline only.

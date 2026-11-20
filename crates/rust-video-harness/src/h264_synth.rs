@@ -184,4 +184,12 @@ mod tests {
         assert_eq!(sized.len(), 1);
         assert_eq!(&sized[0][..5], &[0, 0, 0, 1, 0x67]);
     }
+
+    #[test]
+    fn sized_blob_matches_builder() {
+        let built = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+        let blob =
+            std::fs::read(crate::bench_dir().join("h264-1080p-synth.h264")).expect("blob readable");
+        assert_eq!(built, vec![blob]);
+    }
 }

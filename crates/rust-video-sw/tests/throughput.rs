@@ -32,7 +32,7 @@ use rust_video_caps::traits::Encoder;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_harness::Synth;
 #[cfg(feature = "ffmpeg")]
-use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets};
+use rust_video_harness::{bench_dir, AnnexB, Drive, Ivf, Packets};
 #[cfg(all(feature = "h264-openh264", nasm_available))]
 use rust_video_sw::H264Encoder;
 #[cfg(feature = "gpl")]
@@ -306,7 +306,7 @@ fn h264_decode_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws = vec![fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = decode_fps(&mut decoder, &Packets::from_raws(&raws));
     println!("sw h264 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
@@ -408,7 +408,7 @@ fn h264_surface_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws = vec![fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = surface_fps(decoder, &Packets::from_raws(&raws));
     println!("sw h264 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(

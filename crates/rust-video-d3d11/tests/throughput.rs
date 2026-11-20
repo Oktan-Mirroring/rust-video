@@ -335,7 +335,8 @@ fn noise_frames() -> (Vec<CpuFrame>, Vec<CpuFrame>) {
 /// The synth set holds a single IDR; the surface outlives its decoder
 /// by shared ownership, so any encoder MFT can import it.
 fn surface_1080p(device: &D3d11Device) -> GpuSurface {
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let mut decoder = H264Decoder::open(device);
     let mut surfaces = Vec::new();
     for raw in &raws {
@@ -388,7 +389,8 @@ fn xcode_1080p_measures_realtime() {
         .into_iter()
         .chain(H264Synth::annex_b_h264_packets_cropped())
         .collect();
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = fps(&mut transcoder, &warmup, &raws);
     println!("xcode 1080p: {measured:.1}fps over {HOPS} hops, bar {BAR:.0}fps");
     assert!(
@@ -409,7 +411,8 @@ fn decode_h264_1080p_measures_realtime() {
         }
     };
     let mut decoder = H264Decoder::open(&device);
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 h264 sync");
     println!("d3d11 h264 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
@@ -630,7 +633,8 @@ fn decode_surface_h264_1080p_measures_realtime() {
         }
     };
     let mut decoder = H264Decoder::open(&device);
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = decode_surface_fps(&mut decoder, &raws, &raws);
     println!(
         "d3d11 h264 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"

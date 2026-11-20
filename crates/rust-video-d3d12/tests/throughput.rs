@@ -15,7 +15,6 @@ use rust_video_d3d12::{
     Av1Decoder, D3d12Encoder, D3d12Error, D3d12Frame, GpuSurface, H264Decoder, HevcDecoder,
     OverlappedAv1Pump, OverlappedH264Pump, OverlappedHevcPump,
 };
-use rust_video_harness::H264Synth;
 use rust_video_harness::{bench_dir, AnnexB, Drive, Ivf, Packets, Synth};
 
 /// Hops timed after warmup.
@@ -180,7 +179,8 @@ fn xcode_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let warmup = raws.clone();
     let measured = fps(&mut transcoder, &warmup, &raws);
     println!("xcode 1080p: {measured:.1}fps over {HOPS} hops, bar {BAR:.0}fps");
@@ -309,7 +309,8 @@ fn decode_h264_1080p_measures_realtime() {
         return;
     }
     let mut decoder = H264Decoder::open(&device);
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = match decode_fps(&mut decoder, &raws, &raws) {
         Ok(fps) => fps,
         Err(error)
@@ -531,7 +532,8 @@ fn decode_h264_surface_1080p_measures_realtime() {
         return;
     }
     let mut decoder = H264Decoder::open(&device);
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = match surface_fps(
         &mut decoder,
         H264Decoder::decode_surface,

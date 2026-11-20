@@ -9,7 +9,7 @@ use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Packets, Synth};
 use rust_video_vaapi::{
     Av1Decoder, H264Decoder, H265Decoder, VaApiDevice, VaApiEncoder, VaApiError, VaApiFrame,
 };
@@ -167,7 +167,8 @@ fn h264_decode_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let packets = Packets::from_raws(&raws);
     let mut decoder = H264Decoder::open(&device);
     let measured = decode_fps(&mut decoder, &packets);
@@ -311,7 +312,8 @@ fn h264_decode_surface_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let packets = Packets::from_raws(&raws);
     let mut decoder = H264Decoder::open(&device);
     let measured = surface_fps(&mut decoder, &packets);

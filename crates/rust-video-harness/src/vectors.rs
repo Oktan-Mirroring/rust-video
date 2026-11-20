@@ -29,6 +29,7 @@ mod tests {
     #[test]
     fn bench_vectors_exist() {
         for name in [
+            "h264-1080p-synth.h264",
             "h265-1080p-nvenc.h265",
             "av1-1080p.obu",
             "vp9-1080p.ivf",

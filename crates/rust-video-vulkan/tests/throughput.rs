@@ -14,7 +14,7 @@ use rust_video_caps::encode::{EncodeConfig, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, Ivf, Packets, Synth};
 
 /// Iters timed after warmup.
 const ITERS: u32 = 30;
@@ -188,7 +188,8 @@ fn decode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = decode_fps(&mut decoder, &raws, &raws).expect("bench runs");
     println!("vulkan h264 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
@@ -267,7 +268,8 @@ fn surface_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
+    let raws =
+        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
     let measured = match decode_surface_fps(&mut decoder, &raws, &raws) {
         Ok(measured) => measured,
         Err(error) if export_gap(&error) => {
