@@ -22,7 +22,7 @@ use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::transcode::{FallbackCause, GpuCaps};
 
 /// Submitted surfaces held back across surface calls.
-const SURFACE_HOLD: usize = 1;
+const SURFACE_HOLD: usize = 2;
 
 /// VP9 decoder over a D3D11 device.
 pub struct Vp9Decoder<'a> {
@@ -50,8 +50,10 @@ pub struct Vp9Decoder<'a> {
     finished: bool,
     /// Copy worker behind launches.
     readback: Readback,
-    /// Submitted surfaces held back one packet for submit/wait overlap.
+    /// Submitted surfaces held back two packets for submit/wait overlap.
     held_surfaces: Vec<GpuSurface>,
+    /// Previous call's submitted outputs, held back alongside this call's.
+    held_outputs: usize,
 }
 
 impl Drop for Vp9Decoder<'_> {
@@ -78,6 +80,7 @@ impl<'a> Vp9Decoder<'a> {
             finished: false,
             readback: Readback::spawn(),
             held_surfaces: Vec::new(),
+            held_outputs: 0,
         }
     }
 
@@ -221,6 +224,7 @@ impl<'a> Vp9Decoder<'a> {
         self.active = None;
         self.ingest.reset_refs();
         self.held_surfaces.clear();
+        self.held_outputs = 0;
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -411,8 +415,8 @@ impl<'a> Vp9Decoder<'a> {
         for frame in &frames_in {
             self.surface_frame(frame, &mut fresh)?;
         }
-        // One packet held back: the previous call's surfaces return
-        // complete while the new submit's engine work runs. Past the
+        // Two packets held back: older calls' surfaces return
+        // complete while the new submits' engine work runs. Past the
         // hold the oldest waits, retiring driver queue under the
         // ~30-submit overrun cliff.
         self.held_surfaces.append(&mut fresh);
@@ -464,18 +468,21 @@ impl Decoder for Vp9Decoder<'_> {
     }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
-        // One packet held back: the previous call drains while the new
-        // submit's engine work runs. Siblings stay per-call pinned by
+        // Two packets held back: older calls drain while the new
+        // submits' engine work runs. Siblings stay per-call pinned by
         // surface_contract; VP9 carries no such pin.
         let mut frames = Vec::new();
         let submitted = match self.submit_packet_inner(packet) {
             Ok(queued) => queued,
             Err(error) => {
                 self.parts().abandon_queue();
+                self.held_outputs = 0;
                 return Err(error);
             }
         };
-        while self.queue.pending() > submitted {
+        let hold = submitted + self.held_outputs;
+        self.held_outputs = submitted;
+        while self.queue.pending() > hold {
             if let Err(error) = self.parts().drain_oldest() {
                 self.parts().abandon_queue();
                 self.reset_stream();
@@ -508,6 +515,7 @@ impl Decoder for Vp9Decoder<'_> {
             return Err(error);
         }
         self.parts().take_ready(&mut frames);
+        self.held_outputs = 0;
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
