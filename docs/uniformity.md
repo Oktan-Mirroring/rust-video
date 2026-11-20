@@ -58,7 +58,7 @@ Every tier ships `e2e.rs`, `uniform.rs`, `surface_contract.rs`, `overlap.rs`, `a
 | `encode/` + `decode/` folders | absent | only seven files are one-sided in both DX crates, and nesting them splits helpers from the codec folders they serve |
 | `d3d12/examples/common/hevc.rs` | keeps its name | pinned by tests through `#[path]`; tests are out of rename scope |
 | missing encode/decode examples | absent per tier | each gap matches a missing API constructor |
-| sustained legs, untimed prime | d11 all four + d12 hevc/av1 prime 4 packets untimed; d12 h264 + vk time the cold pass | steady-state cutover landed per leg (270ed46, 974b39a, 9d6db9d); primed and unprimed numbers measure different quantities |
-| sync legs, untimed prime | d12 sync legs prime 4 passes; d11/vk sync legs keep their old warmup | c04ca37 matched d12 sync warmup to surface; same steady-vs-cold split as the sustained prime |
-| sheet-only isolated grading | d11 av1 decode and livepack legs report isolated-leg pace, not full-binary | full-binary contention collapses d11 av1dec runs and discounts livepack 16-29%; sheet method, not code shape |
+| sustained legs, untimed prime | d11 all four + d12 all three prime 4 packets untimed; vk times the cold pass | steady-state cutover landed per leg (270ed46, 974b39a, 9d6db9d, 5c0eaeb); primed and unprimed numbers measure different quantities |
+| sync/surface legs, steady warmup | d11 sync/surface warm 100ms with untimed trailing flush; d12 sync primes 4 passes; vk keeps its old warmup and cold timing | steady-state cutover landed per leg (270ed46, c04ca37, e93b61d); same steady-vs-cold split as the sustained prime |
+| sheet-only isolated grading | d11 av1 decode, livepack legs, d12 h264/av1 sustained, and d12 h264/av1 sync report isolated-leg pace, not full-binary | full-binary contention collapses d11 av1 decode runs and discounts livepack 16-29%; d12 sustained/sync have no full-binary sample on the steady method yet (re-grade pending); sheet method, not code shape |
 | xcode warmup content | d12 warms on the timed content; d11 warms on alien packets | 270ed46 fixed d12's mid-bench reconfigure; d11 keeps the old warmup |
