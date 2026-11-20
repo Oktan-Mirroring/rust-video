@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandQueue, ID3D12Device, ID3D12DeviceChild, ID3D12GraphicsCommandList, ID3D12Resource,
     D3D12_BOX, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
     D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_STATE_COMMON,
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
     D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
@@ -978,7 +978,15 @@ impl DecodeSession {
         DeviceResources::write_upload(&upload, &submission.bitstream)?;
         let mut refs = self.ref_tables();
         let input = self.input_args(submission, Some(&mut refs), &upload)?;
-        let ticket = self.submit_video(&input, submission.slot)?;
+        let mut read = [0u8; 16];
+        let mut count = 0;
+        for entry in &submission.params.ref_frame_list {
+            if entry.entry != 0xFF {
+                read[count] = entry.entry & 0x7F;
+                count += 1;
+            }
+        }
+        let ticket = self.submit_video(&input, submission.slot, &read[..count])?;
         self.bitstream_busy[upload_index] = Some(ticket);
         Ok(ticket)
     }
@@ -1025,7 +1033,15 @@ impl DecodeSession {
         DeviceResources::write_upload(&upload, &submission.bitstream)?;
         let mut refs = self.ref_tables();
         let input = self.input_args(submission, Some(&mut refs), &upload)?;
-        let ticket = self.submit_video(&input, submission.slot)?;
+        let mut read = [0u8; 16];
+        let mut count = 0;
+        for entry in &submission.params.ref_pic_list {
+            if entry.entry != 0xFF {
+                read[count] = entry.entry & 0x7F;
+                count += 1;
+            }
+        }
+        let ticket = self.submit_video(&input, submission.slot, &read[..count])?;
         self.bitstream_busy[upload_index] = Some(ticket);
         Ok(ticket)
     }
@@ -1044,7 +1060,21 @@ impl DecodeSession {
         DeviceResources::write_upload(&upload, &submission.bitstream)?;
         let mut refs = self.ref_tables();
         let input = self.input_args_av1(submission, &mut refs, &upload)?;
-        let ticket = self.submit_video(&input, submission.slot)?;
+        let mut read = [0u8; 16];
+        let mut count = 0;
+        for slot in submission.params.ref_map {
+            if slot != 0xFF {
+                read[count] = slot;
+                count += 1;
+            }
+        }
+        for entry in &submission.params.frame_refs {
+            if entry.index != 0xFF && !read[..count].contains(&entry.index) {
+                read[count] = entry.index;
+                count += 1;
+            }
+        }
+        let ticket = self.submit_video(&input, submission.slot, &read[..count])?;
         self.bitstream_busy[upload_index] = Some(ticket);
         Ok(ticket)
     }
@@ -1076,10 +1106,14 @@ impl DecodeSession {
     ///
     /// Submits without waiting on other slots; only the target slot
     /// re-record waits its own prior ticket.
+    ///
+    /// Only the target plus `refs` transition; unlisted pool textures stay
+    /// in common ground, which later submits assume.
     fn submit_video(
         &mut self,
         input: &D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS,
         slot: u8,
+        refs: &[u8],
     ) -> Result<Ticket, D3d12Error> {
         let index = usize::from(slot);
         if let Some(ticket) = self.video_busy.get(index).copied().flatten() {
@@ -1106,22 +1140,33 @@ impl DecodeSession {
             ConversionArguments: D3D12_VIDEO_DECODE_CONVERSION_ARGUMENTS::default(),
         };
         debug_assert_eq!(self.outputs.len(), POOL);
-        let enter: [D3D12_RESOURCE_BARRIER; POOL] = core::array::from_fn(|index| {
-            let after = if u8::try_from(index).is_ok_and(|at| at == slot) {
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
+        let mut touched = [false; POOL];
+        touched[index] = true;
+        for reference in refs {
+            if let Some(touch) = touched.get_mut(usize::from(*reference)) {
+                *touch = true;
+            }
+        }
+        let mut enter = Vec::with_capacity(POOL);
+        let mut leave = Vec::with_capacity(POOL);
+        for (at, texture) in self.outputs.iter().enumerate() {
+            if !touched[at] {
+                continue;
+            }
+            let (before, after) = if at == index {
+                (
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+                )
             } else {
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
+                (
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+                )
             };
-            DeviceResources::barrier(&self.outputs[index], D3D12_RESOURCE_STATE_COMMON, after)
-        });
-        let leave: [D3D12_RESOURCE_BARRIER; POOL] = core::array::from_fn(|index| {
-            let before = if u8::try_from(index).is_ok_and(|at| at == slot) {
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE
-            } else {
-                D3D12_RESOURCE_STATE_VIDEO_DECODE_READ
-            };
-            DeviceResources::barrier(&self.outputs[index], before, D3D12_RESOURCE_STATE_COMMON)
-        });
+            enter.push(DeviceResources::barrier(texture, before, after));
+            leave.push(DeviceResources::barrier(texture, after, before));
+        }
         // Sound: the barriers name live textures; the list is open.
         // Sound: the argument structs outlive the fence wait below.
         unsafe {
