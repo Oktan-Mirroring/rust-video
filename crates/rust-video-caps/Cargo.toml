@@ -11,4 +11,5 @@ workspace = true
 
 [dependencies]
 bytes = "1"
+rust-video-core = { path = "../rust-video-core" }
 thiserror = "1"

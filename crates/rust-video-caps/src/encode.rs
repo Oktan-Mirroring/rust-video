@@ -15,20 +15,7 @@ use crate::h264;
 use crate::h265;
 use crate::vp9;
 
-/// Encode codec: profile and level family.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Codec {
-    /// H.264.
-    H264,
-    /// H.265.
-    H265,
-    /// AV1.
-    Av1,
-    /// VP9.
-    Vp9,
-    /// VP8.
-    Vp8,
-}
+pub use rust_video_core::Codec;
 
 /// Encode profile: per-codec profile plus the VP8 implicit profile.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -346,6 +346,7 @@ name = "rust-video-caps"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rust-video-core",
  "thiserror",
 ]
 
