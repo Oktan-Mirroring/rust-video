@@ -2,7 +2,7 @@
 
 d3d12 h265 surface beats ffmpeg NVDEC by half again (2009 vs 1290 fps); vulkan h264 sustained more than doubles it on identical bytes (3021 vs 1458). Sustained legs share gold bytes, with a downloaded pair per codec; sync and surface legs run legacy vectors against gold testsrc. Software legs are ffmpeg one-sided. Encode settings differ both sides: encode percents diagnose only.
 
-Release test profile, ITERS=30 sync legs, 120-frame IP sustained legs (d11 all four and d12 hevc/av1 prime 4 packets untimed, d12 h264 and vk time the cold pass; d12 sync legs prime 4 passes), rv median of 3 on d3d11 else mean of 2 (d11 av1 decode isolated: full-binary collapses runs and discounts clean ones), gold rebaseline medians reused (vectors unchanged), quiet box, run 2026-11-20.
+Release test profile, ITERS=30 sync legs, 120-frame IP sustained legs (d11 all four and d12 hevc/av1 prime 4 packets untimed, d12 h264 and vk time the cold pass; d12 sync legs prime 4 passes), rv median of 3 on d3d11 else mean of 2 (d11 av1 decode isolated: full-binary collapses runs and discounts clean ones), gold rebaseline medians reused (vectors unchanged; vp9 pair re-run same-day same-box), quiet box, run 2026-11-20.
 
 ## Environment
 
@@ -18,7 +18,7 @@ Release test profile, ITERS=30 sync legs, 120-frame IP sustained legs (d11 all f
 ## Method
 
 - Sync legs run `just benches-release` (release test profile, ITERS=30, committed noise-IDR/synth vectors). Sustained legs run one 120-frame IP pass per tier overlap pump, exact counts, zero drops.
-- Gold decode: ffmpeg cuvid per codec on testsrc 1080p120 IP streams, gpu-resident (`-f null`) unless noted; downloaded legs per codec (d3d11va + hwdownload + rawvideo file).
+- Gold decode: ffmpeg cuvid per codec on testsrc 1080p120 IP streams, gpu-resident (`-f null`) unless noted; downloaded legs per codec (d3d11va + hwdownload + rawvideo file). VP9 pairs same-content instead: cuvid median of 3 (194fps) on a single-pass 30-frame repeat of the bench vector (stream_loop re-inits per loop and reads ~8x slow); libvpx SW on the same bytes does 229.
 - Gold encode: ffmpeg NVENC p1 from a raw YUV file (lavfi generation starves the encoder), intra CQP qp 28 except AV1 IP g4 (all-intra refused).
 - fps divides actual output frames by wall both sides; ffmpeg parses `speed=` against the 30fps input. rv median of 3 on d3d11 else mean of 2; gold rebaseline medians reused (no vector changed since, one discarded warmup per leg then).
 - Software legs run ffmpeg 9.0 gyan on 600-frame testsrc2 1080p30 streams (decode: h264/h265 ultrafast, svtav1 preset 8, vpx crf 30) and 300-frame raw YUV input (encode at 5 Mbps nominal, vpx realtime); fps divides frames by wall, median of 5.
@@ -86,9 +86,9 @@ Surface, gpu-resident both sides:
 | d3d11 av1 surface | 1242 | 1091 | -12.2% |
 | d3d12 av1 surface | 1242 | 1330 | +7.1% |
 | vulkan av1 surface | 1242 | 1270 | +2.3% |
-| d3d11 vp9 surface, MFT software | 1080 | 262 | -75.7% |
+| d3d11 vp9 surface | 194 | 262 | +35.1% |
 
-d3d12 h264 runs easier bytes (flat synth IDR vs gold testsrc IP). d3d11 vp9 is MFT software against NVDEC silicon. Vulkan h264 spans 3660-3788 across its 2 runs; d3d11 h264 spans 3490-3657 across its 3 (median grades it).
+d3d12 h264 runs easier bytes (flat synth IDR vs gold testsrc IP). d3d11 vp9 decode is NVDEC both sides (ours via the D3D11 VP9 decoder profile); the pair runs identical bytes, software MFT applies to the VP9 encoder only. Vulkan h264 spans 3660-3788 across its 2 runs; d3d11 h264 spans 3490-3657 across its 3 (median grades it).
 
 Sustained overlap, 120-frame IP both sides:
 
@@ -114,7 +114,7 @@ Sync, rv legs with gold alongside (shapes differ; unpercented):
 | d3d11 h264 | 1458 | 2294 |
 | d3d11 h265 | 1290 | 1161 |
 | d3d11 av1 | 1242 | 904 |
-| d3d11 vp9 | 1080 | 115 |
+| d3d11 vp9 | 194 | 115 |
 | d3d12 h264 | 1458 | 2343 |
 | d3d12 h265 | 1290 | 1409 |
 | d3d12 av1 | 1242 | 1010 |
