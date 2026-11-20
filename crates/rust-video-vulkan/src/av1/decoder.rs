@@ -322,6 +322,7 @@ impl<'a> Av1Decoder<'a> {
             begin_bufs,
             ref_bufs,
             pending,
+            shown,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -329,7 +330,7 @@ impl<'a> Av1Decoder<'a> {
         };
         let body = picture.picture();
         let header = picture.header();
-        release_ids(session, picture.pre());
+        release_ids(session, shown, picture.pre());
         let setup_id = body.id().unwrap_or_else(|| scratch.next());
         let setup_slot = claim_slot(session.slots_mut(), setup_id)?;
         let extent = {
@@ -376,7 +377,7 @@ impl<'a> Av1Decoder<'a> {
         if session.meta(setup_slot).is_none() {
             begin_all.push(setup_bind);
         }
-        let submitted = match plan_submit(
+        let submitted = plan_submit(
             session,
             sink,
             body,
@@ -393,14 +394,9 @@ impl<'a> Av1Decoder<'a> {
                 emit: header.show_frame(),
             },
             gpu,
-        ) {
-            Ok(submitted) => submitted,
-            Err(error) => {
-                release_ids(session, picture.post());
-                return Err(error);
-            }
-        };
-        release_ids(session, picture.post());
+        )
+        .inspect_err(|_| release_ids(session, shown, picture.post()))?;
+        release_ids(session, shown, picture.post());
         pending.push(submitted);
         Ok(())
     }
@@ -886,8 +882,9 @@ impl SplitDecode for Av1Decoder<'_> {
     }
 }
 
-/// Release `ids` from the session DPB, clearing their metadata.
-fn release_ids(session: &mut Session, ids: &[ReferenceId]) {
+/// Release `ids` from the session DPB, clearing metadata and retained frames.
+fn release_ids(session: &mut Session, shown: &mut ShowStore, ids: &[ReferenceId]) {
+    shown.evict(ids);
     for id in ids {
         if let Some(slot) = session.slots().slot_of(*id) {
             session.set_meta(slot, None);
