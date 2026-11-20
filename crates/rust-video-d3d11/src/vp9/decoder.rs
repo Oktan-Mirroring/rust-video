@@ -21,6 +21,9 @@ use rust_video_caps::traits::Decoder;
 use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::transcode::{FallbackCause, GpuCaps};
 
+/// Submitted surfaces held back across surface calls.
+const SURFACE_HOLD: usize = 1;
+
 /// VP9 decoder over a D3D11 device.
 pub struct Vp9Decoder<'a> {
     /// Device owning the decode session.
@@ -47,6 +50,8 @@ pub struct Vp9Decoder<'a> {
     finished: bool,
     /// Copy worker behind launches.
     readback: Readback,
+    /// Submitted surfaces held back one packet for submit/wait overlap.
+    held_surfaces: Vec<GpuSurface>,
 }
 
 impl Drop for Vp9Decoder<'_> {
@@ -72,6 +77,7 @@ impl<'a> Vp9Decoder<'a> {
             timings: Vec::new(),
             finished: false,
             readback: Readback::spawn(),
+            held_surfaces: Vec::new(),
         }
     }
 
@@ -115,7 +121,9 @@ impl<'a> Vp9Decoder<'a> {
     }
 
     /// Frames of `packet` submitted, without waiting on completion.
-    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `packet`.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<usize, D3d11Error> {
         let frames_in = match self.ingest.ingest_packet(packet.data()) {
             Ok(frames) => frames,
             Err(error) => {
@@ -124,14 +132,17 @@ impl<'a> Vp9Decoder<'a> {
                 return Err(error);
             }
         };
+        let mut queued = 0;
         for frame in &frames_in {
-            self.submit_frame_split(frame)?;
+            queued += self.submit_frame_split(frame)?;
         }
-        Ok(())
+        Ok(queued)
     }
 
     /// Decode `frame`, queueing its outputs for completion reads.
-    fn submit_frame_split(&mut self, frame: &crate::vp9::Frame) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `frame`.
+    fn submit_frame_split(&mut self, frame: &crate::vp9::Frame) -> Result<usize, D3d11Error> {
         let active = self.frame_active(frame)?;
         let live = self.active;
         if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
@@ -166,7 +177,7 @@ impl<'a> Vp9Decoder<'a> {
             self.queue
                 .push(output.slot(), active, submit_start, submit_end);
         }
-        Ok(())
+        Ok(decoded.outputs.len())
     }
 
     /// `decoded` submitted plus its outputs copied, in VP9 order.
@@ -199,6 +210,7 @@ impl<'a> Vp9Decoder<'a> {
         self.shared = None;
         self.active = None;
         self.ingest.reset_refs();
+        self.held_surfaces.clear();
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -312,7 +324,7 @@ impl<'a> Vp9Decoder<'a> {
             if let Some(submission) = decoded.submission.as_ref() {
                 if let Err(error) = session.submit_vp9(submission) {
                     failed = Some(error);
-                } else if let Err(error) = session.copy_slot(submission.slot) {
+                } else if let Err(error) = session.copy_slot_light(submission.slot) {
                     failed = Some(error);
                 }
             }
@@ -385,9 +397,20 @@ impl<'a> Vp9Decoder<'a> {
                 return Err(error);
             }
         };
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         for frame in &frames_in {
-            self.surface_frame(frame, &mut surfaces)?;
+            self.surface_frame(frame, &mut fresh)?;
+        }
+        // One packet held back: the previous call's surfaces return
+        // complete while the new submit's engine work runs. Past the
+        // hold the oldest waits, retiring driver queue under the
+        // ~30-submit overrun cliff.
+        self.held_surfaces.append(&mut fresh);
+        let mut surfaces = Vec::new();
+        while self.held_surfaces.len() > SURFACE_HOLD {
+            let oldest = self.held_surfaces.remove(0);
+            oldest.try_wait()?;
+            surfaces.push(oldest);
         }
         Ok(surfaces)
     }
@@ -398,7 +421,7 @@ impl<'a> Vp9Decoder<'a> {
     ///
     /// Returns [`D3d11Error`] when the trailing frame fails to convert.
     pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         let trailing = match self.ingest.finish() {
             Ok(trailing) => trailing,
             Err(error) => {
@@ -407,12 +430,13 @@ impl<'a> Vp9Decoder<'a> {
             }
         };
         if let Some(frame) = trailing {
-            self.surface_frame(&frame, &mut surfaces)?;
+            self.surface_frame(&frame, &mut fresh)?;
         }
         if let Some(active) = self.active {
-            self.drain_live_surface(&active, &mut surfaces)?;
+            self.drain_live_surface(&active, &mut fresh)?;
         }
-        Ok(surfaces)
+        self.held_surfaces.append(&mut fresh);
+        Ok(std::mem::take(&mut self.held_surfaces))
     }
 }
 
@@ -430,15 +454,23 @@ impl Decoder for Vp9Decoder<'_> {
     }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        // One packet held back: the previous call drains while the new
+        // submit's engine work runs. Siblings stay per-call pinned by
+        // surface_contract; VP9 carries no such pin.
         let mut frames = Vec::new();
-        if let Err(error) = self.submit_packet_inner(packet) {
-            self.queue.clear();
-            return Err(error);
-        }
-        if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
-            self.reset_stream();
-            return Err(error);
+        let submitted = match self.submit_packet_inner(packet) {
+            Ok(queued) => queued,
+            Err(error) => {
+                self.queue.clear();
+                return Err(error);
+            }
+        };
+        while self.queue.pending() > submitted {
+            if let Err(error) = self.parts().drain_oldest() {
+                self.queue.clear();
+                self.reset_stream();
+                return Err(error);
+            }
         }
         self.parts().take_ready(&mut frames);
         Ok(frames)
