@@ -633,7 +633,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         prepared: Prepared<F::Submission>,
     ) -> Result<(), D3d12Error> {
         let Some((submission, slot)) = prepared.submission else {
-            return self.submit_synced(active, &prepared.outputs);
+            return self.submit_display(active, &prepared.outputs);
         };
         // Boxed before submit: the recorded pointers name stable heap addresses.
         let misc_started = Instant::now();
@@ -679,9 +679,56 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         Ok(())
     }
 
+    /// Display-only `outputs` behind the in-flight pipe, in arrival order.
+    ///
+    /// Outputs attach to the tail picture with downloads queued after the
+    /// latest in-flight video on their slot; settled slots download at once.
+    /// The pipe keeps flowing: later pictures keep the engine fed.
+    fn submit_display(&mut self, active: Active, outputs: &[Output]) -> Result<(), D3d12Error> {
+        if self.pictures.is_empty() {
+            return self.submit_settled(active, outputs);
+        }
+        let downloads_started = Instant::now();
+        let mut queued = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let slot = output.slot();
+            let video = self.latest_video_on(slot);
+            let copy_submit = Instant::now();
+            let Some(session) = self.session.as_mut() else {
+                return Err(D3d12Error::NoSession);
+            };
+            let copy = match video {
+                Some(ticket) => session.start_download_after(slot, ticket)?,
+                None => session.start_download(slot)?,
+            };
+            queued.push((slot, copy, copy_submit));
+        }
+        self.downloads_cpu += downloads_started.elapsed();
+        let Some(tail) = self.pictures.back_mut() else {
+            return Err(D3d12Error::NoSession);
+        };
+        for (slot, copy, copy_submit) in queued {
+            let generation = self.generation;
+            self.generation = self.generation.wrapping_add(1);
+            tail.outputs.push_back(PendingOutput {
+                pin: self.pins.pin(slot),
+                copy,
+                copy_submit,
+                active,
+                generation,
+                video_submit: copy_submit,
+                submit_cpu: Duration::ZERO,
+                launched: false,
+            });
+        }
+        Ok(())
+    }
+
     /// Display-only `outputs` over settled slots into the ready queue.
-    fn submit_synced(&mut self, active: Active, outputs: &[Output]) -> Result<(), D3d12Error> {
-        self.drain_pipeline()?;
+    ///
+    /// Runs only with no picture in flight; the busy pipe routes through
+    /// tail-attached downloads instead.
+    fn submit_settled(&mut self, active: Active, outputs: &[Output]) -> Result<(), D3d12Error> {
         let Some(session) = self.session.as_mut() else {
             return Err(D3d12Error::NoSession);
         };
@@ -699,6 +746,15 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
                 .push_back(emit_frame(&self.shared, nv12, export, &active, generation)?);
         }
         Ok(())
+    }
+
+    /// Latest in-flight video ticket decoding into `slot`, if any.
+    fn latest_video_on(&self, slot: u8) -> Option<Ticket> {
+        self.pictures
+            .iter()
+            .filter(|picture| picture.pin.slot() == slot)
+            .map(|picture| picture.video)
+            .next_back()
     }
 
     /// In-flight tickets behind `slot` completion.
