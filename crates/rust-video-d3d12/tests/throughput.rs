@@ -674,10 +674,80 @@ fn sustained_h264_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut pump = OverlappedH264Pump::open(&device, OverlappedH264Pump::MAX_INFLIGHT);
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    prime(&mut pump, &Packets::from_raws(&raws));
+    let mut drain_us = 0u64;
+    let mut drains = 0u64;
+    let (measured, count) =
+        Drive::sustained(&mut pump, &Packets::from_raws(&raws), |pump, frames| {
+            let started = std::time::Instant::now();
+            drain(pump, frames);
+            drain_us += micros(started.elapsed());
+            drains += 1;
+        });
     let depth = pump.max_depth();
+    assert!(
+        count >= raws.len(),
+        "every packet yields its frames: {count} over {}",
+        raws.len()
+    );
+    assert!(
+        count <= raws.len() + 2 * WARMUP_PASSES,
+        "leftovers within prime work: {count} over {}",
+        raws.len()
+    );
+    let wall = f64::from(u32::try_from(count).expect("frame count fits")) / measured;
+    let measured = f64::from(u32::try_from(raws.len()).expect("packet count fits")) / wall;
+    let timings = pump.timings();
+    let latencies: Vec<u64> = timings.iter().map(PhaseTiming::latency_us).collect();
+    let (quiesce_waits, quiesce_time) = pump.quiesce_stats();
     println!("d3d12 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_H264_BAR:.0}fps");
-    assert_eq!(count, raws.len(), "every picture yields its frame");
+    print_median(
+        "d3d12 h264 sustained worker copy",
+        "frames",
+        pump.copy_times(),
+    );
+    print_phase_medians("d3d12 h264 sustained", "frames", timings);
+    println!(
+        "d3d12 h264 sustained quiesce: {quiesce_waits} waits {}us, latency mean {}us max {}us",
+        micros(quiesce_time),
+        mean(&latencies),
+        latencies.iter().max().copied().unwrap_or(0)
+    );
+    let (send_cpu, land_cpu, drain_time) = pump.cpu_totals();
+    let (ingest_cpu, pictures_cpu, harvest_cpu, downloads_cpu) = pump.send_split();
+    let (sequence_cpu, prepare_cpu, track_video_cpu, track_misc_cpu) = pump.front_split();
+    println!(
+        "d3d12 h264 sustained thread: send {}us (ingest {} pictures {} harvest {} downloads {} sequence {} prepare {} trackvideo {} trackmisc {}) land {}us drain {}us over {count} frames",
+        micros(send_cpu),
+        micros(ingest_cpu),
+        micros(pictures_cpu),
+        micros(harvest_cpu),
+        micros(downloads_cpu),
+        micros(sequence_cpu),
+        micros(prepare_cpu),
+        micros(track_video_cpu),
+        micros(track_misc_cpu),
+        micros(land_cpu),
+        micros(drain_time)
+    );
+    print_median(
+        "d3d12 h264 sustained engine gaps",
+        "signals",
+        pump.engine_gaps(),
+    );
+    print_median(
+        "d3d12 h264 sustained copy gaps",
+        "signals",
+        pump.copy_gaps(),
+    );
+    let (bound_hits, picture_count) = pump.drive_stats();
+    println!(
+        "d3d12 h264 sustained drive: {bound_hits} bound hits, {picture_count} pictures, {drains} drains {drain_us}us"
+    );
+    assert!(
+        measured >= SUSTAINED_H264_BAR,
+        "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
+    );
     assert!(
         measured >= SUSTAINED_H264_BAR,
         "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
