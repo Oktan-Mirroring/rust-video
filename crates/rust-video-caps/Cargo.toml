@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 bytes = "1"
+thiserror = "1"

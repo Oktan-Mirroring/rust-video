@@ -234,6 +234,21 @@ impl Profile {
         }
     }
 
+    /// Resolve idc 0-2; 3-7 are reserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `idc` - profile idc value.
+    #[must_use]
+    pub fn from_idc(idc: u8) -> Option<Self> {
+        match idc {
+            0 => Some(Self::Main),
+            1 => Some(Self::High),
+            2 => Some(Self::Professional),
+            _ => None,
+        }
+    }
+
     /// Decoder capability matrix (S6.4.1, Annex A.2).
     #[must_use]
     pub fn allows(self, depth_bits: u8, chroma: ChromaSampling, mono: bool) -> bool {
@@ -261,6 +276,25 @@ impl Profile {
     #[must_use]
     pub fn decodes(self, stream: Self) -> bool {
         self.idc() >= stream.idc()
+    }
+
+    /// Allowed chroma sampling at any depth (S6.4.1, Annex A.2).
+    #[must_use]
+    pub fn allows_chroma(self, chroma: ChromaSampling) -> bool {
+        match self {
+            Self::Main => matches!(chroma, ChromaSampling::Mono | ChromaSampling::Yuv420),
+            Self::High => chroma == ChromaSampling::Yuv444,
+            Self::Professional => true,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        match self {
+            Self::Main | Self::High => 10,
+            Self::Professional => 12,
+        }
     }
 }
 
@@ -473,10 +507,7 @@ impl EncodeProfile {
     /// Maximum bit depth.
     #[must_use]
     pub fn max_bit_depth(self) -> u8 {
-        match self {
-            Self::Main | Self::High => 10,
-            Self::Professional => 12,
-        }
+        self.profile().max_bit_depth()
     }
 
     /// Depth and chroma allowed together.
@@ -617,5 +648,25 @@ mod tests {
         assert!(ObuKind::classify(0).is_err());
         assert!(ObuKind::classify(9).is_err());
         assert_eq!(FrameType::classify(3), Some(FrameType::Switch));
+    }
+
+    #[test]
+    fn profile_idc_roundtrip() {
+        use super::Profile;
+        assert_eq!(Profile::from_idc(0), Some(Profile::Main));
+        assert_eq!(Profile::from_idc(2), Some(Profile::Professional));
+        assert_eq!(Profile::from_idc(3), None);
+    }
+
+    #[test]
+    fn profile_chroma_and_depth() {
+        use super::Profile;
+        use crate::common::ChromaSampling;
+        assert!(Profile::Main.allows_chroma(ChromaSampling::Yuv420));
+        assert!(!Profile::High.allows_chroma(ChromaSampling::Yuv420));
+        assert!(Profile::Professional.allows_chroma(ChromaSampling::Yuv422));
+        assert_eq!(Profile::Professional.max_bit_depth(), 12);
+        assert_eq!(Profile::High.max_bit_depth(), 10);
+        assert_eq!(super::EncodeProfile::Professional.max_bit_depth(), 12);
     }
 }

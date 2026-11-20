@@ -101,6 +101,62 @@ pub trait SendPackets {
     fn finish(&mut self) -> Result<(), Self::Error>;
 }
 
+/// Submit/poll decode behind one split-phase engine.
+pub trait SplitDecode {
+    /// Decoded frame type.
+    type Frame;
+    /// Submit, poll, or flush failure.
+    type Error: std::error::Error;
+
+    /// `packet` queued without waiting for its pictures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend rejects `packet`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// False when inflight work saturates the depth; the packet stays
+    /// unconsumed, poll then resend.
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, Self::Error>;
+
+    /// Pictures completed since the last poll, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its completed frames.
+    fn poll(&mut self) -> Result<Vec<Self::Frame>, Self::Error>;
+
+    /// Pictures completed within `timeout`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its completed frames.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - wait budget when nothing completed.
+    ///
+    /// # Returns
+    ///
+    /// Empty when the budget lapses with nothing completed.
+    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<Self::Frame>, Self::Error>;
+
+    /// Trailing pictures, then end of stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its trailing frames.
+    fn flush_split(&mut self) -> Result<Vec<Self::Frame>, Self::Error>;
+
+    /// Submit gauges since backend open.
+    fn stats(&self) -> SubmitStats;
+}
+
 /// Full-queue behavior behind a bounded channel.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DropPolicy {
@@ -450,6 +506,7 @@ impl<F> FrameChannel<F> {
     }
 }
 
+// Not core::CopyPump (threaded memcpy) nor an overlap pump (multi-inflight submit/collect).
 /// Split-phase decode over a sync decoder plus a bounded channel.
 ///
 /// `try_send` decodes now and queues output through the bound plus policy;
@@ -1224,5 +1281,37 @@ mod tests {
             SubmitStats::snapshot(3, 2, 1, 7),
             "folds match the snapshot"
         );
+    }
+
+    #[test]
+    fn split_decode_shape_compiles() {
+        use super::{SplitDecode, SubmitStats};
+        use crate::frame::CpuFrame;
+        use crate::packet::Packet;
+        struct Dummy;
+        impl SplitDecode for Dummy {
+            type Frame = CpuFrame;
+            type Error = std::io::Error;
+            fn try_submit(&mut self, _packet: &Packet) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+            fn poll(&mut self) -> Result<Vec<CpuFrame>, Self::Error> {
+                Ok(Vec::new())
+            }
+            fn poll_wait(
+                &mut self,
+                _timeout: std::time::Duration,
+            ) -> Result<Vec<CpuFrame>, Self::Error> {
+                Ok(Vec::new())
+            }
+            fn flush_split(&mut self) -> Result<Vec<CpuFrame>, Self::Error> {
+                Ok(Vec::new())
+            }
+            fn stats(&self) -> SubmitStats {
+                SubmitStats::new()
+            }
+        }
+        fn assert_split_decode<T: SplitDecode>() {}
+        assert_split_decode::<Dummy>();
     }
 }

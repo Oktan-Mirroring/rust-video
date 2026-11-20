@@ -15,7 +15,10 @@ pub mod h264;
 pub mod h265;
 pub mod hw;
 pub mod packet;
+pub mod reason;
 pub mod traits;
 pub mod transcode;
 pub mod vp8;
 pub mod vp9;
+
+pub use reason::{BrokenReferenceReason, ParseReason, UnsupportedReason};

@@ -69,6 +69,38 @@ impl Level {
         LevelCaps { idc: 51, mbps: 983_040, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
         LevelCaps { idc: 52, mbps: 2_073_600, fs_mb: 36_864, dpb_mb: 184_320, br_kbps: 240_000, cpb_kbits: 240_000, min_cr: 2, mvs: Some(16) },
     ];
+    /// Resolve `level_idc` to a level (A.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReservedLevel` for undefined values.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` - signalled level idc; 9 is High-profile 1b, 11 is 1.1.
+    pub fn from_idx(idx: u8) -> Result<Self, Violation> {
+        match idx {
+            9 => Ok(Self::L1b),
+            10 => Ok(Self::L1),
+            11 => Ok(Self::L11),
+            12 => Ok(Self::L12),
+            13 => Ok(Self::L13),
+            20 => Ok(Self::L2),
+            21 => Ok(Self::L21),
+            22 => Ok(Self::L22),
+            30 => Ok(Self::L3),
+            31 => Ok(Self::L31),
+            32 => Ok(Self::L32),
+            40 => Ok(Self::L4),
+            41 => Ok(Self::L41),
+            42 => Ok(Self::L42),
+            50 => Ok(Self::L5),
+            51 => Ok(Self::L51),
+            52 => Ok(Self::L52),
+            reserved => Err(Violation::ReservedLevel(reserved)),
+        }
+    }
+
     /// `level_idc`; 1b reports 11, the base signalling (A.3).
     #[must_use]
     pub fn idc(self) -> u8 {
@@ -92,27 +124,27 @@ impl Level {
         }
     }
 
-    /// Level caps row (Table A-1).
+    /// Level caps row (Table A-1); every level carries one.
     #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
+    pub fn caps(self) -> Option<&'static LevelCaps> {
         match self {
-            Self::L1 => &Self::CAPS[0],
-            Self::L1b => &Self::CAPS[1],
-            Self::L11 => &Self::CAPS[2],
-            Self::L12 => &Self::CAPS[3],
-            Self::L13 => &Self::CAPS[4],
-            Self::L2 => &Self::CAPS[5],
-            Self::L21 => &Self::CAPS[6],
-            Self::L22 => &Self::CAPS[7],
-            Self::L3 => &Self::CAPS[8],
-            Self::L31 => &Self::CAPS[9],
-            Self::L32 => &Self::CAPS[10],
-            Self::L4 => &Self::CAPS[11],
-            Self::L41 => &Self::CAPS[12],
-            Self::L42 => &Self::CAPS[13],
-            Self::L5 => &Self::CAPS[14],
-            Self::L51 => &Self::CAPS[15],
-            Self::L52 => &Self::CAPS[16],
+            Self::L1 => Some(&Self::CAPS[0]),
+            Self::L1b => Some(&Self::CAPS[1]),
+            Self::L11 => Some(&Self::CAPS[2]),
+            Self::L12 => Some(&Self::CAPS[3]),
+            Self::L13 => Some(&Self::CAPS[4]),
+            Self::L2 => Some(&Self::CAPS[5]),
+            Self::L21 => Some(&Self::CAPS[6]),
+            Self::L22 => Some(&Self::CAPS[7]),
+            Self::L3 => Some(&Self::CAPS[8]),
+            Self::L31 => Some(&Self::CAPS[9]),
+            Self::L32 => Some(&Self::CAPS[10]),
+            Self::L4 => Some(&Self::CAPS[11]),
+            Self::L41 => Some(&Self::CAPS[12]),
+            Self::L42 => Some(&Self::CAPS[13]),
+            Self::L5 => Some(&Self::CAPS[14]),
+            Self::L51 => Some(&Self::CAPS[15]),
+            Self::L52 => Some(&Self::CAPS[16]),
         }
     }
 }
@@ -406,7 +438,9 @@ impl Validate for Params {
                 max: max_depth,
             });
         }
-        let caps = self.level.caps();
+        let Some(caps) = self.level.caps() else {
+            return Ok(());
+        };
         let max_samples = u64::from(caps.fs_mb) * 256;
         let samples = self.size.samples();
         if samples > max_samples {
@@ -553,7 +587,7 @@ mod tests {
 
     #[test]
     fn level_41_caps_anchor() {
-        let caps = Level::L41.caps();
+        let caps = Level::L41.caps().expect("caps");
         assert_eq!(caps.idc, 41);
         assert_eq!(caps.mbps, 245_760);
         assert_eq!(caps.fs_mb, 8192);
@@ -562,7 +596,7 @@ mod tests {
 
     #[test]
     fn level_52_caps_anchor() {
-        let caps = Level::L52.caps();
+        let caps = Level::L52.caps().expect("caps");
         assert_eq!(caps.mbps, 2_073_600);
         assert_eq!(caps.fs_mb, 36_864);
     }
@@ -636,5 +670,35 @@ mod tests {
         assert_eq!(slice_rate(Level::L4), Some(60));
         assert_eq!(slice_rate(Level::L41), Some(24));
         assert_eq!(slice_rate(Level::L2), None);
+    }
+
+    #[test]
+    fn level_idx_roundtrip() {
+        use super::Level;
+        assert_eq!(Level::from_idx(9).unwrap(), Level::L1b);
+        assert_eq!(Level::from_idx(11).unwrap(), Level::L11);
+        assert_eq!(Level::from_idx(52).unwrap(), Level::L52);
+        assert!(Level::from_idx(14).is_err());
+        for level in [
+            Level::L1,
+            Level::L1b,
+            Level::L11,
+            Level::L12,
+            Level::L13,
+            Level::L2,
+            Level::L21,
+            Level::L22,
+            Level::L3,
+            Level::L31,
+            Level::L32,
+            Level::L4,
+            Level::L41,
+            Level::L42,
+            Level::L5,
+            Level::L51,
+            Level::L52,
+        ] {
+            assert!(level.caps().is_some());
+        }
     }
 }

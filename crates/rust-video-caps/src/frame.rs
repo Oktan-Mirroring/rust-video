@@ -8,6 +8,33 @@ use crate::common::PictureSize;
 
 use bytes::{Bytes, BytesMut};
 
+/// Surface contract: geometry, provenance, and ticket.
+pub trait Surface {
+    /// Visible picture dimensions in luma samples.
+    #[must_use]
+    fn size(&self) -> PictureSize;
+
+    /// Pixel layout.
+    #[must_use]
+    fn format(&self) -> PixelFormat;
+
+    /// Array layer of this picture.
+    #[must_use]
+    fn slice(&self) -> u32;
+
+    /// Full texture extent.
+    #[must_use]
+    fn coded(&self) -> PictureSize;
+
+    /// Crop left/top in luma samples.
+    #[must_use]
+    fn origin(&self) -> (u32, u32);
+
+    /// Native ticket for cross-backend import.
+    #[must_use]
+    fn export(&self) -> GpuExport;
+}
+
 /// CPU readback failure.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -157,6 +184,32 @@ impl CpuFrame {
     #[must_use]
     pub fn planes(&self) -> &[Plane] {
         &self.planes
+    }
+}
+
+impl Surface for CpuFrame {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        0
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    fn export(&self) -> GpuExport {
+        GpuExport::Opaque { name: "sw" }
     }
 }
 
@@ -598,5 +651,22 @@ mod tests {
         assert_eq!(format, PixelFormat::Nv12);
         assert_eq!(planes[0].offset(), 0);
         assert_eq!(planes[1].offset(), 1024);
+    }
+
+    #[test]
+    fn surface_on_cpu_frame() {
+        use super::{CpuFrame, GpuExport, PixelFormat, Surface};
+        use crate::common::PictureSize;
+        let size = PictureSize::new(4, 2).unwrap();
+        let frame = CpuFrame::from_nv12(size, &bytes::Bytes::from(vec![0u8; 12])).unwrap();
+        assert_eq!(Surface::size(&frame), size);
+        assert_eq!(Surface::format(&frame), PixelFormat::Nv12);
+        assert_eq!(Surface::slice(&frame), 0);
+        assert_eq!(Surface::coded(&frame), size);
+        assert_eq!(Surface::origin(&frame), (0, 0));
+        assert!(matches!(
+            Surface::export(&frame),
+            GpuExport::Opaque { name: "sw" }
+        ));
     }
 }

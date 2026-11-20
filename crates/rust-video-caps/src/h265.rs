@@ -77,6 +77,38 @@ impl Level {
         LevelCaps { idc: 213, ps: 142_606_336, cpb_m: 480_000, cpb_h: Some(3_200_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 8_556_380_160, br_m: 480_000, br_h: Some(3_200_000), cr_m: 6, cr_h: 4 },
         LevelCaps { idc: 216, ps: 142_606_336, cpb_m: 960_000, cpb_h: Some(6_400_000), slices: 1800, tiles_x: 44, tiles_y: 40, sr: 17_112_760_320, br_m: 960_000, br_h: Some(6_400_000), cr_m: 6, cr_h: 4 },
     ];
+    /// Resolve `level_idc`, 30x the level (A.4.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReservedLevel` for undefined values.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` - signalled level idc.
+    pub fn from_idx(idx: u8) -> Result<Self, Violation> {
+        match idx {
+            30 => Ok(Self::L1),
+            60 => Ok(Self::L2),
+            63 => Ok(Self::L21),
+            90 => Ok(Self::L3),
+            93 => Ok(Self::L31),
+            120 => Ok(Self::L4),
+            123 => Ok(Self::L41),
+            150 => Ok(Self::L5),
+            153 => Ok(Self::L51),
+            156 => Ok(Self::L52),
+            180 => Ok(Self::L6),
+            183 => Ok(Self::L61),
+            186 => Ok(Self::L62),
+            189 => Ok(Self::L63),
+            210 => Ok(Self::L7),
+            213 => Ok(Self::L71),
+            216 => Ok(Self::L72),
+            reserved => Err(Violation::ReservedLevel(reserved)),
+        }
+    }
+
     /// `level_idc`, 30x the level (A.4.1).
     #[must_use]
     pub fn idc(self) -> u16 {
@@ -116,27 +148,27 @@ impl Level {
         }
     }
 
-    /// Level caps row (Tables A.8, A.9).
+    /// Level caps row (Tables A.8, A.9); every level carries one.
     #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
+    pub fn caps(self) -> Option<&'static LevelCaps> {
         match self {
-            Self::L1 => &Self::CAPS[0],
-            Self::L2 => &Self::CAPS[1],
-            Self::L21 => &Self::CAPS[2],
-            Self::L3 => &Self::CAPS[3],
-            Self::L31 => &Self::CAPS[4],
-            Self::L4 => &Self::CAPS[5],
-            Self::L41 => &Self::CAPS[6],
-            Self::L5 => &Self::CAPS[7],
-            Self::L51 => &Self::CAPS[8],
-            Self::L52 => &Self::CAPS[9],
-            Self::L6 => &Self::CAPS[10],
-            Self::L61 => &Self::CAPS[11],
-            Self::L62 => &Self::CAPS[12],
-            Self::L63 => &Self::CAPS[13],
-            Self::L7 => &Self::CAPS[14],
-            Self::L71 => &Self::CAPS[15],
-            Self::L72 => &Self::CAPS[16],
+            Self::L1 => Some(&Self::CAPS[0]),
+            Self::L2 => Some(&Self::CAPS[1]),
+            Self::L21 => Some(&Self::CAPS[2]),
+            Self::L3 => Some(&Self::CAPS[3]),
+            Self::L31 => Some(&Self::CAPS[4]),
+            Self::L4 => Some(&Self::CAPS[5]),
+            Self::L41 => Some(&Self::CAPS[6]),
+            Self::L5 => Some(&Self::CAPS[7]),
+            Self::L51 => Some(&Self::CAPS[8]),
+            Self::L52 => Some(&Self::CAPS[9]),
+            Self::L6 => Some(&Self::CAPS[10]),
+            Self::L61 => Some(&Self::CAPS[11]),
+            Self::L62 => Some(&Self::CAPS[12]),
+            Self::L63 => Some(&Self::CAPS[13]),
+            Self::L7 => Some(&Self::CAPS[14]),
+            Self::L71 => Some(&Self::CAPS[15]),
+            Self::L72 => Some(&Self::CAPS[16]),
         }
     }
 }
@@ -223,6 +255,26 @@ impl Profile {
             Self::HighThroughputScreenContent => Some(11),
             Self::ThreeDMain => Some(8),
             Self::ScalableMain | Self::ScalableMain10 | Self::MultiviewMain => None,
+        }
+    }
+
+    /// Resolve `general_profile_idc`; scalable and multiview profiles carry none.
+    ///
+    /// # Arguments
+    ///
+    /// * `idc` - profile idc value.
+    #[must_use]
+    pub fn from_idc(idc: u8) -> Option<Self> {
+        match idc {
+            1 => Some(Self::Main),
+            2 => Some(Self::Main10),
+            3 => Some(Self::MainStillPicture),
+            4 => Some(Self::RangeExtensions),
+            5 => Some(Self::HighThroughput),
+            8 => Some(Self::ThreeDMain),
+            9 => Some(Self::ScreenContent),
+            11 => Some(Self::HighThroughputScreenContent),
+            _ => None,
         }
     }
 
@@ -341,7 +393,11 @@ impl Params {
     /// `MaxDpbSize` for the picture (A.4.2, A-2).
     #[must_use]
     pub fn max_dpb_frames(&self) -> u32 {
-        let max_ps = u64::from(self.level.caps().ps);
+        // every level carries caps; 16 is the unconstrained ceiling
+        let Some(caps) = self.level.caps() else {
+            return 16;
+        };
+        let max_ps = u64::from(caps.ps);
         let samples = self.size.samples();
         let ratio_x4 = samples.saturating_mul(4);
         let base: u32 = if self.curr_pic_ref { 7 } else { 6 };
@@ -377,7 +433,9 @@ impl Validate for Params {
         if self.tier == Tier::High && !self.level.allows_high_tier() {
             return Err(Violation::TierRequired);
         }
-        let caps = self.level.caps();
+        let Some(caps) = self.level.caps() else {
+            return Ok(());
+        };
         let samples = self.size.samples();
         let max_samples = u64::from(caps.ps);
         if samples > max_samples {
@@ -505,7 +563,7 @@ mod tests {
 
     #[test]
     fn level_41_caps_anchor() {
-        let caps = Level::L41.caps();
+        let caps = Level::L41.caps().expect("caps");
         assert_eq!(caps.idc, 123);
         assert_eq!(caps.ps, 2_228_224);
         assert_eq!(caps.sr, 133_693_440);
@@ -514,7 +572,7 @@ mod tests {
 
     #[test]
     fn level_62_caps_anchor() {
-        let caps = Level::L62.caps();
+        let caps = Level::L62.caps().expect("caps");
         assert_eq!(caps.sr, 4_278_190_080);
         assert_eq!(caps.br_h, Some(800_000));
     }
@@ -553,5 +611,45 @@ mod tests {
         assert_eq!(NalClass::classify(64), None);
         assert!(!NalClass::allows_leading(20));
         assert!(NalClass::allows_leading(21));
+    }
+
+    #[test]
+    fn profile_idc_roundtrip() {
+        use super::Profile;
+        assert_eq!(Profile::from_idc(9), Some(Profile::ScreenContent));
+        assert_eq!(Profile::from_idc(6), None);
+        assert_eq!(
+            Profile::from_idc(11),
+            Some(Profile::HighThroughputScreenContent)
+        );
+    }
+
+    #[test]
+    fn level_idx_roundtrip() {
+        use super::Level;
+        assert_eq!(Level::from_idx(30).unwrap(), Level::L1);
+        assert_eq!(Level::from_idx(216).unwrap(), Level::L72);
+        assert!(Level::from_idx(31).is_err());
+        for level in [
+            Level::L1,
+            Level::L2,
+            Level::L21,
+            Level::L3,
+            Level::L31,
+            Level::L4,
+            Level::L41,
+            Level::L5,
+            Level::L51,
+            Level::L52,
+            Level::L6,
+            Level::L61,
+            Level::L62,
+            Level::L63,
+            Level::L7,
+            Level::L71,
+            Level::L72,
+        ] {
+            assert!(level.caps().is_some());
+        }
     }
 }

@@ -69,24 +69,53 @@ impl Level {
         LevelCaps { sr: 2_353_004_544, pic: 35_651_584, br: 240_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
         LevelCaps { sr: 4_706_009_088, pic: 35_651_584, br: 480_000, cpb: None, min_cr: 8, tiles: 16, alt_ref: 10, refs: 4, dim: 16_832 },
     ];
-    /// Level caps row (levels page).
+    /// Resolve 0-based level ordinal; 14 and up are undefined.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReservedLevel` for undefined ordinals.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` - 0-based level ordinal in table order.
+    pub fn from_idx(idx: u8) -> Result<Self, Violation> {
+        match idx {
+            0 => Ok(Self::L1),
+            1 => Ok(Self::L11),
+            2 => Ok(Self::L2),
+            3 => Ok(Self::L21),
+            4 => Ok(Self::L3),
+            5 => Ok(Self::L31),
+            6 => Ok(Self::L4),
+            7 => Ok(Self::L41),
+            8 => Ok(Self::L5),
+            9 => Ok(Self::L51),
+            10 => Ok(Self::L52),
+            11 => Ok(Self::L6),
+            12 => Ok(Self::L61),
+            13 => Ok(Self::L62),
+            reserved => Err(Violation::ReservedLevel(reserved)),
+        }
+    }
+
+    /// Level caps row (levels page); every level carries one.
     #[must_use]
-    pub fn caps(self) -> &'static LevelCaps {
+    pub fn caps(self) -> Option<&'static LevelCaps> {
         match self {
-            Self::L1 => &Self::CAPS[0],
-            Self::L11 => &Self::CAPS[1],
-            Self::L2 => &Self::CAPS[2],
-            Self::L21 => &Self::CAPS[3],
-            Self::L3 => &Self::CAPS[4],
-            Self::L31 => &Self::CAPS[5],
-            Self::L4 => &Self::CAPS[6],
-            Self::L41 => &Self::CAPS[7],
-            Self::L5 => &Self::CAPS[8],
-            Self::L51 => &Self::CAPS[9],
-            Self::L52 => &Self::CAPS[10],
-            Self::L6 => &Self::CAPS[11],
-            Self::L61 => &Self::CAPS[12],
-            Self::L62 => &Self::CAPS[13],
+            Self::L1 => Some(&Self::CAPS[0]),
+            Self::L11 => Some(&Self::CAPS[1]),
+            Self::L2 => Some(&Self::CAPS[2]),
+            Self::L21 => Some(&Self::CAPS[3]),
+            Self::L3 => Some(&Self::CAPS[4]),
+            Self::L31 => Some(&Self::CAPS[5]),
+            Self::L4 => Some(&Self::CAPS[6]),
+            Self::L41 => Some(&Self::CAPS[7]),
+            Self::L5 => Some(&Self::CAPS[8]),
+            Self::L51 => Some(&Self::CAPS[9]),
+            Self::L52 => Some(&Self::CAPS[10]),
+            Self::L6 => Some(&Self::CAPS[11]),
+            Self::L61 => Some(&Self::CAPS[12]),
+            Self::L62 => Some(&Self::CAPS[13]),
         }
     }
 }
@@ -105,6 +134,31 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// Resolve 2-bit profile idc 0-3.
+    ///
+    /// # Arguments
+    ///
+    /// * `idc` - profile idc value.
+    #[must_use]
+    pub fn from_idc(idc: u8) -> Option<Self> {
+        match idc {
+            0 => Some(Self::P0),
+            1 => Some(Self::P1),
+            2 => Some(Self::P2),
+            3 => Some(Self::P3),
+            _ => None,
+        }
+    }
+
+    /// Maximum bit depth.
+    #[must_use]
+    pub fn max_bit_depth(self) -> u8 {
+        match self {
+            Self::P0 | Self::P1 => 8,
+            Self::P2 | Self::P3 => 12,
+        }
+    }
+
     /// Profile capability matrix (S7.2, S6.2, S6.2.2).
     #[must_use]
     pub fn allows(self, depth_bits: u8, chroma: ChromaSampling) -> bool {
@@ -125,6 +179,18 @@ impl Profile {
                         ChromaSampling::Yuv422 | ChromaSampling::Yuv440 | ChromaSampling::Yuv444
                     )
             }
+        }
+    }
+
+    /// Allowed chroma sampling at any depth (S7.2, S6.2).
+    #[must_use]
+    pub fn allows_chroma(self, chroma: ChromaSampling) -> bool {
+        match self {
+            Self::P0 | Self::P2 => chroma == ChromaSampling::Yuv420,
+            Self::P1 | Self::P3 => matches!(
+                chroma,
+                ChromaSampling::Yuv422 | ChromaSampling::Yuv440 | ChromaSampling::Yuv444
+            ),
         }
     }
 }
@@ -194,7 +260,9 @@ impl Validate for Params {
         if !self.profile.allows(self.depth.bits(), self.chroma) {
             return Err(Violation::ChromaNotAllowed);
         }
-        let caps = self.level.caps();
+        let Some(caps) = self.level.caps() else {
+            return Ok(());
+        };
         let samples = self.size.samples();
         let max_samples = u64::from(caps.pic);
         if samples > max_samples {
@@ -297,10 +365,7 @@ impl EncodeProfile {
     /// Maximum bit depth.
     #[must_use]
     pub fn max_bit_depth(self) -> u8 {
-        match self {
-            Self::P0 | Self::P1 => 8,
-            Self::P2 | Self::P3 => 12,
-        }
+        self.profile().max_bit_depth()
     }
 
     /// Depth and chroma allowed together.
@@ -353,7 +418,7 @@ mod tests {
 
     #[test]
     fn level_41_caps_anchor() {
-        let caps = Level::L41.caps();
+        let caps = Level::L41.caps().expect("caps");
         assert_eq!(caps.sr, 160_432_128);
         assert_eq!(caps.refs, 6);
         assert_eq!(caps.dim, 4160);
@@ -361,7 +426,7 @@ mod tests {
 
     #[test]
     fn level_62_caps_anchor() {
-        let caps = Level::L62.caps();
+        let caps = Level::L62.caps().expect("caps");
         assert_eq!(caps.sr, 4_706_009_088);
         assert_eq!(caps.cpb, None);
     }
@@ -396,5 +461,44 @@ mod tests {
         assert!(!inter_scale_valid(40_000, 1920));
         assert!(plain_final_byte_valid(0x00));
         assert!(!plain_final_byte_valid(0b1100_0000));
+    }
+
+    #[test]
+    fn profile_idc_and_caps() {
+        use super::Profile;
+        use crate::common::ChromaSampling;
+        assert_eq!(Profile::from_idc(3), Some(Profile::P3));
+        assert_eq!(Profile::from_idc(4), None);
+        assert!(Profile::P1.allows_chroma(ChromaSampling::Yuv444));
+        assert!(!Profile::P0.allows_chroma(ChromaSampling::Yuv444));
+        assert_eq!(Profile::P2.max_bit_depth(), 12);
+        assert_eq!(Profile::P0.max_bit_depth(), 8);
+        assert_eq!(super::EncodeProfile::P3.max_bit_depth(), 12);
+    }
+
+    #[test]
+    fn level_idx_roundtrip() {
+        use super::Level;
+        assert_eq!(Level::from_idx(0).unwrap(), Level::L1);
+        assert_eq!(Level::from_idx(13).unwrap(), Level::L62);
+        assert!(Level::from_idx(14).is_err());
+        for level in [
+            Level::L1,
+            Level::L11,
+            Level::L2,
+            Level::L21,
+            Level::L3,
+            Level::L31,
+            Level::L4,
+            Level::L41,
+            Level::L5,
+            Level::L51,
+            Level::L52,
+            Level::L6,
+            Level::L61,
+            Level::L62,
+        ] {
+            assert!(level.caps().is_some());
+        }
     }
 }

@@ -74,6 +74,25 @@ pub trait Encoder {
     fn flush(&mut self) -> Result<Vec<Packet>, Self::Error>;
 }
 
+/// GPU surfaces to coded packets.
+pub trait EncodeSurface {
+    /// GPU surface type.
+    type Surface;
+    /// Encode failure.
+    type Error: std::error::Error;
+
+    /// Packets coded from `surface`, possibly none.
+    ///
+    /// # Arguments
+    ///
+    /// * `surface` - GPU input surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot encode `surface`.
+    fn encode_surface(&mut self, surface: &Self::Surface) -> Result<Vec<Packet>, Self::Error>;
+}
+
 /// Held VRAM bytes, released on drop.
 #[derive(Debug)]
 pub struct Lease {
@@ -316,5 +335,22 @@ mod tests {
                 assert_eq!(handle.join().expect("thread"), vec![stream as u64 + 1]);
             }
         });
+    }
+
+    #[test]
+    fn encode_surface_shape_compiles() {
+        use super::EncodeSurface;
+        use crate::frame::CpuFrame;
+        use crate::packet::Packet;
+        struct Dummy;
+        impl EncodeSurface for Dummy {
+            type Surface = CpuFrame;
+            type Error = std::io::Error;
+            fn encode_surface(&mut self, _surface: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
+                Ok(Vec::new())
+            }
+        }
+        fn assert_encode_surface<T: EncodeSurface>() {}
+        assert_encode_surface::<Dummy>();
     }
 }
