@@ -33,6 +33,8 @@ impl From<bool> for InlineCopy {
 }
 
 /// Copy worker behind split-phase readback maps.
+///
+/// Not an async delivery pump; multi-inflight decode engines live per tier.
 pub struct CopyPump<M, D> {
     /// Copy jobs, absent after shutdown or a spawn failure.
     tx: Option<SyncSender<Job<M>>>,
