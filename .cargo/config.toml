@@ -1,0 +1,7 @@
+# CPU floor x86-64-v3 on x86_64 triples; ARM triples stay default.
+# Rationale and knob ledger live in docs/compat.md.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

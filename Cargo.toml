@@ -17,6 +17,13 @@ warnings = "deny"
 all = "warn"
 pedantic = "warn"
 
+# Release floor: explicit O3 plus thin LTO and one codegen unit. panic stays
+# unwind; abort would change lib semantics. See docs/compat.md.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 # Bench holds realtime only against optimized assembly.
 [profile.dev.package.openh264-sys2]
 opt-level = 2
@@ -24,8 +31,9 @@ opt-level = 2
 # d3d12's pure-Rust overlap pump wins under optimization; every other
 # tier measures noise-or-worse there, so codegen stays scoped here.
 # Thin LTO would add the other half of the d3d12 win but cannot scope
-# per package, and d3d11 AV1 reads -6% under it: rejected, revisit if
-# either side moves.
+# per package, and d3d11 AV1 reads -6% under it: rejected for test builds,
+# revisit if either side moves. Release carries global thin LTO regardless;
+# see docs/compat.md.
 [profile.test.package.rust-video-d3d12]
 opt-level = 3
 codegen-units = 1

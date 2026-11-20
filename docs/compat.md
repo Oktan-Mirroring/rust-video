@@ -121,6 +121,35 @@ msrv` recipe (clippy plus test) on the pinned 1.87.0 toolchain.
 Any dependency whose `rust_version` exceeds the floor is rejected at
 review. A bump is a minor-version decision with a changelog note.
 
+## CPU baseline
+
+Rust floor is x86-64-v3 (AVX2, FMA, BMI1/2; 2013 Haswell-class and
+newer), set per triple in `.cargo/config.toml` for
+`x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`, the two x86_64
+triples CI builds. v4/AVX-512 stays out: latest-only silicon, cuts the
+installed base. `native` stays out: build-box CPU leaks into the binary
+and faults on older runners. ARM triples keep the default (NEON
+baseline); SVE stays out as latest-only. The config uses triple-keyed
+tables only, which 1.87 parses; the `msrv` job pins that.
+
+Release profile carries `opt-level = 3` explicit, `lto = "thin"`
+(cross-crate inline at fast links), `codegen-units = 1` (whole-crate
+view instead of 16 fragmented units). `panic` stays `unwind`: abort
+would change lib semantics for `catch_unwind` callers. Debug output
+stays default. The scoped stanzas stay: dev `openh264-sys2` O2 and test
+`rust-video-d3d12` O3/CGU1 live in other profiles, independent of
+release, and debug benches remain the enforced CI floor. Known cost:
+d3d11 AV1 reads -6% under thin LTO (Cargo.toml comment); the scoping
+veto is lifted for maximum speed everywhere, so release takes the
+trade.
+
+C side stays untouched on purpose. `openh264-sys2 0.9.8` builds through
+`cc` defaults plus `nasm-rs` ASM with no `-march` from us or from its
+build script; upstream dispatches SIMD at runtime, and the sw H.264
+encode leg holds 260+ fps on noise 1080p, which only the ASM path
+reaches. No `-march` appears anywhere in the repo, including near the
+NDK triples, where an x86 flag would break the ARM build.
+
 ## Features vs runtime
 
 | Axis | Mechanism | Why |
