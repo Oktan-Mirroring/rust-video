@@ -14,7 +14,8 @@ use crate::H264Decoder;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::reason::UnsupportedReason as StreamCore;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale};
 
@@ -53,7 +54,10 @@ impl<'a> Transcoder<'a> {
             ));
         }
         let share = device.share_mechanism().ok_or_else(declined_export)?;
-        let encoder = D3d11Encoder::open(device, encode)?;
+        let config = D3d11Encoder::auto_config(encode).ok_or(D3d11Error::Unsupported(
+            UnsupportedReason::NoEncoder { codec: encode },
+        ))?;
+        let encoder = D3d11Encoder::open(device, config)?;
         let caps = GpuCaps::new(Some(share), device.supports(decode), encoder.gpu_ready());
         let plan = Plan::for_caps(&caps);
         let decoder = Box::new(H264Decoder::open(device));
@@ -97,6 +101,12 @@ impl<'a> Transcoder<'a> {
         self.caps
     }
 
+    /// Executed plan.
+    #[must_use]
+    pub fn plan(&self) -> Plan {
+        self.plan
+    }
+
     /// Packets transcoded from `packet`, possibly none.
     ///
     /// # Errors
@@ -124,9 +134,9 @@ impl<'a> Transcoder<'a> {
         if self.caps.ready() {
             Ok(())
         } else if let Some(cause) = self.plan.cause() {
-            Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                cause,
-            }))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Fallback { cause },
+            )))
         } else {
             // open derives plan from caps, so a miss names its cause.
             Ok(())
@@ -153,9 +163,9 @@ impl<'a> Transcoder<'a> {
         let mut packets = Vec::new();
         for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
-                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                    cause,
-                }));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                    StreamCore::Fallback { cause },
+                )));
             }
             if let Some(cause) = self.scale.miss(surface.size()) {
                 let scaled = self.scaled_or_miss(surface, cause)?;
@@ -174,9 +184,9 @@ impl<'a> Transcoder<'a> {
         cause: FallbackCause,
     ) -> Result<ScaledSurface, D3d11Error> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                cause,
-            }));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Fallback { cause },
+            )));
         };
         if self
             .scaler
@@ -186,9 +196,9 @@ impl<'a> Transcoder<'a> {
             match Scaler::open(self.device, from, to) {
                 Ok(scaler) => self.scaler = Some(scaler),
                 Err(D3d11Error::Unsupported(_)) => {
-                    return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                        cause,
-                    }));
+                    return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                        StreamCore::Fallback { cause },
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -200,9 +210,9 @@ impl<'a> Transcoder<'a> {
 
 /// Typed decline for a device without shared-texture export.
 fn declined_export() -> D3d11Error {
-    D3d11Error::Unsupported(UnsupportedReason::Fallback {
+    D3d11Error::Unsupported(UnsupportedReason::Stream(StreamCore::Fallback {
         cause: FallbackCause::NoSharedExport,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -224,7 +234,9 @@ mod tests {
         caps: GpuCaps,
         cause: FallbackCause,
     ) -> Option<super::Transcoder<'_>> {
-        let encoder = crate::encoder::D3d11Encoder::open(device, crate::guid::Codec::H264).ok()?;
+        let config =
+            crate::encoder::D3d11Encoder::auto_config(crate::guid::Codec::H264).expect("h264 auto");
+        let encoder = crate::encoder::D3d11Encoder::open(device, config).ok()?;
         Some(super::Transcoder {
             decoder: Box::new(crate::H264Decoder::open(device)),
             encoder,

@@ -153,6 +153,15 @@ impl D3d11Device {
     pub fn submit_lock(&self) -> &Arc<SubmitLock> {
         self.os.submit()
     }
+
+    /// True when the machine encodes `codec` behind an encoder MFT.
+    ///
+    /// The catalog probe lists without activating, so a serving
+    /// transform may still refuse the tier configuration at open.
+    #[must_use]
+    pub fn supports_encode(&self, codec: Codec) -> bool {
+        crate::encode::has_encoder(codec)
+    }
 }
 
 /// Hardware device with video support at feature level 11.

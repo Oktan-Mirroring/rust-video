@@ -7,16 +7,20 @@ use crate::guid::Codec;
 use crate::scale::ScaledSurface;
 use crate::texture::GpuSurface;
 
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::reason::UnsupportedReason as StreamCore;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 use rust_video_core::planes;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// D3D11 hardware encoder over a `MediaFoundation` encoder MFT.
 ///
-/// Encoders run 30 fps progressive with an area-scaled bitrate; input is NV12.
+/// Automatic rate control runs the legacy recipe: 30 fps progressive
+/// with an area-scaled bitrate; explicit configs map onto the media
+/// types and codec API. Input is NV12.
 pub struct D3d11Encoder {
     /// Negotiated MF session.
     session: Session,
@@ -25,16 +29,63 @@ pub struct D3d11Encoder {
 }
 
 impl D3d11Encoder {
-    /// Encoder over `device` for `codec`.
+    /// Legacy recipe config for `codec`, absent without an encode profile.
+    ///
+    /// Automatic rate control over the codec default profile and a
+    /// tier-picked level; [`open`](Self::open) encodes the legacy
+    /// recipe from it. MPEG-2, VC-1, and AV2 name no encode profile.
+    ///
+    /// # Arguments
+    ///
+    /// * `codec` - codec family behind the config.
+    #[must_use]
+    pub fn auto_config(codec: Codec) -> Option<EncodeConfig> {
+        use rust_video_caps::{av1, h264, h265, vp9};
+
+        let (profile, level) = match codec {
+            Codec::H264 => (
+                Profile::H264(h264::EncodeProfile::Main),
+                Level::H264(h264::EncodeLevel::Auto),
+            ),
+            Codec::H265 => (
+                Profile::H265(h265::EncodeProfile::Main),
+                Level::H265(h265::EncodeLevel::Auto),
+            ),
+            Codec::Av1 => (
+                Profile::Av1(av1::EncodeProfile::Main),
+                Level::Av1(av1::EncodeLevel::Auto),
+            ),
+            Codec::Vp9 => (
+                Profile::Vp9(vp9::EncodeProfile::P0),
+                Level::Vp9(vp9::EncodeLevel::Auto),
+            ),
+            Codec::Vp8 => (Profile::Vp8, Level::Vp8),
+            Codec::Mpeg2 | Codec::Vc1 | Codec::Av2 => return None,
+        };
+        Some(EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile,
+            level,
+            ..EncodeConfig::default()
+        })
+    }
+
+    /// Encoder over `device` for `config`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` without `MediaFoundation`, or without a
-    /// `codec` encoder MFT on the machine.
-    pub fn open(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
+    /// Returns `Err` when `config` fails validation or exceeds the
+    /// tier, without `MediaFoundation`, or without a `config` codec
+    /// encoder MFT on the machine.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - rate, structure, quality, profile, level, depth,
+    ///   chroma, frame rate, and color behind the session.
+    pub fn open(device: &D3d11Device, config: EncodeConfig) -> Result<Self, D3d11Error> {
         Ok(Self {
-            session: Session::open(device, codec)?,
-            codec,
+            session: Session::open(device, config)?,
+            codec: config.codec(),
         })
     }
 
@@ -68,32 +119,6 @@ impl D3d11Encoder {
         self.session.gpu_bound()
     }
 
-    /// Packets coded from `surface`, possibly none.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` without a D3D11 bind or when the backend cannot
-    /// encode `surface`.
-    pub fn encode_surface(&mut self, surface: &GpuSurface) -> Result<Vec<Packet>, D3d11Error> {
-        if surface.format() != PixelFormat::Nv12 {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::EncoderInputNotNv12 {
-                    format: surface.format(),
-                },
-            ));
-        }
-        let size = surface.size();
-        let (left, top) = surface.origin();
-        self.session.encode_texture(
-            surface.texture(),
-            surface.slice(),
-            left,
-            top,
-            size.width(),
-            size.height(),
-        )
-    }
-
     /// Packets coded from an NV12 `texture` region, possibly none.
     ///
     /// The region must sit on even offsets with an even extent.
@@ -119,7 +144,9 @@ impl D3d11Encoder {
             self.session
                 .encode_texture(texture, slice, left, top, width, height)
         } else {
-            Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::OddNv12Extent,
+            )))
         }
     }
 
@@ -158,6 +185,31 @@ impl Encoder for D3d11Encoder {
     }
 }
 
+impl EncodeSurface for D3d11Encoder {
+    type Surface = GpuSurface;
+    type Error = D3d11Error;
+
+    fn encode_surface(&mut self, surface: &GpuSurface) -> Result<Vec<Packet>, D3d11Error> {
+        if surface.format() != PixelFormat::Nv12 {
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::EncoderInputNotNv12 {
+                    format: surface.format(),
+                },
+            )));
+        }
+        let size = surface.size();
+        let (left, top) = surface.origin();
+        self.session.encode_texture(
+            surface.texture(),
+            surface.slice(),
+            left,
+            top,
+            size.width(),
+            size.height(),
+        )
+    }
+}
+
 /// Validated NV12 plane views over one frame.
 struct Planes<'a> {
     /// Frame width in luma samples.
@@ -183,22 +235,24 @@ impl<'a> Planes<'a> {
     /// plane, a stride below the width, or a plane short of its stride.
     fn of(frame: &'a CpuFrame) -> Result<Self, D3d11Error> {
         if frame.format() != PixelFormat::Nv12 {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::EncoderInputNotNv12 {
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::EncoderInputNotNv12 {
                     format: frame.format(),
                 },
-            ));
+            )));
         }
         let width = frame.size().width();
         let height = frame.size().height();
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::OddNv12Extent,
+            )));
         }
         let planes = frame.planes();
         let (Some(y), Some(uv)) = (planes.first(), planes.get(1)) else {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::Nv12WithoutTwoPlanes,
-            ));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Nv12WithoutTwoPlanes,
+            )));
         };
         check_plane(y.data(), y.stride(), width, height)?;
         check_plane(uv.data(), uv.stride(), width, height / 2)?;
@@ -243,10 +297,10 @@ impl<'a> Planes<'a> {
 fn check_plane(data: &[u8], stride: u32, width: u32, rows: u32) -> Result<(), D3d11Error> {
     planes::check_plane(data, stride, width, rows).map_err(|fault| match fault {
         planes::PlaneFault::StrideBelowWidth { .. } => {
-            D3d11Error::Unsupported(UnsupportedReason::PlaneStrideBelowWidth)
+            D3d11Error::Unsupported(UnsupportedReason::Stream(StreamCore::PlaneStrideBelowWidth))
         }
         planes::PlaneFault::ShortOfStride { .. } => {
-            D3d11Error::Unsupported(UnsupportedReason::PlaneShortOfStride)
+            D3d11Error::Unsupported(UnsupportedReason::Stream(StreamCore::PlaneShortOfStride))
         }
     })
 }
@@ -330,13 +384,31 @@ mod tests {
     }
 
     #[test]
+    fn auto_config_covers_mft_codecs() {
+        use crate::guid::Codec;
+
+        for codec in [Codec::H264, Codec::H265, Codec::Vp9, Codec::Av1, Codec::Vp8] {
+            let config = super::D3d11Encoder::auto_config(codec).expect("auto config");
+            assert_eq!(config.codec(), codec);
+            assert!(matches!(
+                config.rate_control,
+                rust_video_caps::encode::RateControl::Auto
+            ));
+        }
+        for codec in [Codec::Mpeg2, Codec::Vc1, Codec::Av2] {
+            assert!(super::D3d11Encoder::auto_config(codec).is_none());
+        }
+    }
+
+    #[test]
     fn caps_agree_with_texture_import() {
-        use rust_video_caps::traits::Encoder;
+        use rust_video_caps::traits::{EncodeSurface, Encoder};
 
         let Ok(device) = crate::device::D3d11Device::open() else {
             return;
         };
-        let Ok(mut encoder) = super::D3d11Encoder::open(&device, crate::guid::Codec::H264) else {
+        let config = super::D3d11Encoder::auto_config(crate::guid::Codec::H264).expect("h264 auto");
+        let Ok(mut encoder) = super::D3d11Encoder::open(&device, config) else {
             return;
         };
         let caps = encoder.caps();

@@ -14,6 +14,7 @@ use crate::texture::{ExportLayout, GpuSurface};
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{GpuFrame, PixelFormat};
+use rust_video_caps::reason::ParseReason as ParseCore;
 use rust_video_caps::traits::SharedDevice;
 
 /// Active sequence behind the live session.
@@ -41,8 +42,9 @@ impl Active {
         visible_width: u32,
         visible_height: u32,
     ) -> Result<Self, D3d11Error> {
-        let visible = PictureSize::new(visible_width, visible_height)
-            .ok_or(D3d11Error::Parse(ParseReason::CropEmptiesPicture))?;
+        let visible = PictureSize::new(visible_width, visible_height).ok_or(D3d11Error::Parse(
+            ParseReason::Parse(ParseCore::CropEmptiesPicture),
+        ))?;
         Ok(Self {
             sps_id,
             width,

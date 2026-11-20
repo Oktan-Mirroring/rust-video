@@ -79,7 +79,8 @@ fn hevc_loopback_no_reorder_returns_per_call() {
     let Some(device) = device_for(Codec::H265) else {
         return;
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
+    let config = D3d11Encoder::auto_config(Codec::H265).expect("hevc auto");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("hevc skipped: {error}");
@@ -115,7 +116,8 @@ fn av1_loopback_no_reorder_returns_per_call() {
     let Some(device) = device_for(Codec::Av1) else {
         return;
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Av1) {
+    let config = D3d11Encoder::auto_config(Codec::Av1).expect("av1 auto");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("av1 skipped: {error}");
@@ -209,7 +211,7 @@ fn h264_surfaces_match_frames() {
         let surfaces = decoder.decode_surface(&packet).expect("steady decode");
         assert_eq!(surfaces.len(), 1, "picture {index} completes on its call");
         for surface in &surfaces {
-            surface.wait().expect("surface completes");
+            surface.try_wait().expect("surface completes");
             if total == 0 {
                 assert_surface_metadata(surface, 320, 240);
                 assert_eq!(surface.slice(), 0, "first picture takes slot zero");
@@ -242,7 +244,7 @@ fn hevc_surfaces_match_frames() {
     for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
         for surface in decoder.decode_surface(&packet).expect("steady decode") {
-            surface.wait().expect("surface completes");
+            surface.try_wait().expect("surface completes");
             if total == 0 {
                 assert_surface_metadata(&surface, 320, 240);
             }
@@ -250,7 +252,7 @@ fn hevc_surfaces_match_frames() {
         }
     }
     for surface in decoder.flush_surface().expect("flush drains") {
-        surface.wait().expect("surface completes");
+        surface.try_wait().expect("surface completes");
         total += 1;
     }
     assert_eq!(total, 15, "every picture surfaces");
@@ -271,7 +273,7 @@ fn av1_surfaces_match_frames() {
     for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
         for surface in decoder.decode_surface(&packet).expect("steady decode") {
-            surface.wait().expect("surface completes");
+            surface.try_wait().expect("surface completes");
             if total == 0 {
                 assert_surface_metadata(&surface, 320, 240);
             }
@@ -279,7 +281,7 @@ fn av1_surfaces_match_frames() {
         }
     }
     for surface in decoder.flush_surface().expect("flush drains") {
-        surface.wait().expect("surface completes");
+        surface.try_wait().expect("surface completes");
         total += 1;
     }
     assert_eq!(total, 15, "every frame surfaces");
@@ -308,7 +310,7 @@ fn surface_metadata_names_crop() {
     let coded = surface.coded();
     assert_eq!((coded.width(), coded.height()), (1920, 1088));
     assert_eq!(surface.origin(), (0, 0));
-    surface.wait().expect("surface completes");
+    surface.try_wait().expect("surface completes");
 }
 
 /// Held surfaces pin slots; exhaustion is loud, recovery clean.

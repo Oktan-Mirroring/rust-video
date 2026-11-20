@@ -17,7 +17,8 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H264) {
+    let config = D3d11Encoder::auto_config(Codec::H264).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no h264 encoder ({error})");

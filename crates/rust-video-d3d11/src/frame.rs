@@ -1,7 +1,8 @@
 //! Decoded frame: NV12 bytes with identity, lease, and export.
 
 use bytes::Bytes;
-use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame};
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Surface};
 use rust_video_caps::traits::Lease;
 
 use crate::seam::FrameExport;
@@ -53,6 +54,62 @@ impl D3d11Frame {
     #[must_use]
     pub fn to_cpu(&self) -> Option<CpuFrame> {
         CpuFrame::from_nv12(self.identity.size(), &self.data)
+    }
+
+    /// Visible picture dimensions in luma samples.
+    #[must_use]
+    pub fn size(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Pixel layout.
+    #[must_use]
+    pub fn format(&self) -> PixelFormat {
+        self.identity.format()
+    }
+
+    /// Array layer of this picture.
+    #[must_use]
+    pub fn slice(&self) -> u32 {
+        0
+    }
+
+    /// Full texture extent.
+    #[must_use]
+    pub fn coded(&self) -> PictureSize {
+        self.size()
+    }
+
+    /// Crop left/top in luma samples.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        (0, 0)
+    }
+}
+
+impl Surface for D3d11Frame {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
     }
 }
 
@@ -126,5 +183,21 @@ mod tests {
         let shared = SharedDevice::new("d3d11", 100);
         let held = frame(&shared, 4, 2, vec![0; 11]);
         assert!(held.to_cpu().is_none());
+    }
+
+    #[test]
+    fn surface_reports_full_frame_readback() {
+        use rust_video_caps::frame::Surface;
+
+        let shared = SharedDevice::new("d3d11", 100);
+        let held = frame(&shared, 4, 2, vec![0; 12]);
+        assert_eq!(held.size(), held.identity().size());
+        assert_eq!(held.format(), PixelFormat::Nv12);
+        assert_eq!(held.slice(), 0);
+        assert_eq!(held.coded(), held.size());
+        assert_eq!(held.origin(), (0, 0));
+        let surface: &dyn Surface = &held;
+        assert_eq!(surface.size(), held.size());
+        assert!(matches!(surface.export(), GpuExport::Opaque { .. }));
     }
 }

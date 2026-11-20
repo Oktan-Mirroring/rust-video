@@ -67,7 +67,7 @@ pub(crate) use os::DeviceOs;
 #[cfg(not(target_os = "windows"))]
 pub(crate) use os_stub::DeviceOs;
 #[cfg(target_os = "windows")]
-pub use overlap::{FramePhases, OverlappedPump, PhaseCapture, SplitDecoder};
+pub use overlap::OverlappedPump;
 #[cfg(not(target_os = "windows"))]
 pub use shell::Vp9Decoder;
 pub use shell::{Mpeg2Decoder, Vc1Decoder};
@@ -79,8 +79,6 @@ pub use texture::GpuSurface;
 pub use transcode::Transcoder;
 #[cfg(target_os = "windows")]
 pub use vp9::Vp9Decoder;
-
-pub use rust_video_caps::transcode::GpuCaps;
 
 /// Direct3D 11 video tier.
 pub struct D3d11;

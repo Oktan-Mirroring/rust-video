@@ -106,22 +106,31 @@ fn probe_reports_or_skips() {
     assert!(vc1_decoder.decode(&packet).is_err());
     assert!(vc1_decoder.flush().expect("flush").is_empty());
 
-    drive_encoder(&device, Codec::H264, 1280, 720, true);
-    drive_encoder(&device, Codec::H264, 64, 48, true);
-    for codec in [
-        Codec::H265,
-        Codec::Av1,
-        Codec::Vp9,
-        Codec::Mpeg2,
-        Codec::Vc1,
-    ] {
-        drive_encoder(&device, codec, 64, 48, false);
+    let h264 = D3d11Encoder::auto_config(Codec::H264).expect("h264 auto");
+    drive_encoder(&device, h264, 1280, 720, true);
+    drive_encoder(&device, h264, 64, 48, true);
+    for codec in [Codec::H265, Codec::Av1, Codec::Vp9] {
+        let config = D3d11Encoder::auto_config(codec).expect("codec auto");
+        drive_encoder(&device, config, 64, 48, false);
+    }
+    for codec in [Codec::Mpeg2, Codec::Vc1, Codec::Av2] {
+        assert!(
+            D3d11Encoder::auto_config(codec).is_none(),
+            "{codec} names no encode profile"
+        );
     }
 }
 
-/// Eight frames plus a drain through `codec`, or its loud fallback.
-fn drive_encoder(device: &D3d11Device, codec: Codec, width: u32, height: u32, required: bool) {
-    let mut encoder = match D3d11Encoder::open(device, codec) {
+/// Eight frames plus a drain through `config`, or its loud fallback.
+fn drive_encoder(
+    device: &D3d11Device,
+    config: rust_video_caps::encode::EncodeConfig,
+    width: u32,
+    height: u32,
+    required: bool,
+) {
+    let codec = config.codec();
+    let mut encoder = match D3d11Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => return fallback(codec, required, &error),
     };

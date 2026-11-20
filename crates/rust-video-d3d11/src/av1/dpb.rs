@@ -30,6 +30,7 @@ use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::ViewAlloc;
+use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
 
 /// Session view count behind current view selection.
 const VIEWS: u8 = 16;
@@ -83,11 +84,11 @@ impl Av1Dpb {
             let shown = match self.slots.get(index) {
                 Some(Some(slot)) => slot.clone(),
                 _ => {
-                    return Err(D3d11Error::BrokenReference(
-                        BrokenReferenceReason::NamesEmptySlot {
+                    return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                        BrokenCore::NamesEmptySlot {
                             reference: "show_existing_frame",
                         },
-                    ));
+                    )));
                 }
             };
             if header.frame_type == FrameType::Key {
@@ -172,7 +173,9 @@ impl Av1Dpb {
             });
         }
         if tiles.is_empty() {
-            return Err(D3d11Error::Parse(ParseReason::FrameWithoutTiles));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::FrameWithoutTiles,
+            )));
         }
         let padding = 128 - (bitstream.len() % 128);
         bitstream.resize(bitstream.len() + padding, 0);
@@ -230,11 +233,11 @@ impl Av1Dpb {
         for position in 0..REFS_PER_FRAME {
             let slot = usize::from(header.ref_frame_idx[position]);
             let Some(stored) = self.slots.get(slot).and_then(|slot| slot.as_ref()) else {
-                return Err(D3d11Error::BrokenReference(
-                    BrokenReferenceReason::NamesEmptySlot {
+                return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                    BrokenCore::NamesEmptySlot {
                         reference: "ref_frame_idx",
                     },
-                ));
+                )));
             };
             let motion = &header.global_motion[position];
             params.frame_refs[position] = PicEntryAv1 {
@@ -272,11 +275,11 @@ fn check_slots(
 ) -> Result<(), D3d11Error> {
     for index in &header.ref_frame_idx {
         if !matches!(slots.get(usize::from(*index)), Some(Some(_))) {
-            return Err(D3d11Error::BrokenReference(
-                BrokenReferenceReason::NamesEmptySlot {
+            return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::NamesEmptySlot {
                     reference: "ref_frame_idx",
                 },
-            ));
+            )));
         }
     }
     Ok(())

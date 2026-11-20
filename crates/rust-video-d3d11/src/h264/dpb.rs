@@ -17,6 +17,7 @@ use crate::h264::{
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
 use rust_video_h264::{
     abs_frame_num, apply_ref_mods, frame_num_wrap, initial_ref_lists, mmco_short_target, poc_type2,
     RefCandidate,
@@ -180,9 +181,9 @@ impl Dpb {
     ) -> Result<Decoded, D3d11Error> {
         let frame_num = picture.frame_num();
         if frame_num >= self.max_frame_num {
-            return Err(D3d11Error::Parse(ParseReason::Range {
+            return Err(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "frame_num",
-            }));
+            })));
         }
         self.check_gap(picture, sps)?;
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
@@ -258,7 +259,9 @@ impl Dpb {
                 if sps.gaps_allowed {
                     return Err(D3d11Error::Unsupported(UnsupportedReason::FrameNumGap));
                 }
-                return Err(D3d11Error::Parse(ParseReason::FrameNumGapForbidden));
+                return Err(D3d11Error::Parse(ParseReason::Parse(
+                    ParseCore::FrameNumGapForbidden,
+                )));
             }
         }
         Ok(())
@@ -342,7 +345,9 @@ impl Dpb {
             return Ok(());
         }
         if self.max_refs == 0 {
-            return Err(D3d11Error::Parse(ParseReason::ReferenceWithZeroRefFrames));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::ReferenceWithZeroRefFrames,
+            )));
         }
         let curr = picture.frame_num();
         let max = self.max_frame_num;
@@ -359,9 +364,9 @@ impl Dpb {
             }
         }
         let Some(victim) = victim else {
-            return Err(D3d11Error::BrokenReference(
-                BrokenReferenceReason::NoShortTermToSlide,
-            ));
+            return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::NoShortTermToSlide,
+            )));
         };
         self.slots.evict(victim, emits);
         Ok(())
@@ -413,16 +418,16 @@ impl Dpb {
                     }
                 }
                 if !moved {
-                    return Err(D3d11Error::BrokenReference(
-                        BrokenReferenceReason::ShortTermTargetAbsent,
-                    ));
+                    return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                        BrokenCore::ShortTermTargetAbsent,
+                    )));
                 }
             }
             Mmco::SetMaxLong(plus1) => {
                 let max = i32::try_from(plus1).map_err(|_| {
-                    D3d11Error::Parse(ParseReason::Range {
+                    D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                         syntax: "max_long_term_frame_idx",
-                    })
+                    }))
                 })? - 1;
                 let mut victims = Vec::new();
                 for (index, slot) in self.slots.iter().enumerate() {
@@ -468,9 +473,9 @@ impl Dpb {
             }
         }
         if victims.is_empty() {
-            return Err(D3d11Error::BrokenReference(
-                BrokenReferenceReason::MarkingTargetAbsent,
-            ));
+            return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::MarkingTargetAbsent,
+            )));
         }
         for victim in victims {
             self.slots.evict(victim, emits);
@@ -540,14 +545,14 @@ impl Dpb {
             }
             (PocType::FrameNum, SlicePoc::None) => poc_type2(offset, frame_num, picture.ref_pic()),
             _ => {
-                return Err(D3d11Error::Parse(
-                    ParseReason::PocSyntaxAgainstSequenceMethod,
-                ));
+                return Err(D3d11Error::Parse(ParseReason::Parse(
+                    ParseCore::PocSyntaxAgainstSequenceMethod,
+                )));
             }
         };
-        let poc = poc.ok_or(D3d11Error::Parse(ParseReason::Range {
+        let poc = poc.ok_or(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
             syntax: "pic_order_cnt",
-        }))?;
+        })))?;
         if picture.ref_pic() {
             self.prev_ref_frame_num = frame_num;
             self.prev_frame_num_offset = offset;
@@ -721,12 +726,13 @@ impl Dpb {
             location: span.location,
             bytes: span.bytes,
             chopping: 0,
-            first_mb: u16::try_from(header.first_mb)
-                .map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "first_mb" }))?,
+            first_mb: u16::try_from(header.first_mb).map_err(|_| {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { syntax: "first_mb" }))
+            })?,
             mbs_in_slice: u16::try_from(span.mbs).map_err(|_| {
-                D3d11Error::Parse(ParseReason::Range {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                     syntax: "mbs_in_slice",
-                })
+                }))
             })?,
             bit_offset: header.bit_offset,
             slice_type: header.slice_type.id() + u8::from(header.fixed) * 5,
@@ -735,30 +741,31 @@ impl Dpb {
             num_ref_l0: l0_count,
             num_ref_l1: l1_count,
             alpha_offset: i8::try_from(header.deblocking_alpha).map_err(|_| {
-                D3d11Error::Parse(ParseReason::Range {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                     syntax: "deblocking offset",
-                })
+                }))
             })?,
             beta_offset: i8::try_from(header.deblocking_beta).map_err(|_| {
-                D3d11Error::Parse(ParseReason::Range {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                     syntax: "deblocking offset",
-                })
+                }))
             })?,
             reserved_8: 0,
             ref_lists,
             weights: [[[[0; 2]; 3]; 32]; 2],
             qs_delta: 0,
             qp_delta: i8::try_from(header.qp_delta).map_err(|_| {
-                D3d11Error::Parse(ParseReason::Range {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                     syntax: "slice_qp_delta",
-                })
+                }))
             })?,
             redundant_cnt: 0,
             direct_spatial: u8::from(header.direct_spatial),
             cabac_init_idc: header.cabac_init_idc,
             deblocking_idc: header.deblocking_idc,
-            slice_id: u16::try_from(span.index)
-                .map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "slice id" }))?,
+            slice_id: u16::try_from(span.index).map_err(|_| {
+                D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { syntax: "slice id" }))
+            })?,
         };
         let active = if header.slice_type.is_b() {
             [usize::from(l0_count) + 1, usize::from(l1_count) + 1]
@@ -805,7 +812,9 @@ impl Dpb {
             self.max_frame_num,
             ops,
         ) {
-            return Err(D3d11Error::Parse(ParseReason::ReferencePictureMissing));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::ReferencePictureMissing,
+            )));
         }
         order.truncate(usize::from(active) + 1);
         let mut entries = [PicEntryH264::INVALID; 32];
@@ -840,9 +849,9 @@ impl Dpb {
         params.num_ref_idx_l0_active_minus1 = pps.num_ref_l0;
         params.num_ref_idx_l1_active_minus1 = pps.num_ref_l1;
         params.frame_num = u16::try_from(picture.frame_num()).map_err(|_| {
-            D3d11Error::Parse(ParseReason::Range {
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "frame_num",
-            })
+            }))
         })?;
         params.log2_max_frame_num_minus4 = sps.log2_max_frame_num_minus4;
         params.pic_order_cnt_type = sps.poc_type.id();
@@ -892,9 +901,9 @@ impl Dpb {
                 u16::from(state.long_term_idx)
             } else {
                 u16::try_from(state.frame_num).map_err(|_| {
-                    D3d11Error::Parse(ParseReason::Range {
+                    D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                         syntax: "frame_num",
-                    })
+                    }))
                 })?
             };
             params.used_for_reference_flags |= 0b11 << (2 * index);
@@ -944,14 +953,15 @@ fn fill_weights(
 /// Default weight for `denom`.
 fn default_weight(denom: u8) -> Result<i32, D3d11Error> {
     1i32.checked_shl(u32::from(denom))
-        .ok_or(D3d11Error::Parse(ParseReason::Range {
+        .ok_or(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
             syntax: "weight denom",
-        }))
+        })))
 }
 
 /// Weight value as a driver short.
 fn narrow_weight(value: i32) -> Result<i16, D3d11Error> {
-    i16::try_from(value).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "weight" }))
+    i16::try_from(value)
+        .map_err(|_| D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { syntax: "weight" })))
 }
 
 /// True when any slice carries memory management operation 5.
@@ -965,15 +975,16 @@ fn has_mmco5(picture: &Picture) -> bool {
 /// Long-term index as a byte.
 fn index_u8(index: u32) -> Result<u8, D3d11Error> {
     u8::try_from(index).map_err(|_| {
-        D3d11Error::Parse(ParseReason::Range {
+        D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
             syntax: "long_term_frame_idx",
-        })
+        }))
     })
 }
 
 /// Slot number as a byte.
 fn slot_u8(slot: usize) -> Result<u8, D3d11Error> {
-    u8::try_from(slot).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "slot" }))
+    u8::try_from(slot)
+        .map_err(|_| D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { syntax: "slot" })))
 }
 
 /// Submission plus display-order outputs.

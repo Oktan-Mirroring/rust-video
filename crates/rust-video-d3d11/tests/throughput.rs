@@ -10,14 +10,14 @@ use std::time::Instant;
 
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Encoder, D3d11Error, D3d11Frame, GpuSurface, H264Decoder,
-    HevcDecoder, OverlappedPump, SplitDecoder, Transcoder, Vp9Decoder,
+    HevcDecoder, OverlappedPump, Transcoder, Vp9Decoder,
 };
 
 use bytes::Bytes;
 use rust_video_caps::delivery::ReceiveFrames;
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::traits::{Decoder, EncodeSurface, Encoder};
 use rust_video_caps::transcode::Route;
 use rust_video_harness::{
     bench_dir, decode_dir, AnnexB, CountingAlloc, Drive, H264Synth, Ivf, Packets, Synth,
@@ -180,7 +180,7 @@ fn decode_surface_fps(
     let raws = Packets::from_raws(raws);
     for packet in &warmup {
         for surface in decoder.decode_surface(packet).expect("warmup decode") {
-            surface.wait().expect("warmup wait");
+            surface.try_wait().expect("warmup wait");
         }
     }
     let mut surfaces = 0;
@@ -188,13 +188,13 @@ fn decode_surface_fps(
     for _ in 0..HOPS {
         for packet in &raws {
             for surface in decoder.decode_surface(packet).expect("timed decode") {
-                surface.wait().expect("timed wait");
+                surface.try_wait().expect("timed wait");
                 surfaces += 1;
             }
         }
     }
     for surface in decoder.flush_surface().expect("timed flush") {
-        surface.wait().expect("timed wait");
+        surface.try_wait().expect("timed wait");
         surfaces += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -255,7 +255,7 @@ fn surface_1080p(device: &D3d11Device) -> GpuSurface {
     surfaces.extend(decoder.flush_surface().expect("surface drain"));
     assert_eq!(surfaces.len(), 1, "synth set holds one picture");
     let surface = surfaces.pop().expect("one surface");
-    surface.wait().expect("surface completes");
+    surface.try_wait().expect("surface completes");
     let size = surface.size();
     assert_eq!(
         (size.width(), size.height()),
@@ -415,7 +415,8 @@ fn encode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H264) {
+    let config = D3d11Encoder::auto_config(Codec::H264).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no h264 encoder MFT ({error})");
@@ -442,7 +443,8 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
+    let config = D3d11Encoder::auto_config(Codec::H265).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no hevc encoder MFT ({error})");
@@ -476,7 +478,8 @@ fn encode_vp9_1080p_measures_realtime() {
     let (warmup, frames) = noise_frames();
     let mut runs = Vec::new();
     for _ in 0..VP9_REPEATS {
-        let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+        let config = D3d11Encoder::auto_config(Codec::Vp9).expect("auto config");
+        let mut encoder = match D3d11Encoder::open(&device, config) {
             Ok(encoder) => encoder,
             Err(error) => {
                 println!("d3d11 skipped: no vp9 encoder MFT ({error})");
@@ -505,7 +508,8 @@ fn encode_av1_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Av1) {
+    let config = D3d11Encoder::auto_config(Codec::Av1).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no av1 encoder MFT ({error})");
@@ -636,7 +640,8 @@ fn encode_surface_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H264) {
+    let config = D3d11Encoder::auto_config(Codec::H264).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no h264 encoder MFT ({error})");
@@ -669,7 +674,8 @@ fn encode_surface_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::H265) {
+    let config = D3d11Encoder::auto_config(Codec::H265).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no hevc encoder MFT ({error})");
@@ -702,7 +708,8 @@ fn encode_surface_vp9_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+    let config = D3d11Encoder::auto_config(Codec::Vp9).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no vp9 encoder MFT ({error})");
@@ -733,7 +740,8 @@ fn encode_surface_av1_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Av1) {
+    let config = D3d11Encoder::auto_config(Codec::Av1).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("d3d11 skipped: no av1 encoder MFT ({error})");
@@ -767,13 +775,12 @@ where
 }
 
 /// Measured fps of one sustained overlap pass of `raws`, plus frame count and peak depth.
-fn sustained_fps<D>(decoder: D, raws: &[Vec<u8>]) -> (f64, usize, usize)
-where
-    D: SplitDecoder<Frame = D3d11Frame>,
-{
-    let mut pump = OverlappedPump::open(decoder);
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(raws), drain);
-    (measured, count, pump.max_depth())
+macro_rules! sustained_fps {
+    ($decoder:expr, $raws:expr) => {{
+        let mut pump = OverlappedPump::open($decoder);
+        let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws($raws), drain);
+        (measured, count, pump.max_depth())
+    }};
 }
 
 /// Sustained 1080p H.264 overlap throughput against its bar.
@@ -795,7 +802,7 @@ fn sustained_h264_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let decoder = H264Decoder::open(&device);
-    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    let (measured, count, depth) = sustained_fps!(decoder, &raws);
     println!("d3d11 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_H264_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
@@ -823,7 +830,7 @@ fn sustained_hevc_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let decoder = HevcDecoder::open(&device);
-    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    let (measured, count, depth) = sustained_fps!(decoder, &raws);
     println!("d3d11 hevc sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_HEVC_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
@@ -850,7 +857,7 @@ fn sustained_av1_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let decoder = Av1Decoder::open(&device);
-    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    let (measured, count, depth) = sustained_fps!(decoder, &raws);
     println!("d3d11 av1 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_AV1_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
@@ -877,7 +884,7 @@ fn sustained_vp9_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("vp9-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let decoder = Vp9Decoder::open(&device);
-    let (measured, count, depth) = sustained_fps(decoder, &raws);
+    let (measured, count, depth) = sustained_fps!(decoder, &raws);
     println!("d3d11 vp9 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_VP9_BAR:.0}fps");
     assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
@@ -895,7 +902,8 @@ fn audit_own_frames(codec: Codec, tag: &str) {
             return;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, codec) {
+    let config = D3d11Encoder::auto_config(codec).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("{tag} skipped: {error}");
@@ -960,7 +968,8 @@ fn tuned(width: u32, height: u32) -> Option<(D3d11Encoder, Vec<u8>)> {
             return None;
         }
     };
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Vp9) {
+    let config = D3d11Encoder::auto_config(Codec::Vp9).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("vp9 skipped: {error}");

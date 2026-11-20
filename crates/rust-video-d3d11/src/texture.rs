@@ -9,14 +9,14 @@ use crate::session::SharedExport;
 use crate::submit::SurfaceFence;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{GpuExport, PixelFormat};
+use rust_video_caps::frame::{GpuExport, PixelFormat, Surface};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 /// Device-resident decode surface without CPU access.
 ///
 /// A single thread needs nothing. Threads sharing one device hold
 /// [`SubmitLock`](crate::SubmitLock) around their own direct context calls
-/// to serialize with crate submissions; [`wait`](Self::wait) never holds it.
+/// to serialize with crate submissions; [`try_wait`](Self::try_wait) never holds it.
 ///
 /// A surface borrows nothing: it holds shared ownership of its decode
 /// texture, its completion fence, and its decoder slot pin.
@@ -87,8 +87,34 @@ impl GpuSurface {
     /// # Errors
     ///
     /// Returns `Err` when the GPU misses the wait budget or reports failure.
-    pub fn wait(&self) -> Result<(), D3d11Error> {
+    pub fn try_wait(&self) -> Result<(), D3d11Error> {
         self.fence.wait()
+    }
+}
+
+impl Surface for GpuSurface {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
     }
 }
 

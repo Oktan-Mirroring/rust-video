@@ -22,6 +22,7 @@ use crate::h265::{LtSpec, Picture, Pps, ShortTermRps, Sps};
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
+use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
 use rust_video_h265::{anchors_tid0, is_slnr};
 
 /// DPB slot count.
@@ -135,7 +136,9 @@ impl HevcDpb {
                 let rps = header
                     .rps
                     .as_ref()
-                    .ok_or(D3d11Error::Parse(ParseReason::PictureWithoutReferenceSet))?;
+                    .ok_or(D3d11Error::Parse(ParseReason::Parse(
+                        ParseCore::PictureWithoutReferenceSet,
+                    )))?;
                 let lt_pocs = Self::lt_pocs(&header.lt, poc, sps)?;
                 self.mark(rps, &lt_pocs, poc)?;
             }
@@ -186,11 +189,13 @@ impl HevcDpb {
         }
         let lsb = picture
             .poc_lsb()
-            .ok_or(D3d11Error::Parse(ParseReason::PictureWithoutPoc))?;
+            .ok_or(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::PictureWithoutPoc,
+            )))?;
         sps.poc_from_lsb(self.poc_tid0, lsb, is_bla(picture))
-            .ok_or(D3d11Error::Parse(ParseReason::Range {
+            .ok_or(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "pic_order_cnt",
-            }))
+            })))
     }
 
     /// Undisplayed priors emitted, references kept for set marking.
@@ -234,9 +239,9 @@ impl HevcDpb {
         }
         for curr in curr_pocs(rps, lt_pocs, poc) {
             if !self.slots.iter().flatten().any(|slot| slot.poc == curr) {
-                return Err(D3d11Error::BrokenReference(
-                    BrokenReferenceReason::ReferencePocAbsent { poc: curr },
-                ));
+                return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                    BrokenCore::ReferencePocAbsent { poc: curr },
+                )));
             }
         }
         self.slots.free_displayed_non_refs();
@@ -421,14 +426,14 @@ impl HevcDpb {
         params.max_transform_depth_inter = sps.max_transform_depth_inter;
         params.max_transform_depth_intra = sps.max_transform_depth_intra;
         params.num_short_term_rps = u8::try_from(sps.rps.len()).map_err(|_| {
-            D3d11Error::Parse(ParseReason::Range {
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "rps count",
-            })
+            }))
         })?;
         params.num_long_term_sps = u8::try_from(sps.lt_poc_lsb.len()).map_err(|_| {
-            D3d11Error::Parse(ParseReason::Range {
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "long-term count",
-            })
+            }))
         })?;
         params.num_ref_l0_default_minus1 = pps.num_ref_l0;
         params.num_ref_l1_default_minus1 = pps.num_ref_l1;
@@ -543,9 +548,9 @@ fn lt_poc(spec: &LtSpec, poc: i32, max_lsb: u32) -> Result<i32, D3d11Error> {
     if spec.msb_present {
         return spec
             .poc_msb_present(poc, max_lsb)
-            .ok_or(D3d11Error::Parse(ParseReason::Range {
+            .ok_or(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "long_term poc",
-            }));
+            })));
     }
     let max_lsb = i64::from(max_lsb);
     let lsb = i64::from(spec.poc_lsb);
@@ -560,9 +565,9 @@ fn lt_poc(spec: &LtSpec, poc: i32, max_lsb: u32) -> Result<i32, D3d11Error> {
         cycle_base + lsb
     };
     i32::try_from(derived).map_err(|_| {
-        D3d11Error::Parse(ParseReason::Range {
+        D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
             syntax: "long_term poc",
-        })
+        }))
     })
 }
 
@@ -717,9 +722,9 @@ fn fill_ref_sets(
             continue;
         }
         let member = delta.checked_add(poc).ok_or({
-            D3d11Error::Parse(ParseReason::Range {
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "delta_poc",
-            })
+            }))
         })?;
         params.ref_set_st_curr_before[before] = pp_index(refs, member)?;
         before += 1;
@@ -733,9 +738,9 @@ fn fill_ref_sets(
             continue;
         }
         let member = delta.checked_add(poc).ok_or({
-            D3d11Error::Parse(ParseReason::Range {
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "delta_poc",
-            })
+            }))
         })?;
         params.ref_set_st_curr_after[after] = pp_index(refs, member)?;
         after += 1;
@@ -756,14 +761,15 @@ fn pp_index(refs: &[RefState], poc: i32) -> Result<u8, D3d11Error> {
     refs.iter()
         .position(|state| state.poc == poc)
         .and_then(|index| u8::try_from(index).ok())
-        .ok_or(D3d11Error::BrokenReference(
-            BrokenReferenceReason::ReferencePocAbsent { poc },
-        ))
+        .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+            BrokenCore::ReferencePocAbsent { poc },
+        )))
 }
 
 /// Slot number as a byte.
 fn slot_u8(slot: usize) -> Result<u8, D3d11Error> {
-    u8::try_from(slot).map_err(|_| D3d11Error::Parse(ParseReason::Range { syntax: "slot" }))
+    u8::try_from(slot)
+        .map_err(|_| D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { syntax: "slot" })))
 }
 
 /// Submission plus display-order outputs.

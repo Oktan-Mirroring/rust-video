@@ -9,13 +9,14 @@ use crate::dpb::Output;
 use crate::error::{D3d11Error, UnsupportedReason};
 use crate::frame::D3d11Frame;
 use crate::guid::Codec;
-use crate::overlap::{FramePhases, FrameQueue, PhaseCapture, SplitDecoder, SplitParts};
+use crate::overlap::{FrameQueue, PumpGauges, SplitParts};
 use crate::readback::Readback;
 use crate::session::Session;
 use crate::texture::GpuSurface;
 
-use rust_video_caps::delivery::TrySendError;
+use rust_video_caps::delivery::{PhaseTiming, SplitDecode, SubmitStats};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::UnsupportedReason as StreamCore;
 use rust_video_caps::traits::Decoder;
 use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::transcode::{FallbackCause, GpuCaps};
@@ -40,11 +41,9 @@ pub struct Vp9Decoder<'a> {
     resets: u64,
     /// Submitted outputs plus completed frames awaiting poll.
     queue: FrameQueue<D3d11Frame>,
-    /// Phase capture switch.
-    capture: bool,
-    /// Recorded per-frame phases.
-    phases: Vec<FramePhases>,
-    /// Input ended; sends refuse, receives drain then end.
+    /// Phase-split timing per collected frame, oldest first.
+    timings: Vec<PhaseTiming>,
+    /// Input ended; submits decline, receives drain then end.
     finished: bool,
     /// Copy worker behind launches.
     readback: Readback,
@@ -70,8 +69,7 @@ impl<'a> Vp9Decoder<'a> {
             generation: 0,
             resets: 0,
             queue: FrameQueue::new(),
-            capture: false,
-            phases: Vec::new(),
+            timings: Vec::new(),
             finished: false,
             readback: Readback::spawn(),
         }
@@ -89,6 +87,21 @@ impl<'a> Vp9Decoder<'a> {
         self.queue.max_observed()
     }
 
+    /// Submit gauges since decoder open.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        let mut stats = SubmitStats::new();
+        stats.add_resets(self.resets());
+        stats.fold_peak(self.max_inflight());
+        stats
+    }
+
+    /// Phase-split timing per collected frame, oldest first.
+    #[must_use]
+    pub fn timings(&self) -> &[PhaseTiming] {
+        &self.timings
+    }
+
     /// Queue mechanics over the live session and queue.
     fn parts(&mut self) -> SplitParts<'_> {
         SplitParts::new(
@@ -96,8 +109,7 @@ impl<'a> Vp9Decoder<'a> {
             self.shared.as_ref(),
             &mut self.queue,
             &mut self.generation,
-            self.capture,
-            &mut self.phases,
+            &mut self.timings,
             &self.readback,
         )
     }
@@ -307,9 +319,11 @@ impl<'a> Vp9Decoder<'a> {
             if failed.is_none() {
                 for output in &decoded.outputs {
                     let Some(surface) = emit_surface(session, output, &active, &pins) else {
-                        failed = Some(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                            cause: FallbackCause::NoSharedExport,
-                        }));
+                        failed = Some(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                            StreamCore::Fallback {
+                                cause: FallbackCause::NoSharedExport,
+                            },
+                        )));
                         break;
                     };
                     surfaces.push(surface);
@@ -347,9 +361,11 @@ impl<'a> Vp9Decoder<'a> {
         let pins = dpb.pins().clone();
         for output in super::dpb::Vp9Dpb::drain() {
             let Some(surface) = emit_surface(session, &output, active, &pins) else {
-                return Err(D3d11Error::Unsupported(UnsupportedReason::Fallback {
-                    cause: FallbackCause::NoSharedExport,
-                }));
+                return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                    StreamCore::Fallback {
+                        cause: FallbackCause::NoSharedExport,
+                    },
+                )));
             };
             surfaces.push(surface);
         }
@@ -457,77 +473,91 @@ impl Decoder for Vp9Decoder<'_> {
     }
 }
 
-impl SplitDecoder for Vp9Decoder<'_> {
+impl SplitDecode for Vp9Decoder<'_> {
     type Frame = D3d11Frame;
+    type Error = D3d11Error;
 
-    fn submit_packet(&mut self, packet: Packet) -> Result<(), TrySendError<D3d11Error>> {
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, D3d11Error> {
         if self.finished {
-            return Err(TrySendError::Full { packet });
+            return Ok(false);
         }
-        self.parts()
-            .sweep_ready()
-            .map_err(|error| TrySendError::Failed { error })?;
-        if !self.queue.admits() {
-            return Err(TrySendError::Full { packet });
-        }
-        self.submit_packet_inner(&packet)
-            .map_err(|error| TrySendError::Failed { error })
-    }
-
-    fn poll_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
         self.parts().sweep_ready()?;
-        Ok(self.queue.pop_ready())
+        if !self.queue.admits() {
+            return Ok(false);
+        }
+        self.submit_packet_inner(packet)?;
+        Ok(true)
     }
 
-    fn wait_frame(&mut self) -> Result<Option<D3d11Frame>, D3d11Error> {
+    fn poll(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        self.parts().sweep_ready()?;
+        let mut frames = Vec::new();
+        self.parts().take_ready(&mut frames);
+        Ok(frames)
+    }
+
+    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        let deadline = Instant::now() + timeout;
         loop {
             self.parts().sweep_ready()?;
-            if let Some(frame) = self.queue.pop_ready() {
-                return Ok(Some(frame));
+            let mut frames = Vec::new();
+            self.parts().take_ready(&mut frames);
+            if !frames.is_empty() {
+                return Ok(frames);
             }
             if self.finished && self.queue.is_drained() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             if self.queue.front().is_some() {
                 self.parts().drain_oldest()?;
                 continue;
             }
+            if Instant::now() >= deadline {
+                return Ok(Vec::new());
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    fn finish_input(&mut self) -> Result<(), D3d11Error> {
-        if self.finished {
-            return Ok(());
-        }
-        let trailing = match self.ingest.finish() {
-            Ok(trailing) => trailing,
-            Err(error) => {
+    fn flush_split(&mut self) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        if !self.finished {
+            let trailing = match self.ingest.finish() {
+                Ok(trailing) => trailing,
+                Err(error) => {
+                    self.reset_stream();
+                    self.queue.clear_pending();
+                    return Err(error);
+                }
+            };
+            if let Some(frame) = trailing {
+                if let Err(error) = self.submit_frame_split(&frame) {
+                    self.queue.clear_pending();
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self.parts().drain_all() {
+                self.queue.clear_pending();
                 self.reset_stream();
-                self.queue.clear_pending();
                 return Err(error);
             }
-        };
-        if let Some(frame) = trailing {
-            if let Err(error) = self.submit_frame_split(&frame) {
-                self.queue.clear_pending();
-                return Err(error);
+            if let Some(active) = self.active {
+                let mut drained = Vec::new();
+                self.drain_live(&active, &mut drained)?;
+                self.queue.extend_ready(drained);
             }
+            self.finished = true;
         }
-        if let Err(error) = self.parts().drain_all() {
-            self.queue.clear_pending();
-            self.reset_stream();
-            return Err(error);
-        }
-        if let Some(active) = self.active {
-            let mut drained = Vec::new();
-            self.drain_live(&active, &mut drained)?;
-            self.queue.extend_ready(drained);
-        }
-        self.finished = true;
-        Ok(())
+        let mut frames = Vec::new();
+        self.parts().take_ready(&mut frames);
+        Ok(frames)
     }
 
+    fn stats(&self) -> SubmitStats {
+        self.submit_stats()
+    }
+}
+
+impl PumpGauges for Vp9Decoder<'_> {
     fn depth(&self) -> usize {
         self.queue.pending()
     }
@@ -539,14 +569,8 @@ impl SplitDecoder for Vp9Decoder<'_> {
     fn is_finished(&self) -> bool {
         self.finished
     }
-}
 
-impl PhaseCapture for Vp9Decoder<'_> {
-    fn capture_phases(&mut self, on: bool) {
-        self.capture = on;
-    }
-
-    fn phases(&self) -> &[FramePhases] {
-        &self.phases
+    fn pump_timings(&self) -> &[PhaseTiming] {
+        &self.timings
     }
 }

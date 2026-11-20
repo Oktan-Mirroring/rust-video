@@ -34,6 +34,7 @@ use crate::vp9::SubmittedVp9;
 
 use bytes::Bytes;
 use rust_video_caps::frame::GpuExport;
+use rust_video_caps::reason::BrokenReferenceReason as BrokenCore;
 
 /// Reference surface count.
 const VIEWS: u32 = 16;
@@ -42,7 +43,7 @@ const VIEWS: u32 = 16;
 const SPARE_VIEWS: u32 = 4;
 
 /// Negotiated H.264 decode session.
-pub struct Session {
+pub(crate) struct Session {
     /// Hardware decoder.
     decoder: ID3D11VideoDecoder,
     /// Output view per reference surface.
@@ -106,7 +107,7 @@ impl Session {
     ///
     /// Returns `Err` without a raw bitstream config, past
     /// the adapter surface floor, or when the driver refuses the decoder.
-    pub fn open(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
+    pub(crate) fn open(device: &D3d11Device, width: u32, height: u32) -> Result<Self, D3d11Error> {
         Self::open_windows(device, Codec::H264, width, height)
     }
 
@@ -117,7 +118,7 @@ impl Session {
     /// Returns `Err` without the codec profile, without an NV12
     /// render target, without a raw bitstream config, past
     /// the adapter surface floor, or when the driver refuses the decoder.
-    pub fn open_codec(
+    pub(crate) fn open_codec(
         device: &D3d11Device,
         codec: Codec,
         width: u32,
@@ -247,7 +248,7 @@ impl Session {
     ///
     /// Returns `Err` when a buffer overruns the driver
     /// allocation, or when the driver refuses the submission.
-    pub fn submit(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
+    pub(crate) fn submit(&self, submission: &SubmittedPicture) -> Result<(), D3d11Error> {
         self.submit_windows(submission)
     }
 
@@ -257,7 +258,7 @@ impl Session {
     ///
     /// Returns `Err` when a buffer overruns the driver
     /// allocation, or when the driver refuses the submission.
-    pub fn submit_hevc(&self, submission: &SubmittedHevc) -> Result<(), D3d11Error> {
+    pub(crate) fn submit_hevc(&self, submission: &SubmittedHevc) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);
         let short = slice_slice(&submission.slices);
         let mut parts = vec![
@@ -288,7 +289,7 @@ impl Session {
     ///
     /// Returns `Err` when a buffer overruns the driver
     /// allocation, or when the driver refuses the submission.
-    pub fn submit_av1(&self, submission: &SubmittedAv1) -> Result<(), D3d11Error> {
+    pub(crate) fn submit_av1(&self, submission: &SubmittedAv1) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);
         let tiles = slice_slice(&submission.tiles);
         let parts = [
@@ -309,7 +310,7 @@ impl Session {
     ///
     /// Returns `Err` when a buffer overruns the driver
     /// allocation, or when the driver refuses the submission.
-    pub fn submit_vp9(&self, submission: &SubmittedVp9) -> Result<(), D3d11Error> {
+    pub(crate) fn submit_vp9(&self, submission: &SubmittedVp9) -> Result<(), D3d11Error> {
         let params = struct_slice(&submission.params);
         let slices = slice_slice(&submission.slices);
         let parts = [
@@ -333,13 +334,13 @@ impl Session {
     ///
     /// Returns `Err` for a slot outside the views or when the driver
     /// refuses the copy.
-    pub fn copy_slot(&self, slot: u8) -> Result<(), D3d11Error> {
+    pub(crate) fn copy_slot(&self, slot: u8) -> Result<(), D3d11Error> {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         let list = lane.record(&self.texture, slot)?;
         let _submit = self.submit.enter()?;
         lane.complete(&self.context, &list);
@@ -352,7 +353,7 @@ impl Session {
     ///
     /// Returns `Err` for a slot outside the views, when the copy
     /// misses its completion budget, or when the map fails.
-    pub fn read_slot(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+    pub(crate) fn read_slot(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
         self.wait_slot(slot)?;
         self.read_mapped(slot, crop)
     }
@@ -363,13 +364,13 @@ impl Session {
     ///
     /// Returns `Err` for a slot outside the views or when the GPU
     /// reports failure.
-    pub fn poll_slot(&self, slot: u8) -> Result<bool, D3d11Error> {
+    pub(crate) fn poll_slot(&self, slot: u8) -> Result<bool, D3d11Error> {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         lane.signaled(&self.context)
     }
 
@@ -379,13 +380,13 @@ impl Session {
     ///
     /// Returns `Err` for a slot outside the views or when the copy
     /// misses its completion budget.
-    pub fn wait_slot(&self, slot: u8) -> Result<(), D3d11Error> {
+    pub(crate) fn wait_slot(&self, slot: u8) -> Result<(), D3d11Error> {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         lane.wait(&self.context)
     }
 
@@ -397,13 +398,13 @@ impl Session {
     /// # Errors
     ///
     /// Returns `Err` for a slot outside the views or when the map fails.
-    pub fn read_mapped(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+    pub(crate) fn read_mapped(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         lane.read(&self.context, crop)
     }
 
@@ -416,7 +417,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns `Err` for a slot outside the views or when the map fails.
-    pub fn map_slot(
+    pub(crate) fn map_slot(
         &self,
         slot: u8,
         crop: Option<Crop>,
@@ -425,9 +426,9 @@ impl Session {
         let lane = self
             .slots
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         let mapped = lane.map(&self.context)?;
         Ok(Mapped::new(
             mapped,
@@ -480,9 +481,9 @@ impl Session {
         let view = self
             .views
             .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsideViews,
-            ))?;
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))?;
         let _submit = self.submit.enter()?;
         // Sound: the decoder and view are live; no content key.
         unsafe {

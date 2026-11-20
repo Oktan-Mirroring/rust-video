@@ -17,6 +17,7 @@ use crate::pins::SlotPins;
 use crate::vp9::{Frame, FrameHeader, FrameType, NUM_REF_FRAMES, REFS_PER_FRAME};
 
 use rust_video_caps::dpb::ViewAlloc;
+use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
 
 /// Session view count behind current view selection.
 const VIEWS: u8 = 16;
@@ -63,11 +64,11 @@ impl Vp9Dpb {
             let shown = match self.slots.get(index) {
                 Some(Some(slot)) => slot.clone(),
                 _ => {
-                    return Err(D3d11Error::BrokenReference(
-                        BrokenReferenceReason::NamesEmptySlot {
+                    return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                        BrokenCore::NamesEmptySlot {
                             reference: "show_existing_frame",
                         },
-                    ));
+                    )));
                 }
             };
             if header.frame_type == FrameType::Key {
@@ -137,9 +138,11 @@ impl Vp9Dpb {
                 .checked_add(tile.bytes.len())
                 .is_none_or(|end| end > bitstream.len());
             if overruns {
-                return Err(D3d11Error::Parse(ParseReason::Truncated {
-                    syntax: "tile_data",
-                }));
+                return Err(D3d11Error::Parse(ParseReason::Parse(
+                    ParseCore::Truncated {
+                        syntax: "tile_data",
+                    },
+                )));
             }
             slices.push(SliceVpxShort {
                 location,
@@ -149,7 +152,9 @@ impl Vp9Dpb {
             offset += tile.bytes.len();
         }
         if slices.is_empty() {
-            return Err(D3d11Error::Parse(ParseReason::FrameWithoutTiles));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::FrameWithoutTiles,
+            )));
         }
         Ok(SubmittedVp9 {
             params,
@@ -204,11 +209,11 @@ impl Vp9Dpb {
         for position in 0..REFS_PER_FRAME {
             let slot = usize::from(header.ref_frame_idx[position]);
             let Some(stored) = self.slots.get(slot).and_then(|slot| slot.as_ref()) else {
-                return Err(D3d11Error::BrokenReference(
-                    BrokenReferenceReason::NamesEmptySlot {
+                return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                    BrokenCore::NamesEmptySlot {
                         reference: "ref_frame_idx",
                     },
-                ));
+                )));
             };
             params.frame_refs[position] = PicEntryVpx::frame(stored.view);
         }
@@ -242,11 +247,11 @@ fn check_slots(
 ) -> Result<(), D3d11Error> {
     for index in &header.ref_frame_idx {
         if !matches!(slots.get(usize::from(*index)), Some(Some(_))) {
-            return Err(D3d11Error::BrokenReference(
-                BrokenReferenceReason::NamesEmptySlot {
+            return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::NamesEmptySlot {
                     reference: "ref_frame_idx",
                 },
-            ));
+            )));
         }
     }
     Ok(())

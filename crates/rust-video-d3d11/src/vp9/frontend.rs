@@ -6,6 +6,8 @@ use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 
 pub(crate) use rust_video_vp9::{Frame, FrameHeader, FrameType, NUM_REF_FRAMES, REFS_PER_FRAME};
 
+use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
+
 /// Shared tile and flag vocabulary behind submit tests.
 #[cfg(test)]
 pub(crate) use rust_video_vp9::{
@@ -20,19 +22,27 @@ impl From<rust_video_vp9::Fault> for D3d11Error {
     fn from(fault: rust_video_vp9::Fault) -> Self {
         match fault {
             rust_video_vp9::Fault::FrameMarkerMismatch => {
-                Self::Parse(ParseReason::FrameMarkerMismatch)
+                Self::Parse(ParseReason::Parse(ParseCore::FrameMarkerMismatch))
             }
-            rust_video_vp9::Fault::ReservedProfile => Self::Parse(ParseReason::ReservedProfile),
-            rust_video_vp9::Fault::SyncCodeMismatch => Self::Parse(ParseReason::SyncCodeMismatch),
-            rust_video_vp9::Fault::Range { syntax } => Self::Parse(ParseReason::Range { syntax }),
+            rust_video_vp9::Fault::ReservedProfile => {
+                Self::Parse(ParseReason::Parse(ParseCore::ReservedProfile))
+            }
+            rust_video_vp9::Fault::SyncCodeMismatch => {
+                Self::Parse(ParseReason::Parse(ParseCore::SyncCodeMismatch))
+            }
+            rust_video_vp9::Fault::Range { syntax } => {
+                Self::Parse(ParseReason::Parse(ParseCore::Range { syntax }))
+            }
             rust_video_vp9::Fault::Truncated { syntax } => {
-                Self::Parse(ParseReason::Truncated { syntax })
+                Self::Parse(ParseReason::Parse(ParseCore::Truncated { syntax }))
             }
             rust_video_vp9::Fault::TooWide { syntax } => {
-                Self::Parse(ParseReason::TooWide { syntax })
+                Self::Parse(ParseReason::Parse(ParseCore::TooWide { syntax }))
             }
             rust_video_vp9::Fault::NamesEmptySlot { reference } => {
-                Self::BrokenReference(BrokenReferenceReason::NamesEmptySlot { reference })
+                Self::BrokenReference(BrokenReferenceReason::Broken(BrokenCore::NamesEmptySlot {
+                    reference,
+                }))
             }
         }
     }
@@ -43,6 +53,7 @@ mod tests {
     use super::Ingest;
     use crate::error::{BrokenReferenceReason, D3d11Error, ParseReason};
 
+    use rust_video_caps::reason::{BrokenReferenceReason as BrokenCore, ParseReason as ParseCore};
     use rust_video_harness::Bits;
 
     /// Profile 0 keyframe head through segmentation at `width` x `height`.
@@ -151,39 +162,41 @@ mod tests {
         use rust_video_vp9::Fault;
         assert!(matches!(
             D3d11Error::from(Fault::FrameMarkerMismatch),
-            D3d11Error::Parse(ParseReason::FrameMarkerMismatch)
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::FrameMarkerMismatch))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::ReservedProfile),
-            D3d11Error::Parse(ParseReason::ReservedProfile)
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::ReservedProfile))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::SyncCodeMismatch),
-            D3d11Error::Parse(ParseReason::SyncCodeMismatch)
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::SyncCodeMismatch))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::Range {
                 syntax: "tile_data"
             }),
-            D3d11Error::Parse(ParseReason::Range { .. })
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Range { .. }))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::Truncated {
                 syntax: "tile_data"
             }),
-            D3d11Error::Parse(ParseReason::Truncated { .. })
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::Truncated { .. }))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::TooWide {
                 syntax: "tile_data"
             }),
-            D3d11Error::Parse(ParseReason::TooWide { .. })
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::TooWide { .. }))
         ));
         assert!(matches!(
             D3d11Error::from(Fault::NamesEmptySlot {
                 reference: "ref_frame_idx",
             }),
-            D3d11Error::BrokenReference(BrokenReferenceReason::NamesEmptySlot { .. })
+            D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::NamesEmptySlot { .. }
+            ))
         ));
         assert_eq!(
             D3d11Error::from(Fault::FrameMarkerMismatch).to_string(),
@@ -211,7 +224,7 @@ mod tests {
         let error = Ingest::new().ingest_packet(&[0x00]).unwrap_err();
         assert!(matches!(
             error,
-            D3d11Error::Parse(ParseReason::FrameMarkerMismatch)
+            D3d11Error::Parse(ParseReason::Parse(ParseCore::FrameMarkerMismatch))
         ));
         assert_eq!(error.to_string(), "parse failed: frame marker mismatch");
     }

@@ -14,7 +14,7 @@ use rust_video_caps::delivery::{DecoderPump, DropPolicy, ReceiveFrames};
 use rust_video_caps::packet::Packet;
 use rust_video_d3d11::{
     Av1Decoder, Codec, D3d11Device, D3d11Frame, H264Decoder, HevcDecoder, OverlappedPump,
-    PhaseCapture, Vp9Decoder,
+    Vp9Decoder,
 };
 use rust_video_harness::{decode_dir, AnnexB, Drive, Obu, Packets, Parity};
 
@@ -145,9 +145,9 @@ fn send_bound_refuses_past_depth() {
     );
     check_frames(&frames, PICTURES, "bound");
     assert!(
-        depth <= OverlappedPump::<H264Decoder>::DEPTH + 1,
+        depth <= OverlappedPump::<H264Decoder>::MAX_INFLIGHT + 1,
         "bound holds depth near {}, got {depth}",
-        OverlappedPump::<H264Decoder>::DEPTH
+        OverlappedPump::<H264Decoder>::MAX_INFLIGHT
     );
     assert!(fulls > 0, "rapid sends hit the bound");
 }
@@ -272,7 +272,6 @@ fn phase_timing_parity_and_overlap() {
         "vector holds one packet per picture"
     );
     let mut sync_decoder = H264Decoder::open(&device);
-    sync_decoder.capture_phases(true);
     let sync_start = Instant::now();
     let mut sync_count = 0;
     for packet in &packets {
@@ -281,55 +280,55 @@ fn phase_timing_parity_and_overlap() {
     sync_count += sync_decoder.flush().expect("sync flush").len();
     let sync_wall = sync_start.elapsed();
     assert_eq!(sync_count, PICTURES, "sync yields every frame");
-    let sync_phases = sync_decoder.phases().to_vec();
+    let sync_timings = sync_decoder.timings().to_vec();
 
     let mut overlapped = OverlappedPump::open(H264Decoder::open(&device));
-    overlapped.capture_phases(true);
     let overlapped_start = Instant::now();
     let (mut frames, fulls) = Drive::send_all(&mut overlapped, &packets, drain);
     frames.extend(Drive::finish_all(&mut overlapped));
     let overlapped_wall = overlapped_start.elapsed();
     check_frames(&frames, PICTURES, "overlapped");
-    let overlapped_phases = overlapped.phases().to_vec();
+    let overlapped_timings = overlapped.timings().to_vec();
 
-    assert_eq!(sync_phases.len(), PICTURES, "sync phases cover every frame");
     assert_eq!(
-        overlapped_phases.len(),
+        sync_timings.len(),
         PICTURES,
-        "overlapped phases cover every frame"
+        "sync timings cover every frame"
     );
-    println!("phase table (us): gen | sync submit/wait/read/lat | ovlp submit/wait/read/lat");
-    let mut sync_lat = 0u128;
-    let mut overlapped_lat = 0u128;
-    for (sync_phase, overlapped_phase) in sync_phases.iter().zip(overlapped_phases.iter()) {
-        assert_eq!(
-            sync_phase.generation(),
-            overlapped_phase.generation(),
-            "phases join on generation"
-        );
-        sync_lat += sync_phase.latency().as_micros();
-        overlapped_lat += overlapped_phase.latency().as_micros();
+    assert_eq!(
+        overlapped_timings.len(),
+        PICTURES,
+        "overlapped timings cover every frame"
+    );
+    println!("phase table (us): seq | sync submit/wait/copy/lat | ovlp submit/wait/copy/lat");
+    let mut sync_lat = 0u64;
+    let mut overlapped_lat = 0u64;
+    for (sync, ovlp) in sync_timings.iter().zip(overlapped_timings.iter()) {
+        assert_eq!(sync.seq(), ovlp.seq(), "timings join on seq");
+        sync_lat += sync.latency_us();
+        overlapped_lat += ovlp.latency_us();
         println!(
             "{:>3} | {:>5}/{:>5}/{:>5}/{:>5} | {:>5}/{:>5}/{:>5}/{:>5}",
-            sync_phase.generation(),
-            sync_phase.submit().as_micros(),
-            sync_phase.engine_wait().as_micros(),
-            sync_phase.readback().as_micros(),
-            sync_phase.latency().as_micros(),
-            overlapped_phase.submit().as_micros(),
-            overlapped_phase.engine_wait().as_micros(),
-            overlapped_phase.readback().as_micros(),
-            overlapped_phase.latency().as_micros(),
+            sync.seq(),
+            sync.submit_us(),
+            sync.engine_wait_us(),
+            sync.copy_us(),
+            sync.latency_us(),
+            ovlp.submit_us(),
+            ovlp.engine_wait_us(),
+            ovlp.copy_us(),
+            ovlp.latency_us(),
         );
     }
     let mut events = 0;
-    for pair in overlapped_phases.windows(2) {
-        if pair[1].submit_start() < pair[0].signaled_at() {
+    for pair in overlapped_timings.windows(2) {
+        let prev_ready = pair[0].submitted_at() + pair[0].submit() + pair[0].engine_wait();
+        if pair[1].submitted_at() < prev_ready {
             events += 1;
         }
     }
-    let sync_mean = sync_lat / PICTURES as u128;
-    let overlapped_mean = overlapped_lat / PICTURES as u128;
+    let sync_mean = sync_lat / PICTURES as u64;
+    let overlapped_mean = overlapped_lat / PICTURES as u64;
     println!(
         "phases: sync mean {sync_mean}us, overlapped mean {overlapped_mean}us, \
          overlap events {events}, fulls {fulls}, walls {}us vs {}us",

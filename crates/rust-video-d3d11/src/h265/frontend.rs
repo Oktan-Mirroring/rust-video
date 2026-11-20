@@ -1,5 +1,6 @@
 //! H.265 Annex B ingest over the shared grammar.
 
+use rust_video_caps::reason::{ParseReason as ParseCore, UnsupportedReason as StreamCore};
 use rust_video_h265::{HevcError, HevcGate, ParseKind, UnsupportedKind};
 
 use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
@@ -25,47 +26,74 @@ pub(crate) const MAX_PIC_SIZE: u32 = 16384;
 pub(crate) type Ingest = rust_video_h265::Ingest<D3d11Error, Gate>;
 
 /// Tier capability gates over shared grammar output.
+#[derive(Default)]
 pub(crate) struct Gate;
 
 impl HevcError for D3d11Error {
     /// Parse failure of `kind`.
     fn parse(kind: ParseKind) -> Self {
         match kind {
-            ParseKind::EmptyCodedSize => Self::Parse(ParseReason::Range { syntax: "pic size" }),
-            ParseKind::ConformanceOutside => {
-                Self::Parse(ParseReason::ConformanceWindowOutsideCodedSize)
+            ParseKind::EmptyCodedSize => {
+                Self::Parse(ParseReason::Parse(ParseCore::Range { syntax: "pic size" }))
             }
-            ParseKind::RpsTableOversize => Self::Parse(ParseReason::Range {
+            ParseKind::ConformanceOutside => {
+                Self::Parse(ParseReason::Parse(ParseCore::ConfWinOutsideCodedSize))
+            }
+            ParseKind::RpsTableOversize => Self::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "num_short_term_ref_pic_sets",
-            }),
-            ParseKind::LtSpsOversize => Self::Parse(ParseReason::Range {
+            })),
+            ParseKind::LtSpsOversize => Self::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "num_long_term_ref_pics_sps",
-            }),
-            ParseKind::LtTotalOversize => Self::Parse(ParseReason::Range {
+            })),
+            ParseKind::LtTotalOversize => Self::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "num_long_term_pics",
-            }),
-            ParseKind::EmptySpsRps => Self::Parse(ParseReason::Range {
+            })),
+            ParseKind::EmptySpsRps => Self::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "short_term_ref_pic_set_idx",
-            }),
-            ParseKind::Range { syntax } => Self::Parse(ParseReason::Range {
+            })),
+            ParseKind::Range { syntax } => Self::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: remap_syntax(syntax),
-            }),
-            ParseKind::Truncated { syntax } => Self::Parse(ParseReason::Truncated { syntax }),
-            ParseKind::OverflowU32 { syntax } => Self::Parse(ParseReason::OverflowU32 { syntax }),
-            ParseKind::OverflowI32 { syntax } => Self::Parse(ParseReason::OverflowI32 { syntax }),
-            ParseKind::TooWide { syntax } => Self::Parse(ParseReason::TooWide { syntax }),
-            ParseKind::NalForbiddenBit => Self::Parse(ParseReason::NalForbiddenBit),
-            ParseKind::NalTemporalId => Self::Parse(ParseReason::NalTemporalId),
-            ParseKind::VpsWithoutBody => Self::Parse(ParseReason::VpsWithoutBody),
-            ParseKind::SpsWithoutBody => Self::Parse(ParseReason::SpsWithoutBody),
-            ParseKind::PpsWithoutBody => Self::Parse(ParseReason::PpsWithoutBody),
-            ParseKind::SliceWithoutHeader => Self::Parse(ParseReason::SliceWithoutHeader),
-            ParseKind::PpsCitesUnknownSps => Self::Parse(ParseReason::PpsCitesUnknownSps),
-            ParseKind::SliceCitesUnknownPps => Self::Parse(ParseReason::SliceCitesUnknownPps),
-            ParseKind::SliceCitesUnknownSps => Self::Parse(ParseReason::SliceCitesUnknownSps),
-            ParseKind::PictureSlicesDisagree => Self::Parse(ParseReason::PictureSlicesDisagree),
-            ParseKind::NonIntraSliceInIdr => Self::Parse(ParseReason::NonIntraSliceInIdr),
-            ParseKind::ShortTermRefPicSetSize => Self::Parse(ParseReason::ShortTermRefPicSetSize),
+            })),
+            ParseKind::Truncated { syntax } => {
+                Self::Parse(ParseReason::Parse(ParseCore::Truncated { syntax }))
+            }
+            ParseKind::OverflowU32 { syntax } => {
+                Self::Parse(ParseReason::Parse(ParseCore::OverflowU32 { syntax }))
+            }
+            ParseKind::OverflowI32 { syntax } => {
+                Self::Parse(ParseReason::Parse(ParseCore::OverflowI32 { syntax }))
+            }
+            ParseKind::TooWide { syntax } => {
+                Self::Parse(ParseReason::Parse(ParseCore::TooWide { syntax }))
+            }
+            ParseKind::NalForbiddenBit => {
+                Self::Parse(ParseReason::Parse(ParseCore::NalForbiddenBit))
+            }
+            ParseKind::NalTemporalId => Self::Parse(ParseReason::Parse(ParseCore::NalTemporalId)),
+            ParseKind::VpsWithoutBody => Self::Parse(ParseReason::Parse(ParseCore::VpsWithoutBody)),
+            ParseKind::SpsWithoutBody => Self::Parse(ParseReason::Parse(ParseCore::SpsWithoutBody)),
+            ParseKind::PpsWithoutBody => Self::Parse(ParseReason::Parse(ParseCore::PpsWithoutBody)),
+            ParseKind::SliceWithoutHeader => {
+                Self::Parse(ParseReason::Parse(ParseCore::SliceWithoutHeader))
+            }
+            ParseKind::PpsCitesUnknownSps => {
+                Self::Parse(ParseReason::Parse(ParseCore::PpsCitesUnknownSps))
+            }
+            ParseKind::SliceCitesUnknownPps => {
+                Self::Parse(ParseReason::Parse(ParseCore::SliceCitesUnknownPps))
+            }
+            ParseKind::SliceCitesUnknownSps => {
+                Self::Parse(ParseReason::Parse(ParseCore::SliceCitesUnknownSps))
+            }
+            ParseKind::PictureSlicesDisagree => {
+                Self::Parse(ParseReason::Parse(ParseCore::PictureSlicesDisagree))
+            }
+            ParseKind::NonIntraSliceInIdr => {
+                Self::Parse(ParseReason::Parse(ParseCore::NonIntraSliceInIdr))
+            }
+            ParseKind::ShortTermRefPicSetSize => {
+                Self::Parse(ParseReason::Parse(ParseCore::ShortTermRefPicSetSize))
+            }
         }
     }
 
@@ -73,12 +101,14 @@ impl HevcError for D3d11Error {
     fn unsupported(kind: UnsupportedKind) -> Self {
         match kind {
             UnsupportedKind::DependentSlices => {
-                Self::Unsupported(UnsupportedReason::DependentSliceSegments)
+                Self::Unsupported(UnsupportedReason::Stream(StreamCore::DependentSlices))
             }
             UnsupportedKind::ArbitrarySliceOrder => {
-                Self::Unsupported(UnsupportedReason::ArbitrarySliceOrder)
+                Self::Unsupported(UnsupportedReason::Stream(StreamCore::ArbitrarySliceOrder))
             }
-            UnsupportedKind::Multilayer => Self::Unsupported(UnsupportedReason::Multilayer),
+            UnsupportedKind::Multilayer => {
+                Self::Unsupported(UnsupportedReason::Stream(StreamCore::Multilayer))
+            }
         }
     }
 }
@@ -95,28 +125,34 @@ impl HevcGate<D3d11Error> for Gate {
     /// Sequence set against tier caps.
     fn check_sps(sps: &Sps) -> Result<(), D3d11Error> {
         if sps.chroma_format != 1 {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::ChromaOutside420));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::ChromaOutside420,
+            )));
         }
         if sps.bit_depth_luma != 0 {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::LumaDepthAbove8Bit,
-            ));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::LumaDepthAbove8Bit,
+            )));
         }
         if sps.bit_depth_chroma != 0 {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::ChromaDepthAbove8Bit,
-            ));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::ChromaDepthAbove8Bit,
+            )));
         }
         if sps.width > MAX_PIC_SIZE || sps.height > MAX_PIC_SIZE {
-            return Err(D3d11Error::Parse(ParseReason::Range { syntax: "pic size" }));
+            return Err(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
+                syntax: "pic size",
+            })));
         }
         if sps.pcm() && (sps.pcm_depth_luma > 7 || sps.pcm_depth_chroma > 7) {
-            return Err(D3d11Error::Unsupported(
-                UnsupportedReason::PcmDepthAbove8Bit,
-            ));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::PcmDepthAbove8Bit,
+            )));
         }
         if sps.ptl.source.interlaced && !sps.ptl.source.progressive {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::Interlaced));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Interlaced,
+            )));
         }
         if sps
             .ptl
@@ -124,13 +160,19 @@ impl HevcGate<D3d11Error> for Gate {
             .iter()
             .any(|layer| layer.source.interlaced && !layer.source.progressive)
         {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::Interlaced));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Interlaced,
+            )));
         }
         if sps.vui.as_ref().is_some_and(|vui| vui.field_seq) {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::Interlaced));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Interlaced,
+            )));
         }
         if sps.sps_extension_flags.iter().any(|flag| *flag) {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::SpsExtension));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::SpsExtension,
+            )));
         }
         Ok(())
     }
@@ -138,20 +180,24 @@ impl HevcGate<D3d11Error> for Gate {
     /// Picture set against tier caps with its sequence set, absent for orphans.
     fn check_pps(pps: &Pps, sps: Option<&Sps>) -> Result<(), D3d11Error> {
         let Some(sps) = sps else {
-            return Err(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::PpsCitesUnknownSps,
+            )));
         };
         if pps.sps_id != sps.id {
-            return Err(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps));
+            return Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::PpsCitesUnknownSps,
+            )));
         }
         if pps.num_ref_l0 > 14 {
-            return Err(D3d11Error::Parse(ParseReason::Range {
+            return Err(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "num_ref_idx_l0_default_active_minus1",
-            }));
+            })));
         }
         if pps.num_ref_l1 > 14 {
-            return Err(D3d11Error::Parse(ParseReason::Range {
+            return Err(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "num_ref_idx_l1_default_active_minus1",
-            }));
+            })));
         }
         if usize::from(pps.num_tile_columns) > MAX_TILE_COLUMNS
             || usize::from(pps.num_tile_rows) > MAX_TILE_ROWS
@@ -161,12 +207,14 @@ impl HevcGate<D3d11Error> for Gate {
             ));
         }
         if pps.log2_parallel_merge_minus2 > 4 {
-            return Err(D3d11Error::Parse(ParseReason::Range {
+            return Err(D3d11Error::Parse(ParseReason::Parse(ParseCore::Range {
                 syntax: "log2_parallel_merge_level_minus2",
-            }));
+            })));
         }
         if pps.pps_extension_flags.iter().any(|flag| *flag) {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::PpsExtension));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::PpsExtension,
+            )));
         }
         Ok(())
     }
@@ -177,7 +225,9 @@ impl HevcGate<D3d11Error> for Gate {
         if seen {
             Ok(())
         } else {
-            Err(D3d11Error::Parse(ParseReason::SpsCitesUnknownVps))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::SpsCitesUnknownVps,
+            )))
         }
     }
 }
@@ -191,6 +241,8 @@ mod tests {
         SPS_PCM,
     };
     use crate::error::{D3d11Error, ParseReason, UnsupportedReason};
+
+    use rust_video_caps::reason::{ParseReason as ParseCore, UnsupportedReason as StreamCore};
 
     /// Sequence set with 4:2:0 8-bit 320x240.
     fn sps() -> Sps {
@@ -289,29 +341,33 @@ mod tests {
         set.chroma_format = 2;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(UnsupportedReason::ChromaOutside420))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::ChromaOutside420
+            )))
         ));
         let mut set = sps();
         set.bit_depth_luma = 2;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(
-                UnsupportedReason::LumaDepthAbove8Bit
-            ))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::LumaDepthAbove8Bit
+            )))
         ));
         let mut set = sps();
         set.bit_depth_chroma = 2;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(
-                UnsupportedReason::ChromaDepthAbove8Bit
-            ))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::ChromaDepthAbove8Bit
+            )))
         ));
         let mut set = sps();
         set.height = MAX_PIC_SIZE + 1;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Parse(ParseReason::Range { .. }))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::Range { .. }
+            )))
         ));
     }
 
@@ -322,23 +378,27 @@ mod tests {
         set.ptl.source.progressive = false;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(UnsupportedReason::Interlaced))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::Interlaced
+            )))
         ));
         let mut set = sps();
         set.flags |= SPS_PCM;
         set.pcm_depth_luma = 8;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(
-                UnsupportedReason::PcmDepthAbove8Bit
-            ))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::PcmDepthAbove8Bit
+            )))
         ));
         let mut set = sps();
         set.sps_extension_present = true;
         set.sps_extension_flags[0] = true;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d11Error::Unsupported(UnsupportedReason::SpsExtension))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::SpsExtension
+            )))
         ));
     }
 
@@ -349,17 +409,23 @@ mod tests {
         pic.sps_id = 1;
         assert!(matches!(
             Gate::check_pps(&pic, Some(&set)),
-            Err(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::PpsCitesUnknownSps
+            )))
         ));
         assert!(matches!(
             Gate::check_pps(&pps(), None),
-            Err(D3d11Error::Parse(ParseReason::PpsCitesUnknownSps))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::PpsCitesUnknownSps
+            )))
         ));
         let mut pic = pps();
         pic.num_ref_l0 = 15;
         assert!(matches!(
             Gate::check_pps(&pic, Some(&set)),
-            Err(D3d11Error::Parse(ParseReason::Range { .. }))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::Range { .. }
+            )))
         ));
         let mut pic = pps();
         pic.num_tile_columns = 21;
@@ -373,17 +439,23 @@ mod tests {
         pic.log2_parallel_merge_minus2 = 5;
         assert!(matches!(
             Gate::check_pps(&pic, Some(&set)),
-            Err(D3d11Error::Parse(ParseReason::Range { .. }))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::Range { .. }
+            )))
         ));
         let mut pic = pps();
         pic.pps_extension_flags[1] = true;
         assert!(matches!(
             Gate::check_pps(&pic, Some(&set)),
-            Err(D3d11Error::Unsupported(UnsupportedReason::PpsExtension))
+            Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::PpsExtension
+            )))
         ));
         assert!(matches!(
             Gate::check_sps_citation(0, false),
-            Err(D3d11Error::Parse(ParseReason::SpsCitesUnknownVps))
+            Err(D3d11Error::Parse(ParseReason::Parse(
+                ParseCore::SpsCitesUnknownVps
+            )))
         ));
     }
 }

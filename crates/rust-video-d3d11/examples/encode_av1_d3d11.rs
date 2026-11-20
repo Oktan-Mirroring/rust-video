@@ -17,7 +17,8 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let mut encoder = match D3d11Encoder::open(&device, Codec::Av1) {
+    let config = D3d11Encoder::auto_config(Codec::Av1).expect("auto config");
+    let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no av1 encoder ({error})");

@@ -24,7 +24,19 @@ use crate::guid::Codec;
 use crate::submit::SubmitLock;
 
 use bytes::Bytes;
+use rust_video_caps::av1::EncodeProfile as Av1Profile;
+use rust_video_caps::color::{
+    ColorConfig, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristics,
+};
+use rust_video_caps::common::ChromaSampling;
+use rust_video_caps::encode::{
+    Decline, EncodeConfig, Gop, Level, Profile, RateControl, SpeedPreset,
+};
+use rust_video_caps::h264::{EncodeLevel as H264Level, EncodeProfile as H264Profile};
+use rust_video_caps::h265::EncodeProfile as H265Profile;
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::UnsupportedReason as StreamCore;
+use rust_video_caps::vp9::EncodeProfile as Vp9Profile;
 use windows::core::implement;
 use windows::core::ComObject;
 use windows::core::IUnknown;
@@ -38,7 +50,12 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonQualityVsSpeed, ICodecAPI, IMFActivate, IMFAsyncCallback,
+    eAVEncCommonRateControlMode_CBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncH264VProfile_Base, eAVEncH264VProfile_High, eAVEncH264VProfile_Main,
+    CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVGOPSizeMax, CODECAPI_AVEncMPVGOPSizeMin,
+    CODECAPI_AVEncVideoMaxNumRefFrame, ICodecAPI, IMFActivate, IMFAsyncCallback,
     IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes, IMFDXGIDeviceManager,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
     METransformHaveOutput, METransformNeedInput, MFCreateAlignedMemoryBuffer,
@@ -55,8 +72,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_EVENT_TYPE, MF_E_NOTACCEPTING,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_VIDEO_LEVEL, MF_MT_VIDEO_PROFILE,
+    MF_SA_D3D11_AWARE, MF_SA_D3D11_BINDFLAGS, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION,
 };
 use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
@@ -83,14 +101,263 @@ const MAX_BITRATE: u64 = 50_000_000;
 /// Landed VP9 quality-vs-speed level; 0 favors speed.
 const VP9_QUALITY_VS_SPEED: u32 = 0;
 
+/// Balanced quality-vs-speed level behind the balanced preset.
+const BALANCED_QUALITY_VS_SPEED: u32 = 50;
+
+/// Compression quality-vs-speed level behind the quality preset.
+const QUALITY_QUALITY_VS_SPEED: u32 = 100;
+
+/// Reference frames ceiling behind the GOP gate.
+const MAX_REF_FRAMES: u8 = 16;
+
+/// Consecutive B-frames ceiling behind the GOP gate.
+const MAX_B_FRAMES: u8 = 2;
+
 /// Catalog walk bound in entries.
 const AVAILABLE_TYPES: u32 = 64;
 
 /// Catalog entry reader behind the type walk.
 type Available = unsafe fn(&IMFTransform, u32, u32) -> windows::core::Result<IMFMediaType>;
 
+/// Resolved MF knobs behind one encode session.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EncodePlan {
+    /// Codec the session encodes.
+    codec: Codec,
+    /// Target bitrate in bps, absent for the area-scaled recipe.
+    bitrate: Option<u32>,
+    /// Codec-API rate-control mode, absent when unset.
+    rate_mode: Option<u32>,
+    /// Peak bitrate in bps, absent when unset.
+    max_bitrate: Option<u32>,
+    /// Frame rate in frames per period.
+    fps: (u32, u32),
+    /// Sample duration in 100ns units.
+    frame_hns: i64,
+    /// Keyframe cadence in frames, absent when unset.
+    gop: Option<u32>,
+    /// Minimum keyframe cadence in frames, absent when unset.
+    gop_min: Option<u32>,
+    /// Maximum keyframe cadence in frames, absent when unset.
+    gop_max: Option<u32>,
+    /// Consecutive B-frames, absent when unset.
+    b_frames: Option<u32>,
+    /// Reference frames, absent when unset.
+    max_refs: Option<u32>,
+    /// Quality-vs-speed level, absent for legacy tuning.
+    qvs: Option<u32>,
+    /// H.264 profile idc, absent when unset.
+    profile: Option<u32>,
+    /// H.264 level idc, absent when unset.
+    level: Option<u32>,
+}
+
+impl EncodePlan {
+    /// MF knobs behind `config`.
+    ///
+    /// Automatic rate control resolves the legacy recipe: area-scaled
+    /// bitrate, 30 fps, MFT-picked profile and level, VP9 speed
+    /// tuning only. Explicit rate control maps every knob; the VBV
+    /// buffer stays MFT-managed and non-H.264 levels stay MFT-picked.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`Decline`] when `config` fails validation
+    /// or exceeds the tier.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - rate, structure, quality, profile, level, depth,
+    ///   chroma, frame rate, and color behind the session.
+    pub(crate) fn resolve(config: &EncodeConfig) -> Result<Self, Decline> {
+        config.validate()?;
+        let codec = config.codec();
+        let allowed = Self::check_profile(config.profile)?;
+        Self::check_input(config.bit_depth, config.chroma)?;
+        Self::check_color(config.color)?;
+        let gop = config.gop;
+        Self::check_gop(gop)?;
+        let (bitrate, rate_mode, max_bitrate, legacy) = match config.rate_control {
+            RateControl::Auto => (None, None, None, true),
+            RateControl::Cbr {
+                bitrate, maxrate, ..
+            } => (
+                Some(bitrate),
+                Some(u32_flag(eAVEncCommonRateControlMode_CBR.0)),
+                Some(maxrate),
+                false,
+            ),
+            RateControl::Vbr { bitrate, maxrate } => (
+                Some(bitrate),
+                Some(u32_flag(eAVEncCommonRateControlMode_PeakConstrainedVBR.0)),
+                Some(maxrate),
+                false,
+            ),
+            RateControl::Cqp { .. } | RateControl::Crf { .. } => {
+                return Err(Decline::RateControlUnsupported {
+                    mode: config.rate_control,
+                });
+            }
+        };
+        if legacy {
+            return Ok(Self {
+                codec,
+                bitrate: None,
+                rate_mode: None,
+                max_bitrate: None,
+                fps: (FRAME_RATE, 1),
+                frame_hns: FRAME_HNS,
+                gop: None,
+                gop_min: None,
+                gop_max: None,
+                b_frames: None,
+                max_refs: None,
+                qvs: None,
+                profile: None,
+                level: None,
+            });
+        }
+        let level = match config.level {
+            Level::H264(H264Level::Pinned(level)) => Some(u32::from(level.idc())),
+            _ => None,
+        };
+        Ok(Self {
+            codec,
+            bitrate,
+            rate_mode,
+            max_bitrate,
+            fps: (config.frame_rate.num, config.frame_rate.den),
+            frame_hns: 10_000_000i64.saturating_mul(i64::from(config.frame_rate.den))
+                / i64::from(config.frame_rate.num),
+            gop: Some(gop.keyint),
+            gop_min: Some(gop.min_keyint),
+            gop_max: Some(gop.keyint),
+            b_frames: Some(u32::from(gop.b_frames)),
+            max_refs: Some(u32::from(gop.refs)),
+            qvs: Some(match config.quality.preset {
+                SpeedPreset::Realtime => VP9_QUALITY_VS_SPEED,
+                SpeedPreset::Balanced => BALANCED_QUALITY_VS_SPEED,
+                SpeedPreset::Quality => QUALITY_QUALITY_VS_SPEED,
+            }),
+            profile: allowed,
+            level,
+        })
+    }
+
+    /// Signaled H.264 profile idc behind `profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Decline::ProfileUnsupported`] for a profile outside
+    /// the 8-bit 4:2:0 allowlist.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile` - requested encode profile.
+    fn check_profile(profile: Profile) -> Result<Option<u32>, Decline> {
+        Ok(match profile {
+            Profile::H264(H264Profile::Baseline) => Some(u32_flag(eAVEncH264VProfile_Base.0)),
+            Profile::H264(H264Profile::Main) => Some(u32_flag(eAVEncH264VProfile_Main.0)),
+            Profile::H264(H264Profile::High) => Some(u32_flag(eAVEncH264VProfile_High.0)),
+            Profile::H265(H265Profile::Main)
+            | Profile::Av1(Av1Profile::Main)
+            | Profile::Vp9(Vp9Profile::P0) => None,
+            _ => return Err(Decline::ProfileUnsupported { profile }),
+        })
+    }
+
+    /// 8-bit 4:2:0 input behind `depth` and `chroma`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Decline::BitDepthUnsupported`] above 8 bit or
+    /// [`Decline::ChromaUnsupported`] outside 4:2:0.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - requested bits per sample.
+    /// * `chroma` - requested chroma sampling.
+    fn check_input(depth: u8, chroma: ChromaSampling) -> Result<(), Decline> {
+        if depth != 8 {
+            return Err(Decline::BitDepthUnsupported {
+                actual: depth,
+                max: 8,
+            });
+        }
+        if chroma != ChromaSampling::Yuv420 {
+            return Err(Decline::ChromaUnsupported { chroma });
+        }
+        Ok(())
+    }
+
+    /// BT.709 SDR behind `color`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Decline::HdrUnsupported`] with HDR metadata or the
+    /// per-component decline off the BT.709 baseline.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - requested color description.
+    fn check_color(color: ColorConfig) -> Result<(), Decline> {
+        if color.is_hdr() {
+            return Err(Decline::HdrUnsupported);
+        }
+        if color.primaries != ColorPrimaries::Bt709 {
+            return Err(Decline::PrimariesUnsupported {
+                primaries: color.primaries,
+            });
+        }
+        if color.transfer != TransferCharacteristics::Bt709 {
+            return Err(Decline::TransferUnsupported {
+                transfer: color.transfer,
+            });
+        }
+        if color.matrix != MatrixCoefficients::Bt709 {
+            return Err(Decline::MatrixUnsupported {
+                matrix: color.matrix,
+            });
+        }
+        if color.range != ColorRange::Limited {
+            return Err(Decline::RangeUnsupported { range: color.range });
+        }
+        Ok(())
+    }
+
+    /// Bounded prediction budget behind `gop`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Decline::GopInvalid`] without references,
+    /// [`Decline::RefsUnsupported`] or [`Decline::BFramesUnsupported`]
+    /// past the tier ceilings.
+    ///
+    /// # Arguments
+    ///
+    /// * `gop` - requested keyframe cadence plus prediction budget.
+    fn check_gop(gop: Gop) -> Result<(), Decline> {
+        if gop.refs == 0 {
+            return Err(Decline::GopInvalid { gop });
+        }
+        if gop.refs > MAX_REF_FRAMES {
+            return Err(Decline::RefsUnsupported {
+                actual: gop.refs,
+                max: MAX_REF_FRAMES,
+            });
+        }
+        if gop.b_frames > MAX_B_FRAMES {
+            return Err(Decline::BFramesUnsupported {
+                actual: gop.b_frames,
+                max: MAX_B_FRAMES,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Negotiated encoder session over one `MediaFoundation` transform.
-pub struct Session {
+pub(crate) struct Session {
     /// Encoder transform.
     transform: IMFTransform,
     /// Input stream id.
@@ -119,6 +386,8 @@ pub struct Session {
     subtype: GUID,
     /// Codec the session encodes.
     codec: Codec,
+    /// Resolved MF knobs behind the session.
+    plan: EncodePlan,
     /// Applied VP9 speed tuning, absent off the VP9 path or without the property.
     vp9_tuning: Option<Vp9Tuning>,
     /// Negotiated extent, absent before the first frame.
@@ -132,18 +401,21 @@ pub struct Session {
 }
 
 impl Session {
-    /// Session over `device` for `codec` behind the first matching encoder MFT.
+    /// Session over `device` for `config` behind the first matching encoder MFT.
     ///
     /// # Errors
     ///
-    /// Returns `Err` without `MediaFoundation`, or without a
-    /// `codec` encoder MFT on the machine.
-    pub fn open(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
-        Self::open_windows(device, codec)
+    /// Returns `Err` when `config` fails validation or exceeds the
+    /// tier, without `MediaFoundation`, or without a `config` codec
+    /// encoder MFT on the machine.
+    pub(crate) fn open(device: &D3d11Device, config: EncodeConfig) -> Result<Self, D3d11Error> {
+        Self::open_windows(device, config)
     }
 
-    /// Session over `device` for `codec`.
-    fn open_windows(device: &D3d11Device, codec: Codec) -> Result<Self, D3d11Error> {
+    /// Session over `device` for `config`.
+    fn open_windows(device: &D3d11Device, config: EncodeConfig) -> Result<Self, D3d11Error> {
+        let plan = EncodePlan::resolve(&config)?;
+        let codec = plan.codec;
         let _com = ComGuard::enter();
         startup()?;
         let mut standby = VecDeque::new();
@@ -175,6 +447,7 @@ impl Session {
             standby,
             subtype,
             codec,
+            plan,
             vp9_tuning: None,
             size: None,
             pts: 0,
@@ -203,7 +476,7 @@ impl Session {
 
     /// True when the transform reports D3D11 awareness.
     #[must_use]
-    pub fn uses_d3d11(&self) -> bool {
+    pub(crate) fn uses_d3d11(&self) -> bool {
         self.d3d11_aware
     }
 
@@ -215,13 +488,13 @@ impl Session {
 
     /// Name of the serving encoder MFT.
     #[must_use]
-    pub fn mft_name(&self) -> &str {
+    pub(crate) fn mft_name(&self) -> &str {
         &self.name
     }
 
     /// Applied VP9 speed tuning, absent off the VP9 path or without the property.
     #[must_use]
-    pub fn vp9_tuning(&self) -> Option<Vp9Tuning> {
+    pub(crate) fn vp9_tuning(&self) -> Option<Vp9Tuning> {
         self.vp9_tuning
     }
 
@@ -231,7 +504,7 @@ impl Session {
     ///
     /// Returns `Err` when the extent overflows the sample buffer, or when
     /// the transform refuses the frame.
-    pub fn encode(
+    pub(crate) fn encode(
         &mut self,
         width: u32,
         height: u32,
@@ -254,13 +527,14 @@ impl Session {
         fill: impl FnOnce(&mut [u8]),
     ) -> Result<IMFSample, D3d11Error> {
         let pts = self.pts;
+        let hns = self.plan.frame_hns;
         if let Some(sample) = self.spare_inputs.pop() {
             let bytes = u32::try_from(len)
                 .map_err(|_| D3d11Error::Unsupported(UnsupportedReason::FrameOver4Gib))?;
-            fill_sample(&sample, bytes, pts, fill)?;
+            fill_sample(&sample, bytes, pts, hns, fill)?;
             return Ok(sample);
         }
-        input_sample(len, self.in_align, pts, fill)
+        input_sample(len, self.in_align, pts, hns, fill)
     }
 
     /// Drained packets across the size switch to `width` x `height`.
@@ -283,7 +557,7 @@ impl Session {
         sample: &IMFSample,
         packets: &mut Vec<Packet>,
     ) -> Result<(), D3d11Error> {
-        self.pts = self.pts.wrapping_add(FRAME_HNS);
+        self.pts = self.pts.wrapping_add(self.plan.frame_hns);
         let outcome = if self.pump.is_some() {
             self.submit_async(sample, packets)
         } else {
@@ -325,7 +599,9 @@ impl Session {
     ) -> Result<Vec<Packet>, D3d11Error> {
         let _com = ComGuard::enter();
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(D3d11Error::Unsupported(UnsupportedReason::OddNv12Extent));
+            return Err(D3d11Error::Unsupported(UnsupportedReason::Stream(
+                StreamCore::OddNv12Extent,
+            )));
         }
         let mut packets = self.ensure_size(width, height)?;
         let region = Region {
@@ -348,7 +624,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns `Err` when the transform refuses the drain.
-    pub fn flush(&mut self) -> Result<Vec<Packet>, D3d11Error> {
+    pub(crate) fn flush(&mut self) -> Result<Vec<Packet>, D3d11Error> {
         let _com = ComGuard::enter();
         if self.size.is_none() {
             return Ok(Vec::new());
@@ -372,7 +648,7 @@ impl Session {
     fn configure_try(&mut self, width: u32, height: u32) -> Result<(), D3d11Error> {
         self.set_output_type(width, height)?;
         self.set_input_type(width, height)?;
-        self.tune_vp9();
+        self.tune();
         let bound = self
             .gpu
             .as_ref()
@@ -399,15 +675,23 @@ impl Session {
 
     /// Output media type for `width` x `height` behind the target bitrate.
     fn set_output_type(&self, width: u32, height: u32) -> Result<(), D3d11Error> {
-        let target = bitrate(width, height);
+        let target = self.plan.bitrate.unwrap_or_else(|| bitrate(width, height));
         let output_type = find_available(
             &self.transform,
             self.output,
             &self.subtype,
             IMFTransform::GetOutputAvailableType,
         )
-        .map_or_else(|| media_type(self.subtype, width, height, Some(target)), Ok)?;
-        stamp(&output_type, width, height, Some(target))?;
+        .map_or_else(|| media_type(self.subtype), Ok)?;
+        stamp_output(
+            &output_type,
+            width,
+            height,
+            self.plan.fps,
+            target,
+            self.plan.profile,
+            self.plan.level,
+        )?;
         // Sound: the transform and type are live.
         call(
             unsafe { self.transform.SetOutputType(self.output, &output_type, 0) },
@@ -423,8 +707,8 @@ impl Session {
             &MFVideoFormat_NV12,
             IMFTransform::GetInputAvailableType,
         )
-        .map_or_else(|| media_type(MFVideoFormat_NV12, width, height, None), Ok)?;
-        stamp(&input_type, width, height, None)?;
+        .map_or_else(|| media_type(MFVideoFormat_NV12), Ok)?;
+        stamp_input(&input_type, width, height, self.plan.fps)?;
         // Sound: the transform and type are live.
         call(
             unsafe { self.transform.SetInputType(self.input, &input_type, 0) },
@@ -432,16 +716,41 @@ impl Session {
         )
     }
 
-    /// Fastest VP9 speed level through the codec API, best-effort.
-    fn tune_vp9(&mut self) {
+    /// Codec-API knobs behind the plan, each property best-effort.
+    fn tune(&mut self) {
         self.vp9_tuning = None;
-        if self.codec != Codec::Vp9 {
-            return;
-        }
         let Ok(codec) = self.codec_api() else {
             return;
         };
-        self.vp9_tuning = Vp9Tuning::apply(&codec);
+        if self.codec == Codec::Vp9 {
+            self.vp9_tuning = match self.plan.qvs {
+                Some(level) => Vp9Tuning::apply_level(&codec, level),
+                None => Vp9Tuning::apply(&codec),
+            };
+        } else if let Some(level) = self.plan.qvs {
+            set_codec_u32(&codec, &CODECAPI_AVEncCommonQualityVsSpeed, level);
+        }
+        if let Some(mode) = self.plan.rate_mode {
+            set_codec_u32(&codec, &CODECAPI_AVEncCommonRateControlMode, mode);
+        }
+        if let Some(max) = self.plan.max_bitrate {
+            set_codec_u32(&codec, &CODECAPI_AVEncCommonMaxBitRate, max);
+        }
+        if let Some(gop) = self.plan.gop {
+            set_codec_u32(&codec, &CODECAPI_AVEncMPVGOPSize, gop);
+        }
+        if let Some(min) = self.plan.gop_min {
+            set_codec_u32(&codec, &CODECAPI_AVEncMPVGOPSizeMin, min);
+        }
+        if let Some(max) = self.plan.gop_max {
+            set_codec_u32(&codec, &CODECAPI_AVEncMPVGOPSizeMax, max);
+        }
+        if let Some(b) = self.plan.b_frames {
+            set_codec_u32(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, b);
+        }
+        if let Some(refs) = self.plan.max_refs {
+            set_codec_u32(&codec, &CODECAPI_AVEncVideoMaxNumRefFrame, refs);
+        }
     }
 
     /// Codec API behind the transform, absent without the interface.
@@ -600,8 +909,13 @@ impl Session {
                 }
                 if is_event(typ, METransformHaveOutput) {
                     self.try_output(&mut packets)?;
+                } else if is_event(typ, METransformNeedInput) {
+                    self.credits += 1;
                 }
             }
+            // Draining ends the streaming segment; re-arm input requests.
+            self.message(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING)?;
+            self.message(MFT_MESSAGE_NOTIFY_START_OF_STREAM)?;
         } else {
             self.collect_sync(&mut packets)?;
         }
@@ -682,13 +996,18 @@ pub struct Vp9Tuning {
 
 impl Vp9Tuning {
     /// Fastest tuning through `codec`, absent without the speed property.
+    pub(crate) fn apply(codec: &ICodecAPI) -> Option<Self> {
+        Self::apply_level(codec, VP9_QUALITY_VS_SPEED)
+    }
+
+    /// `level` through `codec`, absent without the speed property.
     ///
     /// 0 favors speed over quality per
     /// [AVEncCommonQualityVsSpeed](https://learn.microsoft.com/en-us/windows/win32/directshow/avenccommonqualityvsspeed-property).
-    pub(crate) fn apply(codec: &ICodecAPI) -> Option<Self> {
-        let value = variant_u32(VP9_QUALITY_VS_SPEED);
-        // Sound: the codec and value are live for the set.
-        unsafe { codec.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &value) }.ok()?;
+    pub(crate) fn apply_level(codec: &ICodecAPI, level: u32) -> Option<Self> {
+        if !set_codec_u32(codec, &CODECAPI_AVEncCommonQualityVsSpeed, level) {
+            return None;
+        }
         // Sound: the codec is live; the property was just set.
         let current = unsafe { codec.GetValue(&CODECAPI_AVEncCommonQualityVsSpeed) }.ok()?;
         read_u32(&current).map(|quality_vs_speed| Self { quality_vs_speed })
@@ -699,6 +1018,13 @@ impl Vp9Tuning {
     pub fn quality_vs_speed(&self) -> u32 {
         self.quality_vs_speed
     }
+}
+
+/// `value` behind `property` on `codec`; false when the MFT refuses it.
+fn set_codec_u32(codec: &ICodecAPI, property: &GUID, value: u32) -> bool {
+    let value = variant_u32(value);
+    // Sound: the codec and value are live for the set.
+    unsafe { codec.SetValue(property, &value) }.is_ok()
 }
 
 /// `VARIANT` holding `value` as `VT_UI4`.
@@ -1192,7 +1518,7 @@ fn startup() -> Result<(), D3d11Error> {
 
 /// Unsupported error naming the absent `codec` encoder MFT.
 fn missing_encoder(codec: Codec) -> D3d11Error {
-    D3d11Error::Unsupported(UnsupportedReason::NoEncoderMft { codec })
+    D3d11Error::Unsupported(UnsupportedReason::NoEncoder { codec })
 }
 
 /// Output subtypes for `codec`, preferred first.
@@ -1204,6 +1530,17 @@ fn subtypes(codec: Codec) -> &'static [GUID] {
         Codec::Av1 => &[MFVideoFormat_AV1],
         Codec::Vp8 | Codec::Av2 | Codec::Mpeg2 | Codec::Vc1 => &[],
     }
+}
+
+/// True when the catalog lists a `codec` encoder MFT, without activating.
+pub(crate) fn has_encoder(codec: Codec) -> bool {
+    let _com = ComGuard::enter();
+    if startup().is_err() {
+        return false;
+    }
+    subtypes(codec)
+        .iter()
+        .any(|subtype| !enumerate(subtype).is_empty())
 }
 
 /// Encoder activates for `subtype`, hardware before software.
@@ -1402,13 +1739,8 @@ fn find_available(
     None
 }
 
-/// Video media type for `subtype` at `width` x `height`.
-fn media_type(
-    subtype: GUID,
-    width: u32,
-    height: u32,
-    bitrate: Option<u32>,
-) -> Result<IMFMediaType, D3d11Error> {
+/// Video media type for `subtype`, stamped by the caller.
+fn media_type(subtype: GUID) -> Result<IMFMediaType, D3d11Error> {
     // Sound: the created type is live for every set below.
     let media = call(unsafe { MFCreateMediaType() }, "MFCreateMediaType")?;
     call(
@@ -1419,16 +1751,15 @@ fn media_type(
         unsafe { media.SetGUID(&MF_MT_SUBTYPE, &raw const subtype) },
         "SetGUID",
     )?;
-    stamp(&media, width, height, bitrate)?;
     Ok(media)
 }
 
 /// Frame geometry plus rate on `media`.
-fn stamp(
+fn stamp_input(
     media: &IMFMediaType,
     width: u32,
     height: u32,
-    bitrate: Option<u32>,
+    fps: (u32, u32),
 ) -> Result<(), D3d11Error> {
     // Sound: the borrowed type is live for every set below.
     call(
@@ -1436,7 +1767,7 @@ fn stamp(
         "SetUINT64",
     )?;
     call(
-        unsafe { media.SetUINT64(&MF_MT_FRAME_RATE, pack(FRAME_RATE, 1)) },
+        unsafe { media.SetUINT64(&MF_MT_FRAME_RATE, pack(fps.0, fps.1)) },
         "SetUINT64",
     )?;
     call(
@@ -1452,9 +1783,34 @@ fn stamp(
         unsafe { media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)) },
         "SetUINT64",
     )?;
-    if let Some(bitrate) = bitrate {
+    Ok(())
+}
+
+/// Output geometry, rate, bitrate, profile, and level on `media`.
+fn stamp_output(
+    media: &IMFMediaType,
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    bitrate: u32,
+    profile: Option<u32>,
+    level: Option<u32>,
+) -> Result<(), D3d11Error> {
+    stamp_input(media, width, height, fps)?;
+    // Sound: the borrowed type is live for every set below.
+    call(
+        unsafe { media.SetUINT32(&MF_MT_AVG_BITRATE, bitrate) },
+        "SetUINT32",
+    )?;
+    if let Some(profile) = profile {
         call(
-            unsafe { media.SetUINT32(&MF_MT_AVG_BITRATE, bitrate) },
+            unsafe { media.SetUINT32(&MF_MT_VIDEO_PROFILE, profile) },
+            "SetUINT32",
+        )?;
+    }
+    if let Some(level) = level {
+        call(
+            unsafe { media.SetUINT32(&MF_MT_VIDEO_LEVEL, level) },
             "SetUINT32",
         )?;
     }
@@ -1492,6 +1848,7 @@ fn input_sample(
     len: u64,
     align: u32,
     pts: i64,
+    hns: i64,
     fill: impl FnOnce(&mut [u8]),
 ) -> Result<IMFSample, D3d11Error> {
     let len = u32::try_from(len)
@@ -1503,7 +1860,7 @@ fn input_sample(
         "MFCreateAlignedMemoryBuffer",
     )?;
     call(unsafe { sample.AddBuffer(&buffer) }, "AddBuffer")?;
-    fill_sample(&sample, len, pts, fill)?;
+    fill_sample(&sample, len, pts, hns, fill)?;
     Ok(sample)
 }
 
@@ -1512,6 +1869,7 @@ fn fill_sample(
     sample: &IMFSample,
     len: u32,
     pts: i64,
+    hns: i64,
     fill: impl FnOnce(&mut [u8]),
 ) -> Result<(), D3d11Error> {
     // Sound: the sample is live past output.
@@ -1527,7 +1885,7 @@ fn fill_sample(
     call(unsafe { buffer.SetCurrentLength(len) }, "SetCurrentLength")?;
     call(unsafe { sample.SetSampleTime(pts) }, "SetSampleTime")?;
     call(
-        unsafe { sample.SetSampleDuration(FRAME_HNS) },
+        unsafe { sample.SetSampleDuration(hns) },
         "SetSampleDuration",
     )?;
     Ok(())
@@ -1637,6 +1995,7 @@ mod tests {
     #[test]
     fn async_session_opens_and_drops() {
         use crate::device::D3d11Device;
+        use crate::encoder::D3d11Encoder;
         use crate::guid::Codec;
 
         use super::Session;
@@ -1657,7 +2016,8 @@ mod tests {
                 return;
             }
         };
-        let session = match Session::open(&device, Codec::H264) {
+        let config = D3d11Encoder::auto_config(Codec::H264).expect("h264 auto");
+        let session = match Session::open(&device, config) {
             Ok(session) => session,
             Err(error) => {
                 println!("d3d11 skipped: {error}");
@@ -1671,5 +2031,237 @@ mod tests {
             "sync"
         };
         println!("d3d11 session: {name} ({path})");
+    }
+
+    /// Resolved plan behind `config`, failing loud on decline.
+    fn plan_of(config: &rust_video_caps::encode::EncodeConfig) -> super::EncodePlan {
+        super::EncodePlan::resolve(config).expect("plan resolves")
+    }
+
+    #[test]
+    fn auto_resolves_legacy_recipe() {
+        use rust_video_caps::encode::{EncodeConfig, RateControl};
+
+        let config = EncodeConfig {
+            rate_control: RateControl::Auto,
+            ..EncodeConfig::default()
+        };
+        let plan = plan_of(&config);
+        assert_eq!(plan.codec, crate::guid::Codec::H264);
+        assert_eq!(plan.bitrate, None);
+        assert_eq!(plan.rate_mode, None);
+        assert_eq!(plan.max_bitrate, None);
+        assert_eq!(plan.fps, (30, 1));
+        assert_eq!(plan.frame_hns, super::FRAME_HNS);
+        assert_eq!(plan.gop, None);
+        assert_eq!(plan.qvs, None);
+        assert_eq!(plan.profile, None);
+        assert_eq!(plan.level, None);
+    }
+
+    #[test]
+    fn default_cbr_maps_bitrate_and_profile() {
+        use rust_video_caps::encode::EncodeConfig;
+
+        let plan = plan_of(&EncodeConfig::default());
+        assert_eq!(plan.codec, crate::guid::Codec::H264);
+        assert_eq!(plan.bitrate, Some(5_000_000));
+        assert_eq!(plan.rate_mode, Some(0));
+        assert_eq!(plan.max_bitrate, Some(5_000_000));
+        assert_eq!(plan.fps, (30, 1));
+        assert_eq!(plan.gop, Some(60));
+        assert_eq!(plan.gop_min, Some(60));
+        assert_eq!(plan.gop_max, Some(60));
+        assert_eq!(plan.b_frames, Some(0));
+        assert_eq!(plan.max_refs, Some(1));
+        assert_eq!(plan.qvs, Some(0));
+        assert_eq!(plan.profile, Some(77));
+        assert_eq!(plan.level, None);
+    }
+
+    #[test]
+    fn vbr_maps_peak_constrained_mode() {
+        use rust_video_caps::encode::{EncodeConfig, RateControl};
+
+        let config = EncodeConfig {
+            rate_control: RateControl::Vbr {
+                bitrate: 2_000_000,
+                maxrate: 4_000_000,
+            },
+            ..EncodeConfig::default()
+        };
+        let plan = plan_of(&config);
+        assert_eq!(plan.bitrate, Some(2_000_000));
+        assert_eq!(plan.rate_mode, Some(1));
+        assert_eq!(plan.max_bitrate, Some(4_000_000));
+    }
+
+    #[test]
+    fn fps_maps_rate_and_sample_duration() {
+        use rust_video_caps::encode::{EncodeConfig, FrameRate};
+
+        let config = EncodeConfig {
+            frame_rate: FrameRate { num: 60, den: 1 },
+            ..EncodeConfig::default()
+        };
+        let plan = plan_of(&config);
+        assert_eq!(plan.fps, (60, 1));
+        assert_eq!(plan.frame_hns, super::FRAME_HNS / 2);
+        let config = EncodeConfig {
+            frame_rate: FrameRate {
+                num: 30_000,
+                den: 1001,
+            },
+            ..EncodeConfig::default()
+        };
+        let plan = plan_of(&config);
+        assert_eq!(plan.frame_hns, 333_666);
+    }
+
+    #[test]
+    fn presets_map_quality_vs_speed() {
+        use rust_video_caps::encode::{EncodeConfig, Quality, SpeedPreset};
+
+        for (preset, qvs) in [
+            (SpeedPreset::Realtime, 0),
+            (SpeedPreset::Balanced, 50),
+            (SpeedPreset::Quality, 100),
+        ] {
+            let config = EncodeConfig {
+                quality: Quality { preset },
+                ..EncodeConfig::default()
+            };
+            assert_eq!(plan_of(&config).qvs, Some(qvs));
+        }
+    }
+
+    #[test]
+    fn pinned_h264_level_maps_idc() {
+        use rust_video_caps::encode::{EncodeConfig, Level};
+        use rust_video_caps::h264;
+
+        let config = EncodeConfig {
+            level: Level::H264(h264::EncodeLevel::Pinned(h264::Level::L4)),
+            ..EncodeConfig::default()
+        };
+        assert_eq!(plan_of(&config).level, Some(40));
+        let config = EncodeConfig {
+            profile: super::Profile::H265(super::H265Profile::Main),
+            level: Level::H265(rust_video_caps::h265::EncodeLevel::Pinned(
+                rust_video_caps::h265::Level::L4,
+            )),
+            ..EncodeConfig::default()
+        };
+        assert_eq!(plan_of(&config).level, None);
+    }
+
+    #[test]
+    fn unsupported_knobs_decline_typed() {
+        use rust_video_caps::color::{ColorPrimaries, ContentLight};
+        use rust_video_caps::common::ChromaSampling;
+        use rust_video_caps::encode::{Decline, EncodeConfig, Gop, Level, Profile, RateControl};
+
+        // VP8 names no encoder MFT.
+        let config = EncodeConfig {
+            profile: Profile::Vp8,
+            level: Level::Vp8,
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::ProfileUnsupported { .. })
+        ));
+        // 10-bit profiles decline.
+        let config = EncodeConfig {
+            profile: Profile::H264(super::H264Profile::High10),
+            bit_depth: 10,
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::ProfileUnsupported { .. })
+        ));
+        // 10-bit depth declines under an allowlisted 10-bit profile.
+        let config = EncodeConfig {
+            profile: Profile::Av1(super::Av1Profile::Main),
+            level: Level::Av1(rust_video_caps::av1::EncodeLevel::Auto),
+            bit_depth: 10,
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::BitDepthUnsupported { .. })
+        ));
+        // Off-420 chroma declines.
+        let config = EncodeConfig {
+            profile: Profile::H264(super::H264Profile::High),
+            chroma: ChromaSampling::Yuv422,
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::ChromaUnsupported { .. })
+        ));
+        // HDR metadata declines.
+        let mut config = EncodeConfig::default();
+        config.color.light = Some(ContentLight {
+            max_cll: 1000,
+            max_fall: 400,
+        });
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::HdrUnsupported)
+        ));
+        // Off-baseline primaries decline.
+        let mut config = EncodeConfig::default();
+        config.color.primaries = ColorPrimaries::Bt2020;
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::PrimariesUnsupported { .. })
+        ));
+        // CQP and CRF decline.
+        for mode in [RateControl::Cqp { qp: 23 }, RateControl::Crf { value: 23 }] {
+            let config = EncodeConfig {
+                rate_control: mode,
+                ..EncodeConfig::default()
+            };
+            assert!(matches!(
+                super::EncodePlan::resolve(&config),
+                Err(Decline::RateControlUnsupported { .. })
+            ));
+        }
+        // Prediction budget overruns decline.
+        let config = EncodeConfig {
+            gop: Gop {
+                b_frames: 3,
+                ..Gop::default()
+            },
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::BFramesUnsupported { .. })
+        ));
+        let config = EncodeConfig {
+            gop: Gop {
+                refs: 17,
+                ..Gop::default()
+            },
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::RefsUnsupported { .. })
+        ));
+        // Structural breaks surface first.
+        let config = EncodeConfig {
+            profile: Profile::H264(super::H264Profile::Main),
+            level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+            ..EncodeConfig::default()
+        };
+        assert!(matches!(
+            super::EncodePlan::resolve(&config),
+            Err(Decline::ProfileLevelMismatch { .. })
+        ));
     }
 }
