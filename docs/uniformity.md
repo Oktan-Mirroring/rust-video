@@ -58,3 +58,5 @@ Every tier ships `e2e.rs`, `uniform.rs`, `surface_contract.rs`, `overlap.rs`, `a
 | `encode/` + `decode/` folders | absent | only seven files are one-sided in both DX crates, and nesting them splits helpers from the codec folders they serve |
 | `d3d12/examples/common/hevc.rs` | keeps its name | pinned by tests through `#[path]`; tests are out of rename scope |
 | missing encode/decode examples | absent per tier | each gap matches a missing API constructor |
+| sustained legs, untimed prime | d11 hevc/av1/vp9 + d12 hevc/av1 prime 4 packets untimed; d11/d12 h264 + vk time the cold pass | steady-state cutover landed per leg (270ed46, 974b39a); primed and unprimed numbers measure different quantities |
+| xcode warmup content | d12 warms on the timed content; d11 warms on alien packets | 270ed46 fixed d12's mid-bench reconfigure; d11 keeps the old warmup |

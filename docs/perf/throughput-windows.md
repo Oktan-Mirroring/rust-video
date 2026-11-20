@@ -1,8 +1,8 @@
 # Windows throughput vs FFmpeg
 
-d3d12 h265 surface matches ffmpeg NVDEC frame for frame (1300 vs 1290 fps); vulkan sustained overlap beats it on identical bytes (3047 vs 1458). Sustained legs share gold bytes, with a downloaded pair per codec; sync and surface legs run legacy vectors against gold testsrc. Software legs are ffmpeg one-sided. Encode settings differ both sides: encode percents diagnose only.
+d3d12 h265 surface beats ffmpeg NVDEC by half again (1995 vs 1290 fps); vulkan h264 sustained nearly doubles it on identical bytes (2881 vs 1458). Sustained legs share gold bytes, with a downloaded pair per codec; sync and surface legs run legacy vectors against gold testsrc. Software legs are ffmpeg one-sided. Encode settings differ both sides: encode percents diagnose only.
 
-Release test profile, ITERS=30 sync legs, 120-frame IP sustained legs, rv median of 3 on d3d11 else mean of 2, gold rebaseline medians reused (vectors unchanged), quiet box, run 2026-11-20.
+Release test profile, ITERS=30 sync legs, 120-frame IP sustained legs (d11 hevc/av1/vp9 and d12 hevc/av1 prime 4 packets untimed, the rest time the cold pass), rv median of 3 on d3d11 else mean of 2 (d11 av1 decode isolated: full-binary collapses half the runs), gold rebaseline medians reused (vectors unchanged), quiet box, run 2026-11-20.
 
 ## Environment
 
@@ -77,50 +77,52 @@ Surface, gpu-resident both sides:
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| d3d11 h264 surface | 1458 | 2431 | +66.7% |
-| d3d12 h264 surface | 1458 | 2193 | +50.4% |
-| vulkan h264 surface | 1458 | 3713 | +154.7% |
-| d3d11 h265 surface | 1290 | 1504 | +16.6% |
-| d3d12 h265 surface | 1290 | 1300 | +0.8% |
-| vulkan h265 surface | 1290 | 1551 | +20.2% |
-| d3d11 av1 surface | 1242 | 921 | -25.8% |
-| d3d12 av1 surface | 1242 | 986 | -20.6% |
-| vulkan av1 surface | 1242 | 1275 | +2.7% |
-| d3d11 vp9 surface, MFT software | 1080 | 267 | -75.3% |
+| d3d11 h264 surface | 1458 | 3210 | +120.2% |
+| d3d12 h264 surface | 1458 | 4956 | +239.9% |
+| vulkan h264 surface | 1458 | 3826 | +162.4% |
+| d3d11 h265 surface | 1290 | 1550 | +20.2% |
+| d3d12 h265 surface | 1290 | 1995 | +54.7% |
+| vulkan h265 surface | 1290 | 1499 | +16.2% |
+| d3d11 av1 surface | 1242 | 1118 | -10.0% |
+| d3d12 av1 surface | 1242 | 1337 | +7.6% |
+| vulkan av1 surface | 1242 | 1250 | +0.6% |
+| d3d11 vp9 surface, MFT software | 1080 | 259 | -76.0% |
 
-d3d12 h264 runs easier bytes (flat synth IDR vs gold testsrc IP). d3d11 vp9 is MFT software against NVDEC silicon. Vulkan h264 spans 3676-3750 across its 2 runs; d3d11 h264 spans 1896-3508 across its 3 (median grades it).
+d3d12 h264 runs easier bytes (flat synth IDR vs gold testsrc IP). d3d11 vp9 is MFT software against NVDEC silicon. Vulkan h264 spans 3794-3858 across its 2 runs; d3d11 h264 spans 2842-3554 across its 5 (A/B/C median grades it).
 
 Sustained overlap, 120-frame IP both sides:
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| vulkan h264 sustained | 1458 | 3047 | +109.0% |
-| vulkan h265 sustained | 1290 | 1749 | +35.6% |
-| vulkan av1 sustained | 1242 | 1969 | +58.5% |
-| d3d11 h264 sustained | 1458 | 1048 | -28.1% |
-| d3d11 h265 sustained | 1290 | 1021 | -20.9% |
-| d3d11 av1 sustained | 1242 | 1153 | -7.2% |
-| d3d11 vp9 sustained | 1080 | 941 | -12.9% |
-| d3d12 h264 sustained | 1458 | 1028 | -29.5% |
-| d3d12 h265 sustained | 1290 | 957 | -25.8% |
-| d3d12 av1 sustained | 1242 | 734 | -40.9% |
+| vulkan h264 sustained | 1458 | 2881 | +97.6% |
+| vulkan h265 sustained | 1290 | 1711 | +32.6% |
+| vulkan av1 sustained | 1242 | 1889 | +52.1% |
+| d3d11 h264 sustained | 1458 | 1430 | -1.9% |
+| d3d11 h265 sustained | 1290 | 1720 | +33.3% |
+| d3d11 av1 sustained | 1242 | 2094 | +68.6% |
+| d3d11 vp9 sustained | 1080 | 1491 | +38.1% |
+| d3d12 h264 sustained | 1458 | 1018 | -30.2% |
+| d3d12 h265 sustained | 1290 | 2086 | +61.7% |
+| d3d12 av1 sustained | 1242 | 1262 | +1.6% |
 
-Every leg shares gold's exact bytes; gold stays resident while rv legs hand CPU frames back: each percent favors gold. Downloaded pairs per codec are the shape-matched d3d legs: gold 825/789/822/846 against rv d3d11 sustained 1048/1021/1153/941 (h264/h265/av1/vp9), gold with a 373 MB file write, rv with CPU frames in hand.
+Every leg shares gold's exact bytes; gold stays resident while rv legs hand CPU frames back: each percent favors gold. Downloaded pairs per codec are the shape-matched d3d legs: gold 825/789/822/846 against rv d3d11 sustained 1430/1720/2094/1491 (h264/h265/av1/vp9), gold with a 373 MB file write, rv with CPU frames in hand.
 
 Sync, rv legs with gold alongside (shapes differ; unpercented):
 
 | Leg | FFmpeg resident | rv sync |
 |---|---|---|
-| d3d11 h264 | 1458 | 1524 |
-| d3d11 h265 | 1290 | 834 |
-| d3d11 av1 | 1242 | 595 |
+| d3d11 h264 | 1458 | 2129 |
+| d3d11 h265 | 1290 | 1171 |
+| d3d11 av1 | 1242 | 910 |
 | d3d11 vp9 | 1080 | 144 |
-| d3d12 h264 | 1458 | 1109 |
-| d3d12 h265 | 1290 | 831 |
-| d3d12 av1 | 1242 | 670 |
-| vulkan h264 | 1458 | 2821 |
-| vulkan h265 | 1290 | 1458 |
-| vulkan av1 | 1242 | 1229 |
+| d3d12 h264 | 1458 | 1093 |
+| d3d12 h265 | 1290 | 804 |
+| d3d12 av1 | 1242 | 653 |
+| vulkan h264 | 1458 | 2833 |
+| vulkan h265 | 1290 | 1422 |
+| vulkan av1 | 1242 | 1203 |
+
+d11 av1 decode reports the isolated-leg median: full-binary runs collapse it to 74-101fps half the time and discount clean runs 17% (contention, reproduced across rounds).
 
 ### Encode, fps
 
@@ -128,21 +130,21 @@ Gold runs intra CQP qp 28 (AV1 IP g4); rv runs MFT/VkVideo/openh264 defaults on 
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| d3d11 h264 | 549 | 387 | -29.5% |
-| d3d11 h265 | 456 | 694 | +52.2% |
-| d3d11 av1 | 618 | 527 | -14.7% |
-| d3d12 h264 | 549 | 104 | -81.1% |
-| vulkan h264 | 549 | 502 | -8.6% |
-| vulkan h265 | 456 | 231 | -49.3% |
+| d3d11 h264 | 549 | 390 | -29.0% |
+| d3d11 h265 | 456 | 692 | +51.8% |
+| d3d11 av1 | 618 | 538 | -12.9% |
+| d3d12 h264 | 549 | 103 | -81.2% |
+| vulkan h264 | 549 | 500 | -8.9% |
+| vulkan h265 | 456 | 229 | -49.8% |
 
 Only d3d11 h265 beats gold, faster per frame at unknown quality. d3d12 h264 and vulkan h265 trail on documented floors: noise entropy-coding physics (10 ms) and the NVIDIA VkVideo submit floor (4.4 ms, ffmpeg-confirmed).
 
 ## One-sided reference, fps
 
-- d3d11 surface encode via rv, no ffmpeg counterpart: h264 669, h265 948, av1 737.
-- Transcode via rv, no ffmpeg counterpart: d3d11 461, d3d12 377.
-- h264 openh264 via rv, absent from the ffmpeg build: 92.0.
-- d3d11 vp9 software encode via rv, no NVENC VP9: 69.
+- d3d11 surface encode via rv, no ffmpeg counterpart: h264 673, h265 946, av1 727.
+- Transcode via rv, no ffmpeg counterpart: d3d11 458, d3d12 613.
+- h264 openh264 via rv, absent from the ffmpeg build: 94.7.
+- d3d11 vp9 software encode via rv, no NVENC VP9: 68.
 
 ## Comparability notes
 
