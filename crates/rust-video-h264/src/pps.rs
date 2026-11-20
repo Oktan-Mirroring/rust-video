@@ -1,24 +1,24 @@
 //! Picture parameter sets, H.264 7.3.2.2.
 
 use crate::bits::BitReader;
-use crate::error::{narrow_u8, H264Error, H264Gate, ParseKind, UnsupportedKind};
+use crate::error::{narrow_u8, H264Error, H264Gate, ParseReason, UnsupportedReason};
 use crate::scaling::{fallback_scaling, picture_scaling, ScalingLists, ScalingMap};
 use crate::sps::Sps;
 
 /// CABAC entropy coding flag bit.
-pub const PPS_ENTROPY: u16 = 1;
+pub const PPS_ENTROPY: u32 = 1;
 /// POC delta present flag bit.
-pub const PPS_PIC_ORDER: u16 = 1 << 1;
+pub const PPS_PIC_ORDER: u32 = 1 << 1;
 /// Weighted prediction flag bit.
-pub const PPS_WEIGHTED_PRED: u16 = 1 << 2;
+pub const PPS_WEIGHTED_PRED: u32 = 1 << 2;
 /// Constrained intra prediction flag bit.
-pub const PPS_CONSTRAINED_INTRA: u16 = 1 << 3;
+pub const PPS_CONSTRAINED_INTRA: u32 = 1 << 3;
 /// Deblocking control present flag bit.
-pub const PPS_DEBLOCKING: u16 = 1 << 4;
+pub const PPS_DEBLOCKING: u32 = 1 << 4;
 /// Redundant pictures present flag bit.
-pub const PPS_REDUNDANT: u16 = 1 << 5;
+pub const PPS_REDUNDANT: u32 = 1 << 5;
 /// 8x8 transform mode flag bit.
-pub const PPS_TRANSFORM_8X8: u16 = 1 << 6;
+pub const PPS_TRANSFORM_8X8: u32 = 1 << 6;
 
 /// Parsed picture parameter set.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub struct Pps {
     /// Sequence set id.
     pub seq_parameter_set_id: u8,
     /// Packed flags.
-    pub flags: u16,
+    pub flags: u32,
     /// Default L0 reference count minus one.
     pub num_ref_l0: u8,
     /// Default L1 reference count minus one.
@@ -111,7 +111,7 @@ pub fn parse_pps<E: H264Error, G: H264Gate<E>>(rbsp: &[u8], sps: Option<&Sps>) -
     let mut reader = BitReader::new(rbsp);
     let pps_id = parse_pps_id(&mut reader)?;
     let sps_id = parse_pps_sps_id(&mut reader, sps)?;
-    let mut flags = 0u16;
+    let mut flags = 0u32;
     if reader.read_bit("entropy_coding_mode_flag")? {
         flags |= PPS_ENTROPY;
     }
@@ -119,7 +119,7 @@ pub fn parse_pps<E: H264Error, G: H264Gate<E>>(rbsp: &[u8], sps: Option<&Sps>) -
         flags |= PPS_PIC_ORDER;
     }
     if reader.read_ue("num_slice_groups_minus1")? != 0 {
-        return Err(E::unsupported(UnsupportedKind::FlexibleMacroblockOrder));
+        return Err(E::unsupported(UnsupportedReason::FlexibleMacroblockOrder));
     }
     let num_ref_l0 = parse_ref_count(&mut reader, "num_ref_idx_l0_default_active_minus1")?;
     let num_ref_l1 = parse_ref_count(&mut reader, "num_ref_idx_l1_default_active_minus1")?;
@@ -211,7 +211,7 @@ fn parse_pps_sps_id<E: H264Error>(reader: &mut BitReader<E>, sps: Option<&Sps>) 
     )?;
     if let Some(sps) = sps {
         if id != sps.seq_parameter_set_id {
-            return Err(E::parse(ParseKind::PpsCitesUnknownSps));
+            return Err(E::parse(ParseReason::PpsCitesUnknownSps));
         }
     }
     Ok(id)
@@ -221,7 +221,7 @@ fn parse_pps_sps_id<E: H264Error>(reader: &mut BitReader<E>, sps: Option<&Sps>) 
 fn parse_ref_count<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 31 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
     narrow_u8(value, syntax)
 }
@@ -229,13 +229,13 @@ fn parse_ref_count<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str
 /// QP delta field.
 fn parse_qp<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str) -> Result<i8, E> {
     let value = reader.read_se(syntax)?;
-    i8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    i8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::error::test_support::TestError;
-    use crate::error::{ParseKind, PermissiveGate, StrictGate};
+    use crate::error::{ParseReason, PermissiveGate, StrictGate};
     use crate::scaling::DEFAULT_4X4_INTRA;
     use crate::tests::{pps_body, pps_body_bipred, pps_body_chroma_no_tail, sps};
 
@@ -309,7 +309,7 @@ mod tests {
         let body = pps_body_bipred(3);
         assert_eq!(
             parse_pps::<TestError, StrictGate>(&body, Some(&sps())).unwrap_err(),
-            TestError::Parse(ParseKind::Range {
+            TestError::Parse(ParseReason::Range {
                 syntax: "weighted_bipred_idc",
             })
         );

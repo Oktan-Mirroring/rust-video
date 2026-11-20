@@ -1,7 +1,7 @@
 //! Short-term reference picture sets.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, ParseKind};
+use crate::error::{H265Error, ParseReason};
 use crate::framing::MAX_RPS_PICS;
 
 /// Pictures per resolved reference set.
@@ -103,7 +103,7 @@ pub fn parse_short_term_rps<E: H265Error>(
     }
     let (ref_idx, delta_idx_minus1) = predict_source(reader, index, num_sps)?;
     let reference = table.get(ref_idx).ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "inter_ref_pic_set_prediction",
         })
     })?;
@@ -145,7 +145,7 @@ fn predict_source<E: H265Error>(
     };
     let delta = usize::try_from(coded).unwrap_or(usize::MAX);
     if delta >= index {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "inter_ref_pic_set_prediction",
         }));
     }
@@ -157,12 +157,12 @@ fn parse_delta_rps<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(i32, 
     let sign = reader.read_bit("delta_rps_sign")?;
     let abs = reader.read_ue("abs_delta_rps_minus1")?;
     if abs > 32767 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "abs_delta_rps_minus1",
         }));
     }
     let magnitude = i32::try_from(abs + 1).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "abs_delta_rps_minus1",
         })
     })?;
@@ -242,7 +242,7 @@ fn push_shifted<E: H265Error>(
         return Ok(());
     }
     let poc = delta.checked_add(shift).ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "delta_poc",
         })
     })?;
@@ -250,7 +250,7 @@ fn push_shifted<E: H265Error>(
         return Ok(());
     }
     if set.num_delta_pocs() >= MAX_RESOLVED_RPS {
-        return Err(E::parse(ParseKind::ShortTermRefPicSetSize));
+        return Err(E::parse(ParseReason::ShortTermRefPicSetSize));
     }
     if negative {
         let at = usize::from(set.negative_count);
@@ -271,7 +271,7 @@ fn parse_explicit_rps<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<Sho
     let negative = parse_rps_count(reader, "num_negative_pics")?;
     let positive = parse_rps_count(reader, "num_positive_pics")?;
     if usize::from(negative) + usize::from(positive) >= MAX_RPS_PICS {
-        return Err(E::parse(ParseKind::ShortTermRefPicSetSize));
+        return Err(E::parse(ParseReason::ShortTermRefPicSetSize));
     }
     let mut set = ShortTermRps {
         negative_count: negative,
@@ -300,9 +300,9 @@ fn parse_rps_count<E: H265Error>(
 ) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if usize::try_from(value).is_ok_and(|count| count >= MAX_RPS_PICS) {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Next explicit delta POC from a minus-one step.
@@ -314,16 +314,16 @@ fn parse_rps_step<E: H265Error>(
 ) -> Result<i32, E> {
     let step = reader.read_ue(syntax)?;
     if step > 32767 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
-    let step = i32::try_from(step + 1).map_err(|_| E::parse(ParseKind::Range { syntax }))?;
+    let step = i32::try_from(step + 1).map_err(|_| E::parse(ParseReason::Range { syntax }))?;
     if positive {
         poc.checked_add(step)
     } else {
         poc.checked_sub(step)
     }
     .ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "delta_poc",
         })
     })

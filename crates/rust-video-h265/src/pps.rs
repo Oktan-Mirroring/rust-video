@@ -1,7 +1,7 @@
 //! Picture parameter sets.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, H265Gate, ParseKind};
+use crate::error::{H265Error, H265Gate, ParseReason};
 use crate::framing::MAX_PPS;
 use crate::scaling::{parse_scaling_list_data, ScalingLists};
 use crate::sps::{parse_bounded_ue, Sps};
@@ -242,7 +242,7 @@ pub fn parse_pps<E: H265Error, G: H265Gate<E>>(rbsp: &[u8], sps: Option<&Sps>) -
     }
     let num_extra_slice_header_bits = reader.read_bits(3, "num_extra_slice_header_bits")?;
     let num_extra_slice_header_bits = u8::try_from(num_extra_slice_header_bits).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "num_extra_slice_header_bits",
         })
     })?;
@@ -351,12 +351,12 @@ struct Deblock {
 fn parse_pps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("pic_parameter_set_id")?;
     let id = u8::try_from(id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pic_parameter_set_id",
         })
     })?;
     if usize::from(id) >= MAX_PPS {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "pic_parameter_set_id",
         }));
     }
@@ -367,7 +367,7 @@ fn parse_pps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 fn parse_pps_sps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("pps_seq_parameter_set_id")?;
     u8::try_from(id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pps_seq_parameter_set_id",
         })
     })
@@ -386,13 +386,13 @@ pub fn parse_pps_ids<E: H265Error>(rbsp: &[u8]) -> Result<(u8, u8), E> {
     let mut reader = BitReader::new(rbsp);
     let pps_id = reader.read_ue("pic_parameter_set_id")?;
     let pps_id = u8::try_from(pps_id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pic_parameter_set_id",
         })
     })?;
     let sps_id = reader.read_ue("pps_seq_parameter_set_id")?;
     let sps_id = u8::try_from(sps_id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pps_seq_parameter_set_id",
         })
     })?;
@@ -410,7 +410,7 @@ pub(crate) fn parse_ref_count<E: H265Error>(
 /// QP delta field.
 fn parse_qp<E: H265Error>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<i8, E> {
     let value = reader.read_se(syntax)?;
-    i8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    i8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// CU QP delta depth, zeroed without deltas.
@@ -424,7 +424,7 @@ fn parse_cu_qp_depth<E: H265Error>(
     *flags |= PPS_CU_QP_DELTA;
     let value = reader.read_ue("diff_cu_qp_delta_depth")?;
     u8::try_from(value).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "diff_cu_qp_delta_depth",
         })
     })
@@ -483,8 +483,8 @@ fn parse_tile_count<E: H265Error>(
     let minus1 = reader.read_ue(syntax)?;
     let count = minus1
         .checked_add(1)
-        .ok_or(E::parse(ParseKind::Range { syntax }))?;
-    u8::try_from(count).map_err(|_| E::parse(ParseKind::Range { syntax }))
+        .ok_or(E::parse(ParseReason::Range { syntax }))?;
+    u8::try_from(count).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Explicit tile extents with the last entry derived from `total`.
@@ -503,18 +503,18 @@ fn parse_tile_widths<E: H265Error>(
         let minus1 = reader.read_ue(syntax)?;
         let width = minus1
             .checked_add(1)
-            .ok_or(E::parse(ParseKind::Range { syntax }))?;
+            .ok_or(E::parse(ParseReason::Range { syntax }))?;
         if let Some(total) = total {
             consumed = consumed
                 .checked_add(width)
                 .filter(|sum| *sum < total)
-                .ok_or(E::parse(ParseKind::Range { syntax }))?;
+                .ok_or(E::parse(ParseReason::Range { syntax }))?;
         }
-        widths.push(u16::try_from(width).map_err(|_| E::parse(ParseKind::Range { syntax }))?);
+        widths.push(u16::try_from(width).map_err(|_| E::parse(ParseReason::Range { syntax }))?);
     }
     if let Some(total) = total {
         let last = total.saturating_sub(consumed);
-        widths.push(u16::try_from(last).map_err(|_| E::parse(ParseKind::Range { syntax }))?);
+        widths.push(u16::try_from(last).map_err(|_| E::parse(ParseReason::Range { syntax }))?);
     }
     Ok(widths)
 }

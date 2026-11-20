@@ -1,7 +1,7 @@
 //! Sequence parameter sets.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, H265Gate, ParseKind};
+use crate::error::{H265Error, H265Gate, ParseReason};
 use crate::framing::{Crop, MAX_LT_SPS, MAX_RPS, MAX_SPS};
 use crate::ptl::{parse_profile_tier_level, ProfileTierLevel};
 use crate::rps::{parse_short_term_rps, ShortTermRps};
@@ -335,7 +335,7 @@ pub fn parse_sps<E: H265Error, G: H265Gate<E>>(rbsp: &[u8]) -> Result<Sps, E> {
 fn parse_vps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_bits(4, "sps_video_parameter_set_id")?;
     u8::try_from(id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "sps_video_parameter_set_id",
         })
     })
@@ -345,7 +345,7 @@ fn parse_vps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 fn parse_sub_layers<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let minus1 = reader.read_bits(3, "sps_max_sub_layers_minus1")?;
     u8::try_from(minus1 + 1).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "sub layers",
         })
     })
@@ -355,12 +355,12 @@ fn parse_sub_layers<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E
 fn parse_sps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
     let id = reader.read_ue("seq_parameter_set_id")?;
     let id = u8::try_from(id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "seq_parameter_set_id",
         })
     })?;
     if usize::from(id) >= MAX_SPS {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "seq_parameter_set_id",
         }));
     }
@@ -371,7 +371,7 @@ fn parse_sps_id<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<u8, E> {
 fn parse_chroma<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u8, bool), E> {
     let chroma = reader.read_ue("chroma_format_idc")?;
     let chroma = u8::try_from(chroma).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "chroma_format_idc",
         })
     })?;
@@ -384,7 +384,7 @@ fn parse_pic_size<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u32, u
     let width = reader.read_ue("pic_width_in_luma_samples")?;
     let height = reader.read_ue("pic_height_in_luma_samples")?;
     if width == 0 || height == 0 {
-        return Err(E::parse(ParseKind::EmptyCodedSize));
+        return Err(E::parse(ParseReason::EmptyCodedSize));
     }
     Ok((width, height))
 }
@@ -411,7 +411,7 @@ fn parse_conformance<E: H265Error>(
             top: top * 2,
             bottom: bottom * 2,
         })),
-        _ => Err(E::parse(ParseKind::ConformanceOutside)),
+        _ => Err(E::parse(ParseReason::ConformanceOutside)),
     }
 }
 
@@ -420,12 +420,12 @@ fn parse_depths<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u8, u8),
     let luma = reader.read_ue("bit_depth_luma_minus8")?;
     let chroma = reader.read_ue("bit_depth_chroma_minus8")?;
     let luma = u8::try_from(luma).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "bit_depth_luma_minus8",
         })
     })?;
     let chroma = u8::try_from(chroma).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "bit_depth_chroma_minus8",
         })
     })?;
@@ -436,9 +436,9 @@ fn parse_depths<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<(u8, u8),
 fn parse_log2<E: H265Error>(reader: &mut BitReader<'_, E>, syntax: &'static str) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 12 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Sublayer ordering limits.
@@ -473,23 +473,23 @@ fn parse_ordering<E: H265Error>(
     for _ in first..max_sub_layers {
         let buffered = reader.read_ue("sps_max_dec_pic_buffering_minus1")?;
         if buffered > 15 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "sps_max_dec_pic_buffering_minus1",
             }));
         }
         ordering.buffering.push(u8::try_from(buffered).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "sps_max_dec_pic_buffering_minus1",
             })
         })?);
         let reordered = reader.read_ue("sps_max_num_reorder_pics")?;
         if reordered > 16 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "sps_max_num_reorder_pics",
             }));
         }
         ordering.reorder.push(u8::try_from(reordered).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "sps_max_num_reorder_pics",
             })
         })?);
@@ -521,9 +521,9 @@ pub(crate) fn parse_bounded_ue<E: H265Error>(
 ) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > ceiling {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Sequence scaling lists, flat without data.
@@ -558,12 +558,12 @@ fn parse_pcm<E: H265Error>(
         *flags |= SPS_PCM_LOOP_DISABLED;
     }
     let luma = u8::try_from(luma).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pcm depth",
         })
     })?;
     let chroma = u8::try_from(chroma).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pcm depth",
         })
     })?;
@@ -574,7 +574,7 @@ fn parse_pcm<E: H265Error>(
 fn parse_rps_table<E: H265Error>(reader: &mut BitReader<'_, E>) -> Result<Vec<ShortTermRps>, E> {
     let count = reader.read_ue("num_short_term_ref_pic_sets")?;
     if usize::try_from(count).is_ok_and(|count| count > MAX_RPS) {
-        return Err(E::parse(ParseKind::RpsTableOversize));
+        return Err(E::parse(ParseReason::RpsTableOversize));
     }
     let mut table = Vec::new();
     for index in 0..count {
@@ -598,7 +598,7 @@ fn parse_long_term_sps<E: H265Error>(
     *flags |= SPS_LONG_TERM;
     let count = reader.read_ue("num_long_term_ref_pics_sps")?;
     if usize::try_from(count).is_ok_and(|count| count > MAX_LT_SPS) {
-        return Err(E::parse(ParseKind::LtSpsOversize));
+        return Err(E::parse(ParseReason::LtSpsOversize));
     }
     let width = u32::from(log2_max_poc_lsb_minus4) + 4;
     let mut poc_lsb = Vec::new();

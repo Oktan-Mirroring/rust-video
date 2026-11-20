@@ -1,7 +1,7 @@
 //! Profile, tier, and level.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, ParseKind};
+use crate::error::{H265Error, ParseReason};
 
 /// Source flags of one profile record.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -87,7 +87,7 @@ pub(crate) fn parse_profile_tier_level<E: H265Error>(
         if level_present[index] {
             layer.level_idc = Some(
                 u8::try_from(reader.read_bits(8, "sub_layer_level_idc")?).map_err(|_| {
-                    E::parse(ParseKind::Range {
+                    E::parse(ParseReason::Range {
                         syntax: "sub_layer_level_idc",
                     })
                 })?,
@@ -102,7 +102,7 @@ pub(crate) fn parse_profile_tier_level<E: H265Error>(
         source: general.source,
         constraints: general.constraints,
         level_idc: u8::try_from(level_idc).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "general_level_idc",
             })
         })?,

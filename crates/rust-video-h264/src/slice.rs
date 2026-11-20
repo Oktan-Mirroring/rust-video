@@ -1,7 +1,7 @@
 //! Slice headers, H.264 7.3.3.
 
 use crate::bits::BitReader;
-use crate::error::{narrow_u16, narrow_u8, H264Error, H264Gate, ParseKind, UnsupportedKind};
+use crate::error::{narrow_u16, narrow_u8, H264Error, H264Gate, ParseReason, UnsupportedReason};
 use crate::pps::Pps;
 use crate::sps::{PocType, Sps};
 
@@ -97,9 +97,13 @@ pub enum SliceType {
 
 impl SliceType {
     /// Type for the `slice_type` value.
-    fn new<E: H264Error>(value: u32) -> Result<Self, E> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a value above 9 or an SP/SI slice type.
+    pub fn new<E: H264Error>(value: u32) -> Result<Self, E> {
         if value > 9 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "slice_type",
             }));
         }
@@ -107,7 +111,7 @@ impl SliceType {
             0 => Ok(Self::P),
             1 => Ok(Self::B),
             2 => Ok(Self::I),
-            _ => Err(E::unsupported(UnsupportedKind::SpSiSlices)),
+            _ => Err(E::unsupported(UnsupportedReason::SpSiSlices)),
         }
     }
 
@@ -251,7 +255,7 @@ pub fn parse_slice_rest<E: H264Error, G: H264Gate<E>>(
 ) -> Result<SliceHeader, E> {
     let (first_mb, slice_type, fixed, pps_id) = prefix;
     if idr && !slice_type.is_intra() {
-        return Err(E::parse(ParseKind::NonIntraSliceInIdr));
+        return Err(E::parse(ParseReason::NonIntraSliceInIdr));
     }
     let width = u32::from(sps.log2_max_frame_num_minus4) + 4;
     let frame_num = reader.read_bits(width, "frame_num")?;
@@ -293,7 +297,7 @@ pub fn parse_slice_rest<E: H264Error, G: H264Gate<E>>(
         offset = offset.next_multiple_of(8);
     }
     header.bit_offset =
-        u16::try_from(offset).map_err(|_| E::parse(ParseKind::SliceHeaderTooLong))?;
+        u16::try_from(offset).map_err(|_| E::parse(ParseReason::SliceHeaderTooLong))?;
     G::check_slice_extra(&header, sps)?;
     Ok(header)
 }
@@ -384,7 +388,7 @@ fn parse_ref_override<E: H264Error>(
 fn parse_ref_count<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 31 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
     narrow_u8(value, syntax)
 }
@@ -406,7 +410,7 @@ fn parse_ref_modification<E: H264Error>(reader: &mut BitReader<E>) -> Result<Vec
             2 => operations.push(RefMod::Long(reader.read_ue("long_term_pic_num")?)),
             3 => return Ok(operations),
             _ => {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "modification_of_pic_nums_idc",
                 }));
             }
@@ -430,7 +434,7 @@ fn parse_weights<E: H264Error>(
     let chroma = sps.fidelity.chroma_format_idc != 0;
     let luma_denom = reader.read_ue("luma_log2_weight_denom")?;
     if luma_denom > 7 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "luma_log2_weight_denom",
         }));
     }
@@ -438,7 +442,7 @@ fn parse_weights<E: H264Error>(
     if chroma {
         chroma_denom = reader.read_ue("chroma_log2_weight_denom")?;
         if chroma_denom > 7 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "chroma_log2_weight_denom",
             }));
         }
@@ -531,7 +535,7 @@ fn parse_marking<E: H264Error>(
             5 => operations.push(Mmco::MarkAllUnused),
             6 => operations.push(Mmco::CurrentToLong(reader.read_ue("long_term_frame_idx")?)),
             _ => {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "memory_management_control_operation",
                 }))
             }
@@ -557,7 +561,7 @@ fn parse_slice_tail<E: H264Error>(
     }
     let idc = reader.read_ue("disable_deblocking_filter_idc")?;
     if idc > 2 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "disable_deblocking_filter_idc",
         }));
     }
@@ -573,7 +577,7 @@ fn parse_slice_tail<E: H264Error>(
 mod tests {
     use crate::bits::BitReader;
     use crate::error::test_support::TestError;
-    use crate::error::{H264Gate, ParseKind, PermissiveGate, StrictGate, UnsupportedKind};
+    use crate::error::{H264Gate, ParseReason, PermissiveGate, StrictGate, UnsupportedReason};
     use crate::pps::parse_pps;
 
     use crate::tests::{
@@ -643,7 +647,7 @@ mod tests {
         assert_eq!(
             parse_slice_rest::<TestError, StrictGate>(&mut reader, prefix, false, 2, &sps, &pps)
                 .unwrap_err(),
-            TestError::Unsupported(UnsupportedKind::RedundantPictures)
+            TestError::Unsupported(UnsupportedReason::RedundantPictures)
         );
         let mut reader = BitReader::<TestError>::new(&body);
         let prefix = parse_slice_prefix(&mut reader).expect("prefix");
@@ -667,7 +671,7 @@ mod tests {
         let strict: Result<(), TestError> = StrictGate::check_slice_extra(&header, &sps);
         assert_eq!(
             strict.unwrap_err(),
-            TestError::Parse(ParseKind::Range {
+            TestError::Parse(ParseReason::Range {
                 syntax: "abs_diff_pic_num",
             })
         );
@@ -678,7 +682,7 @@ mod tests {
         let strict: Result<(), TestError> = StrictGate::check_slice_extra(&header, &sps);
         assert_eq!(
             strict.unwrap_err(),
-            TestError::Parse(ParseKind::Range {
+            TestError::Parse(ParseReason::Range {
                 syntax: "long_term_pic_num",
             })
         );

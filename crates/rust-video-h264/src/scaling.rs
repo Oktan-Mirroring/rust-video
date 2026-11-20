@@ -1,7 +1,7 @@
 //! Frequency scaling lists in zig-zag scan order.
 
 use crate::bits::BitReader;
-use crate::error::{H264Error, ParseKind};
+use crate::error::{H264Error, ParseReason};
 
 /// Default 4x4 inter scaling list, H.264 Table 7-2, zig-zag scan order.
 pub(crate) const DEFAULT_4X4_INTER: [u8; 16] = [
@@ -73,7 +73,7 @@ fn scaling_list<const N: usize, E: H264Error>(
             }
         }
         let scale = u8::try_from(if next == 0 { last } else { next }).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "scaling value",
             })
         })?;

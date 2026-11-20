@@ -22,7 +22,8 @@ pub use derive::{
     poc_type2, RefCandidate,
 };
 pub use error::{
-    H264Error, H264Gate, NalAction, ParseKind, PermissiveGate, StrictGate, UnsupportedKind,
+    H264Error, H264Gate, NalAction, ParseKind, ParseReason, PermissiveGate, StrictGate,
+    UnsupportedKind, UnsupportedReason,
 };
 pub use framing::{
     is_idr, nal_ref_idc, nal_unit_type, rbsp, rbsp_prefix, split_nals, Crop, Nalu, NaluSplitter,

@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use crate::error::{H265Error, ParseKind};
+use crate::error::{H265Error, ParseReason};
 
 /// Exp-Golomb bit reader.
 pub struct BitReader<'a, E: H265Error> {
@@ -64,7 +64,7 @@ impl<'a, E: H265Error> BitReader<'a, E> {
     /// * `syntax` - element under parse.
     pub fn read_bits(&mut self, count: u32, syntax: &'static str) -> Result<u32, E> {
         if count > 32 {
-            return Err(E::parse(ParseKind::TooWide { syntax }));
+            return Err(E::parse(ParseReason::TooWide { syntax }));
         }
         let mut value: u32 = 0;
         for _ in 0..count {
@@ -85,7 +85,7 @@ impl<'a, E: H265Error> BitReader<'a, E> {
     pub fn read_bit(&mut self, syntax: &'static str) -> Result<bool, E> {
         let total = self.data.len() * 8;
         if self.bit >= total {
-            return Err(E::parse(ParseKind::Truncated { syntax }));
+            return Err(E::parse(ParseReason::Truncated { syntax }));
         }
         let bit = self.peek(self.bit);
         self.bit += 1;
@@ -106,7 +106,7 @@ impl<'a, E: H265Error> BitReader<'a, E> {
         while !self.read_bit(syntax)? {
             leading += 1;
             if leading > 31 {
-                return Err(E::parse(ParseKind::OverflowU32 { syntax }));
+                return Err(E::parse(ParseReason::OverflowU32 { syntax }));
             }
         }
         if leading == 0 {
@@ -114,7 +114,7 @@ impl<'a, E: H265Error> BitReader<'a, E> {
         }
         let rest = self.read_bits(leading, syntax)?;
         rest.checked_add((1u32 << leading) - 1)
-            .ok_or(E::parse(ParseKind::OverflowU32 { syntax }))
+            .ok_or(E::parse(ParseReason::OverflowU32 { syntax }))
     }
 
     /// Signed Exp-Golomb code.
@@ -129,13 +129,13 @@ impl<'a, E: H265Error> BitReader<'a, E> {
     pub fn read_se(&mut self, syntax: &'static str) -> Result<i32, E> {
         let code = self.read_ue(syntax)?;
         let value =
-            i32::try_from(code >> 1).map_err(|_| E::parse(ParseKind::OverflowI32 { syntax }))?;
+            i32::try_from(code >> 1).map_err(|_| E::parse(ParseReason::OverflowI32 { syntax }))?;
         if code & 1 == 0 {
             Ok(-value)
         } else {
             value
                 .checked_add(1)
-                .ok_or(E::parse(ParseKind::OverflowI32 { syntax }))
+                .ok_or(E::parse(ParseReason::OverflowI32 { syntax }))
         }
     }
 

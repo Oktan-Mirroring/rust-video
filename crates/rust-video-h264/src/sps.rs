@@ -1,7 +1,7 @@
 //! Sequence parameter sets, H.264 7.3.2.1.
 
 use crate::bits::BitReader;
-use crate::error::{narrow_u8, H264Error, H264Gate, ParseKind, UnsupportedKind};
+use crate::error::{narrow_u8, H264Error, H264Gate, ParseReason, UnsupportedReason};
 use crate::framing::{Crop, MAX_SPS};
 use crate::scaling::{fallback_scaling, sequence_scaling, ScalingLists, ScalingMap};
 use crate::vui::{parse_vui, VuiParams};
@@ -24,7 +24,7 @@ impl PocType {
             0 => Ok(Self::Lsb),
             1 => Ok(Self::Delta),
             2 => Ok(Self::FrameNum),
-            _ => Err(E::parse(ParseKind::Range {
+            _ => Err(E::parse(ParseReason::Range {
                 syntax: "pic_order_cnt_type",
             })),
         }
@@ -299,7 +299,7 @@ pub fn parse_sps<E: H264Error, G: H264Gate<E>>(rbsp: &[u8]) -> Result<Sps, E> {
     let width_in_mbs_minus1 = parse_mbs(&mut reader, "pic_width_in_mbs")?;
     let height_in_mbs_minus1 = parse_mbs(&mut reader, "pic_height_in_map_units")?;
     if !reader.read_bit("frame_mbs_only_flag")? {
-        return Err(E::unsupported(UnsupportedKind::Interlaced));
+        return Err(E::unsupported(UnsupportedReason::Interlaced));
     }
     let direct_8x8 = reader.read_bit("direct_8x8_inference_flag")?;
     let (crop_offsets, crop) = parse_crop(&mut reader, width_in_mbs_minus1, height_in_mbs_minus1)?;
@@ -341,7 +341,7 @@ fn parse_sps_id<E: H264Error>(reader: &mut BitReader<E>) -> Result<u8, E> {
         "seq_parameter_set_id",
     )?;
     if usize::from(id) >= MAX_SPS {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "seq_parameter_set_id",
         }));
     }
@@ -372,7 +372,7 @@ fn parse_sps_chroma<E: H264Error>(
     }
     let chroma = narrow_u8(reader.read_ue("chroma_format_idc")?, "chroma_format_idc")?;
     if chroma > 3 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "chroma_format_idc",
         }));
     }
@@ -400,7 +400,7 @@ fn parse_sps_chroma<E: H264Error>(
 fn parse_log2<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 12 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
     narrow_u8(value, syntax)
 }
@@ -462,7 +462,7 @@ fn parse_poc_cycle<E: H264Error>(
         total += i64::from(*slot);
     }
     section.expected = i32::try_from(total).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "pic_order_cnt_cycle",
         })
     })?;
@@ -472,7 +472,7 @@ fn parse_poc_cycle<E: H264Error>(
 /// Macroblock count field.
 fn parse_mbs<E: H264Error>(reader: &mut BitReader<E>, syntax: &'static str) -> Result<u16, E> {
     let value = reader.read_ue(syntax)?;
-    u16::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u16::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Frame crop raw offsets with the rectangle validated against the coded size.
@@ -507,7 +507,7 @@ fn parse_crop<E: H264Error>(
 #[cfg(test)]
 mod tests {
     use crate::error::test_support::TestError;
-    use crate::error::{ParseKind, PermissiveGate, StrictGate, UnsupportedKind};
+    use crate::error::{ParseReason, PermissiveGate, StrictGate, UnsupportedReason};
     use crate::tests::{crop_sps_body, fidelity_sps_body, sps, sps_body_vui};
 
     use super::{parse_sps, PocType, Sps};
@@ -586,7 +586,7 @@ mod tests {
         let body = fidelity_sps_body(2);
         assert_eq!(
             parse_sps::<TestError, StrictGate>(&body).unwrap_err(),
-            TestError::Unsupported(UnsupportedKind::ChromaOutside420)
+            TestError::Unsupported(UnsupportedReason::ChromaOutside420)
         );
         let sps = parse_sps::<TestError, PermissiveGate>(&body).expect("permissive sps");
         assert_eq!(sps.fidelity.chroma_format_idc, 2);
@@ -597,7 +597,7 @@ mod tests {
         let body = crop_sps_body(1000, 1000, 0, 0);
         assert_eq!(
             parse_sps::<TestError, StrictGate>(&body).unwrap_err(),
-            TestError::Parse(ParseKind::FrameCropOutsideCodedSize)
+            TestError::Parse(ParseReason::FrameCropOutsideCodedSize)
         );
         let sps = parse_sps::<TestError, PermissiveGate>(&body).expect("permissive sps");
         assert_eq!(sps.crop_offsets, Some([1000, 1000, 0, 0]));

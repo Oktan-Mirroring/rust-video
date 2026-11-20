@@ -12,10 +12,10 @@ use crate::vps::Vps;
 /// Grammar error behind a tier failure.
 pub trait H265Error: Sized {
     /// Parse failure of `kind`.
-    fn parse(kind: ParseKind) -> Self;
+    fn parse(kind: ParseReason) -> Self;
 
     /// Tier-declined construct of `kind`.
-    fn unsupported(kind: UnsupportedKind) -> Self;
+    fn unsupported(kind: UnsupportedReason) -> Self;
 }
 
 pub use self::H265Error as HevcError;
@@ -105,7 +105,7 @@ pub trait H265Gate<E: H265Error> {
             match previous {
                 None => previous = Some(*addr),
                 Some(prev) if *addr > prev => previous = Some(*addr),
-                _ => return Err(E::unsupported(UnsupportedKind::ArbitrarySliceOrder)),
+                _ => return Err(E::unsupported(UnsupportedReason::ArbitrarySliceOrder)),
             }
         }
         Ok(())
@@ -123,7 +123,7 @@ pub trait H265Gate<E: H265Error> {
     /// * `layer_id` - NUH layer id.
     fn classify_nal(nal_type: u8, layer_id: u16) -> Result<NalAction, E> {
         if layer_id != 0 {
-            return Err(E::unsupported(UnsupportedKind::Multilayer));
+            return Err(E::unsupported(UnsupportedReason::Multilayer));
         }
         Ok(match nal_type {
             VCL_FIRST..=VCL_LAST => NalAction::Vcl,
@@ -221,6 +221,8 @@ pub enum ParseKind {
     EmptySpsRps,
 }
 
+pub use self::ParseKind as ParseReason;
+
 /// Legal construct the tier declines inside shared code.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum UnsupportedKind {
@@ -231,6 +233,8 @@ pub enum UnsupportedKind {
     /// Multilayer stream.
     Multilayer,
 }
+
+pub use self::UnsupportedKind as UnsupportedReason;
 
 /// Gate accepting every construct.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -269,31 +273,74 @@ impl<E: H265Error> H265Gate<E> for PermissiveGate {
     }
 }
 
+/// Gate holding 8-bit 4:2:0 pictures.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct StrictGate;
+
+impl<E: H265Error> H265Gate<E> for StrictGate {
+    /// Sequence set against tier caps.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on sampling outside 8-bit 4:2:0.
+    fn check_sps(sps: &Sps) -> Result<(), E> {
+        if sps.chroma_format != 1 {
+            return Err(E::parse(ParseReason::Range {
+                syntax: "chroma_format_idc",
+            }));
+        }
+        if sps.bit_depth_luma != 0 {
+            return Err(E::parse(ParseReason::Range {
+                syntax: "bit_depth_luma_minus8",
+            }));
+        }
+        if sps.bit_depth_chroma != 0 {
+            return Err(E::parse(ParseReason::Range {
+                syntax: "bit_depth_chroma_minus8",
+            }));
+        }
+        Ok(())
+    }
+
+    /// Picture set against tier caps with its sequence set, absent for orphans.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on dependent slice segments.
+    fn check_pps(pps: &Pps, sps: Option<&Sps>) -> Result<(), E> {
+        let _ = sps;
+        if pps.dependent_slices() {
+            return Err(E::unsupported(UnsupportedReason::DependentSlices));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Grammar test error.
 
-    use super::{H265Error, ParseKind, UnsupportedKind};
+    use super::{H265Error, ParseReason, UnsupportedReason};
 
     /// Test failure capturing grammar kinds.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum TestError {
         /// Parse failure.
-        Parse(ParseKind),
+        Parse(ParseReason),
         /// Tier-declined construct.
-        Unsupported(UnsupportedKind),
+        Unsupported(UnsupportedReason),
         /// Sequence set cites an unseen video set.
         SpsCitesUnknownVps,
     }
 
     impl H265Error for TestError {
         /// Parse failure of `kind`.
-        fn parse(kind: ParseKind) -> Self {
+        fn parse(kind: ParseReason) -> Self {
             Self::Parse(kind)
         }
 
         /// Tier-declined construct of `kind`.
-        fn unsupported(kind: UnsupportedKind) -> Self {
+        fn unsupported(kind: UnsupportedReason) -> Self {
             Self::Unsupported(kind)
         }
     }

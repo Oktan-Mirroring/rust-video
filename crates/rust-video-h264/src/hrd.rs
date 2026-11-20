@@ -1,7 +1,7 @@
 //! Hypothetical reference decoder parameters, H.264 E.1.2.
 
 use crate::bits::BitReader;
-use crate::error::{narrow_u8, H264Error, ParseKind};
+use crate::error::{narrow_u8, H264Error, ParseReason};
 
 /// HRD parameters of one set.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub(crate) fn parse_hrd<E: H264Error>(reader: &mut BitReader<E>) -> Result<HrdPa
     let mut hrd = HrdParams::default();
     let count = reader.read_ue("cpb_cnt_minus1")?;
     if count > 31 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "cpb_cnt_minus1",
         }));
     }

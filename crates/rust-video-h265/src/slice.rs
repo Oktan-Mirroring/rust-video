@@ -1,7 +1,7 @@
 //! Slice segment headers.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, ParseKind, UnsupportedKind};
+use crate::error::{H265Error, ParseReason, UnsupportedReason};
 use crate::framing::{is_idr, is_irap, MAX_LT_SPS};
 use crate::pps::{parse_ref_count, Pps};
 use crate::rps::{parse_short_term_rps, ShortTermRps};
@@ -20,12 +20,16 @@ pub enum SliceType {
 
 impl SliceType {
     /// Type for the `slice_type` value.
-    fn new<E: H265Error>(value: u32) -> Result<Self, E> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on a value above 2.
+    pub fn new<E: H265Error>(value: u32) -> Result<Self, E> {
         match value {
             0 => Ok(Self::B),
             1 => Ok(Self::P),
             2 => Ok(Self::I),
-            _ => Err(E::parse(ParseKind::Range {
+            _ => Err(E::parse(ParseReason::Range {
                 syntax: "slice_type",
             })),
         }
@@ -41,6 +45,16 @@ impl SliceType {
     #[must_use]
     pub const fn is_b(self) -> bool {
         matches!(self, Self::B)
+    }
+
+    /// Slice type number.
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Self::B => 0,
+            Self::P => 1,
+            Self::I => 2,
+        }
     }
 }
 
@@ -133,7 +147,7 @@ pub fn parse_slice_prefix<E: H265Error>(
     };
     let pps_id = reader.read_ue("slice_pic_parameter_set_id")?;
     let pps_id = u8::try_from(pps_id).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "slice_pic_parameter_set_id",
         })
     })?;
@@ -167,7 +181,7 @@ pub fn parse_slice_rest<E: H265Error>(
     }
     let slice_type = SliceType::new(reader.read_ue("slice_type")?)?;
     if is_idr(nal_type) && !slice_type.is_intra() {
-        return Err(E::parse(ParseKind::NonIntraSliceInIdr));
+        return Err(E::parse(ParseReason::NonIntraSliceInIdr));
     }
     let pic_output = if pps.output_flag_present() {
         reader.read_bit("pic_output_flag")?
@@ -218,7 +232,7 @@ fn parse_slice_address<E: H265Error>(
         return Ok(0);
     }
     if pps.dependent_slices() && reader.read_bit("dependent_slice_segment_flag")? {
-        return Err(E::unsupported(UnsupportedKind::DependentSlices));
+        return Err(E::unsupported(UnsupportedReason::DependentSlices));
     }
     let ctbs = sps.width_in_ctbs() * sps.height_in_ctbs();
     if ctbs <= 1 {
@@ -227,7 +241,7 @@ fn parse_slice_address<E: H265Error>(
     let width = 32 - (ctbs - 1).leading_zeros();
     let address = reader.read_bits(width, "slice_segment_address")?;
     if address >= ctbs {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "slice_segment_address",
         }));
     }
@@ -288,7 +302,7 @@ fn parse_slice_short_term<E: H265Error>(
             .position()
             .checked_sub(start)
             .and_then(|bits| u16::try_from(bits).ok())
-            .ok_or(E::parse(ParseKind::ShortTermRefPicSetSize))?;
+            .ok_or(E::parse(ParseReason::ShortTermRefPicSetSize))?;
         return Ok((
             resolved.set,
             RpsBits {
@@ -300,7 +314,7 @@ fn parse_slice_short_term<E: H265Error>(
         ));
     }
     if sps.rps.is_empty() {
-        return Err(E::parse(ParseKind::EmptySpsRps));
+        return Err(E::parse(ParseReason::EmptySpsRps));
     }
     let index = if sps.rps.len() > 1 {
         let width = 32
@@ -308,7 +322,7 @@ fn parse_slice_short_term<E: H265Error>(
                 .unwrap_or(u32::MAX)
                 .leading_zeros();
         usize::try_from(reader.read_bits(width, "short_term_ref_pic_set_idx")?).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "short_term_ref_pic_set_idx",
             })
         })?
@@ -316,7 +330,7 @@ fn parse_slice_short_term<E: H265Error>(
         0
     };
     let set = sps.rps.get(index).cloned().ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "short_term_ref_pic_set_idx",
         })
     })?;
@@ -349,10 +363,10 @@ fn parse_slice_long_term<E: H265Error>(
         .unwrap_or(usize::MAX)
         .saturating_add(usize::try_from(from_slice).unwrap_or(usize::MAX));
     if total > MAX_LT_SPS {
-        return Err(E::parse(ParseKind::LtTotalOversize));
+        return Err(E::parse(ParseReason::LtTotalOversize));
     }
     if from_sps > u32::try_from(sps.lt_poc_lsb.len()).unwrap_or(u32::MAX) {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "num_long_term_sps",
         }));
     }
@@ -394,7 +408,7 @@ fn parse_lt_sps_entry<E: H265Error>(
                 .unwrap_or(u32::MAX)
                 .leading_zeros();
         usize::try_from(reader.read_bits(width, "lt_idx_sps")?).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "lt_idx_sps",
             })
         })?
@@ -402,12 +416,12 @@ fn parse_lt_sps_entry<E: H265Error>(
         0
     };
     let poc_lsb = sps.lt_poc_lsb.get(index).copied().ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "lt_idx_sps",
         })
     })?;
     let used = sps.lt_used_by_curr.get(index).copied().ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "lt_idx_sps",
         })
     })?;
@@ -455,7 +469,7 @@ fn parse_slice_inter<E: H265Error>(
         parse_weight_table(reader, slice_type, num_l0, num_l1)?;
     }
     if reader.read_ue("five_minus_max_num_merge_cand")? > 4 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "five_minus_max_num_merge_cand",
         }));
     }
@@ -499,7 +513,7 @@ fn parse_lists_modification<E: H265Error>(
         for _ in 0..=num_l0 {
             let entry = reader.read_bits(width, "list_entry_l0")?;
             if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "list_entry_l0",
                 }));
             }
@@ -509,7 +523,7 @@ fn parse_lists_modification<E: H265Error>(
         for _ in 0..=num_l1 {
             let entry = reader.read_bits(width, "list_entry_l1")?;
             if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "list_entry_l1",
                 }));
             }
@@ -538,7 +552,7 @@ fn parse_collocated<E: H265Error>(
     if ceiling > 0 {
         let index = reader.read_ue("collocated_ref_idx")?;
         if index > u32::from(ceiling) {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "collocated_ref_idx",
             }));
         }
@@ -554,7 +568,7 @@ fn parse_weight_table<E: H265Error>(
     num_l1: u8,
 ) -> Result<(), E> {
     if reader.read_ue("luma_log2_weight_denom")? > 7 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "luma_log2_weight_denom",
         }));
     }
@@ -647,7 +661,7 @@ fn parse_entry_points<E: H265Error>(reader: &mut BitReader<'_, E>, pps: &Pps) ->
     }
     let length_minus1 = reader.read_ue("offset_len_minus1")?;
     if length_minus1 > 31 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "offset_len_minus1",
         }));
     }
@@ -782,7 +796,7 @@ pub fn parse_slice_tail<E: H265Error>(
     }
     let slice_type = SliceType::new(reader.read_ue("slice_type")?)?;
     if is_idr(nal_type) && !slice_type.is_intra() {
-        return Err(E::parse(ParseKind::NonIntraSliceInIdr));
+        return Err(E::parse(ParseReason::NonIntraSliceInIdr));
     }
     if pps.output_flag_present() {
         reader.read_bit("pic_output_flag")?;
@@ -794,7 +808,7 @@ pub fn parse_slice_tail<E: H265Error>(
     if sps.separate_colour_plane {
         tail.colour_plane =
             u8::try_from(reader.read_bits(2, "colour_plane_id")?).map_err(|_| {
-                E::parse(ParseKind::Range {
+                E::parse(ParseReason::Range {
                     syntax: "colour_plane_id",
                 })
             })?;
@@ -856,7 +870,7 @@ fn parse_tail_short_term<E: H265Error>(
         return Ok(resolved.set.used_negative() + resolved.set.used_positive());
     }
     if sps.rps.is_empty() {
-        return Err(E::parse(ParseKind::EmptySpsRps));
+        return Err(E::parse(ParseReason::EmptySpsRps));
     }
     let index = if sps.rps.len() > 1 {
         let width = 32
@@ -865,12 +879,12 @@ fn parse_tail_short_term<E: H265Error>(
                 .leading_zeros();
         let index = usize::try_from(reader.read_bits(width, "short_term_ref_pic_set_idx")?)
             .map_err(|_| {
-                E::parse(ParseKind::Range {
+                E::parse(ParseReason::Range {
                     syntax: "short_term_ref_pic_set_idx",
                 })
             })?;
         if index >= sps.rps.len() {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "short_term_ref_pic_set_idx",
             }));
         }
@@ -879,7 +893,7 @@ fn parse_tail_short_term<E: H265Error>(
         0
     };
     let set = sps.rps.get(index).ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "short_term_ref_pic_set_idx",
         })
     })?;
@@ -905,10 +919,10 @@ fn parse_tail_long_term<E: H265Error>(
         .unwrap_or(usize::MAX)
         .saturating_add(usize::try_from(from_slice).unwrap_or(usize::MAX));
     if total > MAX_LT_SPS {
-        return Err(E::parse(ParseKind::LtTotalOversize));
+        return Err(E::parse(ParseReason::LtTotalOversize));
     }
     if from_sps > u32::try_from(sps.lt_poc_lsb.len()).unwrap_or(u32::MAX) {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "num_long_term_sps",
         }));
     }
@@ -955,7 +969,7 @@ fn parse_tail_lt_sps_entry<E: H265Error>(
                 .unwrap_or(u32::MAX)
                 .leading_zeros();
         usize::try_from(reader.read_bits(width, "lt_idx_sps")?).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "lt_idx_sps",
             })
         })?
@@ -963,12 +977,12 @@ fn parse_tail_lt_sps_entry<E: H265Error>(
         0
     };
     let poc_lsb = sps.lt_poc_lsb.get(index).copied().ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "lt_idx_sps",
         })
     })?;
     let used = sps.lt_used_by_curr.get(index).copied().ok_or({
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "lt_idx_sps",
         })
     })?;
@@ -1003,12 +1017,12 @@ fn parse_tail_inter<E: H265Error>(
     }
     let merge = reader.read_ue("five_minus_max_num_merge_cand")?;
     if merge > 4 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "five_minus_max_num_merge_cand",
         }));
     }
     tail.merge_cand_minus5 = u8::try_from(merge).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "five_minus_max_num_merge_cand",
         })
     })?;
@@ -1040,9 +1054,9 @@ fn parse_tail_ref_count<E: H265Error>(
 ) -> Result<u8, E> {
     let value = reader.read_ue(syntax)?;
     if value > 14 {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
-    u8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Reference list modification entries into `tail`.
@@ -1060,7 +1074,7 @@ fn parse_tail_lists_modification<E: H265Error>(
         for _ in 0..=num_l0 {
             let entry = reader.read_bits(width, "list_entry_l0")?;
             if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "list_entry_l0",
                 }));
             }
@@ -1072,7 +1086,7 @@ fn parse_tail_lists_modification<E: H265Error>(
         for _ in 0..=num_l1 {
             let entry = reader.read_bits(width, "list_entry_l1")?;
             if usize::try_from(entry).is_ok_and(|entry| entry >= total_curr) {
-                return Err(E::parse(ParseKind::Range {
+                return Err(E::parse(ParseReason::Range {
                     syntax: "list_entry_l1",
                 }));
             }
@@ -1105,12 +1119,12 @@ fn parse_tail_collocated<E: H265Error>(
     if ceiling > 0 {
         let index = reader.read_ue("collocated_ref_idx")?;
         if index > u32::from(ceiling) {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "collocated_ref_idx",
             }));
         }
         tail.collocated_ref_idx = u8::try_from(index).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "collocated_ref_idx",
             })
         })?;
@@ -1128,12 +1142,12 @@ fn parse_tail_weight_table<E: H265Error>(
 ) -> Result<(), E> {
     let luma_denom = reader.read_ue("luma_log2_weight_denom")?;
     if luma_denom > 7 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "luma_log2_weight_denom",
         }));
     }
     weights.luma_denom = u8::try_from(luma_denom).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "luma_log2_weight_denom",
         })
     })?;
@@ -1196,7 +1210,7 @@ fn tail_bounded_se<E: H265Error>(
 ) -> Result<i32, E> {
     let value = reader.read_se(syntax)?;
     if value < min || value > max {
-        return Err(E::parse(ParseKind::Range { syntax }));
+        return Err(E::parse(ParseReason::Range { syntax }));
     }
     Ok(value)
 }
@@ -1212,7 +1226,7 @@ fn parse_tail_qp<E: H265Error>(
     let qp_y = 26 + i32::from(pps.pic_init_qp_minus26) + tail.qp_delta;
     let qp_bd_offset = 6 * i32::from(sps.bit_depth_luma);
     if qp_y < -qp_bd_offset || qp_y > 51 {
-        return Err(E::parse(ParseKind::Range {
+        return Err(E::parse(ParseReason::Range {
             syntax: "slice_qp_delta",
         }));
     }
@@ -1220,14 +1234,14 @@ fn parse_tail_qp<E: H265Error>(
         tail.cb_qp_offset = tail_bounded_se(reader, "slice_cb_qp_offset", -12, 12)?;
         let sum = i32::from(pps.cb_qp_offset) + tail.cb_qp_offset;
         if !(-12..=12).contains(&sum) {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "slice_cb_qp_offset",
             }));
         }
         tail.cr_qp_offset = tail_bounded_se(reader, "slice_cr_qp_offset", -12, 12)?;
         let sum = i32::from(pps.cr_qp_offset) + tail.cr_qp_offset;
         if !(-12..=12).contains(&sum) {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "slice_cr_qp_offset",
             }));
         }

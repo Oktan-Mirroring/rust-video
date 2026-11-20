@@ -1,7 +1,7 @@
 //! Scaling lists in coded order.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, ParseKind};
+use crate::error::{H265Error, ParseReason};
 
 /// Default intra scaling list in diagonal scan order, H.265 7.4.5.
 const DEFAULT_INTRA: [u8; 64] = [
@@ -90,7 +90,7 @@ fn parse_scaling_matrix<E: H265Error>(
         }
         let delta = usize::try_from(delta).unwrap_or(usize::MAX);
         let reference = matrix_id.checked_sub(delta).ok_or({
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "scaling_list_pred_matrix_id",
             })
         })?;
@@ -101,12 +101,12 @@ fn parse_scaling_matrix<E: H265Error>(
     if size_id > 1 {
         let dc = reader.read_se("scaling_list_dc_coef_minus8")?;
         if !(-7..=247).contains(&dc) {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "scaling_list_dc_coef",
             }));
         }
         let dc = u8::try_from(dc + 8).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "scaling_list_dc_coef",
             })
         })?;
@@ -118,7 +118,7 @@ fn parse_scaling_matrix<E: H265Error>(
         let delta = reader.read_se("scaling_list_delta_coef")?;
         let stepped = (i64::from(next) + i64::from(delta)).rem_euclid(256);
         let coef = u8::try_from(stepped).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "scaling_list_delta_coef",
             })
         })?;

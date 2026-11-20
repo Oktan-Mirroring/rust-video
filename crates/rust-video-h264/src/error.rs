@@ -7,10 +7,10 @@ use crate::sps::Sps;
 /// Grammar error behind a tier failure.
 pub trait H264Error: Sized {
     /// Parse failure of `kind`.
-    fn parse(kind: ParseKind) -> Self;
+    fn parse(kind: ParseReason) -> Self;
 
     /// Tier-declined construct of `kind`.
-    fn unsupported(kind: UnsupportedKind) -> Self;
+    fn unsupported(kind: UnsupportedReason) -> Self;
 }
 
 /// Tier capability gates over shared grammar output.
@@ -50,7 +50,7 @@ pub trait H264Gate<E: H264Error>: Default {
             match previous {
                 None => previous = Some(*addr),
                 Some(prev) if *addr > prev => previous = Some(*addr),
-                _ => return Err(E::unsupported(UnsupportedKind::ArbitrarySliceOrder)),
+                _ => return Err(E::unsupported(UnsupportedReason::ArbitrarySliceOrder)),
             }
         }
         Ok(())
@@ -67,8 +67,8 @@ pub trait H264Gate<E: H264Error>: Default {
             7 => NalAction::Sps,
             8 => NalAction::Pps,
             9..=11 => NalAction::Complete,
-            2..=4 => return Err(E::unsupported(UnsupportedKind::DataPartitions)),
-            13..=15 | 20 => return Err(E::unsupported(UnsupportedKind::Multiview)),
+            2..=4 => return Err(E::unsupported(UnsupportedReason::DataPartitions)),
+            13..=15 | 20 => return Err(E::unsupported(UnsupportedReason::Multiview)),
             _ => NalAction::Ignore,
         })
     }
@@ -141,6 +141,8 @@ pub enum ParseKind {
     FrameCropOutsideCodedSize,
 }
 
+pub use self::ParseKind as ParseReason;
+
 /// Legal construct the tier declines inside shared code.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum UnsupportedKind {
@@ -167,6 +169,8 @@ pub enum UnsupportedKind {
     /// Slices out of decode order.
     ArbitrarySliceOrder,
 }
+
+pub use self::UnsupportedKind as UnsupportedReason;
 
 /// Gate accepting every construct.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -216,24 +220,24 @@ impl<E: H264Error> H264Gate<E> for StrictGate {
     /// window past 16, or a crop past the coded size.
     fn check_sps(sps: &Sps) -> Result<(), E> {
         if sps.fidelity.chroma_format_idc != 1 {
-            return Err(E::unsupported(UnsupportedKind::ChromaOutside420));
+            return Err(E::unsupported(UnsupportedReason::ChromaOutside420));
         }
         if sps.fidelity.bit_depth_luma_minus8 != 0 {
-            return Err(E::unsupported(UnsupportedKind::LumaDepthAbove8Bit));
+            return Err(E::unsupported(UnsupportedReason::LumaDepthAbove8Bit));
         }
         if sps.fidelity.bit_depth_chroma_minus8 != 0 {
-            return Err(E::unsupported(UnsupportedKind::ChromaDepthAbove8Bit));
+            return Err(E::unsupported(UnsupportedReason::ChromaDepthAbove8Bit));
         }
         if sps.fidelity.transform_bypass {
-            return Err(E::unsupported(UnsupportedKind::TransformBypass));
+            return Err(E::unsupported(UnsupportedReason::TransformBypass));
         }
         if sps.max_num_ref_frames > 16 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "max_num_ref_frames",
             }));
         }
         if sps.crop_offsets.is_some() && sps.crop.is_none() {
-            return Err(E::parse(ParseKind::FrameCropOutsideCodedSize));
+            return Err(E::parse(ParseReason::FrameCropOutsideCodedSize));
         }
         Ok(())
     }
@@ -246,7 +250,7 @@ impl<E: H264Error> H264Gate<E> for StrictGate {
     fn check_pps(pps: &Pps, sps: &Sps) -> Result<(), E> {
         let _ = sps;
         if pps.weighted_bipred_idc > 2 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "weighted_bipred_idc",
             }));
         }
@@ -261,7 +265,7 @@ impl<E: H264Error> H264Gate<E> for StrictGate {
     /// reference window.
     fn check_slice_extra(header: &SliceHeader, sps: &Sps) -> Result<(), E> {
         if header.redundant_pic_cnt != 0 {
-            return Err(E::unsupported(UnsupportedKind::RedundantPictures));
+            return Err(E::unsupported(UnsupportedReason::RedundantPictures));
         }
         for mods in [&header.ref_mod_l0, &header.ref_mod_l1] {
             for modification in mods {
@@ -269,12 +273,12 @@ impl<E: H264Error> H264Gate<E> for StrictGate {
                     RefMod::ShortBelow(diff) | RefMod::ShortAbove(diff)
                         if diff >= sps.max_frame_num() =>
                     {
-                        return Err(E::parse(ParseKind::Range {
+                        return Err(E::parse(ParseReason::Range {
                             syntax: "abs_diff_pic_num",
                         }));
                     }
                     RefMod::Long(index) if index > u32::from(sps.max_num_ref_frames) => {
-                        return Err(E::parse(ParseKind::Range {
+                        return Err(E::parse(ParseReason::Range {
                             syntax: "long_term_pic_num",
                         }));
                     }
@@ -288,37 +292,37 @@ impl<E: H264Error> H264Gate<E> for StrictGate {
 
 /// Checked narrowing of a parsed value to `u8`.
 pub(crate) fn narrow_u8<E: H264Error>(value: u32, syntax: &'static str) -> Result<u8, E> {
-    u8::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u8::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 /// Checked narrowing of a parsed value to `u16`.
 pub(crate) fn narrow_u16<E: H264Error>(value: u32, syntax: &'static str) -> Result<u16, E> {
-    u16::try_from(value).map_err(|_| E::parse(ParseKind::Range { syntax }))
+    u16::try_from(value).map_err(|_| E::parse(ParseReason::Range { syntax }))
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Grammar test error.
 
-    use super::{H264Error, ParseKind, UnsupportedKind};
+    use super::{H264Error, ParseReason, UnsupportedReason};
 
     /// Test failure capturing grammar kinds.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum TestError {
         /// Parse failure.
-        Parse(ParseKind),
+        Parse(ParseReason),
         /// Tier-declined construct.
-        Unsupported(UnsupportedKind),
+        Unsupported(UnsupportedReason),
     }
 
     impl H264Error for TestError {
         /// Parse failure of `kind`.
-        fn parse(kind: ParseKind) -> Self {
+        fn parse(kind: ParseReason) -> Self {
             Self::Parse(kind)
         }
 
         /// Tier-declined construct of `kind`.
-        fn unsupported(kind: UnsupportedKind) -> Self {
+        fn unsupported(kind: UnsupportedReason) -> Self {
             Self::Unsupported(kind)
         }
     }

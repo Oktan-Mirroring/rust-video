@@ -3,7 +3,7 @@
 use core::marker::PhantomData;
 
 use crate::bits::BitReader;
-use crate::error::{H264Error, H264Gate, NalAction, ParseKind};
+use crate::error::{H264Error, H264Gate, NalAction, ParseReason};
 use crate::framing::{rbsp, rbsp_prefix, split_nals, HEADER_PREFIX, MAX_PPS, MAX_SPS};
 use crate::pps::{parse_pps, parse_pps_ids, Pps};
 use crate::slice::{parse_slice_prefix, parse_slice_rest, SliceHeader};
@@ -17,6 +17,10 @@ pub struct Ingest<E: H264Error, G: H264Gate<E>> {
     pps: Box<[Option<Pps>; MAX_PPS]>,
     /// Slices of the open picture.
     pending: Vec<PendingSlice>,
+    /// Sequence store writes behind mirror sync.
+    sps_version: u64,
+    /// Picture store writes behind mirror sync.
+    pps_version: u64,
     /// Tier error under construction.
     error: PhantomData<E>,
     /// Tier gate under enforcement.
@@ -38,6 +42,8 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
             sps: Box::new(core::array::from_fn(|_| None)),
             pps: Box::new(core::array::from_fn(|_| None)),
             pending: Vec::new(),
+            sps_version: 0,
+            pps_version: 0,
             error: PhantomData,
             gate: PhantomData,
         }
@@ -53,6 +59,12 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
     #[must_use]
     pub fn pps(&self, id: u8) -> Option<&Pps> {
         self.pps.get(usize::from(id))?.as_ref()
+    }
+
+    /// Sequence and picture store versions behind mirror sync.
+    #[must_use]
+    pub fn versions(&self) -> (u64, u64) {
+        (self.sps_version, self.pps_version)
     }
 
     /// Pictures completed by `data`; trailing slices complete the picture.
@@ -87,7 +99,7 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
             return Ok(());
         };
         if header >> 7 != 0 {
-            return Err(E::parse(ParseKind::NalForbiddenBit));
+            return Err(E::parse(ParseReason::NalForbiddenBit));
         }
         let ref_idc = (header >> 5) & 3;
         match G::classify_nal(header & 0x1F)? {
@@ -116,14 +128,14 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
         let mut prefix_buf = [0u8; HEADER_PREFIX];
         let prefix_body = rbsp_prefix(nal, &mut prefix_buf);
         let Some(prefix_body) = prefix_body.get(1..) else {
-            return Err(E::parse(ParseKind::SliceWithoutHeader));
+            return Err(E::parse(ParseReason::SliceWithoutHeader));
         };
         // Prefix failure retries whole: a prefix error reproduces on the full bytes.
         let parsed = match self.parse_vcl(prefix_body, idr, ref_idc) {
             Err(_) => {
                 let bytes = rbsp(nal);
                 let Some(body) = bytes.get(1..) else {
-                    return Err(E::parse(ParseKind::SliceWithoutHeader));
+                    return Err(E::parse(ParseReason::SliceWithoutHeader));
                 };
                 self.parse_vcl(body, idr, ref_idc)?
             }
@@ -149,10 +161,10 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
         let prefix = parse_slice_prefix(&mut reader)?;
         let pps = self
             .pps(prefix.3)
-            .ok_or(E::parse(ParseKind::SliceCitesUnknownPps))?;
+            .ok_or(E::parse(ParseReason::SliceCitesUnknownPps))?;
         let sps = self
             .sps(pps.seq_parameter_set_id)
-            .ok_or(E::parse(ParseKind::SliceCitesUnknownSps))?;
+            .ok_or(E::parse(ParseReason::SliceCitesUnknownSps))?;
         parse_slice_rest::<E, G>(&mut reader, prefix, idr, ref_idc, sps, pps)
     }
 
@@ -160,11 +172,12 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
     fn ingest_sps(&mut self, nal: &[u8]) -> Result<(), E> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(1..) else {
-            return Err(E::parse(ParseKind::SpsWithoutBody));
+            return Err(E::parse(ParseReason::SpsWithoutBody));
         };
         let sps = parse_sps::<E, G>(body)?;
         let id = sps.seq_parameter_set_id;
         self.sps[usize::from(id)] = Some(sps);
+        self.sps_version = self.sps_version.wrapping_add(1);
         Ok(())
     }
 
@@ -172,16 +185,17 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
     fn ingest_pps(&mut self, nal: &[u8]) -> Result<(), E> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(1..) else {
-            return Err(E::parse(ParseKind::PpsWithoutBody));
+            return Err(E::parse(ParseReason::PpsWithoutBody));
         };
         let (_, sps_id) = parse_pps_ids(body)?;
         let sps = self
             .sps(sps_id)
-            .ok_or(E::parse(ParseKind::PpsCitesUnknownSps))?
+            .ok_or(E::parse(ParseReason::PpsCitesUnknownSps))?
             .clone();
         let pps = parse_pps::<E, G>(body, Some(&sps))?;
         let id = pps.pic_parameter_set_id;
         self.pps[usize::from(id)] = Some(pps);
+        self.pps_version = self.pps_version.wrapping_add(1);
         Ok(())
     }
 
@@ -198,7 +212,7 @@ impl<E: H264Error, G: H264Gate<E>> Ingest<E, G> {
                 || slice.idr != first.idr
                 || slice.ref_idc != first.ref_idc
             {
-                return Err(E::parse(ParseKind::PictureSlicesDisagree));
+                return Err(E::parse(ParseReason::PictureSlicesDisagree));
             }
         }
         let first_mbs: Vec<u32> = slices.iter().map(|slice| slice.header.first_mb).collect();
@@ -307,6 +321,16 @@ mod tests {
             .expect("sets");
         let pictures = ingest.ingest_packet(&data).expect("packet");
         assert_eq!(pictures.len(), 2);
+    }
+
+    #[test]
+    fn ingest_versions_count_store_writes() {
+        let mut ingest = Ingest::<TestError, StrictGate>::new();
+        assert_eq!(ingest.versions(), (0, 0));
+        ingest
+            .ingest_packet(&packet(&[nal(7, 3, &sps_body()), nal(8, 3, &pps_body())]))
+            .expect("sets");
+        assert_eq!(ingest.versions(), (1, 1));
     }
 
     #[test]

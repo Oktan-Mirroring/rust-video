@@ -20,7 +20,8 @@ mod vui;
 
 pub use bits::BitReader;
 pub use error::{
-    H265Error, H265Gate, HevcError, HevcGate, NalAction, ParseKind, PermissiveGate, UnsupportedKind,
+    H265Error, H265Gate, HevcError, HevcGate, NalAction, ParseKind, ParseReason, PermissiveGate,
+    StrictGate, UnsupportedKind, UnsupportedReason,
 };
 pub use framing::{
     anchors_tid0, is_bla, is_cra, is_cra_bla, is_idr, is_irap, is_radl, is_rasl, is_slnr,

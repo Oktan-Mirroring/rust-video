@@ -2,8 +2,8 @@
 
 use crate::bits::BitReader;
 use crate::error::test_support::TestError;
-use crate::error::H265Gate;
 use crate::error::NalAction;
+use crate::error::{H265Gate, ParseReason, StrictGate, UnsupportedReason};
 use crate::framing::rbsp;
 use crate::picture::Ingest;
 use crate::pps::{parse_pps, Pps};
@@ -14,6 +14,7 @@ use crate::sps::{parse_sps, Sps};
 use rust_video_harness::Bits;
 
 /// Test gate with ingest citation checks.
+#[derive(Default)]
 struct TestGate;
 
 impl H265Gate<TestError> for TestGate {
@@ -41,6 +42,7 @@ impl H265Gate<TestError> for TestGate {
 }
 
 /// Test gate asserting the classified NAL layer id.
+#[derive(Default)]
 struct LayerGate;
 
 impl H265Gate<TestError> for LayerGate {
@@ -384,6 +386,66 @@ fn pps_reports_flags_and_defaults() {
     assert!(
         pps.column_width.is_empty(),
         "untiled picture stores no widths"
+    );
+}
+
+#[test]
+fn strict_gate_holds_8bit_420() {
+    let sps = sps();
+    let checked: Result<(), TestError> = StrictGate::check_sps(&sps);
+    assert!(checked.is_ok());
+    let mut wide = sps.clone();
+    wide.chroma_format = 0;
+    assert_eq!(
+        StrictGate::check_sps(&wide),
+        Err(TestError::Parse(ParseReason::Range {
+            syntax: "chroma_format_idc",
+        }))
+    );
+    wide.chroma_format = 1;
+    wide.bit_depth_luma = 2;
+    assert_eq!(
+        StrictGate::check_sps(&wide),
+        Err(TestError::Parse(ParseReason::Range {
+            syntax: "bit_depth_luma_minus8",
+        }))
+    );
+    wide.bit_depth_luma = 0;
+    wide.bit_depth_chroma = 2;
+    assert_eq!(
+        StrictGate::check_sps(&wide),
+        Err(TestError::Parse(ParseReason::Range {
+            syntax: "bit_depth_chroma_minus8",
+        }))
+    );
+}
+
+#[test]
+fn strict_gate_declines_dependent_slices() {
+    let sps = sps();
+    let plain =
+        parse_pps::<TestError, TestGate>(&rbsp(&pps_body()), Some(&sps)).expect("valid pps");
+    let checked: Result<(), TestError> = StrictGate::check_pps(&plain, Some(&sps));
+    assert!(checked.is_ok());
+    let dependent = parse_pps::<TestError, TestGate>(&rbsp(&pps_body_opts(true)), Some(&sps))
+        .expect("dependent pps");
+    assert!(dependent.dependent_slices());
+    assert_eq!(
+        StrictGate::check_pps(&dependent, Some(&sps)),
+        Err(TestError::Unsupported(UnsupportedReason::DependentSlices))
+    );
+}
+
+#[test]
+fn strict_gate_orders_slices() {
+    let ordered: Result<(), TestError> =
+        StrictGate::check_slice_order(&[0, 5, 9], &[true, false, false]);
+    assert!(ordered.is_ok());
+    assert_eq!(
+        StrictGate::check_slice_order(&[5, 5], &[true, false]),
+        Err(TestError::Unsupported(
+            UnsupportedReason::ArbitrarySliceOrder
+        ))
     );
 }
 

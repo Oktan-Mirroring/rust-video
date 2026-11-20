@@ -3,7 +3,7 @@
 use core::marker::PhantomData;
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, H265Gate, NalAction, ParseKind};
+use crate::error::{H265Error, H265Gate, NalAction, ParseReason};
 use crate::framing::{
     is_cra_bla, is_idr, is_irap, is_rasl, rbsp, rbsp_prefix, split_nals, HEADER_PREFIX, MAX_PPS,
     MAX_SPS,
@@ -167,13 +167,13 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
             return Ok(());
         };
         if header[0] >> 7 != 0 {
-            return Err(E::parse(ParseKind::NalForbiddenBit));
+            return Err(E::parse(ParseReason::NalForbiddenBit));
         }
         let nal_type = (header[0] >> 1) & 0x3F;
         let layer_id = ((u16::from(header[0]) & 1) << 5) | (u16::from(header[1]) >> 3);
         let temporal_plus1 = header[1] & 7;
         if temporal_plus1 == 0 {
-            return Err(E::parse(ParseKind::NalTemporalId));
+            return Err(E::parse(ParseReason::NalTemporalId));
         }
         let temporal_id = temporal_plus1 - 1;
         match G::classify_nal(nal_type, layer_id)? {
@@ -202,12 +202,12 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
         let mut prefix_buf = [0u8; HEADER_PREFIX];
         let prefix_body = rbsp_prefix(nal, &mut prefix_buf);
         let Some(prefix_body) = prefix_body.get(2..) else {
-            return Err(E::parse(ParseKind::SliceWithoutHeader));
+            return Err(E::parse(ParseReason::SliceWithoutHeader));
         };
         let (parsed, pps_id) = self.parse_vcl(prefix_body, nal_type).or_else(|_| {
             let bytes = rbsp(nal);
             let Some(body) = bytes.get(2..) else {
-                return Err(E::parse(ParseKind::SliceWithoutHeader));
+                return Err(E::parse(ParseReason::SliceWithoutHeader));
             };
             self.parse_vcl(body, nal_type)
         })?;
@@ -234,10 +234,10 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
         let pps_id = prefix.2;
         let pps = self
             .pps(pps_id)
-            .ok_or(E::parse(ParseKind::SliceCitesUnknownPps))?;
+            .ok_or(E::parse(ParseReason::SliceCitesUnknownPps))?;
         let sps = self
             .sps(pps.sps_id)
-            .ok_or(E::parse(ParseKind::SliceCitesUnknownSps))?;
+            .ok_or(E::parse(ParseReason::SliceCitesUnknownSps))?;
         Ok((
             parse_slice_rest(&mut reader, prefix, nal_type, sps, pps)?,
             pps_id,
@@ -248,12 +248,12 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
     fn ingest_vps(&mut self, nal: &[u8]) -> Result<(), E> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(2..) else {
-            return Err(E::parse(ParseKind::VpsWithoutBody));
+            return Err(E::parse(ParseReason::VpsWithoutBody));
         };
         let mut reader = BitReader::new(body);
         let id = reader.read_bits(4, "vps_video_parameter_set_id")?;
         let id =
-            usize::try_from(id).map_err(|_| E::parse(ParseKind::Range { syntax: "vps id" }))?;
+            usize::try_from(id).map_err(|_| E::parse(ParseReason::Range { syntax: "vps id" }))?;
         if id < MAX_SPS {
             self.vps[id] = true;
         }
@@ -264,12 +264,12 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
     fn ingest_sps(&mut self, nal: &[u8]) -> Result<(), E> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(2..) else {
-            return Err(E::parse(ParseKind::SpsWithoutBody));
+            return Err(E::parse(ParseReason::SpsWithoutBody));
         };
         let mut probe = BitReader::new(body);
         let vps_id = probe.read_bits(4, "sps_video_parameter_set_id")?;
         let vps_id =
-            u8::try_from(vps_id).map_err(|_| E::parse(ParseKind::Range { syntax: "vps id" }))?;
+            u8::try_from(vps_id).map_err(|_| E::parse(ParseReason::Range { syntax: "vps id" }))?;
         let seen = self.vps.get(usize::from(vps_id)).copied().unwrap_or(false);
         G::check_sps_citation(vps_id, seen)?;
         let sps = parse_sps::<E, G>(body)?;
@@ -283,19 +283,19 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
     fn ingest_pps(&mut self, nal: &[u8]) -> Result<(), E> {
         let bytes = rbsp(nal);
         let Some(body) = bytes.get(2..) else {
-            return Err(E::parse(ParseKind::PpsWithoutBody));
+            return Err(E::parse(ParseReason::PpsWithoutBody));
         };
         let mut probe = BitReader::new(body);
         probe.read_ue("pic_parameter_set_id")?;
         let sps_id = probe.read_ue("seq_parameter_set_id")?;
         let sps_id = u8::try_from(sps_id).map_err(|_| {
-            E::parse(ParseKind::Range {
+            E::parse(ParseReason::Range {
                 syntax: "seq_parameter_set_id",
             })
         })?;
         let sps = self
             .sps(sps_id)
-            .ok_or(E::parse(ParseKind::PpsCitesUnknownSps))?;
+            .ok_or(E::parse(ParseReason::PpsCitesUnknownSps))?;
         let pps = parse_pps::<E, G>(body, Some(sps))?;
         let id = pps.id;
         self.pps[usize::from(id)] = Some(pps);
@@ -312,7 +312,7 @@ impl<E: H265Error, G: H265Gate<E>> Ingest<E, G> {
         let first = &slices[0];
         for slice in &slices {
             if slice.pps_id != first.pps_id || slice.nal_type != first.nal_type {
-                return Err(E::parse(ParseKind::PictureSlicesDisagree));
+                return Err(E::parse(ParseReason::PictureSlicesDisagree));
             }
         }
         let addrs: Vec<u32> = slices.iter().map(|slice| slice.header.address).collect();

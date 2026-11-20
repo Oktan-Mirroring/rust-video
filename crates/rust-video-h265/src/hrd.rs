@@ -1,7 +1,7 @@
 //! Hypothetical reference decoder parameters.
 
 use crate::bits::BitReader;
-use crate::error::{H265Error, ParseKind};
+use crate::error::{H265Error, ParseReason};
 
 /// HRD stream presence of one parameter set.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -138,7 +138,7 @@ fn parse_hrd_layer<E: H265Error>(
     } else {
         let count = reader.read_ue("cpb_cnt_minus1")?;
         if count > 31 {
-            return Err(E::parse(ParseKind::Range {
+            return Err(E::parse(ParseReason::Range {
                 syntax: "cpb_cnt_minus1",
             }));
         }
@@ -191,7 +191,7 @@ fn parse_hrd_cpb<E: H265Error>(
 /// Checked narrowing of a parsed value to `u8`.
 fn narrow_u8<E: H265Error>(value: u32) -> Result<u8, E> {
     u8::try_from(value).map_err(|_| {
-        E::parse(ParseKind::Range {
+        E::parse(ParseReason::Range {
             syntax: "hrd scale",
         })
     })

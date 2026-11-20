@@ -317,6 +317,7 @@ dependencies = [
  "rust-video-av1",
  "rust-video-av2",
  "rust-video-caps",
+ "rust-video-core",
  "rust-video-d3d11",
  "rust-video-d3d12",
  "rust-video-h264",
@@ -390,6 +391,7 @@ dependencies = [
 name = "rust-video-h264"
 version = "0.1.0"
 dependencies = [
+ "rust-video-core",
  "rust-video-harness",
 ]
 
@@ -397,6 +399,7 @@ dependencies = [
 name = "rust-video-h265"
 version = "0.1.0"
 dependencies = [
+ "rust-video-core",
  "rust-video-harness",
 ]
 
@@ -413,6 +416,9 @@ dependencies = [
 [[package]]
 name = "rust-video-livepack"
 version = "0.1.0"
+dependencies = [
+ "rust-video-core",
+]
 
 [[package]]
 name = "rust-video-mediacodec"
