@@ -1,6 +1,7 @@
 //! AV1 decode over a live video session.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::dpb::{Av1Decoded, Av1Dpb};
 use super::frontend::{Frame as Av1Frame, Ingest as Av1Ingest};
@@ -16,7 +17,7 @@ use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::delivery::SubmitStats;
+use rust_video_caps::delivery::{PhaseTiming, SubmitStats};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::{ParseReason as SharedParse, UnsupportedReason as SharedUnsupported};
 use rust_video_caps::traits::{Decoder, SharedDevice};
@@ -45,6 +46,8 @@ pub struct Av1Decoder<'a> {
     inflight_max: usize,
     /// Live-surface pin counts over the decoder pool.
     pins: Arc<SlotPins>,
+    /// Phase-split timing per submitted surface picture, oldest first.
+    surface_timings: Vec<PhaseTiming>,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -62,6 +65,7 @@ impl<'a> Av1Decoder<'a> {
             resets: 0,
             inflight_max: 0,
             pins: Arc::new(SlotPins::new()),
+            surface_timings: Vec::new(),
         }
     }
 
@@ -100,6 +104,12 @@ impl<'a> Av1Decoder<'a> {
         stats.add_resets(self.resets());
         stats.fold_peak(self.max_inflight());
         stats
+    }
+
+    /// Phase-split timing per submitted surface picture, oldest first.
+    #[must_use]
+    pub fn surface_timings(&self) -> &[PhaseTiming] {
+        &self.surface_timings
     }
 
     /// Decode `frame`, queueing its outputs for readback into `pending`.
@@ -314,15 +324,20 @@ impl<'a> Av1Decoder<'a> {
         active: &Active,
         surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
+        let submitted_at = Instant::now();
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
         // Submit before any surface handoff: outputs may name the submission slot.
         let ticket = match decoded.submission.as_ref() {
             Some(submission) => Some(session.submit_av1(submission)?),
             None => None,
         };
+        let submitted = Instant::now();
         if let Some(ticket) = ticket {
             session.wait_video(ticket)?;
         }
+        let signaled = Instant::now();
+        let submit = submitted.duration_since(submitted_at);
+        let engine_wait = signaled.duration_since(submitted);
         for output in &decoded.outputs {
             let slot = output.slot();
             let resource = session.texture(slot)?;
@@ -340,7 +355,28 @@ impl<'a> Av1Decoder<'a> {
             ));
             self.generation = self.generation.wrapping_add(1);
         }
+        if ticket.is_some() {
+            self.record_surface_timing(submitted_at, submit, engine_wait, Duration::ZERO);
+        }
         Ok(())
+    }
+
+    /// Surface phases from `submitted_at` into the timing log.
+    fn record_surface_timing(
+        &mut self,
+        submitted_at: Instant,
+        submit: Duration,
+        engine_wait: Duration,
+        copy: Duration,
+    ) {
+        self.surface_timings.push(PhaseTiming::new(
+            self.generation,
+            submit,
+            engine_wait,
+            copy,
+            submitted_at,
+            Instant::now(),
+        ));
     }
 
     /// Session for `active`, draining the previous sequence first.

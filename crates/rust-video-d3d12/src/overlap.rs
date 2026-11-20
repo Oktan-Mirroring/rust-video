@@ -360,6 +360,46 @@ pub struct OverlapPump<'a, F: OverlapFront> {
     max_depth: usize,
     /// Phase-split timing per harvested frame, oldest first.
     timings: Vec<PhaseTiming>,
+    /// Worker copy time per harvested frame, oldest first.
+    copies: Vec<Duration>,
+    /// Slot-quiesce waits behind sends.
+    quiesce_waits: u64,
+    /// Slot-quiesce wait time behind sends.
+    quiesce_time: Duration,
+    /// Send-path time behind sends.
+    send_cpu: Duration,
+    /// Packet-ingest time behind sends.
+    ingest_cpu: Duration,
+    /// Picture-submit time behind sends.
+    pictures_cpu: Duration,
+    /// Download-submit time behind sends.
+    downloads_cpu: Duration,
+    /// Sequence-derive time behind sends.
+    sequence_cpu: Duration,
+    /// DPB-prepare time behind sends.
+    prepare_cpu: Duration,
+    /// Video-submit time behind sends.
+    track_video_cpu: Duration,
+    /// Track bookkeeping time behind sends.
+    track_misc_cpu: Duration,
+    /// Pipe-full hits behind sends.
+    bound_hits: u64,
+    /// Pictures behind sends.
+    picture_count: u64,
+    /// Video-signal gaps behind harvests.
+    engine_gaps: Vec<Duration>,
+    /// Last video-signal stamp behind gaps.
+    last_video_signaled: Option<Instant>,
+    /// Copy-signal gaps behind harvests.
+    copy_gaps: Vec<Duration>,
+    /// Last copy-signal stamp behind gaps.
+    last_copy_signaled: Option<Instant>,
+    /// Send-harvest time behind sends.
+    harvest_cpu: Duration,
+    /// Harvest-land time behind receives.
+    land_cpu: Duration,
+    /// Pipeline-drain time behind synced outputs and finish.
+    drain_time: Duration,
     /// Progress signal sender behind blocking receive.
     wake_tx: Sender<()>,
     /// Progress signal receiver behind blocking receive.
@@ -407,6 +447,26 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             finished: false,
             max_depth: 0,
             timings: Vec::new(),
+            copies: Vec::new(),
+            quiesce_waits: 0,
+            quiesce_time: Duration::ZERO,
+            send_cpu: Duration::ZERO,
+            ingest_cpu: Duration::ZERO,
+            pictures_cpu: Duration::ZERO,
+            downloads_cpu: Duration::ZERO,
+            sequence_cpu: Duration::ZERO,
+            prepare_cpu: Duration::ZERO,
+            track_video_cpu: Duration::ZERO,
+            track_misc_cpu: Duration::ZERO,
+            bound_hits: 0,
+            picture_count: 0,
+            engine_gaps: Vec::new(),
+            last_video_signaled: None,
+            copy_gaps: Vec::new(),
+            last_copy_signaled: None,
+            harvest_cpu: Duration::ZERO,
+            land_cpu: Duration::ZERO,
+            drain_time: Duration::ZERO,
             wake_tx,
             wake_rx,
             pins: Arc::new(SlotPins::new()),
@@ -456,9 +516,83 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         &self.timings
     }
 
+    /// Worker copy time per harvested frame, oldest first.
+    #[must_use]
+    pub fn copy_times(&self) -> &[Duration] {
+        &self.copies
+    }
+
+    /// Slot-quiesce waits plus wait time behind sends.
+    #[must_use]
+    pub fn quiesce_stats(&self) -> (u64, Duration) {
+        (self.quiesce_waits, self.quiesce_time)
+    }
+
+    /// Send, land, and drain time behind the drive.
+    #[must_use]
+    pub fn cpu_totals(&self) -> (Duration, Duration, Duration) {
+        (self.send_cpu, self.land_cpu, self.drain_time)
+    }
+
+    /// Ingest, picture-submit, harvest, and download time behind sends.
+    #[must_use]
+    pub fn send_split(&self) -> (Duration, Duration, Duration, Duration) {
+        (
+            self.ingest_cpu,
+            self.pictures_cpu,
+            self.harvest_cpu,
+            self.downloads_cpu,
+        )
+    }
+
+    /// Video-signal gaps behind harvests, oldest first.
+    #[must_use]
+    pub fn engine_gaps(&self) -> &[Duration] {
+        &self.engine_gaps
+    }
+
+    /// Sequence-derive, DPB-prepare, video-submit, and bookkeeping time behind sends.
+    #[must_use]
+    pub fn front_split(&self) -> (Duration, Duration, Duration, Duration) {
+        (
+            self.sequence_cpu,
+            self.prepare_cpu,
+            self.track_video_cpu,
+            self.track_misc_cpu,
+        )
+    }
+
+    /// Copy-signal gaps behind harvests, oldest first.
+    #[must_use]
+    pub fn copy_gaps(&self) -> &[Duration] {
+        &self.copy_gaps
+    }
+
+    /// Pipe-full hits plus pictures behind sends.
+    #[must_use]
+    pub fn drive_stats(&self) -> (u64, u64) {
+        (self.bound_hits, self.picture_count)
+    }
+
+    /// Video-signal gap from `signaled` into the gap log.
+    fn engine_gap_at(&mut self, signaled: Instant) {
+        if let Some(previous) = self.last_video_signaled.replace(signaled) {
+            self.engine_gaps.push(signaled.duration_since(previous));
+        }
+    }
+
+    /// Copy-signal gap from `signaled` into the gap log.
+    fn copy_gap_at(&mut self, signaled: Instant) {
+        if let Some(previous) = self.last_copy_signaled.replace(signaled) {
+            self.copy_gaps.push(signaled.duration_since(previous));
+        }
+    }
+
     /// Decode `picture` through a pipelined submit plus queued downloads.
     fn submit_picture(&mut self, picture: &F::Picture) -> Result<(), D3d12Error> {
+        let sequence_started = Instant::now();
         let active = F::sequence(&self.ingest, picture, self.active)?;
+        self.sequence_cpu += sequence_started.elapsed();
         if F::needs_reconfigure(self.active, active) {
             self.drain_pipeline()?;
             self.reconfigure(active)?;
@@ -466,7 +600,10 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             self.active = Some(active);
         }
         let dpb = self.dpb.as_mut().ok_or(D3d12Error::NoSession)?;
-        let prepared = match F::prepare(&self.ingest, dpb, picture) {
+        let prepare_started = Instant::now();
+        let prepared = F::prepare(&self.ingest, dpb, picture);
+        self.prepare_cpu += prepare_started.elapsed();
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 if !matches!(error, D3d12Error::NoFreeSlot) {
@@ -498,14 +635,18 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             return self.submit_synced(active, &prepared.outputs);
         };
         // Boxed before submit: the recorded pointers name stable heap addresses.
+        let misc_started = Instant::now();
         let submission = Box::new(submission);
         let pin = self.pins.pin(slot);
         let Some(session) = self.session.as_mut() else {
             return Err(D3d12Error::NoSession);
         };
+        self.track_misc_cpu += misc_started.elapsed();
         let video_submit = Instant::now();
         let ticket = F::submit_video(session, &submission)?;
         let submit_cpu = video_submit.elapsed();
+        self.track_video_cpu += submit_cpu;
+        let downloads_started = Instant::now();
         let mut pending = VecDeque::with_capacity(prepared.outputs.len());
         for output in &prepared.outputs {
             let copy_submit = Instant::now();
@@ -523,6 +664,8 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
                 launched: false,
             });
         }
+        self.downloads_cpu += downloads_started.elapsed();
+        let post_started = Instant::now();
         self.pictures.push_back(InflightPicture {
             submission: Some(submission),
             pin,
@@ -531,6 +674,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             outputs: pending,
         });
         self.note_depth();
+        self.track_misc_cpu += post_started.elapsed();
         Ok(())
     }
 
@@ -576,12 +720,15 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
+        let waited = Instant::now();
+        self.quiesce_waits += u64::try_from(videos.len() + copies.len()).unwrap_or(u64::MAX);
         for ticket in videos {
             session.wait_video(ticket)?;
         }
         for ticket in copies {
             session.wait_copy(ticket)?;
         }
+        self.quiesce_time += waited.elapsed();
         self.harvest_poll()
     }
 
@@ -593,11 +740,17 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
+        let mut stamped = Vec::new();
         for picture in &mut self.pictures {
             if picture.video_signaled.is_none() && session.video_signaled(picture.video) {
-                picture.video_signaled = Some(Instant::now());
+                let signaled = Instant::now();
+                picture.video_signaled = Some(signaled);
                 picture.submission = None;
+                stamped.push(signaled);
             }
+        }
+        for signaled in stamped {
+            self.engine_gap_at(signaled);
         }
         while self.harvest_front()? {}
         Ok(())
@@ -642,12 +795,17 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             return Ok(false);
         }
         let mapped = session.map_slot(slot)?;
+        let mut signaled_copy = false;
         if let Some(output) = self
             .pictures
             .front_mut()
             .and_then(|front| front.outputs.front_mut())
         {
             output.launched = true;
+            signaled_copy = true;
+        }
+        if signaled_copy {
+            self.copy_gap_at(Instant::now());
         }
         if let Some(done) = self.readback.launch(mapped) {
             self.land_front(done)?;
@@ -657,7 +815,16 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
 
     /// Front output plus `done` into the ready queue.
     fn land_front(&mut self, done: Done) -> Result<(), D3d12Error> {
-        let (slot, bytes, release, _copy) = done.into_parts();
+        let started = Instant::now();
+        let out = self.land_front_inner(done);
+        self.land_cpu += started.elapsed();
+        out
+    }
+
+    /// Front output plus `done` into the ready queue.
+    fn land_front_inner(&mut self, done: Done) -> Result<(), D3d12Error> {
+        let (slot, bytes, release, copy) = done.into_parts();
+        self.copies.push(copy);
         let output = self
             .pictures
             .front_mut()
@@ -839,9 +1006,11 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
 
     /// Every in-flight picture into the ready queue, waiting.
     fn drain_pipeline(&mut self) -> Result<(), D3d12Error> {
+        let started = Instant::now();
         while !self.pictures.is_empty() {
             self.pump_progress()?;
         }
+        self.drain_time += started.elapsed();
         Ok(())
     }
 
@@ -948,27 +1117,57 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
 
     /// Pictures behind `data` into the pipeline plus a harvest.
     fn submit_packet_data(&mut self, data: &[u8]) -> Result<(), D3d12Error> {
-        let pictures = F::ingest_packet(&mut self.ingest, data)?;
+        let ingest_started = Instant::now();
+        let pictures = F::ingest_packet(&mut self.ingest, data);
+        self.ingest_cpu += ingest_started.elapsed();
+        let pictures = pictures?;
         let ready_len = self.ready.len();
+        let pictures_started = Instant::now();
         for picture in &pictures {
             while self.pictures.len() >= self.bound {
+                self.bound_hits += 1;
                 if let Err(error) = self.pump_progress() {
                     self.ready.truncate(ready_len);
                     return Err(self.fail(error));
                 }
             }
+            self.picture_count += 1;
             if let Err(error) = self.submit_picture(picture) {
+                self.pictures_cpu += pictures_started.elapsed();
                 self.ready.truncate(ready_len);
                 self.signal();
                 return Err(error);
             }
         }
-        if let Err(error) = self.harvest_poll() {
+        self.pictures_cpu += pictures_started.elapsed();
+        let harvest_started = Instant::now();
+        let harvested = self.harvest_poll();
+        self.harvest_cpu += harvest_started.elapsed();
+        if let Err(error) = harvested {
             self.ready.truncate(ready_len);
             self.signal();
             return Err(self.fail(error));
         }
         self.signal();
+        Ok(())
+    }
+
+    /// `packet` into the pipeline unless finished, unsupported, or full.
+    fn try_send_inner(&mut self, packet: Packet) -> Result<(), TrySendError<D3d12Error>> {
+        if self.finished {
+            return Err(TrySendError::Full { packet });
+        }
+        if !self.device.supports(F::CODEC) {
+            return Err(TrySendError::Failed {
+                error: SkipReason::ProfileUnsupported { codec: F::CODEC }.into(),
+            });
+        }
+        if self.pictures.len() >= self.bound {
+            return Err(TrySendError::Full { packet });
+        }
+        self.submit_packet_data(packet.data())
+            .map_err(|error| TrySendError::Failed { error })?;
+        self.submitted = self.submitted.wrapping_add(1);
         Ok(())
     }
 
@@ -1002,21 +1201,10 @@ impl<F: OverlapFront> SendPackets for OverlapPump<'_, F> {
     type Error = D3d12Error;
 
     fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
-        if self.finished {
-            return Err(TrySendError::Full { packet });
-        }
-        if !self.device.supports(F::CODEC) {
-            return Err(TrySendError::Failed {
-                error: SkipReason::ProfileUnsupported { codec: F::CODEC }.into(),
-            });
-        }
-        if self.pictures.len() >= self.bound {
-            return Err(TrySendError::Full { packet });
-        }
-        self.submit_packet_data(packet.data())
-            .map_err(|error| TrySendError::Failed { error })?;
-        self.submitted = self.submitted.wrapping_add(1);
-        Ok(())
+        let started = Instant::now();
+        let out = self.try_send_inner(packet);
+        self.send_cpu += started.elapsed();
+        out
     }
 
     fn finish(&mut self) -> Result<(), Self::Error> {

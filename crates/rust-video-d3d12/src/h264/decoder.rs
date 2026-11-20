@@ -1,6 +1,7 @@
 //! H.264 decode over a live video session.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::dpb::{Decoded, Dpb};
 use super::frontend::{Ingest, Picture};
@@ -15,7 +16,7 @@ use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::delivery::SubmitStats;
+use rust_video_caps::delivery::{PhaseTiming, SubmitStats};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::ParseReason as SharedParse;
 use rust_video_caps::traits::{Decoder, SharedDevice};
@@ -44,6 +45,8 @@ pub struct H264Decoder<'a> {
     inflight_max: usize,
     /// Live-surface pin counts over the decoder pool.
     pins: Arc<SlotPins>,
+    /// Phase-split timing per submitted surface picture, oldest first.
+    surface_timings: Vec<PhaseTiming>,
 }
 
 impl<'a> H264Decoder<'a> {
@@ -61,6 +64,7 @@ impl<'a> H264Decoder<'a> {
             resets: 0,
             inflight_max: 0,
             pins: Arc::new(SlotPins::new()),
+            surface_timings: Vec::new(),
         }
     }
 
@@ -99,6 +103,12 @@ impl<'a> H264Decoder<'a> {
         stats.add_resets(self.resets());
         stats.fold_peak(self.max_inflight());
         stats
+    }
+
+    /// Phase-split timing per submitted surface picture, oldest first.
+    #[must_use]
+    pub fn surface_timings(&self) -> &[PhaseTiming] {
+        &self.surface_timings
     }
 
     /// Decode `picture`, queueing its outputs for readback into `pending`.
@@ -303,10 +313,15 @@ impl<'a> H264Decoder<'a> {
         active: &Active,
         surfaces: &mut Vec<GpuSurface>,
     ) -> Result<(), D3d12Error> {
+        let submitted_at = Instant::now();
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
         // Submit before any surface handoff: outputs may name the submission slot.
         let ticket = session.submit(&decoded.submission)?;
+        let submitted = Instant::now();
         session.wait_video(ticket)?;
+        let signaled = Instant::now();
+        let submit = submitted.duration_since(submitted_at);
+        let engine_wait = signaled.duration_since(submitted);
         if !session.cropped() {
             for output in &decoded.outputs {
                 let slot = output.slot();
@@ -325,6 +340,7 @@ impl<'a> H264Decoder<'a> {
                 ));
                 self.generation = self.generation.wrapping_add(1);
             }
+            self.record_surface_timing(submitted_at, submit, engine_wait, Duration::ZERO);
             return Ok(());
         }
         let mut pending = Vec::with_capacity(decoded.outputs.len());
@@ -347,7 +363,26 @@ impl<'a> H264Decoder<'a> {
             ));
             self.generation = self.generation.wrapping_add(1);
         }
+        self.record_surface_timing(submitted_at, submit, engine_wait, signaled.elapsed());
         Ok(())
+    }
+
+    /// Surface phases from `submitted_at` into the timing log.
+    fn record_surface_timing(
+        &mut self,
+        submitted_at: Instant,
+        submit: Duration,
+        engine_wait: Duration,
+        copy: Duration,
+    ) {
+        self.surface_timings.push(PhaseTiming::new(
+            self.generation,
+            submit,
+            engine_wait,
+            copy,
+            submitted_at,
+            Instant::now(),
+        ));
     }
 
     /// Session for `active`, draining the previous sequence first.
