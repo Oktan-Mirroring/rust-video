@@ -867,6 +867,56 @@ where
     );
 }
 
+/// Timed overlap pass over `packets`, counting frames then dropping them.
+///
+/// Holding every frame pins pooled byte buffers and forces cold packs
+/// no brief-hold consumer reproduces; dropping after the count keeps
+/// the pool hot like the sync legs. Byte parity stays covered by the
+/// overlap tests, which hold their frames for comparison.
+fn sustained_dropping<P>(pump: &mut P, packets: &[Packet]) -> (f64, usize)
+where
+    P: rust_video_caps::delivery::SendPackets<Error = D3d11Error>
+        + rust_video_caps::delivery::PollFrames<Frame = D3d11Frame, Error = D3d11Error>
+        + rust_video_caps::delivery::ReceiveFrames<Frame = D3d11Frame, Error = D3d11Error>,
+{
+    use rust_video_caps::delivery::TrySendError;
+
+    let start = std::time::Instant::now();
+    let mut count = 0usize;
+    for (index, packet) in packets.iter().enumerate() {
+        let mut packet = packet.clone();
+        loop {
+            match pump.try_send(packet) {
+                Ok(()) => break,
+                Err(TrySendError::Full { packet: back }) => {
+                    packet = back;
+                    let frame = pump
+                        .receive()
+                        .expect("in-flight frame completes")
+                        .expect("input unfinished");
+                    count += 1;
+                    drop(frame);
+                }
+                Err(TrySendError::Failed { error }) => {
+                    panic!("overlap packet {index}: {error}")
+                }
+            }
+        }
+    }
+    while pump.try_receive().expect("overlap poll").is_some() {
+        count += 1;
+    }
+    pump.finish().expect("finish drains");
+    while pump.receive().expect("drain").is_some() {
+        count += 1;
+    }
+    let wall = start.elapsed().as_secs_f64();
+    (
+        f64::from(u32::try_from(count).expect("frame count fits")) / wall,
+        count,
+    )
+}
+
 /// Whole microseconds behind `elapsed`, saturating.
 fn micros(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
@@ -920,7 +970,7 @@ fn sustained_h264_1080p_measures_realtime() {
     let decoder = H264Decoder::open(&device);
     let mut pump = OverlappedPump::open(decoder);
     prime(&mut pump, &Packets::from_raws(&raws));
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    let (measured, count) = sustained_dropping(&mut pump, &Packets::from_raws(&raws));
     let depth = pump.max_depth();
     assert!(
         count >= raws.len(),
@@ -962,7 +1012,7 @@ fn sustained_hevc_1080p_measures_realtime() {
     let decoder = HevcDecoder::open(&device);
     let mut pump = OverlappedPump::open(decoder);
     prime(&mut pump, &Packets::from_raws(&raws));
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    let (measured, count) = sustained_dropping(&mut pump, &Packets::from_raws(&raws));
     let depth = pump.max_depth();
     assert!(
         count >= raws.len(),
@@ -1003,7 +1053,7 @@ fn sustained_av1_1080p_measures_realtime() {
     let decoder = Av1Decoder::open(&device);
     let mut pump = OverlappedPump::open(decoder);
     prime(&mut pump, &Packets::from_raws(&raws));
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    let (measured, count) = sustained_dropping(&mut pump, &Packets::from_raws(&raws));
     let depth = pump.max_depth();
     assert!(
         count >= raws.len(),
@@ -1044,7 +1094,7 @@ fn sustained_vp9_1080p_measures_realtime() {
     let decoder = Vp9Decoder::open(&device);
     let mut pump = OverlappedPump::open(decoder);
     prime(&mut pump, &Packets::from_raws(&raws));
-    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    let (measured, count) = sustained_dropping(&mut pump, &Packets::from_raws(&raws));
     let depth = pump.max_depth();
     assert!(
         count >= raws.len(),
