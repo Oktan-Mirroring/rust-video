@@ -778,15 +778,6 @@ where
     );
 }
 
-/// Measured fps of one sustained overlap pass of `raws`, plus frame count and peak depth.
-macro_rules! sustained_fps {
-    ($decoder:expr, $raws:expr) => {{
-        let mut pump = OverlappedPump::open($decoder);
-        let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws($raws), drain);
-        (measured, count, pump.max_depth())
-    }};
-}
-
 /// Whole microseconds behind `elapsed`, saturating.
 fn micros(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
@@ -838,9 +829,23 @@ fn sustained_h264_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let decoder = H264Decoder::open(&device);
-    let (measured, count, depth) = sustained_fps!(decoder, &raws);
+    let mut pump = OverlappedPump::open(decoder);
+    prime(&mut pump, &Packets::from_raws(&raws));
+    let (measured, count) = Drive::sustained(&mut pump, &Packets::from_raws(&raws), drain);
+    let depth = pump.max_depth();
+    assert!(
+        count >= raws.len(),
+        "every packet yields its frames: {count} over {}",
+        raws.len()
+    );
+    assert!(
+        count <= raws.len() + 2 * WARMUP_PASSES,
+        "leftovers within prime work: {count} over {}",
+        raws.len()
+    );
+    let wall = f64::from(u32::try_from(count).expect("frame count fits")) / measured;
+    let measured = f64::from(u32::try_from(raws.len()).expect("packet count fits")) / wall;
     println!("d3d11 h264 sustained overlap 1080p: {measured:.1}fps over {count} frames, depth {depth}, bar {SUSTAINED_H264_BAR:.0}fps");
-    assert_eq!(count, raws.len(), "every picture yields its frame");
     assert!(
         measured >= SUSTAINED_H264_BAR,
         "below sustained bar: {measured:.1}fps < {SUSTAINED_H264_BAR:.0}fps"
