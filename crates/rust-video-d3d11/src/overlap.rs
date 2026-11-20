@@ -52,15 +52,27 @@ pub(crate) struct FrameQueue<F> {
     ready: VecDeque<F>,
     /// Peak pending count.
     max_observed: usize,
+    /// Admitted outputs before sends refuse.
+    depth: usize,
 }
 
 impl<F> FrameQueue<F> {
     /// Empty queue.
     pub(crate) fn new() -> Self {
+        Self::with_depth(INFLIGHT_DEPTH)
+    }
+
+    /// Empty queue admitting at most `depth` outputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - admitted outputs before sends refuse; clamped to `1..=INFLIGHT_CEILING`.
+    pub(crate) fn with_depth(depth: usize) -> Self {
         Self {
             pending: VecDeque::new(),
             ready: VecDeque::new(),
             max_observed: 0,
+            depth: depth.clamp(1, INFLIGHT_CEILING),
         }
     }
 
@@ -86,7 +98,7 @@ impl<F> FrameQueue<F> {
 
     /// True while another send fits under the in-flight bound.
     pub(crate) fn admits(&self) -> bool {
-        self.pending.len() < INFLIGHT_DEPTH
+        self.pending.len() < self.depth
     }
 
     /// Oldest pending output, if any.
@@ -635,7 +647,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
-    use super::{FrameQueue, OverlappedPump, PumpGauges, INFLIGHT_DEPTH};
+    use super::{FrameQueue, OverlappedPump, PumpGauges, INFLIGHT_CEILING, INFLIGHT_DEPTH};
     use crate::decoder::Active;
     use crate::error::D3d11Error;
 
@@ -769,6 +781,31 @@ mod tests {
         assert_eq!(queue.max_observed(), INFLIGHT_DEPTH);
         queue.pop_pending();
         assert!(queue.admits());
+    }
+
+    #[test]
+    fn queue_depth_clamps_to_lanes() {
+        let start = Instant::now();
+        let mut one = FrameQueue::<u64>::with_depth(0);
+        one.push(0, active(), start, start);
+        assert!(!one.admits());
+        let mut full = FrameQueue::<u64>::with_depth(usize::MAX);
+        for lane in 0..u8::try_from(INFLIGHT_CEILING).expect("bound fits") {
+            assert!(full.admits());
+            full.push(lane, active(), start, start);
+        }
+        assert!(!full.admits());
+    }
+
+    #[test]
+    fn queue_admits_under_configured_depth() {
+        let mut queue = FrameQueue::<u64>::with_depth(2);
+        let start = Instant::now();
+        assert!(queue.admits());
+        queue.push(0, active(), start, start);
+        assert!(queue.admits());
+        queue.push(1, active(), start, start);
+        assert!(!queue.admits());
     }
 
     #[test]

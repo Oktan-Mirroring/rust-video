@@ -57,9 +57,25 @@ impl Drop for Av1Decoder<'_> {
 }
 
 impl<'a> Av1Decoder<'a> {
+    /// Admitted outputs before sends refuse, by default.
+    pub const DEFAULT_DEPTH: usize = crate::overlap::INFLIGHT_DEPTH;
+    /// Admitted outputs before sends refuse, at most.
+    pub const MAX_DEPTH: usize = crate::overlap::INFLIGHT_CEILING;
+
     /// Decoder over `device`; the session starts on the first frame.
     #[must_use]
     pub fn open(device: &'a D3d11Device) -> Self {
+        Self::open_depth(device, Self::DEFAULT_DEPTH)
+    }
+
+    /// Decoder over `device` admitting at most `depth` outputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - D3D11 device behind decode sessions.
+    /// * `depth` - admitted outputs before sends refuse; clamped to `1..=MAX_DEPTH`.
+    #[must_use]
+    pub fn open_depth(device: &'a D3d11Device, depth: usize) -> Self {
         Self {
             device,
             ingest: crate::av1::Ingest::new(),
@@ -69,7 +85,7 @@ impl<'a> Av1Decoder<'a> {
             active: None,
             generation: 0,
             resets: 0,
-            queue: FrameQueue::new(),
+            queue: FrameQueue::with_depth(depth),
             timings: Vec::new(),
             finished: false,
             readback: Readback::spawn(),
