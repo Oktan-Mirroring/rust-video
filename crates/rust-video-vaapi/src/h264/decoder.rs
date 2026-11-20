@@ -4,6 +4,7 @@
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::backend::{Backend, Pool, StatsInner};
 use crate::buffer::bytes_of;
@@ -20,8 +21,10 @@ use crate::sys;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, DmaBufPlane, GpuExport, GpuFrame, PixelFormat};
+use rust_video_caps::delivery::{SplitDecode, SubmitStats};
+use rust_video_caps::frame::{CpuFrame, DmaBufPlane, GpuExport, GpuFrame, PixelFormat, Surface};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{BrokenReferenceReason as CapsBroken, ParseReason as CapsParse};
 use rust_video_caps::traits::{Decoder, Lease, SharedDevice};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
@@ -48,6 +51,8 @@ pub struct H264Decoder<'a> {
     list0: Vec<usize>,
     /// Scratch list-one indices, reused across slices.
     list1: Vec<usize>,
+    /// Split-phase frames decoded inline, awaiting poll.
+    split_pending: Vec<VaApiFrame>,
 }
 
 impl<'a> H264Decoder<'a> {
@@ -64,6 +69,7 @@ impl<'a> H264Decoder<'a> {
             slice_params: Vec::new(),
             list0: Vec::new(),
             list1: Vec::new(),
+            split_pending: Vec::new(),
         }
     }
 
@@ -115,7 +121,7 @@ impl<'a> H264Decoder<'a> {
 
     /// Phase timings of the live context, absent before the first sequence set.
     #[must_use]
-    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+    pub fn phase_stats(&self) -> Option<crate::backend::VaPhaseStats> {
         self.backend.as_ref().map(Backend::phase_stats)
     }
 
@@ -152,9 +158,7 @@ impl<'a> H264Decoder<'a> {
                 }
                 _ if drained.is_empty() => {}
                 _ => {
-                    return Err(VaApiError::Parse(
-                        "reconfig dropped decoded pictures".to_owned(),
-                    ));
+                    return Err(VaApiError::Parse(CapsParse::Range { syntax: "reconfig" }));
                 }
             }
             self.maybe_drop_backend();
@@ -204,12 +208,12 @@ impl<'a> H264Decoder<'a> {
             .frontend
             .sps()
             .cloned()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let profile = Params::profile(sps.profile_idc)?;
         let (width, height) = self
             .frontend
             .coded_size()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let count = self.frontend.max_dpb_frames().unwrap_or(16) + 4;
         let backend = Backend::open(self.device, profile, width, height, count)?;
         self.shared = Some(SharedDevice::new("vaapi", u64::MAX));
@@ -284,19 +288,14 @@ impl<'a> H264Decoder<'a> {
             slots
                 .into_iter()
                 .map(|slot| {
-                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
-                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })?;
+                    let guard = backend
+                        .surface_guard(slot.index())
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     let surface = backend
                         .surfaces()
                         .get(slot.index() as usize)
                         .copied()
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!(
-                                "slot {} outside pool",
-                                slot.index()
-                            ))
-                        })?;
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     Ok((slot, guard, surface))
                 })
                 .collect::<Result<Vec<_>, VaApiError>>()?
@@ -367,19 +366,20 @@ impl<'a> H264Decoder<'a> {
             .backend
             .as_ref()
             .and_then(|backend| backend.surfaces().get(slot.index() as usize).copied())
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         let first = picture
             .slices()
             .first()
-            .ok_or_else(|| VaApiError::Parse("picture without slices".to_owned()))?;
-        let max_pic_num = i32::try_from(picture.sps().max_frame_num())
-            .map_err(|_| VaApiError::Parse("frame_num range".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::PictureWithoutSlices))?;
+        let max_pic_num = i32::try_from(picture.sps().max_frame_num()).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "frame_num",
+            })
+        })?;
         let backend = self
             .backend
             .as_ref()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let params = Params::new(self.frontend.dpb(), backend.surfaces());
         let picture_params = params.picture(
             picture.sps(),
@@ -411,7 +411,7 @@ impl<'a> H264Decoder<'a> {
         let backend = self
             .backend
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         backend.submit_slices(
             surface,
             bytes_of(&picture_params),
@@ -529,14 +529,14 @@ impl<'a> H264Decoder<'a> {
     fn crop(&self) -> Result<(u32, u32, u32, u32), VaApiError> {
         self.frontend
             .visible_rect()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))
     }
 
     /// Live context and budget.
     fn active(&self) -> Result<(&Backend, &SharedDevice), VaApiError> {
         match (self.backend.as_ref(), self.shared.as_ref()) {
             (Some(backend), Some(shared)) => Ok((backend, shared)),
-            _ => Err(VaApiError::Parse("decode before sequence set".to_owned())),
+            _ => Err(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader)),
         }
     }
 }
@@ -559,6 +559,35 @@ impl Decoder for H264Decoder<'_> {
 
     fn flush(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.flush_inner(true)
+    }
+}
+
+impl SplitDecode for H264Decoder<'_> {
+    type Frame = VaApiFrame;
+    type Error = VaApiError;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, VaApiError> {
+        let frames = self.decode(packet)?;
+        self.split_pending.extend(frames);
+        Ok(true)
+    }
+
+    fn poll(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Ok(std::mem::take(&mut self.split_pending))
+    }
+
+    fn poll_wait(&mut self, _timeout: Duration) -> Result<Vec<VaApiFrame>, VaApiError> {
+        self.poll()
+    }
+
+    fn flush_split(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        let mut frames = std::mem::take(&mut self.split_pending);
+        frames.extend(self.flush()?);
+        Ok(frames)
+    }
+
+    fn stats(&self) -> SubmitStats {
+        self.submit_stats().unwrap_or_default()
     }
 }
 
@@ -637,9 +666,7 @@ impl VaApiFrame {
                 .surfaces()
                 .get(slot.index() as usize)
                 .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })?;
+                .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
             let data = if emit.readback {
                 Bytes::from(backend.read_nv12(surface, emit.crop)?)
             } else {
@@ -794,9 +821,9 @@ impl VaApiFrame {
     /// # Errors
     ///
     /// Returns `Err` when the driver reports the surface failed.
-    pub fn wait(&self) -> Result<(), VaApiError> {
+    pub fn try_wait(&self) -> Result<(), VaApiError> {
         match self.device.as_ref() {
-            Some(surface) => surface.wait(),
+            Some(surface) => surface.try_wait(),
             None => Ok(()),
         }
     }
@@ -845,6 +872,32 @@ impl VaApiFrame {
     }
 }
 
+impl Surface for VaApiFrame {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
+    }
+}
+
 /// Device surface behind a frame, leased against pool reuse.
 ///
 /// A live surface keeps its own resources alive: dropping the decoder never invalidates outstanding surfaces, and dropping a surface releases its slot.
@@ -885,7 +938,7 @@ impl DeviceSurface {
     /// # Errors
     ///
     /// Returns `Err` when the driver reports the surface failed.
-    fn wait(&self) -> Result<(), VaApiError> {
+    fn try_wait(&self) -> Result<(), VaApiError> {
         // Sound: the display and surface are live behind the pool lease.
         let outcome = Reader::sync_surface(self.display, self.surface);
         self.gauges.note_synced();
@@ -1116,7 +1169,7 @@ mod tests {
         let shared = SharedDevice::new("vaapi", 100);
         let held = frame(&shared, 4, 2, vec![0; 12]);
         assert_eq!(held.surface(), None);
-        assert!(held.wait().is_ok());
+        assert!(held.try_wait().is_ok());
     }
 
     #[test]

@@ -7,14 +7,15 @@ use std::process::Command;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
 use rust_video_caps::frame::{GpuExport, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device, Encoder};
 use rust_video_caps::transcode::Route;
 use rust_video_harness::{FrameHash, Stream, Synth};
 use rust_video_vaapi::{
-    EncodeCodec, GopShape, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder,
-    VaApiError, VaApiFrame,
+    EncodeCodec, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder, VaApiError,
+    VaApiFrame,
 };
 
 /// Corpus root: `$RUST_VIDEO_CORPUS` or the checkout's `corpus/`.
@@ -217,6 +218,61 @@ fn device() -> Option<VaApiDevice> {
     }
 }
 
+/// Legacy config for `codec`: tier profile under `Auto` rate control.
+fn legacy_config(codec: EncodeCodec) -> EncodeConfig {
+    let (profile, level) = match codec {
+        EncodeCodec::H264 => (
+            Profile::H264(rust_video_caps::h264::EncodeProfile::High),
+            Level::H264(rust_video_caps::h264::EncodeLevel::Auto),
+        ),
+        EncodeCodec::H265 => (
+            Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+            Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ),
+    };
+    EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile,
+        level,
+        ..EncodeConfig::default()
+    }
+}
+
+/// CQP config for `codec` with an IDR every `keyint` pictures.
+fn low_delay_config(codec: EncodeCodec, keyint: u32) -> EncodeConfig {
+    let mut config = legacy_config(codec);
+    config.rate_control = RateControl::Cqp { qp: 26 };
+    config.gop = Gop {
+        keyint,
+        min_keyint: keyint,
+        b_frames: 0,
+        refs: 1,
+    };
+    config
+}
+
+/// Encoder open with driver-gap skips.
+fn open_encoder(
+    device: &VaApiDevice,
+    codec: EncodeCodec,
+    size: PictureSize,
+    config: &EncodeConfig,
+) -> Option<VaApiEncoder> {
+    match VaApiEncoder::open(device, codec, size, config) {
+        Ok(encoder) => Some(encoder),
+        Err(
+            VaApiError::Unsupported(_)
+            | VaApiError::Declined(_)
+            | VaApiError::NoPackedHeaders { .. }
+            | VaApiError::NoNv12ImageFormat,
+        ) => {
+            skip(&format!("{codec} encode entrypoint"));
+            None
+        }
+        Err(error) => panic!("unexpected encode failure: {error}"),
+    }
+}
+
 #[test]
 fn demux_matches_ffmpeg_remux() {
     let path = corpus().join("synth/h264/anchor-high.mp4");
@@ -367,13 +423,9 @@ fn vaapi_encodes_h264_all_intra() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
-        Ok(encoder) => encoder,
-        Err(VaApiError::Unsupported(message)) => {
-            skip(&format!("h264 encode entrypoint ({message})"));
-            return;
-        }
-        Err(error) => panic!("unexpected encode failure: {error}"),
+    let config = legacy_config(EncodeCodec::H264);
+    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+        return;
     };
     let mut annex_b = Vec::new();
     let mut coded = 0;
@@ -423,13 +475,9 @@ fn vaapi_encodes_h265_keyframes() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
-        Ok(encoder) => encoder,
-        Err(VaApiError::Unsupported(message)) => {
-            skip(&format!("h265 encode entrypoint ({message})"));
-            return;
-        }
-        Err(error) => panic!("unexpected encode failure: {error}"),
+    let config = legacy_config(EncodeCodec::H265);
+    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H265, size, &config) else {
+        return;
     };
     let mut annex_b = Vec::new();
     let mut coded = 0;
@@ -534,13 +582,9 @@ fn vaapi_encodes_h264_low_delay_gop60() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
-        Ok(encoder) => encoder.with_gop(GopShape::LowDelay { intra_period: 60 }),
-        Err(VaApiError::Unsupported(message)) => {
-            skip(&format!("h264 encode entrypoint ({message})"));
-            return;
-        }
-        Err(error) => panic!("unexpected encode failure: {error}"),
+    let config = low_delay_config(EncodeCodec::H264, 60);
+    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+        return;
     };
     let (packets, annex_b) = encode_low_delay(&mut encoder, size, 65);
     assert_eq!(packets.len(), 65);
@@ -574,13 +618,9 @@ fn vaapi_encodes_h265_low_delay_gop60() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
-        Ok(encoder) => encoder.with_gop(GopShape::LowDelay { intra_period: 60 }),
-        Err(VaApiError::Unsupported(message)) => {
-            skip(&format!("h265 encode entrypoint ({message})"));
-            return;
-        }
-        Err(error) => panic!("unexpected encode failure: {error}"),
+    let config = low_delay_config(EncodeCodec::H265, 60);
+    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H265, size, &config) else {
+        return;
     };
     let (packets, annex_b) = encode_low_delay(&mut encoder, size, 65);
     assert_eq!(packets.len(), 65);
@@ -615,18 +655,13 @@ fn vaapi_low_delay_beats_all_intra_bitrate() {
     };
     let size = PictureSize::new(320, 240).expect("synth size");
     for codec in [EncodeCodec::H264, EncodeCodec::H265] {
-        let open = |gop| match VaApiEncoder::open(&device, codec, size) {
-            Ok(encoder) => Some(encoder.with_gop(gop)),
-            Err(VaApiError::Unsupported(message)) => {
-                skip(&format!("{codec} encode entrypoint ({message})"));
-                None
-            }
-            Err(error) => panic!("unexpected encode failure: {error}"),
-        };
-        let Some(mut intra) = open(GopShape::AllIntra) else {
+        let open = |config: &EncodeConfig| open_encoder(&device, codec, size, config);
+        let intra_config = legacy_config(codec);
+        let Some(mut intra) = open(&intra_config) else {
             continue;
         };
-        let Some(mut low_delay) = open(GopShape::LowDelay { intra_period: 60 }) else {
+        let low_config = low_delay_config(codec, 60);
+        let Some(mut low_delay) = open(&low_config) else {
             continue;
         };
         let (intra_packets, _) = encode_low_delay(&mut intra, size, 60);
@@ -731,13 +766,9 @@ fn vaapi_reuses_encode_buffers() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
-        Ok(encoder) => encoder,
-        Err(VaApiError::Unsupported(message)) => {
-            skip(&format!("h264 encode entrypoint ({message})"));
-            return;
-        }
-        Err(error) => panic!("unexpected encode failure: {error}"),
+    let config = legacy_config(EncodeCodec::H264);
+    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+        return;
     };
     let mut coded = 0;
     for index in 0..8 {
@@ -746,7 +777,13 @@ fn vaapi_reuses_encode_buffers() {
     }
     coded += encoder.flush().expect("flush").len();
     assert_eq!(coded, 8);
-    eprintln!("encode reuse: creates={}", encoder.buffer_creates());
+    let stats = encoder.submit_stats();
+    eprintln!(
+        "encode reuse: submitted={} creates={}",
+        stats.submitted(),
+        stats.buffer_creates()
+    );
+    assert_eq!(stats.submitted(), 8);
     assert!(
         encoder.buffer_creates() < 8 * 4,
         "reused buffers, not per-picture: {} creates for 8 pictures",
@@ -843,6 +880,7 @@ fn vaapi_transcodes_on_device() {
         skip("transcode export+encode caps");
         return;
     }
+    assert_eq!(transcoder.plan().route(), Route::Gpu);
     let path = corpus().join("synth/h264/anchor-high.mp4");
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
@@ -867,7 +905,7 @@ fn vaapi_transcodes_low_delay_gop60() {
         return;
     };
     let mut transcoder = Transcoder::open(&device, EncodeCodec::H264)
-        .with_gop(GopShape::LowDelay { intra_period: 60 });
+        .with_config(low_delay_config(EncodeCodec::H264, 60));
     if !transcoder.caps().ready() {
         skip("transcode export+encode caps");
         return;

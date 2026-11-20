@@ -31,54 +31,52 @@ use rust_video_av1::{
     UnsupportedReason as Av1Unsupported,
 };
 
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
+
 use crate::error::VaApiError;
 
 impl From<Av1Error> for VaApiError {
     fn from(error: Av1Error) -> Self {
         match error {
             Av1Error::Parse(reason) => Self::Parse(match reason {
-                Av1Parse::FrameBeforeSequenceHeader => "frame before sequence header".to_owned(),
-                Av1Parse::FrameWithoutTileData => "frame without tile data".to_owned(),
-                Av1Parse::IncompleteTileGroup => "incomplete tile group".to_owned(),
-                Av1Parse::ObuExtensionReservedBits => "obu extension reserved bits".to_owned(),
-                Av1Parse::ObuForbiddenBit => "obu forbidden bit".to_owned(),
-                Av1Parse::ObuReservedBit => "obu reserved bit".to_owned(),
-                Av1Parse::ObuSizeExceedsPayload => "obu size exceeds payload".to_owned(),
-                Av1Parse::OverflowI32 { syntax } | Av1Parse::OverflowU32 { syntax } => {
-                    format!("read number cannot fit in 32 bits at {syntax}")
-                }
-                Av1Parse::Range { syntax } => format!("{syntax} out of range"),
-                Av1Parse::RedundantHeaderMismatch => "redundant header mismatch".to_owned(),
-                Av1Parse::ReservedObuType => "reserved obu type".to_owned(),
-                Av1Parse::TileGridCoverage => "tile grid coverage".to_owned(),
-                Av1Parse::TileGroupOrder => "tile group order".to_owned(),
-                Av1Parse::TileGroupWithoutData => "tile group without data".to_owned(),
-                Av1Parse::TileGroupWithoutFrameHeader => {
-                    "tile group without frame header".to_owned()
-                }
-                Av1Parse::TooWide { syntax } => {
-                    format!("more than 31 bits were requested at {syntax}")
-                }
-                Av1Parse::Truncated { syntax } => format!("reader ran out of bits at {syntax}"),
+                Av1Parse::FrameBeforeSequenceHeader => CapsParse::FrameBeforeSequenceHeader,
+                Av1Parse::FrameWithoutTileData => CapsParse::FrameWithoutTileData,
+                Av1Parse::IncompleteTileGroup => CapsParse::IncompleteTileGroup,
+                Av1Parse::ObuExtensionReservedBits => CapsParse::ObuExtensionReservedBits,
+                Av1Parse::ObuForbiddenBit => CapsParse::ObuForbiddenBit,
+                Av1Parse::ObuReservedBit => CapsParse::ObuReservedBit,
+                Av1Parse::ObuSizeExceedsPayload => CapsParse::ObuSizeExceedsPayload,
+                Av1Parse::OverflowI32 { syntax } => CapsParse::OverflowI32 { syntax },
+                Av1Parse::OverflowU32 { syntax } => CapsParse::OverflowU32 { syntax },
+                Av1Parse::Range { syntax } => CapsParse::Range { syntax },
+                Av1Parse::RedundantHeaderMismatch => CapsParse::RedundantHeaderMismatch,
+                Av1Parse::ReservedObuType => CapsParse::ReservedObuType,
+                Av1Parse::TileGridCoverage => CapsParse::TileGridCoverage,
+                Av1Parse::TileGroupOrder => CapsParse::TileGroupOrder,
+                Av1Parse::TileGroupWithoutData => CapsParse::TileGroupWithoutData,
+                Av1Parse::TileGroupWithoutFrameHeader => CapsParse::TileGroupWithoutFrameHeader,
+                Av1Parse::TooWide { syntax } => CapsParse::TooWide { syntax },
+                Av1Parse::Truncated { syntax } => CapsParse::Truncated { syntax },
             }),
             Av1Error::Unsupported(reason) => Self::Unsupported(match reason {
                 Av1Unsupported::Av1BitDepthNeedsTarget { depth } => {
-                    format!("av1 bit depth {depth} needs target")
+                    CapsUnsupported::Av1BitDepthNeedsTarget { depth }
                 }
-                Av1Unsupported::Av1ChromaOutside420 => "av1 chroma outside 4:2:0".to_owned(),
-                Av1Unsupported::Av1Monochrome => "av1 monochrome".to_owned(),
+                Av1Unsupported::Av1ChromaOutside420 => CapsUnsupported::Av1ChromaOutside420,
+                Av1Unsupported::Av1Monochrome => CapsUnsupported::Av1Monochrome,
                 Av1Unsupported::RenderSizeDiffersFromFrameSize => {
-                    "render size differs from frame size".to_owned()
+                    CapsUnsupported::RenderSizeDiffersFromFrameSize
                 }
-                Av1Unsupported::SpatialLayers => "spatial layers".to_owned(),
-                Av1Unsupported::SuperresUpscale => "superres upscale".to_owned(),
-                Av1Unsupported::TileCountAbove256 => "tile count above 256".to_owned(),
-                Av1Unsupported::TileList => "large-scale tiles".to_owned(),
+                Av1Unsupported::SpatialLayers => CapsUnsupported::SpatialLayers,
+                Av1Unsupported::SuperresUpscale => CapsUnsupported::SuperresUpscale,
+                Av1Unsupported::TileCountAbove256 => CapsUnsupported::TileCountAbove256,
+                Av1Unsupported::TileList => CapsUnsupported::TileList,
             }),
             Av1Error::BrokenReference(reason) => Self::BrokenReference(match reason {
-                Av1Broken::NamesEmptySlot { reference } => {
-                    format!("{reference} names empty slot")
-                }
+                Av1Broken::NamesEmptySlot { reference } => CapsBroken::NamesEmptySlot { reference },
             }),
         }
     }
@@ -131,11 +129,11 @@ mod tests {
                 syntax: "tile data"
             }))
             .to_string(),
-            "parse failed: tile data out of range"
+            "parse failed: tile data range"
         );
         assert_eq!(
             VaApiError::from(Error::Unsupported(UnsupportedReason::TileList)).to_string(),
-            "unsupported stream: large-scale tiles"
+            "unsupported stream: tile list"
         );
         assert_eq!(
             VaApiError::from(Error::BrokenReference(

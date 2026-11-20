@@ -31,46 +31,41 @@ pub(crate) use rust_video_h265::SliceWeights;
 
 use rust_video_h265::{HevcError, HevcGate, ParseKind, UnsupportedKind};
 
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
+
 use crate::error::VaApiError;
 
 /// Tier capability gates over shared grammar output.
+#[derive(Default)]
 pub(crate) struct Gate;
 
 impl HevcError for VaApiError {
     /// Parse failure of `kind`.
     fn parse(kind: ParseKind) -> Self {
         match kind {
-            ParseKind::Truncated { .. }
-            | ParseKind::VpsWithoutBody
-            | ParseKind::SpsWithoutBody
-            | ParseKind::PpsWithoutBody
-            | ParseKind::SliceWithoutHeader => Self::Parse("reader ran out of bits".to_owned()),
-            ParseKind::OverflowU32 { .. } | ParseKind::OverflowI32 { .. } => {
-                Self::Parse("read number cannot fit in 32 bits".to_owned())
-            }
-            ParseKind::TooWide { syntax } => {
-                Self::Parse(format!("more than 31 bits were requested at {syntax}"))
-            }
-            ParseKind::Range { syntax } => Self::Parse(format!("{syntax} out of range")),
-            ParseKind::NalForbiddenBit => Self::Parse("nal forbidden bit".to_owned()),
-            ParseKind::NalTemporalId => Self::Parse("nal temporal id".to_owned()),
-            ParseKind::PpsCitesUnknownSps => Self::Parse("pps cites unknown sps".to_owned()),
-            ParseKind::SliceCitesUnknownPps => Self::Parse("slice cites unknown pps".to_owned()),
-            ParseKind::SliceCitesUnknownSps => Self::Parse("slice cites unknown sps".to_owned()),
-            ParseKind::PictureSlicesDisagree => Self::Parse("picture slices disagree".to_owned()),
-            ParseKind::NonIntraSliceInIdr => {
-                Self::Parse("non-intra slice in idr picture".to_owned())
-            }
-            ParseKind::ShortTermRefPicSetSize => Self::Parse("short-term set size".to_owned()),
-            ParseKind::EmptyCodedSize => Self::Parse("empty coded size".to_owned()),
-            ParseKind::ConformanceOutside => {
-                Self::Parse("conformance outside coded size".to_owned())
-            }
-            ParseKind::RpsTableOversize => Self::Parse("rps table oversize".to_owned()),
-            ParseKind::LtSpsOversize | ParseKind::LtTotalOversize => {
-                Self::Parse("long-term oversize".to_owned())
-            }
-            ParseKind::EmptySpsRps => Self::Parse("empty sps rps".to_owned()),
+            ParseKind::Truncated { syntax } => Self::Parse(CapsParse::Truncated { syntax }),
+            ParseKind::VpsWithoutBody => Self::Parse(CapsParse::VpsWithoutBody),
+            ParseKind::SpsWithoutBody => Self::Parse(CapsParse::SpsWithoutBody),
+            ParseKind::PpsWithoutBody => Self::Parse(CapsParse::PpsWithoutBody),
+            ParseKind::SliceWithoutHeader => Self::Parse(CapsParse::SliceWithoutHeader),
+            ParseKind::OverflowU32 { syntax } => Self::Parse(CapsParse::OverflowU32 { syntax }),
+            ParseKind::OverflowI32 { syntax } => Self::Parse(CapsParse::OverflowI32 { syntax }),
+            ParseKind::TooWide { syntax } => Self::Parse(CapsParse::TooWide { syntax }),
+            ParseKind::Range { syntax } => Self::Parse(CapsParse::Range { syntax }),
+            ParseKind::NalForbiddenBit => Self::Parse(CapsParse::NalForbiddenBit),
+            ParseKind::NalTemporalId => Self::Parse(CapsParse::NalTemporalId),
+            ParseKind::PpsCitesUnknownSps => Self::Parse(CapsParse::PpsCitesUnknownSps),
+            ParseKind::SliceCitesUnknownPps => Self::Parse(CapsParse::SliceCitesUnknownPps),
+            ParseKind::SliceCitesUnknownSps => Self::Parse(CapsParse::SliceCitesUnknownSps),
+            ParseKind::PictureSlicesDisagree => Self::Parse(CapsParse::PictureSlicesDisagree),
+            ParseKind::NonIntraSliceInIdr => Self::Parse(CapsParse::NonIntraSliceInIdr),
+            ParseKind::ShortTermRefPicSetSize => Self::Parse(CapsParse::ShortTermRefPicSetSize),
+            ParseKind::EmptyCodedSize => Self::Parse(CapsParse::EmptyCodedSize),
+            ParseKind::ConformanceOutside => Self::Parse(CapsParse::ConfWinOutsideCodedSize),
+            ParseKind::RpsTableOversize => Self::Parse(CapsParse::RpsTableOversize),
+            ParseKind::LtSpsOversize => Self::Parse(CapsParse::LtSpsOversize),
+            ParseKind::LtTotalOversize => Self::Parse(CapsParse::LtTotalOversize),
+            ParseKind::EmptySpsRps => Self::Parse(CapsParse::EmptySpsRps),
         }
     }
 
@@ -79,11 +74,11 @@ impl HevcError for VaApiError {
         match kind {
             // Well-formed but declined: the tier holds no address or
             // tail for dependent slices.
-            UnsupportedKind::DependentSlices => Self::Unsupported("dependent slices".to_owned()),
+            UnsupportedKind::DependentSlices => Self::Unsupported(CapsUnsupported::DependentSlices),
             UnsupportedKind::ArbitrarySliceOrder => {
-                Self::Unsupported("arbitrary slice order".to_owned())
+                Self::Unsupported(CapsUnsupported::ArbitrarySliceOrder)
             }
-            UnsupportedKind::Multilayer => Self::Unsupported("multilayer".to_owned()),
+            UnsupportedKind::Multilayer => Self::Unsupported(CapsUnsupported::Multilayer),
         }
     }
 }
@@ -92,28 +87,28 @@ impl HevcGate<VaApiError> for Gate {
     /// Sequence set against tier caps.
     fn check_sps(sps: &Sps) -> Result<(), VaApiError> {
         if sps.chroma_format != 1 {
-            return Err(VaApiError::Unsupported(format!(
-                "chroma {}",
-                sps.chroma_format
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
         if sps.separate_colour_plane {
-            return Err(VaApiError::Unsupported("separate colour planes".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
         if sps.bit_depth_luma > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 6, got {}",
-                sps.bit_depth_luma
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "bit_depth_luma",
+            }));
         }
         if sps.bit_depth_chroma > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 6, got {}",
-                sps.bit_depth_chroma
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "bit_depth_chroma",
+            }));
         }
-        if sps.bit_depth_luma != 0 || sps.bit_depth_chroma != 0 {
-            return Err(VaApiError::Unsupported("high bit depth".to_owned()));
+        if sps.bit_depth_luma != 0 {
+            return Err(VaApiError::Unsupported(CapsUnsupported::LumaDepthAbove8Bit));
+        }
+        if sps.bit_depth_chroma != 0 {
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::ChromaDepthAbove8Bit,
+            ));
         }
         Self::check_level(sps.level_idc)?;
         for layer in &sps.ptl.sub_layers {
@@ -122,39 +117,27 @@ impl HevcGate<VaApiError> for Gate {
             }
         }
         if sps.max_sub_layers == 0 || sps.max_sub_layers > 7 {
-            let value = sps.max_sub_layers.saturating_sub(1);
-            return Err(VaApiError::Parse(format!(
-                "Invalid max_sub_layers_minus1 {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "max_sub_layers",
+            }));
         }
         if sps.id > 15 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 15, got {}",
-                sps.id
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "sps_id" }));
         }
         Self::check_sps_dimensions(sps)?;
         Self::check_sps_ordering(sps)?;
         Self::check_sps_blocks(sps)?;
         if sps.rps.len() > 64 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 64, got {}",
-                sps.rps.len()
-            )));
+            return Err(VaApiError::Parse(CapsParse::RpsTableOversize));
         }
         if sps.lt_poc_lsb.len() > 32 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 32, got {}",
-                sps.lt_poc_lsb.len()
-            )));
+            return Err(VaApiError::Parse(CapsParse::LtSpsOversize));
         }
         if sps.sps_extension_flags[1] {
-            return Err(VaApiError::Parse(
-                "Multilayer extension not supported.".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Multilayer));
         }
         if sps.sps_extension_flags[2] {
-            return Err(VaApiError::Parse("3D extension not supported.".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Multiview));
         }
         Ok(())
     }
@@ -162,40 +145,28 @@ impl HevcGate<VaApiError> for Gate {
     /// Picture set against tier caps with its sequence set, absent for orphans.
     fn check_pps(pps: &Pps, sps: Option<&Sps>) -> Result<(), VaApiError> {
         if pps.id > 63 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 63, got {}",
-                pps.id
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "pps_id" }));
         }
         if pps.sps_id > 15 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 15, got {}",
-                pps.sps_id
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "sps_id" }));
         }
         Self::check_pps_qp(pps, sps)?;
         Self::check_pps_tiles(pps, sps)?;
         if pps.beta_offset_div2 < -6 || pps.beta_offset_div2 > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -6-6, got {}",
-                pps.beta_offset_div2
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "beta_offset_div2",
+            }));
         }
         if pps.tc_offset_div2 < -6 || pps.tc_offset_div2 > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -6-6, got {}",
-                pps.tc_offset_div2
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "tc_offset_div2",
+            }));
         }
         if pps.pps_extension_flags[1] {
-            return Err(VaApiError::Parse(
-                "Multilayer extension is not supported".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Multilayer));
         }
         if pps.pps_extension_flags[2] {
-            return Err(VaApiError::Parse(
-                "3D extension is not supported".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Multiview));
         }
         Ok(())
     }
@@ -208,7 +179,9 @@ impl Gate {
             level_idc,
             30 | 60 | 63 | 90 | 93 | 120 | 123 | 150 | 153 | 156 | 180 | 183 | 186
         ) {
-            return Err(VaApiError::Parse(format!("Invalid Level {level_idc}")));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "level_idc",
+            }));
         }
         Ok(())
     }
@@ -216,22 +189,15 @@ impl Gate {
     /// Coded size and depth bounds, 7.4.3.2.1.
     fn check_sps_dimensions(sps: &Sps) -> Result<(), VaApiError> {
         if sps.width == 0 || sps.width > 16888 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 1 - 16888, got {}",
-                sps.width
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "width" }));
         }
         if sps.height == 0 || sps.height > 16888 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 1 - 16888, got {}",
-                sps.height
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "height" }));
         }
         if sps.log2_max_poc_lsb_minus4 > 12 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 12, got {}",
-                sps.log2_max_poc_lsb_minus4
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_max_poc_lsb",
+            }));
         }
         Ok(())
     }
@@ -240,24 +206,21 @@ impl Gate {
     fn check_sps_ordering(sps: &Sps) -> Result<(), VaApiError> {
         for (index, buffering) in sps.ordering_buffering.iter().enumerate() {
             if *buffering > 16 {
-                return Err(VaApiError::Parse(format!(
-                    "Value out of bounds: expected 0 - 16, got {buffering}"
-                )));
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "ordering_buffering",
+                }));
             }
             let reorder = sps.ordering_reorder.get(index).copied().unwrap_or(0);
             if reorder > *buffering {
-                return Err(VaApiError::Parse(format!(
-                    "Value out of bounds: expected 0 - {buffering}, got {reorder}"
-                )));
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "ordering_reorder",
+                }));
             }
             let latency = sps.ordering_latency.get(index).copied().unwrap_or(0);
-            if latency == u32::MAX {
-                return Err(VaApiError::Parse(format!(
-                    "Value out of bounds: expected 0 - 4294967294, got {latency}"
-                )));
-            }
-            if latency > 255 {
-                return Err(VaApiError::Parse("Conversion error".to_owned()));
+            if latency == u32::MAX || latency > 255 {
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "ordering_latency",
+                }));
             }
         }
         Ok(())
@@ -266,42 +229,32 @@ impl Gate {
     /// Block geometry bounds, 7.4.3.2.1.
     fn check_sps_blocks(sps: &Sps) -> Result<(), VaApiError> {
         if sps.log2_min_cb_size_minus3 > 3 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 3, got {}",
-                sps.log2_min_cb_size_minus3
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_min_cb_size",
+            }));
         }
         if sps.log2_diff_max_min_cb_size > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 6, got {}",
-                sps.log2_diff_max_min_cb_size
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_diff_cb_size",
+            }));
         }
         if sps.log2_min_tb_size_minus2 > 3 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 3, got {}",
-                sps.log2_min_tb_size_minus2
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_min_tb_size",
+            }));
         }
         if sps.log2_diff_max_min_tb_size > 3 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 3, got {}",
-                sps.log2_diff_max_min_tb_size
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_diff_tb_size",
+            }));
         }
         if sps.max_transform_depth_inter > 4 || sps.max_transform_depth_intra > 4 {
-            let value = sps
-                .max_transform_depth_inter
-                .max(sps.max_transform_depth_intra);
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 4, got {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "max_transform_depth",
+            }));
         }
         if sps.pcm_log2_min_minus3 > 2 || sps.pcm_log2_diff > 2 {
-            let value = sps.pcm_log2_min_minus3.max(sps.pcm_log2_diff);
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 2, got {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "pcm_log2" }));
         }
         Ok(())
     }
@@ -309,46 +262,37 @@ impl Gate {
     /// Picture QP bounds against the sequence set.
     fn check_pps_qp(pps: &Pps, sps: Option<&Sps>) -> Result<(), VaApiError> {
         if pps.num_ref_l0 > 14 || pps.num_ref_l1 > 14 {
-            let value = pps.num_ref_l0.max(pps.num_ref_l1);
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 14, got {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "num_ref" }));
         }
         let Some(sps) = sps else {
             return Ok(());
         };
         let qp_min = -i32::from(26 + 6 * sps.bit_depth_luma);
         if i32::from(pps.pic_init_qp_minus26) < qp_min || pps.pic_init_qp_minus26 > 25 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between {qp_min}-25, got {}",
-                pps.pic_init_qp_minus26
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "pic_init_qp",
+            }));
         }
         if pps.cb_qp_offset < -12 || pps.cb_qp_offset > 12 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -12-12, got {}",
-                pps.cb_qp_offset
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "cb_qp_offset",
+            }));
         }
         if pps.cr_qp_offset < -12 || pps.cr_qp_offset > 12 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -12-12, got {}",
-                pps.cr_qp_offset
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "cr_qp_offset",
+            }));
         }
         if pps.diff_cu_qp_delta_depth > sps.log2_diff_max_min_cb_size {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - {}, got {}",
-                sps.log2_diff_max_min_cb_size, pps.diff_cu_qp_delta_depth
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "diff_cu_qp_delta_depth",
+            }));
         }
         let ctb_log2 = u32::from(sps.log2_min_cb_size_minus3 + 3 + sps.log2_diff_max_min_cb_size);
         if u32::from(pps.log2_parallel_merge_minus2) > ctb_log2.saturating_sub(2) {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - {}, got {}",
-                ctb_log2.saturating_sub(2),
-                pps.log2_parallel_merge_minus2
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "log2_parallel_merge",
+            }));
         }
         Ok(())
     }
@@ -356,16 +300,14 @@ impl Gate {
     /// Tile counts inside the treeblock grid.
     fn check_pps_tiles(pps: &Pps, sps: Option<&Sps>) -> Result<(), VaApiError> {
         if pps.num_tile_columns > 19 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 18, got {}",
-                pps.num_tile_columns.saturating_sub(1)
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "num_tile_columns",
+            }));
         }
         if pps.num_tile_rows > 21 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 20, got {}",
-                pps.num_tile_rows.saturating_sub(1)
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "num_tile_rows",
+            }));
         }
         let Some(sps) = sps else {
             return Ok(());
@@ -373,18 +315,10 @@ impl Gate {
         let width_ctbs = sps.width_in_ctbs();
         let height_ctbs = sps.height_in_ctbs();
         if u32::from(pps.num_tile_columns) > width_ctbs {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - {}, got {}",
-                width_ctbs.saturating_sub(1),
-                pps.num_tile_columns.saturating_sub(1)
-            )));
+            return Err(VaApiError::Parse(CapsParse::TileGridCoverage));
         }
         if u32::from(pps.num_tile_rows) > height_ctbs {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - {}, got {}",
-                height_ctbs.saturating_sub(1),
-                pps.num_tile_rows.saturating_sub(1)
-            )));
+            return Err(VaApiError::Parse(CapsParse::TileGridCoverage));
         }
         Ok(())
     }
@@ -448,7 +382,7 @@ mod tests {
         set.level_idc = 15;
         assert_eq!(
             Gate::check_sps(&set).unwrap_err().to_string(),
-            "parse failed: Invalid Level 15"
+            "parse failed: level_idc range"
         );
     }
 
@@ -459,7 +393,7 @@ mod tests {
                 syntax: "slice_type"
             })
             .to_string(),
-            "parse failed: slice_type out of range"
+            "parse failed: slice_type range"
         );
         assert_eq!(
             VaApiError::parse(ParseKind::NalTemporalId).to_string(),

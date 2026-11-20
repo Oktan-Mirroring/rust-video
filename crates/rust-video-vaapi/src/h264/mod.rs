@@ -20,6 +20,8 @@ pub(crate) use rust_video_h264::{
 
 use rust_video_h264::{H264Error, H264Gate, ParseKind, UnsupportedKind};
 
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
+
 use crate::error::VaApiError;
 
 /// Tier capability gates over shared grammar output.
@@ -30,50 +32,52 @@ impl H264Error for VaApiError {
     /// Parse failure of `kind`.
     fn parse(kind: ParseKind) -> Self {
         match kind {
-            ParseKind::Truncated { .. }
-            | ParseKind::SpsWithoutBody
-            | ParseKind::PpsWithoutBody
-            | ParseKind::SliceWithoutHeader => Self::Parse("reader ran out of bits".to_owned()),
-            ParseKind::OverflowU32 { .. } | ParseKind::OverflowI32 { .. } => {
-                Self::Parse("read number cannot fit in 32 bits".to_owned())
+            ParseKind::Truncated { syntax } => Self::Parse(CapsParse::Truncated { syntax }),
+            ParseKind::SpsWithoutBody => Self::Parse(CapsParse::SpsWithoutBody),
+            ParseKind::PpsWithoutBody => Self::Parse(CapsParse::PpsWithoutBody),
+            ParseKind::SliceWithoutHeader => Self::Parse(CapsParse::SliceWithoutHeader),
+            ParseKind::OverflowU32 { syntax } => Self::Parse(CapsParse::OverflowU32 { syntax }),
+            ParseKind::OverflowI32 { syntax } => Self::Parse(CapsParse::OverflowI32 { syntax }),
+            ParseKind::TooWide { syntax } => Self::Parse(CapsParse::TooWide { syntax }),
+            ParseKind::Range { syntax } => Self::Parse(CapsParse::Range { syntax }),
+            ParseKind::NalForbiddenBit => Self::Parse(CapsParse::NalForbiddenBit),
+            ParseKind::SliceHeaderTooLong => Self::Parse(CapsParse::SliceHeaderTooLong),
+            ParseKind::PpsCitesUnknownSps => Self::Parse(CapsParse::PpsCitesUnknownSps),
+            ParseKind::SliceCitesUnknownPps => Self::Parse(CapsParse::SliceCitesUnknownPps),
+            ParseKind::SliceCitesUnknownSps => Self::Parse(CapsParse::SliceCitesUnknownSps),
+            ParseKind::PictureSlicesDisagree => Self::Parse(CapsParse::PictureSlicesDisagree),
+            ParseKind::NonIntraSliceInIdr => Self::Parse(CapsParse::NonIntraSliceInIdr),
+            ParseKind::FrameCropOutsideCodedSize => {
+                Self::Parse(CapsParse::FrameCropOutsideCodedSize)
             }
-            ParseKind::TooWide { syntax } => {
-                Self::Parse(format!("more than 31 bits were requested at {syntax}"))
-            }
-            ParseKind::Range { syntax } => Self::Parse(format!("{syntax} out of range")),
-            ParseKind::NalForbiddenBit => Self::Parse("nal forbidden bit".to_owned()),
-            ParseKind::SliceHeaderTooLong => Self::Parse("slice header too long".to_owned()),
-            ParseKind::PpsCitesUnknownSps => Self::Parse("pps cites unknown sps".to_owned()),
-            ParseKind::SliceCitesUnknownPps => Self::Parse("slice cites unknown pps".to_owned()),
-            ParseKind::SliceCitesUnknownSps => Self::Parse("slice cites unknown sps".to_owned()),
-            ParseKind::PictureSlicesDisagree => Self::Parse("picture slices disagree".to_owned()),
-            ParseKind::NonIntraSliceInIdr => {
-                Self::Parse("non-intra slice in idr picture".to_owned())
-            }
-            ParseKind::FrameCropOutsideCodedSize => Self::Parse("invalid frame crop".to_owned()),
         }
     }
 
     /// Tier-declined construct of `kind`.
     fn unsupported(kind: UnsupportedKind) -> Self {
         match kind {
-            UnsupportedKind::Interlaced => Self::Unsupported("interlaced".to_owned()),
+            UnsupportedKind::Interlaced => Self::Unsupported(CapsUnsupported::Interlaced),
             UnsupportedKind::ChromaOutside420 => {
-                Self::Unsupported("chroma outside 4:2:0".to_owned())
+                Self::Unsupported(CapsUnsupported::ChromaOutside420)
             }
-            UnsupportedKind::LumaDepthAbove8Bit | UnsupportedKind::ChromaDepthAbove8Bit => {
-                Self::Unsupported("high bit depth".to_owned())
+            UnsupportedKind::LumaDepthAbove8Bit => {
+                Self::Unsupported(CapsUnsupported::LumaDepthAbove8Bit)
             }
-            UnsupportedKind::TransformBypass => Self::Unsupported("transform bypass".to_owned()),
-            UnsupportedKind::FlexibleMacroblockOrder => Self::Unsupported("fmo".to_owned()),
-            UnsupportedKind::DataPartitions => Self::Unsupported("slice partitions".to_owned()),
-            UnsupportedKind::Multiview => Self::Unsupported("scalable/multiview nal".to_owned()),
-            UnsupportedKind::SpSiSlices => Self::Unsupported("sp/si slices".to_owned()),
+            UnsupportedKind::ChromaDepthAbove8Bit => {
+                Self::Unsupported(CapsUnsupported::ChromaDepthAbove8Bit)
+            }
+            UnsupportedKind::TransformBypass => Self::Unsupported(CapsUnsupported::TransformBypass),
+            UnsupportedKind::FlexibleMacroblockOrder => {
+                Self::Unsupported(CapsUnsupported::FlexibleMacroblockOrder)
+            }
+            UnsupportedKind::DataPartitions => Self::Unsupported(CapsUnsupported::DataPartitions),
+            UnsupportedKind::Multiview => Self::Unsupported(CapsUnsupported::Multiview),
+            UnsupportedKind::SpSiSlices => Self::Unsupported(CapsUnsupported::SpSiSlices),
             UnsupportedKind::RedundantPictures => {
-                Self::Unsupported("redundant pictures".to_owned())
+                Self::Unsupported(CapsUnsupported::RedundantPictures)
             }
             UnsupportedKind::ArbitrarySliceOrder => {
-                Self::Unsupported("arbitrary slice order".to_owned())
+                Self::Unsupported(CapsUnsupported::ArbitrarySliceOrder)
             }
         }
     }
@@ -104,42 +108,37 @@ impl H264Gate<VaApiError> for Gate {
                 | 61
                 | 62
         ) {
-            return Err(VaApiError::Parse(format!(
-                "Invalid Level {}",
-                sps.level_idc
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "level_idc",
+            }));
         }
         if sps.scaling_map.is_some() {
-            return Err(VaApiError::Parse(
-                "custom scaling matrices unsupported".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "scaling_map",
+            }));
         }
         if sps.fidelity.separate_plane {
-            return Err(VaApiError::Parse("separate colour planes".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "separate_plane",
+            }));
         }
         if sps.fidelity.bit_depth_luma_minus8 > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 6, got {}",
-                sps.fidelity.bit_depth_luma_minus8
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "bit_depth_luma_minus8",
+            }));
         }
         if sps.fidelity.bit_depth_chroma_minus8 > 6 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 6, got {}",
-                sps.fidelity.bit_depth_chroma_minus8
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "bit_depth_chroma_minus8",
+            }));
         }
         if sps.cycle > 254 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 254, got {}",
-                sps.cycle
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "cycle" }));
         }
         if sps.max_num_ref_frames > 16 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 16, got {}",
-                sps.max_num_ref_frames
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "max_num_ref_frames",
+            }));
         }
         Self::check_crop(sps)?;
         Self::check_vui(sps)?;
@@ -149,34 +148,30 @@ impl H264Gate<VaApiError> for Gate {
     /// Picture set against tier caps with its sequence set.
     fn check_pps(pps: &Pps, sps: &Sps) -> Result<(), VaApiError> {
         if pps.scaling_map.is_some() {
-            return Err(VaApiError::Parse(
-                "custom scaling matrices unsupported".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "scaling_map",
+            }));
         }
         if pps.seq_parameter_set_id > 31 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 31, got {}",
-                pps.seq_parameter_set_id
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "seq_parameter_set_id",
+            }));
         }
         let qp_min = -i32::from(26 + 6 * sps.fidelity.bit_depth_luma_minus8);
         if i32::from(pps.pic_init_qp) < qp_min || pps.pic_init_qp > 25 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between {qp_min}-25, got {}",
-                pps.pic_init_qp
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "pic_init_qp",
+            }));
         }
         if pps.pic_init_qs < -26 || pps.pic_init_qs > 25 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -26-25, got {}",
-                pps.pic_init_qs
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "pic_init_qs",
+            }));
         }
         if pps.chroma_qp < -12 || pps.chroma_qp > 12 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -12-12, got {}",
-                pps.chroma_qp
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "chroma_qp",
+            }));
         }
         Ok(())
     }
@@ -185,34 +180,27 @@ impl H264Gate<VaApiError> for Gate {
     fn check_slice_extra(header: &SliceHeader, sps: &Sps) -> Result<(), VaApiError> {
         let _ = sps;
         if header.redundant_pic_cnt > 127 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 127, got {}",
-                header.redundant_pic_cnt
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "redundant_pic_cnt",
+            }));
         }
         if header.cabac_init_idc > 2 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 2, got {}",
-                header.cabac_init_idc
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "cabac_init_idc",
+            }));
         }
         if !(-87..=77).contains(&header.qp_delta) {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -87-77, got {}",
-                header.qp_delta
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "qp_delta" }));
         }
         if !(-6..=6).contains(&header.deblocking_alpha) {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -6-6, got {}",
-                header.deblocking_alpha
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "deblocking_alpha",
+            }));
         }
         if !(-6..=6).contains(&header.deblocking_beta) {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -6-6, got {}",
-                header.deblocking_beta
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "deblocking_beta",
+            }));
         }
         Self::check_weights(header)?;
         Ok(())
@@ -236,12 +224,12 @@ impl Gate {
             .checked_add(offsets[1])
             .and_then(|sum| sum.checked_mul(unit_x))
             .and_then(|used| width.checked_sub(used))
-            .ok_or_else(|| VaApiError::Parse("Invalid frame crop width".to_owned()))?;
+            .ok_or(VaApiError::Parse(CapsParse::FrameCropOutsideCodedSize))?;
         offsets[2]
             .checked_add(offsets[3])
             .and_then(|sum| sum.checked_mul(unit_y))
             .and_then(|used| height.checked_sub(used))
-            .ok_or_else(|| VaApiError::Parse("invalid frame crop height".to_owned()))?;
+            .ok_or(VaApiError::Parse(CapsParse::FrameCropOutsideCodedSize))?;
         Ok(())
     }
 
@@ -252,35 +240,30 @@ impl Gate {
         };
         if let Some(loc) = &vui.chroma_loc {
             if loc.top > 5 || loc.bottom > 5 {
-                let value = loc.top.max(loc.bottom);
-                return Err(VaApiError::Parse(format!(
-                    "Value out of bounds: expected 0 - 5, got {value}"
-                )));
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "chroma_loc",
+                }));
             }
         }
         if let Some(timing) = &vui.timing {
             if timing.num_units_in_tick == 0 {
-                return Err(VaApiError::Parse(
-                    "num_units_in_tick == 0, which is not allowed by E.2.1".to_owned(),
-                ));
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "num_units_in_tick",
+                }));
             }
             if timing.time_scale == 0 {
-                return Err(VaApiError::Parse(
-                    "time_scale == 0, which is not allowed by E.2.1".to_owned(),
-                ));
+                return Err(VaApiError::Parse(CapsParse::Range {
+                    syntax: "time_scale",
+                }));
             }
         }
         if vui.max_bits_per_mcu_denom > 16 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 16, got {}",
-                vui.max_bits_per_mcu_denom
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "max_bits_per_mcu_denom",
+            }));
         }
         if vui.max_mv_horizontal > 16 || vui.max_mv_vertical > 16 {
-            let value = vui.max_mv_horizontal.max(vui.max_mv_vertical);
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 16, got {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "max_mv" }));
         }
         Ok(())
     }
@@ -305,9 +288,7 @@ impl Gate {
     /// Single weight or offset inside -128..=127.
     fn check_weight(value: i32) -> Result<(), VaApiError> {
         if !(-128..=127).contains(&value) {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds, expected between -128-127, got {value}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "weight" }));
         }
         Ok(())
     }
@@ -367,7 +348,7 @@ mod tests {
         set.fidelity.separate_plane = true;
         assert_eq!(
             Gate::check_sps(&set).unwrap_err().to_string(),
-            "parse failed: separate colour planes"
+            "parse failed: separate_plane range"
         );
         let mut set = sps(PocType::Lsb);
         set.max_num_ref_frames = 17;
@@ -426,7 +407,7 @@ mod tests {
         set.level_idc = 15;
         assert_eq!(
             Gate::check_sps(&set).unwrap_err().to_string(),
-            "parse failed: Invalid Level 15"
+            "parse failed: level_idc range"
         );
     }
 
@@ -437,7 +418,7 @@ mod tests {
                 syntax: "slice_type"
             })
             .to_string(),
-            "parse failed: slice_type out of range"
+            "parse failed: slice_type range"
         );
         assert_eq!(
             VaApiError::parse(ParseKind::NalForbiddenBit).to_string(),
@@ -449,20 +430,20 @@ mod tests {
         );
         assert_eq!(
             VaApiError::unsupported(UnsupportedKind::FlexibleMacroblockOrder).to_string(),
-            "unsupported stream: fmo"
+            "unsupported stream: flexible macroblock order"
         );
         assert_eq!(
             VaApiError::unsupported(UnsupportedKind::DataPartitions).to_string(),
-            "unsupported stream: slice partitions"
+            "unsupported stream: data partitions"
         );
     }
 
     #[test]
     fn empty_and_garbage_payloads_fail_typed() {
-        assert_eq!(
-            parse_sps::<VaApiError, Gate>(&[]).unwrap_err().to_string(),
-            "parse failed: reader ran out of bits"
-        );
+        assert!(matches!(
+            parse_sps::<VaApiError, Gate>(&[]),
+            Err(VaApiError::Parse(_))
+        ));
         assert!(parse_sps::<VaApiError, Gate>(&[0xFF; 6]).is_err());
         assert!(parse_pps::<VaApiError, Gate>(&[], None).is_err());
     }

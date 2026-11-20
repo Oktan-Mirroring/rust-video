@@ -16,6 +16,10 @@ use crate::error::VaApiError;
 use crate::h264::frontend::SurfaceSlot;
 
 use bytes::Bytes;
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
 
 /// Number of AV1 reference slots.
 pub const NUM_SLOTS: usize = 8;
@@ -276,8 +280,10 @@ impl Frontend {
         match pending.kind {
             PendingKind::Existing => {
                 let index = usize::from(pending.header.frame_to_show_map_idx);
-                let (slot, size) = self.refs.get(index).copied().flatten().ok_or_else(|| {
-                    VaApiError::BrokenReference("no reference picture to display".to_owned())
+                let (slot, size) = self.refs.get(index).copied().flatten().ok_or({
+                    VaApiError::BrokenReference(CapsBroken::NamesEmptySlot {
+                        reference: "show_existing_frame",
+                    })
                 })?;
                 self.refresh(slot, size, u32::from(pending.header.refresh_frame_flags));
                 Ok(Begun::Existing { slot, size })
@@ -336,9 +342,7 @@ impl Frontend {
             }
             OBU_TILE_GROUP => {
                 let Some((_, header)) = self.open.clone() else {
-                    return Err(VaApiError::Parse(
-                        "tile group without frame header".to_owned(),
-                    ));
+                    return Err(VaApiError::Parse(CapsParse::TileGroupWithoutFrameHeader));
                 };
                 self.groups
                     .push(Self::split_group(obu.payload, bytes, &header)?);
@@ -356,13 +360,13 @@ impl Frontend {
                 let rest = obu
                     .payload
                     .get(start..)
-                    .ok_or_else(|| VaApiError::Parse("frame header overruns obu".to_owned()))?;
+                    .ok_or(VaApiError::Parse(CapsParse::ObuSizeExceedsPayload))?;
                 if header.show_existing_frame() {
                     show_existing_refs(&mut self.parse_refs, &header);
                     if !rest.is_empty() {
-                        return Err(VaApiError::Parse(
-                            "tiles after show-existing frame".to_owned(),
-                        ));
+                        return Err(VaApiError::Parse(CapsParse::Range {
+                            syntax: "show_existing_frame",
+                        }));
                     }
                     out.frames.push(PendingFrame {
                         seq,
@@ -382,7 +386,7 @@ impl Frontend {
                 }
             }
             OBU_TILE_LIST => {
-                return Err(VaApiError::Unsupported("large-scale tiles".to_owned()));
+                return Err(VaApiError::Unsupported(CapsUnsupported::TileList));
             }
             _ => {}
         }
@@ -395,7 +399,7 @@ impl Frontend {
         bytes: &Bytes,
         header: &FrameHeader,
     ) -> Result<PendingTileGroup, VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("tile {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let count = usize::from(header.tile_cols).saturating_mul(usize::from(header.tile_rows));
         let head = tile_group_range::<VaApiError>(
             payload,
@@ -430,7 +434,7 @@ impl Frontend {
     fn active_seq(&self) -> Result<Rc<SequenceHeader>, VaApiError> {
         self.seq
             .clone()
-            .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))
+            .ok_or(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))
     }
 
     /// Finish the open frame into `out`.
@@ -454,22 +458,25 @@ impl Frontend {
     /// Reject streams outside Profile 0 8-bit 4:2:0 without scalability.
     fn check_supported(seq: &SequenceHeader) -> Result<(), VaApiError> {
         if seq.profile != 0 {
-            return Err(VaApiError::Unsupported(format!(
-                "av1 profile {}",
-                seq.profile
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain));
         }
         if seq.bit_depth() != 8 {
-            return Err(VaApiError::Unsupported("high bit depth".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::Av1BitDepthNeedsTarget {
+                    depth: seq.bit_depth(),
+                },
+            ));
         }
         if seq.mono_chrome() {
-            return Err(VaApiError::Unsupported("monochrome".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Av1Monochrome));
         }
         if !seq.subsampling_x() || !seq.subsampling_y() {
-            return Err(VaApiError::Unsupported("chroma subsampling".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::Av1ChromaOutside420,
+            ));
         }
         if seq.operating.len() > 1 {
-            return Err(VaApiError::Unsupported("scalable".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::SpatialLayers));
         }
         Ok(())
     }
@@ -694,10 +701,10 @@ mod tests {
         let mut frontend = sequenced();
         let stream = obu(8, &[0]);
         let bytes = Bytes::from(stream);
-        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Unsupported(reason)) = frontend.ingest(&bytes) else {
             panic!("tile list declines");
         };
-        assert!(message.contains("large-scale"));
+        assert_eq!(reason, rust_video_caps::reason::UnsupportedReason::TileList);
     }
 
     #[test]
@@ -776,10 +783,15 @@ mod tests {
         let mut payload = show_existing_payload(0);
         payload.push(9);
         let bytes = Bytes::from(obu(6, &payload));
-        let Err(VaApiError::Parse(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Parse(reason)) = frontend.ingest(&bytes) else {
             panic!("tiled show-existing fails");
         };
-        assert_eq!(message, "tiles after show-existing frame");
+        assert_eq!(
+            reason,
+            rust_video_caps::reason::ParseReason::Range {
+                syntax: "show_existing_frame"
+            }
+        );
     }
 
     #[test]

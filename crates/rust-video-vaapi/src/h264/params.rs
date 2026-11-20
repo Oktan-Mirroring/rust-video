@@ -15,6 +15,11 @@ use crate::h264::frontend::{PendingSlice, SurfaceSlot};
 use crate::h264::picture::{PictureData, Reference};
 use crate::h264::{Pps, SliceHeader, SliceType, Sps};
 
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
+
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
     /// Decoded-picture buffer backing reference pictures.
@@ -53,7 +58,7 @@ impl<'a> Params<'a> {
             66 => Ok(crate::ffi::VA_PROFILE_H264_CONSTRAINED_BASELINE),
             77 => Ok(crate::ffi::VA_PROFILE_H264_MAIN),
             100 => Ok(crate::ffi::VA_PROFILE_H264_HIGH),
-            other => Err(VaApiError::Unsupported(format!("h264 profile {other}"))),
+            _other => Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain)),
         }
     }
 
@@ -88,8 +93,11 @@ impl<'a> Params<'a> {
             chroma_qp_index_offset: pps.chroma_qp,
             second_chroma_qp_index_offset: pps.second_chroma_qp,
             pic_fields: Self::pic_fields(pps, pic),
-            frame_num: u16::try_from(header.frame_num)
-                .map_err(|_| VaApiError::Parse("frame_num range".to_owned()))?,
+            frame_num: u16::try_from(header.frame_num).map_err(|_| {
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "frame_num",
+                })
+            })?,
             reserved: [0; 8],
         })
     }
@@ -131,7 +139,7 @@ impl<'a> Params<'a> {
         pps: &Pps,
     ) -> Result<VaSliceParameterBufferH264, VaApiError> {
         let header = slice.header();
-        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let weights = Weights::try_new(header, sps, pps)?;
         Ok(VaSliceParameterBufferH264 {
             slice_data_size: u32::try_from(slice.data().len()).map_err(|_| range("data size"))?,
@@ -201,15 +209,16 @@ impl<'a> Params<'a> {
     fn ref_list(&self, indices: &[usize]) -> Result<[VaPictureH264; 32], VaApiError> {
         let mut list = [Self::invalid(); 32];
         for (slot, index) in list.iter_mut().zip(indices.iter()) {
-            let entry =
-                self.dpb.entries().get(*index).ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("dpb index {index} absent"))
-                })?;
+            let entry = self
+                .dpb
+                .entries()
+                .get(*index)
+                .ok_or(VaApiError::BrokenReference(CapsBroken::MarkingTargetAbsent))?;
             let picture = entry.pic.borrow();
             let Some(backing) = entry.reference.or(entry.decoded_frame) else {
-                return Err(VaApiError::BrokenReference(
-                    "reference without slot".to_owned(),
-                ));
+                return Err(VaApiError::BrokenReference(CapsBroken::NamesEmptySlot {
+                    reference: "reference",
+                }));
             };
             *slot = self.describe(&picture, backing)?;
         }
@@ -226,9 +235,7 @@ impl<'a> Params<'a> {
             .surfaces
             .get(slot.index() as usize)
             .copied()
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         Ok(Self::picture_descriptor(picture, surface))
     }
 
@@ -424,7 +431,7 @@ impl Weights {
         chroma_default: i32,
         chroma_samples: bool,
     ) -> Result<(), VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         for (index, (weight, offset)) in slots
             .luma_weight
             .iter_mut()

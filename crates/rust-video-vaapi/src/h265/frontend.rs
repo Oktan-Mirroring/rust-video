@@ -20,6 +20,10 @@ use crate::h265::{
 };
 
 use bytes::Bytes;
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
 
 /// One coded slice: parsed header plus its NAL bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -283,9 +287,10 @@ impl Rps {
             }
             let at = usize::try_from(entries.get(index).copied().unwrap_or(u32::MAX))
                 .unwrap_or(usize::MAX);
-            let entry = temp.get(at).copied().ok_or_else(|| {
-                VaApiError::BrokenReference(format!("list entry {at} outside temp list"))
-            })?;
+            let entry = temp
+                .get(at)
+                .copied()
+                .ok_or(VaApiError::BrokenReference(CapsBroken::MarkingTargetAbsent))?;
             out.push(entry);
         }
         Ok(())
@@ -602,9 +607,9 @@ impl Frontend {
         let parsed = parse_sps::<VaApiError, Gate>(&rbsp)?;
         let id = parsed.id;
         if self.sps_store.keys().len() >= 16 {
-            return Err(VaApiError::Parse(
-                "Broken data: Number of active SPSs > MAX_SPS_COUNT".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "sps_count",
+            }));
         }
         let sps = Rc::new(parsed);
         self.sps_store.insert(id, Rc::clone(&sps));
@@ -639,26 +644,21 @@ impl Frontend {
         let rbsp = rbsp(body);
         let (pps_id, sps_id) = parse_pps_ids::<VaApiError>(&rbsp)?;
         if pps_id > 63 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 63, got {pps_id}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "pps_id" }));
         }
         if sps_id > 15 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 15, got {sps_id}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "sps_id" }));
         }
-        let sps = self.sps_store.get(&sps_id).ok_or_else(|| {
-            VaApiError::Parse(format!(
-                "Could not get SPS for seq_parameter_set_id {sps_id}"
-            ))
-        })?;
+        let sps = self
+            .sps_store
+            .get(&sps_id)
+            .ok_or(VaApiError::Parse(CapsParse::PpsCitesUnknownSps))?;
         let parsed = parse_pps::<VaApiError, Gate>(&rbsp, Some(sps))?;
         let id = parsed.id;
         if self.pps_store.keys().len() >= 64 {
-            return Err(VaApiError::Parse(
-                "Broken data: Number of active PPSs > MAX_PPS_COUNT".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "pps_count",
+            }));
         }
         self.pps_store.insert(id, Rc::new(parsed));
         Ok(())
@@ -675,7 +675,7 @@ impl Frontend {
     ) -> Result<(), VaApiError> {
         let layer_id = (u16::from(header[0] & 1) << 5) | (u16::from(header[1]) >> 3);
         if layer_id != 0 {
-            return Err(VaApiError::Unsupported("multilayer".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Multilayer));
         }
         let nalu_type = crate::h265::nal_unit_type(header[0]);
         let temporal_id = crate::h265::temporal_id(header[1]);
@@ -683,22 +683,20 @@ impl Frontend {
         let mut reader = BitReader::new(&rbsp);
         let prefix = parse_slice_prefix::<VaApiError>(&mut reader, nalu_type)?;
         let pps_id = prefix.2;
-        let pps = self.pps_store.get(&pps_id).cloned().ok_or_else(|| {
-            VaApiError::Parse(format!(
-                "Could not get PPS for pic_parameter_set_id {pps_id}"
-            ))
-        })?;
-        let sps = self.sps_store.get(&pps.sps_id).cloned().ok_or_else(|| {
-            VaApiError::Parse(format!(
-                "Could not get PPS for pic_parameter_set_id {pps_id}"
-            ))
-        })?;
+        let pps = self
+            .pps_store
+            .get(&pps_id)
+            .cloned()
+            .ok_or(VaApiError::Parse(CapsParse::SliceCitesUnknownPps))?;
+        let sps = self
+            .sps_store
+            .get(&pps.sps_id)
+            .cloned()
+            .ok_or(VaApiError::Parse(CapsParse::PpsCitesUnknownSps))?;
         let parsed = parse_slice_rest::<VaApiError>(&mut reader, prefix, nalu_type, &sps, &pps)?;
         let tail = parse_slice_tail::<VaApiError>(&rbsp, nalu_type, &sps, &pps)?;
         if self.sps.as_ref() != Some(&sps) {
-            return Err(VaApiError::Parse(
-                "slice names inactive sequence set".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::SliceCitesUnknownSps));
         }
         if !self.pending.is_empty() && parsed.first {
             if let Some(picture) = self.take_pending() {
@@ -764,7 +762,7 @@ impl Frontend {
         let first = pending
             .slices
             .first()
-            .ok_or_else(|| VaApiError::Parse("picture without slices".to_owned()))?;
+            .ok_or(VaApiError::Parse(CapsParse::PictureWithoutSlices))?;
         Self::check_supported(&pending.sps, &pending.pps)?;
         let pic = PictureData::new_from_slice(
             &first.header,
@@ -939,28 +937,30 @@ impl Frontend {
         // Compatibility flags pack into bits 31..0 for profiles 0..32.
         let compat = sps.ptl.compat & (1u32 << 30) != 0 || sps.ptl.compat & (1u32 << 28) != 0;
         if profile != 1 && profile != 3 && !compat {
-            return Err(VaApiError::Unsupported(format!("h265 profile {profile}")));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain));
         }
         if sps.chroma_format != 1 {
-            return Err(VaApiError::Unsupported(format!(
-                "chroma {}",
-                sps.chroma_format
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
         if sps.separate_colour_plane {
-            return Err(VaApiError::Unsupported("separate colour planes".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
-        if sps.bit_depth_luma != 0 || sps.bit_depth_chroma != 0 {
-            return Err(VaApiError::Unsupported("high bit depth".to_owned()));
+        if sps.bit_depth_luma != 0 {
+            return Err(VaApiError::Unsupported(CapsUnsupported::LumaDepthAbove8Bit));
+        }
+        if sps.bit_depth_chroma != 0 {
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::ChromaDepthAbove8Bit,
+            ));
         }
         if sps.sps_extension_flags[0] || pps.pps_extension_flags[0] {
-            return Err(VaApiError::Unsupported("range extension".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::SpsExtension));
         }
         if sps.sps_extension_flags[3] || pps.pps_extension_flags[3] {
-            return Err(VaApiError::Unsupported("screen content coding".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::SpsExtension));
         }
         if sps.vui.as_ref().is_some_and(|vui| vui.field_seq) {
-            return Err(VaApiError::Unsupported("interlaced".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Interlaced));
         }
         Ok(())
     }
@@ -1151,10 +1151,10 @@ mod tests {
         let mut slice = vec![0, 0, 0, 1, 1u8 << 1, 0x09];
         slice.extend(p_payload(2, 1));
         let bytes = Bytes::from(slice);
-        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Unsupported(reason)) = frontend.ingest(&bytes) else {
             panic!("layered slice declines");
         };
-        assert!(message.contains("multilayer"));
+        assert!(reason.to_string().contains("multilayer"));
     }
 
     #[test]
@@ -1198,10 +1198,10 @@ mod tests {
         slice.se(0);
         stream.extend(nal(1, &slice.finish()));
         let bytes = Bytes::from(stream);
-        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Unsupported(reason)) = frontend.ingest(&bytes) else {
             panic!("orphan dependent slice fails");
         };
-        assert!(message.contains("dependent"));
+        assert!(reason.to_string().contains("dependent"));
     }
 
     #[test]

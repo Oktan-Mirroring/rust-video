@@ -16,6 +16,11 @@ use crate::vp9::lookups::{
 };
 use crate::vp9::{FrameHeader, MAX_SEGMENTS};
 
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
+
 /// Last-frame reference index, shared by `Params` and `Segmentation`.
 const LAST_FRAME: usize = 1;
 /// Golden-frame reference index, shared by `Params` and `Segmentation`.
@@ -44,7 +49,7 @@ impl<'a> Params<'a> {
     pub fn profile(profile: u8) -> Result<c_int, VaApiError> {
         match profile {
             0 => Ok(crate::ffi::VA_PROFILE_VP9_PROFILE0),
-            other => Err(VaApiError::Unsupported(format!("vp9 profile {other}"))),
+            _other => Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain)),
         }
     }
 
@@ -59,7 +64,7 @@ impl<'a> Params<'a> {
         header: &FrameHeader,
         refs: &[Option<(SurfaceSlot, (u32, u32))>; NUM_SLOTS],
     ) -> Result<VaDecPictureParameterBufferVp9, VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("picture {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let mut reference_frames = [crate::ffi::VA_INVALID_ID; NUM_SLOTS];
         for (surface, entry) in reference_frames.iter_mut().zip(refs.iter()) {
             let Some((slot, _)) = entry else {
@@ -69,9 +74,7 @@ impl<'a> Params<'a> {
                 .surfaces
                 .get(slot.index() as usize)
                 .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })?;
+                .ok_or(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         }
         Ok(VaDecPictureParameterBufferVp9 {
             frame_width: u16::try_from(header.frame_width).map_err(|_| range("frame width"))?,
@@ -123,8 +126,11 @@ impl<'a> Params<'a> {
             *out = Self::segment(header, segment)?;
         }
         Ok(VaSliceParameterBufferVp9 {
-            slice_data_size: u32::try_from(size)
-                .map_err(|_| VaApiError::Parse("frame size range".to_owned()))?,
+            slice_data_size: u32::try_from(size).map_err(|_| {
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "frame size",
+                })
+            })?,
             slice_data_offset: 0,
             slice_data_flag: crate::ffi::VA_SLICE_DATA_FLAG_ALL,
             seg_param,
@@ -188,8 +194,11 @@ impl<'a> Params<'a> {
     ) -> Result<VaSegmentParameterVp9, VaApiError> {
         use crate::ffi::{VP9_SEG_REFERENCE, VP9_SEG_REFERENCE_ENABLED, VP9_SEG_REFERENCE_SKIPPED};
         let enabled = header.segmentation_enabled();
-        let reference = u16::try_from(segment.reference_frame)
-            .map_err(|_| VaApiError::Parse("segment reference range".to_owned()))?;
+        let reference = u16::try_from(segment.reference_frame).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "segment reference",
+            })
+        })?;
         Ok(VaSegmentParameterVp9 {
             segment_flags: (u16::from(enabled && segment.reference_frame_enabled)
                 << VP9_SEG_REFERENCE_ENABLED)

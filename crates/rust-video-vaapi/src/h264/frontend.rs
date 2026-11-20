@@ -18,6 +18,10 @@ use crate::h264::{
 
 use bytes::Bytes;
 use rust_video_caps::dpb::PocTracker as CapsPocTracker;
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
 
 /// DPB surface slot.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -409,10 +413,10 @@ impl Frontend {
                     self.ingest_slice(nal, body, header, bytes, &mut out.pictures)?;
                 }
                 2..=4 => {
-                    return Err(VaApiError::Unsupported("slice partitions".to_owned()));
+                    return Err(VaApiError::Unsupported(CapsUnsupported::DataPartitions));
                 }
                 14..=15 | 19..=21 => {
-                    return Err(VaApiError::Unsupported("scalable/multiview nal".to_owned()));
+                    return Err(VaApiError::Unsupported(CapsUnsupported::Multiview));
                 }
                 10..=11 => {
                     if let Some(picture) = self.take_pending() {
@@ -457,9 +461,9 @@ impl Frontend {
         let parsed = parse_sps::<VaApiError, Gate>(&rbsp)?;
         let id = parsed.seq_parameter_set_id;
         if self.sps_store.keys().len() >= 32 {
-            return Err(VaApiError::Parse(
-                "Broken data: Number of active SPSs > MAX_SPS_COUNT".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "sps_count",
+            }));
         }
         let sps = Rc::new(parsed);
         self.sps_store.insert(id, Rc::clone(&sps));
@@ -489,21 +493,20 @@ impl Frontend {
         let rbsp = rbsp(body);
         let (_, sps_id) = parse_pps_ids::<VaApiError>(&rbsp)?;
         if sps_id > 31 {
-            return Err(VaApiError::Parse(format!(
-                "Value out of bounds: expected 0 - 31, got {sps_id}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "seq_parameter_set_id",
+            }));
         }
-        let sps = self.sps_store.get(&sps_id).ok_or_else(|| {
-            VaApiError::Parse(format!(
-                "Could not get SPS for seq_parameter_set_id {sps_id}"
-            ))
-        })?;
+        let sps = self
+            .sps_store
+            .get(&sps_id)
+            .ok_or(VaApiError::Parse(CapsParse::PpsCitesUnknownSps))?;
         let parsed = parse_pps::<VaApiError, Gate>(&rbsp, Some(sps))?;
         let id = parsed.pic_parameter_set_id;
         if self.pps_store.keys().len() >= 256 {
-            return Err(VaApiError::Parse(
-                "Broken Data: number of active PPSs > MAX_PPS_COUNT".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "pps_count",
+            }));
         }
         self.pps_store.insert(id, Rc::new(parsed));
         Ok(())
@@ -524,16 +527,14 @@ impl Frontend {
         let mut reader = BitReader::new(&rbsp);
         let prefix = parse_slice_prefix::<VaApiError>(&mut reader)?;
         let pps_id = prefix.3;
-        let pps = self.pps_store.get(&pps_id).cloned().ok_or_else(|| {
-            VaApiError::Parse(format!(
-                "Could not get PPS for pic_parameter_set_id {pps_id}"
-            ))
-        })?;
+        let pps = self
+            .pps_store
+            .get(&pps_id)
+            .cloned()
+            .ok_or(VaApiError::Parse(CapsParse::SliceCitesUnknownPps))?;
         let sps_cited = self.sps_store.get(&pps.seq_parameter_set_id);
         let Some(sps_cited) = sps_cited else {
-            return Err(VaApiError::Parse(format!(
-                "Could not get PPS for pic_parameter_set_id {pps_id}"
-            )));
+            return Err(VaApiError::Parse(CapsParse::PpsCitesUnknownSps));
         };
         let parsed = parse_slice_rest::<VaApiError, Gate>(
             &mut reader,
@@ -545,7 +546,7 @@ impl Frontend {
         )?;
         let header_bits = reader.position();
         if parsed.num_ref_l0(&pps) > 15 || parsed.num_ref_l1(&pps) > 15 {
-            return Err(VaApiError::Parse("Broken Data".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::Range { syntax: "num_ref" }));
         }
         if parsed.redundant_pic_cnt > 0 {
             return Ok(());
@@ -553,7 +554,7 @@ impl Frontend {
         let sps = self
             .sps
             .clone()
-            .ok_or_else(|| VaApiError::Parse("slice before sequence set".to_owned()))?;
+            .ok_or(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let key = SliceKey::new(&parsed, ref_idc, is_idr);
         if self
             .pending_key
@@ -601,7 +602,7 @@ impl Frontend {
         let first = pending
             .slices
             .first()
-            .ok_or_else(|| VaApiError::Parse("picture without slices".to_owned()))?;
+            .ok_or(VaApiError::Parse(CapsParse::PictureWithoutSlices))?;
         Self::check_progressive(&pending.sps)?;
         let mut pic = PictureData::default();
         pic.pic_order_cnt_type = pending.sps.poc_type.id();
@@ -704,7 +705,7 @@ impl Frontend {
                         }
                     };
                     pred = i32::try_from(nowrap)
-                        .map_err(|_| VaApiError::BrokenReference("picnum overflow".to_owned()))?;
+                        .map_err(|_| VaApiError::Parse(CapsParse::Range { syntax: "pic_num" }))?;
                     let num = if nowrap > i64::from(curr_pic_num) {
                         pred.wrapping_sub(max_pic_num)
                     } else {
@@ -720,8 +721,8 @@ impl Frontend {
                                 && picture.pic_num == num
                                 && !picture.nonexisting
                         })
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!("short-term {num} absent"))
+                        .ok_or({
+                            VaApiError::BrokenReference(CapsBroken::ShortTermTargetAbsent)
                         })?;
                     Self::shift_insert(list, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
@@ -742,9 +743,7 @@ impl Frontend {
                             matches!(picture.reference(), Reference::LongTerm)
                                 && picture.long_term_pic_num == num
                         })
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!("long-term {num} absent"))
-                        })?;
+                        .ok_or(VaApiError::BrokenReference(CapsBroken::MarkingTargetAbsent))?;
                     let cap = self.max_long_term_frame_idx;
                     Self::shift_insert(list, ref_idx, position, active, |index| {
                         self.dpb.entries()[index]
@@ -881,10 +880,7 @@ impl Frontend {
             return Ok(bumped);
         }
         if !sps.gaps_allowed {
-            return Err(VaApiError::Unsupported(format!(
-                "frame_num gap {} -> {}",
-                previous, pic.frame_num
-            )));
+            return Err(VaApiError::Parse(CapsParse::FrameNumGapForbidden));
         }
         let mut unused = expected;
         while unused != pic.frame_num {
@@ -930,13 +926,15 @@ impl Frontend {
     /// the grammar and the gate decline them at ingest.
     fn check_progressive(sps: &Sps) -> Result<(), VaApiError> {
         if sps.fidelity.chroma_format_idc != 1 {
-            return Err(VaApiError::Unsupported(format!(
-                "chroma {}",
-                sps.fidelity.chroma_format_idc
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
-        if sps.fidelity.bit_depth_luma_minus8 != 0 || sps.fidelity.bit_depth_chroma_minus8 != 0 {
-            return Err(VaApiError::Unsupported("high bit depth".to_owned()));
+        if sps.fidelity.bit_depth_luma_minus8 != 0 {
+            return Err(VaApiError::Unsupported(CapsUnsupported::LumaDepthAbove8Bit));
+        }
+        if sps.fidelity.bit_depth_chroma_minus8 != 0 {
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::ChromaDepthAbove8Bit,
+            ));
         }
         Ok(())
     }
@@ -950,9 +948,7 @@ impl Frontend {
         keep: impl Fn(usize) -> bool,
     ) -> Result<(), VaApiError> {
         if at > list.len() {
-            return Err(VaApiError::BrokenReference(
-                "ref index past list".to_owned(),
-            ));
+            return Err(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool));
         }
         list.insert(at, position);
         let next = at + 1;
@@ -972,7 +968,18 @@ impl Frontend {
 
     /// Marking failure as a broken reference list.
     fn broken(error: &crate::h264::dpb::MmcoError) -> VaApiError {
-        VaApiError::BrokenReference(error.to_string())
+        use crate::h264::dpb::MmcoError;
+        match error {
+            MmcoError::NoShortTermPic => {
+                VaApiError::BrokenReference(CapsBroken::NoShortTermToSlide)
+            }
+            MmcoError::ExpectedMarked => {
+                VaApiError::BrokenReference(CapsBroken::ShortTermTargetAbsent)
+            }
+            MmcoError::ExpectedExisting => {
+                VaApiError::BrokenReference(CapsBroken::MarkingTargetAbsent)
+            }
+        }
     }
 }
 
@@ -1067,10 +1074,8 @@ impl PocTracker {
             0 => self.derive_type0(pic, sps, is_idr)?,
             1 => self.derive_type1(pic, sps, is_idr)?,
             2 => self.derive_type2(pic, sps, is_idr)?,
-            other => {
-                return Err(VaApiError::Unsupported(format!(
-                    "pic_order_cnt_type {other}"
-                )));
+            _other => {
+                return Err(VaApiError::Unsupported(CapsUnsupported::SpsExtension));
             }
         }
         pic.pic_order_cnt = pic.top_field_order_cnt.min(pic.bottom_field_order_cnt);
@@ -1088,7 +1093,7 @@ impl PocTracker {
         let max_lsb = i64::from(sps.max_poc_lsb());
         let lsb = i64::from(pic.pic_order_cnt_lsb);
         pic.pic_order_cnt_msb = i32::try_from(poc_msb(lsb, max_lsb, prev))
-            .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
+            .map_err(|_| VaApiError::Parse(CapsParse::Range { syntax: "poc" }))?;
         pic.top_field_order_cnt = pic.pic_order_cnt_msb + pic.pic_order_cnt_lsb;
         pic.bottom_field_order_cnt = pic.top_field_order_cnt + pic.delta_pic_order_cnt_bottom;
         Ok(())
@@ -1112,13 +1117,13 @@ impl PocTracker {
             expected += i64::from(sps.offset_non_ref);
         }
         pic.top_field_order_cnt = i32::try_from(expected + i64::from(pic.delta_pic_order_cnt0))
-            .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
+            .map_err(|_| VaApiError::Parse(CapsParse::Range { syntax: "poc" }))?;
         pic.bottom_field_order_cnt = i32::try_from(
             i64::from(pic.top_field_order_cnt)
                 + i64::from(sps.offset_top_bottom)
                 + i64::from(pic.delta_pic_order_cnt1),
         )
-        .map_err(|_| VaApiError::Unsupported("poc overflow".to_owned()))?;
+        .map_err(|_| VaApiError::Parse(CapsParse::Range { syntax: "poc" }))?;
         Ok(())
     }
 
@@ -1138,7 +1143,7 @@ impl PocTracker {
                 pic.frame_num,
                 pic.nal_ref_idc != 0,
             )
-            .ok_or_else(|| VaApiError::Unsupported("poc overflow".to_owned()))?
+            .ok_or(VaApiError::Parse(CapsParse::Range { syntax: "poc" }))?
         };
         pic.top_field_order_cnt = count;
         pic.bottom_field_order_cnt = count;
@@ -1726,22 +1731,26 @@ mod tests {
 
     #[test]
     fn ingest_declines_partitions_typed() {
+        use rust_video_caps::reason::UnsupportedReason;
+
         let mut frontend = Frontend::new();
         let bytes = stream(&[(0x42, vec![0xFF])]);
-        let Err(VaApiError::Unsupported(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Unsupported(reason)) = frontend.ingest(&bytes) else {
             panic!("partitions decline");
         };
-        assert_eq!(message, "slice partitions");
+        assert_eq!(reason, UnsupportedReason::DataPartitions);
     }
 
     #[test]
     fn ingest_rejects_slice_without_sets() {
+        use rust_video_caps::reason::ParseReason;
+
         let mut frontend = Frontend::new();
         let bytes = Bytes::from(annexed(0x65, &idr_slice_body()));
-        let Err(VaApiError::Parse(message)) = frontend.ingest(&bytes) else {
+        let Err(VaApiError::Parse(reason)) = frontend.ingest(&bytes) else {
             panic!("slice without sets fails");
         };
-        assert!(message.contains("Could not get PPS"));
+        assert_eq!(reason, ParseReason::SliceCitesUnknownPps);
     }
 
     #[test]

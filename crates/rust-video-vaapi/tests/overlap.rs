@@ -11,7 +11,9 @@ use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Parity};
-use rust_video_vaapi::{Av1Decoder, H264Decoder, H265Decoder, PhaseStats, VaApiDevice, VaApiFrame};
+use rust_video_vaapi::{
+    Av1Decoder, H264Decoder, H265Decoder, VaApiDevice, VaApiFrame, VaPhaseStats,
+};
 
 /// Repeat passes over single-picture packets.
 const PASSES: usize = 8;
@@ -44,7 +46,7 @@ trait Pipelined: Decoder<Frame = VaApiFrame> {
     fn set_depth(&mut self, depth: usize);
 
     /// Phase timings of the live context.
-    fn phases(&self) -> Option<PhaseStats>;
+    fn phases(&self) -> Option<VaPhaseStats>;
 
     /// Submit gauges of the live context.
     fn submits(&self) -> Option<SubmitStats>;
@@ -55,7 +57,7 @@ impl Pipelined for H264Decoder<'_> {
         self.set_pipeline_depth(depth);
     }
 
-    fn phases(&self) -> Option<PhaseStats> {
+    fn phases(&self) -> Option<VaPhaseStats> {
         self.phase_stats()
     }
 
@@ -69,7 +71,7 @@ impl Pipelined for H265Decoder<'_> {
         self.set_pipeline_depth(depth);
     }
 
-    fn phases(&self) -> Option<PhaseStats> {
+    fn phases(&self) -> Option<VaPhaseStats> {
         self.phase_stats()
     }
 
@@ -83,7 +85,7 @@ impl Pipelined for Av1Decoder<'_> {
         self.set_pipeline_depth(depth);
     }
 
-    fn phases(&self) -> Option<PhaseStats> {
+    fn phases(&self) -> Option<VaPhaseStats> {
         self.phase_stats()
     }
 
@@ -121,7 +123,7 @@ fn assert_parity(name: &str, sync: &[VaApiFrame], pipelined: &[VaApiFrame]) {
 }
 
 /// Phase table line for one leg.
-fn report(name: &str, leg: &str, wall: Duration, phases: &PhaseStats, submits: &SubmitStats) {
+fn report(name: &str, leg: &str, wall: Duration, phases: &VaPhaseStats, submits: &SubmitStats) {
     let frames = phases.frames();
     assert!(frames > 0, "{name}: leg decoded no frames");
     println!(
@@ -140,7 +142,7 @@ fn report(name: &str, leg: &str, wall: Duration, phases: &PhaseStats, submits: &
 }
 
 /// Leg stats, failing loud before the backend opens.
-fn stats(decoder: &impl Pipelined, name: &str) -> (PhaseStats, SubmitStats) {
+fn stats(decoder: &impl Pipelined, name: &str) -> (VaPhaseStats, SubmitStats) {
     match (decoder.phases(), decoder.submits()) {
         (Some(phases), Some(submits)) => (phases, submits),
         _ => panic!("{name}: backend closed"),

@@ -1,5 +1,7 @@
 //! VP9 decode behind the caps `Decoder` trait.
 
+use std::time::Duration;
+
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
 use crate::device::VaApiDevice;
@@ -11,7 +13,9 @@ use crate::seam::VaSeam;
 use crate::vp9::frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
 use crate::vp9::params::Params;
 
+use rust_video_caps::delivery::{SplitDecode, SubmitStats};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{BrokenReferenceReason as CapsBroken, ParseReason as CapsParse};
 use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
@@ -35,6 +39,8 @@ pub struct Vp9Decoder<'a> {
     generation: u64,
     /// Decoded surfaces awaiting sync plus copy.
     pending: PendingQueue,
+    /// Split-phase frames decoded inline, awaiting poll.
+    split_pending: Vec<VaApiFrame>,
 }
 
 impl<'a> Vp9Decoder<'a> {
@@ -48,6 +54,7 @@ impl<'a> Vp9Decoder<'a> {
             shared: None,
             generation: 0,
             pending: PendingQueue::new(PendingQueue::DEFAULT_DEPTH),
+            split_pending: Vec::new(),
         }
     }
 
@@ -99,7 +106,7 @@ impl<'a> Vp9Decoder<'a> {
 
     /// Phase timings of the live context, absent before the first frame.
     #[must_use]
-    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+    pub fn phase_stats(&self) -> Option<crate::backend::VaPhaseStats> {
         self.backend.as_ref().map(Backend::phase_stats)
     }
 
@@ -180,12 +187,12 @@ impl<'a> Vp9Decoder<'a> {
         let profile = self
             .frontend
             .profile()
-            .ok_or_else(|| VaApiError::Parse("frame before first header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let profile = Params::profile(profile)?;
         let (width, height) = self
             .frontend
             .coded_size()
-            .ok_or_else(|| VaApiError::Parse("frame before first header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let backend = Backend::open(self.device, profile, width, height, POOL_SIZE)?;
         self.shared = Some(SharedDevice::new("vaapi", u64::MAX));
         self.backend = Some(backend);
@@ -258,19 +265,14 @@ impl<'a> Vp9Decoder<'a> {
             slots
                 .into_iter()
                 .map(|slot| {
-                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
-                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })?;
+                    let guard = backend
+                        .surface_guard(slot.index())
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     let surface = backend
                         .surfaces()
                         .get(slot.index() as usize)
                         .copied()
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!(
-                                "slot {} outside pool",
-                                slot.index()
-                            ))
-                        })?;
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     Ok((slot, guard, surface))
                 })
                 .collect::<Result<Vec<_>, VaApiError>>()?
@@ -340,21 +342,19 @@ impl<'a> Vp9Decoder<'a> {
         let backend = self
             .backend
             .as_ref()
-            .ok_or_else(|| VaApiError::Parse("decode before first header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let surface = backend
             .surfaces()
             .get(slot.index() as usize)
             .copied()
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         let params = Params::new(backend.surfaces());
         let picture_params = params.picture(picture.header(), picture.refs())?;
         let slice_params = Params::slice(picture.header(), picture.data().len())?;
         let backend = self
             .backend
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("decode before first header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         backend.submit_slices(
             surface,
             bytes_of(&picture_params),
@@ -392,7 +392,7 @@ impl<'a> Vp9Decoder<'a> {
     fn active(&self) -> Result<(&Backend, &SharedDevice), VaApiError> {
         match (self.backend.as_ref(), self.shared.as_ref()) {
             (Some(backend), Some(shared)) => Ok((backend, shared)),
-            _ => Err(VaApiError::Parse("decode before first header".to_owned())),
+            _ => Err(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader)),
         }
     }
 }
@@ -415,5 +415,34 @@ impl Decoder for Vp9Decoder<'_> {
 
     fn flush(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.flush_inner(true)
+    }
+}
+
+impl SplitDecode for Vp9Decoder<'_> {
+    type Frame = VaApiFrame;
+    type Error = VaApiError;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, VaApiError> {
+        let frames = self.decode(packet)?;
+        self.split_pending.extend(frames);
+        Ok(true)
+    }
+
+    fn poll(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Ok(std::mem::take(&mut self.split_pending))
+    }
+
+    fn poll_wait(&mut self, _timeout: Duration) -> Result<Vec<VaApiFrame>, VaApiError> {
+        self.poll()
+    }
+
+    fn flush_split(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        let mut frames = std::mem::take(&mut self.split_pending);
+        frames.extend(self.flush()?);
+        Ok(frames)
+    }
+
+    fn stats(&self) -> SubmitStats {
+        self.submit_stats().unwrap_or_default()
     }
 }

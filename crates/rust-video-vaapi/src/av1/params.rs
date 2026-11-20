@@ -17,6 +17,11 @@ use crate::ffi::{
 };
 use crate::h264::frontend::SurfaceSlot;
 
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
+
 /// VA-API parameter builder over the surface pool.
 pub struct Params<'a> {
     /// Pool surfaces by slot index.
@@ -38,7 +43,7 @@ impl<'a> Params<'a> {
     pub fn profile(profile: u8) -> Result<c_int, VaApiError> {
         match profile {
             0 => Ok(crate::ffi::VA_PROFILE_AV1_PROFILE0),
-            other => Err(VaApiError::Unsupported(format!("av1 profile {other}"))),
+            _other => Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain)),
         }
     }
 
@@ -59,7 +64,7 @@ impl<'a> Params<'a> {
         current: VaSurfaceId,
         display: VaSurfaceId,
     ) -> Result<VaDecPictureParameterBufferAv1, VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("picture {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let mut ref_frame_map = [crate::ffi::VA_INVALID_ID; NUM_REF_FRAMES];
         for (surface, entry) in ref_frame_map.iter_mut().zip(refs.iter()) {
             let Some((slot, _)) = entry else {
@@ -69,9 +74,7 @@ impl<'a> Params<'a> {
                 .surfaces
                 .get(slot.index() as usize)
                 .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })?;
+                .ok_or(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         }
         Ok(VaDecPictureParameterBufferAv1 {
             profile: seq.profile,
@@ -157,7 +160,7 @@ impl<'a> Params<'a> {
         offset: u32,
         size: u32,
     ) -> Result<VaSliceParameterBufferAv1, VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("tile {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         Ok(VaSliceParameterBufferAv1 {
             slice_data_size: size,
             slice_data_offset: offset,
@@ -313,8 +316,11 @@ impl<'a> Params<'a> {
     fn ar_coeffs<const N: usize>(plus_128: &[u8]) -> Result<[i8; N], VaApiError> {
         let mut out = [0i8; N];
         for (slot, value) in out.iter_mut().zip(plus_128.iter()) {
-            *slot = i8::try_from(i16::from(*value) - 128)
-                .map_err(|_| VaApiError::Parse("grain coeff range".to_owned()))?;
+            *slot = i8::try_from(i16::from(*value) - 128).map_err(|_| {
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "grain coeff",
+                })
+            })?;
         }
         Ok(out)
     }
@@ -323,7 +329,9 @@ impl<'a> Params<'a> {
     fn tile_widths(header: &FrameHeader) -> Result<[u16; 63], VaApiError> {
         let count = usize::from(header.tile_cols);
         if count > 63 {
-            return Err(VaApiError::Parse("tile columns range".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "tile columns",
+            }));
         }
         let mut widths = [0u16; 63];
         for (out, width) in widths
@@ -340,7 +348,9 @@ impl<'a> Params<'a> {
     fn tile_heights(header: &FrameHeader) -> Result<[u16; 63], VaApiError> {
         let count = usize::from(header.tile_rows);
         if count > 63 {
-            return Err(VaApiError::Parse("tile rows range".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "tile rows",
+            }));
         }
         let mut heights = [0u16; 63];
         for (out, height) in heights
@@ -372,7 +382,7 @@ impl<'a> Params<'a> {
     /// parameter range.
     fn qmatrix_fields(header: &FrameHeader) -> Result<u16, VaApiError> {
         use crate::ffi::{AV1_QM_U, AV1_QM_V, AV1_QM_Y, AV1_USING_QMATRIX};
-        let range = |what: &str| VaApiError::Parse(format!("quant {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let qm_y = u16::from(header.qm_y);
         let qm_u = u16::from(header.qm_u);
         let qm_v = u16::from(header.qm_v);
@@ -414,8 +424,11 @@ impl<'a> Params<'a> {
         let count = (1usize << bits.min(3)).min(8);
         for (index, out) in strengths.iter_mut().enumerate().take(count) {
             let strength = (u16::from(pri[index] & 0xf) << 2) | u16::from(sec[index].min(3));
-            *out = u8::try_from(strength)
-                .map_err(|_| VaApiError::Parse("cdef strength range".to_owned()))?;
+            *out = u8::try_from(strength).map_err(|_| {
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "cdef strength",
+                })
+            })?;
         }
         Ok(strengths)
     }

@@ -5,10 +5,10 @@
 #![cfg(target_os = "linux")]
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{GpuExport, PixelFormat};
+use rust_video_caps::frame::{GpuExport, PixelFormat, Surface};
 use rust_video_caps::traits::{Decoder, Device};
 use rust_video_harness::{Drive, H264Synth, Packets};
-use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaSeam};
+use rust_video_vaapi::{H264Decoder, VaApiDevice, VaApiError, VaApiFrame, VaSeam};
 
 /// Open device, skipping `test` loudly without hardware.
 fn device(test: &str) -> Option<VaApiDevice> {
@@ -60,12 +60,26 @@ fn readback_frames_carry_surface_metadata() {
     assert_eq!(frame.coded(), PictureSize::new(320, 240).expect("extent"));
     assert_eq!(frame.origin(), (0, 0));
     assert_eq!(frame.surface(), None);
-    assert!(frame.wait().is_ok());
+    assert!(frame.try_wait().is_ok());
     assert!(matches!(
         frame.export(),
         GpuExport::Opaque { name: "vaapi" }
     ));
     assert_eq!(frame.nv12().len(), 320 * 240 * 3 / 2);
+    assert_surface_delegates(frame);
+}
+
+/// Shared trait accessors delegate to the inherent frame methods.
+fn assert_surface_delegates(frame: &VaApiFrame) {
+    assert_eq!(<VaApiFrame as Surface>::size(frame), frame.size());
+    assert_eq!(<VaApiFrame as Surface>::format(frame), frame.format());
+    assert_eq!(<VaApiFrame as Surface>::slice(frame), frame.slice());
+    assert_eq!(<VaApiFrame as Surface>::coded(frame), frame.coded());
+    assert_eq!(<VaApiFrame as Surface>::origin(frame), frame.origin());
+    assert!(matches!(
+        <VaApiFrame as Surface>::export(frame),
+        GpuExport::Opaque { .. }
+    ));
 }
 
 /// Cropped frames separate the visible size from the coded extent.
@@ -104,7 +118,7 @@ fn device_frames_wait_and_name_their_surface() {
     let frame = &frames[0];
     assert_eq!(frame.slice(), 0);
     assert!(frame.surface().is_some());
-    assert!(frame.wait().is_ok());
+    assert!(frame.try_wait().is_ok());
     let export = frame.export();
     assert!(
         matches!(export, GpuExport::DmaBuf { .. } | GpuExport::Opaque { .. }),

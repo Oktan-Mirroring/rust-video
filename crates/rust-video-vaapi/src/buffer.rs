@@ -9,6 +9,8 @@ use crate::error::VaApiError;
 use crate::ffi;
 use crate::sys;
 
+use rust_video_caps::reason::ParseReason as CapsParse;
+
 /// Owned VA-API data buffer, destroyed on drop.
 pub(crate) struct VaBuffer {
     /// Display owning the buffer.
@@ -36,8 +38,11 @@ impl VaBuffer {
         data: &[u8],
     ) -> Result<Self, VaApiError> {
         let mut id = 0;
-        let len = u32::try_from(data.len())
-            .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
+        let len = u32::try_from(data.len()).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "buffer size",
+            })
+        })?;
         // Sound: the context is live; `data` holds `len` bytes.
         sys::status(unsafe {
             sys::vaCreateBuffer(
@@ -71,8 +76,11 @@ impl VaBuffer {
         data: &[MaybeUninit<u8>],
     ) -> Result<Self, VaApiError> {
         let mut id = 0;
-        let len = u32::try_from(data.len())
-            .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
+        let len = u32::try_from(data.len()).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "buffer size",
+            })
+        })?;
         // SAFETY: the context is live; `data` spans `len` bytes of driver-layout storage.
         sys::status(unsafe {
             sys::vaCreateBuffer(
@@ -106,8 +114,11 @@ impl VaBuffer {
         len: usize,
     ) -> Result<Self, VaApiError> {
         let mut id = 0;
-        let size = u32::try_from(len)
-            .map_err(|_| VaApiError::Unsupported("buffer outside driver range".to_owned()))?;
+        let size = u32::try_from(len).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "buffer size",
+            })
+        })?;
         // Sound: the context is live; a null payload means uninitialized.
         sys::status(unsafe {
             sys::vaCreateBuffer(

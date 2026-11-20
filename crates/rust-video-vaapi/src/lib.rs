@@ -10,6 +10,8 @@ mod backend;
 mod buffer;
 #[cfg(target_os = "linux")]
 mod device;
+#[allow(dead_code)]
+mod encode_config;
 #[cfg(target_os = "linux")]
 mod encoder;
 #[allow(dead_code)]
@@ -42,11 +44,11 @@ mod vp9;
 #[cfg(target_os = "linux")]
 pub use av1::Av1Decoder;
 #[cfg(target_os = "linux")]
-pub use backend::{Backend, PhaseStats};
+pub use backend::{Backend, VaPhaseStats};
 #[cfg(target_os = "linux")]
 pub use device::{DisplayHandle, VaApiDevice};
 #[cfg(target_os = "linux")]
-pub use encoder::{EncodeCodec, GopShape, VaApiEncoder};
+pub use encoder::{EncodeCodec, VaApiEncoder};
 #[cfg(target_os = "linux")]
 pub use error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]

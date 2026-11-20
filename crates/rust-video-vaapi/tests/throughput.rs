@@ -5,6 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
@@ -189,7 +190,13 @@ fn h264_encode_1080p_measures_realtime() {
         }
     };
     let size = PictureSize::new(1920, 1080).expect("1080p extent");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+    let config = EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile: Profile::H264(rust_video_caps::h264::EncodeProfile::High),
+        level: Level::H264(rust_video_caps::h264::EncodeLevel::Auto),
+        ..EncodeConfig::default()
+    };
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size, &config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP vaapi h264 encode 1080p: {error}");
@@ -245,7 +252,13 @@ fn h265_encode_1080p_measures_realtime() {
         }
     };
     let size = PictureSize::new(1920, 1080).expect("1080p extent");
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size) {
+    let config = EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+        level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ..EncodeConfig::default()
+    };
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size, &config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP vaapi h265 encode 1080p: {error}");

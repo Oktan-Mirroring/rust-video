@@ -80,6 +80,10 @@ pub const VA_CONFIG_ATTRIB_RATE_CONTROL: c_int = 5;
 pub const VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS: c_int = 10;
 /// Constant-QP rate control.
 pub const VA_RC_CQP: u32 = 0x0000_0010;
+/// Constant-bitrate rate control.
+pub const VA_RC_CBR: u32 = 0x0000_0002;
+/// Variable-bitrate rate control.
+pub const VA_RC_VBR: u32 = 0x0000_0004;
 /// Packed sequence header support flag.
 pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
 /// Packed picture header support flag.

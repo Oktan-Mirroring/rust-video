@@ -15,6 +15,7 @@ use crate::h264::decoder::VaApiFrame;
 use crate::sys;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
 use rust_video_caps::transcode::FallbackCause;
 
 /// VA-API scaler over one display.
@@ -57,9 +58,9 @@ impl Scaler {
         to: PictureSize,
     ) -> Result<Self, VaApiError> {
         if !device.supports(ffi::VA_PROFILE_NONE, ffi::VA_ENTRYPOINT_VIDEO_PROC) {
-            return Err(VaApiError::Unsupported(
-                "video processing entrypoint absent".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback {
+                cause: FallbackCause::ScaleNeeded { from, to },
+            }));
         }
         let session = Session::open(device, to)?;
         let display = device.display();
@@ -105,24 +106,20 @@ impl Scaler {
     /// refuses the scale.
     pub fn scale(&mut self, frame: &VaApiFrame) -> Result<ScaledSurface, VaApiError> {
         let Some((display, surface)) = frame.device_handle() else {
-            return Err(VaApiError::Unsupported(
-                "scale without a device surface".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback {
+                cause: FallbackCause::NoSharedExport,
+            }));
         };
         if display != self.session.inner.display {
-            return Err(VaApiError::Unsupported(
-                FallbackCause::DeviceMismatch.to_string(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback {
+                cause: FallbackCause::DeviceMismatch,
+            }));
         }
         let size = frame.identity().size();
         if size != self.from {
-            return Err(VaApiError::Unsupported(format!(
-                "scale source {}x{} vs pipeline {}x{}",
-                size.width(),
-                size.height(),
-                self.from.width(),
-                self.from.height(),
-            )));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::ScaleSourceOutsideScaler,
+            ));
         }
         let slot = self.next;
         let target = self.session.inner.surfaces[slot];
@@ -136,10 +133,14 @@ impl Scaler {
             x: 0,
             y: 0,
             width: u16::try_from(self.from.width()).map_err(|_| {
-                VaApiError::Unsupported("dimensions outside driver range".to_owned())
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "dimensions",
+                })
             })?,
             height: u16::try_from(self.from.height()).map_err(|_| {
-                VaApiError::Unsupported("dimensions outside driver range".to_owned())
+                VaApiError::Parse(CapsParse::Range {
+                    syntax: "dimensions",
+                })
             })?,
         };
         let params = ffi::VaProcPipelineParameterBuffer {
@@ -253,10 +254,16 @@ impl Session {
     /// Session rendering into `to` surfaces.
     fn open(device: &VaApiDevice, to: PictureSize) -> Result<Self, VaApiError> {
         let display = device.display();
-        let width_c = c_int::try_from(to.width())
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
-        let height_c = c_int::try_from(to.height())
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
+        let width_c = c_int::try_from(to.width()).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
+        let height_c = c_int::try_from(to.height()).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
         let mut config = 0;
         // Sound: the display is initialized; no attributes travel with a
         // processing config.
@@ -281,7 +288,9 @@ impl Session {
                 to.height(),
                 surfaces.as_mut_ptr(),
                 u32::try_from(count).map_err(|_| {
-                    VaApiError::Unsupported("dimensions outside driver range".to_owned())
+                    VaApiError::Parse(CapsParse::Range {
+                        syntax: "dimensions",
+                    })
                 })?,
                 std::ptr::null_mut(),
                 0,
@@ -294,8 +303,11 @@ impl Session {
             }
             return Err(error);
         }
-        let count_c = c_int::try_from(count)
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
+        let count_c = c_int::try_from(count).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
         let mut context = 0;
         // Sound: the surface array outlives context creation.
         let status = unsafe {

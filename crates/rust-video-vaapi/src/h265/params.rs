@@ -16,6 +16,11 @@ use crate::h265::frontend::{PendingSlice, Rps};
 use crate::h265::picture::{PictureData, Reference};
 use crate::h265::{is_idr, is_irap, Pps, SliceHeader, SliceTail, SliceType, Sps};
 
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, ParseReason as CapsParse,
+    UnsupportedReason as CapsUnsupported,
+};
+
 /// VA-API parameter builder over the DPB and the surface pool.
 pub struct Params<'a> {
     /// Decoded-picture buffer backing reference pictures.
@@ -51,7 +56,7 @@ impl<'a> Params<'a> {
     pub fn profile(profile_idc: u8) -> Result<c_int, VaApiError> {
         match profile_idc {
             1 | 3 => Ok(crate::ffi::VA_PROFILE_HEVC_MAIN),
-            other => Err(VaApiError::Unsupported(format!("h265 profile {other}"))),
+            _other => Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain)),
         }
     }
 
@@ -84,7 +89,7 @@ impl<'a> Params<'a> {
         surface: VaSurfaceId,
     ) -> Result<VaPictureParameterBufferHevc, VaApiError> {
         let buffering = sps.ordering_buffering.last().copied().unwrap_or(0);
-        let range = |what: &str| VaApiError::Parse(format!("picture {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let (columns, rows) = Self::tile_grid(sps, pps, &range)?;
         Ok(VaPictureParameterBufferHevc {
             curr_pic: VaPictureHevc {
@@ -141,7 +146,7 @@ impl<'a> Params<'a> {
     fn tile_grid(
         sps: &Sps,
         pps: &Pps,
-        range: &impl Fn(&str) -> VaApiError,
+        range: &impl Fn(&'static str) -> VaApiError,
     ) -> Result<([u16; 19], [u16; 21]), VaApiError> {
         let mut columns = [0u16; 19];
         let mut rows = [0u16; 21];
@@ -239,7 +244,7 @@ impl<'a> Params<'a> {
         let header = slice.header();
         let tail = slice.tail();
         let weights = Weights::try_new(tail, header.slice_type)?;
-        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         Ok(VaSliceParameterBufferHevc {
             slice_data_size: u32::try_from(slice.data().len()).map_err(|_| range("data size"))?,
             slice_data_offset: 0,
@@ -294,9 +299,7 @@ impl<'a> Params<'a> {
                 continue;
             }
             if count == frames.len() {
-                return Err(VaApiError::BrokenReference(
-                    "reference frames overflow".to_owned(),
-                ));
+                return Err(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool));
             }
             frames[count] = self.describe(&picture, entry.1, rps_flags(index, rps))?;
             count += 1;
@@ -307,18 +310,16 @@ impl<'a> Params<'a> {
     /// Reference list as `ReferenceFrames` indices, padded with `0xFF`.
     fn ref_list(&self, indices: &[Option<usize>]) -> Result<[u8; 15], VaApiError> {
         if indices.len() > 15 {
-            return Err(VaApiError::BrokenReference(
-                "reference list overflow".to_owned(),
-            ));
+            return Err(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool));
         }
         let mut list = [0xff; 15];
         for (slot, index) in list.iter_mut().zip(indices.iter()) {
             let Some(index) = index else {
                 continue;
             };
-            *slot = self.ref_position(*index).ok_or_else(|| {
-                VaApiError::BrokenReference(format!("dpb index {index} unreferenced"))
-            })?;
+            *slot = self
+                .ref_position(*index)
+                .ok_or(VaApiError::BrokenReference(CapsBroken::MarkingTargetAbsent))?;
         }
         Ok(list)
     }
@@ -349,9 +350,7 @@ impl<'a> Params<'a> {
             .surfaces
             .get(slot.index() as usize)
             .copied()
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or(VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         let mut flags = rps;
         if matches!(picture.reference(), Reference::LongTerm) {
             flags |= crate::ffi::VA_PICTURE_HEVC_LONG_TERM_REFERENCE;
@@ -512,13 +511,18 @@ impl Weights {
     /// Returns `Err` when a corrupt denominator or delta falls outside
     /// the parameter range.
     fn try_new(tail: &SliceTail, slice_type: SliceType) -> Result<Self, VaApiError> {
-        let range = |what: &str| VaApiError::Parse(format!("slice {what} range"));
+        let range = |what: &'static str| VaApiError::Parse(CapsParse::Range { syntax: what });
         let chroma_denom = i32::from(tail.weights.luma_denom) + tail.weights.delta_chroma_denom;
         if !(0..=7).contains(&chroma_denom) {
-            return Err(VaApiError::Parse("weight denom range".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::Range {
+                syntax: "weight denom",
+            }));
         }
-        let chroma_denom = u8::try_from(chroma_denom)
-            .map_err(|_| VaApiError::Parse("weight denom range".to_owned()))?;
+        let chroma_denom = u8::try_from(chroma_denom).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "weight denom",
+            })
+        })?;
         let mut weights = Self {
             luma_log2_denom: tail.weights.luma_denom,
             delta_chroma_log2_denom: i8::try_from(tail.weights.delta_chroma_denom)
@@ -563,7 +567,7 @@ impl Weights {
         chroma_offset: &mut [[i8; 2]; 15],
         entries: &[crate::h265::WeightEntry],
         chroma_denom: u8,
-        range: &impl Fn(&str) -> VaApiError,
+        range: &impl Fn(&'static str) -> VaApiError,
     ) -> Result<(), VaApiError> {
         for index in 0..15 {
             let entry = entries.get(index);
@@ -589,8 +593,11 @@ impl Weights {
         let half = 128;
         let weight = (1 << denom) + delta_weight;
         let offset = half + delta_offset - ((half * weight) >> denom);
-        i8::try_from(offset.clamp(-half, half - 1))
-            .map_err(|_| VaApiError::Parse("weight offset range".to_owned()))
+        i8::try_from(offset.clamp(-half, half - 1)).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "weight offset",
+            })
+        })
     }
 }
 

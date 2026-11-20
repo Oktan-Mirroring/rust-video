@@ -9,15 +9,25 @@
 //! live on disk under `src/vp8/` and join the build when the frontend is
 //! wired; until then every packet declines with typed `Unsupported`.
 
+use crate::device::VaApiDevice;
 use crate::error::VaApiError;
 use crate::h264::decoder::VaApiFrame;
 
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::UnsupportedReason as CapsUnsupported;
 use rust_video_caps::traits::Decoder;
 use rust_video_caps::transcode::GpuCaps;
 
 /// VP8 decoder handle: frontend staged, every packet declines typed.
 pub struct Vp8Decoder;
+
+impl Vp8Decoder {
+    /// Decoder over `device`; the frontend stays staged.
+    #[must_use]
+    pub fn open(_device: &VaApiDevice) -> Self {
+        Self
+    }
+}
 
 impl Decoder for Vp8Decoder {
     type Frame = VaApiFrame;
@@ -28,7 +38,7 @@ impl Decoder for Vp8Decoder {
     }
 
     fn decode(&mut self, _packet: &Packet) -> Result<Vec<VaApiFrame>, VaApiError> {
-        Err(VaApiError::Unsupported("vp8 frontend not wired".to_owned()))
+        Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain))
     }
 
     fn flush(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
@@ -49,10 +59,26 @@ mod tests {
     fn decode_declines_typed() {
         let mut decoder = Vp8Decoder;
         let packet = Packet::new(Bytes::from_static(&[0, 1, 2]));
-        let Err(VaApiError::Unsupported(message)) = decoder.decode(&packet) else {
+        let Err(VaApiError::Unsupported(reason)) = decoder.decode(&packet) else {
             panic!("staged frontend declines");
         };
-        assert!(message.contains("vp8"));
+        assert_eq!(
+            reason,
+            rust_video_caps::reason::UnsupportedReason::ProfileOutsideMain
+        );
+    }
+
+    #[test]
+    fn open_builds_handle() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let mut decoder = Vp8Decoder::open(&device);
+        let packet = Packet::new(Bytes::from_static(&[0, 1, 2]));
+        assert!(matches!(
+            decoder.decode(&packet),
+            Err(VaApiError::Unsupported(_))
+        ));
     }
 
     #[test]

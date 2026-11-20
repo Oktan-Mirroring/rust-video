@@ -23,11 +23,18 @@ pub(crate) type Parser = rust_video_vp9::Ingest<crate::error::VaApiError>;
 
 impl From<rust_video_vp9::Fault> for crate::error::VaApiError {
     fn from(fault: rust_video_vp9::Fault) -> Self {
+        use rust_video_caps::reason::{BrokenReferenceReason, ParseReason};
+        use rust_video_vp9::Fault;
         match fault {
-            rust_video_vp9::Fault::NamesEmptySlot { .. } => {
-                Self::BrokenReference(fault.to_string())
+            Fault::NamesEmptySlot { reference } => {
+                Self::BrokenReference(BrokenReferenceReason::NamesEmptySlot { reference })
             }
-            _ => Self::Parse(fault.to_string()),
+            Fault::FrameMarkerMismatch => Self::Parse(ParseReason::FrameMarkerMismatch),
+            Fault::ReservedProfile => Self::Parse(ParseReason::ReservedProfile),
+            Fault::SyncCodeMismatch => Self::Parse(ParseReason::SyncCodeMismatch),
+            Fault::Range { syntax } => Self::Parse(ParseReason::Range { syntax }),
+            Fault::Truncated { syntax } => Self::Parse(ParseReason::Truncated { syntax }),
+            Fault::TooWide { syntax } => Self::Parse(ParseReason::TooWide { syntax }),
         }
     }
 }

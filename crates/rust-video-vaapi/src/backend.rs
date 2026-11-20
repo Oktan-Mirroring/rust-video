@@ -21,6 +21,7 @@ use crate::seam::{ContextId, SurfaceId, VaSeam};
 use crate::sys;
 
 use rust_video_caps::delivery::SubmitStats;
+use rust_video_caps::reason::ParseReason as CapsParse;
 use rust_video_core::micros;
 
 /// VA-API decode context over a surface pool.
@@ -214,7 +215,7 @@ impl Backend {
 
     /// Phase timings since open.
     #[must_use]
-    pub fn phase_stats(&self) -> PhaseStats {
+    pub fn phase_stats(&self) -> VaPhaseStats {
         self.gauges.phase_snapshot()
     }
 
@@ -351,7 +352,9 @@ impl Backend {
 
     /// Dimensions outside the driver range.
     fn range() -> VaApiError {
-        VaApiError::Unsupported("dimensions outside driver range".to_owned())
+        VaApiError::Parse(CapsParse::Range {
+            syntax: "dimensions",
+        })
     }
 }
 
@@ -566,7 +569,7 @@ struct PhaseLog {
 
 /// Phase timings since backend open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhaseStats {
+pub struct VaPhaseStats {
     /// Readback calls.
     frames: u64,
     /// Submit microseconds.
@@ -583,7 +586,7 @@ pub struct PhaseStats {
     overlapped: u64,
 }
 
-impl PhaseStats {
+impl VaPhaseStats {
     /// Readback calls.
     #[must_use]
     pub const fn frames(&self) -> u64 {
@@ -734,8 +737,8 @@ impl StatsInner {
     }
 
     /// Phase-timing snapshot.
-    fn phase_snapshot(&self) -> PhaseStats {
-        PhaseStats {
+    fn phase_snapshot(&self) -> VaPhaseStats {
+        VaPhaseStats {
             frames: self.frames.load(Ordering::Relaxed),
             submit_us: self.submit_us.load(Ordering::Relaxed),
             wait_us: self.wait_us.load(Ordering::Relaxed),

@@ -8,6 +8,9 @@ use crate::h264::frontend::SurfaceSlot;
 use crate::vp9::{FrameHeader, Parser};
 
 use bytes::Bytes;
+use rust_video_caps::reason::{
+    BrokenReferenceReason as CapsBroken, UnsupportedReason as CapsUnsupported,
+};
 
 /// Number of VP9 reference slots.
 pub(crate) use crate::vp9::NUM_REF_FRAMES as NUM_SLOTS;
@@ -173,8 +176,10 @@ impl Frontend {
         Self::check_supported(&pending.header)?;
         if pending.header.show_existing_frame() {
             let index = usize::from(pending.header.frame_to_show_map_idx);
-            let (slot, size) = self.refs.get(index).copied().flatten().ok_or_else(|| {
-                VaApiError::BrokenReference("no reference picture to display".to_owned())
+            let (slot, size) = self.refs.get(index).copied().flatten().ok_or({
+                VaApiError::BrokenReference(CapsBroken::NamesEmptySlot {
+                    reference: "show_existing_frame",
+                })
             })?;
             return Ok(Begun::Existing { slot, size });
         }
@@ -202,21 +207,13 @@ impl Frontend {
             return Ok(());
         }
         if header.profile != 0 {
-            return Err(VaApiError::Unsupported(format!(
-                "vp9 profile {}",
-                header.profile
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ProfileOutsideMain));
         }
         if header.bit_depth != 8 {
-            return Err(VaApiError::Unsupported(format!(
-                "vp9 bit depth {}",
-                header.bit_depth
-            )));
+            return Err(VaApiError::Unsupported(CapsUnsupported::LumaDepthAbove8Bit));
         }
         if !header.subsampling_x() || !header.subsampling_y() {
-            return Err(VaApiError::Unsupported(
-                "vp9 chroma outside 4:2:0".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::ChromaOutside420));
         }
         Ok(())
     }

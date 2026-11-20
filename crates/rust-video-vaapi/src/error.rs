@@ -3,6 +3,9 @@
 //! Portable: the driver status mapping lives in the Linux-only
 //! `sys` module; this module holds only the types.
 
+use rust_video_caps::encode::Decline;
+use rust_video_caps::reason::{BrokenReferenceReason, ParseReason, UnsupportedReason};
+
 /// Machine declined by the VA-API tier, with the cause.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum SkipReason {
@@ -36,13 +39,16 @@ pub enum VaApiError {
     },
     /// Bitstream the tier refuses: interlaced, FMO, odd chroma, or a gap it cannot bridge.
     #[error("unsupported stream: {0}")]
-    Unsupported(String),
+    Unsupported(UnsupportedReason),
     /// Bitstream parse failure.
     #[error("parse failed: {0}")]
-    Parse(String),
+    Parse(ParseReason),
     /// Reference list names a picture the DPB cannot supply.
     #[error("broken reference list: {0}")]
-    BrokenReference(String),
+    BrokenReference(BrokenReferenceReason),
+    /// Encode config the tier cannot open.
+    #[error("encode declined: {0}")]
+    Declined(#[from] Decline),
     /// DPB has no free slot for the next picture.
     #[error("dpb full")]
     DpbFull,
@@ -64,6 +70,21 @@ pub enum VaApiError {
         /// Returned height in luma samples.
         height: u32,
     },
+    /// Driver lacks packed headers for `codec`.
+    #[error("{codec}: no packed headers")]
+    NoPackedHeaders {
+        /// Codec needing packed headers.
+        codec: rust_video_core::Codec,
+    },
+    /// Driver returned a coded segment off the byte grid.
+    #[error("unaligned coded segment")]
+    UnalignedCodedSegment,
+    /// Driver produced no coded bytes for the picture.
+    #[error("encoder produced no bytes")]
+    EmptyCodedOutput,
+    /// Driver reports no NV12 image format.
+    #[error("nv12 image format absent")]
+    NoNv12ImageFormat,
 }
 
 #[cfg(test)]
@@ -105,8 +126,42 @@ mod tests {
     #[test]
     fn unsupported_names_stream() {
         assert_eq!(
-            VaApiError::Unsupported("fmo".to_owned()).to_string(),
-            "unsupported stream: fmo"
+            VaApiError::Unsupported(
+                rust_video_caps::reason::UnsupportedReason::FlexibleMacroblockOrder
+            )
+            .to_string(),
+            "unsupported stream: flexible macroblock order"
+        );
+    }
+
+    #[test]
+    fn declined_names_config() {
+        assert_eq!(
+            VaApiError::from(rust_video_caps::encode::Decline::HdrUnsupported).to_string(),
+            "encode declined: HDR metadata on SDR tier unsupported"
+        );
+    }
+
+    #[test]
+    fn driver_variants_name_cause() {
+        assert_eq!(
+            VaApiError::NoPackedHeaders {
+                codec: rust_video_core::Codec::H264,
+            }
+            .to_string(),
+            "h264: no packed headers"
+        );
+        assert_eq!(
+            VaApiError::UnalignedCodedSegment.to_string(),
+            "unaligned coded segment"
+        );
+        assert_eq!(
+            VaApiError::EmptyCodedOutput.to_string(),
+            "encoder produced no bytes"
+        );
+        assert_eq!(
+            VaApiError::NoNv12ImageFormat.to_string(),
+            "nv12 image format absent"
         );
     }
 

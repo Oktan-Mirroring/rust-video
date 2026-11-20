@@ -1,19 +1,22 @@
 //! GPU transcode: decode surface to encoder input without readback.
 
 use crate::device::VaApiDevice;
-use crate::encoder::{EncodeCodec, GopShape, VaApiEncoder};
+use crate::encoder::{EncodeCodec, VaApiEncoder};
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::h264::decoder::{H264Decoder, VaApiFrame};
 use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::{
     Convert, FallbackCause, GpuCaps, Outcome, Plan, Scale, ShareMechanism,
 };
+use rust_video_caps::{h264, h265};
 
 /// GPU transcode from H.264 decode to encoder input.
 ///
@@ -26,8 +29,8 @@ pub struct Transcoder<'a> {
     decoder: H264Decoder<'a>,
     /// Codec the transcode writes.
     encode_codec: EncodeCodec,
-    /// GOP shape the transcode writes.
-    gop: GopShape,
+    /// Encode config behind the lazy session.
+    config: EncodeConfig,
     /// Encoder behind device surfaces, opened on first picture.
     encoder: Option<VaApiEncoder>,
     /// Per-hop capabilities.
@@ -57,7 +60,7 @@ impl<'a> Transcoder<'a> {
         Self {
             decoder: H264Decoder::open(device),
             encode_codec: encode,
-            gop: GopShape::AllIntra,
+            config: Self::default_config(encode),
             encoder: None,
             caps,
             scale: Scale::passthrough(),
@@ -65,6 +68,26 @@ impl<'a> Transcoder<'a> {
             device,
             scaler: None,
             plan,
+        }
+    }
+
+    /// Legacy config for `encode`: tier profile under `Auto` rate control.
+    fn default_config(encode: EncodeCodec) -> EncodeConfig {
+        let (profile, level) = match encode {
+            EncodeCodec::H264 => (
+                Profile::H264(h264::EncodeProfile::High),
+                Level::H264(h264::EncodeLevel::Auto),
+            ),
+            EncodeCodec::H265 => (
+                Profile::H265(h265::EncodeProfile::Main),
+                Level::H265(h265::EncodeLevel::Auto),
+            ),
+        };
+        EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile,
+            level,
+            ..EncodeConfig::default()
         }
     }
 
@@ -90,10 +113,10 @@ impl<'a> Transcoder<'a> {
         self
     }
 
-    /// Transcoder writing `gop` instead of all-intra.
+    /// Transcoder encoding under `config` instead of the legacy recipe.
     #[must_use]
-    pub fn with_gop(mut self, gop: GopShape) -> Self {
-        self.gop = gop;
+    pub fn with_config(mut self, config: EncodeConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -101,6 +124,12 @@ impl<'a> Transcoder<'a> {
     #[must_use]
     pub fn caps(&self) -> GpuCaps {
         self.caps
+    }
+
+    /// Executed transcode plan.
+    #[must_use]
+    pub fn plan(&self) -> Plan {
+        self.plan
     }
 
     /// Packets transcoded from `packet`, possibly none.
@@ -130,7 +159,7 @@ impl<'a> Transcoder<'a> {
         if self.caps.ready() {
             Ok(())
         } else if let Some(cause) = self.plan.cause() {
-            Err(VaApiError::Unsupported(cause.to_string()))
+            Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }))
         } else {
             // open derives plan from caps, so a miss names its cause.
             Ok(())
@@ -164,7 +193,7 @@ impl<'a> Transcoder<'a> {
         let mut pending: Option<ScaledSurface> = None;
         for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
-                return Err(VaApiError::Unsupported(cause.to_string()));
+                return Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }));
             }
             if let Some(cause) = self.scale.miss(surface.identity().size()) {
                 if self.scaler_swap_needed(&cause) {
@@ -218,7 +247,7 @@ impl<'a> Transcoder<'a> {
         cause: FallbackCause,
     ) -> Result<ScaledSurface, VaApiError> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
-            return Err(VaApiError::Unsupported(cause.to_string()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }));
         };
         if self
             .scaler
@@ -228,7 +257,7 @@ impl<'a> Transcoder<'a> {
             match Scaler::open(self.device, from, to) {
                 Ok(scaler) => self.scaler = Some(scaler),
                 Err(VaApiError::Unsupported(_)) => {
-                    return Err(VaApiError::Unsupported(cause.to_string()));
+                    return Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }));
                 }
                 Err(error) => return Err(error),
             }
@@ -236,7 +265,7 @@ impl<'a> Transcoder<'a> {
         let scaler = self
             .scaler
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("scale without a scaler".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::Range { syntax: "scaler" }))?;
         scaler.scale(surface)
     }
 
@@ -247,13 +276,12 @@ impl<'a> Transcoder<'a> {
             .as_ref()
             .is_none_or(|encoder| encoder.size() != size)
         {
-            let encoder =
-                VaApiEncoder::open(self.device, self.encode_codec, size)?.with_gop(self.gop);
+            let encoder = VaApiEncoder::open(self.device, self.encode_codec, size, &self.config)?;
             self.encoder = Some(encoder);
         }
         match self.encoder.as_mut() {
             Some(encoder) => Ok(encoder),
-            None => Err(VaApiError::Parse("encoder without a session".to_owned())),
+            None => Err(VaApiError::Parse(CapsParse::Range { syntax: "encoder" })),
         }
     }
 }
@@ -275,7 +303,7 @@ mod tests {
         super::Transcoder {
             decoder: crate::h264::decoder::H264Decoder::open(device),
             encode_codec: crate::encoder::EncodeCodec::H264,
-            gop: crate::encoder::GopShape::AllIntra,
+            config: super::Transcoder::default_config(crate::encoder::EncodeCodec::H264),
             encoder: None,
             caps,
             scale: Scale::passthrough(),

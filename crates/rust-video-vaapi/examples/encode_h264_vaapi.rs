@@ -5,6 +5,7 @@
 #[cfg(target_os = "linux")]
 fn main() {
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
     use rust_video_caps::traits::{Device, Encoder};
     use rust_video_harness::{FrameHash, Synth};
     use rust_video_vaapi::{EncodeCodec, VaApiDevice, VaApiEncoder, VaApiError};
@@ -47,10 +48,24 @@ fn main() {
         eprintln!("va-api h264 encode: zero extent {width}x{height}");
         std::process::exit(2);
     };
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+    let config = EncodeConfig {
+        rate_control: RateControl::Auto,
+        profile: Profile::H264(rust_video_caps::h264::EncodeProfile::High),
+        level: Level::H264(rust_video_caps::h264::EncodeLevel::Auto),
+        ..EncodeConfig::default()
+    };
+    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size, &config) {
         Ok(encoder) => encoder,
-        Err(VaApiError::Unsupported(message)) => {
-            println!("SKIP va-api h264 encode ({message})");
+        Err(VaApiError::Unsupported(reason)) => {
+            println!("SKIP va-api h264 encode ({reason})");
+            return;
+        }
+        Err(VaApiError::Declined(reason)) => {
+            println!("SKIP va-api h264 encode ({reason})");
+            return;
+        }
+        Err(VaApiError::NoPackedHeaders { .. } | VaApiError::NoNv12ImageFormat) => {
+            println!("SKIP va-api h264 encode (driver gap)");
             return;
         }
         Err(error) => {

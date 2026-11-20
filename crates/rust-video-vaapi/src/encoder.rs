@@ -1,7 +1,9 @@
-//! VA-API encode: CQP sessions for H.264 and H.265.
+//! VA-API encode: CQP/CBR/VBR sessions for H.264 and H.265.
 //!
-//! All-intra or low-delay IPPP over a one-frame sliding window. CQP
-//! keeps constant quality without a bitrate model.
+//! All-intra or low-delay IPPP over a one-frame sliding window. The
+//! shared [`EncodeConfig`](rust_video_caps::encode::EncodeConfig)
+//! selects the rate control, GOP, profile, level, and color; `Auto`
+//! rate control keeps the legacy CQP all-intra recipe.
 
 #![allow(unsafe_code)]
 
@@ -12,6 +14,7 @@ use std::os::raw::{c_int, c_void};
 
 use crate::buffer::{bytes_of, VaBuffer};
 use crate::device::VaApiDevice;
+use crate::encode_config::{DriverCaps, MappedEncode};
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::h264::decoder::VaApiFrame;
@@ -20,10 +23,14 @@ use crate::sys;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::delivery::SubmitStats;
+use rust_video_caps::encode::EncodeConfig;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
+use rust_video_core::{Codec, Gop};
 
 /// Codec an encoder session writes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -44,12 +51,12 @@ impl EncodeCodec {
         }
     }
 
-    /// Coded-size alignment in luma samples.
+    /// Shared codec identity behind the session.
     #[must_use]
-    const fn block(self) -> u32 {
+    const fn core(self) -> Codec {
         match self {
-            Self::H264 => 16,
-            Self::H265 => 8,
+            Self::H264 => Codec::H264,
+            Self::H265 => Codec::H265,
         }
     }
 }
@@ -63,19 +70,6 @@ impl fmt::Display for EncodeCodec {
     }
 }
 
-/// GOP shape an encoder session writes.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum GopShape {
-    /// Every picture an IDR.
-    #[default]
-    AllIntra,
-    /// IDR every period, P between; no reorder delay.
-    LowDelay {
-        /// Pictures per IDR; 0 behaves as 1.
-        intra_period: u32,
-    },
-}
-
 /// VA-API hardware encoder over one display.
 ///
 /// `Send`, never `Sync`: hand the session to another thread when idle,
@@ -84,8 +78,8 @@ pub enum GopShape {
 pub struct VaApiEncoder {
     /// Codec the session writes.
     codec: EncodeCodec,
-    /// GOP shape the session writes.
-    gop: GopShape,
+    /// IDR cadence the session writes.
+    gop: Gop,
     /// Previous picture as next P reference, if any.
     prev: Option<Reference>,
     /// Visible size in luma samples.
@@ -94,6 +88,10 @@ pub struct VaApiEncoder {
     coded: (u32, u32),
     /// Constant quantization.
     qp: u8,
+    /// Sequence bitrate in bits per second, zero under CQP.
+    bitrate: u32,
+    /// H.264 VUI timing, zeroed under legacy control.
+    timing: (u32, u32),
     /// Quantization the packed picture header carries, if packed.
     packed_qp: Option<u8>,
     /// Packed sequence/picture bit shifts and fixed words.
@@ -141,10 +139,6 @@ pub struct VaApiEncoder {
 }
 
 impl VaApiEncoder {
-    /// Default constant quantization.
-    const DEFAULT_QP: u8 = 26;
-    /// Maximum quantization.
-    const MAX_QP: u8 = 51;
     /// Upload surface count; slots alternate across pictures.
     const UPLOADS: usize = 2;
     /// First reconstruction surface index.
@@ -202,72 +196,49 @@ impl VaApiEncoder {
         | (Self::VUI_MV_LEN << Self::H264_VUI_MV_V)
         | (1 << Self::H264_VUI_MV_OVER);
 
-    /// Encoder over `device` for `codec` at `visible` size.
+    /// Encoder over `device` for `codec` at `visible` size under `config`.
     ///
     /// The device must outlive the encoder.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the driver lacks the encode entrypoint, CQP
-    /// rate control, packed headers, or NV12 upload for `codec`.
+    /// Returns `Err` when `config` is invalid or exceeds the tier or
+    /// driver, or when the driver refuses the session.
     pub fn open(
         device: &VaApiDevice,
         codec: EncodeCodec,
         visible: PictureSize,
+        config: &EncodeConfig,
     ) -> Result<Self, VaApiError> {
         let profile = codec.profile();
-        if !device.supports(profile, ffi::VA_ENTRYPOINT_ENC_SLICE) {
-            return Err(VaApiError::Unsupported(format!(
-                "{codec}: {}",
-                FallbackCause::EncoderCpuOnly
-            )));
-        }
-        let rt = device.config_attr(
-            profile,
-            ffi::VA_ENTRYPOINT_ENC_SLICE,
-            ffi::VA_CONFIG_ATTRIB_RT_FORMAT,
-        );
-        if rt.is_none_or(|value| value & ffi::VA_RT_FORMAT_YUV420 == 0) {
-            return Err(VaApiError::Unsupported(format!(
-                "{codec}: no nv12 encode target"
-            )));
-        }
-        let rc = device.config_attr(
-            profile,
-            ffi::VA_ENTRYPOINT_ENC_SLICE,
-            ffi::VA_CONFIG_ATTRIB_RATE_CONTROL,
-        );
-        if rc.is_none_or(|value| value & ffi::VA_RC_CQP == 0) {
-            return Err(VaApiError::Unsupported(format!(
-                "{codec}: no cqp rate control"
-            )));
-        }
-        let packed = device.config_attr(
-            profile,
-            ffi::VA_ENTRYPOINT_ENC_SLICE,
-            ffi::VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS,
-        );
-        let need = ffi::VA_ENC_PACKED_HEADER_SEQUENCE
-            | ffi::VA_ENC_PACKED_HEADER_PICTURE
-            | ffi::VA_ENC_PACKED_HEADER_SLICE;
-        if packed.is_none_or(|value| value & need != need) {
-            return Err(VaApiError::Unsupported(format!(
-                "{codec}: no packed headers"
-            )));
-        }
+        let caps = DriverCaps {
+            entrypoint: device.supports(profile, ffi::VA_ENTRYPOINT_ENC_SLICE),
+            rt_format: device.config_attr(
+                profile,
+                ffi::VA_ENTRYPOINT_ENC_SLICE,
+                ffi::VA_CONFIG_ATTRIB_RT_FORMAT,
+            ),
+            rate_control: device.config_attr(
+                profile,
+                ffi::VA_ENTRYPOINT_ENC_SLICE,
+                ffi::VA_CONFIG_ATTRIB_RATE_CONTROL,
+            ),
+            packed_headers: device.config_attr(
+                profile,
+                ffi::VA_ENTRYPOINT_ENC_SLICE,
+                ffi::VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS,
+            ),
+        };
+        let mapped = MappedEncode::map(codec.core(), visible, config, &caps)?;
         let mut image_format = Self::nv12_format(device)?;
-        let block = codec.block();
-        let coded_size = (
-            visible.width().div_ceil(block) * block,
-            visible.height().div_ceil(block) * block,
-        );
-        let session = Session::open(device, profile, coded_size)?;
+        let coded_size = mapped.coded;
+        let session = Session::open(device, mapped.profile, coded_size, mapped.rate_control)?;
         let display = device.display();
         let context = session.context;
         let ([first, second], [first_derived, second_derived]) =
             Self::upload_images(display, &session.surfaces, &mut image_format, coded_size)?;
         let words = Words::new(codec);
-        let level = Self::level(codec, coded_size);
+        let level = mapped.level;
         let visible_pair = (visible.width(), visible.height());
         let (vps, sps, mut creates) =
             Self::pack_session_headers(codec, coded_size, visible_pair, level, display, context)?;
@@ -275,11 +246,13 @@ impl VaApiEncoder {
         creates += 9;
         Ok(Self {
             codec,
-            gop: GopShape::AllIntra,
+            gop: mapped.gop,
             prev: None,
             visible,
             coded: coded_size,
-            qp: Self::DEFAULT_QP,
+            qp: mapped.qp,
+            bitrate: mapped.bitrate,
+            timing: mapped.timing,
             packed_qp: None,
             words,
             level,
@@ -313,20 +286,6 @@ impl VaApiEncoder {
             session,
             _thread: PhantomData,
         })
-    }
-
-    /// Encoder retargeted to constant quantization `qp`, clamped to 51.
-    #[must_use]
-    pub fn with_qp(mut self, qp: u8) -> Self {
-        self.qp = qp.min(Self::MAX_QP);
-        self
-    }
-
-    /// Encoder writing `gop` instead of all-intra.
-    #[must_use]
-    pub fn with_gop(mut self, gop: GopShape) -> Self {
-        self.gop = gop;
-        self
     }
 
     /// Packed VPS (H.265) and sequence headers for the session.
@@ -376,6 +335,15 @@ impl VaApiEncoder {
         self.visible
     }
 
+    /// Submit gauges since open.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        let mut stats = SubmitStats::new();
+        stats.add_submitted(self.count);
+        stats.add_buffer_creates(self.creates);
+        stats
+    }
+
     /// Packets coded from the device surface behind `frame`, possibly none.
     ///
     /// # Errors
@@ -383,11 +351,11 @@ impl VaApiEncoder {
     /// Returns `Err` when the frame has no device surface, lives on
     /// another display, misses the session size, or the backend
     /// refuses the picture.
-    pub(crate) fn encode_surface(&mut self, frame: &VaApiFrame) -> Result<Vec<Packet>, VaApiError> {
+    pub fn encode_surface(&mut self, frame: &VaApiFrame) -> Result<Vec<Packet>, VaApiError> {
         let Some((display, surface)) = frame.device_handle() else {
-            return Err(VaApiError::Unsupported(
-                FallbackCause::NoSharedExport.to_string(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback {
+                cause: FallbackCause::NoSharedExport,
+            }));
         };
         self.check_surface(display, frame.identity().size())?;
         self.encode_inner(surface)
@@ -415,19 +383,14 @@ impl VaApiEncoder {
     /// Display and size behind a caller surface.
     fn check_surface(&self, display: ffi::VaDisplay, size: PictureSize) -> Result<(), VaApiError> {
         if display != self.session.display {
-            return Err(VaApiError::Unsupported(
-                FallbackCause::DeviceMismatch.to_string(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::Fallback {
+                cause: FallbackCause::DeviceMismatch,
+            }));
         }
         if size != self.visible {
-            return Err(VaApiError::Unsupported(format!(
-                "{} encode size {}x{} vs session {}x{}",
-                self.codec,
-                size.width(),
-                size.height(),
-                self.visible.width(),
-                self.visible.height(),
-            )));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::RenderSizeDiffersFromFrameSize,
+            ));
         }
         Ok(())
     }
@@ -501,46 +464,44 @@ impl VaApiEncoder {
         }
     }
 
-    /// Pictures per IDR under `gop`.
+    /// Pictures per IDR under the session cadence.
     fn intra_period(&self) -> u32 {
-        match self.gop {
-            GopShape::AllIntra => 1,
-            GopShape::LowDelay { intra_period } => intra_period.max(1),
-        }
+        self.gop.period()
     }
 
     /// Numbers for the `count`-th picture under `gop`.
-    fn numbers(gop: GopShape, count: u64) -> Result<Numbers, VaApiError> {
-        match gop {
-            GopShape::AllIntra => Ok(Numbers {
+    fn numbers(gop: Gop, count: u64) -> Result<Numbers, VaApiError> {
+        if gop.period() == 1 {
+            return Ok(Numbers {
                 idr: true,
                 frame_num: u16::try_from(count % 16).map_err(|_| Self::range())?,
                 idr_pic_id: u16::try_from(count % 65_535).map_err(|_| Self::range())?,
                 poc: u16::try_from(count.wrapping_mul(2) % 64).map_err(|_| Self::range())?,
-            }),
-            GopShape::LowDelay { intra_period } => {
-                let period = u64::from(intra_period.max(1));
-                let pos = count % period;
-                Ok(Numbers {
-                    idr: pos == 0,
-                    frame_num: u16::try_from(pos % 16).map_err(|_| Self::range())?,
-                    idr_pic_id: u16::try_from(count / period % 65_535)
-                        .map_err(|_| Self::range())?,
-                    poc: u16::try_from(pos.wrapping_mul(2) % 64).map_err(|_| Self::range())?,
-                })
-            }
+            });
         }
+        let period = u64::from(gop.period());
+        let pos = count % period;
+        Ok(Numbers {
+            idr: pos == 0,
+            frame_num: u16::try_from(pos % 16).map_err(|_| Self::range())?,
+            idr_pic_id: u16::try_from(count / period % 65_535).map_err(|_| Self::range())?,
+            poc: u16::try_from(pos.wrapping_mul(2) % 64).map_err(|_| Self::range())?,
+        })
     }
 
     /// NV12 frame bytes onto the `slot` upload surface.
     fn upload(&mut self, frame: &CpuFrame, slot: usize) -> Result<ffi::VaSurfaceId, VaApiError> {
-        if frame.format() != PixelFormat::Nv12 || frame.size() != self.visible {
-            return Err(VaApiError::Unsupported(format!(
-                "{} encode needs nv12 at {}x{}",
-                self.codec,
-                self.visible.width(),
-                self.visible.height(),
-            )));
+        if frame.format() != PixelFormat::Nv12 {
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::EncoderInputNotNv12 {
+                    format: frame.format(),
+                },
+            ));
+        }
+        if frame.size() != self.visible {
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::RenderSizeDiffersFromFrameSize,
+            ));
         }
         let display = self.session.display;
         let surface = self.session.surfaces[slot];
@@ -642,11 +603,15 @@ impl VaApiEncoder {
     /// NV12 planes of `frame` into the mapped `image`.
     fn copy_into(&self, image: &ffi::VaImage, frame: &CpuFrame) -> Result<(), VaApiError> {
         if image.num_planes < 2 {
-            return Err(VaApiError::Unsupported("upload image not nv12".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::Nv12WithoutTwoPlanes,
+            ));
         }
         let planes = frame.planes();
         if planes.len() != 2 {
-            return Err(VaApiError::Unsupported("upload frame not nv12".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::Nv12WithoutTwoPlanes,
+            ));
         }
         let width = usize::try_from(self.visible.width()).map_err(|_| Self::range())?;
         let height = usize::try_from(self.visible.height()).map_err(|_| Self::range())?;
@@ -659,9 +624,7 @@ impl VaApiEncoder {
             || luma.data().len() < luma_stride.saturating_mul(height)
             || chroma.data().len() < chroma_stride.saturating_mul(height) / 2
         {
-            return Err(VaApiError::Unsupported(
-                "upload planes short of their strides".to_owned(),
-            ));
+            return Err(VaApiError::Unsupported(CapsUnsupported::PlaneShortOfStride));
         }
         let len = u64::from(image.data_size);
         let end_y = u64::from(image.offsets[0])
@@ -669,14 +632,16 @@ impl VaApiEncoder {
         let end_uv = u64::from(image.offsets[1])
             .saturating_add(u64::from(image.pitches[1]) * u64::from(self.visible.height() / 2));
         if end_y > len || end_uv > len {
-            return Err(VaApiError::Unsupported("upload image layout".to_owned()));
+            return Err(VaApiError::Unsupported(CapsUnsupported::PlaneShortOfStride));
         }
         let y_base = usize::try_from(image.offsets[0]).map_err(|_| Self::range())?;
         let y_pitch = usize::try_from(image.pitches[0]).map_err(|_| Self::range())?;
         let uv_base = usize::try_from(image.offsets[1]).map_err(|_| Self::range())?;
         let uv_pitch = usize::try_from(image.pitches[1]).map_err(|_| Self::range())?;
         if width > y_pitch || width > uv_pitch {
-            return Err(VaApiError::Unsupported("upload image layout".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::PlaneStrideBelowWidth,
+            ));
         }
         let display = self.session.display;
         // Sound: the image buffer is live until `vaDestroyImage`.
@@ -734,14 +699,10 @@ impl VaApiEncoder {
             sys::vaUnmapBuffer(display, coded);
         }
         if failed {
-            return Err(VaApiError::Unsupported(
-                "unaligned coded segment".to_owned(),
-            ));
+            return Err(VaApiError::UnalignedCodedSegment);
         }
         if out.is_empty() {
-            return Err(VaApiError::Unsupported(
-                "encoder produced no bytes".to_owned(),
-            ));
+            return Err(VaApiError::EmptyCodedOutput);
         }
         Ok(out)
     }
@@ -890,6 +851,7 @@ impl VaApiEncoder {
             intra_period: period,
             intra_idr_period: period,
             ip_period: 1,
+            bits_per_second: self.bitrate,
             pic_width_in_luma_samples: u16::try_from(self.coded.0).map_err(|_| Self::range())?,
             pic_height_in_luma_samples: u16::try_from(self.coded.1).map_err(|_| Self::range())?,
             seq_fields: self.words.seq,
@@ -983,7 +945,7 @@ impl VaApiEncoder {
             intra_period: period,
             intra_idr_period: period,
             ip_period: 1,
-            bits_per_second: 0,
+            bits_per_second: self.bitrate,
             max_num_ref_frames: 1,
             picture_width_in_mbs: u16::try_from(mbw).map_err(|_| Self::range())?,
             picture_height_in_mbs: u16::try_from(mbh).map_err(|_| Self::range())?,
@@ -1004,8 +966,8 @@ impl VaApiEncoder {
             aspect_ratio_idc: 0,
             sar_width: 0,
             sar_height: 0,
-            num_units_in_tick: 0,
-            time_scale: 0,
+            num_units_in_tick: self.timing.0,
+            time_scale: self.timing.1,
             va_reserved: [0; 4],
         })
     }
@@ -1315,51 +1277,7 @@ impl VaApiEncoder {
                 .iter()
                 .find(|format| format.fourcc == ffi::VA_FOURCC_NV12)
                 .copied()
-                .ok_or_else(|| VaApiError::Unsupported("nv12 image format absent".to_owned()))
-        }
-    }
-
-    /// Level idc covering `coded` for `codec`.
-    fn level(codec: EncodeCodec, coded_size: (u32, u32)) -> u8 {
-        let samples = u64::from(coded_size.0) * u64::from(coded_size.1);
-        match codec {
-            EncodeCodec::H264 => {
-                let mbs = samples / 256;
-                if mbs <= 396 {
-                    22
-                } else if mbs <= 1620 {
-                    30
-                } else if mbs <= 3600 {
-                    31
-                } else if mbs <= 5120 {
-                    32
-                } else if mbs <= 8192 {
-                    41
-                } else if mbs <= 22_080 {
-                    50
-                } else {
-                    51
-                }
-            }
-            EncodeCodec::H265 => {
-                if samples <= 36_864 {
-                    30
-                } else if samples <= 122_880 {
-                    60
-                } else if samples <= 245_760 {
-                    63
-                } else if samples <= 552_960 {
-                    90
-                } else if samples <= 983_040 {
-                    93
-                } else if samples <= 2_228_224 {
-                    120
-                } else if samples <= 8_912_896 {
-                    150
-                } else {
-                    153
-                }
-            }
+                .ok_or_else(|| VaApiError::NoNv12ImageFormat)
         }
     }
 
@@ -1372,7 +1290,9 @@ impl VaApiEncoder {
 
     /// Dimensions outside the driver range.
     fn range() -> VaApiError {
-        VaApiError::Unsupported("dimensions outside driver range".to_owned())
+        VaApiError::Parse(CapsParse::Range {
+            syntax: "dimensions",
+        })
     }
 }
 
@@ -1397,6 +1317,16 @@ impl Encoder for VaApiEncoder {
     }
 }
 
+impl EncodeSurface for VaApiEncoder {
+    type Surface = VaApiFrame;
+    type Error = VaApiError;
+
+    fn encode_surface(&mut self, surface: &VaApiFrame) -> Result<Vec<Packet>, VaApiError> {
+        // Dot syntax resolves to the inherent method, not this trait method.
+        self.encode_surface(surface)
+    }
+}
+
 /// Owned encode session: config, context, and surfaces.
 struct Session {
     /// Initialized display.
@@ -1412,13 +1342,24 @@ struct Session {
 }
 
 impl Session {
-    /// Session for `profile` at `coded`, with upload and recon surfaces.
-    fn open(device: &VaApiDevice, profile: c_int, coded: (u32, u32)) -> Result<Self, VaApiError> {
+    /// Session for `profile` at `coded` under `rate_control`, with upload and recon surfaces.
+    fn open(
+        device: &VaApiDevice,
+        profile: c_int,
+        coded: (u32, u32),
+        rate_control: u32,
+    ) -> Result<Self, VaApiError> {
         let display = device.display();
-        let width_c = c_int::try_from(coded.0)
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
-        let height_c = c_int::try_from(coded.1)
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
+        let width_c = c_int::try_from(coded.0).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
+        let height_c = c_int::try_from(coded.1).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
         let mut attribs = [
             ffi::VaConfigAttrib {
                 attr_type: ffi::VA_CONFIG_ATTRIB_RT_FORMAT,
@@ -1426,7 +1367,7 @@ impl Session {
             },
             ffi::VaConfigAttrib {
                 attr_type: ffi::VA_CONFIG_ATTRIB_RATE_CONTROL,
-                value: ffi::VA_RC_CQP,
+                value: rate_control,
             },
             ffi::VaConfigAttrib {
                 attr_type: ffi::VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS,
@@ -1458,7 +1399,9 @@ impl Session {
                 coded.1,
                 surfaces.as_mut_ptr(),
                 u32::try_from(count).map_err(|_| {
-                    VaApiError::Unsupported("dimensions outside driver range".to_owned())
+                    VaApiError::Parse(CapsParse::Range {
+                        syntax: "dimensions",
+                    })
                 })?,
                 std::ptr::null_mut(),
                 0,
@@ -1471,8 +1414,11 @@ impl Session {
             }
             return Err(error);
         }
-        let count_c = c_int::try_from(count)
-            .map_err(|_| VaApiError::Unsupported("dimensions outside driver range".to_owned()))?;
+        let count_c = c_int::try_from(count).map_err(|_| {
+            VaApiError::Parse(CapsParse::Range {
+                syntax: "dimensions",
+            })
+        })?;
         let mut context = 0;
         // Sound: the surface array outlives context creation.
         let status = unsafe {
@@ -1782,10 +1728,25 @@ impl BitWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitWriter, EncodeCodec, GopShape, VaApiEncoder, Words};
+    use super::{BitWriter, EncodeCodec, VaApiEncoder, Words};
     use crate::error::VaApiError;
     use crate::h264::Gate;
     use crate::h265::Gate as Gate265;
+
+    use rust_video_core::Gop;
+
+    /// Legacy H.264 config: High auto under `Auto` rate control.
+    fn legacy_h264() -> rust_video_caps::encode::EncodeConfig {
+        use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+        use rust_video_caps::h264;
+
+        EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile: Profile::H264(h264::EncodeProfile::High),
+            level: Level::H264(h264::EncodeLevel::Auto),
+            ..EncodeConfig::default()
+        }
+    }
 
     #[test]
     fn caps_agree_with_texture_import() {
@@ -1798,15 +1759,22 @@ mod tests {
             return;
         };
         let size = PictureSize::new(320, 240).expect("synth size");
-        let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size) {
+        let config = legacy_h264();
+        let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size, &config) {
             Ok(encoder) => encoder,
-            Err(VaApiError::Unsupported(_)) => return,
+            Err(
+                VaApiError::Unsupported(_)
+                | VaApiError::Declined(_)
+                | VaApiError::NoPackedHeaders { .. }
+                | VaApiError::NoNv12ImageFormat,
+            ) => return,
             Err(error) => panic!("unexpected encode failure: {error}"),
         };
         assert_eq!(
             encoder.caps(),
             GpuCaps::new(Some(ShareMechanism::DmaBuf), false, true)
         );
+        assert_eq!(encoder.submit_stats().submitted(), 0);
         let mut decoder = crate::h264::decoder::H264Decoder::open(&device);
         let raws = H264Synth::annex_b_h264_packets();
         let packets = Packets::from_raws(&raws);
@@ -1817,6 +1785,8 @@ mod tests {
         surfaces.extend(decoder.flush_surface().expect("decode drains"));
         let surface = surfaces.pop().expect("first picture surfaces");
         encoder.encode_surface(&surface).expect("import runs");
+        assert_eq!(encoder.submit_stats().submitted(), 1);
+        assert!(encoder.submit_stats().buffer_creates() > 0);
     }
 
     #[test]
@@ -1873,14 +1843,11 @@ mod tests {
 
     #[test]
     fn numbers_shape_gop_periods() {
-        let idr = |count| VaApiEncoder::numbers(GopShape::AllIntra, count).expect("small count");
+        let idr = |count| VaApiEncoder::numbers(Gop::all_intra(), count).expect("small count");
         assert!(idr(0).idr);
         assert_eq!((idr(17).frame_num, idr(17).poc), (1, 34));
         assert_eq!(idr(65_535).idr_pic_id, 0);
-        let low = |count| {
-            VaApiEncoder::numbers(GopShape::LowDelay { intra_period: 60 }, count)
-                .expect("small count")
-        };
+        let low = |count| VaApiEncoder::numbers(Gop::interval(60), count).expect("small count");
         let first = low(0);
         assert!(first.idr);
         assert_eq!((first.frame_num, first.idr_pic_id, first.poc), (0, 0, 0));
@@ -1892,18 +1859,8 @@ mod tests {
         assert!(next.idr);
         assert_eq!((next.frame_num, next.idr_pic_id, next.poc), (0, 1, 0));
         assert!(!low(61).idr);
-        let degenerate =
-            VaApiEncoder::numbers(GopShape::LowDelay { intra_period: 0 }, 7).expect("small count");
+        let degenerate = VaApiEncoder::numbers(Gop::interval(0), 7).expect("small count");
         assert!(degenerate.idr);
-    }
-
-    #[test]
-    fn level_covers_picture_sizes() {
-        assert_eq!(VaApiEncoder::level(EncodeCodec::H264, (320, 240)), 22);
-        assert_eq!(VaApiEncoder::level(EncodeCodec::H264, (1920, 1080)), 41);
-        assert_eq!(VaApiEncoder::level(EncodeCodec::H265, (320, 240)), 60);
-        assert_eq!(VaApiEncoder::level(EncodeCodec::H265, (1920, 1080)), 120);
-        assert_eq!(VaApiEncoder::level(EncodeCodec::H265, (3840, 2160)), 150);
     }
 
     /// RBSP body of Annex B `bytes`: start code and header stripped.

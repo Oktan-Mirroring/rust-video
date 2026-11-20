@@ -20,6 +20,7 @@ use crate::ffi;
 use crate::seam::SurfaceId;
 use crate::sys;
 
+use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
 use rust_video_core::micros;
 
 /// Copied transfer answer route.
@@ -444,9 +445,7 @@ impl Reader {
     ) -> Result<Mapped, VaApiError> {
         let (x, y, width, height) = crop;
         if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
-            return Err(VaApiError::Unsupported(
-                "crop outside coded size".to_owned(),
-            ));
+            return Err(VaApiError::Parse(CapsParse::FrameCropOutsideCodedSize));
         }
         let display = self.pool.display();
         let wait_start = Instant::now();
@@ -546,7 +545,9 @@ impl Reader {
             unsafe {
                 sys::vaDestroyImage(display, image.image_id);
             }
-            return Err(VaApiError::Unsupported("driver image not nv12".to_owned()));
+            return Err(VaApiError::Unsupported(
+                CapsUnsupported::Nv12WithoutTwoPlanes,
+            ));
         }
         Ok(Some(image))
     }
@@ -587,7 +588,7 @@ impl Reader {
                 sys::vaDestroyImage(display, image.image_id);
             }
             return got.and(Err(VaApiError::Unsupported(
-                "driver image not nv12".to_owned(),
+                CapsUnsupported::Nv12WithoutTwoPlanes,
             )));
         }
         Ok(image)
@@ -620,13 +621,15 @@ impl Reader {
                 .iter()
                 .find(|format| format.fourcc == ffi::VA_FOURCC_NV12)
                 .copied()
-                .ok_or_else(|| VaApiError::Unsupported("nv12 image format absent".to_owned()))
+                .ok_or_else(|| VaApiError::NoNv12ImageFormat)
         }
     }
 
     /// Dimensions outside the driver range.
     fn range() -> VaApiError {
-        VaApiError::Unsupported("dimensions outside driver range".to_owned())
+        VaApiError::Parse(CapsParse::Range {
+            syntax: "dimensions",
+        })
     }
 
     /// Plane rows for the crop rectangle.
@@ -638,7 +641,7 @@ impl Reader {
         crop: (u32, u32, u32, u32),
         method: CopyMethod,
     ) -> Result<Vec<u8>, VaApiError> {
-        let bad = || VaApiError::Unsupported("driver image layout".to_owned());
+        let bad = || VaApiError::Unsupported(CapsUnsupported::PlaneShortOfStride);
         let (x, y, width, height) = crop;
         let chroma_height = height / 2;
         let row_end = u64::from(x).checked_add(u64::from(width)).ok_or_else(bad)?;
@@ -710,7 +713,7 @@ impl Reader {
         dst: *mut u8,
         method: CopyMethod,
     ) -> Result<(), VaApiError> {
-        let bad = || VaApiError::Unsupported("driver image layout".to_owned());
+        let bad = || VaApiError::Unsupported(CapsUnsupported::PlaneShortOfStride);
         let (_, y, width, height) = crop;
         let luma = usize::try_from(u64::from(width) * u64::from(height)).map_err(|_| bad())?;
         let chroma =

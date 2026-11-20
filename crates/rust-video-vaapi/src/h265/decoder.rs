@@ -1,5 +1,7 @@
 //! H.265 decode behind the caps `Decoder` trait.
 
+use std::time::Duration;
+
 use crate::backend::Backend;
 use crate::buffer::bytes_of;
 use crate::device::VaApiDevice;
@@ -12,7 +14,9 @@ use crate::h265::params::Params;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 
+use rust_video_caps::delivery::{SplitDecode, SubmitStats};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{BrokenReferenceReason as CapsBroken, ParseReason as CapsParse};
 use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
@@ -41,6 +45,8 @@ pub struct H265Decoder<'a> {
     list1: Vec<Option<usize>>,
     /// Scratch temporary list, reused across slices.
     temp: Vec<Option<usize>>,
+    /// Split-phase frames decoded inline, awaiting poll.
+    split_pending: Vec<VaApiFrame>,
 }
 
 impl<'a> H265Decoder<'a> {
@@ -58,6 +64,7 @@ impl<'a> H265Decoder<'a> {
             list0: Vec::new(),
             list1: Vec::new(),
             temp: Vec::new(),
+            split_pending: Vec::new(),
         }
     }
 
@@ -109,7 +116,7 @@ impl<'a> H265Decoder<'a> {
 
     /// Phase timings of the live context, absent before the first sequence set.
     #[must_use]
-    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+    pub fn phase_stats(&self) -> Option<crate::backend::VaPhaseStats> {
         self.backend.as_ref().map(Backend::phase_stats)
     }
 
@@ -146,9 +153,7 @@ impl<'a> H265Decoder<'a> {
                 }
                 _ if drained.is_empty() => {}
                 _ => {
-                    return Err(VaApiError::Parse(
-                        "reconfig dropped decoded pictures".to_owned(),
-                    ));
+                    return Err(VaApiError::Parse(CapsParse::Range { syntax: "reconfig" }));
                 }
             }
             self.maybe_drop_backend();
@@ -200,12 +205,12 @@ impl<'a> H265Decoder<'a> {
             .frontend
             .sps()
             .cloned()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let profile = Params::sps_profile(&sps)?;
         let (width, height) = self
             .frontend
             .coded_size()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let count = self.frontend.max_dpb_frames().unwrap_or(16) + 4;
         let backend = Backend::open(self.device, profile, width, height, count)?;
         self.shared = Some(SharedDevice::new("vaapi", u64::MAX));
@@ -280,19 +285,14 @@ impl<'a> H265Decoder<'a> {
             slots
                 .into_iter()
                 .map(|slot| {
-                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
-                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })?;
+                    let guard = backend
+                        .surface_guard(slot.index())
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     let surface = backend
                         .surfaces()
                         .get(slot.index() as usize)
                         .copied()
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!(
-                                "slot {} outside pool",
-                                slot.index()
-                            ))
-                        })?;
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     Ok((slot, guard, surface))
                 })
                 .collect::<Result<Vec<_>, VaApiError>>()?
@@ -363,13 +363,11 @@ impl<'a> H265Decoder<'a> {
             .backend
             .as_ref()
             .and_then(|backend| backend.surfaces().get(slot.index() as usize).copied())
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         let backend = self
             .backend
             .as_ref()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let params = Params::new(self.frontend.dpb(), backend.surfaces());
         let picture_params = params.picture(
             picture.sps(),
@@ -400,7 +398,7 @@ impl<'a> H265Decoder<'a> {
         let backend = self
             .backend
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence set".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         backend.submit_slices(
             surface,
             bytes_of(&picture_params),
@@ -463,14 +461,14 @@ impl<'a> H265Decoder<'a> {
     fn crop(&self) -> Result<(u32, u32, u32, u32), VaApiError> {
         self.frontend
             .visible_rect()
-            .ok_or_else(|| VaApiError::Parse("picture before sequence set".to_owned()))
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))
     }
 
     /// Live context and budget.
     fn active(&self) -> Result<(&Backend, &SharedDevice), VaApiError> {
         match (self.backend.as_ref(), self.shared.as_ref()) {
             (Some(backend), Some(shared)) => Ok((backend, shared)),
-            _ => Err(VaApiError::Parse("decode before sequence set".to_owned())),
+            _ => Err(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader)),
         }
     }
 }
@@ -493,5 +491,34 @@ impl Decoder for H265Decoder<'_> {
 
     fn flush(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.flush_inner(true)
+    }
+}
+
+impl SplitDecode for H265Decoder<'_> {
+    type Frame = VaApiFrame;
+    type Error = VaApiError;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, VaApiError> {
+        let frames = self.decode(packet)?;
+        self.split_pending.extend(frames);
+        Ok(true)
+    }
+
+    fn poll(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Ok(std::mem::take(&mut self.split_pending))
+    }
+
+    fn poll_wait(&mut self, _timeout: Duration) -> Result<Vec<VaApiFrame>, VaApiError> {
+        self.poll()
+    }
+
+    fn flush_split(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        let mut frames = std::mem::take(&mut self.split_pending);
+        frames.extend(self.flush()?);
+        Ok(frames)
+    }
+
+    fn stats(&self) -> SubmitStats {
+        self.submit_stats().unwrap_or_default()
     }
 }

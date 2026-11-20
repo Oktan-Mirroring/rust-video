@@ -1,5 +1,7 @@
 //! AV1 decode behind the caps `Decoder` trait.
 
+use std::time::Duration;
+
 use crate::av1::frontend::{Begun, Frontend, PendingFrame, Picture, NUM_SLOTS};
 use crate::av1::params::Params;
 use crate::backend::Backend;
@@ -12,7 +14,9 @@ use crate::h264::frontend::SurfaceSlot;
 use crate::inflight::{PendingQueue, PendingSlot};
 use crate::seam::VaSeam;
 
+use rust_video_caps::delivery::{SplitDecode, SubmitStats};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{BrokenReferenceReason as CapsBroken, ParseReason as CapsParse};
 use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 
@@ -38,6 +42,8 @@ pub struct Av1Decoder<'a> {
     pending: PendingQueue,
     /// Scratch slice parameters, reused across pictures.
     slice_params: Vec<VaSliceParameterBufferAv1>,
+    /// Split-phase frames decoded inline, awaiting poll.
+    split_pending: Vec<VaApiFrame>,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -52,6 +58,7 @@ impl<'a> Av1Decoder<'a> {
             generation: 0,
             pending: PendingQueue::new(PendingQueue::DEFAULT_DEPTH),
             slice_params: Vec::new(),
+            split_pending: Vec::new(),
         }
     }
 
@@ -103,7 +110,7 @@ impl<'a> Av1Decoder<'a> {
 
     /// Phase timings of the live context, absent before the first sequence header.
     #[must_use]
-    pub fn phase_stats(&self) -> Option<crate::backend::PhaseStats> {
+    pub fn phase_stats(&self) -> Option<crate::backend::VaPhaseStats> {
         self.backend.as_ref().map(Backend::phase_stats)
     }
 
@@ -195,12 +202,12 @@ impl<'a> Av1Decoder<'a> {
             .frontend
             .seq()
             .cloned()
-            .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let profile = Params::profile(seq.profile)?;
         let (width, height) = self
             .frontend
             .coded_size()
-            .ok_or_else(|| VaApiError::Parse("frame before sequence header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let backend = Backend::open(self.device, profile, width, height, POOL_SIZE)?;
         self.shared = Some(SharedDevice::new("vaapi", u64::MAX));
         self.backend = Some(backend);
@@ -275,19 +282,14 @@ impl<'a> Av1Decoder<'a> {
             slots
                 .into_iter()
                 .map(|slot| {
-                    let guard = backend.surface_guard(slot.index()).ok_or_else(|| {
-                        VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                    })?;
+                    let guard = backend
+                        .surface_guard(slot.index())
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     let surface = backend
                         .surfaces()
                         .get(slot.index() as usize)
                         .copied()
-                        .ok_or_else(|| {
-                            VaApiError::BrokenReference(format!(
-                                "slot {} outside pool",
-                                slot.index()
-                            ))
-                        })?;
+                        .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
                     Ok((slot, guard, surface))
                 })
                 .collect::<Result<Vec<_>, VaApiError>>()?
@@ -362,22 +364,18 @@ impl<'a> Av1Decoder<'a> {
         let backend = self
             .backend
             .as_ref()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         let surface = backend
             .surfaces()
             .get(slot.index() as usize)
             .copied()
-            .ok_or_else(|| {
-                VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-            })?;
+            .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))?;
         let shown = display.map_or(Ok(surface), |slot| {
             backend
                 .surfaces()
                 .get(slot.index() as usize)
                 .copied()
-                .ok_or_else(|| {
-                    VaApiError::BrokenReference(format!("slot {} outside pool", slot.index()))
-                })
+                .ok_or_else(|| VaApiError::BrokenReference(CapsBroken::SlotOutsidePool))
         })?;
         let params = Params::new(backend.surfaces());
         let picture_params = params.picture(
@@ -391,29 +389,38 @@ impl<'a> Av1Decoder<'a> {
         let mut payloads: Vec<&[u8]> = Vec::new();
         for group in picture.groups() {
             for tile in group.tiles() {
-                let offset = usize::try_from(tile.offset)
-                    .map_err(|_| VaApiError::Parse("tile offset range".to_owned()))?;
-                let size = usize::try_from(tile.size)
-                    .map_err(|_| VaApiError::Parse("tile size range".to_owned()))?;
+                let offset = usize::try_from(tile.offset).map_err(|_| {
+                    VaApiError::Parse(CapsParse::Range {
+                        syntax: "tile offset",
+                    })
+                })?;
+                let size = usize::try_from(tile.size).map_err(|_| {
+                    VaApiError::Parse(CapsParse::Range {
+                        syntax: "tile size",
+                    })
+                })?;
                 if offset + size > group.data().len() {
-                    return Err(VaApiError::Parse("tile outside payload".to_owned()));
+                    return Err(VaApiError::Parse(CapsParse::Truncated { syntax: "tile" }));
                 }
                 payloads.push(&group.data()[offset..offset + size]);
                 self.slice_params.push(Params::slice(
                     tile,
                     0,
-                    u32::try_from(size)
-                        .map_err(|_| VaApiError::Parse("tile size range".to_owned()))?,
+                    u32::try_from(size).map_err(|_| {
+                        VaApiError::Parse(CapsParse::Range {
+                            syntax: "tile size",
+                        })
+                    })?,
                 )?);
             }
         }
         if self.slice_params.is_empty() {
-            return Err(VaApiError::Parse("frame without tiles".to_owned()));
+            return Err(VaApiError::Parse(CapsParse::FrameWithoutTiles));
         }
         let backend = self
             .backend
             .as_mut()
-            .ok_or_else(|| VaApiError::Parse("decode before sequence header".to_owned()))?;
+            .ok_or_else(|| VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader))?;
         backend.submit_slices(
             surface,
             bytes_of(&picture_params),
@@ -451,9 +458,7 @@ impl<'a> Av1Decoder<'a> {
     fn active(&self) -> Result<(&Backend, &SharedDevice), VaApiError> {
         match (self.backend.as_ref(), self.shared.as_ref()) {
             (Some(backend), Some(shared)) => Ok((backend, shared)),
-            _ => Err(VaApiError::Parse(
-                "decode before sequence header".to_owned(),
-            )),
+            _ => Err(VaApiError::Parse(CapsParse::FrameBeforeSequenceHeader)),
         }
     }
 }
@@ -476,5 +481,34 @@ impl Decoder for Av1Decoder<'_> {
 
     fn flush(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
         self.flush_inner(true)
+    }
+}
+
+impl SplitDecode for Av1Decoder<'_> {
+    type Frame = VaApiFrame;
+    type Error = VaApiError;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, VaApiError> {
+        let frames = self.decode(packet)?;
+        self.split_pending.extend(frames);
+        Ok(true)
+    }
+
+    fn poll(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        Ok(std::mem::take(&mut self.split_pending))
+    }
+
+    fn poll_wait(&mut self, _timeout: Duration) -> Result<Vec<VaApiFrame>, VaApiError> {
+        self.poll()
+    }
+
+    fn flush_split(&mut self) -> Result<Vec<VaApiFrame>, VaApiError> {
+        let mut frames = std::mem::take(&mut self.split_pending);
+        frames.extend(self.flush()?);
+        Ok(frames)
+    }
+
+    fn stats(&self) -> SubmitStats {
+        self.submit_stats().unwrap_or_default()
     }
 }
