@@ -269,7 +269,7 @@ impl<'a> HevcDecoder<'a> {
 
     /// Session plus picture buffer for `active`.
     fn open_session(&mut self, active: Active) -> Result<(), D3d12Error> {
-        let queues = self.session.take().map(DecodeSession::into_queues);
+        let queues = self.session.take().map(|session| session.queues());
         let pins = Arc::new(SlotPins::new());
         let (session, dpb) =
             open_sequence_hevc(self.device, &self.ingest, Arc::clone(&pins), queues, active)?;

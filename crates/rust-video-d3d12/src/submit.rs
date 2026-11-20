@@ -904,6 +904,7 @@ impl Drop for Fence {
 }
 
 /// Allocator plus list behind one submit slot.
+#[derive(Clone)]
 pub(crate) struct CommandSlot<L> {
     /// Allocator behind the list.
     allocator: ID3D12CommandAllocator,

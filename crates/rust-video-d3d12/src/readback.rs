@@ -15,7 +15,6 @@ use crate::submit::{visible_rect, Nv12Layout};
 
 use bytes::Bytes;
 use rust_video_core::{CopyPump, InlineCopy};
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 /// One copied transfer.
 pub(crate) struct Done {
@@ -23,22 +22,11 @@ pub(crate) struct Done {
     slot: u8,
     /// Copied bytes or the copy failure.
     bytes: Result<Vec<u8>, D3d12Error>,
-    /// Mapping behind the copy, released by the submit thread.
-    release: Release,
     /// Copy time.
     copy: Duration,
 }
 
-/// Mapping release: unmap on the submit thread.
-pub(crate) struct Release {
-    /// Staging buffer behind the map.
-    staging: ID3D12Resource,
-}
-
-/// Mapped staging buffer awaiting its copy.
-///
-/// Single owner at a time: the submit thread maps, the worker
-/// copies, the submit thread releases.
+/// Session-life staging map awaiting its copy.
 pub(crate) struct Mapped {
     /// Decode slot behind the output.
     slot: u8,
@@ -54,15 +42,12 @@ pub(crate) struct Mapped {
     height: u32,
     /// Visible rectangle, if the stream crops.
     crop: Option<Crop>,
-    /// Mapping behind the copy.
-    release: Release,
-    /// Not auto-Send: the mapping outlives the transfer by handoff.
+    /// Not auto-Send: the map outlives the transfer by handoff.
     _send: PhantomData<*const ()>,
 }
 
-// Sound: the map outlives the transfer; each hop moves sole
-// ownership, unmap runs on the submit thread after the copy lands,
-// and only the worker dereferences the pointer.
+// Sound: the session-life map outlives the transfer; each hop moves
+// sole ownership, and only the worker dereferences the pointer.
 unsafe impl Send for Mapped {}
 
 /// Readback handle with a copy worker behind one decoder.
@@ -94,7 +79,6 @@ impl Readback {
                 Done {
                     slot: mapped.slot,
                     bytes: result.map(|()| out),
-                    release: mapped.release,
                     copy: started.elapsed(),
                 }
             }),
@@ -124,9 +108,9 @@ impl Readback {
         self.pump.collect()
     }
 
-    /// Queued copies drain, the worker joins, orphaned maps release.
+    /// Queued copies drain and the worker joins.
     pub(crate) fn shutdown(&mut self) {
-        self.pump.shutdown_with(|done| done.release.unmap());
+        self.pump.shutdown_with(|_done| {});
     }
 }
 
@@ -136,27 +120,14 @@ impl Drop for Readback {
     }
 }
 
-impl Release {
-    /// Staging buffer behind the map.
-    pub(crate) fn new(staging: ID3D12Resource) -> Self {
-        Self { staging }
-    }
-
-    /// Release the mapping on the calling thread.
-    pub(crate) fn unmap(self) {
-        super::submit::DeviceResources::unmap_readback(&self.staging);
-    }
-}
-
 impl Mapped {
-    /// Mapped staging bytes plus their release.
+    /// Mapped staging bytes over the session-life map.
     pub(crate) fn new(
         slot: u8,
         data: *const u8,
         len: usize,
         layout: Nv12Layout,
         geometry: (u32, u32, Option<Crop>),
-        release: Release,
     ) -> Self {
         let (width, height, crop) = geometry;
         Self {
@@ -167,16 +138,15 @@ impl Mapped {
             width,
             height,
             crop,
-            release,
             _send: PhantomData,
         }
     }
 }
 
 impl Done {
-    /// Slot, copied bytes, mapping release, and copy time.
-    pub(crate) fn into_parts(self) -> (u8, Result<Vec<u8>, D3d12Error>, Release, Duration) {
-        (self.slot, self.bytes, self.release, self.copy)
+    /// Slot, copied bytes, and copy time.
+    pub(crate) fn into_parts(self) -> (u8, Result<Vec<u8>, D3d12Error>, Duration) {
+        (self.slot, self.bytes, self.copy)
     }
 }
 

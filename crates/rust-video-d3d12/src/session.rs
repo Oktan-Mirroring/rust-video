@@ -276,6 +276,11 @@ pub(crate) struct DecodeSession {
     bitstream_next: usize,
     /// Download staging buffers, one per pool slot.
     staging: Vec<ID3D12Resource>,
+    /// Session-life staging maps, one per pool slot; unmapped at drop.
+    ///
+    /// Reads order behind the copy fence, never behind a fresh map; the copy
+    /// worker joins before the session drops, so no transfer outlives its map.
+    maps: Vec<*const u8>,
     /// Staging layout.
     layout: Nv12Layout,
     /// Driver footprints behind staging copies.
@@ -320,13 +325,13 @@ impl DecodeSession {
     /// Submit queues plus slots for the next session rebuild.
     ///
     /// Call past the session waits only; in-flight slots reset under the GPU.
-    pub(crate) fn into_queues(self) -> DecodeQueues {
+    pub(crate) fn queues(&self) -> DecodeQueues {
         DecodeQueues {
-            video_queue: self.video_queue,
-            video_slots: self.video_slots,
-            copy_queue: self.copy_queue,
-            copy_slots: self.copy_slots,
-            pool: self.pool,
+            video_queue: self.video_queue.clone(),
+            video_slots: self.video_slots.clone(),
+            copy_queue: self.copy_queue.clone(),
+            copy_slots: self.copy_slots.clone(),
+            pool: Arc::clone(&self.pool),
         }
     }
 
@@ -367,6 +372,71 @@ impl DecodeSession {
         } = queues;
         let video_fence = Fence::open(device.device())?;
         let copy_fence = Fence::open(device.device())?;
+        let (outputs, crops) = Self::output_pool(&resources, width, height, crop)?;
+        let upload_desc = DeviceResources::buffer_desc(BITSTREAM_CAP);
+        let mut bitstreams = Vec::with_capacity(BITSTREAM_SLOTS);
+        for _ in 0..BITSTREAM_SLOTS {
+            bitstreams.push(resources.committed(
+                D3D12_HEAP_TYPE_UPLOAD,
+                &upload_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                "CreateBitstream",
+            )?);
+        }
+        let (layout, footprints) = resources.nv12_layout(width, height)?;
+        let staging_desc = DeviceResources::buffer_desc(layout.total);
+        let mut staging = Vec::with_capacity(POOL);
+        for _ in 0..POOL {
+            staging.push(resources.committed(
+                D3D12_HEAP_TYPE_READBACK,
+                &staging_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                "CreateStaging",
+            )?);
+        }
+        let staged_len = usize::try_from(layout.total)
+            .unwrap_or(usize::MAX)
+            .min(isize::MAX as usize);
+        let maps = Self::stage_maps(&staging, staged_len)?;
+        Ok(Self {
+            device: device.device().clone(),
+            video_queue,
+            video_slots,
+            video_busy: vec![None; POOL],
+            copy_queue,
+            copy_slots,
+            copy_busy: vec![None; POOL],
+            video_fence,
+            copy_fence,
+            heap,
+            decoder,
+            outputs,
+            crops,
+            bitstreams,
+            bitstream_busy: vec![None; BITSTREAM_SLOTS],
+            bitstream_next: 0,
+            staging,
+            maps,
+            layout,
+            footprints,
+            width,
+            height,
+            crop,
+            pool,
+        })
+    }
+
+    /// Output texture pool plus crop targets behind the DPB slots.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the driver refuses a texture.
+    fn output_pool(
+        resources: &DeviceResources,
+        width: u32,
+        height: u32,
+        crop: Option<Crop>,
+    ) -> Result<(Vec<ID3D12Resource>, Vec<ID3D12Resource>), D3d12Error> {
         let texture_desc = DeviceResources::texture_desc(width, height);
         let mut outputs = Vec::with_capacity(POOL);
         for _ in 0..POOL {
@@ -390,52 +460,28 @@ impl DecodeSession {
                 )?);
             }
         }
-        let upload_desc = DeviceResources::buffer_desc(BITSTREAM_CAP);
-        let mut bitstreams = Vec::with_capacity(BITSTREAM_SLOTS);
-        for _ in 0..BITSTREAM_SLOTS {
-            bitstreams.push(resources.committed(
-                D3D12_HEAP_TYPE_UPLOAD,
-                &upload_desc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                "CreateBitstream",
-            )?);
+        Ok((outputs, crops))
+    }
+
+    /// Session-life maps over staging buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a mapping fails, releasing earlier maps.
+    fn stage_maps(staging: &[ID3D12Resource], len: usize) -> Result<Vec<*const u8>, D3d12Error> {
+        let mut maps = Vec::with_capacity(POOL);
+        for buffer in staging {
+            match DeviceResources::map_readback(buffer, len) {
+                Ok(mapped) => maps.push(mapped),
+                Err(error) => {
+                    for mapped in staging.iter().take(maps.len()) {
+                        DeviceResources::unmap_readback(mapped);
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let (layout, footprints) = resources.nv12_layout(width, height)?;
-        let staging_desc = DeviceResources::buffer_desc(layout.total);
-        let mut staging = Vec::with_capacity(POOL);
-        for _ in 0..POOL {
-            staging.push(resources.committed(
-                D3D12_HEAP_TYPE_READBACK,
-                &staging_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                "CreateStaging",
-            )?);
-        }
-        Ok(Self {
-            device: device.device().clone(),
-            video_queue,
-            video_slots,
-            video_busy: vec![None; POOL],
-            copy_queue,
-            copy_slots,
-            copy_busy: vec![None; POOL],
-            video_fence,
-            copy_fence,
-            heap,
-            decoder,
-            outputs,
-            crops,
-            bitstreams,
-            bitstream_busy: vec![None; BITSTREAM_SLOTS],
-            bitstream_next: 0,
-            staging,
-            layout,
-            footprints,
-            width,
-            height,
-            crop,
-            pool,
-        })
+        Ok(maps)
     }
 
     /// `submission` through the video queue, without waiting.
@@ -699,47 +745,54 @@ impl DecodeSession {
     /// staging falls short of the layout.
     fn readback(&self, slot: u8) -> Result<Bytes, D3d12Error> {
         let index = usize::from(slot);
-        let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
-            BrokenReferenceReason::Broken(SharedBroken::SlotOutsidePool),
-        ))?;
+        let data = self
+            .maps
+            .get(index)
+            .copied()
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
         let mut buf = self
             .pool
             .take(Nv12Layout::tight_len(self.width, self.height, self.crop));
-        DeviceResources::with_readback(staging, total, |mapped| {
-            self.layout
-                .tighten_into(mapped, self.width, self.height, self.crop, &mut buf)
-        })?;
+        // Sound: the session-life map spans `total` bytes; the copy fence
+        // signaled before this call.
+        let mapped = unsafe { std::slice::from_raw_parts(data, total) };
+        self.layout
+            .tighten_into(mapped, self.width, self.height, self.crop, &mut buf)?;
         Ok(BufferPool::wrap(&self.pool, buf))
     }
 
-    /// Mapped staging of `slot` for a worker copy.
+    /// Session-life staging map behind `slot` for a worker copy.
     ///
-    /// Call once the copy fence signaled; the caller releases the
-    /// mapping after its copy lands.
+    /// Call only after the slot's fence signaled; the map lives with
+    /// the session, so no release runs after the copy lands.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the pool or when the map fails.
+    /// Returns `Err` for a slot outside the pool.
     pub(crate) fn map_slot(&self, slot: u8) -> Result<crate::readback::Mapped, D3d12Error> {
-        use crate::readback::{Mapped, Release};
+        use crate::readback::Mapped;
         let index = usize::from(slot);
-        let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
-            BrokenReferenceReason::Broken(SharedBroken::SlotOutsidePool),
-        ))?;
+        let data = self
+            .maps
+            .get(index)
+            .copied()
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
-        let data = DeviceResources::map_readback(staging, total)?;
         Ok(Mapped::new(
             slot,
             data,
             total,
             self.layout,
             (self.width, self.height, self.crop),
-            Release::new(staging.clone()),
         ))
     }
 
@@ -1195,6 +1248,15 @@ impl DecodeSession {
             },
             pHeap: ManuallyDrop::new(Some(self.heap.clone())),
         })
+    }
+}
+
+impl Drop for DecodeSession {
+    fn drop(&mut self) {
+        // Sound: the maps are live; the copy worker joined before the drop.
+        for staging in &self.staging {
+            DeviceResources::unmap_readback(staging);
+        }
     }
 }
 

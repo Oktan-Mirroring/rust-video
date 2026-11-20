@@ -880,7 +880,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
 
     /// Front output plus `done` into the ready queue.
     fn land_front_inner(&mut self, done: Done) -> Result<(), D3d12Error> {
-        let (slot, bytes, release, copy) = done.into_parts();
+        let (slot, bytes, copy) = done.into_parts();
         self.copies.push(copy);
         let output = self
             .pictures
@@ -891,7 +891,6 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             return Ok(());
         };
         debug_assert_eq!(slot, output.pin.slot());
-        release.unmap();
         let signaled = Instant::now();
         let video = self
             .pictures
@@ -1103,7 +1102,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
         if let Some(previous) = self.active {
             self.drain_previous(&previous)?;
         }
-        let queues = self.session.take().map(DecodeSession::into_queues);
+        let queues = self.session.take().map(|session| session.queues());
         let pins = Arc::new(SlotPins::new());
         let (session, dpb) = F::open(self.device, &self.ingest, Arc::clone(&pins), queues, active)?;
         self.session = Some(session);
@@ -1123,12 +1122,8 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             .count();
         while launched > 0 {
             launched -= 1;
-            match self.readback.collect() {
-                Some(done) => {
-                    let (_, _, release, _) = done.into_parts();
-                    release.unmap();
-                }
-                None => break,
+            if self.readback.collect().is_none() {
+                break;
             }
         }
         self.dpb = None;
