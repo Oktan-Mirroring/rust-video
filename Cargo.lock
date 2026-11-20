@@ -441,6 +441,8 @@ dependencies = [
  "openh264",
  "rust-video",
  "rust-video-caps",
+ "rust-video-core",
+ "rust-video-h264",
  "rust-video-harness",
 ]
 

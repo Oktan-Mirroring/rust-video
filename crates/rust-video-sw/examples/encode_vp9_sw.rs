@@ -1,9 +1,13 @@
 //! VP9 encode on the software tier, from a synthetic frame to packets.
 
 #[cfg(feature = "ffmpeg")]
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+#[cfg(feature = "ffmpeg")]
 use rust_video_caps::packet::Packet;
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::traits::Encoder;
+#[cfg(feature = "ffmpeg")]
+use rust_video_caps::vp9::{EncodeLevel, EncodeProfile};
 #[cfg(feature = "ffmpeg")]
 use rust_video_harness::Synth;
 #[cfg(feature = "ffmpeg")]
@@ -11,7 +15,17 @@ use rust_video_sw::Vp9Encoder;
 
 #[cfg(feature = "ffmpeg")]
 fn main() {
-    let mut encoder = Vp9Encoder::open(64, 64, 500, 1).expect("encoder init");
+    let config = EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 500_000,
+            maxrate: 500_000,
+            bufsize: 500_000,
+        },
+        profile: Profile::Vp9(EncodeProfile::P0),
+        level: Level::Vp9(EncodeLevel::Auto),
+        ..Default::default()
+    };
+    let mut encoder = Vp9Encoder::open(64, 64, config, 1).expect("encoder init");
     let frame = Synth::black_yuv420p(64, 64);
     let mut packets_out = 0;
     let mut bytes_out = 0;

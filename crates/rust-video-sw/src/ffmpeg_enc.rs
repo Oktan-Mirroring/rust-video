@@ -8,6 +8,7 @@
 use std::ffi::CStr;
 use std::ptr;
 
+use crate::config::FfmpegRate;
 use crate::error::SwError;
 use crate::ffmpeg_sys as sys;
 
@@ -46,7 +47,7 @@ pub(crate) struct FfmpegEncoder {
 unsafe impl Send for FfmpegEncoder {}
 
 impl FfmpegEncoder {
-    /// CBR encoder for `name` at `width`x`height` and `bitrate_kbps`.
+    /// Encoder for `name` at `width`x`height` and `bitrate_bps`.
     ///
     /// # Errors
     ///
@@ -56,14 +57,14 @@ impl FfmpegEncoder {
         name: &'static CStr,
         width: u32,
         height: u32,
-        bitrate_kbps: u32,
+        bitrate_bps: u32,
         configure: impl Fn(*mut sys::AVCodecContext, i64) -> bool + Send + 'static,
     ) -> Result<Self, SwError> {
         Self::open_candidates(
             vec![name],
             width,
             height,
-            bitrate_kbps,
+            bitrate_bps,
             move |candidate, ctx, bitrate| {
                 debug_assert_eq!(candidate, name);
                 configure(ctx, bitrate)
@@ -71,7 +72,7 @@ impl FfmpegEncoder {
         )
     }
 
-    /// CBR encoder selecting the first available candidate in `names`.
+    /// Encoder selecting the first available candidate in `names`.
     ///
     /// # Errors
     ///
@@ -80,7 +81,7 @@ impl FfmpegEncoder {
         names: Vec<&'static CStr>,
         width: u32,
         height: u32,
-        bitrate_kbps: u32,
+        bitrate_bps: u32,
         configure: impl Fn(&'static CStr, *mut sys::AVCodecContext, i64) -> bool + Send + 'static,
     ) -> Result<Self, SwError> {
         // SAFETY: version queries take no arguments and touch no state.
@@ -92,10 +93,9 @@ impl FfmpegEncoder {
         if PictureSize::new(width, height).is_none() {
             return Err(SwError::Init);
         }
-        let bitrate = i64::from(bitrate_kbps) * 1000;
-        if bitrate <= 0 {
-            return Err(SwError::Init);
-        }
+        // Zero is a quality mode (CQP/CRF), not a missing bitrate: callers
+        // validate rate control before opening and pass zero deliberately.
+        let bitrate = i64::from(bitrate_bps);
         let build_ctx = move || -> Result<*mut sys::AVCodecContext, SwError> {
             let mut last_err = SwError::Init;
             for &name in &names {
@@ -343,6 +343,60 @@ impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
         // SAFETY: every slot came from its allocator and is dropped once.
         unsafe { Self::release(self.ctx, self.frame, self.packet) };
+    }
+}
+
+/// Rate options behind `rate` on live `ctx`; false on first refusal.
+///
+/// `crf` carries the preformatted factor for `Crf`; quality modes zero `b`
+/// explicitly. Callers resolve `Qp` support before opening: the arm sets the
+/// wrapper `qp` option and fails closed where the wrapper lacks it.
+///
+/// # Arguments
+///
+/// * `ctx` - live encoder context.
+/// * `rate` - resolved rate options.
+/// * `crf` - preformatted factor; required for `Crf`.
+pub(crate) fn set_rate(
+    ctx: *mut sys::AVCodecContext,
+    rate: &FfmpegRate,
+    crf: Option<&CStr>,
+) -> bool {
+    // SAFETY: context is live; option names are valid C strings.
+    unsafe {
+        match *rate {
+            FfmpegRate::Cbr {
+                bitrate,
+                maxrate,
+                minrate,
+                bufsize,
+            } => {
+                sys::opt_int(ctx, c"b", i64::from(bitrate), 0)
+                    && sys::opt_int(ctx, c"maxrate", i64::from(maxrate), 0)
+                    && sys::opt_int(ctx, c"minrate", i64::from(minrate), 0)
+                    && sys::opt_int(ctx, c"bufsize", i64::from(bufsize), 0)
+            }
+            FfmpegRate::Vbr {
+                bitrate,
+                maxrate,
+                bufsize,
+            } => {
+                sys::opt_int(ctx, c"b", i64::from(bitrate), 0)
+                    && sys::opt_int(ctx, c"maxrate", i64::from(maxrate), 0)
+                    && sys::opt_int(ctx, c"bufsize", i64::from(bufsize), 0)
+            }
+            FfmpegRate::Qp { qp } => {
+                sys::opt_int(ctx, c"b", 0, 0)
+                    && sys::opt_int(ctx, c"qp", i64::from(qp), sys::OPT_SEARCH_CHILDREN)
+            }
+            FfmpegRate::Crf { .. } => {
+                let Some(text) = crf else {
+                    return false;
+                };
+                sys::opt_int(ctx, c"b", 0, 0)
+                    && sys::opt_str(ctx, c"crf", text, sys::OPT_SEARCH_CHILDREN)
+            }
+        }
     }
 }
 

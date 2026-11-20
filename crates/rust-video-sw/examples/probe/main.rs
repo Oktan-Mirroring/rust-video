@@ -15,6 +15,59 @@ mod x265;
 #[cfg(any(feature = "h264-openh264", feature = "ffmpeg"))]
 use std::path::Path;
 
+/// VP8 probe config: 8 Mbps CBR on the implicit profile.
+#[cfg(feature = "ffmpeg")]
+fn vp8_probe_config() -> rust_video_caps::encode::EncodeConfig {
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 8_000_000,
+            maxrate: 8_000_000,
+            bufsize: 8_000_000,
+        },
+        profile: Profile::Vp8,
+        level: Level::Vp8,
+        ..Default::default()
+    }
+}
+
+/// VP9 probe config: 8 Mbps CBR on P0 auto.
+#[cfg(feature = "ffmpeg")]
+fn vp9_probe_config() -> rust_video_caps::encode::EncodeConfig {
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+    use rust_video_caps::vp9::{EncodeLevel, EncodeProfile};
+
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 8_000_000,
+            maxrate: 8_000_000,
+            bufsize: 8_000_000,
+        },
+        profile: Profile::Vp9(EncodeProfile::P0),
+        level: Level::Vp9(EncodeLevel::Auto),
+        ..Default::default()
+    }
+}
+
+/// AV1 probe config: 8 Mbps CBR on Main auto.
+#[cfg(feature = "ffmpeg")]
+fn av1_probe_config() -> rust_video_caps::encode::EncodeConfig {
+    use rust_video_caps::av1::{EncodeLevel, EncodeProfile};
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 8_000_000,
+            maxrate: 8_000_000,
+            bufsize: 8_000_000,
+        },
+        profile: Profile::Av1(EncodeProfile::Main),
+        level: Level::Av1(EncodeLevel::Auto),
+        ..Default::default()
+    }
+}
+
 /// Probe entry point.
 ///
 /// # Panics
@@ -58,7 +111,8 @@ fn main() {
             let w = args[3].parse().expect("width");
             let h = args[4].parse().expect("height");
             let frames = args[5].parse().expect("frames");
-            let encoder = rust_video_sw::Vp8Encoder::open(w, h, 8_000, 4).expect("encoder");
+            let encoder =
+                rust_video_sw::Vp8Encoder::open(w, h, vp8_probe_config(), 4).expect("encoder");
             let mut probe = rust_video_harness::IvfEncode::new(encoder, "vp8enc", *b"VP80");
             probe.run(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }
@@ -67,7 +121,8 @@ fn main() {
             let w = args[3].parse().expect("width");
             let h = args[4].parse().expect("height");
             let frames = args[5].parse().expect("frames");
-            let encoder = rust_video_sw::Vp9Encoder::open(w, h, 8_000, 4).expect("encoder");
+            let encoder =
+                rust_video_sw::Vp9Encoder::open(w, h, vp9_probe_config(), 4).expect("encoder");
             let mut probe = rust_video_harness::IvfEncode::new(encoder, "vpxenc", *b"VP90");
             probe.run(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }
@@ -76,7 +131,8 @@ fn main() {
             let w = args[3].parse().expect("width");
             let h = args[4].parse().expect("height");
             let frames = args[5].parse().expect("frames");
-            let encoder = rust_video_sw::Av1Encoder::open(w, h, 8_000, 4).expect("encoder");
+            let encoder =
+                rust_video_sw::Av1Encoder::open(w, h, av1_probe_config(), 4).expect("encoder");
             let mut probe = rust_video_harness::IvfEncode::new(encoder, "av1enc", *b"AV01");
             probe.run(Path::new(&args[2]), w, h, frames, Path::new(&args[6]));
         }

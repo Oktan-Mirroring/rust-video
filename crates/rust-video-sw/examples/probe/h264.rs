@@ -53,6 +53,7 @@ fn push_packed(yuv: &openh264::decoder::DecodedYUV<'_>, out: &mut Vec<u8>) {
 pub fn run_encode(raw: &Path, width: u32, height: u32, frames: usize, out: &Path) {
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::encode::{EncodeConfig, RateControl};
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::traits::Encoder as _;
     use rust_video_sw::H264Encoder;
@@ -61,7 +62,15 @@ pub fn run_encode(raw: &Path, width: u32, height: u32, frames: usize, out: &Path
     let bytes = fs::read(raw).expect("raw readable");
     let size = pitch * 3 / 2;
     assert!(bytes.len() >= size * frames, "raw holds frames");
-    let mut encoder = H264Encoder::open(width, height, 8_000_000, 4).expect("encoder init");
+    let config = EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 8_000_000,
+            maxrate: 8_000_000,
+            bufsize: 8_000_000,
+        },
+        ..Default::default()
+    };
+    let mut encoder = H264Encoder::open(width, height, config, 4).expect("encoder init");
     let picture = PictureSize::new(width, height).expect("size");
     let mut coded = Vec::new();
     let start = Instant::now();

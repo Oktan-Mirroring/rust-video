@@ -1,6 +1,10 @@
 //! H.265 encode on the software tier, from a synthetic frame to packets.
 
 #[cfg(feature = "gpl")]
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+#[cfg(feature = "gpl")]
+use rust_video_caps::h265::{EncodeLevel, EncodeProfile};
+#[cfg(feature = "gpl")]
 use rust_video_caps::packet::Packet;
 #[cfg(feature = "gpl")]
 use rust_video_caps::traits::Encoder;
@@ -11,7 +15,17 @@ use rust_video_sw::H265Encoder;
 
 #[cfg(feature = "gpl")]
 fn main() {
-    let mut encoder = H265Encoder::open(64, 64, 500, 1).expect("encoder init");
+    let config = EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 500_000,
+            maxrate: 500_000,
+            bufsize: 500_000,
+        },
+        profile: Profile::H265(EncodeProfile::Main),
+        level: Level::H265(EncodeLevel::Auto),
+        ..Default::default()
+    };
+    let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder init");
     let frame = Synth::black_yuv420p(64, 64);
     let mut packets_out = 0;
     let mut bytes_out = 0;

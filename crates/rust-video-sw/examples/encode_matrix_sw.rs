@@ -6,6 +6,61 @@ fn main() {
 }
 
 #[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+use rust_video_caps::encode::{EncodeConfig, RateControl};
+
+/// CBR config at `bps` with the default structure.
+#[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+fn cbr(bps: u32) -> EncodeConfig {
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: bps,
+            maxrate: bps,
+            bufsize: bps,
+        },
+        ..Default::default()
+    }
+}
+
+/// AV1 matrix config on Main auto.
+#[cfg(feature = "ffmpeg")]
+fn av1_config() -> EncodeConfig {
+    use rust_video_caps::av1::{EncodeLevel, EncodeProfile};
+    use rust_video_caps::encode::{Level, Profile};
+
+    EncodeConfig {
+        profile: Profile::Av1(EncodeProfile::Main),
+        level: Level::Av1(EncodeLevel::Auto),
+        ..cbr(500_000)
+    }
+}
+
+/// VP9 matrix config on P0 auto.
+#[cfg(feature = "ffmpeg")]
+fn vp9_config() -> EncodeConfig {
+    use rust_video_caps::encode::{Level, Profile};
+    use rust_video_caps::vp9::{EncodeLevel, EncodeProfile};
+
+    EncodeConfig {
+        profile: Profile::Vp9(EncodeProfile::P0),
+        level: Level::Vp9(EncodeLevel::Auto),
+        ..cbr(500_000)
+    }
+}
+
+/// H.265 matrix config on Main auto.
+#[cfg(feature = "gpl")]
+fn h265_config() -> EncodeConfig {
+    use rust_video_caps::encode::{Level, Profile};
+    use rust_video_caps::h265::{EncodeLevel, EncodeProfile};
+
+    EncodeConfig {
+        profile: Profile::H265(EncodeProfile::Main),
+        level: Level::H265(EncodeLevel::Auto),
+        ..cbr(500_000)
+    }
+}
+
+#[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
 fn main() {
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
@@ -60,11 +115,23 @@ fn main() {
     }
 
     #[cfg(feature = "ffmpeg")]
-    run("av1", rust_video_sw::Av1Encoder::open(64, 64, 500, 1));
+    run(
+        "av1",
+        rust_video_sw::Av1Encoder::open(64, 64, av1_config(), 1),
+    );
     #[cfg(feature = "ffmpeg")]
-    run("vp9", rust_video_sw::Vp9Encoder::open(64, 64, 500, 1));
+    run(
+        "vp9",
+        rust_video_sw::Vp9Encoder::open(64, 64, vp9_config(), 1),
+    );
     #[cfg(feature = "h264-openh264")]
-    run("h264", rust_video_sw::H264Encoder::open(64, 64, 500_000, 1));
+    run(
+        "h264",
+        rust_video_sw::H264Encoder::open(64, 64, cbr(500_000), 1),
+    );
     #[cfg(feature = "gpl")]
-    run("h265", rust_video_sw::H265Encoder::open(64, 64, 500, 1));
+    run(
+        "h265",
+        rust_video_sw::H265Encoder::open(64, 64, h265_config(), 1),
+    );
 }

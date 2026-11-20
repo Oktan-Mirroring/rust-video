@@ -11,7 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rust_video_caps::delivery::{
-    ChannelConfig, FrameChannel, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    ChannelConfig, FrameChannel, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SplitDecode,
+    SubmitStats, TrySendError,
 };
 use rust_video_caps::packet::Packet;
 
@@ -67,62 +68,6 @@ pub trait RawSource {
     ///
     /// Returns `Err` when the picture cannot form a frame.
     fn convert(raw: Self::Raw) -> Result<Self::Frame, Self::Error>;
-}
-
-/// Submit/poll decode behind one pipelined engine.
-pub trait SplitDecoder {
-    /// Decoded frame type.
-    type Frame;
-    /// Submit, poll, or conversion failure.
-    type Error: std::error::Error;
-
-    /// `packet` queued without waiting for its pictures.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the packet is rejected or a freed picture is unusable.
-    ///
-    /// # Arguments
-    ///
-    /// * `packet` - coded input.
-    ///
-    /// # Returns
-    ///
-    /// False when conversions saturate the depth; the packet stays
-    /// unconsumed, receive then resend.
-    fn try_submit(&mut self, packet: &Packet) -> Result<bool, Self::Error>;
-
-    /// Pictures completed since the last poll, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` on the first failed conversion, dropping staged frames.
-    fn poll(&mut self) -> Result<Vec<Self::Frame>, Self::Error>;
-
-    /// Pictures completed within `timeout`, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` on the first failed conversion, dropping staged frames.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - wait budget when nothing completed.
-    ///
-    /// # Returns
-    ///
-    /// Empty when the budget lapses with nothing completed.
-    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<Self::Frame>, Self::Error>;
-
-    /// Trailing pictures, then end of stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` on the first failed conversion, dropping staged frames.
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error>;
-
-    /// Phase timing plus depth behind the session so far.
-    fn stats(&self) -> PhaseStats;
 }
 
 /// FIFO conversion worker mapping raw pictures to frames.
@@ -507,6 +452,7 @@ impl Default for PipelineConfig {
 type ConvertFn<I> =
     fn(<I as RawSource>::Raw) -> Result<<I as RawSource>::Frame, <I as RawSource>::Error>;
 
+// Not core CopyPump (threaded memcpy) nor caps DecoderPump (sync delivery).
 /// Split-phase decode over one engine plus a conversion worker.
 ///
 /// `Send`, never `Sync`: hand the decoder to another thread when idle,
@@ -572,6 +518,30 @@ impl<I: RawSource> PipelinedDecoder<I> {
     #[must_use]
     pub fn config(&self) -> PipelineConfig {
         self.config
+    }
+
+    /// Phase timing plus depth behind the session so far.
+    #[must_use]
+    pub fn phase_stats(&self) -> PhaseStats {
+        let first_frame = self
+            .first_submit
+            .zip(self.first_yield)
+            .map(|(start, end)| end.saturating_duration_since(start));
+        let wall = self
+            .first_submit
+            .zip(self.last_yield)
+            .map(|(start, end)| end.saturating_duration_since(start));
+        PhaseStats {
+            submitted: self.submitted,
+            completed: self.completed,
+            max_inflight: self.convert.max_outstanding(),
+            overlap: self.overlap,
+            submit: self.submit.clone(),
+            engine: self.engine.clone(),
+            copy: self.convert.spans().to_vec(),
+            first_frame,
+            wall,
+        }
     }
 
     /// Engine harvest posted for conversion.
@@ -648,7 +618,7 @@ impl<I: RawSource> PipelinedDecoder<I> {
     }
 }
 
-impl<I: RawSource> SplitDecoder for PipelinedDecoder<I> {
+impl<I: RawSource> SplitDecode for PipelinedDecoder<I> {
     type Frame = I::Frame;
     type Error = I::Error;
 
@@ -697,7 +667,7 @@ impl<I: RawSource> SplitDecoder for PipelinedDecoder<I> {
         }
     }
 
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+    fn flush_split(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
         for raw in self.inner.flush_raw()? {
             self.convert.post(raw);
         }
@@ -707,31 +677,14 @@ impl<I: RawSource> SplitDecoder for PipelinedDecoder<I> {
         self.drain()
     }
 
-    fn stats(&self) -> PhaseStats {
-        let first_frame = self
-            .first_submit
-            .zip(self.first_yield)
-            .map(|(start, end)| end.saturating_duration_since(start));
-        let wall = self
-            .first_submit
-            .zip(self.last_yield)
-            .map(|(start, end)| end.saturating_duration_since(start));
-        PhaseStats {
-            submitted: self.submitted,
-            completed: self.completed,
-            max_inflight: self.convert.max_outstanding(),
-            overlap: self.overlap,
-            submit: self.submit.clone(),
-            engine: self.engine.clone(),
-            copy: self.convert.spans().to_vec(),
-            first_frame,
-            wall,
-        }
+    fn stats(&self) -> SubmitStats {
+        SubmitStats::snapshot(self.submitted, self.convert.max_outstanding(), 0, 0)
     }
 }
 
+// Not core CopyPump (threaded memcpy) nor caps DecoderPump (sync delivery).
 /// Bounded multi-inflight decode session over a split decoder.
-pub struct PipelinedPump<D: SplitDecoder> {
+pub struct PipelinedPump<D: SplitDecode> {
     /// Split-phase decode behind sends.
     decoder: D,
     /// Bounded output with drop policy.
@@ -740,7 +693,7 @@ pub struct PipelinedPump<D: SplitDecoder> {
     finished: bool,
 }
 
-impl<D: SplitDecoder> PipelinedPump<D> {
+impl<D: SplitDecode> PipelinedPump<D> {
     /// Bounded wait behind blocking receive.
     const RECEIVE_QUANTUM: Duration = Duration::from_secs(1);
 
@@ -765,9 +718,12 @@ impl<D: SplitDecoder> PipelinedPump<D> {
         &self.decoder
     }
 
-    /// Phase timing plus depth behind the session so far.
+    /// Submit gauges since backend open.
+    ///
+    /// Detail timing lives behind the decoder; see
+    /// [`PipelinedDecoder::phase_stats`].
     #[must_use]
-    pub fn stats(&self) -> PhaseStats {
+    pub fn stats(&self) -> SubmitStats {
         self.decoder.stats()
     }
 
@@ -824,7 +780,7 @@ impl<D: SplitDecoder> PipelinedPump<D> {
     }
 }
 
-impl<D: SplitDecoder> SendPackets for PipelinedPump<D> {
+impl<D: SplitDecode> SendPackets for PipelinedPump<D> {
     type Error = D::Error;
 
     fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
@@ -848,7 +804,7 @@ impl<D: SplitDecoder> SendPackets for PipelinedPump<D> {
             return Ok(());
         }
         self.finished = true;
-        for frame in self.decoder.flush()? {
+        for frame in self.decoder.flush_split()? {
             let _dropped = self.channel.send(frame);
         }
         self.channel.close();
@@ -856,7 +812,7 @@ impl<D: SplitDecoder> SendPackets for PipelinedPump<D> {
     }
 }
 
-impl<D: SplitDecoder> PollFrames for PipelinedPump<D> {
+impl<D: SplitDecode> PollFrames for PipelinedPump<D> {
     type Frame = D::Frame;
     type Error = D::Error;
 
@@ -866,7 +822,7 @@ impl<D: SplitDecoder> PollFrames for PipelinedPump<D> {
     }
 }
 
-impl<D: SplitDecoder> ReceiveFrames for PipelinedPump<D> {
+impl<D: SplitDecode> ReceiveFrames for PipelinedPump<D> {
     type Frame = D::Frame;
     type Error = D::Error;
 
@@ -915,16 +871,14 @@ mod tests {
     use rust_video_caps::common::PictureSize;
     use rust_video_caps::delivery::{
         ChannelConfig, DecoderPump, DropPolicy, PollFrames, ReceiveError, ReceiveFrames,
-        SendPackets, TrySendError,
+        SendPackets, SplitDecode as _, TrySendError,
     };
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Decoder;
     use rust_video_caps::transcode::GpuCaps;
 
-    use super::{
-        Converter, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource, SplitDecoder,
-    };
+    use super::{Converter, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource};
     use crate::error::SwError;
 
     /// Scripted raw source stamping each job id into its frame.
@@ -1096,7 +1050,10 @@ mod tests {
                 assert_eq!(plane.data(), goal.data());
             }
         }
-        let stats = pump.stats();
+        let gauges = pump.stats();
+        assert_eq!(gauges.submitted(), 6);
+        assert!(gauges.peak_inflight() >= 1);
+        let stats = pump.decoder().phase_stats();
         assert_eq!(stats.submitted(), 6);
         assert_eq!(stats.completed(), 6);
         assert_eq!(stats.submit_spans().len(), 6);
@@ -1117,7 +1074,8 @@ mod tests {
             panic!("full past depth");
         };
         assert_eq!(refused.data(), &[2]);
-        assert_eq!(pump.stats().max_inflight(), 2);
+        assert_eq!(pump.decoder().phase_stats().max_inflight(), 2);
+        assert_eq!(pump.stats().peak_inflight(), 2);
         let mut frames = Vec::new();
         while let Some(frame) = pump.receive_timeout(Duration::from_secs(5)).expect("wait") {
             frames.push(frame);
@@ -1148,11 +1106,12 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
-        let frames = decoder.flush().expect("flush drains");
+        let frames = decoder.flush_split().expect("flush drains");
         assert_eq!(frames.len(), 4);
-        let stats = decoder.stats();
+        let stats = decoder.phase_stats();
         assert!(stats.max_inflight() >= 2, "backlog observed");
         assert!(stats.overlap_observed(), "submit shared conversion time");
+        assert_eq!(decoder.stats().submitted(), 4);
     }
 
     #[test]
@@ -1179,7 +1138,7 @@ mod tests {
             .expect("last poll");
         assert_eq!(rest.len(), 1);
         assert_eq!(stamped(&rest[0]), 2);
-        assert_eq!(decoder.stats().completed(), 2);
+        assert_eq!(decoder.phase_stats().completed(), 2);
     }
 
     #[test]

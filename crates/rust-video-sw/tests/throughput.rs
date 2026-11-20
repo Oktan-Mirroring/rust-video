@@ -15,8 +15,12 @@ use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
+#[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
+use rust_video_caps::encode::{EncodeConfig, FrameRate, RateControl};
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::frame::GpuExport;
+#[cfg(feature = "ffmpeg")]
+use rust_video_caps::frame::Surface as _;
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 #[cfg(feature = "ffmpeg")]
@@ -34,7 +38,7 @@ use rust_video_sw::H264Encoder;
 #[cfg(feature = "gpl")]
 use rust_video_sw::H265Encoder;
 #[cfg(feature = "ffmpeg")]
-use rust_video_sw::{Av1Decoder, H264Decoder, H265Decoder, SwSurface, Vp8Decoder, Vp9Decoder};
+use rust_video_sw::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
 #[cfg(feature = "ffmpeg")]
 use rust_video_sw::{Av1Encoder, Vp8Encoder, Vp9Encoder};
 
@@ -87,13 +91,12 @@ where
 ///
 /// # Arguments
 ///
-/// * `frame` - decoded frame; single layer, opaque export, complete at return.
+/// * `frame` - decoded frame; single layer, opaque export.
 fn touch_surface(frame: &CpuFrame) -> u64 {
     assert_eq!(frame.slice(), 0);
     assert_eq!(frame.coded(), frame.size());
     assert_eq!(frame.origin(), (0, 0));
     assert!(matches!(frame.export(), GpuExport::Opaque { name: "sw" }));
-    frame.wait();
     let mut folded = 0u64;
     for plane in frame.planes() {
         for byte in plane.data() {
@@ -161,6 +164,77 @@ where
     let elapsed = start.elapsed().as_secs_f64();
     assert!(frames > 0);
     f64::from(frames) / elapsed
+}
+
+#[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
+/// Legacy-equivalent CBR config: 5 Mbps capped CBR at 60 fps.
+fn realtime_cbr() -> EncodeConfig {
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 5_000_000,
+            maxrate: 5_000_000,
+            bufsize: 5_000_000,
+        },
+        frame_rate: FrameRate { num: 60, den: 1 },
+        ..Default::default()
+    }
+}
+
+#[cfg(all(feature = "h264-openh264", nasm_available))]
+/// H.264 bench config: legacy-equivalent CBR.
+fn h264_config() -> EncodeConfig {
+    realtime_cbr()
+}
+
+#[cfg(feature = "gpl")]
+/// H.265 bench config: legacy-equivalent CBR on Main auto.
+fn h265_config() -> EncodeConfig {
+    use rust_video_caps::encode::{Level, Profile};
+    use rust_video_caps::h265::{EncodeLevel, EncodeProfile};
+
+    EncodeConfig {
+        profile: Profile::H265(EncodeProfile::Main),
+        level: Level::H265(EncodeLevel::Auto),
+        ..realtime_cbr()
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+/// VP8 bench config: legacy-equivalent CBR on the implicit profile.
+fn vp8_config() -> EncodeConfig {
+    use rust_video_caps::encode::{Level, Profile};
+
+    EncodeConfig {
+        profile: Profile::Vp8,
+        level: Level::Vp8,
+        ..realtime_cbr()
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+/// VP9 bench config: legacy-equivalent CBR on P0 auto.
+fn vp9_config() -> EncodeConfig {
+    use rust_video_caps::encode::{Level, Profile};
+    use rust_video_caps::vp9::{EncodeLevel, EncodeProfile};
+
+    EncodeConfig {
+        profile: Profile::Vp9(EncodeProfile::P0),
+        level: Level::Vp9(EncodeLevel::Auto),
+        ..realtime_cbr()
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+/// AV1 bench config: legacy-equivalent CBR on Main auto.
+fn av1_config() -> EncodeConfig {
+    use rust_video_caps::av1::{EncodeLevel, EncodeProfile};
+    use rust_video_caps::encode::{Level, Profile};
+
+    EncodeConfig {
+        profile: Profile::Av1(EncodeProfile::Main),
+        level: Level::Av1(EncodeLevel::Auto),
+        ..realtime_cbr()
+    }
 }
 
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
@@ -429,7 +503,7 @@ fn av1_surface_1080p_measures_realtime() {
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn h264_encode_1080p_measures_realtime() {
-    let mut encoder = match H264Encoder::open(WIDTH, HEIGHT, 5_000_000, 4) {
+    let mut encoder = match H264Encoder::open(WIDTH, HEIGHT, h264_config(), 4) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("sw h264 encode 1080p skipped: {error}");
@@ -455,7 +529,7 @@ fn h264_encode_skipped_without_nasm() {
 /// 1080p HEVC encode measured against the realtime bar.
 #[test]
 fn h265_encode_1080p_measures_realtime() {
-    let mut encoder = match H265Encoder::open(WIDTH, HEIGHT, 5_000, 4) {
+    let mut encoder = match H265Encoder::open(WIDTH, HEIGHT, h265_config(), 4) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("sw h265 encode 1080p skipped: {error}");
@@ -475,7 +549,7 @@ fn h265_encode_1080p_measures_realtime() {
 /// 1080p VP8 encode measured against the realtime bar.
 #[test]
 fn vp8_encode_1080p_measures_realtime() {
-    let mut encoder = match Vp8Encoder::open(WIDTH, HEIGHT, 5_000, 4) {
+    let mut encoder = match Vp8Encoder::open(WIDTH, HEIGHT, vp8_config(), 4) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("sw vp8 encode 1080p skipped: {error}");
@@ -495,7 +569,7 @@ fn vp8_encode_1080p_measures_realtime() {
 /// 1080p VP9 encode measured against the realtime bar.
 #[test]
 fn vp9_encode_1080p_measures_realtime() {
-    let mut encoder = match Vp9Encoder::open(WIDTH, HEIGHT, 5_000, 4) {
+    let mut encoder = match Vp9Encoder::open(WIDTH, HEIGHT, vp9_config(), 4) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("sw vp9 encode 1080p skipped: {error}");
@@ -515,7 +589,7 @@ fn vp9_encode_1080p_measures_realtime() {
 /// 1080p AV1 encode measured against the realtime bar.
 #[test]
 fn av1_encode_1080p_measures_realtime() {
-    let mut encoder = match Av1Encoder::open(WIDTH, HEIGHT, 5_000, 4) {
+    let mut encoder = match Av1Encoder::open(WIDTH, HEIGHT, av1_config(), 4) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("sw av1 encode 1080p skipped: {error}");

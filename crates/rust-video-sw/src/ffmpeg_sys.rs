@@ -4,7 +4,7 @@
 //!
 //! Hand-written surface over the system libraries; no bindgen.
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CStr};
 
 /// Native H.264 codec id.
 pub const CODEC_ID_H264: c_int = 27;
@@ -194,4 +194,38 @@ unsafe extern "C" {
     pub fn av_frame_unref(frame: *mut AVFrame);
     /// Frame released.
     pub fn av_frame_free(frame: *mut *mut AVFrame);
+}
+
+/// Integer option behind `name` on live `ctx`; false on refusal.
+///
+/// # Safety
+///
+/// `ctx` must point to a live `AVCodecContext`.
+///
+/// # Arguments
+///
+/// * `ctx` - live encoder context.
+/// * `name` - NUL-terminated option name.
+/// * `value` - option value.
+/// * `search` - private-option search flags.
+pub unsafe fn opt_int(ctx: *mut AVCodecContext, name: &CStr, value: i64, search: c_int) -> bool {
+    // SAFETY: live context and valid name by the contract above.
+    unsafe { av_opt_set_int(ctx.cast::<c_void>(), name.as_ptr(), value, search) == 0 }
+}
+
+/// String option behind `name` on live `ctx`; false on refusal.
+///
+/// # Safety
+///
+/// `ctx` must point to a live `AVCodecContext`.
+///
+/// # Arguments
+///
+/// * `ctx` - live encoder context.
+/// * `name` - NUL-terminated option name.
+/// * `value` - NUL-terminated option value.
+/// * `search` - private-option search flags.
+pub unsafe fn opt_str(ctx: *mut AVCodecContext, name: &CStr, value: &CStr, search: c_int) -> bool {
+    // SAFETY: live context and valid strings by the contract above.
+    unsafe { av_opt_set(ctx.cast::<c_void>(), name.as_ptr(), value.as_ptr(), search) == 0 }
 }

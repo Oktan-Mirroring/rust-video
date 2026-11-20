@@ -20,6 +20,7 @@ use rust_video_caps::traits::Decoder;
 use rust_video_caps::transcode::GpuCaps;
 
 pub use crate::ffmpeg_sys::AVCodecContext;
+pub use rust_video_core::Codec;
 
 /// Sink for pictures drained from the decoder.
 trait PictureSink {
@@ -56,49 +57,50 @@ impl PictureSink for Vec<RawPicture> {
     }
 }
 
-/// Codec decoded through libavcodec.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Codec {
-    /// Native H.264 decoder.
-    H264,
-    /// Native HEVC decoder.
-    H265,
-    /// Native VP8 decoder.
-    Vp8,
-    /// Native VP9 decoder.
-    Vp9,
-    /// AV1 through the libdav1d wrapper.
-    Av1,
+/// libavcodec id behind `codec`; `None` for undecodable families.
+///
+/// # Arguments
+///
+/// * `codec` - codec family; MPEG-2, VC-1, and AV2 have no ffmpeg decoder here.
+pub(crate) fn codec_id(codec: Codec) -> Option<c_int> {
+    match codec {
+        Codec::H264 => Some(sys::CODEC_ID_H264),
+        Codec::H265 => Some(sys::CODEC_ID_HEVC),
+        Codec::Vp8 => Some(sys::CODEC_ID_VP8),
+        Codec::Vp9 => Some(sys::CODEC_ID_VP9),
+        Codec::Av1 => Some(sys::CODEC_ID_AV1),
+        Codec::Mpeg2 | Codec::Vc1 | Codec::Av2 => None,
+    }
 }
 
-impl Codec {
-    /// libavcodec id selected by `find_decoder`, unless named below.
-    fn id(self) -> c_int {
-        match self {
-            Self::H264 => sys::CODEC_ID_H264,
-            Self::H265 => sys::CODEC_ID_HEVC,
-            Self::Vp8 => sys::CODEC_ID_VP8,
-            Self::Vp9 => sys::CODEC_ID_VP9,
-            Self::Av1 => sys::CODEC_ID_AV1,
-        }
+/// Decoder name for `find_decoder_by_name`, when id lookup is wrong.
+///
+/// Callers check [`codec_id`] first; undecodable families never arrive here.
+///
+/// # Arguments
+///
+/// * `codec` - codec family.
+pub(crate) fn decoder_name(codec: Codec) -> Option<&'static std::ffi::CStr> {
+    match codec {
+        // By name, not by id: id lookup returns whichever AV1 decoder
+        // registered first, and the true native `av1` is hardware-only.
+        Codec::Av1 => Some(c"libdav1d"),
+        _ => None,
     }
+}
 
-    /// Decoder name for `find_decoder_by_name`, when id lookup is wrong.
-    fn decoder_name(self) -> Option<&'static std::ffi::CStr> {
-        match self {
-            // By name, not by id: id lookup returns whichever AV1 decoder
-            // registered first, and the true native `av1` is hardware-only.
-            Self::Av1 => Some(c"libdav1d"),
-            Self::H264 | Self::H265 | Self::Vp8 | Self::Vp9 => None,
-        }
-    }
-
-    /// Packets already hold whole frames, so no parser runs.
-    fn framed(self) -> bool {
-        match self {
-            Self::H264 | Self::H265 => false,
-            Self::Vp8 | Self::Vp9 | Self::Av1 => true,
-        }
+/// True when packets already hold whole frames, so no parser runs.
+///
+/// `None` for undecodable families.
+///
+/// # Arguments
+///
+/// * `codec` - codec family; MPEG-2, VC-1, and AV2 have no ffmpeg decoder here.
+pub(crate) fn framed(codec: Codec) -> Option<bool> {
+    match codec {
+        Codec::H264 | Codec::H265 => Some(false),
+        Codec::Vp8 | Codec::Vp9 | Codec::Av1 => Some(true),
+        Codec::Mpeg2 | Codec::Vc1 | Codec::Av2 => None,
     }
 }
 
@@ -141,22 +143,26 @@ impl FfmpegDecoder {
 
     /// Decoder for `codec` with `threads` worker threads; zero uses every CPU.
     ///
+    /// MPEG-2, VC-1, and AV2 decline: no ffmpeg decoder ships for them here.
+    ///
     /// # Errors
     ///
-    /// Returns `Err` when the system library drifts from the bound ABI or
-    /// rejects the configuration.
+    /// Returns `Err` when the codec family is undecodable, the system library
+    /// drifts from the bound ABI, or it rejects the configuration.
     pub fn open(codec: Codec, threads: u32) -> Result<Self, SwError> {
+        let id = codec_id(codec).ok_or(SwError::Init)?;
+        let framed = framed(codec).ok_or(SwError::Init)?;
         // SAFETY: version queries take no arguments and touch no state.
         if unsafe { sys::avcodec_version() } >> 16 != sys::ABI_MAJOR
             || unsafe { sys::avutil_version() } >> 16 != sys::UTIL_MAJOR
         {
             return Err(SwError::Init);
         }
-        let codec_ptr = match codec.decoder_name() {
+        let codec_ptr = match decoder_name(codec) {
             // SAFETY: name is a valid C string; null is checked.
             Some(name) => unsafe { sys::avcodec_find_decoder_by_name(name.as_ptr()) },
             // SAFETY: id names a registered decoder; null is checked.
-            None => unsafe { sys::avcodec_find_decoder(codec.id()) },
+            None => unsafe { sys::avcodec_find_decoder(id) },
         };
         if codec_ptr.is_null() {
             return Err(SwError::Init);
@@ -204,16 +210,16 @@ impl FfmpegDecoder {
         }
         // Framed codecs take whole frames per packet; byte streams need the splitter.
         // SAFETY: id names a registered parser; null is checked.
-        let parser = if codec.framed() {
+        let parser = if framed {
             ptr::null_mut()
         } else {
-            unsafe { sys::av_parser_init(codec.id()) }
+            unsafe { sys::av_parser_init(id) }
         };
         // SAFETY: blank frame or null; null is checked.
         let frame = unsafe { sys::av_frame_alloc() };
         // SAFETY: blank packet or null; null is checked.
         let packet = unsafe { sys::av_packet_alloc() };
-        if (!codec.framed() && parser.is_null()) || frame.is_null() || packet.is_null() {
+        if (!framed && parser.is_null()) || frame.is_null() || packet.is_null() {
             // SAFETY: non-null slots are live; null slots are skipped.
             unsafe { Self::release(ctx, parser, frame, packet) };
             return Err(SwError::Init);
@@ -223,7 +229,7 @@ impl FfmpegDecoder {
             parser,
             frame,
             packet,
-            framed: codec.framed(),
+            framed,
             pending: Vec::new(),
         })
     }
@@ -1175,8 +1181,19 @@ mod tests {
         copy_rows, Av1Decoder, Codec, FfmpegDecoder, H264Decoder, H265Decoder, Vp8Decoder,
         Vp9Decoder,
     };
+    use crate::error::SwError;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn undecodable_families_decline() {
+        for codec in [Codec::Mpeg2, Codec::Vc1, Codec::Av2] {
+            assert!(
+                matches!(FfmpegDecoder::open(codec, 1), Err(SwError::Init)),
+                "{codec:?} declines"
+            );
+        }
+    }
 
     #[test]
     fn decoders_move_between_threads() {
@@ -1204,7 +1221,7 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(decoder.caps(), GpuCaps::new(None, false, false));
         for frame in &frames {
-            assert!(!frame.planes().is_empty());
+            assert_ne!(frame.planes().len(), 0);
         }
     }
 
@@ -1320,6 +1337,7 @@ mod tests {
     #[cfg(feature = "h264-openh264")]
     #[test]
     fn own_encoder_output_decodes_back() {
+        use rust_video_caps::encode::EncodeConfig;
         use rust_video_caps::frame::PixelFormat;
         use rust_video_caps::traits::Encoder as _;
 
@@ -1327,7 +1345,7 @@ mod tests {
         use crate::h264::H264Encoder;
 
         let frame = frame_64();
-        let mut encoder = H264Encoder::open(64, 64, 500_000, 1).expect("encoder");
+        let mut encoder = H264Encoder::open(64, 64, EncodeConfig::default(), 1).expect("encoder");
         let first = encoder.encode(&frame).expect("encode");
         let second = encoder.encode(&frame).expect("encode");
         let mut decoder = H264Decoder::open(1).expect("decoder");

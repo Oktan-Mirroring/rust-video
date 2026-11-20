@@ -4,180 +4,237 @@
 //! Enabling links the GPL path (x265 GPL-2+ flips the ffmpeg build GPL); see <https://ffmpeg.org/legal.html>.
 // Unsafe is the option-setting FFI below: live context, valid C strings.
 
+use std::ffi::CString;
+
+use crate::config::{check_color_default, check_common, time_base, FfmpegRate};
+use crate::error::SwError;
+use crate::ffmpeg_enc::{set_rate, FfmpegEncoder};
+use crate::ffmpeg_sys as sys;
+
+use rust_video_caps::encode::{
+    Codec, Decline, EncodeConfig, Level as ConfigLevel, Profile, RateControl, SpeedPreset,
+};
 use rust_video_caps::frame::CpuFrame;
+use rust_video_caps::h265::EncodeProfile as H265Profile;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Encoder;
 use rust_video_caps::transcode::GpuCaps;
 
-use crate::error::SwError;
-use crate::ffmpeg_enc::FfmpegEncoder;
-use crate::ffmpeg_sys as sys;
-
-/// Speed preset for the x265 wrapper.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum H265Preset {
-    /// Fastest tune.
-    Ultrafast,
-    /// Slower tune.
-    Superfast,
-    /// Slowest shipped tune.
-    Veryfast,
-}
-
-impl H265Preset {
-    /// Wrapper `preset` string.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Ultrafast => "ultrafast",
-            Self::Superfast => "superfast",
-            Self::Veryfast => "veryfast",
-        }
-    }
-}
-
 /// HEVC encoder over `libx265`; throughput unmeasured.
 pub struct H265Encoder {
+    /// Shared ffmpeg encode session.
     inner: FfmpegEncoder,
 }
 
-impl H265Encoder {
-    /// CBR encoder for `width`x`height` at `bitrate_kbps` on `threads`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the system library drifts from the bound ABI or
-    /// rejects the configuration.
-    pub fn open(width: u32, height: u32, bitrate_kbps: u32, threads: u32) -> Result<Self, SwError> {
-        Self::open_with_preset(
-            width,
-            height,
-            bitrate_kbps,
-            threads,
-            H265Preset::Ultrafast,
-            60,
-        )
-    }
+/// Resolved libx265 options behind one open.
+struct X265Params {
+    /// Coded width in luma samples.
+    width: u32,
+    /// Coded height in luma samples.
+    height: u32,
+    /// Resolved rate options.
+    rate: FfmpegRate,
+    /// Maximum keyframe interval in frames.
+    keyint: u32,
+    /// Minimum keyframe interval in frames.
+    min_keyint: u32,
+    /// Wrapper preset name.
+    preset: &'static str,
+    /// Wrapper profile name.
+    profile: &'static str,
+    /// Coded `time_base` value.
+    time_base: CString,
+    /// Worker threads.
+    threads: u32,
+}
 
-    /// CBR encoder with `preset` and a `keyint_frames` keyframe interval.
+impl H265Encoder {
+    /// Maximum constant-QP the wrapper accepts.
+    const MAX_QP: u8 = 51;
+    /// Maximum constant rate factor the wrapper accepts.
+    const MAX_CRF: u8 = 51;
+
+    /// Encoder for `width`x`height` under `config` on `threads`.
+    ///
+    /// Maps the shared config onto the libx265 wrapper: rate control selects
+    /// bitrate, QP, or CRF options, `gop` sets the keyframe interval plus
+    /// x265 keyint bounds, preset selects the wrapper preset, profile pins
+    /// the wrapper restriction, frame rate sets the time base. Pinned levels
+    /// decline: the wrapper exposes no level option, so the tier auto-selects.
+    /// Color stays default: the tier signals none. B-frames, extra
+    /// references, and 10-bit profiles decline typed.
+    ///
+    /// # Arguments
+    ///
+    /// * `width` - coded width in luma samples; nonzero.
+    /// * `height` - coded height in luma samples; nonzero.
+    /// * `config` - shared encode configuration.
+    /// * `threads` - worker threads; zero resolves inside ffmpeg.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the system library drifts from the bound ABI or
-    /// rejects the configuration.
-    pub fn open_with_preset(
+    /// Returns `Err` on structural or tier [`Decline`]s, when the system
+    /// library drifts from the bound ABI, or when it rejects the options.
+    pub fn open(
         width: u32,
         height: u32,
-        bitrate_kbps: u32,
+        config: EncodeConfig,
         threads: u32,
-        preset: H265Preset,
-        keyint_frames: u32,
     ) -> Result<Self, SwError> {
-        if keyint_frames == 0 {
-            return Err(SwError::Init);
-        }
+        check_common(Codec::H265, &config)?;
+        check_color_default(&config.color)?;
+        Self::check_level(config.level)?;
+        let rate = Self::map_rate(config.rate_control)?;
+        let params = X265Params {
+            width,
+            height,
+            rate,
+            keyint: config.gop.keyint,
+            min_keyint: config.gop.min_keyint,
+            preset: Self::map_preset(config.quality.preset),
+            profile: Self::map_profile(config.profile)?,
+            time_base: time_base(config.frame_rate).ok_or(SwError::Init)?,
+            threads,
+        };
         FfmpegEncoder::open(
             c"libx265",
             width,
             height,
-            bitrate_kbps,
-            move |ctx, bitrate| {
-                Self::configure(ctx, width, height, bitrate, threads, preset, keyint_frames)
-            },
+            rate.bitrate_bps(),
+            move |ctx, _bitrate| Self::configure(ctx, &params),
         )
         .map(|inner| Self { inner })
     }
 
+    /// Resolved rate options behind `mode`.
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - requested rate control.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on QP or CRF above the wrapper range.
+    fn map_rate(mode: RateControl) -> Result<FfmpegRate, SwError> {
+        match mode {
+            RateControl::Auto => Ok(FfmpegRate::auto()),
+            RateControl::Cbr {
+                bitrate,
+                maxrate,
+                bufsize,
+            } => Ok(FfmpegRate::cbr(bitrate, maxrate, bufsize)),
+            RateControl::Vbr { bitrate, maxrate } => Ok(FfmpegRate::vbr(bitrate, maxrate)),
+            RateControl::Cqp { qp } => {
+                if qp > Self::MAX_QP {
+                    return Err(Decline::RateControlUnsupported { mode }.into());
+                }
+                Ok(FfmpegRate::Qp { qp })
+            }
+            RateControl::Crf { value } => {
+                if value > Self::MAX_CRF {
+                    return Err(Decline::RateControlUnsupported { mode }.into());
+                }
+                Ok(FfmpegRate::Crf { value })
+            }
+        }
+    }
+
+    /// Wrapper preset name behind `preset`.
+    ///
+    /// # Arguments
+    ///
+    /// * `preset` - requested speed preset.
+    fn map_preset(preset: SpeedPreset) -> &'static str {
+        match preset {
+            SpeedPreset::Realtime => "ultrafast",
+            SpeedPreset::Balanced => "superfast",
+            SpeedPreset::Quality => "veryfast",
+        }
+    }
+
+    /// Wrapper profile name behind `profile`; 10-bit profiles decline.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile` - requested encode profile; H.265 Main only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the profile names another codec or needs 10-bit.
+    fn map_profile(profile: Profile) -> Result<&'static str, SwError> {
+        match profile {
+            Profile::H265(H265Profile::Main) => Ok("main"),
+            _ => Err(Decline::ProfileUnsupported { profile }.into()),
+        }
+    }
+
+    /// Rejection unless `level` leaves selection to the backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - requested encode level; auto only.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on pinned levels or levels naming another codec.
+    fn check_level(level: ConfigLevel) -> Result<(), SwError> {
+        match level {
+            ConfigLevel::H265(rust_video_caps::h265::EncodeLevel::Auto) => Ok(()),
+            _ => Err(Decline::LevelUnsupported { level }.into()),
+        }
+    }
+
     /// Context options matching the `zerolatency` tune; false on first refusal.
-    fn configure(
-        ctx: *mut sys::AVCodecContext,
-        width: u32,
-        height: u32,
-        bitrate: i64,
-        threads: u32,
-        preset: H265Preset,
-        keyint_frames: u32,
-    ) -> bool {
-        let Ok(size) = std::ffi::CString::new(format!("{width}x{height}")) else {
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - live encoder context.
+    /// * `params` - resolved options.
+    fn configure(ctx: *mut sys::AVCodecContext, params: &X265Params) -> bool {
+        let Ok(size) = CString::new(format!("{}x{}", params.width, params.height)) else {
             return false;
         };
-        let Ok(x265_params) = std::ffi::CString::new(format!(
-            "keyint={keyint_frames}:min-keyint={keyint_frames}:repeat-headers=1:log-level=error"
+        let Ok(x265_params) = CString::new(format!(
+            "keyint={}:min-keyint={}:repeat-headers=1:log-level=error",
+            params.keyint, params.min_keyint
         )) else {
             return false;
         };
-        let Ok(preset) = std::ffi::CString::new(preset.as_str()) else {
+        let Ok(preset) = CString::new(params.preset) else {
             return false;
+        };
+        let Ok(profile) = CString::new(params.profile) else {
+            return false;
+        };
+        let crf = match params.rate {
+            FfmpegRate::Crf { value } => match CString::new(format!("{value}")) {
+                Ok(text) => Some(text),
+                Err(_) => return false,
+            },
+            _ => None,
         };
         // SAFETY: context is live; option names are valid C strings.
         unsafe {
-            sys::av_opt_set(
-                ctx.cast::<std::ffi::c_void>(),
-                c"video_size".as_ptr(),
-                size.as_ptr(),
-                0,
-            ) == 0
-                && sys::av_opt_set(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"pixel_format".as_ptr(),
-                    c"yuv420p".as_ptr(),
-                    0,
-                ) == 0
-                && sys::av_opt_set(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"time_base".as_ptr(),
-                    c"1/60".as_ptr(),
-                    0,
-                ) == 0
-                && sys::av_opt_set_int(ctx.cast::<std::ffi::c_void>(), c"b".as_ptr(), bitrate, 0)
-                    == 0
-                && sys::av_opt_set_int(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"maxrate".as_ptr(),
-                    bitrate,
-                    0,
-                ) == 0
-                && sys::av_opt_set_int(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"minrate".as_ptr(),
-                    bitrate,
-                    0,
-                ) == 0
-                && sys::av_opt_set_int(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"bufsize".as_ptr(),
-                    bitrate * 2,
-                    0,
-                ) == 0
-                && sys::av_opt_set_int(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"g".as_ptr(),
-                    i64::from(keyint_frames),
-                    0,
-                ) == 0
-                && sys::av_opt_set_int(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"threads".as_ptr(),
-                    i64::from(threads),
-                    0,
-                ) == 0
-                && sys::av_opt_set(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"preset".as_ptr(),
-                    preset.as_ptr(),
+            sys::opt_str(ctx, c"video_size", size.as_c_str(), 0)
+                && sys::opt_str(ctx, c"pixel_format", c"yuv420p", 0)
+                && sys::opt_str(ctx, c"time_base", params.time_base.as_c_str(), 0)
+                && set_rate(ctx, &params.rate, crf.as_deref())
+                && sys::opt_int(ctx, c"g", i64::from(params.keyint), 0)
+                && sys::opt_int(ctx, c"threads", i64::from(params.threads), 0)
+                && sys::opt_str(ctx, c"preset", preset.as_c_str(), sys::OPT_SEARCH_CHILDREN)
+                && sys::opt_str(ctx, c"tune", c"zerolatency", sys::OPT_SEARCH_CHILDREN)
+                && sys::opt_str(
+                    ctx,
+                    c"x265-params",
+                    x265_params.as_c_str(),
                     sys::OPT_SEARCH_CHILDREN,
-                ) == 0
-                && sys::av_opt_set(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"tune".as_ptr(),
-                    c"zerolatency".as_ptr(),
+                )
+                && sys::opt_str(
+                    ctx,
+                    c"profile",
+                    profile.as_c_str(),
                     sys::OPT_SEARCH_CHILDREN,
-                ) == 0
-                && sys::av_opt_set(
-                    ctx.cast::<std::ffi::c_void>(),
-                    c"x265-params".as_ptr(),
-                    x265_params.as_ptr(),
-                    sys::OPT_SEARCH_CHILDREN,
-                ) == 0
+                )
         }
     }
 }
@@ -200,27 +257,58 @@ impl Encoder for H265Encoder {
 
 #[cfg(test)]
 mod tests {
+    use rust_video_caps::color::{ColorPrimaries, ContentLight};
+    use rust_video_caps::common::ChromaSampling;
+    use rust_video_caps::encode::{
+        Decline, EncodeConfig, FrameRate, Gop, Level, Profile, Quality, RateControl, SpeedPreset,
+    };
     use rust_video_caps::frame::PixelFormat;
+    use rust_video_caps::h265::{EncodeLevel, EncodeProfile};
     use rust_video_caps::traits::Encoder;
 
-    use super::{H265Encoder, H265Preset};
-    use crate::fixtures::{frame_16, frame_64, frame_with_y};
+    use super::H265Encoder;
+    use crate::error::SwError;
+    use crate::fixtures::{frame_16, frame_64, frame_noise_64, frame_with_y};
+
+    /// H.265 config with a CBR target of `bps` at 60 fps and a 60-frame GOP.
+    fn cbr(bps: u32) -> EncodeConfig {
+        EncodeConfig {
+            rate_control: RateControl::Cbr {
+                bitrate: bps,
+                maxrate: bps,
+                bufsize: bps,
+            },
+            frame_rate: FrameRate { num: 60, den: 1 },
+            profile: Profile::H265(EncodeProfile::Main),
+            level: Level::H265(EncodeLevel::Auto),
+            ..Default::default()
+        }
+    }
+
+    /// Default config retargeted at H.265 Main auto.
+    fn hevc() -> EncodeConfig {
+        EncodeConfig {
+            profile: Profile::H265(EncodeProfile::Main),
+            level: Level::H265(EncodeLevel::Auto),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn encode_rejects_short_plane() {
-        let mut encoder = H265Encoder::open(64, 64, 500, 1).expect("encoder");
+        let mut encoder = H265Encoder::open(64, 64, hevc(), 1).expect("encoder");
         assert!(encoder.encode(&frame_with_y(64 * 63)).is_err());
     }
 
     #[test]
     fn encode_rejects_oversized_plane() {
-        let mut encoder = H265Encoder::open(64, 64, 500, 1).expect("encoder");
+        let mut encoder = H265Encoder::open(64, 64, hevc(), 1).expect("encoder");
         assert!(encoder.encode(&frame_with_y(64 * 65)).is_err());
     }
 
     #[test]
     fn encode_marks_first_packet_keyframe() {
-        let mut encoder = H265Encoder::open(64, 64, 500, 1).expect("encoder");
+        let mut encoder = H265Encoder::open(64, 64, hevc(), 1).expect("encoder");
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
         packets.extend(encoder.flush().expect("flush"));
@@ -229,14 +317,17 @@ mod tests {
     }
 
     #[test]
-    fn preset_open_encodes_keyframe() {
+    fn preset_configs_encode_keyframe() {
         for preset in [
-            H265Preset::Ultrafast,
-            H265Preset::Superfast,
-            H265Preset::Veryfast,
+            SpeedPreset::Realtime,
+            SpeedPreset::Balanced,
+            SpeedPreset::Quality,
         ] {
-            let mut encoder =
-                H265Encoder::open_with_preset(64, 64, 500, 1, preset, 60).expect("encoder");
+            let config = EncodeConfig {
+                quality: Quality { preset },
+                ..hevc()
+            };
+            let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder");
             let mut packets = encoder.encode(&frame_64()).expect("encode");
             packets.extend(encoder.flush().expect("flush"));
             assert!(!packets.is_empty(), "{preset:?}");
@@ -250,7 +341,7 @@ mod tests {
 
         use crate::ffmpeg::H265Decoder;
 
-        let mut encoder = H265Encoder::open(64, 64, 500, 2).expect("encoder");
+        let mut encoder = H265Encoder::open(64, 64, hevc(), 2).expect("encoder");
         let mut decoder = H265Decoder::open(2).expect("decoder");
         let mut packets = encoder.encode(&frame_64()).expect("encode");
         packets.extend(encoder.encode(&frame_64()).expect("encode"));
@@ -271,24 +362,301 @@ mod tests {
     }
 
     #[test]
+    fn bitrate_changes_output() {
+        let mut low = H265Encoder::open(64, 64, cbr(500_000), 1).expect("encoder");
+        let mut high = H265Encoder::open(64, 64, cbr(2_000_000), 1).expect("encoder");
+        let frame = frame_noise_64(7);
+        let mut low_packets = low.encode(&frame).expect("encode");
+        low_packets.extend(low.flush().expect("flush"));
+        let mut high_packets = high.encode(&frame).expect("encode");
+        high_packets.extend(high.flush().expect("flush"));
+        let low_bytes: Vec<u8> = low_packets.iter().flat_map(|p| p.data().to_vec()).collect();
+        let high_bytes: Vec<u8> = high_packets
+            .iter()
+            .flat_map(|p| p.data().to_vec())
+            .collect();
+        assert_ne!(low_bytes, high_bytes);
+    }
+
+    #[test]
+    fn preset_changes_output() {
+        let mut fast = H265Encoder::open(64, 64, hevc(), 1).expect("encoder");
+        let slow_config = EncodeConfig {
+            quality: Quality {
+                preset: SpeedPreset::Quality,
+            },
+            ..hevc()
+        };
+        let mut slow = H265Encoder::open(64, 64, slow_config, 1).expect("encoder");
+        let frame = frame_noise_64(11);
+        let mut fast_packets = fast.encode(&frame).expect("encode");
+        fast_packets.extend(fast.flush().expect("flush"));
+        let mut slow_packets = slow.encode(&frame).expect("encode");
+        slow_packets.extend(slow.flush().expect("flush"));
+        let fast_bytes: Vec<u8> = fast_packets
+            .iter()
+            .flat_map(|p| p.data().to_vec())
+            .collect();
+        let slow_bytes: Vec<u8> = slow_packets
+            .iter()
+            .flat_map(|p| p.data().to_vec())
+            .collect();
+        assert_ne!(fast_bytes, slow_bytes);
+    }
+
+    #[test]
+    fn cqp_encodes_keyframe() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Cqp { qp: 23 },
+            ..hevc()
+        };
+        let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder");
+        let mut packets = encoder.encode(&frame_64()).expect("encode");
+        packets.extend(encoder.flush().expect("flush"));
+        assert!(packets[0].is_keyframe());
+    }
+
+    #[test]
+    fn crf_encodes_keyframe() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Crf { value: 23 },
+            ..hevc()
+        };
+        let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder");
+        let mut packets = encoder.encode(&frame_64()).expect("encode");
+        packets.extend(encoder.flush().expect("flush"));
+        assert!(packets[0].is_keyframe());
+    }
+
+    #[test]
+    fn vbr_encodes_keyframe() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Vbr {
+                bitrate: 500_000,
+                maxrate: 1_000_000,
+            },
+            ..hevc()
+        };
+        let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder");
+        let packets = encoder.encode(&frame_64()).expect("encode");
+        assert_ne!(packets.len(), 0);
+    }
+
+    #[test]
+    fn auto_encodes_keyframe() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Auto,
+            ..hevc()
+        };
+        let mut encoder = H265Encoder::open(64, 64, config, 1).expect("encoder");
+        let packets = encoder.encode(&frame_64()).expect("encode");
+        assert_ne!(packets.len(), 0);
+    }
+
+    #[test]
+    fn foreign_codec_profile_declines() {
+        assert!(matches!(
+            H265Encoder::open(64, 64, EncodeConfig::default(), 1),
+            Err(SwError::Declined {
+                decline: Decline::ProfileUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn main10_profile_declines() {
+        let config = EncodeConfig {
+            profile: Profile::H265(EncodeProfile::Main10),
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::ProfileUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn pinned_level_declines() {
+        let config = EncodeConfig {
+            level: Level::H265(EncodeLevel::Pinned(rust_video_caps::h265::Level::L41)),
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::LevelUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn ten_bit_depth_declines() {
+        let config = EncodeConfig {
+            profile: Profile::H265(EncodeProfile::Main10),
+            bit_depth: 10,
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::BitDepthUnsupported { actual: 10, max: 8 },
+            })
+        ));
+    }
+
+    #[test]
+    fn non_420_chroma_declines() {
+        let config = EncodeConfig {
+            chroma: ChromaSampling::Yuv444,
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::ChromaUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn b_frames_decline() {
+        let config = EncodeConfig {
+            gop: Gop {
+                b_frames: 2,
+                ..Default::default()
+            },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::BFramesUnsupported { actual: 2, max: 0 },
+            })
+        ));
+    }
+
+    #[test]
+    fn extra_refs_decline() {
+        let config = EncodeConfig {
+            gop: Gop {
+                refs: 3,
+                ..Default::default()
+            },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::RefsUnsupported { actual: 3, max: 1 },
+            })
+        ));
+    }
+
+    #[test]
+    fn wild_qp_declines() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Cqp { qp: 60 },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::RateControlUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn wild_crf_declines() {
+        let config = EncodeConfig {
+            rate_control: RateControl::Crf { value: 60 },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::RateControlUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn unsignaled_color_declines() {
+        let mut color = hevc().color;
+        color.primaries = ColorPrimaries::Smpte170M;
+        let config = EncodeConfig { color, ..hevc() };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::PrimariesUnsupported { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn hdr_color_declines() {
+        let mut color = hevc().color;
+        color.light = Some(ContentLight {
+            max_cll: 1000,
+            max_fall: 400,
+        });
+        let config = EncodeConfig { color, ..hevc() };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::HdrUnsupported,
+            })
+        ));
+    }
+
+    #[test]
     fn encode_rejects_size_mismatch() {
-        let mut encoder = H265Encoder::open(64, 64, 500, 1).expect("encoder");
+        let mut encoder = H265Encoder::open(64, 64, hevc(), 1).expect("encoder");
         assert!(encoder.encode(&frame_16()).is_err());
     }
 
     #[test]
     fn encode_rejects_zero_geometry() {
-        assert!(H265Encoder::open(0, 64, 500, 1).is_err());
-        assert!(H265Encoder::open(64, 0, 500, 1).is_err());
+        assert!(H265Encoder::open(0, 64, hevc(), 1).is_err());
+        assert!(H265Encoder::open(64, 0, hevc(), 1).is_err());
     }
 
     #[test]
     fn encode_rejects_zero_bitrate() {
-        assert!(H265Encoder::open(64, 64, 0, 1).is_err());
+        let config = EncodeConfig {
+            rate_control: RateControl::Cbr {
+                bitrate: 0,
+                maxrate: 5_000_000,
+                bufsize: 5_000_000,
+            },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::RateControlInvalid { .. },
+            })
+        ));
     }
 
     #[test]
     fn encode_rejects_zero_keyint() {
-        assert!(H265Encoder::open_with_preset(64, 64, 500, 1, H265Preset::Ultrafast, 0).is_err());
+        let config = EncodeConfig {
+            gop: Gop {
+                keyint: 0,
+                min_keyint: 60,
+                b_frames: 0,
+                refs: 1,
+            },
+            ..hevc()
+        };
+        assert!(matches!(
+            H265Encoder::open(64, 64, config, 1),
+            Err(SwError::Declined {
+                decline: Decline::GopInvalid { .. },
+            })
+        ));
     }
 }

@@ -15,6 +15,8 @@ use openh264::decoder::{DecodeOptions, Decoder as OpenH264Decoder, DecoderConfig
 use openh264::formats::YUVSource;
 #[cfg(all(feature = "h264-openh264", nasm_available))]
 use rust_video_caps::common::PictureSize;
+#[cfg(all(feature = "h264-openh264", nasm_available))]
+use rust_video_caps::encode::{EncodeConfig, FrameRate, RateControl};
 #[cfg(any(feature = "ffmpeg", all(feature = "h264-openh264", nasm_available)))]
 use rust_video_caps::frame::CpuFrame;
 #[cfg(all(feature = "h264-openh264", nasm_available))]
@@ -293,7 +295,16 @@ fn yuv420p_from_noise(seed: u64) -> CpuFrame {
 #[cfg(all(feature = "h264-openh264", nasm_available))]
 #[test]
 fn multislice_output_decodes_to_full_size() {
-    let mut encoder = H264Encoder::open(1920, 1080, 5_000_000, 4).expect("open");
+    let config = EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 5_000_000,
+            maxrate: 5_000_000,
+            bufsize: 5_000_000,
+        },
+        frame_rate: FrameRate { num: 60, den: 1 },
+        ..Default::default()
+    };
+    let mut encoder = H264Encoder::open(1920, 1080, config, 4).expect("open");
     let api = openh264::OpenH264API::from_source();
     let config = DecoderConfig::new().flush_after_decode(Flush::NoFlush);
     let mut decoder = OpenH264Decoder::with_api_config(api, config).expect("decoder");

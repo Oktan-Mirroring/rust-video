@@ -6,20 +6,20 @@
 
 use std::time::{Duration, Instant};
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames};
+use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SplitDecode};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_harness::{bench_dir, Drive, H264Synth, Ivf, Packets, Parity};
 use rust_video_sw::{
-    H264Decoder, PhaseStats, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource,
-    SplitDecoder, SwError, Vp9Decoder,
+    H264Decoder, PhaseStats, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource, SwError,
+    Vp9Decoder,
 };
 
 /// Ready frames moved into `frames`, waiting for one when empty.
 fn drain<D>(pump: &mut PipelinedPump<D>, frames: &mut Vec<CpuFrame>)
 where
-    D: SplitDecoder<Frame = CpuFrame>,
+    D: SplitDecode<Frame = CpuFrame>,
     D::Error: std::fmt::Debug,
 {
     let mut moved = false;
@@ -50,7 +50,11 @@ where
     let (mut frames, _) = Drive::send_all(&mut pump, packets, drain);
     frames.extend(Drive::finish_all(&mut pump));
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    let stats = pump.stats();
+    assert_eq!(
+        pump.stats().submitted(),
+        u64::try_from(packets.len()).expect("packet count fits")
+    );
+    let stats = pump.decoder().phase_stats();
     (frames, stats)
 }
 

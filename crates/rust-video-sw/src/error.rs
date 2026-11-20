@@ -3,6 +3,8 @@
 use std::fmt;
 
 #[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+use rust_video_caps::encode::Decline;
+#[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 
 /// Software backend failure.
@@ -20,6 +22,19 @@ pub enum SwError {
         /// Native backend status code.
         code: i64,
     },
+    /// Valid config the backend cannot satisfy.
+    #[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+    Declined {
+        /// Typed decline reason.
+        decline: Decline,
+    },
+}
+
+#[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+impl From<Decline> for SwError {
+    fn from(decline: Decline) -> Self {
+        Self::Declined { decline }
+    }
 }
 
 impl SwError {
@@ -67,6 +82,8 @@ impl fmt::Display for SwError {
             Self::Rejected => write!(f, "backend rejected input"),
             Self::BadFrame => write!(f, "backend returned unusable frame"),
             Self::Native { code } => write!(f, "backend call failed: {code}"),
+            #[cfg(any(feature = "ffmpeg", feature = "gpl", feature = "h264-openh264"))]
+            Self::Declined { decline } => write!(f, "backend declined config: {decline}"),
         }
     }
 }

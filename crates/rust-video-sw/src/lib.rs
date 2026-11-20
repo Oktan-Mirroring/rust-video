@@ -5,6 +5,8 @@
 
 #[cfg(feature = "ffmpeg")]
 pub mod av1;
+#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
+mod config;
 pub mod error;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
@@ -20,8 +22,6 @@ pub mod h264;
 pub mod h265;
 #[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
 pub mod overlap;
-#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
-pub mod surface;
 #[cfg(feature = "ffmpeg")]
 pub mod vpx;
 #[cfg(feature = "gpl")]
@@ -38,15 +38,12 @@ pub use ffmpeg::{
 #[cfg(feature = "h264-openh264")]
 pub use h264::H264Encoder;
 #[cfg(feature = "gpl")]
-pub use h265::{H265Encoder, H265Preset};
+pub use h265::H265Encoder;
 #[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
 pub use overlap::{
     EnginePoll, PhaseSpan, PhaseStats, PipelineConfig, PipelinedDecoder, PipelinedPump, RawSource,
-    SplitDecoder,
 };
-#[cfg(any(feature = "ffmpeg", feature = "h264-openh264"))]
-pub use surface::SwSurface;
 #[cfg(feature = "ffmpeg")]
 pub use vpx::{Vp8Encoder, Vp9Encoder};
 #[cfg(feature = "gpl")]
-pub use x264::{X264Encoder, X264Preset};
+pub use x264::X264Encoder;
