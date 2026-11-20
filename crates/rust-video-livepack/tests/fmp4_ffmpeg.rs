@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rust_video_livepack::{
-    AccessUnit, AnnexB, Av1Config, AvcConfig, Codec, FragmentMux, HevcConfig, TrackConfig, TsDemux,
-    TsMux, TsMuxConfig,
+    AccessUnit, Av1Config, AvcConfig, Codec, FragmentMux, HevcConfig, NaluIter, TrackConfig,
+    TsDemux, TsMux, TsMuxConfig,
 };
 
 /// True when `RUST_VIDEO_ALLOW_SKIP=1` permits skipping.
@@ -167,14 +167,14 @@ fn probe_frame_count(path: &Path) -> usize {
 /// NALUs of an annex-B file.
 fn annexb_nalus(path: &Path) -> Vec<Vec<u8>> {
     let bytes = std::fs::read(path).expect("annexb");
-    AnnexB::new(&bytes).map(<[u8]>::to_vec).collect()
+    NaluIter::new(&bytes).map(<[u8]>::to_vec).collect()
 }
 
 /// NALUs of demuxed units in order.
 fn units_nalus(units: &[AccessUnit]) -> Vec<Vec<u8>> {
     units
         .iter()
-        .flat_map(|u| AnnexB::new(u.payload()).map(<[u8]>::to_vec))
+        .flat_map(|u| NaluIter::new(u.payload()).map(<[u8]>::to_vec))
         .collect()
 }
 
@@ -223,7 +223,7 @@ fn h264_sets(units: &[AccessUnit]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let key = units.iter().find(|u| u.is_keyframe()).expect("keyframe");
     let mut sps = Vec::new();
     let mut pps = Vec::new();
-    for nalu in AnnexB::new(key.payload()) {
+    for nalu in NaluIter::new(key.payload()) {
         match nalu.first().map(|b| b & 0x1F) {
             Some(7) => sps.push(nalu.to_vec()),
             Some(8) => pps.push(nalu.to_vec()),

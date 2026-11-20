@@ -6,7 +6,8 @@
 use std::fmt;
 
 use crate::codec::{
-    AccessUnit, AnnexB, AvcSpsInfo, Codec, KeyframeGate, KeyframeState, PacketAction,
+    AccessUnit, AvcSpsInfo, Codec, CodecPackaging, KeyframeGate, KeyframeState, NaluIter,
+    PacketAction,
 };
 use crate::time::{ClockTracker, Ts90k, STC_WRAP};
 
@@ -604,7 +605,7 @@ impl FragmentMux {
             return Ok(unit.payload().to_vec());
         }
         let mut sample = Vec::with_capacity(unit.payload().len());
-        for nalu in AnnexB::new(unit.payload()) {
+        for nalu in NaluIter::new(unit.payload()) {
             let len = u32::try_from(nalu.len()).unwrap_or(u32::MAX);
             sample.extend_from_slice(&len.to_be_bytes());
             sample.extend_from_slice(nalu);
@@ -847,8 +848,10 @@ impl<'a> ByteSink<'a> {
             Codec::H265 => *b"hvcC",
             Codec::Av1 => *b"av1C",
             Codec::Vp9 | Codec::Vp8 => *b"vpcC",
-            // BLOCKED: no TrackConfig carries Av2; unreachable.
+            // BLOCKED: no TrackConfig carries Av2, MPEG-2, or VC-1; unreachable.
             Codec::Av2 => *b"av02",
+            Codec::Mpeg2 => *b"mp4v",
+            Codec::Vc1 => *b"vc-1",
         };
         let config = self.open(config_tag);
         self.bytes(&track.record_bytes());

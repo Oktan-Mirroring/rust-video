@@ -9,6 +9,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+rust-video-core = { version = "0.1.0", path = "../rust-video-core" }
+
 [features]
 oracle = []
 

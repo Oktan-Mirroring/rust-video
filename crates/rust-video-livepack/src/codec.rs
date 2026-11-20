@@ -5,21 +5,193 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Coded video codec.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Codec {
-    /// ITU-T H.264.
-    H264,
-    /// ITU-T H.265.
-    H265,
-    /// AV1.
-    Av1,
-    /// VP9.
-    Vp9,
-    /// VP8.
-    Vp8,
-    /// AV2 packing stub; every mux path declines it typed.
-    Av2,
+pub use rust_video_core::Codec;
+
+/// Broadcast-packaging hooks for one coded-video codec.
+pub trait CodecPackaging {
+    /// MPEG-TS `stream_type`; `None` has no registered value.
+    ///
+    /// `0x1B`/`0x24`: H.222.0 section 2.4.4.9 table 2-34. AV1/VP9/VP8/AV2
+    /// have none: [FFmpeg master `mpegts.h`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mpegts.h)
+    /// carries no video type for them (`0xCF` there is HLS AAC audio).
+    /// MPEG-2/VC-1 decline: the mux maps H.264/H.265 only.
+    #[must_use]
+    fn ts_stream_type(self) -> Option<u8>;
+
+    /// ISO BMFF sample entry fourcc.
+    ///
+    /// `Av2` lacks a mux path; decline tests pin this arm. MPEG-2/VC-1
+    /// lack track configs; their fourccs never reach the mux.
+    #[must_use]
+    fn sample_entry(self) -> [u8; 4];
+
+    /// True when `payload` starts a random access point.
+    #[must_use]
+    fn is_keyframe(&self, payload: &[u8]) -> bool;
+}
+
+impl CodecPackaging for Codec {
+    fn ts_stream_type(self) -> Option<u8> {
+        match self {
+            Self::H264 => Some(0x1B),
+            Self::H265 => Some(0x24),
+            Self::Av1 | Self::Vp9 | Self::Vp8 | Self::Av2 | Self::Mpeg2 | Self::Vc1 => None,
+        }
+    }
+
+    fn sample_entry(self) -> [u8; 4] {
+        match self {
+            Self::H264 => *b"avc1",
+            Self::H265 => *b"hvc1",
+            Self::Av1 => *b"av01",
+            Self::Vp9 => *b"vp09",
+            Self::Vp8 => *b"vp08",
+            Self::Av2 => *b"av02",
+            Self::Mpeg2 => *b"mp4v",
+            Self::Vc1 => *b"vc-1",
+        }
+    }
+
+    fn is_keyframe(&self, payload: &[u8]) -> bool {
+        match *self {
+            Self::H264 => first_vcl_header(payload, |b| matches!(b & 0x1F, 1..=5))
+                .is_some_and(|b| b & 0x1F == 5),
+            Self::H265 => first_vcl_header(payload, |b| (b >> 1) & 0x3F <= 23)
+                .is_some_and(|b| matches!((b >> 1) & 0x3F, 16..=23)),
+            Self::Av1 => av1_frame_is_key(payload),
+            Self::Vp9 => vp9_frame_is_key(payload),
+            Self::Vp8 => vp8_frame_is_key(payload),
+            Self::Av2 | Self::Mpeg2 | Self::Vc1 => false,
+        }
+    }
+}
+
+/// Header byte of the first non-empty NALU passing `is_vcl`.
+///
+/// Peeks the byte after each start code and stops at the first
+/// VCL header; NALU bodies stay unscanned. A peeked zero falls
+/// back to the next-code scan: it may open the following code.
+fn first_vcl_header(payload: &[u8], is_vcl: fn(u8) -> bool) -> Option<u8> {
+    let mut at = 0;
+    while at < payload.len() {
+        let (_, content) = NaluIter::start_code(&payload[at..])?;
+        let content = at + content;
+        if content >= payload.len() {
+            return None;
+        }
+        let header = payload[content];
+        let genuine = header != 0
+            || NaluIter::start_code(&payload[content..]).is_none_or(|(code, _)| code > 0);
+        if genuine && is_vcl(header) {
+            return Some(header);
+        }
+        at = content;
+    }
+    None
+}
+
+/// True when the first AV1 frame OBU is a key frame.
+///
+/// Reads `show_existing_frame` then `frame_type` at the frame header
+/// start; key iff bits are `0,00`. Streams using
+/// `reduced_still_picture_header` omit the first bit and classify
+/// `false`.
+///
+/// # Usage Notes
+///
+/// Reduced still-picture headers classify `false`; keep them off the
+/// live path.
+fn av1_frame_is_key(payload: &[u8]) -> bool {
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let Some((obu_type, header_len, size)) = obu_header(rest) else {
+            return false;
+        };
+        let body = &rest[header_len..];
+        let end = size.map_or(body.len(), |len| len.min(body.len()));
+        let body = &body[..end];
+        if obu_type == 3 || obu_type == 6 {
+            return av1_header_is_key(body);
+        }
+        if !matches!(obu_type, 1 | 2 | 4 | 5 | 7 | 15) {
+            return false;
+        }
+        if size.is_none() {
+            return false;
+        }
+        rest = &rest[header_len + end..];
+    }
+    false
+}
+
+/// OBU header: type, header length, payload length when sized.
+fn obu_header(bytes: &[u8]) -> Option<(u8, usize, Option<usize>)> {
+    let header = *bytes.first()?;
+    if header >> 7 != 0 {
+        return None;
+    }
+    let obu_type = (header >> 3) & 0x0F;
+    let mut len = 1;
+    if header & 0x04 != 0 {
+        len += 1;
+        if bytes.len() < 2 {
+            return None;
+        }
+    }
+    if header & 0x02 == 0 {
+        return Some((obu_type, len, None));
+    }
+    let (size, size_len) = leb128(bytes.get(len..)?)?;
+    Some((obu_type, len + size_len, Some(size)))
+}
+
+/// Unsigned LEB128 value and its byte length.
+fn leb128(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut value: usize = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        value |= usize::from(b & 0x7F) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// True when a frame header body opens with `0,00`.
+fn av1_header_is_key(body: &[u8]) -> bool {
+    BitReader::new(body).read_bits(3).is_some_and(|v| v == 0)
+}
+
+/// True when a VP8 frame tag opens a key frame.
+///
+/// Bit 0 of byte 0 is `frame_type`: 0 key, 1 inter; empty payload
+/// carries no tag.
+fn vp8_frame_is_key(payload: &[u8]) -> bool {
+    payload.first().is_some_and(|b| b & 0x01 == 0)
+}
+
+/// True when a VP9 uncompressed header opens a key frame.
+///
+/// Key iff `frame_marker` is `0b10`, `show_existing_frame` is 0,
+/// and `frame_type` is 0. Truncation or marker mismatch reads
+/// `false`.
+fn vp9_frame_is_key(payload: &[u8]) -> bool {
+    let mut reader = BitReader::new(payload);
+    if reader.read_bits(2) != Some(0b10) {
+        return false;
+    }
+    let low = reader.read_bits(1);
+    let high = reader.read_bits(1);
+    let (Some(low), Some(high)) = (low, high) else {
+        return false;
+    };
+    if (high << 1) | low == 3 && reader.read_bits(1).is_none() {
+        return false;
+    }
+    if reader.read_bits(1) != Some(0) {
+        return false;
+    }
+    reader.read_bits(1) == Some(0)
 }
 
 /// One decodable frame: NALUs or OBUs sharing a timestamp.
@@ -65,9 +237,9 @@ pub struct KeyframeGate {
     pending: AtomicBool,
 }
 
-/// Annex-B NALU splitter over one access unit.
+/// Annex-B NALU iterator over one access unit.
 #[derive(Debug)]
-pub struct AnnexB<'a> {
+pub struct NaluIter<'a> {
     /// Remaining unscanned bytes.
     rest: &'a [u8],
 }
@@ -76,7 +248,7 @@ pub struct AnnexB<'a> {
 ///
 /// Field order: ITU-T H.264 section 7.3.2.1.1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AvcSpsInfo {
+pub(crate) struct AvcSpsInfo {
     /// `profile_idc`.
     pub profile: u8,
     /// `constraint_set` flags plus reserved bits.
@@ -98,180 +270,6 @@ struct BitReader<'a> {
     bytes: &'a [u8],
     /// Consumed bit count.
     pos: usize,
-}
-
-impl Codec {
-    /// MPEG-TS `stream_type`; `None` has no registered value.
-    ///
-    /// `0x1B`/`0x24`: H.222.0 section 2.4.4.9 table 2-34. AV1/VP9/VP8/AV2
-    /// have none: [FFmpeg master `mpegts.h`](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/mpegts.h)
-    /// carries no video type for them (`0xCF` there is HLS AAC audio).
-    #[must_use]
-    pub fn ts_stream_type(self) -> Option<u8> {
-        match self {
-            Self::H264 => Some(0x1B),
-            Self::H265 => Some(0x24),
-            Self::Av1 | Self::Vp9 | Self::Vp8 | Self::Av2 => None,
-        }
-    }
-
-    /// ISO BMFF sample entry fourcc.
-    ///
-    /// `Av2` lacks a mux path; decline tests pin this arm.
-    #[must_use]
-    pub fn sample_entry(self) -> [u8; 4] {
-        match self {
-            Self::H264 => *b"avc1",
-            Self::H265 => *b"hvc1",
-            Self::Av1 => *b"av01",
-            Self::Vp9 => *b"vp09",
-            Self::Vp8 => *b"vp08",
-            Self::Av2 => *b"av02",
-        }
-    }
-
-    /// True when `payload` starts a random access point.
-    #[must_use]
-    pub fn is_keyframe(self, payload: &[u8]) -> bool {
-        match self {
-            Self::H264 => Self::first_vcl_header(payload, |b| matches!(b & 0x1F, 1..=5))
-                .is_some_and(|b| b & 0x1F == 5),
-            Self::H265 => Self::first_vcl_header(payload, |b| (b >> 1) & 0x3F <= 23)
-                .is_some_and(|b| matches!((b >> 1) & 0x3F, 16..=23)),
-            Self::Av1 => Self::av1_frame_is_key(payload),
-            Self::Vp9 => Self::vp9_frame_is_key(payload),
-            Self::Vp8 => Self::vp8_frame_is_key(payload),
-            Self::Av2 => false,
-        }
-    }
-
-    /// Header byte of the first non-empty NALU passing `is_vcl`.
-    ///
-    /// Peeks the byte after each start code and stops at the first
-    /// VCL header; NALU bodies stay unscanned. A peeked zero falls
-    /// back to the next-code scan: it may open the following code.
-    fn first_vcl_header(payload: &[u8], is_vcl: fn(u8) -> bool) -> Option<u8> {
-        let mut at = 0;
-        while at < payload.len() {
-            let (_, content) = AnnexB::start_code(&payload[at..])?;
-            let content = at + content;
-            if content >= payload.len() {
-                return None;
-            }
-            let header = payload[content];
-            let genuine = header != 0
-                || AnnexB::start_code(&payload[content..]).is_none_or(|(code, _)| code > 0);
-            if genuine && is_vcl(header) {
-                return Some(header);
-            }
-            at = content;
-        }
-        None
-    }
-
-    /// True when the first AV1 frame OBU is a key frame.
-    ///
-    /// Reads `show_existing_frame` then `frame_type` at the frame header
-    /// start; key iff bits are `0,00`. Streams using
-    /// `reduced_still_picture_header` omit the first bit and classify
-    /// `false`.
-    ///
-    /// # Usage Notes
-    ///
-    /// Reduced still-picture headers classify `false`; keep them off the
-    /// live path.
-    fn av1_frame_is_key(payload: &[u8]) -> bool {
-        let mut rest = payload;
-        while !rest.is_empty() {
-            let Some((obu_type, header_len, size)) = Self::obu_header(rest) else {
-                return false;
-            };
-            let body = &rest[header_len..];
-            let end = size.map_or(body.len(), |len| len.min(body.len()));
-            let body = &body[..end];
-            if obu_type == 3 || obu_type == 6 {
-                return Self::av1_header_is_key(body);
-            }
-            if !matches!(obu_type, 1 | 2 | 4 | 5 | 7 | 15) {
-                return false;
-            }
-            if size.is_none() {
-                return false;
-            }
-            rest = &rest[header_len + end..];
-        }
-        false
-    }
-
-    /// OBU header: type, header length, payload length when sized.
-    fn obu_header(bytes: &[u8]) -> Option<(u8, usize, Option<usize>)> {
-        let header = *bytes.first()?;
-        if header >> 7 != 0 {
-            return None;
-        }
-        let obu_type = (header >> 3) & 0x0F;
-        let mut len = 1;
-        if header & 0x04 != 0 {
-            len += 1;
-            if bytes.len() < 2 {
-                return None;
-            }
-        }
-        if header & 0x02 == 0 {
-            return Some((obu_type, len, None));
-        }
-        let (size, size_len) = Self::leb128(bytes.get(len..)?)?;
-        Some((obu_type, len + size_len, Some(size)))
-    }
-
-    /// Unsigned LEB128 value and its byte length.
-    fn leb128(bytes: &[u8]) -> Option<(usize, usize)> {
-        let mut value: usize = 0;
-        for (i, &b) in bytes.iter().take(8).enumerate() {
-            value |= usize::from(b & 0x7F) << (7 * i);
-            if b & 0x80 == 0 {
-                return Some((value, i + 1));
-            }
-        }
-        None
-    }
-
-    /// True when a frame header body opens with `0,00`.
-    fn av1_header_is_key(body: &[u8]) -> bool {
-        BitReader::new(body).read_bits(3).is_some_and(|v| v == 0)
-    }
-
-    /// True when a VP8 frame tag opens a key frame.
-    ///
-    /// Bit 0 of byte 0 is `frame_type`: 0 key, 1 inter; empty payload
-    /// carries no tag.
-    fn vp8_frame_is_key(payload: &[u8]) -> bool {
-        payload.first().is_some_and(|b| b & 0x01 == 0)
-    }
-
-    /// True when a VP9 uncompressed header opens a key frame.
-    ///
-    /// Key iff `frame_marker` is `0b10`, `show_existing_frame` is 0,
-    /// and `frame_type` is 0. Truncation or marker mismatch reads
-    /// `false`.
-    fn vp9_frame_is_key(payload: &[u8]) -> bool {
-        let mut reader = BitReader::new(payload);
-        if reader.read_bits(2) != Some(0b10) {
-            return false;
-        }
-        let low = reader.read_bits(1);
-        let high = reader.read_bits(1);
-        let (Some(low), Some(high)) = (low, high) else {
-            return false;
-        };
-        if (high << 1) | low == 3 && reader.read_bits(1).is_none() {
-            return false;
-        }
-        if reader.read_bits(1) != Some(0) {
-            return false;
-        }
-        reader.read_bits(1) == Some(0)
-    }
 }
 
 impl AccessUnit {
@@ -358,7 +356,7 @@ impl KeyframeGate {
     }
 }
 
-impl<'a> AnnexB<'a> {
+impl<'a> NaluIter<'a> {
     /// Splitter over annex-B bytes.
     #[must_use]
     pub fn new(bytes: &'a [u8]) -> Self {
@@ -383,7 +381,7 @@ impl<'a> AnnexB<'a> {
     }
 }
 
-impl<'a> Iterator for AnnexB<'a> {
+impl<'a> Iterator for NaluIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -493,7 +491,9 @@ impl AvcSpsInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessUnit, AnnexB, AvcSpsInfo, Codec, KeyframeGate, KeyframeState};
+    use super::{
+        AccessUnit, AvcSpsInfo, Codec, CodecPackaging, KeyframeGate, KeyframeState, NaluIter,
+    };
 
     /// Annex-B access unit from `(header, body_len)` NALUs.
     fn annexb(nalus: &[(u8, usize)]) -> Vec<u8> {
@@ -508,21 +508,21 @@ mod tests {
     #[test]
     fn annexb_splits_mixed_start_codes() {
         let bytes = [0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB, 0xCC];
-        let units: Vec<&[u8]> = AnnexB::new(&bytes).collect();
+        let units: Vec<&[u8]> = NaluIter::new(&bytes).collect();
         assert_eq!(units, vec![&[0x67, 0xAA][..], &[0x68, 0xBB, 0xCC][..]]);
     }
 
     #[test]
     fn annexb_skips_empty_units() {
         let bytes = [0, 0, 1, 0, 0, 1, 0x65, 0xFF];
-        let units: Vec<&[u8]> = AnnexB::new(&bytes).collect();
+        let units: Vec<&[u8]> = NaluIter::new(&bytes).collect();
         assert_eq!(units, vec![&[0x65, 0xFF][..]]);
     }
 
     #[test]
     fn annexb_needs_start_code() {
-        assert_eq!(AnnexB::new(&[0x65, 0xFF]).count(), 0);
-        assert_eq!(AnnexB::new(&[]).count(), 0);
+        assert_eq!(NaluIter::new(&[0x65, 0xFF]).count(), 0);
+        assert_eq!(NaluIter::new(&[]).count(), 0);
     }
 
     #[test]
@@ -600,6 +600,8 @@ mod tests {
         assert_eq!(Codec::Vp9.ts_stream_type(), None);
         assert_eq!(Codec::Vp8.ts_stream_type(), None);
         assert_eq!(Codec::Av2.ts_stream_type(), None);
+        assert_eq!(Codec::Mpeg2.ts_stream_type(), None);
+        assert_eq!(Codec::Vc1.ts_stream_type(), None);
     }
 
     #[test]
@@ -609,6 +611,8 @@ mod tests {
         assert_eq!(Codec::Av1.sample_entry(), *b"av01");
         assert_eq!(Codec::Vp9.sample_entry(), *b"vp09");
         assert_eq!(Codec::Vp8.sample_entry(), *b"vp08");
+        assert_eq!(Codec::Mpeg2.sample_entry(), *b"mp4v");
+        assert_eq!(Codec::Vc1.sample_entry(), *b"vc-1");
     }
 
     #[test]
@@ -628,9 +632,11 @@ mod tests {
     }
 
     #[test]
-    fn av2_never_classifies_key() {
-        assert!(!Codec::Av2.is_keyframe(&[0x00]));
-        assert!(!Codec::Av2.is_keyframe(&[]));
+    fn unclassified_codecs_never_key() {
+        for codec in [Codec::Av2, Codec::Mpeg2, Codec::Vc1] {
+            assert!(!codec.is_keyframe(&[0x00]));
+            assert!(!codec.is_keyframe(&[]));
+        }
     }
 
     #[test]

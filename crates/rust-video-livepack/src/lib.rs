@@ -8,7 +8,9 @@ mod queue;
 mod time;
 mod ts;
 
-pub use codec::{AccessUnit, AnnexB, Codec, KeyframeGate, KeyframeState, PacketAction};
+pub use codec::{
+    AccessUnit, Codec, CodecPackaging, KeyframeGate, KeyframeState, NaluIter, PacketAction,
+};
 pub use fmp4::{
     Av1Config, AvcConfig, ConfigError, Fmp4Error, FragmentMux, HevcConfig, TrackConfig, Vp8Config,
     Vp9Config,

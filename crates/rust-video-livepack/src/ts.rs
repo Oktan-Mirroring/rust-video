@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::codec::{AccessUnit, Codec, KeyframeGate, KeyframeState, PacketAction};
+use crate::codec::{AccessUnit, Codec, CodecPackaging, KeyframeGate, KeyframeState, PacketAction};
 use crate::time::{Pcr, Ts90k};
 
 /// Sync byte starting every packet; shared by [`TsMux`] and [`TsDemux`].
@@ -53,7 +53,7 @@ impl Default for TsMuxConfig {
 pub enum TsMuxError {
     /// PID outside `0x0020..=0x1FFA`, or PMT equals video PID.
     InvalidPid(u16),
-    /// Codec has no MPEG-TS `stream_type` (AV1, VP9, VP8, AV2).
+    /// Codec has no MPEG-TS `stream_type` (AV1, VP9, VP8, AV2, MPEG-2, VC-1).
     CodecNotMappable(Codec),
     /// Payload exceeds `max_pes_bytes`.
     PayloadTooLarge(usize),
@@ -168,8 +168,8 @@ impl TsMux {
     ///
     /// # Errors
     ///
-    /// Returns `Err` on AV1/VP9/VP8/AV2 payloads, empty payloads, and
-    /// payloads past `max_pes_bytes`.
+    /// Returns `Err` on AV1/VP9/VP8/AV2/MPEG-2/VC-1 payloads, empty
+    /// payloads, and payloads past `max_pes_bytes`.
     ///
     /// # Arguments
     ///
