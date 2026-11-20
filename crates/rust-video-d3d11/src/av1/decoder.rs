@@ -121,7 +121,7 @@ impl<'a> Av1Decoder<'a> {
             Ok(frames) => frames,
             Err(error) => {
                 self.reset_stream();
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 return Err(error);
             }
         };
@@ -146,49 +146,59 @@ impl<'a> Av1Decoder<'a> {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 return Err(error);
             }
         };
-        let slot = decoded
-            .submission
-            .as_ref()
-            .map(|submission| submission.slot);
-        self.parts().make_room(slot)?;
-        let submit_start = Instant::now();
-        let outcome = self.submit_ordered(&decoded);
-        let submit_end = Instant::now();
-        if let Err(error) = outcome {
-            self.reset_stream();
-            self.queue.clear_pending();
-            return Err(error);
-        }
-        for output in &decoded.outputs {
-            self.queue
-                .push(output.slot(), active, submit_start, submit_end);
-        }
-        Ok(())
-    }
-
-    /// `decoded` submitted plus its outputs copied, in AV1 order.
-    fn submit_ordered(&self, decoded: &super::dpb::Av1Decoded) -> Result<(), D3d11Error> {
-        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
         // Priors precede the submit: it overwrites the submission
-        // view, which evicted priors may still name. The current
-        // frame alone follows it.
+        // view, which evicted priors may still name.
+        let mut copied = Vec::with_capacity(decoded.outputs.len());
         for (index, output) in decoded.outputs.iter().enumerate() {
             if Some(index) == decoded.current_index {
                 continue;
             }
-            session.copy_slot(output.slot())?;
+            match self.parts().copy_output(output.slot()) {
+                Ok(lane) => copied.push(lane),
+                Err(error) => {
+                    self.reset_stream();
+                    self.parts().abandon_pending();
+                    return Err(error);
+                }
+            }
         }
-        if let Some(submission) = decoded.submission.as_ref() {
-            session.submit_av1(submission)?;
+        let submit_start = Instant::now();
+        if let Err(error) = self.submit_av1_inner(&decoded) {
+            self.reset_stream();
+            self.parts().abandon_pending();
+            return Err(error);
         }
+        let submit_end = Instant::now();
+        // The current frame alone follows the submit.
         if let Some(index) = decoded.current_index {
             if let Some(output) = decoded.outputs.get(index) {
-                session.copy_slot(output.slot())?;
+                match self.parts().copy_output(output.slot()) {
+                    Ok(lane) => copied.push(lane),
+                    Err(error) => {
+                        self.reset_stream();
+                        self.parts().abandon_pending();
+                        return Err(error);
+                    }
+                }
             }
+        }
+        for lane in copied {
+            self.queue.push(lane, active, submit_start, submit_end);
+        }
+        Ok(())
+    }
+
+    /// `decoded` submitted, if it carries one.
+    fn submit_av1_inner(&self, decoded: &super::dpb::Av1Decoded) -> Result<(), D3d11Error> {
+        if let Some(submission) = decoded.submission.as_ref() {
+            self.session
+                .as_ref()
+                .ok_or(D3d11Error::NoSession)?
+                .submit_av1(submission)?;
         }
         Ok(())
     }
@@ -452,11 +462,11 @@ impl Decoder for Av1Decoder<'_> {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
         if let Err(error) = self.submit_packet_inner(packet) {
-            self.queue.clear();
+            self.parts().abandon_queue();
             return Err(error);
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -470,18 +480,18 @@ impl Decoder for Av1Decoder<'_> {
             Ok(trailing) => trailing,
             Err(error) => {
                 self.reset_stream();
-                self.queue.clear();
+                self.parts().abandon_queue();
                 return Err(error);
             }
         };
         if let Some(frame) = trailing {
             if let Err(error) = self.submit_frame_split(&frame) {
-                self.queue.clear();
+                self.parts().abandon_queue();
                 return Err(error);
             }
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -545,18 +555,18 @@ impl SplitDecode for Av1Decoder<'_> {
                 Ok(trailing) => trailing,
                 Err(error) => {
                     self.reset_stream();
-                    self.queue.clear_pending();
+                    self.parts().abandon_pending();
                     return Err(error);
                 }
             };
             if let Some(frame) = trailing {
                 if let Err(error) = self.submit_frame_split(&frame) {
-                    self.queue.clear_pending();
+                    self.parts().abandon_pending();
                     return Err(error);
                 }
             }
             if let Err(error) = self.parts().drain_all() {
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 self.reset_stream();
                 return Err(error);
             }

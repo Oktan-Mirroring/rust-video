@@ -4,6 +4,7 @@
 #![allow(unsafe_code)]
 
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::D3d11Error;
@@ -61,22 +62,29 @@ unsafe impl Send for Mapped {}
 pub(crate) struct Readback {
     /// Shared copy pump behind launches.
     pump: CopyPump<Mapped, Done>,
+    /// Shard-copy team behind large packs.
+    team: Arc<super::submit::PackTeam>,
 }
 
 impl Readback {
     /// Worker over nothing; maps arrive per copy.
     #[must_use]
     pub(crate) fn spawn() -> Self {
+        let pool = Arc::new(BufferPool::new());
+        let team = Arc::new(super::submit::PackTeam::spawn());
         Self {
-            pump: CopyPump::spawn("d3d11-readback", |mapped: Mapped, started: Instant| {
-                let bytes =
-                    super::submit::copy_nv12(&mapped.map, mapped.width, mapped.height, mapped.crop);
-                Done {
-                    bytes,
-                    release: mapped.release,
-                    copy: started.elapsed(),
+            pump: CopyPump::spawn("d3d11-readback", {
+                let team = Arc::clone(&team);
+                move |mapped: Mapped, started: Instant| {
+                    let bytes = BufferPool::pack(&pool, &team, &mapped);
+                    Done {
+                        bytes,
+                        release: mapped.release,
+                        copy: started.elapsed(),
+                    }
                 }
             }),
+            team,
         }
     }
 
@@ -105,6 +113,7 @@ impl Readback {
     /// Queued copies drain, the worker joins, orphaned maps release.
     pub(crate) fn shutdown(&mut self) {
         self.pump.shutdown_with(|done| done.release.unmap());
+        self.team.shutdown();
     }
 }
 
@@ -164,5 +173,96 @@ impl Done {
     /// Copied bytes, mapping release, and copy time.
     pub(crate) fn into_parts(self) -> (Result<Bytes, D3d11Error>, Release, Duration) {
         (self.bytes, self.release, self.copy)
+    }
+}
+
+/// Returned buffers kept per decoder.
+const POOL_CAP: usize = 16;
+
+/// Pooled frame-byte buffers behind worker packs.
+struct BufferPool {
+    /// Returned buffers awaiting reuse.
+    free: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    /// Empty pool.
+    fn new() -> Self {
+        Self {
+            free: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `mapped` packed into a reused buffer, empty pool allocates.
+    fn pack(
+        pool: &Arc<Self>,
+        team: &Arc<super::submit::PackTeam>,
+        mapped: &Mapped,
+    ) -> Result<Bytes, D3d11Error> {
+        let mut buf = pool.take(mapped.bytes());
+        super::submit::copy_nv12_team(
+            &mapped.map,
+            mapped.width,
+            mapped.height,
+            mapped.crop,
+            &mut buf,
+            team,
+        )?;
+        Ok(Bytes::from_owner(Pooled::new(buf, Arc::clone(pool))))
+    }
+
+    /// Buffer holding `len`, from the pool or fresh.
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = free.iter().rposition(|buf| buf.capacity() >= len) {
+            return free.swap_remove(index);
+        }
+        Vec::with_capacity(len)
+    }
+
+    /// `buf` returned for reuse, past the cap dropped.
+    fn give(&self, buf: Vec<u8>) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.len() < POOL_CAP {
+            free.push(buf);
+        }
+    }
+}
+
+/// Pooled owner behind frame bytes; the buffer returns on last drop.
+struct Pooled {
+    /// Packed bytes, absent after the return.
+    buf: Option<Vec<u8>>,
+    /// Pool behind the buffer.
+    pool: Arc<BufferPool>,
+}
+
+impl Pooled {
+    /// Owner of `buf` returning to `pool`.
+    fn new(buf: Vec<u8>, pool: Arc<BufferPool>) -> Self {
+        Self {
+            buf: Some(buf),
+            pool,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Pooled {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref().map_or(&[], Vec::as_slice)
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            self.pool.give(buf);
+        }
     }
 }

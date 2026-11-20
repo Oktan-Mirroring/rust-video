@@ -3,7 +3,7 @@
 // FFI boundary: decoder-session COM calls live here.
 #![allow(unsafe_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
@@ -42,6 +42,9 @@ const VIEWS: u32 = 16;
 /// Pipeline margin past the reference surfaces.
 const SPARE_VIEWS: u32 = 4;
 
+/// Free-list readback lanes; covers the pending ceiling.
+const LANES: u8 = 8;
+
 /// Negotiated H.264 decode session.
 pub(crate) struct Session {
     /// Hardware decoder.
@@ -52,6 +55,10 @@ pub(crate) struct Session {
     texture: ID3D11Texture2D,
     /// Copy lane per reference surface.
     slots: Vec<CopySlot>,
+    /// Free-list readback lanes behind byte copies.
+    lanes: Vec<CopySlot>,
+    /// Readback lanes awaiting take.
+    free: Mutex<Vec<u8>>,
     /// Video context behind frame submission.
     video_context: ID3D11VideoContext,
     /// Immediate context behind copies and readback.
@@ -206,6 +213,11 @@ impl Session {
         for _ in 0..VIEWS {
             slots.push(CopySlot::open(device.device(), width, height)?);
         }
+        let mut lanes = Vec::with_capacity(usize::from(LANES));
+        for _ in 0..LANES {
+            lanes.push(CopySlot::open(device.device(), width, height)?);
+        }
+        let free: Vec<u8> = (0..LANES).collect();
         let export = shared_export(&texture);
         let slice_short = config.ConfigBitstreamRaw == 2;
         Ok(Self {
@@ -213,6 +225,8 @@ impl Session {
             views,
             texture,
             slots,
+            lanes,
+            free: Mutex::new(free),
             video_context: device.video_context().clone(),
             context: device.context().clone(),
             submit: device.submit_lock().clone(),
@@ -325,31 +339,58 @@ impl Session {
         self.submit_parts(submission.slot, &parts)
     }
 
-    /// Array `slot` copied to its lane staging through the immediate context.
+    /// Free readback lane, if one awaits take.
+    pub(crate) fn take_lane(&self) -> Option<u8> {
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+    }
+
+    /// `lane` returned for reuse.
+    pub(crate) fn give_lane(&self, lane: u8) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if free.len() < self.lanes.len() && !free.contains(&lane) {
+            free.push(lane);
+        }
+    }
+
+    /// Array `slot` copied to `lane` staging through the immediate context.
     ///
-    /// The copy orders the lane marker behind the video decode; surface
-    /// waits depend on it.
+    /// The copy orders the lane marker behind the video decode.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views.
-    pub(crate) fn copy_slot(&self, slot: u8) -> Result<(), D3d11Error> {
-        let lane = self
-            .slots
-            .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+    /// Returns `Err` for a slot outside the views or a lane outside the pool.
+    pub(crate) fn copy_lane(&self, slot: u8, lane: u8) -> Result<(), D3d11Error> {
+        let lane = self.lane(lane)?;
+        if usize::from(slot) >= self.views.len() {
+            return Err(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
                 BrokenCore::SlotOutsidePool,
-            )))?;
+            )));
+        }
         let _submit = self.submit.enter()?;
         lane.copy(&self.context, &self.texture, slot);
         Ok(())
     }
 
+    /// Readback `lane` behind byte copies.
+    fn lane(&self, lane: u8) -> Result<&CopySlot, D3d11Error> {
+        self.lanes
+            .get(usize::from(lane))
+            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
+                BrokenCore::SlotOutsidePool,
+            )))
+    }
+
     /// Lane marker of array `slot` ordered behind the video decode.
     ///
     /// Moves only the mark region; staging bytes outside it keep their
-    /// previous contents, so reads need [`copy_slot`](Self::copy_slot)
-    /// first. Surface handoffs use this; readback uses the full copy.
+    /// previous contents. Surface handoffs use this; readback uses the
+    /// full copy onto a free lane.
     ///
     /// # Errors
     ///
@@ -366,88 +407,65 @@ impl Session {
         Ok(())
     }
 
-    /// NV12 bytes for `slot` cropped to the visible rectangle.
+    /// NV12 bytes for `lane` cropped to the visible rectangle.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views, when the copy
+    /// Returns `Err` for a lane outside the pool, when the copy
     /// misses its completion budget, or when the map fails.
-    pub(crate) fn read_slot(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
-        self.wait_slot(slot)?;
-        self.read_mapped(slot, crop)
+    pub(crate) fn read_lane(&self, lane: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+        self.wait_lane(lane)?;
+        self.read_mapped(lane, crop)
     }
 
-    /// True once the last copy to `slot` completed, without waiting.
+    /// True once the last copy to `lane` completed, without waiting.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views or when the GPU
+    /// Returns `Err` for a lane outside the pool or when the GPU
     /// reports failure.
-    pub(crate) fn poll_slot(&self, slot: u8) -> Result<bool, D3d11Error> {
-        let lane = self
-            .slots
-            .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
-                BrokenCore::SlotOutsidePool,
-            )))?;
-        lane.signaled(&self.context)
+    pub(crate) fn poll_lane(&self, lane: u8) -> Result<bool, D3d11Error> {
+        self.lane(lane)?.signaled(&self.context)
     }
 
-    /// Completion of the last copy to `slot`, outside the submit lock.
+    /// Completion of the last copy to `lane`, outside the submit lock.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views or when the copy
+    /// Returns `Err` for a lane outside the pool or when the copy
     /// misses its completion budget.
-    pub(crate) fn wait_slot(&self, slot: u8) -> Result<(), D3d11Error> {
-        let lane = self
-            .slots
-            .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
-                BrokenCore::SlotOutsidePool,
-            )))?;
-        lane.wait(&self.context)
+    pub(crate) fn wait_lane(&self, lane: u8) -> Result<(), D3d11Error> {
+        self.lane(lane)?.wait(&self.context)
     }
 
-    /// NV12 bytes for `slot` cropped to the visible rectangle, without waiting.
+    /// NV12 bytes for `lane` cropped to the visible rectangle, without waiting.
     ///
-    /// Call after [`poll_slot`](Self::poll_slot) or [`wait_slot`](Self::wait_slot);
+    /// Call after [`poll_lane`](Self::poll_lane) or [`wait_lane`](Self::wait_lane);
     /// mapping an incomplete copy reads torn bytes.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views or when the map fails.
-    pub(crate) fn read_mapped(&self, slot: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
-        let lane = self
-            .slots
-            .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
-                BrokenCore::SlotOutsidePool,
-            )))?;
-        lane.read(&self.context, crop)
+    /// Returns `Err` for a lane outside the pool or when the map fails.
+    pub(crate) fn read_mapped(&self, lane: u8, crop: Option<Crop>) -> Result<Bytes, D3d11Error> {
+        self.lane(lane)?.read(&self.context, crop)
     }
 
-    /// Mapped staging of `slot` for a worker copy.
+    /// Mapped staging of `lane` for a worker copy.
     ///
-    /// Call after [`poll_slot`](Self::poll_slot) or [`wait_slot`](Self::wait_slot);
+    /// Call after [`poll_lane`](Self::poll_lane) or [`wait_lane`](Self::wait_lane);
     /// mapping an incomplete copy reads torn bytes. The caller releases
     /// the mapping after its copy lands.
     ///
     /// # Errors
     ///
-    /// Returns `Err` for a slot outside the views or when the map fails.
-    pub(crate) fn map_slot(
+    /// Returns `Err` for a lane outside the pool or when the map fails.
+    pub(crate) fn map_lane(
         &self,
-        slot: u8,
+        lane: u8,
         crop: Option<Crop>,
     ) -> Result<crate::readback::Mapped, D3d11Error> {
         use crate::readback::{Mapped, Release};
-        let lane = self
-            .slots
-            .get(usize::from(slot))
-            .ok_or(D3d11Error::BrokenReference(BrokenReferenceReason::Broken(
-                BrokenCore::SlotOutsidePool,
-            )))?;
+        let lane = self.lane(lane)?;
         let mapped = lane.map(&self.context)?;
         Ok(Mapped::new(
             mapped,
@@ -789,8 +807,10 @@ mod tests {
                 continue;
             }
             let session = Session::open_codec(&device, codec, 320, 240).expect("codec session");
-            session.copy_slot(0).expect("copy");
-            let bytes = session.read_slot(0, None).expect("readback");
+            let lane = session.take_lane().expect("free lane");
+            session.copy_lane(0, lane).expect("copy");
+            let bytes = session.read_lane(lane, None).expect("readback");
+            session.give_lane(lane);
             assert_eq!(bytes.len(), 320 * 240 * 3 / 2);
         }
     }
@@ -807,8 +827,9 @@ mod tests {
             return;
         };
         let session = Session::open(&device, 1920, 1088).expect("1080p session");
-        session.copy_slot(0).expect("copy");
-        let full = session.read_slot(0, None).expect("readback");
+        let lane = session.take_lane().expect("free lane");
+        session.copy_lane(0, lane).expect("copy");
+        let full = session.read_lane(lane, None).expect("readback");
         assert_eq!(full.len(), 1920 * 1088 * 3 / 2);
         let crop = Crop {
             left: 0,
@@ -816,15 +837,18 @@ mod tests {
             top: 0,
             bottom: 8,
         };
-        session.copy_slot(0).expect("copy");
-        let visible = session.read_slot(0, Some(crop)).expect("cropped readback");
+        session.copy_lane(0, lane).expect("copy");
+        let visible = session
+            .read_lane(lane, Some(crop))
+            .expect("cropped readback");
         assert_eq!(visible.len(), 1920 * 1080 * 3 / 2);
         let rounds = 60u32;
         let start = std::time::Instant::now();
         for _ in 0..rounds {
-            session.copy_slot(0).expect("copy");
-            session.read_slot(0, None).expect("readback");
+            session.copy_lane(0, lane).expect("copy");
+            session.read_lane(lane, None).expect("readback");
         }
+        session.give_lane(lane);
         let elapsed = start.elapsed();
         let frame_bytes = 1920u128 * 1088 * 3 / 2;
         let micros = elapsed.as_micros().max(1);

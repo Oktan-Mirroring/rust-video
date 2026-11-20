@@ -60,15 +60,15 @@ impl Active {
     }
 }
 
-/// Frame for copied `slot`.
+/// Frame for copied `lane`.
 pub(crate) fn emit_frame(
     session: &Session,
     shared: &SharedDevice,
-    slot: u8,
+    lane: u8,
     active: &Active,
     generation: u64,
 ) -> Result<D3d11Frame, D3d11Error> {
-    let data = session.read_slot(slot, active.crop)?;
+    let data = session.read_lane(lane, active.crop)?;
     emit_frame_bytes(session, shared, active, generation, data)
 }
 

@@ -136,43 +136,53 @@ impl<'a> HevcDecoder<'a> {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 return Err(error);
             }
         };
-        self.parts().make_room(Some(decoded.submission.slot))?;
-        let submit_start = Instant::now();
-        let outcome = self.submit_ordered(&decoded);
-        let submit_end = Instant::now();
-        if let Err(error) = outcome {
-            self.reset_stream();
-            self.queue.clear_pending();
-            return Err(error);
-        }
-        for output in &decoded.outputs {
-            self.queue
-                .push(output.slot(), active, submit_start, submit_end);
-        }
-        Ok(())
-    }
-
-    /// `decoded` submitted plus its outputs copied, in HEVC order.
-    fn submit_ordered(&self, decoded: &super::dpb::HevcDecoded) -> Result<(), D3d11Error> {
-        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
         // Priors precede the submit: it overwrites the submission
-        // slot, which evicted priors may still name. The current
-        // picture alone follows it.
+        // slot, which evicted priors may still name.
+        let mut copied = Vec::with_capacity(decoded.outputs.len());
         for (index, output) in decoded.outputs.iter().enumerate() {
             if Some(index) == decoded.current_index {
                 continue;
             }
-            session.copy_slot(output.slot())?;
+            match self.parts().copy_output(output.slot()) {
+                Ok(lane) => copied.push(lane),
+                Err(error) => {
+                    self.reset_stream();
+                    self.parts().abandon_pending();
+                    return Err(error);
+                }
+            }
         }
-        session.submit_hevc(&decoded.submission)?;
+        let submit_start = Instant::now();
+        if let Err(error) = self
+            .session
+            .as_ref()
+            .ok_or(D3d11Error::NoSession)
+            .and_then(|session| session.submit_hevc(&decoded.submission))
+        {
+            self.reset_stream();
+            self.parts().abandon_pending();
+            return Err(error);
+        }
+        let submit_end = Instant::now();
+        // The current picture alone follows the submit.
         if let Some(index) = decoded.current_index {
             if let Some(output) = decoded.outputs.get(index) {
-                session.copy_slot(output.slot())?;
+                match self.parts().copy_output(output.slot()) {
+                    Ok(lane) => copied.push(lane),
+                    Err(error) => {
+                        self.reset_stream();
+                        self.parts().abandon_pending();
+                        return Err(error);
+                    }
+                }
             }
+        }
+        for lane in copied {
+            self.queue.push(lane, active, submit_start, submit_end);
         }
         Ok(())
     }
@@ -413,11 +423,11 @@ impl Decoder for HevcDecoder<'_> {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
         if let Err(error) = self.submit_packet_inner(packet) {
-            self.queue.clear();
+            self.parts().abandon_queue();
             return Err(error);
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -429,12 +439,12 @@ impl Decoder for HevcDecoder<'_> {
         let mut frames = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
             if let Err(error) = self.submit_picture_split(&picture) {
-                self.queue.clear();
+                self.parts().abandon_queue();
                 return Err(error);
             }
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -496,12 +506,12 @@ impl SplitDecode for HevcDecoder<'_> {
         if !self.finished {
             if let Some(picture) = self.ingest.finish()? {
                 if let Err(error) = self.submit_picture_split(&picture) {
-                    self.queue.clear_pending();
+                    self.parts().abandon_pending();
                     return Err(error);
                 }
             }
             if let Err(error) = self.parts().drain_all() {
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 self.reset_stream();
                 return Err(error);
             }

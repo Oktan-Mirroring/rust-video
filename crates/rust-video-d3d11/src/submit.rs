@@ -6,6 +6,7 @@
 // FFI boundary: device-context COM calls live here.
 #![allow(unsafe_code)]
 
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -252,6 +253,160 @@ impl CopySlot {
     }
 }
 
+/// Pack shards behind large copies.
+const SHARDS: usize = 4;
+
+/// Copies below this size pack on the calling thread.
+const SHARD_MIN_BYTES: usize = 256 * 1024;
+
+/// One pack shard: disjoint segments plus its ack.
+struct ShardJob {
+    /// Source, destination, length per segment.
+    segments: [(*const u8, *mut u8, usize); 2],
+    /// Segments behind the shard.
+    count: usize,
+    /// Acked after the last segment lands.
+    ack: SyncSender<()>,
+}
+
+// Sound: each hop moves sole ownership; segments never alias
+// across shards; the packer waits every ack before touching dst.
+unsafe impl Send for ShardJob {}
+
+/// Persistent shard-copy team behind large packs.
+pub(crate) struct PackTeam {
+    /// One inbox per shard worker.
+    inbox: Mutex<Vec<SyncSender<ShardJob>>>,
+    /// Shard workers, joined on shutdown.
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl PackTeam {
+    /// Shard team over nothing; packs arrive per copy.
+    #[must_use]
+    pub(crate) fn spawn() -> Self {
+        let mut inbox = Vec::with_capacity(SHARDS);
+        let mut workers = Vec::with_capacity(SHARDS);
+        for index in 0..SHARDS {
+            let (tx, rx) = sync_channel::<ShardJob>(1);
+            let worker = std::thread::Builder::new()
+                .name(format!("d3d11-pack-{index}"))
+                .spawn(move || {
+                    for job in rx {
+                        for (src, dst, len) in job.segments.iter().take(job.count) {
+                            // Sound: the packer carved disjoint ranges
+                            // inside live source and destination.
+                            unsafe {
+                                (*src).copy_to(*dst, *len);
+                            }
+                        }
+                        let _ = job.ack.send(());
+                    }
+                });
+            let Ok(worker) = worker else {
+                break;
+            };
+            inbox.push(tx);
+            workers.push(worker);
+        }
+        Self {
+            inbox: Mutex::new(inbox),
+            workers: Mutex::new(workers),
+        }
+    }
+
+    /// `runs` scattered over the shards into `dst`, waiting all.
+    fn scatter(&self, dst: &mut Vec<u8>, runs: &FastGeom, base: *const u8) {
+        let total = runs.y_len + runs.c_len;
+        dst.clear();
+        dst.reserve(total);
+        let target = dst.as_mut_ptr();
+        let inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let shards = inbox.len();
+        let mut acks = Vec::with_capacity(shards);
+        for (index, tx) in inbox.iter().enumerate() {
+            let start = total * index / shards;
+            let end = total * (index + 1) / shards;
+            let mut segments = [(std::ptr::null(), std::ptr::null_mut(), 0); 2];
+            let mut count;
+            if start < runs.y_len {
+                let cut = end.min(runs.y_len);
+                // Sound: the run bounds the segment.
+                segments[0] = (
+                    // Sound: the mapped base plus run offsets stays inside the staging texture.
+                    unsafe { base.add(runs.y_src_off + start) },
+                    // Sound: the destination reserved the total.
+                    unsafe { target.add(start) },
+                    cut - start,
+                );
+                count = 1;
+                if end > runs.y_len {
+                    segments[1] = (
+                        unsafe { base.add(runs.c_src_off) },
+                        unsafe { target.add(runs.y_len) },
+                        end - runs.y_len,
+                    );
+                    count = 2;
+                }
+            } else {
+                segments[0] = (
+                    unsafe { base.add(runs.c_src_off + (start - runs.y_len)) },
+                    unsafe { target.add(start) },
+                    end - start,
+                );
+                count = 1;
+            }
+            let (ack_tx, ack_rx) = sync_channel::<()>(0);
+            let job = ShardJob {
+                segments,
+                count,
+                ack: ack_tx,
+            };
+            if tx.send(job).is_err() {
+                for (src, dst, len) in segments.iter().take(count) {
+                    // Sound: the dead shard's ranges stay disjoint.
+                    unsafe {
+                        (*src).copy_to(*dst, *len);
+                    }
+                }
+                continue;
+            }
+            acks.push(ack_rx);
+        }
+        for ack in acks {
+            let _ = ack.recv();
+        }
+        // Sound: every acked shard wrote its disjoint range.
+        unsafe {
+            dst.set_len(total);
+        }
+    }
+
+    /// Shard workers joined, inboxes closed.
+    pub(crate) fn shutdown(&self) {
+        self.inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        for worker in self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            let _ = worker.join();
+        }
+    }
+
+    /// True with at least one live shard worker.
+    fn armed(&self) -> bool {
+        self.inbox.lock().is_ok_and(|inbox| !inbox.is_empty())
+    }
+}
+
 /// Completion fence behind one decode surface.
 pub(crate) struct SurfaceFence {
     /// Immediate context behind the wait.
@@ -372,6 +527,69 @@ pub(crate) fn copy_nv12(
     height: u32,
     crop: Option<Crop>,
 ) -> Result<Bytes, D3d11Error> {
+    let capacity = packed_len(width, height, crop);
+    let mut bytes = Vec::with_capacity(capacity);
+    copy_nv12_into(mapped, width, height, crop, &mut bytes)?;
+    Ok(Bytes::from(bytes))
+}
+
+/// Mapped staging texture packed under `crop` into `dst`, cleared first.
+pub(crate) fn copy_nv12_into(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    width: u32,
+    height: u32,
+    crop: Option<Crop>,
+    dst: &mut Vec<u8>,
+) -> Result<(), D3d11Error> {
+    if let Some(runs) = FastGeom::derive(mapped, width, height, crop)? {
+        dst.clear();
+        // Sound: the pitch and extents bound every row inside the mapped staging texture.
+        unsafe {
+            let base = mapped.pData.cast::<u8>();
+            dst.extend_from_slice(std::slice::from_raw_parts(
+                base.add(runs.y_src_off),
+                runs.y_len,
+            ));
+            dst.extend_from_slice(std::slice::from_raw_parts(
+                base.add(runs.c_src_off),
+                runs.c_len,
+            ));
+        }
+        return Ok(());
+    }
+    copy_nv12_rows(mapped, width, height, crop, dst)
+}
+
+/// Mapped staging texture packed over `team` into `dst`, cleared first.
+///
+/// Small or left-cropped packs run on the calling thread.
+pub(crate) fn copy_nv12_team(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    width: u32,
+    height: u32,
+    crop: Option<Crop>,
+    dst: &mut Vec<u8>,
+    team: &PackTeam,
+) -> Result<(), D3d11Error> {
+    if packed_len(width, height, crop) < SHARD_MIN_BYTES || !team.armed() {
+        return copy_nv12_into(mapped, width, height, crop, dst);
+    }
+    if let Some(runs) = FastGeom::derive(mapped, width, height, crop)? {
+        // Sound: the mapped base stays live across the scatter.
+        team.scatter(dst, &runs, mapped.pData.cast::<u8>().cast_const());
+        return Ok(());
+    }
+    copy_nv12_rows(mapped, width, height, crop, dst)
+}
+
+/// Row-by-row pack for left-cropped or padded pitches.
+fn copy_nv12_rows(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    width: u32,
+    height: u32,
+    crop: Option<Crop>,
+    dst: &mut Vec<u8>,
+) -> Result<(), D3d11Error> {
     if mapped.RowPitch < width {
         return Err(D3d11Error::Call {
             call: "Map",
@@ -385,38 +603,76 @@ pub(crate) fn copy_nv12(
     let visible_width = usize::try_from(visible_width).unwrap_or(0);
     let visible_height = usize::try_from(visible_height).unwrap_or(0);
     let height = usize::try_from(height).unwrap_or(0);
-    let capacity = visible_width
-        .saturating_mul(visible_height)
-        .saturating_mul(3)
-        / 2;
-    let mut bytes = Vec::with_capacity(capacity);
+    dst.clear();
     // Sound: the pitch and extents bound every row inside the mapped staging texture.
     unsafe {
         let base = mapped.pData.cast::<u8>();
-        if pitch == visible_width && left == 0 {
-            let y_src = base.add(top * pitch);
-            bytes.extend_from_slice(std::slice::from_raw_parts(
-                y_src,
-                visible_width * visible_height,
-            ));
-            let chroma = base.add(height * pitch + top * pitch / 2);
-            bytes.extend_from_slice(std::slice::from_raw_parts(
-                chroma,
-                visible_width * (visible_height / 2),
-            ));
-            return Ok(Bytes::from(bytes));
-        }
         for row in 0..visible_height {
             let src = base.add(top * pitch + row * pitch + left);
-            bytes.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
+            dst.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
         }
         let chroma = base.add(height * pitch);
         for row in 0..visible_height / 2 {
             let src = chroma.add(top * pitch / 2 + row * pitch + left);
-            bytes.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
+            dst.extend_from_slice(std::slice::from_raw_parts(src, visible_width));
         }
     }
-    Ok(Bytes::from(bytes))
+    Ok(())
+}
+
+/// Fast-path geometry: contiguous luma plus chroma runs.
+struct FastGeom {
+    /// Luma run offset from the mapped base.
+    y_src_off: usize,
+    /// Chroma run offset from the mapped base.
+    c_src_off: usize,
+    /// Luma run length.
+    y_len: usize,
+    /// Chroma run length.
+    c_len: usize,
+}
+
+impl FastGeom {
+    /// Geometry when the pitch packs tight without a left crop, else none.
+    fn derive(
+        mapped: &D3D11_MAPPED_SUBRESOURCE,
+        width: u32,
+        height: u32,
+        crop: Option<Crop>,
+    ) -> Result<Option<Self>, D3d11Error> {
+        if mapped.RowPitch < width {
+            return Err(D3d11Error::Call {
+                call: "Map",
+                hresult: windows::Win32::Foundation::E_FAIL.0,
+            });
+        }
+        let (left, top, visible_width, visible_height) = visible_rect(width, height, crop);
+        let pitch = usize::try_from(mapped.RowPitch).unwrap_or(0);
+        let left = usize::try_from(left).unwrap_or(0);
+        let top = usize::try_from(top).unwrap_or(0);
+        let visible_width = usize::try_from(visible_width).unwrap_or(0);
+        let visible_height = usize::try_from(visible_height).unwrap_or(0);
+        let height = usize::try_from(height).unwrap_or(0);
+        if pitch != visible_width || left != 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            y_src_off: top * pitch,
+            c_src_off: height * pitch + top * pitch / 2,
+            y_len: visible_width * visible_height,
+            c_len: visible_width * (visible_height / 2),
+        }))
+    }
+}
+
+/// Packed NV12 length inside the coded extent under `crop`.
+fn packed_len(width: u32, height: u32, crop: Option<Crop>) -> usize {
+    let (_, _, visible_width, visible_height) = visible_rect(width, height, crop);
+    usize::try_from(visible_width)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(visible_height).unwrap_or(0))
+        .saturating_mul(3)
+        / 2
 }
 
 /// Visible rectangle inside the coded extent.
@@ -509,6 +765,43 @@ mod tests {
         let mut staged = vec![0; 12];
         let view = mapped(&mut staged, 2);
         assert!(copy_nv12(&view, 4, 2, None).is_err());
+    }
+
+    #[test]
+    fn team_pack_matches_single() {
+        use super::{copy_nv12_into, copy_nv12_team, PackTeam};
+
+        let crop = Crop {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        };
+        let mut staged = vec![0u8; 1920 * 1088 * 3 / 2];
+        for (index, byte) in staged.iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).expect("byte range");
+        }
+        let team = PackTeam::spawn();
+        let view = mapped(&mut staged, 1920);
+        let mut single = Vec::new();
+        copy_nv12_into(&view, 1920, 1088, Some(crop), &mut single).expect("single pack");
+        let mut sharded = Vec::new();
+        copy_nv12_team(&view, 1920, 1088, Some(crop), &mut sharded, &team).expect("team pack");
+        team.shutdown();
+        assert_eq!(sharded, single);
+        let left = Crop {
+            left: 2,
+            right: 0,
+            top: 0,
+            bottom: 8,
+        };
+        let mut single = Vec::new();
+        copy_nv12_into(&view, 1920, 1088, Some(left), &mut single).expect("single pack");
+        let team = PackTeam::spawn();
+        let mut sharded = Vec::new();
+        copy_nv12_team(&view, 1920, 1088, Some(left), &mut sharded, &team).expect("team pack");
+        team.shutdown();
+        assert_eq!(sharded, single);
     }
 
     #[test]

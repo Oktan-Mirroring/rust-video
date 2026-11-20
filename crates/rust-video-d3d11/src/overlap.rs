@@ -89,11 +89,6 @@ impl<F> FrameQueue<F> {
         self.pending.len() < INFLIGHT_DEPTH
     }
 
-    /// True when `slot` names a pending output lane.
-    pub(crate) fn collides(&self, slot: u8) -> bool {
-        self.pending.iter().any(|output| output.slot() == slot)
-    }
-
     /// Oldest pending output, if any.
     pub(crate) fn front(&self) -> Option<&PendingOutput> {
         self.pending.front()
@@ -104,16 +99,16 @@ impl<F> FrameQueue<F> {
         self.pending.front_mut()
     }
 
-    /// `slot` submitted under `active` across the submit span.
+    /// Output submitted under `active` across the submit span, read via `lane`.
     pub(crate) fn push(
         &mut self,
-        slot: u8,
+        lane: u8,
         active: Active,
         submit_start: Instant,
         submit_end: Instant,
     ) {
         self.pending
-            .push_back(PendingOutput::new(slot, active, submit_start, submit_end));
+            .push_back(PendingOutput::new(lane, active, submit_start, submit_end));
         self.observe(self.pending.len());
     }
 
@@ -309,8 +304,8 @@ impl<D: SplitDecode<Error = D3d11Error> + PumpGauges> ReceiveFrames for Overlapp
 /// Submitted output awaiting completion read.
 #[derive(Clone, Debug)]
 pub(crate) struct PendingOutput {
-    /// Decode slot behind the output.
-    slot: u8,
+    /// Readback lane behind the output.
+    lane: u8,
     /// Sequence behind the submit.
     active: Active,
     /// Submit plus copy issue start.
@@ -326,15 +321,15 @@ pub(crate) struct PendingOutput {
 }
 
 impl PendingOutput {
-    /// Output from `slot` under `active` across the submit span.
+    /// Output under `active` across the submit span, read via `lane`.
     pub(crate) fn new(
-        slot: u8,
+        lane: u8,
         active: Active,
         submit_start: Instant,
         submit_end: Instant,
     ) -> Self {
         Self {
-            slot,
+            lane,
             active,
             submit_start,
             submit_end,
@@ -344,9 +339,9 @@ impl PendingOutput {
         }
     }
 
-    /// Decode slot behind the output.
-    pub(crate) fn slot(&self) -> u8 {
-        self.slot
+    /// Readback lane behind the output.
+    pub(crate) fn lane(&self) -> u8 {
+        self.lane
     }
 }
 
@@ -394,16 +389,16 @@ impl<'s> SplitParts<'s> {
         };
         loop {
             let launch = match self.queue.front() {
-                Some(front) if !front.launched => Some((front.slot, front.active)),
+                Some(front) if !front.launched => Some((front.lane(), front.active)),
                 _ => None,
             };
-            let Some((slot, active)) = launch else {
+            let Some((lane, active)) = launch else {
                 break;
             };
-            if !session.poll_slot(slot)? {
+            if !session.poll_lane(lane)? {
                 break;
             }
-            self.launch_front(slot, active)?;
+            self.launch_front(lane, active)?;
         }
         Ok(())
     }
@@ -416,24 +411,24 @@ impl<'s> SplitParts<'s> {
             return Ok(());
         };
         let launch = match self.queue.front() {
-            Some(front) if !front.launched => Some((front.slot, front.active)),
+            Some(front) if !front.launched => Some((front.lane(), front.active)),
             Some(_) => None,
             None => return Ok(()),
         };
-        if let Some((slot, active)) = launch {
-            session.wait_slot(slot)?;
-            self.launch_front(slot, active)?;
+        if let Some((lane, active)) = launch {
+            session.wait_lane(lane)?;
+            self.launch_front(lane, active)?;
         }
         self.collect_oldest()
     }
 
     /// Front copy launched on the worker, signaled just now.
-    fn launch_front(&mut self, slot: u8, active: Active) -> Result<(), D3d11Error> {
+    fn launch_front(&mut self, lane: u8, active: Active) -> Result<(), D3d11Error> {
         let (Some(session), _) = (self.session, self.shared) else {
             return Ok(());
         };
         let signaled_at = Instant::now();
-        let mapped = session.map_slot(slot, active.crop())?;
+        let mapped = session.map_lane(lane, active.crop())?;
         let generation = *self.generation;
         *self.generation = self.generation.wrapping_add(1);
         if let Some(front) = self.queue.front_mut() {
@@ -467,6 +462,7 @@ impl<'s> SplitParts<'s> {
         let (bytes, release, copy) = done.into_parts();
         let unmap_start = Instant::now();
         release.unmap();
+        session.give_lane(output.lane);
         let signaled_at = output.signaled_at.unwrap_or(unmap_start);
         let read_end = signaled_at + copy + unmap_start.elapsed();
         let frame = emit_frame_bytes(session, shared, &output.active, output.generation, bytes?)?;
@@ -495,10 +491,11 @@ impl<'s> SplitParts<'s> {
         let frame = emit_frame(
             session,
             shared,
-            output.slot,
+            output.lane,
             &output.active,
             output.generation,
         )?;
+        session.give_lane(output.lane);
         self.queue.push_ready(frame);
         Ok(())
     }
@@ -518,19 +515,53 @@ impl<'s> SplitParts<'s> {
         }
     }
 
-    /// Oldest-first blocking drains until `slot` fits under the ceiling.
-    ///
-    /// # Arguments
-    ///
-    /// * `slot` - submission slot checked against pending lanes; `None`
-    ///   skips the collision check.
-    pub(crate) fn make_room(&mut self, slot: Option<u8>) -> Result<(), D3d11Error> {
-        while self.queue.pending() >= INFLIGHT_CEILING
-            || slot.is_some_and(|slot| self.queue.collides(slot))
-        {
+    /// Free readback lane, draining oldest-first under the ceiling until one frees.
+    pub(crate) fn make_lane(&mut self) -> Result<u8, D3d11Error> {
+        let Some(session) = self.session else {
+            return Err(D3d11Error::NoSession);
+        };
+        loop {
+            if self.queue.pending() < INFLIGHT_CEILING {
+                if let Some(lane) = session.take_lane() {
+                    return Ok(lane);
+                }
+            }
+            if self.queue.front().is_none() {
+                return Err(D3d11Error::OverCaps {
+                    what: "readback lanes",
+                });
+            }
             self.drain_oldest()?;
         }
-        Ok(())
+    }
+
+    /// `slot` copied onto a free lane, returning it.
+    pub(crate) fn copy_output(&mut self, slot: u8) -> Result<u8, D3d11Error> {
+        let (Some(session), _) = (self.session, self.shared) else {
+            return Err(D3d11Error::NoSession);
+        };
+        let lane = self.make_lane()?;
+        if let Err(error) = session.copy_lane(slot, lane) {
+            session.give_lane(lane);
+            return Err(error);
+        }
+        Ok(lane)
+    }
+
+    /// Pending outputs abandoned, their lanes returned.
+    pub(crate) fn abandon_pending(&mut self) {
+        if let Some(session) = self.session {
+            while let Some(output) = self.queue.pop_pending() {
+                session.give_lane(output.lane);
+            }
+        }
+        self.queue.clear_pending();
+    }
+
+    /// Pending outputs and ready frames abandoned, lanes returned.
+    pub(crate) fn abandon_queue(&mut self) {
+        self.abandon_pending();
+        self.queue.clear();
     }
 
     /// `slots` copied and read under `active` into `frames`, oldest first.
@@ -543,16 +574,31 @@ impl<'s> SplitParts<'s> {
         let (Some(session), Some(shared)) = (self.session, self.shared) else {
             return Ok(());
         };
-        let mut spans = Vec::with_capacity(slots.len());
+        let Some(lane) = session.take_lane() else {
+            return Err(D3d11Error::OverCaps {
+                what: "readback lanes",
+            });
+        };
+        let mut outcome = Ok(());
         for slot in slots {
             let submit_start = Instant::now();
-            session.copy_slot(*slot)?;
-            spans.push((*slot, submit_start, Instant::now()));
-        }
-        for (slot, submit_start, submit_end) in spans {
-            session.wait_slot(slot)?;
+            if let Err(error) = session.copy_lane(*slot, lane) {
+                outcome = Err(error);
+                break;
+            }
+            let submit_end = Instant::now();
+            if let Err(error) = session.wait_lane(lane) {
+                outcome = Err(error);
+                break;
+            }
             let signaled_at = Instant::now();
-            let frame = emit_frame(session, shared, slot, active, *self.generation)?;
+            let frame = match emit_frame(session, shared, lane, active, *self.generation) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            };
             let read_end = Instant::now();
             self.timings.push(PhaseTiming::new(
                 *self.generation,
@@ -565,7 +611,8 @@ impl<'s> SplitParts<'s> {
             *self.generation = self.generation.wrapping_add(1);
             frames.push(frame);
         }
-        Ok(())
+        session.give_lane(lane);
+        outcome
     }
 
     /// Oldest launched copy into ready, waiting for it.
@@ -713,9 +760,9 @@ mod tests {
     fn queue_admits_under_bound() {
         let mut queue = FrameQueue::<u64>::new();
         let start = Instant::now();
-        for slot in 0..u8::try_from(INFLIGHT_DEPTH).expect("bound fits") {
+        for lane in 0..u8::try_from(INFLIGHT_DEPTH).expect("bound fits") {
             assert!(queue.admits());
-            queue.push(slot, active(), start, start);
+            queue.push(lane, active(), start, start);
         }
         assert!(!queue.admits());
         assert_eq!(queue.pending(), INFLIGHT_DEPTH);
@@ -725,14 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn queue_collides_on_pending_slot() {
+    fn queue_pending_carries_lane() {
         let mut queue = FrameQueue::<u64>::new();
         let start = Instant::now();
-        queue.push(3, active(), start, start);
-        assert!(queue.collides(3));
-        assert!(!queue.collides(4));
+        queue.push(5, active(), start, start);
+        let front = queue.front().expect("pending output");
+        assert_eq!(front.lane(), 5);
         queue.pop_pending();
-        assert!(!queue.collides(3));
+        assert!(queue.front().is_none());
     }
 
     #[test]
@@ -751,7 +798,7 @@ mod tests {
     fn queue_clear_pending_keeps_ready() {
         let mut queue = FrameQueue::new();
         let start = Instant::now();
-        queue.push(0, active(), start, start);
+        queue.push(1, active(), start, start);
         queue.push_ready(7);
         queue.clear_pending();
         assert_eq!(queue.pending(), 0);

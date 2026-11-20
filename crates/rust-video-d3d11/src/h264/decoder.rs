@@ -136,33 +136,36 @@ impl<'a> H264Decoder<'a> {
             Ok(decoded) => decoded,
             Err(error) => {
                 self.reset_stream();
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 return Err(error);
             }
         };
-        self.parts().make_room(Some(decoded.submission.slot))?;
         let submit_start = Instant::now();
-        let outcome = self.submit_ordered(&decoded);
-        let submit_end = Instant::now();
-        if let Err(error) = outcome {
+        // Submit before any copy: outputs may name the submission slot.
+        if let Err(error) = self
+            .session
+            .as_ref()
+            .ok_or(D3d11Error::NoSession)
+            .and_then(|session| session.submit(&decoded.submission))
+        {
             self.reset_stream();
-            self.queue.clear_pending();
+            self.parts().abandon_pending();
             return Err(error);
         }
+        let submit_end = Instant::now();
+        let mut copied = Vec::with_capacity(decoded.outputs.len());
         for output in &decoded.outputs {
-            self.queue
-                .push(output.slot(), active, submit_start, submit_end);
+            match self.parts().copy_output(output.slot()) {
+                Ok(lane) => copied.push(lane),
+                Err(error) => {
+                    self.reset_stream();
+                    self.parts().abandon_pending();
+                    return Err(error);
+                }
+            }
         }
-        Ok(())
-    }
-
-    /// `decoded` submitted plus its outputs copied, in H.264 order.
-    fn submit_ordered(&self, decoded: &Decoded) -> Result<(), D3d11Error> {
-        let session = self.session.as_ref().ok_or(D3d11Error::NoSession)?;
-        // Submit before any copy: outputs may name the submission slot.
-        session.submit(&decoded.submission)?;
-        for output in &decoded.outputs {
-            session.copy_slot(output.slot())?;
+        for lane in copied {
+            self.queue.push(lane, active, submit_start, submit_end);
         }
         Ok(())
     }
@@ -401,11 +404,11 @@ impl Decoder for H264Decoder<'_> {
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
         let mut frames = Vec::new();
         if let Err(error) = self.submit_packet_inner(packet) {
-            self.queue.clear();
+            self.parts().abandon_queue();
             return Err(error);
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -417,12 +420,12 @@ impl Decoder for H264Decoder<'_> {
         let mut frames = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
             if let Err(error) = self.submit_picture_split(&picture) {
-                self.queue.clear();
+                self.parts().abandon_queue();
                 return Err(error);
             }
         }
         if let Err(error) = self.parts().drain_all() {
-            self.queue.clear();
+            self.parts().abandon_queue();
             self.reset_stream();
             return Err(error);
         }
@@ -484,12 +487,12 @@ impl SplitDecode for H264Decoder<'_> {
         if !self.finished {
             if let Some(picture) = self.ingest.finish()? {
                 if let Err(error) = self.submit_picture_split(&picture) {
-                    self.queue.clear_pending();
+                    self.parts().abandon_pending();
                     return Err(error);
                 }
             }
             if let Err(error) = self.parts().drain_all() {
-                self.queue.clear_pending();
+                self.parts().abandon_pending();
                 self.reset_stream();
                 return Err(error);
             }
@@ -554,18 +557,11 @@ mod tests {
         let held = held.expect("first picture surfaces");
         let slot = held.slot;
         let crop = decoder.active.expect("live sequence").crop();
-        decoder
-            .session
-            .as_ref()
-            .expect("live session")
-            .copy_slot(slot)
-            .expect("copy runs");
-        let before = decoder
-            .session
-            .as_ref()
-            .expect("live session")
-            .read_slot(slot, crop)
-            .expect("read runs");
+        let session = decoder.session.as_ref().expect("live session");
+        let lane = session.take_lane().expect("free lane");
+        session.copy_lane(slot, lane).expect("copy runs");
+        let before = session.read_lane(lane, crop).expect("read runs");
+        session.give_lane(lane);
         for seed in 1..20u64 {
             let frame = rust_video_harness::Synth::noise(320, 240, seed);
             for packet in encoder.encode(&frame).expect("encode runs") {
@@ -576,18 +572,11 @@ mod tests {
             decoder.decode_surface(&packet).expect("decode runs");
         }
         decoder.flush_surface().expect("decode drains");
-        decoder
-            .session
-            .as_ref()
-            .expect("live session")
-            .copy_slot(slot)
-            .expect("copy runs");
-        let after = decoder
-            .session
-            .as_ref()
-            .expect("live session")
-            .read_slot(slot, crop)
-            .expect("read runs");
+        let session = decoder.session.as_ref().expect("live session");
+        let lane = session.take_lane().expect("free lane");
+        session.copy_lane(slot, lane).expect("copy runs");
+        let after = session.read_lane(lane, crop).expect("read runs");
+        session.give_lane(lane);
         assert_eq!(before.as_ref(), after.as_ref());
     }
 
