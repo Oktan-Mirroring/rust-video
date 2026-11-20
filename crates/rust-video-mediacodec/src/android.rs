@@ -678,10 +678,18 @@ mod tests {
         use crate::error::MediaCodecError;
         use crate::format::FormatSpec;
 
-        let spec = FormatSpec::h264(64, 64)
+        let packet = rust_video_harness::AnnexB::picture_packets(
+            &rust_video_harness::decode_dir().join("valid_320x240.h264"),
+            rust_video_harness::AnnexB::is_h264_vcl,
+        )
+        .into_iter()
+        .next()
+        .expect("vector groups into pictures");
+        let (sps, pps) = rust_video_harness::AnnexB::avc_csd(&packet).expect("sps/pps in vector");
+        let spec = FormatSpec::h264(320, 240)
             .expect("valid dims")
-            .with_csd_0(vec![0, 0, 1])
-            .with_csd_1(vec![0, 0, 1]);
+            .with_csd_0(sps)
+            .with_csd_1(pps);
         let mut decoder = match MediaCodecDecoder::open(&spec) {
             Ok(decoder) => decoder,
             Err(
@@ -710,7 +718,7 @@ mod tests {
         use crate::encoder::EncodeSpec;
         use crate::error::MediaCodecError;
 
-        let spec = EncodeSpec::h264(64, 64, 1_000_000, 30, 1).expect("valid spec");
+        let spec = EncodeSpec::h264(320, 240, 1_000_000, 30, 1).expect("valid spec");
         let encoder = match MediaCodecEncoder::open(&spec) {
             Ok(encoder) => encoder,
             Err(
