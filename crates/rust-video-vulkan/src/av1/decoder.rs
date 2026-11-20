@@ -669,8 +669,7 @@ impl<'a> Av1Decoder<'a> {
             debug_assert!(false, "landed copy without launched picture");
             return Ok(None);
         };
-        let (bytes, release, copy) = done.into_parts();
-        release.unmap();
+        let (bytes, copy) = done.into_parts();
         let seq = launched.picture.seq;
         self.land_retained(launched, bytes, copy)
             .map(|frames| Some(self.emit_or_buffer(seq, frames)))
@@ -682,8 +681,7 @@ impl<'a> Av1Decoder<'a> {
             return Ok(Vec::new());
         };
         if let Some(done) = self.sink.readback.collect() {
-            let (bytes, release, copy) = done.into_parts();
-            release.unmap();
+            let (bytes, copy) = done.into_parts();
             let seq = launched.picture.seq;
             let frames = self.land_retained(launched, bytes, copy)?;
             return Ok(self.emit_or_buffer(seq, frames));
@@ -691,10 +689,6 @@ impl<'a> Av1Decoder<'a> {
         let Some(session) = self.session.as_mut() else {
             return Err(VulkanError::NoSession);
         };
-        let mut launched = launched;
-        if let Some(release) = launched.release.take() {
-            release.unmap();
-        }
         let seq = launched.picture.seq;
         let mut buffer = self.sink.pooled(launched.size, launched.coded);
         let copy_start = Instant::now();
@@ -716,7 +710,6 @@ impl<'a> Av1Decoder<'a> {
             size,
             coded: _,
             layout,
-            release: _,
         } = launched;
         let emit = picture.emit;
         let show_id = picture.show_id;
@@ -783,8 +776,7 @@ impl<'a> Av1Decoder<'a> {
                 debug_assert!(false, "landed copy without launched picture");
                 return Ok(Some(Vec::new()));
             };
-            let (bytes, release, copy) = done.into_parts();
-            release.unmap();
+            let (bytes, copy) = done.into_parts();
             let seq = launched.picture.seq;
             let frames = self.land_retained(launched, bytes, copy)?;
             return Ok(Some(self.emit_or_buffer(seq, frames)));
@@ -830,8 +822,7 @@ impl<'a> Av1Decoder<'a> {
             debug_assert!(false, "landed copy without launched picture");
             return Ok(Some(Vec::new()));
         };
-        let (bytes, release, copy) = done.into_parts();
-        release.unmap();
+        let (bytes, copy) = done.into_parts();
         let seq = launched.picture.seq;
         let frames = self.land_retained(launched, bytes, copy)?;
         Ok(Some(self.emit_or_buffer(seq, frames)))

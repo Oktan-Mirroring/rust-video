@@ -966,8 +966,6 @@ pub(crate) struct LaunchedPicture {
     pub(crate) coded: PictureSize,
     /// Surface layout behind the frame.
     pub(crate) layout: SurfaceLayout,
-    /// Live mapping behind a queued copy, for rescue unmaps.
-    pub(crate) release: Option<crate::readback::Release>,
 }
 
 /// Submitted but uncollected picture.
@@ -1097,13 +1095,12 @@ pub(crate) fn launch_waited(
         height: display_height,
     })?;
     let buffer = sink.pooled(size, coded);
-    let (data, len, release) = session.map_pending(picture.pending)?;
-    let mapped = crate::readback::Mapped::new(buffer, data, len, release.clone());
+    let (data, len) = session.map_pending(picture.pending)?;
+    let mapped = crate::readback::Mapped::new(buffer, data, len);
     // References land deferred: show-existing reads them after release.
     let inline = picture.show_id.is_none();
     if let Some(done) = sink.readback.launch(mapped, inline) {
-        let (bytes, release, copy) = done.into_parts();
-        release.unmap();
+        let (bytes, copy) = done.into_parts();
         return land_launched(
             session,
             sink,
@@ -1114,7 +1111,6 @@ pub(crate) fn launch_waited(
                 size,
                 coded,
                 layout,
-                release: None,
             },
             bytes,
             copy,
@@ -1126,7 +1122,6 @@ pub(crate) fn launch_waited(
         size,
         coded,
         layout,
-        release: Some(release),
     });
     Ok(Vec::new())
 }
@@ -1176,8 +1171,7 @@ fn harvest_landed(
             debug_assert!(false, "landed copy without launched picture");
             break;
         };
-        let (bytes, release, copy) = done.into_parts();
-        release.unmap();
+        let (bytes, copy) = done.into_parts();
         out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
     }
     Ok(out)
@@ -1196,8 +1190,7 @@ fn collect_launched(
     };
     match sink.readback.collect() {
         Some(done) => {
-            let (bytes, release, copy) = done.into_parts();
-            release.unmap();
+            let (bytes, copy) = done.into_parts();
             land_launched(session, sink, stats, launched, bytes, copy)
         }
         None => rescue_launched(session, sink, stats, launched),
@@ -1209,11 +1202,8 @@ fn rescue_launched(
     session: &mut Session,
     sink: &mut FrameSink,
     stats: &mut SubmitStats,
-    mut launched: LaunchedPicture,
+    launched: LaunchedPicture,
 ) -> Result<Vec<VulkanFrame>, VulkanError> {
-    if let Some(release) = launched.release.take() {
-        release.unmap();
-    }
     let mut buffer = sink.pooled(launched.size, launched.coded);
     let copy_start = Instant::now();
     session.copy_pending_into(launched.picture.pending, &mut buffer)?;
@@ -1302,8 +1292,7 @@ pub(crate) fn collect_oldest_timeout(
                 debug_assert!(false, "landed copy without launched picture");
                 return Ok(Some(out));
             };
-            let (bytes, release, copy) = done.into_parts();
-            release.unmap();
+            let (bytes, copy) = done.into_parts();
             out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
             return Ok(Some(out));
         }
@@ -1331,8 +1320,7 @@ pub(crate) fn collect_oldest_timeout(
                 debug_assert!(false, "landed copy without launched picture");
                 return Ok(Some(out));
             };
-            let (bytes, release, copy) = done.into_parts();
-            release.unmap();
+            let (bytes, copy) = done.into_parts();
             out.extend(land_launched(session, sink, stats, launched, bytes, copy)?);
         }
     }
