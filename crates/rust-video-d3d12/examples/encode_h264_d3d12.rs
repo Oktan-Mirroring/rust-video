@@ -18,7 +18,8 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let mut encoder = match D3d12Encoder::open(&device, Codec::H264) {
+    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no h264 encoder ({error})");

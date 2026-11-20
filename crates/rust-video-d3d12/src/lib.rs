@@ -5,6 +5,8 @@
 #[cfg(target_os = "windows")]
 mod av1;
 #[cfg(target_os = "windows")]
+mod config;
+#[cfg(target_os = "windows")]
 mod decoder;
 mod device;
 #[cfg(target_os = "windows")]
@@ -79,8 +81,6 @@ pub use texture::GpuSurface;
 pub use transcode::Transcoder;
 #[cfg(target_os = "windows")]
 pub use vp9::decoder::Vp9Decoder;
-
-pub use rust_video_caps::transcode::GpuCaps;
 
 /// Direct3D 12 video tier.
 pub struct D3d12;

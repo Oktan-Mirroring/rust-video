@@ -18,7 +18,8 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let mut encoder = match D3d12Encoder::open(&device, Codec::H265) {
+    let config = D3d12Encoder::legacy_config(Codec::H265).expect("legacy hevc");
+    let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no h265 encoder ({error})");

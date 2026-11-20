@@ -7,9 +7,13 @@
 
 use std::mem::ManuallyDrop;
 
+use crate::config::{MappedConfig, MappedLevel, MappedProfile, MappedRate};
 use crate::error::{D3d12Error, UnsupportedReason};
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 
+use rust_video_caps::color::{ColorConfig, ColorRange};
+use rust_video_caps::encode::FrameRate;
+use rust_video_caps::reason::UnsupportedReason as SharedUnsupported;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandQueue, ID3D12GraphicsCommandList, ID3D12Resource, D3D12_BOX,
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE, D3D12_HEAP_TYPE_DEFAULT,
@@ -70,18 +74,20 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_SUBREGIONS_LAYOUT_DATA,
     D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC, D3D12_VIDEO_ENCODER_PROFILE_DESC,
     D3D12_VIDEO_ENCODER_PROFILE_H264, D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH,
-    D3D12_VIDEO_ENCODER_PROFILE_HEVC, D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN,
-    D3D12_VIDEO_ENCODER_RATE_CONTROL, D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS,
+    D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN, D3D12_VIDEO_ENCODER_PROFILE_HEVC,
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN, D3D12_VIDEO_ENCODER_RATE_CONTROL,
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR, D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS,
     D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0, D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
-    D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP,
-    D3D12_VIDEO_ENCODER_RECONSTRUCTED_PICTURE,
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR,
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP, D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR,
+    D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR, D3D12_VIDEO_ENCODER_RECONSTRUCTED_PICTURE,
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_INPUT_ARGUMENTS,
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS,
     D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC, D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAGS,
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE, D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_0,
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_H264,
-    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC, D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN,
-    D3D12_VIDEO_ENCODE_REFERENCE_FRAMES,
+    D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC, D3D12_VIDEO_ENCODER_TIER_HEVC_HIGH,
+    D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN, D3D12_VIDEO_ENCODE_REFERENCE_FRAMES,
 };
 
 /// Macroblock edge in luma samples.
@@ -90,11 +96,11 @@ const MB: u32 = 16;
 /// Metadata staging fallback size in bytes.
 const META_CAP_FALLBACK: u64 = 128 * 1024;
 
-/// Constant quantizer behind intra frames.
-const INTRA_QP: u32 = 26;
-
 /// High profile idc.
-const PROFILE_IDC: u8 = 100;
+const PROFILE_IDC_HIGH: u8 = 100;
+
+/// Main profile idc.
+const PROFILE_IDC_MAIN: u8 = 77;
 
 /// Level ceiling per macroblock count, H.264 Table A-1.
 const LEVELS: &[(u32, u8)] = &[
@@ -170,7 +176,25 @@ impl H264Headers {
     /// # Errors
     ///
     /// Returns `Err` for an odd visible extent or past level 5.2.
+    #[cfg(test)]
     pub(crate) fn build(width: u32, height: u32) -> Result<Self, D3d12Error> {
+        Self::build_mapped(width, height, MappedConfig::LEGACY_H264)
+    }
+
+    /// Headers for `width` by `height` under `mapped`.
+    ///
+    /// A padded extent carries a frame crop rectangle over the visible
+    /// size; the encoder session codes the padded grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an odd visible extent, past level 5.2, or when the
+    /// extent needs a level above the pinned one.
+    pub(crate) fn build_mapped(
+        width: u32,
+        height: u32,
+        mapped: MappedConfig,
+    ) -> Result<Self, D3d12Error> {
         let coded = (pad_grid(width)?, pad_grid(height)?);
         let crop = pad_crop(coded, (width, height))?;
         let mbs = coded
@@ -178,7 +202,7 @@ impl H264Headers {
             .checked_div(MB)
             .and_then(|w| coded.1.checked_div(MB).and_then(|h| w.checked_mul(h)))
             .ok_or(D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let level_idc = LEVELS.iter().find(|entry| mbs <= entry.0).map_or_else(
+        let required = LEVELS.iter().find(|entry| mbs <= entry.0).map_or_else(
             || {
                 Err(D3d12Error::Unsupported(
                     UnsupportedReason::ExtentAboveLevel52,
@@ -186,6 +210,16 @@ impl H264Headers {
             },
             |entry| Ok(entry.1),
         )?;
+        let level_idc = match mapped.level {
+            MappedLevel::Auto => required,
+            MappedLevel::Pinned { idc } => {
+                if required > idc {
+                    return Err(D3d12Error::OverCaps { what: "level" });
+                }
+                idc
+            }
+        };
+        let main = matches!(mapped.profile, MappedProfile::H264Main);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x67]);
         bytes.extend_from_slice(&sps_body(
@@ -193,6 +227,8 @@ impl H264Headers {
             coded.1 / MB - 1,
             level_idc,
             crop,
+            main,
+            mapped.color,
         ));
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x68]);
         bytes.extend_from_slice(&pps_body());
@@ -225,17 +261,28 @@ fn sps_body(
     height_mbs_minus1: u32,
     level_idc: u8,
     crop: Option<crate::h264::frontend::Crop>,
+    main: bool,
+    color: Option<ColorConfig>,
 ) -> Vec<u8> {
     let mut writer = BitWriter::new();
-    writer.bits(u32::from(PROFILE_IDC), 8);
+    writer.bits(
+        u32::from(if main {
+            PROFILE_IDC_MAIN
+        } else {
+            PROFILE_IDC_HIGH
+        }),
+        8,
+    );
     writer.bits(0, 8);
     writer.bits(u32::from(level_idc), 8);
     writer.ue(0);
-    writer.ue(1);
-    writer.ue(0);
-    writer.ue(0);
-    writer.bit(false);
-    writer.bit(false);
+    if !main {
+        writer.ue(1);
+        writer.ue(0);
+        writer.ue(0);
+        writer.bit(false);
+        writer.bit(false);
+    }
     writer.ue(0);
     writer.ue(0);
     writer.ue(0);
@@ -254,8 +301,33 @@ fn sps_body(
     } else {
         writer.bit(false);
     }
-    writer.bit(false);
+    match color {
+        Some(color) => {
+            writer.bit(true);
+            vui_h264(&mut writer, &color);
+        }
+        None => writer.bit(false),
+    }
     writer.finish()
+}
+
+/// VUI color description for `color`, H.264 E.1.1.
+fn vui_h264(writer: &mut BitWriter, color: &ColorConfig) {
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(true);
+    writer.bits(5, 3);
+    writer.bit(color.range == ColorRange::Full);
+    writer.bit(true);
+    writer.bits(u32::from(color.primaries.idc()), 8);
+    writer.bits(u32::from(color.transfer.idc()), 8);
+    writer.bits(u32::from(color.matrix.idc()), 8);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
 }
 
 /// Annex B parameter sets matching the HEVC encoder configuration.
@@ -279,14 +351,34 @@ impl HevcHeaders {
     /// # Errors
     ///
     /// Returns `Err` for an odd visible extent or past level 6.2.
+    #[cfg(test)]
     pub(crate) fn build(width: u32, height: u32) -> Result<Self, D3d12Error> {
+        Self::build_mapped(width, height, MappedConfig::LEGACY_HEVC)
+    }
+
+    /// Headers for `width` by `height` under `mapped`.
+    ///
+    /// Block sizes match the encoder configuration: 8 to 32 luma
+    /// coding blocks, 4 to 32 luma transform blocks, depth one. A
+    /// padded extent carries a conformance window over the visible
+    /// size; the encoder session codes the padded grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for an odd visible extent, past level 6.2, or when the
+    /// extent needs a level above the pinned one.
+    pub(crate) fn build_mapped(
+        width: u32,
+        height: u32,
+        mapped: MappedConfig,
+    ) -> Result<Self, D3d12Error> {
         let coded = (pad_grid(width)?, pad_grid(height)?);
         let crop = pad_crop(coded, (width, height))?;
         let samples = coded
             .0
             .checked_mul(coded.1)
             .ok_or(D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
-        let level_idc = LEVELS_HEVC
+        let required = LEVELS_HEVC
             .iter()
             .find(|entry| samples <= entry.0)
             .map_or_else(
@@ -297,11 +389,28 @@ impl HevcHeaders {
                 },
                 |entry| Ok(entry.1),
             )?;
+        let level_idc = match mapped.level {
+            MappedLevel::Auto => required,
+            MappedLevel::Pinned { idc } => {
+                if required > idc {
+                    return Err(D3d12Error::OverCaps { what: "level" });
+                }
+                idc
+            }
+        };
+        let high_tier = mapped.high_tier(level_idc);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x40, 0x01]);
-        bytes.extend_from_slice(&hevc_vps_body(level_idc));
+        bytes.extend_from_slice(&hevc_vps_body(level_idc, high_tier));
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01]);
-        bytes.extend_from_slice(&hevc_sps_body(coded.0, coded.1, level_idc, crop));
+        bytes.extend_from_slice(&hevc_sps_body(
+            coded.0,
+            coded.1,
+            level_idc,
+            crop,
+            high_tier,
+            mapped.color,
+        ));
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01]);
         bytes.extend_from_slice(&hevc_pps_body());
         Ok(Self {
@@ -328,7 +437,7 @@ impl HevcHeaders {
 }
 
 /// Video set body for the encoder configuration.
-fn hevc_vps_body(level_idc: u8) -> Vec<u8> {
+fn hevc_vps_body(level_idc: u8, high_tier: bool) -> Vec<u8> {
     let mut writer = BitWriter::new();
     writer.bits(0, 4);
     writer.bit(true);
@@ -337,7 +446,7 @@ fn hevc_vps_body(level_idc: u8) -> Vec<u8> {
     writer.bits(0, 3);
     writer.bit(true);
     writer.bits(0xFFFF, 16);
-    hevc_profile_tier(&mut writer, level_idc);
+    hevc_profile_tier(&mut writer, level_idc, high_tier);
     writer.bit(true);
     writer.ue(0);
     writer.ue(0);
@@ -355,12 +464,14 @@ fn hevc_sps_body(
     height: u32,
     level_idc: u8,
     crop: Option<crate::h264::frontend::Crop>,
+    high_tier: bool,
+    color: Option<ColorConfig>,
 ) -> Vec<u8> {
     let mut writer = BitWriter::new();
     writer.bits(0, 4);
     writer.bits(0, 3);
     writer.bit(true);
-    hevc_profile_tier(&mut writer, level_idc);
+    hevc_profile_tier(&mut writer, level_idc, high_tier);
     writer.ue(0);
     writer.ue(1);
     writer.ue(width);
@@ -395,15 +506,42 @@ fn hevc_sps_body(
     writer.bit(false);
     writer.bit(false);
     writer.bit(true);
-    writer.bit(false);
+    match color {
+        Some(color) => {
+            writer.bit(true);
+            vui_hevc(&mut writer, &color);
+        }
+        None => writer.bit(false),
+    }
     writer.bit(false);
     writer.finish()
 }
 
-/// General profile, tier, and level for the encoder configuration.
-fn hevc_profile_tier(writer: &mut BitWriter, level_idc: u8) {
-    writer.bits(0, 2);
+/// VUI color description for `color`, H.265 E.3.1.
+fn vui_hevc(writer: &mut BitWriter, color: &ColorConfig) {
     writer.bit(false);
+    writer.bit(false);
+    writer.bit(true);
+    writer.bits(5, 3);
+    writer.bit(color.range == ColorRange::Full);
+    writer.bit(true);
+    writer.bits(u32::from(color.primaries.idc()), 8);
+    writer.bits(u32::from(color.transfer.idc()), 8);
+    writer.bits(u32::from(color.matrix.idc()), 8);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(false);
+}
+
+/// General profile, tier, and level for the encoder configuration.
+fn hevc_profile_tier(writer: &mut BitWriter, level_idc: u8, high_tier: bool) {
+    writer.bits(0, 2);
+    writer.bit(high_tier);
     writer.bits(1, 5);
     writer.bits(0x4000_0000, 32);
     writer.bit(true);
@@ -491,9 +629,9 @@ fn pad_nv12(
     let (coded_w, coded_h) = (coded_extent.0 as usize, coded_extent.1 as usize);
     let y_len = vis_w.saturating_mul(vis_h);
     if visible.len() < y_len + y_len / 2 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::Nv12ShortOfExtent,
-        ));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+            SharedUnsupported::Nv12ShortOfExtent,
+        )));
     }
     let mut out = Vec::with_capacity(coded_w * coded_h * 3 / 2);
     pad_plane(&visible[..y_len], vis_w, vis_h, coded_w, coded_h, &mut out);
@@ -716,6 +854,10 @@ pub(crate) struct EncodeSession {
     resolved_staging: ID3D12Resource,
     /// Codec behind the session.
     codec: crate::guid::Codec,
+    /// Rate control behind submits.
+    rate: MappedRate,
+    /// Target frame rate behind submits.
+    frame_rate: FrameRate,
     /// Coded width in luma samples.
     width: u32,
     /// Coded height in luma samples.
@@ -762,29 +904,39 @@ struct HevcDescriptors {
     resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC,
 }
 
+/// FFI rate control parameters behind one submit.
+enum FfiRate {
+    /// Constant quantizer.
+    Cqp(D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP),
+    /// Constant bitrate.
+    Cbr(D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR),
+    /// Variable bitrate.
+    Vbr(D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR),
+}
+
 impl EncodeSession {
-    /// Session over `device` for `codec` at `width` by `height`.
+    /// Session over `device` for `mapped` at `width` by `height`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` without a `codec` encoder, past the
+    /// Returns `Err` without an encoder for the mapped profile, past the
     /// adapter encode caps, or when the driver refuses the session.
     ///
     /// # Arguments
     ///
     /// * `device` - D3D12 device behind the session.
-    /// * `codec` - codec the session encodes.
+    /// * `mapped` - mapped session configuration.
     /// * `width` - visible width in luma samples.
     /// * `height` - visible height in luma samples.
     /// * `queues` - submit queues from the dropped session, absent on first open.
     pub(crate) fn open(
         device: &crate::device::D3d12Device,
-        codec: crate::guid::Codec,
+        mapped: MappedConfig,
         width: u32,
         height: u32,
         queues: Option<EncodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        Self::open_windows(device, codec, width, height, queues)
+        Self::open_windows(device, mapped, width, height, queues)
     }
 
     /// Submit queues plus slots for the next session rebuild.
@@ -799,20 +951,15 @@ impl EncodeSession {
         }
     }
 
-    /// Session over `device` for `codec` at `width` by `height`.
+    /// Session over `device` for `mapped` at `width` by `height`.
     fn open_windows(
         device: &crate::device::D3d12Device,
-        codec: crate::guid::Codec,
+        mapped: MappedConfig,
         width: u32,
         height: u32,
         queues: Option<EncodeQueues>,
     ) -> Result<Self, D3d12Error> {
-        if codec != crate::guid::Codec::H264 && codec != crate::guid::Codec::H265 {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::EncodeArgsPending { codec },
-            ));
-        }
-        let (mut descriptors, header_bytes) = Self::descriptors(codec, width, height)?;
+        let (mut descriptors, header_bytes) = Self::descriptors(mapped, width, height)?;
         let (coded_width, coded_height) = match descriptors.as_ref() {
             EncoderDescriptors::H264(h264) => (h264.resolution.Width, h264.resolution.Height),
             EncoderDescriptors::Hevc(hevc) => (hevc.resolution.Width, hevc.resolution.Height),
@@ -836,7 +983,9 @@ impl EncodeSession {
             Self::query_requirements(device.video(), &mut descriptors, coded_width, coded_height)?;
         let buffers = Self::open_buffers(&resources, coded_width, coded_height, meta_cap)?;
         Ok(Self {
-            codec,
+            codec: mapped.profile.codec(),
+            rate: mapped.rate,
+            frame_rate: mapped.frame_rate,
             video_queue,
             video,
             copy_queue,
@@ -870,19 +1019,24 @@ impl EncodeSession {
         })
     }
 
-    /// Descriptors plus header bytes for `codec` at visible `width` by `height`.
+    /// Descriptors plus header bytes for `mapped` at visible `width` by `height`.
     fn descriptors(
-        codec: crate::guid::Codec,
+        mapped: MappedConfig,
         width: u32,
         height: u32,
     ) -> Result<(Box<EncoderDescriptors>, Vec<u8>), D3d12Error> {
-        match codec {
-            crate::guid::Codec::H264 => {
-                let headers = H264Headers::build(width, height)?;
+        match mapped.profile {
+            MappedProfile::H264Main | MappedProfile::H264High => {
+                let headers = H264Headers::build_mapped(width, height, mapped)?;
                 let level = Self::level_h264(headers.level_idc())?;
                 let (coded_width, coded_height) = headers.coded();
+                let profile = if matches!(mapped.profile, MappedProfile::H264Main) {
+                    D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN
+                } else {
+                    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH
+                };
                 let descriptors = EncoderDescriptors::H264(H264Descriptors {
-                    profile: D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH,
+                    profile,
                     level_setting: level,
                     codec_config: Self::codec_config_h264(),
                     resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
@@ -892,13 +1046,21 @@ impl EncodeSession {
                 });
                 Ok((Box::new(descriptors), headers.into_bytes()))
             }
-            crate::guid::Codec::H265 => {
-                let headers = HevcHeaders::build(width, height)?;
+            MappedProfile::HevcMain => {
+                let headers = HevcHeaders::build_mapped(width, height, mapped)?;
                 let level = Self::level_hevc(headers.level_idc())?;
                 let (coded_width, coded_height) = headers.coded();
+                let tier = if mapped.high_tier(headers.level_idc()) {
+                    D3D12_VIDEO_ENCODER_TIER_HEVC_HIGH
+                } else {
+                    D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN
+                };
                 let descriptors = EncoderDescriptors::Hevc(HevcDescriptors {
                     profile: D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN,
-                    level_setting: level,
+                    level_setting: D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC {
+                        Level: level,
+                        Tier: tier,
+                    },
                     codec_config: Self::codec_config_hevc(),
                     resolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
                         Width: coded_width,
@@ -907,9 +1069,6 @@ impl EncodeSession {
                 });
                 Ok((Box::new(descriptors), headers.into_bytes()))
             }
-            _ => Err(D3d12Error::Unsupported(
-                UnsupportedReason::EncodeArgsPending { codec },
-            )),
         }
     }
 
@@ -936,32 +1095,24 @@ impl EncodeSession {
         }
     }
 
-    /// Encoder level for `level_idc` on the main tier.
-    fn level_hevc(
-        level_idc: u8,
-    ) -> Result<D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC, D3d12Error> {
-        let level: D3D12_VIDEO_ENCODER_LEVELS_HEVC = match level_idc {
-            30 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_1,
-            60 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_2,
-            63 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_21,
-            90 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_3,
-            93 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_31,
-            120 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_4,
-            123 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_41,
-            150 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_5,
-            153 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_51,
-            156 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_52,
-            180 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_6,
-            183 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_61,
-            186 => D3D12_VIDEO_ENCODER_LEVELS_HEVC_62,
-            _ => {
-                return Err(D3d12Error::Unsupported(UnsupportedReason::LevelOutside62));
-            }
-        };
-        Ok(D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC {
-            Level: level,
-            Tier: D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN,
-        })
+    /// Encoder level for `level_idc`.
+    fn level_hevc(level_idc: u8) -> Result<D3D12_VIDEO_ENCODER_LEVELS_HEVC, D3d12Error> {
+        match level_idc {
+            30 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_1),
+            60 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_2),
+            63 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_21),
+            90 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_3),
+            93 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_31),
+            120 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_4),
+            123 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_41),
+            150 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_5),
+            153 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_51),
+            156 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_52),
+            180 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_6),
+            183 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_61),
+            186 => Ok(D3D12_VIDEO_ENCODER_LEVELS_HEVC_62),
+            _ => Err(D3d12Error::Unsupported(UnsupportedReason::LevelOutside62)),
+        }
     }
 
     /// Intra-only codec configuration.
@@ -1011,33 +1162,100 @@ impl EncodeSession {
         }
     }
 
-    /// Constant quantizer behind every frame type.
-    fn cqp() -> D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP {
-        D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP {
-            ConstantQP_FullIntracodedFrame: INTRA_QP,
-            ConstantQP_InterPredictedFrame_PrevRefOnly: INTRA_QP,
-            ConstantQP_InterPredictedFrame_BiDirectionalRef: INTRA_QP,
+    /// FFI rate control for `rate`.
+    fn ffi_rate(rate: MappedRate) -> FfiRate {
+        match rate {
+            MappedRate::Cqp { qp } => FfiRate::Cqp(D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP {
+                ConstantQP_FullIntracodedFrame: qp,
+                ConstantQP_InterPredictedFrame_PrevRefOnly: qp,
+                ConstantQP_InterPredictedFrame_BiDirectionalRef: qp,
+            }),
+            MappedRate::Cbr {
+                initial_qp,
+                min_qp,
+                max_qp,
+                max_frame_bits,
+                target_bitrate,
+                vbv_capacity,
+                vbv_fullness,
+            } => FfiRate::Cbr(D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR {
+                InitialQP: initial_qp,
+                MinQP: min_qp,
+                MaxQP: max_qp,
+                MaxFrameBitSize: max_frame_bits,
+                TargetBitRate: target_bitrate,
+                VBVCapacity: vbv_capacity,
+                InitialVBVFullness: vbv_fullness,
+            }),
+            MappedRate::Vbr {
+                initial_qp,
+                min_qp,
+                max_qp,
+                max_frame_bits,
+                target_avg,
+                peak,
+                vbv_capacity,
+                vbv_fullness,
+            } => FfiRate::Vbr(D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR {
+                InitialQP: initial_qp,
+                MinQP: min_qp,
+                MaxQP: max_qp,
+                MaxFrameBitSize: max_frame_bits,
+                TargetAvgBitRate: target_avg,
+                PeakBitRate: peak,
+                VBVCapacity: vbv_capacity,
+                InitialVBVFullness: vbv_fullness,
+            }),
         }
     }
 
-    /// Rate control over `cqp`.
-    fn rate_control(
-        cqp: &D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
-    ) -> D3D12_VIDEO_ENCODER_RATE_CONTROL {
-        D3D12_VIDEO_ENCODER_RATE_CONTROL {
-            Mode: D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP,
-            Flags: D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE,
-            ConfigParams: D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS {
-                DataSize:
-                    u32::try_from(std::mem::size_of::<D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP>())
-                        .unwrap_or(u32::MAX),
-                Anonymous: D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0 {
-                    pConfiguration_CQP: std::ptr::from_ref(cqp),
+    /// Rate control over `rc` at `fps`.
+    fn rate_control(rc: &FfiRate, fps: FrameRate) -> D3D12_VIDEO_ENCODER_RATE_CONTROL {
+        let (mode, params) = match rc {
+            FfiRate::Cqp(cqp) => (
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CQP,
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS {
+                    DataSize: u32::try_from(std::mem::size_of::<
+                        D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
+                    >())
+                    .unwrap_or(u32::MAX),
+                    Anonymous: D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0 {
+                        pConfiguration_CQP: std::ptr::from_ref(cqp),
+                    },
                 },
-            },
+            ),
+            FfiRate::Cbr(cbr) => (
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_CBR,
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS {
+                    DataSize: u32::try_from(std::mem::size_of::<
+                        D3D12_VIDEO_ENCODER_RATE_CONTROL_CBR,
+                    >())
+                    .unwrap_or(u32::MAX),
+                    Anonymous: D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0 {
+                        pConfiguration_CBR: std::ptr::from_ref(cbr),
+                    },
+                },
+            ),
+            FfiRate::Vbr(vbr) => (
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_MODE_VBR,
+                D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS {
+                    DataSize: u32::try_from(std::mem::size_of::<
+                        D3D12_VIDEO_ENCODER_RATE_CONTROL_VBR,
+                    >())
+                    .unwrap_or(u32::MAX),
+                    Anonymous: D3D12_VIDEO_ENCODER_RATE_CONTROL_CONFIGURATION_PARAMS_0 {
+                        pConfiguration_VBR: std::ptr::from_ref(vbr),
+                    },
+                },
+            ),
+        };
+        D3D12_VIDEO_ENCODER_RATE_CONTROL {
+            Mode: mode,
+            Flags: D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE,
+            ConfigParams: params,
             TargetFrameRate: DXGI_RATIONAL {
-                Numerator: 30,
-                Denominator: 1,
+                Numerator: fps.num,
+                Denominator: fps.den,
             },
         }
     }
@@ -1558,12 +1776,13 @@ impl EncodeSession {
         }
     }
 
-    /// Sequence control over `cqp` and `gop` at `width` by `height`.
+    /// Sequence control over `rc` and `gop` at `width` by `height`.
     fn sequence_control(
-        cqp: &D3D12_VIDEO_ENCODER_RATE_CONTROL_CQP,
+        rc: &FfiRate,
         gop: D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE,
         width: u32,
         height: u32,
+        fps: FrameRate,
     ) -> D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC {
         D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_DESC {
             Flags: D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAGS(0),
@@ -1571,7 +1790,7 @@ impl EncodeSession {
                 Mode: D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE,
                 IntraRefreshDuration: 0,
             },
-            RateControl: Self::rate_control(cqp),
+            RateControl: Self::rate_control(rc, fps),
             PictureTargetResolution: D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC {
                 Width: width,
                 Height: height,
@@ -1620,7 +1839,7 @@ impl EncodeSession {
             Self::picture_data_h264(&mut pic_h264)
         };
         let picture_control = Self::picture_control(codec_data);
-        let cqp = Self::cqp();
+        let rc = Self::ffi_rate(self.rate);
         let mut gop_h264 = Self::gop_h264();
         let mut gop_hevc = Self::gop_hevc();
         let gop = if hevc {
@@ -1628,7 +1847,7 @@ impl EncodeSession {
         } else {
             Self::sequence_gop_h264(&mut gop_h264)
         };
-        let sequence = Self::sequence_control(&cqp, gop, self.width, self.height);
+        let sequence = Self::sequence_control(&rc, gop, self.width, self.height, self.frame_rate);
         let input_args = D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS {
             SequenceControlDesc: sequence,
             PictureControlDesc: picture_control,
@@ -1847,8 +2066,38 @@ impl EncodeSession {
 mod tests {
     use super::{pad_nv12, H264Headers, HevcHeaders};
 
+    use crate::config::{MappedConfig, MappedLevel, MappedProfile, MappedRate};
     use crate::h264::frontend::{parse_pps, parse_sps, rbsp, split_nals};
     use crate::h265::frontend as hevc;
+
+    use rust_video_caps::color::{
+        ColorConfig, ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristics,
+    };
+    use rust_video_caps::encode::{FrameRate, SpeedPreset};
+
+    /// Mapped Main config with `color` VUI.
+    fn main_color(color: ColorConfig) -> MappedConfig {
+        MappedConfig {
+            profile: MappedProfile::H264Main,
+            level: MappedLevel::Auto,
+            rate: MappedRate::Cqp { qp: 26 },
+            preset: SpeedPreset::Realtime,
+            frame_rate: FrameRate { num: 30, den: 1 },
+            color: Some(color),
+        }
+    }
+
+    /// Mapped HEVC config with `preset` and `color` VUI.
+    fn hevc_mapped(preset: SpeedPreset, color: ColorConfig) -> MappedConfig {
+        MappedConfig {
+            profile: MappedProfile::HevcMain,
+            level: MappedLevel::Auto,
+            rate: MappedRate::Cqp { qp: 26 },
+            preset,
+            frame_rate: FrameRate { num: 30, den: 1 },
+            color: Some(color),
+        }
+    }
 
     #[test]
     fn headers_round_trip_through_parser() {
@@ -1974,5 +2223,126 @@ mod tests {
         );
         assert!(HevcHeaders::build(65, 48).is_err());
         assert!(HevcHeaders::build(8192, 8192).is_err());
+    }
+
+    #[test]
+    fn mapped_main_headers_parse() {
+        let mapped = main_color(ColorConfig::default());
+        let headers = H264Headers::build_mapped(64, 48, mapped).expect("headers");
+        assert_eq!(headers.level_idc(), 10);
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
+        assert_eq!(nals.len(), 2);
+        let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
+        assert_eq!(sps.profile_idc, 77);
+        assert_eq!(sps.level_idc, 10);
+        assert_eq!((sps.width(), sps.height()), (64, 48));
+        let signal = sps
+            .vui
+            .as_ref()
+            .expect("vui")
+            .signal
+            .as_ref()
+            .expect("signal");
+        assert_eq!(signal.format, 5);
+        assert!(!signal.full_range);
+        let colour = signal.colour.as_ref().expect("colour");
+        assert_eq!(
+            (colour.primaries, colour.transfer, colour.matrix),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn mapped_high_full_range_pq_parses() {
+        let color = ColorConfig {
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::SmpteSt2084,
+            matrix: MatrixCoefficients::Bt2020Ncl,
+            range: ColorRange::Full,
+            ..Default::default()
+        };
+        let mut mapped = main_color(color);
+        mapped.profile = MappedProfile::H264High;
+        let headers = H264Headers::build_mapped(64, 48, mapped).expect("headers");
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
+        let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
+        assert_eq!(sps.profile_idc, 100);
+        let signal = sps
+            .vui
+            .as_ref()
+            .expect("vui")
+            .signal
+            .as_ref()
+            .expect("signal");
+        assert!(signal.full_range);
+        let parsed = signal.colour.as_ref().expect("colour");
+        assert_eq!(
+            (parsed.primaries, parsed.transfer, parsed.matrix),
+            (9, 16, 9)
+        );
+    }
+
+    #[test]
+    fn mapped_pinned_level_applies() {
+        let mut mapped = main_color(ColorConfig::default());
+        mapped.level = MappedLevel::Pinned { idc: 31 };
+        let headers = H264Headers::build_mapped(64, 48, mapped).expect("headers");
+        assert_eq!(headers.level_idc(), 31);
+        let bytes = headers.into_bytes();
+        let nals = split_nals(&bytes);
+        let sps = parse_sps(&rbsp(nals[0])[1..]).expect("sps");
+        assert_eq!(sps.level_idc, 31);
+    }
+
+    #[test]
+    fn mapped_pinned_level_below_extent_declines() {
+        let mut mapped = main_color(ColorConfig::default());
+        mapped.level = MappedLevel::Pinned { idc: 10 };
+        let Err(error) = H264Headers::build_mapped(1280, 720, mapped) else {
+            panic!("pinned level below extent declines");
+        };
+        assert_eq!(error.to_string(), "stream level above adapter caps");
+    }
+
+    #[test]
+    fn hevc_mapped_tier_and_vui_parse() {
+        let mapped = hevc_mapped(SpeedPreset::Quality, ColorConfig::default());
+        let headers = HevcHeaders::build_mapped(1920, 1080, mapped).expect("headers");
+        assert_eq!(headers.level_idc(), 120);
+        let bytes = headers.into_bytes();
+        let nals = hevc::split_nals(&bytes);
+        assert_eq!(nals.len(), 3);
+        let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
+        assert!(sps.ptl.tier, "quality at L4 signals high tier");
+        assert_eq!(sps.level_idc, 120);
+        let signal = &sps.vui.as_ref().expect("vui").signal;
+        assert!(signal.present);
+        assert!(signal.colour_present);
+        assert_eq!(
+            (signal.primaries, signal.transfer, signal.matrix),
+            (1, 1, 1)
+        );
+        assert!(!signal.full_range);
+    }
+
+    #[test]
+    fn hevc_mapped_small_extent_stays_main_tier() {
+        let mapped = hevc_mapped(SpeedPreset::Quality, ColorConfig::default());
+        let headers = HevcHeaders::build_mapped(64, 48, mapped).expect("headers");
+        assert_eq!(headers.level_idc(), 30);
+        let bytes = headers.into_bytes();
+        let nals = hevc::split_nals(&bytes);
+        let sps = hevc::parse_sps(&rust_video_h265::rbsp(nals[1])[2..]).expect("sps");
+        assert!(!sps.ptl.tier, "below L4 clamps to main tier");
+    }
+
+    #[test]
+    fn legacy_header_open_bytes() {
+        let bytes = H264Headers::build(64, 48).expect("headers").into_bytes();
+        assert_eq!(&bytes[..8], &[0, 0, 0, 1, 0x67, 100, 0, 10]);
+        let bytes = HevcHeaders::build(64, 48).expect("headers").into_bytes();
+        assert_eq!(&bytes[..6], &[0, 0, 0, 1, 0x40, 0x01]);
     }
 }

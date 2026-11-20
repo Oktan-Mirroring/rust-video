@@ -16,7 +16,9 @@ use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::{ParseReason as SharedParse, UnsupportedReason as SharedUnsupported};
 use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
@@ -89,6 +91,15 @@ impl<'a> Av1Decoder<'a> {
     #[must_use]
     pub fn max_inflight(&self) -> usize {
         self.inflight_max
+    }
+
+    /// Submit gauges since decoder open.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        let mut stats = SubmitStats::new();
+        stats.add_resets(self.resets());
+        stats.fold_peak(self.max_inflight());
+        stats
     }
 
     /// Decode `frame`, queueing its outputs for readback into `pending`.
@@ -533,12 +544,14 @@ pub(crate) fn frame_active_av1(
     let width = seq.max_frame_width();
     let height = seq.max_frame_height();
     if header.frame_width > width || header.frame_height > height {
-        return Err(D3d12Error::Parse(
-            ParseReason::FrameSizeAboveSequenceMaximum,
-        ));
+        return Err(D3d12Error::Parse(ParseReason::Parse(
+            SharedParse::FrameSizeAboveSequenceMaximum,
+        )));
     }
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::OddNv12Extent));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+            SharedUnsupported::OddNv12Extent,
+        )));
     }
     if !header.frame_width.is_multiple_of(2) || !header.frame_height.is_multiple_of(2) {
         return Err(D3d12Error::Unsupported(UnsupportedReason::OddVisibleExtent));
@@ -553,8 +566,9 @@ pub(crate) fn frame_active_av1(
             bottom: height - header.frame_height,
         })
     };
-    let visible = PictureSize::new(header.frame_width, header.frame_height)
-        .ok_or(D3d12Error::Parse(ParseReason::CropEmptiesPicture))?;
+    let visible = PictureSize::new(header.frame_width, header.frame_height).ok_or(
+        D3d12Error::Parse(ParseReason::Parse(SharedParse::CropEmptiesPicture)),
+    )?;
     Ok(Active {
         sps_id: 0,
         width,

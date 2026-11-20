@@ -1,5 +1,6 @@
 //! H.265 Annex B ingest over the shared grammar.
 
+use rust_video_caps::reason::{ParseReason as SharedParse, UnsupportedReason as SharedUnsupported};
 use rust_video_h265::{HevcError, HevcGate, NalAction, ParseKind, UnsupportedKind};
 
 use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
@@ -26,55 +27,49 @@ pub(crate) struct Gate;
 impl HevcError for D3d12Error {
     /// Parse failure of `kind`.
     fn parse(kind: ParseKind) -> Self {
-        match kind {
-            ParseKind::EmptyCodedSize => Self::Parse(ParseReason::EmptyCodedSize),
-            ParseKind::ConformanceOutside => Self::Parse(ParseReason::ConfWinOutsideCodedSize),
-            ParseKind::RpsTableOversize => Self::Parse(ParseReason::Range {
+        Self::Parse(ParseReason::Parse(match kind {
+            ParseKind::EmptyCodedSize => SharedParse::EmptyCodedSize,
+            ParseKind::ConformanceOutside => SharedParse::ConfWinOutsideCodedSize,
+            ParseKind::RpsTableOversize => SharedParse::Range {
                 syntax: "num_short_term_ref_pic_sets",
-            }),
-            ParseKind::LtSpsOversize => Self::Parse(ParseReason::Range {
+            },
+            ParseKind::LtSpsOversize => SharedParse::Range {
                 syntax: "num_long_term_ref_pics_sps",
-            }),
-            ParseKind::LtTotalOversize => Self::Parse(ParseReason::Range {
+            },
+            ParseKind::LtTotalOversize => SharedParse::Range {
                 syntax: "num_long_term_pics",
-            }),
-            ParseKind::EmptySpsRps => Self::Parse(ParseReason::Range {
+            },
+            ParseKind::EmptySpsRps => SharedParse::Range {
                 syntax: "short_term_ref_pic_set_idx",
-            }),
-            ParseKind::Range { syntax } => Self::Parse(ParseReason::Range {
+            },
+            ParseKind::Range { syntax } => SharedParse::Range {
                 syntax: remap_syntax(syntax),
-            }),
-            ParseKind::Truncated { syntax } => Self::Parse(ParseReason::Truncated { syntax }),
-            ParseKind::OverflowU32 { syntax } => Self::Parse(ParseReason::OverflowU32 { syntax }),
-            ParseKind::OverflowI32 { syntax } => Self::Parse(ParseReason::OverflowI32 { syntax }),
-            ParseKind::TooWide { syntax } => Self::Parse(ParseReason::TooWide { syntax }),
-            ParseKind::NalForbiddenBit => Self::Parse(ParseReason::NalForbiddenBit),
-            ParseKind::NalTemporalId => Self::Parse(ParseReason::NalTemporalId),
-            ParseKind::VpsWithoutBody | ParseKind::SpsWithoutBody => {
-                Self::Parse(ParseReason::SpsWithoutBody)
-            }
-            ParseKind::PpsWithoutBody => Self::Parse(ParseReason::PpsWithoutBody),
-            ParseKind::SliceWithoutHeader => Self::Parse(ParseReason::SliceWithoutHeader),
-            ParseKind::PpsCitesUnknownSps => Self::Parse(ParseReason::PpsCitesUnknownSps),
-            ParseKind::SliceCitesUnknownPps => Self::Parse(ParseReason::SliceCitesUnknownPps),
-            ParseKind::SliceCitesUnknownSps => Self::Parse(ParseReason::SliceCitesUnknownSps),
-            ParseKind::PictureSlicesDisagree => Self::Parse(ParseReason::PictureSlicesDisagree),
-            ParseKind::NonIntraSliceInIdr => Self::Parse(ParseReason::NonIntraSliceInIdr),
-            ParseKind::ShortTermRefPicSetSize => Self::Parse(ParseReason::ShortTermRefPicSetSize),
-        }
+            },
+            ParseKind::Truncated { syntax } => SharedParse::Truncated { syntax },
+            ParseKind::OverflowU32 { syntax } => SharedParse::OverflowU32 { syntax },
+            ParseKind::OverflowI32 { syntax } => SharedParse::OverflowI32 { syntax },
+            ParseKind::TooWide { syntax } => SharedParse::TooWide { syntax },
+            ParseKind::NalForbiddenBit => SharedParse::NalForbiddenBit,
+            ParseKind::NalTemporalId => SharedParse::NalTemporalId,
+            ParseKind::VpsWithoutBody | ParseKind::SpsWithoutBody => SharedParse::SpsWithoutBody,
+            ParseKind::PpsWithoutBody => SharedParse::PpsWithoutBody,
+            ParseKind::SliceWithoutHeader => SharedParse::SliceWithoutHeader,
+            ParseKind::PpsCitesUnknownSps => SharedParse::PpsCitesUnknownSps,
+            ParseKind::SliceCitesUnknownPps => SharedParse::SliceCitesUnknownPps,
+            ParseKind::SliceCitesUnknownSps => SharedParse::SliceCitesUnknownSps,
+            ParseKind::PictureSlicesDisagree => SharedParse::PictureSlicesDisagree,
+            ParseKind::NonIntraSliceInIdr => SharedParse::NonIntraSliceInIdr,
+            ParseKind::ShortTermRefPicSetSize => SharedParse::ShortTermRefPicSetSize,
+        }))
     }
 
     /// Tier-declined construct of `kind`.
     fn unsupported(kind: UnsupportedKind) -> Self {
-        match kind {
-            UnsupportedKind::DependentSlices => {
-                Self::Unsupported(UnsupportedReason::DependentSlicesPending)
-            }
-            UnsupportedKind::ArbitrarySliceOrder => {
-                Self::Unsupported(UnsupportedReason::ArbitrarySliceOrder)
-            }
-            UnsupportedKind::Multilayer => Self::Unsupported(UnsupportedReason::Multilayer),
-        }
+        Self::Unsupported(UnsupportedReason::Stream(match kind {
+            UnsupportedKind::DependentSlices => SharedUnsupported::DependentSlices,
+            UnsupportedKind::ArbitrarySliceOrder => SharedUnsupported::ArbitrarySliceOrder,
+            UnsupportedKind::Multilayer => SharedUnsupported::Multilayer,
+        }))
     }
 }
 
@@ -95,20 +90,24 @@ impl HevcGate<D3d12Error> for Gate {
     /// Sequence set against tier caps.
     fn check_sps(sps: &Sps) -> Result<(), D3d12Error> {
         if sps.max_sub_layers != 1 {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::Sublayers));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Sublayers,
+            )));
         }
         if sps.chroma_format != 1 {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::ChromaOutside420));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ChromaOutside420,
+            )));
         }
         if sps.bit_depth_luma != 0 {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::LumaDepthAbove8Bit,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::LumaDepthAbove8Bit,
+            )));
         }
         if sps.bit_depth_chroma != 0 {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::ChromaDepthAbove8Bit,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ChromaDepthAbove8Bit,
+            )));
         }
         if sps.scaling_enabled() {
             return Err(D3d12Error::Unsupported(
@@ -124,22 +123,24 @@ impl HevcGate<D3d12Error> for Gate {
             ));
         }
         if sps.ptl.profile_idc != 1 && sps.ptl.compat & 0x4000_0000 == 0 {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::ProfileOutsideMain,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ProfileOutsideMain,
+            )));
         }
         if sps.ptl.source.interlaced && !sps.ptl.source.progressive {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::Interlaced));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Interlaced,
+            )));
         }
         if !LEVELS.contains(&sps.ptl.level_idc) {
-            return Err(D3d12Error::Parse(ParseReason::Range {
+            return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "general_level_idc",
-            }));
+            })));
         }
         if sps.sps_extension_present {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::SpsExtensionPending,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::SpsExtension,
+            )));
         }
         Ok(())
     }
@@ -147,10 +148,14 @@ impl HevcGate<D3d12Error> for Gate {
     /// Picture set against tier caps with its sequence set, absent for orphans.
     fn check_pps(pps: &Pps, sps: Option<&Sps>) -> Result<(), D3d12Error> {
         let Some(sps) = sps else {
-            return Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PpsCitesUnknownSps,
+            )));
         };
         if pps.sps_id != sps.id {
-            return Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PpsCitesUnknownSps,
+            )));
         }
         if pps.flags & rust_video_h265::PPS_SCALING != 0 {
             return Err(D3d12Error::Unsupported(
@@ -158,9 +163,9 @@ impl HevcGate<D3d12Error> for Gate {
             ));
         }
         if pps.diff_cu_qp_delta_depth > 31 {
-            return Err(D3d12Error::Parse(ParseReason::Range {
+            return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "diff_cu_qp_delta_depth",
-            }));
+            })));
         }
         check_tile_grid(pps.num_tile_columns, pps.num_tile_rows)?;
         let ctb_log2 = sps
@@ -168,14 +173,14 @@ impl HevcGate<D3d12Error> for Gate {
             .saturating_add(3)
             .saturating_add(sps.log2_diff_max_min_cb_size);
         if pps.log2_parallel_merge_minus2 > ctb_log2.saturating_sub(2) {
-            return Err(D3d12Error::Parse(ParseReason::Range {
+            return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "log2_parallel_merge_level",
-            }));
+            })));
         }
         if pps.pps_extension_present {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::PpsExtensionPending,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::PpsExtension,
+            )));
         }
         Ok(())
     }
@@ -186,14 +191,16 @@ impl HevcGate<D3d12Error> for Gate {
             return Ok(());
         };
         if !first_first {
-            return Err(D3d12Error::Parse(ParseReason::PictureWithoutFirstSlice));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PictureWithoutFirstSlice,
+            )));
         }
         let mut previous = 0u32;
         for (addr, first) in addrs.iter().zip(firsts.iter()).skip(1) {
             if *first || *addr <= previous {
-                return Err(D3d12Error::Unsupported(
-                    UnsupportedReason::ArbitrarySliceOrder,
-                ));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                    SharedUnsupported::ArbitrarySliceOrder,
+                )));
             }
             previous = *addr;
         }
@@ -203,7 +210,9 @@ impl HevcGate<D3d12Error> for Gate {
     /// NAL unit action for `nal_type` on layer `layer_id`.
     fn classify_nal(nal_type: u8, layer_id: u16) -> Result<NalAction, D3d12Error> {
         if layer_id != 0 {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::Multilayer));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Multilayer,
+            )));
         }
         match nal_type {
             0..=9 | 16..=21 => Ok(NalAction::Vcl),
@@ -223,14 +232,14 @@ fn check_tile_grid(columns: u8, rows: u8) -> Result<(), D3d12Error> {
     let columns_minus1 = columns.saturating_sub(1);
     let rows_minus1 = rows.saturating_sub(1);
     if columns_minus1 > 31 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
+        return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
             syntax: "num_tile_columns_minus1",
-        }));
+        })));
     }
     if rows_minus1 > 31 {
-        return Err(D3d12Error::Parse(ParseReason::Range {
+        return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
             syntax: "num_tile_rows_minus1",
-        }));
+        })));
     }
     if columns_minus1 >= 19 || rows_minus1 >= 21 {
         return Err(D3d12Error::Unsupported(UnsupportedReason::TileGridPending));
@@ -256,6 +265,9 @@ mod gate_tests {
 
     use super::{ConstraintFlags, Gate, ProfileTierLevel, ScalingLists, SourceFlags};
     use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
+    use rust_video_caps::reason::{
+        ParseReason as SharedParse, UnsupportedReason as SharedUnsupported,
+    };
 
     /// Shared sequence set with Main profile and one sublayer.
     fn sps() -> SharedSps {
@@ -325,7 +337,9 @@ mod gate_tests {
         set.max_sub_layers = 2;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d12Error::Unsupported(UnsupportedReason::Sublayers))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Sublayers
+            )))
         ));
         let mut set = sps();
         set.flags |= rust_video_h265::SPS_SCALING;
@@ -354,23 +368,25 @@ mod gate_tests {
         set.ptl.compat = 0;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d12Error::Unsupported(
-                UnsupportedReason::ProfileOutsideMain
-            ))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ProfileOutsideMain
+            )))
         ));
         let mut set = sps();
         set.ptl.level_idc = 121;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+            Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::Range { .. }
+            )))
         ));
         let mut set = sps();
         set.sps_extension_present = true;
         assert!(matches!(
             Gate::check_sps(&set),
-            Err(D3d12Error::Unsupported(
-                UnsupportedReason::SpsExtensionPending
-            ))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::SpsExtension
+            )))
         ));
     }
 
@@ -404,13 +420,17 @@ mod gate_tests {
         pps.sps_id = 1;
         assert!(matches!(
             Gate::check_pps(&pps, Some(&sps)),
-            Err(D3d12Error::Parse(ParseReason::PpsCitesUnknownSps))
+            Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PpsCitesUnknownSps
+            )))
         ));
         pps.sps_id = 0;
         pps.diff_cu_qp_delta_depth = 32;
         assert!(matches!(
             Gate::check_pps(&pps, Some(&sps)),
-            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+            Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::Range { .. }
+            )))
         ));
         pps.diff_cu_qp_delta_depth = 0;
         pps.num_tile_columns = 20;
@@ -422,15 +442,17 @@ mod gate_tests {
         pps.log2_parallel_merge_minus2 = 5;
         assert!(matches!(
             Gate::check_pps(&pps, Some(&sps)),
-            Err(D3d12Error::Parse(ParseReason::Range { .. }))
+            Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::Range { .. }
+            )))
         ));
         pps.log2_parallel_merge_minus2 = 0;
         pps.pps_extension_present = true;
         assert!(matches!(
             Gate::check_pps(&pps, Some(&sps)),
-            Err(D3d12Error::Unsupported(
-                UnsupportedReason::PpsExtensionPending
-            ))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::PpsExtension
+            )))
         ));
     }
 
@@ -439,13 +461,15 @@ mod gate_tests {
         assert!(Gate::check_slice_order(&[0, 4], &[true, false]).is_ok());
         assert!(matches!(
             Gate::check_slice_order(&[4], &[false]),
-            Err(D3d12Error::Parse(ParseReason::PictureWithoutFirstSlice))
+            Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PictureWithoutFirstSlice
+            )))
         ));
         assert!(matches!(
             Gate::check_slice_order(&[0, 0], &[true, false]),
-            Err(D3d12Error::Unsupported(
-                UnsupportedReason::ArbitrarySliceOrder
-            ))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ArbitrarySliceOrder
+            )))
         ));
     }
 
@@ -463,7 +487,9 @@ mod gate_tests {
         ));
         assert!(matches!(
             Gate::classify_nal(1, 1),
-            Err(D3d12Error::Unsupported(UnsupportedReason::Multilayer))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Multilayer
+            )))
         ));
     }
 }

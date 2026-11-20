@@ -6,7 +6,7 @@ use crate::session::SharedExport;
 use crate::submit::Fence;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
+use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat, Surface};
 use windows::Win32::Graphics::Direct3D12::{ID3D12Fence, ID3D12Resource};
 
 /// Device-resident decode surface without CPU access.
@@ -132,9 +132,9 @@ impl GpuSurface {
     /// # Errors
     ///
     /// Returns `Err` when the GPU misses the wait budget.
-    pub fn wait(&self) -> Result<(), D3d12Error> {
+    pub fn try_wait(&self) -> Result<(), D3d12Error> {
         if let Some(wait) = &self.wait {
-            wait.wait()?;
+            wait.try_wait()?;
         }
         Ok(())
     }
@@ -155,6 +155,32 @@ impl GpuSurface {
             wait: None,
             shared: None,
         }
+    }
+}
+
+impl Surface for GpuSurface {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
     }
 }
 
@@ -202,7 +228,7 @@ impl SurfaceWait {
     }
 
     /// Surface completion through a transient event.
-    pub(crate) fn wait(&self) -> Result<(), D3d12Error> {
+    pub(crate) fn try_wait(&self) -> Result<(), D3d12Error> {
         Fence::wait_on(&self.fence, self.value)
     }
 }

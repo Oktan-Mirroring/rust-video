@@ -2,39 +2,21 @@
 
 use crate::guid::Codec;
 
-use rust_video_caps::frame::PixelFormat;
-use rust_video_caps::transcode::FallbackCause;
+use rust_video_caps::encode::Decline;
+use rust_video_caps::reason::{
+    BrokenReferenceReason as SharedBroken, ParseReason as SharedParse,
+    UnsupportedReason as SharedUnsupported,
+};
 
 /// Reference list naming a picture the buffer cannot supply.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum BrokenReferenceReason {
+    /// Shared reference failure.
+    #[error("{0}")]
+    Broken(SharedBroken),
     /// Crop target without a crop rectangle.
     #[error("crop target without crop")]
     CropTargetWithoutCrop,
-    /// Marking sweep names an absent picture.
-    #[error("marking target absent")]
-    MarkingTargetAbsent,
-    /// Reference naming an empty slot.
-    #[error("{reference} names empty slot")]
-    NamesEmptySlot {
-        /// Reference naming the empty slot.
-        reference: &'static str,
-    },
-    /// Sliding window finds no short-term picture.
-    #[error("no short-term to slide")]
-    NoShortTermToSlide,
-    /// Reference POC absent from the buffer.
-    #[error("reference poc {poc} absent")]
-    ReferencePocAbsent {
-        /// Missing picture order count.
-        poc: i32,
-    },
-    /// Move names an absent short-term picture.
-    #[error("short-term target absent")]
-    ShortTermTargetAbsent,
-    /// Slot outside the texture pool.
-    #[error("slot outside pool")]
-    SlotOutsidePool,
 }
 
 /// Hard D3D12 tier failure.
@@ -51,6 +33,9 @@ pub enum D3d12Error {
         /// Failing call status.
         hresult: i32,
     },
+    /// Encode configuration the tier declines.
+    #[error("encode declined: {0}")]
+    Declined(#[from] Decline),
     /// Bitstream the tier refuses: interlaced, depth and chroma outside
     /// 8-bit 4:2:0, or a pending picture builder.
     #[error("unsupported stream: {0}")]
@@ -92,150 +77,9 @@ pub enum D3d12Error {
 /// Bitstream element the parser rejects.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum ParseReason {
-    /// Window outside the coded size.
-    #[error("conf_win outside coded size")]
-    ConfWinOutsideCodedSize,
-    /// Crop empties the picture.
-    #[error("crop empties picture")]
-    CropEmptiesPicture,
-    /// Coded size of zero.
-    #[error("empty coded size")]
-    EmptyCodedSize,
-    /// Frame before its sequence header.
-    #[error("frame before sequence header")]
-    FrameBeforeSequenceHeader,
-    /// Crop extends past the coded size.
-    #[error("frame_crop outside coded size")]
-    FrameCropOutsideCodedSize,
-    /// Gap with gaps forbidden by the sequence.
-    #[error("frame_num gap with gaps forbidden")]
-    FrameNumGapForbidden,
-    /// Frame size above the sequence maximum.
-    #[error("frame size above sequence maximum")]
-    FrameSizeAboveSequenceMaximum,
-    /// Frame without tile data.
-    #[error("frame without tile data")]
-    FrameWithoutTileData,
-    /// Frame without tiles.
-    #[error("frame without tiles")]
-    FrameWithoutTiles,
-    /// Tile group short of its tiles.
-    #[error("incomplete tile group")]
-    IncompleteTileGroup,
-    /// NAL `forbidden_zero_bit` set.
-    #[error("nal forbidden bit")]
-    NalForbiddenBit,
-    /// NAL temporal id zero.
-    #[error("nal temporal id")]
-    NalTemporalId,
-    /// Non-intra slice inside an IDR picture.
-    #[error("non-intra slice in IDR")]
-    NonIntraSliceInIdr,
-    /// OBU extension reserved bits set.
-    #[error("obu extension reserved bits")]
-    ObuExtensionReservedBits,
-    /// OBU `forbidden_zero_bit` set.
-    #[error("obu forbidden bit")]
-    ObuForbiddenBit,
-    /// OBU reserved bit set.
-    #[error("obu reserved bit")]
-    ObuReservedBit,
-    /// OBU size past its payload.
-    #[error("obu size exceeds payload")]
-    ObuSizeExceedsPayload,
-    /// Signed Exp-Golomb code exceeds `i32`.
-    #[error("{syntax} overflows i32")]
-    OverflowI32 {
-        /// Syntax element under parse.
-        syntax: &'static str,
-    },
-    /// Exp-Golomb code exceeds 32 bits.
-    #[error("{syntax} overflows u32")]
-    OverflowU32 {
-        /// Syntax element under parse.
-        syntax: &'static str,
-    },
-    /// Slices of one picture disagree.
-    #[error("picture slices disagree")]
-    PictureSlicesDisagree,
-    /// Picture without its first slice.
-    #[error("picture without first slice")]
-    PictureWithoutFirstSlice,
-    /// Picture without an order count.
-    #[error("picture without poc")]
-    PictureWithoutPoc,
-    /// Picture without a reference set.
-    #[error("picture without reference set")]
-    PictureWithoutReferenceSet,
-    /// Picture without slices.
-    #[error("picture without slices")]
-    PictureWithoutSlices,
-    /// Order-count syntax against the sequence method.
-    #[error("poc syntax against sequence method")]
-    PocSyntaxAgainstSequenceMethod,
-    /// Picture set cites an unseen sequence set.
-    #[error("pps cites unknown sps")]
-    PpsCitesUnknownSps,
-    /// Picture set without a body.
-    #[error("pps without body")]
-    PpsWithoutBody,
-    /// Value outside its field width.
-    #[error("{syntax} range")]
-    Range {
-        /// Syntax element under parse.
-        syntax: &'static str,
-    },
-    /// Redundant header against the first.
-    #[error("redundant header mismatch")]
-    RedundantHeaderMismatch,
-    /// Reference with zero reference frames.
-    #[error("reference with zero ref frames")]
-    ReferenceWithZeroRefFrames,
-    /// Reserved OBU type.
-    #[error("reserved obu type")]
-    ReservedObuType,
-    /// Short-term set past its size.
-    #[error("short_term_ref_pic_set size")]
-    ShortTermRefPicSetSize,
-    /// Slice cites an unseen picture set.
-    #[error("slice cites unknown pps")]
-    SliceCitesUnknownPps,
-    /// Slice cites an unseen sequence set.
-    #[error("slice cites unknown sps")]
-    SliceCitesUnknownSps,
-    /// Slice header exceeds its length cap.
-    #[error("slice header too long")]
-    SliceHeaderTooLong,
-    /// Slice without a header.
-    #[error("slice without header")]
-    SliceWithoutHeader,
-    /// Sequence set without a body.
-    #[error("sps without body")]
-    SpsWithoutBody,
-    /// Tile grid short of the frame.
-    #[error("tile grid coverage")]
-    TileGridCoverage,
-    /// Tile groups out of order.
-    #[error("tile group order")]
-    TileGroupOrder,
-    /// Tile group without data.
-    #[error("tile group without data")]
-    TileGroupWithoutData,
-    /// Tile group without a frame header.
-    #[error("tile group without frame header")]
-    TileGroupWithoutFrameHeader,
-    /// Element wider than 32 bits.
-    #[error("{syntax} wider than 32 bits")]
-    TooWide {
-        /// Syntax element under parse.
-        syntax: &'static str,
-    },
-    /// NAL ends before the element completes.
-    #[error("truncated {syntax}")]
-    Truncated {
-        /// Syntax element under parse.
-        syntax: &'static str,
-    },
+    /// Shared parse failure.
+    #[error("{0}")]
+    Parse(SharedParse),
 }
 
 /// Machine declined by the D3D12 tier, with the cause.
@@ -267,21 +111,6 @@ pub enum SkipReason {
 /// Bitstream construct the D3D12 tier declines.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum UnsupportedReason {
-    /// Slices out of decode order.
-    #[error("arbitrary slice order")]
-    ArbitrarySliceOrder,
-    /// AV1 bit depth above the 8-bit target.
-    #[error("av1 {depth}-bit needs a {depth}-bit target")]
-    Av1BitDepthNeedsTarget {
-        /// Sequence bit depth.
-        depth: u8,
-    },
-    /// AV1 chroma outside 4:2:0.
-    #[error("av1 chroma outside 4:2:0")]
-    Av1ChromaOutside420,
-    /// AV1 monochrome.
-    #[error("av1 monochrome")]
-    Av1Monochrome,
     /// Driver bitstream above the length cap.
     #[error("bitstream too large")]
     BitstreamTooLarge,
@@ -291,15 +120,6 @@ pub enum UnsupportedReason {
         /// Call returning null.
         call: &'static str,
     },
-    /// Chroma depth above 8 bit.
-    #[error("chroma depth above 8 bit")]
-    ChromaDepthAbove8Bit,
-    /// Chroma outside 4:2:0.
-    #[error("chroma outside 4:2:0")]
-    ChromaOutside420,
-    /// Partitioned slices.
-    #[error("data partitions")]
-    DataPartitions,
     /// Decode without a picture builder.
     #[error("{codec} decode pending")]
     DecodePending {
@@ -309,9 +129,6 @@ pub enum UnsupportedReason {
     /// Decode tier 1 hardware.
     #[error("decode tier 1")]
     DecodeTier1,
-    /// Dependent slices.
-    #[error("dependent slices pending")]
-    DependentSlicesPending,
     /// Driver bitstream outside its buffer.
     #[error("driver bitstream outside buffer")]
     DriverBitstreamOutsideBuffer,
@@ -330,27 +147,12 @@ pub enum UnsupportedReason {
         /// Driver error flags.
         flags: u64,
     },
-    /// Encoder input outside NV12.
-    #[error("encoder input {format:?}; nv12 only")]
-    EncoderInputNotNv12 {
-        /// Rejected input layout.
-        format: PixelFormat,
-    },
     /// Extent above HEVC level 5.2.
     #[error("extent above level 5.2")]
     ExtentAboveLevel52,
     /// Extent above HEVC level 6.2.
     #[error("extent above level 6.2")]
     ExtentAboveLevel62,
-    /// GPU hop miss behind the transcode.
-    #[error("{cause}")]
-    Fallback {
-        /// Failed hop.
-        cause: FallbackCause,
-    },
-    /// Flexible macroblock order.
-    #[error("flexible macroblock order")]
-    FlexibleMacroblockOrder,
     /// Gap in frame numbers.
     #[error("frame_num gap")]
     FrameNumGap,
@@ -360,9 +162,6 @@ pub enum UnsupportedReason {
     /// Inter picture without references.
     #[error("inter picture needs references")]
     InterPictureNeedsReferences,
-    /// Interlaced fields.
-    #[error("interlaced")]
-    Interlaced,
     /// Level outside 5.2.
     #[error("level outside 5.2")]
     LevelOutside52,
@@ -372,18 +171,9 @@ pub enum UnsupportedReason {
     /// Long-term references.
     #[error("long-term refs pending")]
     LongTermRefsPending,
-    /// Luma depth above 8 bit.
-    #[error("luma depth above 8 bit")]
-    LumaDepthAbove8Bit,
     /// Packet with more than one picture.
     #[error("multi-picture packet needs per-picture encode")]
     MultiPicturePacketNeedsPerPictureEncode,
-    /// Multilayer slices.
-    #[error("multilayer")]
-    Multilayer,
-    /// Multiview slices.
-    #[error("multiview")]
-    Multiview,
     /// Codec without a decode profile.
     #[error("no {codec} decode profile")]
     NoDecodeProfile {
@@ -392,22 +182,13 @@ pub enum UnsupportedReason {
     },
     /// Codec without adapter video encode.
     #[error("no {codec} d3d12 video encode on this adapter")]
-    NoVideoEncode {
+    NoEncoder {
         /// Codec the adapter cannot encode.
         codec: Codec,
     },
     /// Non-IDR intra without order-count tracking.
     #[error("non-IDR intra needs POC tracking")]
     NonIdrIntraNeedsPocTracking,
-    /// NV12 bytes short of the extent.
-    #[error("nv12 short of its extent")]
-    Nv12ShortOfExtent,
-    /// NV12 frame without two planes.
-    #[error("nv12 frame without two planes")]
-    Nv12WithoutTwoPlanes,
-    /// Odd NV12 extent.
-    #[error("odd NV12 extent")]
-    OddNv12Extent,
     /// Odd visible extent.
     #[error("odd visible extent")]
     OddVisibleExtent,
@@ -435,42 +216,21 @@ pub enum UnsupportedReason {
     /// Picture without slices.
     #[error("picture without slices")]
     PictureWithoutSlices,
-    /// Plane short of its stride.
-    #[error("plane short of its stride")]
-    PlaneShortOfStride,
-    /// Plane stride below the width.
-    #[error("plane stride below width")]
-    PlaneStrideBelowWidth,
-    /// Picture-set extension data.
-    #[error("pps extension pending")]
-    PpsExtensionPending,
-    /// Profile outside main.
-    #[error("profile outside main")]
-    ProfileOutsideMain,
     /// Readback map returning null.
     #[error("readback map returned null")]
     ReadbackMapReturnedNull,
     /// Readback bytes short of the extent.
     #[error("readback short of extent")]
     ReadbackShortOfExtent,
-    /// Redundant pictures.
-    #[error("redundant pictures")]
-    RedundantPictures,
     /// Reference picture sets.
     #[error("reference sets pending")]
     ReferenceSetsPending,
-    /// Render size against the frame size.
-    #[error("render size differs from frame size")]
-    RenderSizeDiffersFromFrameSize,
     /// Reserved slice type.
     #[error("reserved slice type")]
     ReservedSliceType,
     /// Resolved metadata short of its length.
     #[error("resolved metadata short")]
     ResolvedMetadataShort,
-    /// Scale source outside the scaler.
-    #[error("scale source outside scaler")]
-    ScaleSourceOutsideScaler,
     /// Scale target outside even extents.
     #[error("scale target outside even extents")]
     ScaleTargetOutsideEvenExtents,
@@ -483,39 +243,18 @@ pub enum UnsupportedReason {
     /// Scaling lists.
     #[error("scaling lists pending")]
     ScalingListsPending,
-    /// SP/SI slices.
-    #[error("sp/si slices")]
-    SpSiSlices,
-    /// Spatial layers.
-    #[error("spatial layers")]
-    SpatialLayers,
-    /// Sequence-set extension data.
-    #[error("sps extension pending")]
-    SpsExtensionPending,
     /// Staging bytes short of the layout.
     #[error("staging short of its layout")]
     StagingShortOfLayout,
-    /// Temporal sublayers.
-    #[error("sublayers")]
-    Sublayers,
-    /// Superres upscale.
-    #[error("superres upscale")]
-    SuperresUpscale,
+    /// Shared stream decline.
+    #[error("{0}")]
+    Stream(SharedUnsupported),
     /// Texture extent outside the session.
     #[error("texture extent outside session")]
     TextureExtentOutsideSession,
-    /// Tile count above 256.
-    #[error("tile count above 256")]
-    TileCountAbove256,
     /// Tile grid.
     #[error("tile grid pending")]
     TileGridPending,
-    /// Tile list.
-    #[error("tile list")]
-    TileList,
-    /// Transform bypass.
-    #[error("transform bypass")]
-    TransformBypass,
     /// Upload map returning null.
     #[error("upload map returned null")]
     UploadMapReturnedNull,
@@ -529,7 +268,12 @@ mod tests {
     use super::{BrokenReferenceReason, D3d12Error, ParseReason, SkipReason, UnsupportedReason};
     use crate::guid::Codec;
 
+    use rust_video_caps::encode::Decline;
     use rust_video_caps::frame::PixelFormat;
+    use rust_video_caps::reason::{
+        BrokenReferenceReason as SharedBroken, ParseReason as SharedParse,
+        UnsupportedReason as SharedUnsupported,
+    };
     use rust_video_caps::transcode::FallbackCause;
 
     #[test]
@@ -581,15 +325,20 @@ mod tests {
     #[test]
     fn stream_failures_name_cause() {
         assert_eq!(
-            D3d12Error::Unsupported(UnsupportedReason::Interlaced).to_string(),
+            D3d12Error::Unsupported(UnsupportedReason::Stream(SharedUnsupported::Interlaced))
+                .to_string(),
             "unsupported stream: interlaced"
         );
         assert_eq!(
-            D3d12Error::Parse(ParseReason::Truncated { syntax: "sps" }).to_string(),
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Truncated { syntax: "sps" }))
+                .to_string(),
             "parse failed: truncated sps"
         );
         assert_eq!(
-            D3d12Error::BrokenReference(BrokenReferenceReason::SlotOutsidePool).to_string(),
+            D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool
+            ))
+            .to_string(),
             "broken reference list: slot outside pool"
         );
         assert_eq!(D3d12Error::DpbFull.to_string(), "dpb full");
@@ -605,7 +354,7 @@ mod tests {
             "unsupported stream: vp9 decode pending"
         );
         assert_eq!(
-            D3d12Error::Unsupported(UnsupportedReason::NoVideoEncode { codec: Codec::H264 })
+            D3d12Error::Unsupported(UnsupportedReason::NoEncoder { codec: Codec::H264 })
                 .to_string(),
             "unsupported stream: no h264 d3d12 video encode on this adapter"
         );
@@ -620,9 +369,11 @@ mod tests {
             "unsupported stream: av1 picture builder pending"
         );
         assert_eq!(
-            D3d12Error::Unsupported(UnsupportedReason::EncoderInputNotNv12 {
-                format: PixelFormat::Rgba8
-            })
+            D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::EncoderInputNotNv12 {
+                    format: PixelFormat::Rgba8
+                }
+            ))
             .to_string(),
             "unsupported stream: encoder input Rgba8; nv12 only"
         );
@@ -638,22 +389,55 @@ mod tests {
             "unsupported stream: CreateCommittedResource returned null"
         );
         assert_eq!(
-            D3d12Error::Unsupported(UnsupportedReason::Fallback {
+            D3d12Error::Unsupported(UnsupportedReason::Stream(SharedUnsupported::Fallback {
                 cause: FallbackCause::NoSharedExport
-            })
+            }))
             .to_string(),
             "unsupported stream: decode texture without share handle"
         );
         assert_eq!(
-            D3d12Error::Parse(ParseReason::Range {
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "frame_num"
-            })
+            }))
             .to_string(),
             "parse failed: frame_num range"
         );
         assert_eq!(
-            D3d12Error::Parse(ParseReason::OverflowU32 { syntax: "pps" }).to_string(),
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::OverflowU32 {
+                syntax: "pps"
+            }))
+            .to_string(),
             "parse failed: pps overflows u32"
+        );
+    }
+
+    #[test]
+    fn folded_pending_strings_drop_pending() {
+        assert_eq!(
+            D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::DependentSlices
+            ))
+            .to_string(),
+            "unsupported stream: dependent slices"
+        );
+        assert_eq!(
+            D3d12Error::Unsupported(UnsupportedReason::Stream(SharedUnsupported::SpsExtension))
+                .to_string(),
+            "unsupported stream: sps extension"
+        );
+        assert_eq!(
+            D3d12Error::Unsupported(UnsupportedReason::Stream(SharedUnsupported::PpsExtension))
+                .to_string(),
+            "unsupported stream: pps extension"
+        );
+    }
+
+    #[test]
+    fn declined_wraps_decline() {
+        let error = D3d12Error::from(Decline::HdrUnsupported);
+        assert_eq!(
+            error.to_string(),
+            "encode declined: HDR metadata on SDR tier unsupported"
         );
     }
 

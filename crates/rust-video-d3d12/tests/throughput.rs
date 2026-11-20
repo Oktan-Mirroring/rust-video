@@ -167,24 +167,24 @@ fn surface_fps<D>(
     let raws = Packets::from_raws(raws);
     for packet in &warmup {
         for surface in decode(decoder, packet)? {
-            surface.wait()?;
+            surface.try_wait()?;
         }
     }
     for surface in flush(decoder)? {
-        surface.wait()?;
+        surface.try_wait()?;
     }
     let mut surfaces = 0u32;
     let start = std::time::Instant::now();
     for _ in 0..HOPS {
         for packet in &raws {
             for surface in decode(decoder, packet).expect("timed decode") {
-                surface.wait().expect("surface completes");
+                surface.try_wait().expect("surface completes");
                 surfaces += 1;
             }
         }
     }
     for surface in flush(decoder).expect("timed drain") {
-        surface.wait().expect("surface completes");
+        surface.try_wait().expect("surface completes");
         surfaces += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -319,7 +319,8 @@ fn encode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d12Encoder::open(&device, Codec::H264) {
+    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no h264 encoder ({error})");
@@ -361,7 +362,8 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let mut encoder = match D3d12Encoder::open(&device, Codec::H265) {
+    let config = D3d12Encoder::legacy_config(Codec::H265).expect("legacy hevc");
+    let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP: no hevc encoder ({error})");

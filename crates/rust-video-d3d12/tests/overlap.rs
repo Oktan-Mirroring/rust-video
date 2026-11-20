@@ -13,7 +13,7 @@ use rust_video_d3d12::{
 
 use bytes::Bytes;
 use rust_video_caps::delivery::{
-    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SplitDecode, TrySendError,
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
@@ -491,4 +491,55 @@ fn overlap_av1_matches_sync_bytes() {
     assert_eq!(overlapped, sync, "overlap bytes match sync");
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
     assert_eq!(pump.resets(), 0);
+}
+
+/// Split-phase drive matches sync bytes with honest gauges.
+#[test]
+fn split_decode_matches_sync_bytes() {
+    let _guard = Drive::serial();
+    let Some(device) = device() else {
+        return;
+    };
+    if !device.supports(Codec::H264) {
+        println!("SKIP: no h264 decoder profile");
+        return;
+    }
+    let packets = h264_packets();
+    let mut decoder = H264Decoder::open(&device);
+    let sync = drive_sync_with(&mut decoder, &packets);
+    let mut pump = OverlappedH264Pump::open(&device, OverlappedH264Pump::MAX_INFLIGHT);
+    let mut frames = Vec::new();
+    for packet in &packets {
+        let mut submitted = pump.try_submit(packet).expect("split submit");
+        while !submitted {
+            frames.extend(pump.poll_wait(Duration::from_secs(5)).expect("split wait"));
+            submitted = pump.try_submit(packet).expect("split resubmit");
+        }
+        frames.extend(pump.poll().expect("split poll"));
+    }
+    frames.extend(pump.flush_split().expect("split flush"));
+    let stats = pump.stats();
+    println!(
+        "split: {} frames, submitted={} peak={} resets={}",
+        frames.len(),
+        stats.submitted(),
+        stats.peak_inflight(),
+        stats.resets()
+    );
+    assert_eq!(frames.len(), PICTURES, "split yields every picture");
+    let bytes: Vec<Vec<u8>> = frames
+        .into_iter()
+        .map(|frame| frame.nv12().to_vec())
+        .collect();
+    assert_eq!(bytes, sync, "split bytes match sync");
+    assert_eq!(
+        stats.submitted(),
+        u64::try_from(PICTURES).expect("picture count")
+    );
+    assert_eq!(stats.resets(), 0);
+    assert!(stats.peak_inflight() > 0);
+    assert!(
+        !pump.try_submit(&packets[0]).expect("post-finish refuses"),
+        "submit past finish refuses"
+    );
 }

@@ -14,6 +14,7 @@ use crate::submit::{CommandSlot, DeviceResources, Fence};
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::reason::{ParseReason as SharedParse, UnsupportedReason as SharedUnsupported};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandQueue, ID3D12Resource, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
@@ -110,9 +111,9 @@ impl Scaler {
     /// driver refuses the scale.
     pub(crate) fn scale(&mut self, surface: &GpuSurface) -> Result<GpuSurface, D3d12Error> {
         if surface.size() != self.from {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::ScaleSourceOutsideScaler,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::ScaleSourceOutsideScaler,
+            )));
         }
         self.slot.reset()?;
         let source = surface.texture();
@@ -288,10 +289,12 @@ fn create_processor(
 
 /// Full-frame rectangle for `size`.
 fn full_rect(size: PictureSize) -> Result<RECT, D3d12Error> {
-    let right = i32::try_from(size.width())
-        .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "extent" }))?;
-    let bottom = i32::try_from(size.height())
-        .map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "extent" }))?;
+    let right = i32::try_from(size.width()).map_err(|_| {
+        D3d12Error::Parse(ParseReason::Parse(SharedParse::Range { syntax: "extent" }))
+    })?;
+    let bottom = i32::try_from(size.height()).map_err(|_| {
+        D3d12Error::Parse(ParseReason::Parse(SharedParse::Range { syntax: "extent" }))
+    })?;
     Ok(RECT {
         left: 0,
         top: 0,

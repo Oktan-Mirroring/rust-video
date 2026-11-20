@@ -15,7 +15,9 @@ use crate::submit::Ticket;
 use crate::texture::GpuSurface;
 
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::packet::Packet;
+use rust_video_caps::reason::ParseReason as SharedParse;
 use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
@@ -88,6 +90,15 @@ impl<'a> H264Decoder<'a> {
     #[must_use]
     pub fn max_inflight(&self) -> usize {
         self.inflight_max
+    }
+
+    /// Submit gauges since decoder open.
+    #[must_use]
+    pub fn submit_stats(&self) -> SubmitStats {
+        let mut stats = SubmitStats::new();
+        stats.add_resets(self.resets());
+        stats.fold_peak(self.max_inflight());
+        stats
     }
 
     /// Decode `picture`, queueing its outputs for readback into `pending`.
@@ -538,8 +549,9 @@ pub(crate) fn sequence_of(ingest: &Ingest, picture: &Picture) -> Result<Active, 
     let sps = ingest
         .sps(pps.seq_parameter_set_id)
         .ok_or(D3d12Error::NoSession)?;
-    let visible = PictureSize::new(sps.visible_width(), sps.visible_height())
-        .ok_or(D3d12Error::Parse(ParseReason::CropEmptiesPicture))?;
+    let visible = PictureSize::new(sps.visible_width(), sps.visible_height()).ok_or(
+        D3d12Error::Parse(ParseReason::Parse(SharedParse::CropEmptiesPicture)),
+    )?;
     Ok(Active {
         sps_id: sps.seq_parameter_set_id,
         width: sps.width(),

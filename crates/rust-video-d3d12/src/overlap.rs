@@ -29,7 +29,8 @@ use crate::session::{DecodeQueues, DecodeSession};
 use crate::submit::Ticket;
 
 use rust_video_caps::delivery::{
-    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, TrySendError,
+    PhaseTiming, PollFrames, ReceiveError, ReceiveFrames, SendPackets, SplitDecode, SubmitStats,
+    TrySendError,
 };
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::SharedDevice;
@@ -324,7 +325,9 @@ struct InflightPicture<S> {
 /// Submits video work without blocking on completion. Downloads ride
 /// the copy queue behind GPU waits; copy N runs beside decode N+1.
 /// Completions surface in order through poll or blocking receive.
-// Sealed per codec: only the three concrete pumps name a front.
+///
+/// Not `CopyPump` (threaded memcpy) or `DecoderPump` (async delivery):
+/// open a codec alias below; the front bound stays private.
 #[allow(private_bounds)]
 pub struct OverlapPump<'a, F: OverlapFront> {
     /// Device owning the decode session.
@@ -343,6 +346,8 @@ pub struct OverlapPump<'a, F: OverlapFront> {
     generation: u64,
     /// Stream resets after mid-picture failures.
     resets: u64,
+    /// Packets accepted behind sends.
+    submitted: u64,
     /// Pipelined picture ceiling behind sends.
     bound: usize,
     /// Submitted pictures with work outstanding, oldest first.
@@ -395,6 +400,7 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
             active: None,
             generation: 0,
             resets: 0,
+            submitted: 0,
             bound: max_inflight.clamp(1, Self::MAX_INFLIGHT),
             pictures: VecDeque::new(),
             ready: VecDeque::new(),
@@ -939,54 +945,35 @@ impl<'a, F: OverlapFront> OverlapPump<'a, F> {
     fn signal(&self) {
         let _dropped = self.wake_tx.send(());
     }
-}
 
-#[allow(private_bounds)]
-impl<F: OverlapFront> SendPackets for OverlapPump<'_, F> {
-    type Error = D3d12Error;
-
-    fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
-        if self.finished {
-            return Err(TrySendError::Full { packet });
-        }
-        if !self.device.supports(F::CODEC) {
-            return Err(TrySendError::Failed {
-                error: SkipReason::ProfileUnsupported { codec: F::CODEC }.into(),
-            });
-        }
-        if self.pictures.len() >= self.bound {
-            return Err(TrySendError::Full { packet });
-        }
-        let pictures = F::ingest_packet(&mut self.ingest, packet.data())
-            .map_err(|error| TrySendError::Failed { error })?;
+    /// Pictures behind `data` into the pipeline plus a harvest.
+    fn submit_packet_data(&mut self, data: &[u8]) -> Result<(), D3d12Error> {
+        let pictures = F::ingest_packet(&mut self.ingest, data)?;
         let ready_len = self.ready.len();
         for picture in &pictures {
             while self.pictures.len() >= self.bound {
                 if let Err(error) = self.pump_progress() {
                     self.ready.truncate(ready_len);
-                    return Err(TrySendError::Failed {
-                        error: self.fail(error),
-                    });
+                    return Err(self.fail(error));
                 }
             }
             if let Err(error) = self.submit_picture(picture) {
                 self.ready.truncate(ready_len);
                 self.signal();
-                return Err(TrySendError::Failed { error });
+                return Err(error);
             }
         }
         if let Err(error) = self.harvest_poll() {
             self.ready.truncate(ready_len);
             self.signal();
-            return Err(TrySendError::Failed {
-                error: self.fail(error),
-            });
+            return Err(self.fail(error));
         }
         self.signal();
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), Self::Error> {
+    /// Trailing picture plus every in-flight picture into the ready queue.
+    fn finish_input(&mut self) -> Result<(), D3d12Error> {
         if self.finished {
             return Ok(());
         }
@@ -1007,6 +994,33 @@ impl<F: OverlapFront> SendPackets for OverlapPump<'_, F> {
         }
         self.signal();
         Ok(())
+    }
+}
+
+#[allow(private_bounds)]
+impl<F: OverlapFront> SendPackets for OverlapPump<'_, F> {
+    type Error = D3d12Error;
+
+    fn try_send(&mut self, packet: Packet) -> Result<(), TrySendError<Self::Error>> {
+        if self.finished {
+            return Err(TrySendError::Full { packet });
+        }
+        if !self.device.supports(F::CODEC) {
+            return Err(TrySendError::Failed {
+                error: SkipReason::ProfileUnsupported { codec: F::CODEC }.into(),
+            });
+        }
+        if self.pictures.len() >= self.bound {
+            return Err(TrySendError::Full { packet });
+        }
+        self.submit_packet_data(packet.data())
+            .map_err(|error| TrySendError::Failed { error })?;
+        self.submitted = self.submitted.wrapping_add(1);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), Self::Error> {
+        self.finish_input()
     }
 }
 
@@ -1075,6 +1089,67 @@ impl<F: OverlapFront> ReceiveFrames for OverlapPump<'_, F> {
                 return Err(ReceiveError::Timeout);
             }
         }
+    }
+}
+
+#[allow(private_bounds)]
+impl<F: OverlapFront> SplitDecode for OverlapPump<'_, F> {
+    type Frame = D3d12Frame;
+    type Error = D3d12Error;
+
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, Self::Error> {
+        if self.finished {
+            return Ok(false);
+        }
+        if !self.device.supports(F::CODEC) {
+            return Err(SkipReason::ProfileUnsupported { codec: F::CODEC }.into());
+        }
+        if self.pictures.len() >= self.bound {
+            return Ok(false);
+        }
+        self.submit_packet_data(packet.data())?;
+        self.submitted = self.submitted.wrapping_add(1);
+        Ok(true)
+    }
+
+    fn poll(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.harvest_poll()?;
+        Ok(self.ready.drain(..).collect())
+    }
+
+    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<Self::Frame>, Self::Error> {
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            if let Err(error) = self.harvest_poll() {
+                return Err(self.fail(error));
+            }
+            if !self.ready.is_empty() {
+                return Ok(self.ready.drain(..).collect());
+            }
+            if self.pictures.is_empty() {
+                return Ok(Vec::new());
+            }
+            if !self
+                .wait_front_before(deadline)
+                .map_err(|error| self.fail(error))?
+            {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    fn flush_split(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.finish_input()?;
+        self.harvest_poll()?;
+        Ok(self.ready.drain(..).collect())
+    }
+
+    fn stats(&self) -> SubmitStats {
+        let mut stats = SubmitStats::new();
+        stats.add_submitted(self.submitted);
+        stats.add_resets(self.resets);
+        stats.fold_peak(self.max_depth);
+        stats
     }
 }
 

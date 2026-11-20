@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 
+use crate::config::MappedProfile;
 use crate::device::D3d12Device;
 use crate::error::{D3d12Error, SkipReason, UnsupportedReason};
 use crate::guid::{Codec, Profile};
@@ -51,8 +52,9 @@ use windows::Win32::Media::MediaFoundation::{
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC, D3D12_VIDEO_ENCODER_CODEC_H264,
     D3D12_VIDEO_ENCODER_CODEC_HEVC, D3D12_VIDEO_ENCODER_PROFILE_DESC,
     D3D12_VIDEO_ENCODER_PROFILE_DESC_0, D3D12_VIDEO_ENCODER_PROFILE_H264,
-    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_PROFILE_HEVC,
-    D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN, D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
+    D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH, D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN,
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC, D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN,
+    D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE,
 };
 
 /// H.264 profile name the tier decodes.
@@ -176,6 +178,30 @@ impl D3d12Device {
     /// configuration, so H.264 and HEVC also probe their profile.
     #[must_use]
     pub fn supports_encode(&self, codec: Codec) -> bool {
+        if !self.supports_encoder_codec(codec) {
+            return false;
+        }
+        match codec {
+            Codec::H264 => self.supports_h264_profile(D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH),
+            Codec::H265 => self.supports_hevc_config(),
+            _ => true,
+        }
+    }
+
+    /// True when the adapter encodes the mapped session profile.
+    pub(crate) fn supports_encode_mapped(&self, profile: MappedProfile) -> bool {
+        match profile {
+            MappedProfile::H264Main => {
+                self.supports_encoder_codec(Codec::H264)
+                    && self.supports_h264_profile(D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN)
+            }
+            MappedProfile::H264High => self.supports_encode(Codec::H264),
+            MappedProfile::HevcMain => self.supports_encode(Codec::H265),
+        }
+    }
+
+    /// True when the adapter encodes `codec` at all.
+    fn supports_encoder_codec(&self, codec: Codec) -> bool {
         let Some(encoder) = encoder_codec(codec) else {
             return false;
         };
@@ -183,27 +209,19 @@ impl D3d12Device {
             Codec: encoder,
             ..Default::default()
         };
-        if feature_support(
+        feature_support(
             self.os.video(),
             D3D12_FEATURE_VIDEO_ENCODER_CODEC,
             &mut probe,
             "EncoderCodec",
         )
-        .is_err()
-            || !probe.IsSupported.as_bool()
-        {
-            return false;
-        }
-        match codec {
-            Codec::H264 => self.supports_h264_config(),
-            Codec::H265 => self.supports_hevc_config(),
-            _ => true,
-        }
+        .is_ok()
+            && probe.IsSupported.as_bool()
     }
 
-    /// True when the adapter encodes the tier H.264 configuration.
-    fn supports_h264_config(&self) -> bool {
-        let mut profile = D3D12_VIDEO_ENCODER_PROFILE_H264_HIGH;
+    /// True when the adapter encodes the tier H.264 `profile`.
+    fn supports_h264_profile(&self, profile: D3D12_VIDEO_ENCODER_PROFILE_H264) -> bool {
+        let mut profile = profile;
         let mut details = D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_H264::default();
         let mut probe = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT {
             NodeIndex: 0,

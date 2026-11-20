@@ -94,7 +94,8 @@ fn report(frame: &D3d12Frame) {
 /// H.265 encode attempt; names the miss when the box declines it.
 #[cfg(target_os = "windows")]
 fn probe_encode_miss(device: &D3d12Device) {
-    let mut encoder = match D3d12Encoder::open(device, Codec::H265) {
+    let config = D3d12Encoder::legacy_config(Codec::H265).expect("legacy hevc");
+    let mut encoder = match D3d12Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("MISS: h265 encode unavailable ({error})");

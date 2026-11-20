@@ -5,6 +5,7 @@ use crate::error::{D3d12Error, SkipReason, UnsupportedReason};
 use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 
+use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
 use rust_video_caps::transcode::GpuCaps;
@@ -23,6 +24,13 @@ macro_rules! shell {
             #[must_use]
             pub fn open(device: &'a D3d12Device) -> Self {
                 Self { device }
+            }
+
+            /// Submit gauges since decoder open.
+            #[must_use]
+            pub fn submit_stats(&self) -> SubmitStats {
+                let _ = self;
+                SubmitStats::new()
             }
         }
 

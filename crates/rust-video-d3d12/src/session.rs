@@ -21,6 +21,7 @@ use crate::h265::picture::HevcSubmission;
 use crate::submit::{CommandSlot, DeviceResources, Fence, Nv12Layout, Ticket};
 use crate::texture::SurfaceWait;
 
+use rust_video_caps::reason::BrokenReferenceReason as SharedBroken;
 use windows::core::Interface;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
@@ -578,17 +579,17 @@ impl DecodeSession {
         let source = self
             .outputs
             .get(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?
             .clone();
         self.wait_copy_slot(index)?;
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         pair.reset()?;
         let list = pair.list();
         // Sound: the barriers name a live texture; the list is open.
@@ -602,9 +603,9 @@ impl DecodeSession {
         let staging = self
             .staging
             .get(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?
             .clone();
         // Sound: the copy locations name live resources; the list is open.
         unsafe {
@@ -639,9 +640,9 @@ impl DecodeSession {
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
         self.copy_busy[index] = Some(ticket);
         Ok(ticket)
@@ -667,7 +668,7 @@ impl DecodeSession {
     fn readback(&self, slot: u8) -> Result<Vec<u8>, D3d12Error> {
         let index = usize::from(slot);
         let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
-            BrokenReferenceReason::SlotOutsidePool,
+            BrokenReferenceReason::Broken(SharedBroken::SlotOutsidePool),
         ))?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
@@ -690,7 +691,7 @@ impl DecodeSession {
         use crate::readback::{Mapped, Release};
         let index = usize::from(slot);
         let staging = self.staging.get(index).ok_or(D3d12Error::BrokenReference(
-            BrokenReferenceReason::SlotOutsidePool,
+            BrokenReferenceReason::Broken(SharedBroken::SlotOutsidePool),
         ))?;
         let total = usize::try_from(self.layout.total)
             .unwrap_or(usize::MAX)
@@ -756,9 +757,9 @@ impl DecodeSession {
         self.outputs
             .get(usize::from(slot))
             .cloned()
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))
     }
 
     /// True with per-slot crop targets behind the session.
@@ -777,16 +778,16 @@ impl DecodeSession {
         let source = self
             .outputs
             .get(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?
             .clone();
         let target = self
             .crops
             .get(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?
             .clone();
         let plan = crop_plan(self.width, self.height, self.crop).ok_or(
             D3d12Error::BrokenReference(BrokenReferenceReason::CropTargetWithoutCrop),
@@ -795,9 +796,9 @@ impl DecodeSession {
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         pair.reset()?;
         let list = pair.list();
         // Sound: the barriers name live textures; the list is open.
@@ -853,9 +854,9 @@ impl DecodeSession {
         let pair = self
             .copy_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         let ticket = pair.close_execute(&self.copy_queue, &mut self.copy_fence)?;
         self.copy_busy[index] = Some(ticket);
         Ok(ticket)
@@ -876,9 +877,9 @@ impl DecodeSession {
         self.crops
             .get(usize::from(slot))
             .cloned()
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))
     }
 
     /// `submission` through the video queue into its pool slot.
@@ -998,16 +999,16 @@ impl DecodeSession {
         let target = self
             .outputs
             .get(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?
             .clone();
         let pair = self
             .video_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         pair.reset()?;
         let list = pair.list();
         let output = D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS {
@@ -1046,9 +1047,9 @@ impl DecodeSession {
         let pair = self
             .video_slots
             .get_mut(index)
-            .ok_or(D3d12Error::BrokenReference(
-                BrokenReferenceReason::SlotOutsidePool,
-            ))?;
+            .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::SlotOutsidePool,
+            )))?;
         let ticket = pair.close_execute(&self.video_queue, &mut self.video_fence)?;
         self.video_busy[index] = Some(ticket);
         Ok(ticket)

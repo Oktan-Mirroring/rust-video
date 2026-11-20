@@ -95,7 +95,7 @@ fn surface_geometry_matches_stream() {
         assert_eq!(surface.coded().width(), 320);
         assert_eq!(surface.coded().height(), 240);
         assert_eq!(surface.origin(), (0, 0));
-        surface.wait().expect("surface complete");
+        surface.try_wait().expect("surface complete");
         match surface.export() {
             GpuExport::NtHandle { handle } => assert_ne!(handle, 0),
             GpuExport::Opaque { name } => assert_eq!(name, "d3d12"),
@@ -127,7 +127,7 @@ fn cropped_surface_separates_visible_from_coded() {
     assert_eq!(surface.coded().height(), 240);
     assert_eq!(surface.origin(), (0, 0));
     assert_eq!(surface.format(), PixelFormat::Nv12);
-    surface.wait().expect("surface complete");
+    surface.try_wait().expect("surface complete");
 }
 
 /// Held HEVC surfaces pin their slots while other slots keep decoding; a full pool fails loud.
@@ -231,7 +231,7 @@ fn av1_surfaces_match_frames() {
     for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
         for surface in decoder.decode_surface(&packet).expect("steady decode") {
-            surface.wait().expect("surface completes");
+            surface.try_wait().expect("surface completes");
             if total == 0 {
                 assert_eq!(surface.size().width(), 320);
                 assert_eq!(surface.size().height(), 240);
@@ -251,7 +251,7 @@ fn av1_surfaces_match_frames() {
         }
     }
     for surface in decoder.flush_surface().expect("flush drains") {
-        surface.wait().expect("surface completes");
+        surface.try_wait().expect("surface completes");
         total += 1;
     }
     assert_eq!(total, 15, "every frame surfaces");

@@ -10,6 +10,7 @@ use crate::texture::SurfaceLayout;
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::{GpuFrame, PixelFormat};
+use rust_video_caps::reason::ParseReason as SharedParse;
 use rust_video_caps::traits::SharedDevice;
 
 /// Active sequence behind the live session.
@@ -36,8 +37,9 @@ impl Active {
 
 /// Surface layout for pool `slot` under `active`.
 pub(crate) fn surface_layout(active: &Active, slot: u8) -> Result<SurfaceLayout, D3d12Error> {
-    let coded = PictureSize::new(active.width, active.height)
-        .ok_or(D3d12Error::Parse(ParseReason::EmptyCodedSize))?;
+    let coded = PictureSize::new(active.width, active.height).ok_or(D3d12Error::Parse(
+        ParseReason::Parse(SharedParse::EmptyCodedSize),
+    ))?;
     let origin = active.crop.map_or((0, 0), |crop| (crop.left, crop.top));
     Ok(SurfaceLayout::new(
         active.visible,

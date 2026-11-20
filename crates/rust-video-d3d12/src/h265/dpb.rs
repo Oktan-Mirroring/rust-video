@@ -21,6 +21,7 @@ use crate::pins::SlotPins;
 use crate::session::start_coded_bitstream;
 
 use rust_video_caps::dpb::{DpbBookkeeping, SlotAllocFailure, SlotState};
+use rust_video_caps::reason::{BrokenReferenceReason as SharedBroken, ParseReason as SharedParse};
 use rust_video_h265::{anchors_tid0, is_slnr};
 
 /// DPB slot count.
@@ -108,7 +109,9 @@ impl HevcDpb {
         pps: &Pps,
     ) -> Result<HevcDecoded, D3d12Error> {
         if picture.slices.is_empty() {
-            return Err(D3d12Error::Parse(ParseReason::PictureWithoutSlices));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PictureWithoutSlices,
+            )));
         }
         if matches!(self.alloc(), Err(D3d12Error::NoFreeSlot)) {
             return Err(D3d12Error::NoFreeSlot);
@@ -129,7 +132,9 @@ impl HevcDpb {
                 let rps = header
                     .rps
                     .as_ref()
-                    .ok_or(D3d12Error::Parse(ParseReason::PictureWithoutReferenceSet))?;
+                    .ok_or(D3d12Error::Parse(ParseReason::Parse(
+                        SharedParse::PictureWithoutReferenceSet,
+                    )))?;
                 self.mark(rps, poc)?;
             }
             self.make_room(&mut emits)?;
@@ -165,11 +170,13 @@ impl HevcDpb {
         }
         let lsb = picture
             .poc_lsb()
-            .ok_or(D3d12Error::Parse(ParseReason::PictureWithoutPoc))?;
+            .ok_or(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PictureWithoutPoc,
+            )))?;
         sps.poc_from_lsb(self.poc_tid0, lsb, is_bla(picture))
-            .ok_or(D3d12Error::Parse(ParseReason::Range {
+            .ok_or(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "pic_order_cnt",
-            }))
+            })))
     }
 
     /// Undisplayed priors emitted, references kept for set marking.
@@ -200,9 +207,9 @@ impl HevcDpb {
         }
         for curr in curr_pocs(rps, poc) {
             if !self.slots.iter().flatten().any(|slot| slot.poc == curr) {
-                return Err(D3d12Error::BrokenReference(
-                    BrokenReferenceReason::ReferencePocAbsent { poc: curr },
-                ));
+                return Err(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                    SharedBroken::ReferencePocAbsent { poc: curr },
+                )));
             }
         }
         self.slots.free_displayed_non_refs();
@@ -342,9 +349,9 @@ impl HevcDpb {
         params.max_transform_hierarchy_depth_inter = sps.max_transform_depth_inter;
         params.max_transform_hierarchy_depth_intra = sps.max_transform_depth_intra;
         params.num_short_term_ref_pic_sets = u8::try_from(sps.rps.len()).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "rps count",
-            })
+            }))
         })?;
         params.num_ref_idx_l0_default_active_minus1 = pps.num_ref_l0;
         params.num_ref_idx_l1_default_active_minus1 = pps.num_ref_l1;
@@ -530,9 +537,9 @@ fn fill_tiles(params: &mut PicParamsHevc, pps: &Pps) -> Result<(), D3d12Error> {
         };
         *slot = width
             .checked_sub(1)
-            .ok_or(D3d12Error::Parse(ParseReason::Range {
+            .ok_or(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "column_width_minus1",
-            }))?;
+            })))?;
     }
     for (index, height) in pps.row_height.iter().enumerate() {
         if index + 1 >= pps.row_height.len() {
@@ -543,9 +550,9 @@ fn fill_tiles(params: &mut PicParamsHevc, pps: &Pps) -> Result<(), D3d12Error> {
         };
         *slot = height
             .checked_sub(1)
-            .ok_or(D3d12Error::Parse(ParseReason::Range {
+            .ok_or(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "row_height_minus1",
-            }))?;
+            })))?;
     }
     Ok(())
 }
@@ -575,9 +582,9 @@ fn fill_ref_sets(
             continue;
         }
         let member = delta.checked_add(poc).ok_or({
-            D3d12Error::Parse(ParseReason::Range {
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "delta_poc",
-            })
+            }))
         })?;
         params.ref_pic_set_st_curr_before[before] = pp_index(refs, member)?;
         before += 1;
@@ -591,9 +598,9 @@ fn fill_ref_sets(
             continue;
         }
         let member = delta.checked_add(poc).ok_or({
-            D3d12Error::Parse(ParseReason::Range {
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "delta_poc",
-            })
+            }))
         })?;
         params.ref_pic_set_st_curr_after[after] = pp_index(refs, member)?;
         after += 1;
@@ -606,9 +613,9 @@ fn pp_index(refs: &[RefState], poc: i32) -> Result<u8, D3d12Error> {
     refs.iter()
         .position(|state| state.poc == poc)
         .and_then(|index| u8::try_from(index).ok())
-        .ok_or(D3d12Error::BrokenReference(
-            BrokenReferenceReason::ReferencePocAbsent { poc },
-        ))
+        .ok_or(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+            SharedBroken::ReferencePocAbsent { poc },
+        )))
 }
 
 /// Submission plus display-order outputs.

@@ -12,6 +12,7 @@ use std::mem::ManuallyDrop;
 use std::time::Duration;
 
 use crate::error::{D3d12Error, UnsupportedReason};
+use rust_video_caps::reason::UnsupportedReason as SharedUnsupported;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::{
@@ -189,9 +190,9 @@ impl Nv12Layout {
         let y_len = usize::try_from(u64::from(width) * u64::from(height))
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;
         if nv12.len() < y_len + y_len / 2 {
-            return Err(D3d12Error::Unsupported(
-                UnsupportedReason::Nv12ShortOfExtent,
-            ));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Nv12ShortOfExtent,
+            )));
         }
         let total = usize::try_from(self.total)
             .map_err(|_| D3d12Error::Unsupported(UnsupportedReason::PictureTooLarge))?;

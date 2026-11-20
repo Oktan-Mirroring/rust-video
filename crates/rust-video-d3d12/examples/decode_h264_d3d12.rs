@@ -93,7 +93,8 @@ fn report(frame: &D3d12Frame) {
 /// H.264 encode probe on flat input.
 #[cfg(target_os = "windows")]
 fn probe_encode(device: &D3d12Device) {
-    let mut encoder = match D3d12Encoder::open(device, Codec::H264) {
+    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let mut encoder = match D3d12Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("MISS: h264 encode unavailable ({error})");

@@ -20,10 +20,12 @@ use rust_video_d3d12::{
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
 use rust_video_caps::frame::GpuExport;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device, Encoder};
 use rust_video_caps::transcode::{Outcome, Route};
+use rust_video_caps::{av1, vp9};
 use rust_video_harness::{decode_dir, AnnexB, H264Synth, Synth};
 
 /// Pictures in the shared vector.
@@ -200,20 +202,63 @@ where
     assert!(decoder.flush().expect("flush").is_empty());
 }
 
+/// Encode config for `codec`: legacy Auto for H.264/H.265, explicit CQP
+/// elsewhere; absent when `codec` has no encode profile.
+fn encoder_config(codec: Codec) -> Option<EncodeConfig> {
+    if matches!(codec, Codec::H264 | Codec::H265) {
+        return D3d12Encoder::legacy_config(codec).ok();
+    }
+    let (profile, level) = match codec {
+        Codec::Vp9 => (
+            Profile::Vp9(vp9::EncodeProfile::P0),
+            Level::Vp9(vp9::EncodeLevel::Auto),
+        ),
+        Codec::Av1 => (
+            Profile::Av1(av1::EncodeProfile::Main),
+            Level::Av1(av1::EncodeLevel::Auto),
+        ),
+        Codec::Vp8 => (Profile::Vp8, Level::Vp8),
+        _ => return None,
+    };
+    Some(EncodeConfig {
+        rate_control: RateControl::Cqp { qp: 26 },
+        gop: Gop {
+            keyint: 1,
+            min_keyint: 1,
+            b_frames: 0,
+            refs: 1,
+        },
+        profile,
+        level,
+        ..EncodeConfig::default()
+    })
+}
+
 /// Bitstream or loud fallback for `codec` at `width` x `height`.
 fn drive_encoder(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
-    let mut encoder = match D3d12Encoder::open(device, codec) {
+    let Some(config) = encoder_config(codec) else {
+        println!("{codec} encode inexpressible in EncodeConfig: skipped");
+        return;
+    };
+    let mut encoder = match D3d12Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("{codec} encode unavailable: {error}");
-            assert!(
-                matches!(error, D3d12Error::Unsupported(_)),
-                "loud fallback: {error}"
-            );
-            assert!(
-                error.to_string().contains("d3d12 video encode"),
-                "loud fallback: {error}"
-            );
+            if matches!(codec, Codec::H264 | Codec::H265) {
+                assert!(
+                    matches!(error, D3d12Error::Unsupported(_)),
+                    "loud fallback: {error}"
+                );
+                assert!(
+                    error.to_string().contains("d3d12 video encode"),
+                    "loud fallback: {error}"
+                );
+            } else {
+                assert!(
+                    matches!(error, D3d12Error::Declined(_)),
+                    "loud fallback: {error}"
+                );
+            }
             return;
         }
     };
@@ -305,7 +350,8 @@ fn drive_encode_roundtrip<D>(
 ) where
     D: Decoder<Frame = D3d12Frame, Error = D3d12Error>,
 {
-    let mut encoder = match D3d12Encoder::open(device, codec) {
+    let config = encoder_config(codec).expect("h264/h265 expressible");
+    let mut encoder = match D3d12Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("{codec} encode unavailable: {error}");
@@ -357,11 +403,19 @@ fn drive_encode_roundtrip<D>(
 
 /// Bitstream or loud fallback for `codec`.
 fn drive_encode_loud(device: &D3d12Device, codec: Codec, width: u32, height: u32) {
-    let mut encoder = match D3d12Encoder::open(device, codec) {
+    let Some(config) = encoder_config(codec) else {
+        println!("{codec} encode inexpressible in EncodeConfig: skipped");
+        return;
+    };
+    let mut encoder = match D3d12Encoder::open(device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("{codec} encode unavailable: {error}");
-            assert!(matches!(error, D3d12Error::Unsupported(_)));
+            if matches!(codec, Codec::H264 | Codec::H265) {
+                assert!(matches!(error, D3d12Error::Unsupported(_)));
+            } else {
+                assert!(matches!(error, D3d12Error::Declined(_)));
+            }
             return;
         }
     };

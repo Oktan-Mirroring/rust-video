@@ -3,7 +3,8 @@
 use crate::seam::Seam;
 
 use bytes::Bytes;
-use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame};
+use rust_video_caps::common::PictureSize;
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Surface};
 use rust_video_caps::traits::Lease;
 
 /// Decoded frame: NV12 bytes with identity and a budget lease.
@@ -50,6 +51,36 @@ impl D3d12Frame {
         self.identity
     }
 
+    /// Picture dimensions in luma samples.
+    #[must_use]
+    pub fn size(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Pixel layout behind the frame.
+    #[must_use]
+    pub fn format(&self) -> PixelFormat {
+        self.identity.format()
+    }
+
+    /// Image array layer behind the picture.
+    #[must_use]
+    pub fn slice(&self) -> u32 {
+        0
+    }
+
+    /// Full texture extent in luma samples.
+    #[must_use]
+    pub fn coded(&self) -> PictureSize {
+        self.identity.size()
+    }
+
+    /// Crop left and top offsets in luma samples.
+    #[must_use]
+    pub fn origin(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
     /// NV12 frame bytes in row-major order.
     #[must_use]
     pub fn nv12(&self) -> &[u8] {
@@ -82,13 +113,39 @@ impl D3d12Frame {
     }
 }
 
+impl Surface for D3d12Frame {
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    fn export(&self) -> GpuExport {
+        self.export()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::D3d12Frame;
 
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat};
+    use rust_video_caps::frame::{GpuExport, GpuFrame, PixelFormat, Surface};
     use rust_video_caps::traits::SharedDevice;
 
     /// Frame over `data` leased against `shared`.
@@ -153,5 +210,20 @@ mod tests {
     fn frame_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<D3d12Frame>();
+    }
+
+    #[test]
+    fn surface_accessors_delegate_to_identity() {
+        fn assert_surface<T: Surface>() {}
+        assert_surface::<D3d12Frame>();
+        let shared = SharedDevice::new("d3d12", 100);
+        let held = frame(&shared, 4, 2, vec![7; 12]);
+        assert_eq!(held.size().width(), 4);
+        assert_eq!(held.size().height(), 2);
+        assert_eq!(held.format(), PixelFormat::Nv12);
+        assert_eq!(held.slice(), 0);
+        assert_eq!(held.coded().width(), 4);
+        assert_eq!(held.coded().height(), 2);
+        assert_eq!(held.origin(), (0, 0));
     }
 }

@@ -18,6 +18,7 @@ use crate::error::{BrokenReferenceReason, D3d12Error, ParseReason, UnsupportedRe
 use crate::pins::SlotPins;
 
 use rust_video_caps::dpb::{DpbBookkeeping, PocTracker, SlotAllocFailure, SlotState};
+use rust_video_caps::reason::{BrokenReferenceReason as SharedBroken, ParseReason as SharedParse};
 use rust_video_h264::{abs_frame_num, frame_num_wrap, mmco_short_target, poc_type2};
 
 /// DPB slot count.
@@ -135,16 +136,18 @@ impl Dpb {
         pps: &Pps,
     ) -> Result<Decoded, D3d12Error> {
         if picture.slices.is_empty() {
-            return Err(D3d12Error::Parse(ParseReason::PictureWithoutSlices));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::PictureWithoutSlices,
+            )));
         }
         if matches!(self.alloc(), Err(D3d12Error::NoFreeSlot)) {
             return Err(D3d12Error::NoFreeSlot);
         }
         let frame_num = picture.frame_num();
         if frame_num >= self.max_frame_num {
-            return Err(D3d12Error::Parse(ParseReason::Range {
+            return Err(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "frame_num",
-            }));
+            })));
         }
         self.check_gap(picture, sps)?;
         let mut emits: Vec<(i32, usize)> = Vec::with_capacity(SLOTS);
@@ -198,7 +201,9 @@ impl Dpb {
                 if sps.gaps_allowed {
                     return Err(D3d12Error::Unsupported(UnsupportedReason::FrameNumGap));
                 }
-                return Err(D3d12Error::Parse(ParseReason::FrameNumGapForbidden));
+                return Err(D3d12Error::Parse(ParseReason::Parse(
+                    SharedParse::FrameNumGapForbidden,
+                )));
             }
         }
         Ok(())
@@ -282,7 +287,9 @@ impl Dpb {
             return Ok(());
         }
         if self.max_refs == 0 {
-            return Err(D3d12Error::Parse(ParseReason::ReferenceWithZeroRefFrames));
+            return Err(D3d12Error::Parse(ParseReason::Parse(
+                SharedParse::ReferenceWithZeroRefFrames,
+            )));
         }
         let curr = picture.frame_num();
         let max = self.max_frame_num;
@@ -299,9 +306,9 @@ impl Dpb {
             }
         }
         let Some(victim) = victim else {
-            return Err(D3d12Error::BrokenReference(
-                BrokenReferenceReason::NoShortTermToSlide,
-            ));
+            return Err(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::NoShortTermToSlide,
+            )));
         };
         self.slots.evict(victim, emits);
         Ok(())
@@ -353,16 +360,16 @@ impl Dpb {
                     }
                 }
                 if !moved {
-                    return Err(D3d12Error::BrokenReference(
-                        BrokenReferenceReason::ShortTermTargetAbsent,
-                    ));
+                    return Err(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                        SharedBroken::ShortTermTargetAbsent,
+                    )));
                 }
             }
             Mmco::SetMaxLong(plus1) => {
                 let max = i32::try_from(plus1).map_err(|_| {
-                    D3d12Error::Parse(ParseReason::Range {
+                    D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                         syntax: "max_long_term_frame_idx",
-                    })
+                    }))
                 })? - 1;
                 let mut victims = Vec::new();
                 for (index, slot) in self.slots.iter().enumerate() {
@@ -408,9 +415,9 @@ impl Dpb {
             }
         }
         if victims.is_empty() {
-            return Err(D3d12Error::BrokenReference(
-                BrokenReferenceReason::MarkingTargetAbsent,
-            ));
+            return Err(D3d12Error::BrokenReference(BrokenReferenceReason::Broken(
+                SharedBroken::MarkingTargetAbsent,
+            )));
         }
         for victim in victims {
             self.slots.evict(victim, emits);
@@ -480,14 +487,14 @@ impl Dpb {
             }
             (PocType::FrameNum, SlicePoc::None) => poc_type2(offset, frame_num, picture.ref_pic()),
             _ => {
-                return Err(D3d12Error::Parse(
-                    ParseReason::PocSyntaxAgainstSequenceMethod,
-                ));
+                return Err(D3d12Error::Parse(ParseReason::Parse(
+                    SharedParse::PocSyntaxAgainstSequenceMethod,
+                )));
             }
         };
-        let poc = poc.ok_or(D3d12Error::Parse(ParseReason::Range {
+        let poc = poc.ok_or(D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
             syntax: "pic_order_cnt",
-        }))?;
+        })))?;
         if picture.ref_pic() {
             self.prev_ref_frame_num = frame_num;
             self.prev_frame_num_offset = offset;
@@ -604,9 +611,9 @@ impl Dpb {
         params.num_ref_idx_l0_active_minus1 = pps.num_ref_l0;
         params.num_ref_idx_l1_active_minus1 = pps.num_ref_l1;
         params.frame_num = u16::try_from(picture.frame_num()).map_err(|_| {
-            D3d12Error::Parse(ParseReason::Range {
+            D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                 syntax: "frame_num",
-            })
+            }))
         })?;
         params.log2_max_frame_num_minus4 = sps.log2_max_frame_num_minus4;
         params.pic_order_cnt_type = sps.poc_type.id();
@@ -656,9 +663,9 @@ impl Dpb {
                 u16::from(state.long_term_idx)
             } else {
                 u16::try_from(state.frame_num).map_err(|_| {
-                    D3d12Error::Parse(ParseReason::Range {
+                    D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
                         syntax: "frame_num",
-                    })
+                    }))
                 })?
             };
             params.used_for_reference_flags |= 0b11 << (2 * index);
@@ -678,9 +685,9 @@ fn has_mmco5(picture: &Picture) -> bool {
 /// Long-term index as a byte.
 fn index_u8(index: u32) -> Result<u8, D3d12Error> {
     u8::try_from(index).map_err(|_| {
-        D3d12Error::Parse(ParseReason::Range {
+        D3d12Error::Parse(ParseReason::Parse(SharedParse::Range {
             syntax: "long_term_frame_idx",
-        })
+        }))
     })
 }
 

@@ -2,9 +2,12 @@
 
 use crate::error::{D3d12Error, ParseReason};
 
+use rust_video_caps::reason::ParseReason as SharedParse;
+
 /// Slot number as a byte.
 pub(crate) fn slot_u8(slot: usize) -> Result<u8, D3d12Error> {
-    u8::try_from(slot).map_err(|_| D3d12Error::Parse(ParseReason::Range { syntax: "slot" }))
+    u8::try_from(slot)
+        .map_err(|_| D3d12Error::Parse(ParseReason::Parse(SharedParse::Range { syntax: "slot" })))
 }
 
 /// Outputs for `emits` in display order.

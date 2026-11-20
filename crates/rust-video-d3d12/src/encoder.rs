@@ -2,16 +2,21 @@
 //!
 //! NV12 input through the video encoder into driver bitstreams.
 
+use crate::config::MappedConfig;
 use crate::device::D3d12Device;
 use crate::encode::EncodeSession;
 use crate::error::{D3d12Error, UnsupportedReason};
 use crate::guid::Codec;
+use crate::texture::GpuSurface;
 
 use bytes::Bytes;
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::reason::UnsupportedReason as SharedUnsupported;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
+use rust_video_caps::{h264, h265};
 use rust_video_core::planes;
 
 /// D3D12 hardware encoder over the video encode session.
@@ -21,7 +26,7 @@ use rust_video_core::planes;
 ///
 /// # Usage Notes
 ///
-/// Emitted parameter sets describe the encoder output: High
+/// Emitted parameter sets describe the encoder output: Main or High
 /// profile CABAC without 8x8 transform signaling, matching the
 /// fixed slice assumptions. HEVC encode needs driver
 /// configuration support: boxes reporting the codec but refusing
@@ -29,8 +34,8 @@ use rust_video_core::planes;
 pub struct D3d12Encoder<'a> {
     /// Device owning the encode session.
     device: &'a D3d12Device,
-    /// Codec the encoder encodes.
-    codec: Codec,
+    /// Mapped session configuration.
+    mapped: MappedConfig,
     /// Live encode session, created from the first frame.
     session: Option<EncodeSession>,
     /// Geometry behind the live session.
@@ -38,29 +43,74 @@ pub struct D3d12Encoder<'a> {
 }
 
 impl<'a> D3d12Encoder<'a> {
-    /// Encoder over `device` for `codec`.
+    /// Encoder over `device` for `config`.
+    ///
+    /// Auto rate control replays the legacy recipe: CQP 26 all-intra at
+    /// 30 fps with header bytes untouched. Explicit modes map rate control,
+    /// GOP, preset, profile, level, depth, chroma, frame rate, and color onto
+    /// the session and decline the rest typed.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` - D3D12 device behind the session.
+    /// * `config` - shared encode configuration.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the adapter reports no `codec` video encode.
-    pub fn open(device: &'a D3d12Device, codec: Codec) -> Result<Self, D3d12Error> {
-        if !device.supports_encode(codec) {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::NoVideoEncode {
-                codec,
+    /// Returns `Decline` for an invalid config or one the tier exceeds,
+    /// or `Unsupported` without adapter video encode for the codec.
+    pub fn open(device: &'a D3d12Device, config: EncodeConfig) -> Result<Self, D3d12Error> {
+        let mapped = MappedConfig::map(config)?;
+        if !device.supports_encode_mapped(mapped.profile) {
+            return Err(D3d12Error::Unsupported(UnsupportedReason::NoEncoder {
+                codec: mapped.profile.codec(),
             }));
         }
         Ok(Self {
             device,
-            codec,
+            mapped,
             session: None,
             active: None,
+        })
+    }
+
+    /// Legacy Auto config for `codec`.
+    ///
+    /// # Arguments
+    ///
+    /// * `codec` - codec the config encodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for codecs the tier never encodes.
+    pub fn legacy_config(codec: Codec) -> Result<EncodeConfig, D3d12Error> {
+        let (profile, level) = match codec {
+            Codec::H264 => (
+                Profile::H264(h264::EncodeProfile::High),
+                Level::H264(h264::EncodeLevel::Auto),
+            ),
+            Codec::H265 => (
+                Profile::H265(h265::EncodeProfile::Main),
+                Level::H265(h265::EncodeLevel::Auto),
+            ),
+            _ => {
+                return Err(D3d12Error::Unsupported(UnsupportedReason::NoEncoder {
+                    codec,
+                }));
+            }
+        };
+        Ok(EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile,
+            level,
+            ..EncodeConfig::default()
         })
     }
 
     /// Codec the encoder encodes.
     #[must_use]
     pub const fn codec(&self) -> Codec {
-        self.codec
+        self.mapped.profile.codec()
     }
 
     /// Live session at `width` x `height`, reopened on change.
@@ -71,39 +121,25 @@ impl<'a> D3d12Encoder<'a> {
     ) -> Result<&mut EncodeSession, D3d12Error> {
         if self.active != Some((width, height)) {
             let queues = self.session.take().map(EncodeSession::into_queues);
-            let session = EncodeSession::open(self.device, self.codec, width, height, queues)?;
+            let session = EncodeSession::open(self.device, self.mapped, width, height, queues)?;
             self.session = Some(session);
             self.active = Some((width, height));
         }
         self.session.as_mut().ok_or(D3d12Error::NoSession)
     }
 
-    /// Packets coded from `surface`, possibly none.
-    ///
-    /// The caller completes its GPU work on the surface first: the copy
-    /// waits on no foreign queue.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the surface misses the session extent or the
-    /// backend cannot encode it.
-    pub fn encode_surface(
-        &mut self,
-        surface: &crate::texture::GpuSurface,
-    ) -> Result<Vec<Packet>, D3d12Error> {
-        self.encode_texture(surface)
+    /// Drop the live session and geometry after a mid-picture failure.
+    fn reset_session(&mut self) {
+        self.session = None;
+        self.active = None;
     }
+}
 
-    /// Packets coded from `surface`, possibly none.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the surface misses the session extent or the
-    /// backend cannot encode it.
-    pub(crate) fn encode_texture(
-        &mut self,
-        surface: &crate::texture::GpuSurface,
-    ) -> Result<Vec<Packet>, D3d12Error> {
+impl EncodeSurface for D3d12Encoder<'_> {
+    type Surface = GpuSurface;
+    type Error = D3d12Error;
+
+    fn encode_surface(&mut self, surface: &GpuSurface) -> Result<Vec<Packet>, D3d12Error> {
         let size = surface.size();
         let (width, height) = (size.width(), size.height());
         let session = self.ensure_session(width, height)?;
@@ -116,19 +152,13 @@ impl<'a> D3d12Encoder<'a> {
             }
         }
     }
-
-    /// Drop the live session and geometry after a mid-picture failure.
-    fn reset_session(&mut self) {
-        self.session = None;
-        self.active = None;
-    }
 }
 
 impl Encoder for D3d12Encoder<'_> {
     type Error = D3d12Error;
 
     fn caps(&self) -> GpuCaps {
-        let live = self.device.supports_encode(self.codec);
+        let live = self.device.supports_encode_mapped(self.mapped.profile);
         GpuCaps::new(live.then_some(ShareMechanism::NtHandle), false, live)
     }
 
@@ -153,22 +183,24 @@ impl Encoder for D3d12Encoder<'_> {
 /// Contiguous NV12 bytes plus extents for `frame`.
 fn pack_nv12(frame: &CpuFrame) -> Result<(u32, u32, Vec<u8>), D3d12Error> {
     if frame.format() != PixelFormat::Nv12 {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::EncoderInputNotNv12 {
+        return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+            SharedUnsupported::EncoderInputNotNv12 {
                 format: frame.format(),
             },
-        ));
+        )));
     }
     let width = frame.size().width();
     let height = frame.size().height();
     if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-        return Err(D3d12Error::Unsupported(UnsupportedReason::OddNv12Extent));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+            SharedUnsupported::OddNv12Extent,
+        )));
     }
     let planes = frame.planes();
     let (Some(y), Some(uv)) = (planes.first(), planes.get(1)) else {
-        return Err(D3d12Error::Unsupported(
-            UnsupportedReason::Nv12WithoutTwoPlanes,
-        ));
+        return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+            SharedUnsupported::Nv12WithoutTwoPlanes,
+        )));
     };
     let capacity = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2).unwrap_or(0);
     let mut nv12 = Vec::with_capacity(capacity);
@@ -190,12 +222,12 @@ fn copy_plane(
     out: &mut Vec<u8>,
 ) -> Result<(), D3d12Error> {
     planes::check_plane(data, stride, width, rows).map_err(|fault| match fault {
-        planes::PlaneFault::StrideBelowWidth { .. } => {
-            D3d12Error::Unsupported(UnsupportedReason::PlaneStrideBelowWidth)
-        }
-        planes::PlaneFault::ShortOfStride { .. } => {
-            D3d12Error::Unsupported(UnsupportedReason::PlaneShortOfStride)
-        }
+        planes::PlaneFault::StrideBelowWidth { .. } => D3d12Error::Unsupported(
+            UnsupportedReason::Stream(SharedUnsupported::PlaneStrideBelowWidth),
+        ),
+        planes::PlaneFault::ShortOfStride { .. } => D3d12Error::Unsupported(
+            UnsupportedReason::Stream(SharedUnsupported::PlaneShortOfStride),
+        ),
     })?;
     planes::copy_rows_extend(data, stride, width, rows, out);
     Ok(())
@@ -281,13 +313,15 @@ mod tests {
     fn caps_agree_with_texture_import() {
         use bytes::Bytes;
         use rust_video_caps::packet::Packet;
-        use rust_video_caps::traits::Encoder;
+        use rust_video_caps::traits::{EncodeSurface, Encoder};
         use rust_video_harness::H264Synth;
 
         let Ok(device) = crate::device::D3d12Device::open() else {
             return;
         };
-        let Ok(mut encoder) = super::D3d12Encoder::open(&device, crate::guid::Codec::H264) else {
+        let config =
+            super::D3d12Encoder::legacy_config(crate::guid::Codec::H264).expect("legacy h264");
+        let Ok(mut encoder) = super::D3d12Encoder::open(&device, config) else {
             return;
         };
         let caps = encoder.caps();
@@ -302,6 +336,6 @@ mod tests {
         }
         surfaces.extend(decoder.flush_surface().expect("decode drains"));
         let surface = surfaces.pop().expect("first picture surfaces");
-        encoder.encode_texture(&surface).expect("import runs");
+        encoder.encode_surface(&surface).expect("import runs");
     }
 }

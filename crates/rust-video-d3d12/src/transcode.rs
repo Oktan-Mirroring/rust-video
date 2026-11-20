@@ -12,7 +12,8 @@ use crate::texture::GpuSurface;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::reason::UnsupportedReason as SharedUnsupported;
+use rust_video_caps::traits::{EncodeSurface, Encoder};
 use rust_video_caps::transcode::FallbackCause;
 use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Scale, ShareMechanism};
 #[cfg(test)]
@@ -81,7 +82,8 @@ impl<'a> Transcoder<'a> {
                 }));
             }
         };
-        let encoder = D3d12Encoder::open(device, encode)?;
+        let config = D3d12Encoder::legacy_config(encode)?;
+        let encoder = D3d12Encoder::open(device, config)?;
         let caps = GpuCaps::new(
             Some(ShareMechanism::NtHandle),
             device.supports(decode),
@@ -128,6 +130,12 @@ impl<'a> Transcoder<'a> {
         self.caps
     }
 
+    /// Executed plan.
+    #[must_use]
+    pub fn plan(&self) -> Plan {
+        self.plan
+    }
+
     /// Packets transcoded from `packet`, possibly none.
     ///
     /// # Errors
@@ -155,9 +163,9 @@ impl<'a> Transcoder<'a> {
         if self.caps.ready() {
             Ok(())
         } else if let Some(cause) = self.plan.cause() {
-            Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
-                cause,
-            }))
+            Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Fallback { cause },
+            )))
         } else {
             // open derives plan from caps, so a miss names its cause.
             Ok(())
@@ -184,9 +192,9 @@ impl<'a> Transcoder<'a> {
         let mut packets = Vec::new();
         for surface in surfaces {
             if let Some(cause) = self.convert.miss(PixelFormat::Nv12) {
-                return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
-                    cause,
-                }));
+                return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                    SharedUnsupported::Fallback { cause },
+                )));
             }
             let scaled;
             let input = if let Some(cause) = self.scale.miss(surface.size()) {
@@ -195,7 +203,7 @@ impl<'a> Transcoder<'a> {
             } else {
                 surface
             };
-            packets.append(&mut self.encoder.encode_texture(input)?);
+            packets.append(&mut self.encoder.encode_surface(input)?);
         }
         Ok(packets)
     }
@@ -207,9 +215,9 @@ impl<'a> Transcoder<'a> {
         cause: FallbackCause,
     ) -> Result<GpuSurface, D3d12Error> {
         let FallbackCause::ScaleNeeded { from, to } = cause else {
-            return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
-                cause,
-            }));
+            return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                SharedUnsupported::Fallback { cause },
+            )));
         };
         if self
             .scaler
@@ -219,9 +227,9 @@ impl<'a> Transcoder<'a> {
             match Scaler::open(self.device, from, to) {
                 Ok(scaler) => self.scaler = Some(scaler),
                 Err(D3d12Error::Unsupported(_)) => {
-                    return Err(D3d12Error::Unsupported(UnsupportedReason::Fallback {
-                        cause,
-                    }));
+                    return Err(D3d12Error::Unsupported(UnsupportedReason::Stream(
+                        SharedUnsupported::Fallback { cause },
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -253,7 +261,8 @@ mod tests {
         caps: GpuCaps,
         cause: FallbackCause,
     ) -> Option<super::Transcoder<'_>> {
-        let encoder = crate::encoder::D3d12Encoder::open(device, crate::guid::Codec::H264).ok()?;
+        let config = crate::encoder::D3d12Encoder::legacy_config(crate::guid::Codec::H264).ok()?;
+        let encoder = crate::encoder::D3d12Encoder::open(device, config).ok()?;
         Some(super::Transcoder {
             source: super::Source::H264(Box::new(crate::h264::decoder::H264Decoder::open(device))),
             encoder,
