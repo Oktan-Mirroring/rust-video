@@ -11,8 +11,7 @@ use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Encoder};
 use rust_video_harness::{bench_dir, AnnexB, H264Synth, Packets, Synth};
 use rust_video_vaapi::{
-    Av1Decoder, EncodeCodec, H264Decoder, H265Decoder, VaApiDevice, VaApiEncoder, VaApiError,
-    VaApiFrame,
+    Av1Decoder, H264Decoder, H265Decoder, VaApiDevice, VaApiEncoder, VaApiError, VaApiFrame,
 };
 
 /// Tier realtime bar in frames per second.
@@ -196,7 +195,7 @@ fn h264_encode_1080p_measures_realtime() {
         level: Level::H264(rust_video_caps::h264::EncodeLevel::Auto),
         ..EncodeConfig::default()
     };
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size, &config) {
+    let mut encoder = match VaApiEncoder::open(&device, size, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP vaapi h264 encode 1080p: {error}");
@@ -258,7 +257,7 @@ fn h265_encode_1080p_measures_realtime() {
         level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
         ..EncodeConfig::default()
     };
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size, &config) {
+    let mut encoder = match VaApiEncoder::open(&device, size, config) {
         Ok(encoder) => encoder,
         Err(error) => {
             println!("SKIP vaapi h265 encode 1080p: {error}");

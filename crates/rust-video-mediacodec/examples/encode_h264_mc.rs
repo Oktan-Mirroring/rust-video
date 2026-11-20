@@ -1,6 +1,8 @@
 //! H.264 encode probe on the `MediaCodec` tier.
 
 #[cfg(target_os = "android")]
+use rust_video_caps::encode::EncodeConfig;
+#[cfg(target_os = "android")]
 use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "android")]
 use rust_video_harness::Synth;
@@ -19,6 +21,7 @@ fn main() {
         println!("ERROR: h264 spec rejected");
         std::process::exit(1);
     };
+    let spec = spec.with_config(EncodeConfig::default());
     let mut encoder = match MediaCodecEncoder::open(&spec) {
         Ok(encoder) => encoder,
         Err(error) => {

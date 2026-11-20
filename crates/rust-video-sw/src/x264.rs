@@ -17,7 +17,7 @@ use rust_video_caps::encode::{
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::h264::{EncodeLevel, EncodeProfile as H264Profile, Level as H264Level};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 
 /// H.264 encoder over `libx264`; throughput unmeasured.
@@ -290,6 +290,15 @@ impl Encoder for X264Encoder {
     }
 }
 
+impl KeyframeRequest for X264Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.request_keyframe();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_video_caps::color::{ColorPrimaries, ContentLight};
@@ -300,7 +309,7 @@ mod tests {
     use rust_video_caps::frame::PixelFormat;
     use rust_video_caps::h264::{EncodeLevel, EncodeProfile};
     use rust_video_caps::packet::Packet;
-    use rust_video_caps::traits::Encoder;
+    use rust_video_caps::traits::{Encoder, KeyframeRequest};
     use rust_video_h264::{is_idr, nal_unit_type, split_nals};
 
     use super::X264Encoder;
@@ -450,6 +459,25 @@ mod tests {
         let keyed: Vec<bool> = packets.iter().map(Packet::is_keyframe).collect();
         assert!(keyed[0], "first packet keys");
         assert!(keyed[30], "thirtieth packet keys: {keyed:?}");
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn keyframe_request_forces_single_idr() {
+        let mut encoder = X264Encoder::open(64, 64, cbr(500_000), 1).expect("encoder");
+        let mut packets = Vec::new();
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        encoder.request_keyframe().expect("request");
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.flush().expect("flush"));
+        let keyed: Vec<bool> = packets.iter().map(Packet::is_keyframe).collect();
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
     }
 
     #[test]

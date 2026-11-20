@@ -7,15 +7,14 @@ use std::process::Command;
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
+use rust_video_caps::encode::{EncodeConfig, Gop, RateControl};
 use rust_video_caps::frame::{GpuExport, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Device, Encoder};
+use rust_video_caps::traits::{Decoder, Device, Encoder, KeyframeRequest};
 use rust_video_caps::transcode::Route;
 use rust_video_harness::{FrameHash, Stream, Synth};
 use rust_video_vaapi::{
-    EncodeCodec, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder, VaApiError,
-    VaApiFrame,
+    Codec, H264Decoder, H265Decoder, Transcoder, VaApiDevice, VaApiEncoder, VaApiError, VaApiFrame,
 };
 
 /// Corpus root: `$RUST_VIDEO_CORPUS` or the checkout's `corpus/`.
@@ -219,27 +218,12 @@ fn device() -> Option<VaApiDevice> {
 }
 
 /// Legacy config for `codec`: tier profile under `Auto` rate control.
-fn legacy_config(codec: EncodeCodec) -> EncodeConfig {
-    let (profile, level) = match codec {
-        EncodeCodec::H264 => (
-            Profile::H264(rust_video_caps::h264::EncodeProfile::High),
-            Level::H264(rust_video_caps::h264::EncodeLevel::Auto),
-        ),
-        EncodeCodec::H265 => (
-            Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
-            Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
-        ),
-    };
-    EncodeConfig {
-        rate_control: RateControl::Auto,
-        profile,
-        level,
-        ..EncodeConfig::default()
-    }
+fn legacy_config(codec: Codec) -> EncodeConfig {
+    VaApiEncoder::auto_config(codec).expect("tier recipe")
 }
 
 /// CQP config for `codec` with an IDR every `keyint` pictures.
-fn low_delay_config(codec: EncodeCodec, keyint: u32) -> EncodeConfig {
+fn low_delay_config(codec: Codec, keyint: u32) -> EncodeConfig {
     let mut config = legacy_config(codec);
     config.rate_control = RateControl::Cqp { qp: 26 };
     config.gop = Gop {
@@ -254,11 +238,11 @@ fn low_delay_config(codec: EncodeCodec, keyint: u32) -> EncodeConfig {
 /// Encoder open with driver-gap skips.
 fn open_encoder(
     device: &VaApiDevice,
-    codec: EncodeCodec,
+    codec: Codec,
     size: PictureSize,
     config: &EncodeConfig,
 ) -> Option<VaApiEncoder> {
-    match VaApiEncoder::open(device, codec, size, config) {
+    match VaApiEncoder::open(device, size, *config) {
         Ok(encoder) => Some(encoder),
         Err(
             VaApiError::Unsupported(_)
@@ -423,8 +407,8 @@ fn vaapi_encodes_h264_all_intra() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let config = legacy_config(EncodeCodec::H264);
-    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+    let config = legacy_config(Codec::H264);
+    let Some(mut encoder) = open_encoder(&device, Codec::H264, size, &config) else {
         return;
     };
     let mut annex_b = Vec::new();
@@ -475,8 +459,8 @@ fn vaapi_encodes_h265_keyframes() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let config = legacy_config(EncodeCodec::H265);
-    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H265, size, &config) else {
+    let config = legacy_config(Codec::H265);
+    let Some(mut encoder) = open_encoder(&device, Codec::H265, size, &config) else {
         return;
     };
     let mut annex_b = Vec::new();
@@ -582,8 +566,8 @@ fn vaapi_encodes_h264_low_delay_gop60() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let config = low_delay_config(EncodeCodec::H264, 60);
-    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+    let config = low_delay_config(Codec::H264, 60);
+    let Some(mut encoder) = open_encoder(&device, Codec::H264, size, &config) else {
         return;
     };
     let (packets, annex_b) = encode_low_delay(&mut encoder, size, 65);
@@ -618,8 +602,8 @@ fn vaapi_encodes_h265_low_delay_gop60() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let config = low_delay_config(EncodeCodec::H265, 60);
-    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H265, size, &config) else {
+    let config = low_delay_config(Codec::H265, 60);
+    let Some(mut encoder) = open_encoder(&device, Codec::H265, size, &config) else {
         return;
     };
     let (packets, annex_b) = encode_low_delay(&mut encoder, size, 65);
@@ -654,7 +638,7 @@ fn vaapi_low_delay_beats_all_intra_bitrate() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    for codec in [EncodeCodec::H264, EncodeCodec::H265] {
+    for codec in [Codec::H264, Codec::H265] {
         let open = |config: &EncodeConfig| open_encoder(&device, codec, size, config);
         let intra_config = legacy_config(codec);
         let Some(mut intra) = open(&intra_config) else {
@@ -766,8 +750,8 @@ fn vaapi_reuses_encode_buffers() {
         return;
     };
     let size = PictureSize::new(320, 240).expect("synth size");
-    let config = legacy_config(EncodeCodec::H264);
-    let Some(mut encoder) = open_encoder(&device, EncodeCodec::H264, size, &config) else {
+    let config = legacy_config(Codec::H264);
+    let Some(mut encoder) = open_encoder(&device, Codec::H264, size, &config) else {
         return;
     };
     let mut coded = 0;
@@ -828,7 +812,8 @@ fn vaapi_transcodes_scaled_on_device() {
     let Some(device) = device() else {
         return;
     };
-    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264)
+    let mut transcoder = Transcoder::open(&device, Codec::H264, Codec::H264)
+        .expect("open scaled")
         .with_target(PictureSize::new(640, 360).expect("scale target"));
     if !transcoder.caps().ready() {
         skip("transcode export+encode caps");
@@ -839,18 +824,17 @@ fn vaapi_transcodes_scaled_on_device() {
     let mut coded = 0;
     let mut annex_b = Vec::new();
     for sample in &stream.samples {
-        let outcome = transcoder
+        let packets = transcoder
             .transcode(&Packet::new(Bytes::copy_from_slice(sample)))
             .expect("transcode");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        for packet in outcome.packets() {
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        for packet in &packets {
             assert!(packet.is_keyframe(), "all-intra keyframe");
             annex_b.extend_from_slice(packet.data());
             coded += 1;
         }
     }
-    let outcome = transcoder.flush().expect("flush");
-    for packet in outcome.packets() {
+    for packet in transcoder.flush().expect("flush") {
         annex_b.extend_from_slice(packet.data());
         coded += 1;
     }
@@ -875,7 +859,8 @@ fn vaapi_transcodes_on_device() {
     let Some(device) = device() else {
         return;
     };
-    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264);
+    let mut transcoder =
+        Transcoder::open(&device, Codec::H264, Codec::H264).expect("open transcode");
     if !transcoder.caps().ready() {
         skip("transcode export+encode caps");
         return;
@@ -885,17 +870,16 @@ fn vaapi_transcodes_on_device() {
     let stream = Stream::demux(&path).expect("demux synth high");
     let mut coded = 0;
     for sample in &stream.samples {
-        let outcome = transcoder
+        let packets = transcoder
             .transcode(&Packet::new(Bytes::copy_from_slice(sample)))
             .expect("transcode");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        for packet in outcome.packets() {
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        for packet in &packets {
             assert!(packet.is_keyframe(), "all-intra keyframe");
             coded += 1;
         }
     }
-    let outcome = transcoder.flush().expect("flush");
-    coded += outcome.packets().len();
+    coded += transcoder.flush().expect("flush").len();
     assert_eq!(coded, stream.samples.len());
 }
 
@@ -904,8 +888,9 @@ fn vaapi_transcodes_low_delay_gop60() {
     let Some(device) = device() else {
         return;
     };
-    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264)
-        .with_config(low_delay_config(EncodeCodec::H264, 60));
+    let mut transcoder = Transcoder::open(&device, Codec::H264, Codec::H264)
+        .expect("open gop")
+        .with_config(low_delay_config(Codec::H264, 60));
     if !transcoder.caps().ready() {
         skip("transcode export+encode caps");
         return;
@@ -915,23 +900,106 @@ fn vaapi_transcodes_low_delay_gop60() {
     let mut packets = Vec::new();
     let mut annex_b = Vec::new();
     for sample in &stream.samples {
-        let outcome = transcoder
+        let coded = transcoder
             .transcode(&Packet::new(Bytes::copy_from_slice(sample)))
             .expect("transcode");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        for packet in outcome.packets() {
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        for packet in coded {
             annex_b.extend_from_slice(packet.data());
-            packets.push(packet.clone());
+            packets.push(packet);
         }
     }
-    let outcome = transcoder.flush().expect("flush");
-    for packet in outcome.packets() {
+    for packet in transcoder.flush().expect("flush") {
         annex_b.extend_from_slice(packet.data());
-        packets.push(packet.clone());
+        packets.push(packet);
     }
     assert_eq!(packets.len(), stream.samples.len());
     assert_eq!(keyframes(&packets), vec![0]);
     let mut decoder = H264Decoder::open(&device);
     let frames = decode_packets(&mut decoder, &packets);
     assert_eq!(frames.len(), packets.len());
+}
+
+/// Forced keyframe codes the next picture as IDR.
+#[test]
+fn keyframe_request_forces_idr() {
+    let Some(device) = device() else {
+        return;
+    };
+    keyframe_case_h264(&device);
+    keyframe_case_h265(&device);
+}
+
+/// Forced H.264 keyframe codes the next picture as IDR.
+fn keyframe_case_h264(device: &VaApiDevice) {
+    let size = PictureSize::new(320, 240).expect("synth size");
+    let config = low_delay_config(Codec::H264, 60);
+    let Some(mut encoder) = open_encoder(device, Codec::H264, size, &config) else {
+        return;
+    };
+    let mut packets = Vec::new();
+    let mut annex_b = Vec::new();
+    for index in 0..4u32 {
+        let frame = Synth::gradient(size, index);
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            annex_b.extend_from_slice(packet.data());
+            packets.push(packet);
+        }
+    }
+    encoder.request_keyframe().expect("keyframe forces");
+    for index in 4..6u32 {
+        let frame = Synth::gradient(size, index);
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            annex_b.extend_from_slice(packet.data());
+            packets.push(packet);
+        }
+    }
+    for packet in encoder.flush().expect("flush runs") {
+        annex_b.extend_from_slice(packet.data());
+        packets.push(packet);
+    }
+    assert_eq!(packets.len(), 6, "one packet per frame");
+    assert_eq!(keyframes(&packets), vec![0, 4]);
+    assert_eq!(count_vcl(&annex_b, h264_kind, &[5, 1]), vec![2, 4]);
+    let mut decoder = H264Decoder::open(device);
+    let frames = decode_packets(&mut decoder, &packets);
+    assert_eq!(frames.len(), 6, "forced stream decodes clean");
+    println!("keyframe: p-flow then forced IDR at picture 5");
+}
+
+/// Forced H.265 keyframe codes the next picture as IDR.
+fn keyframe_case_h265(device: &VaApiDevice) {
+    let size = PictureSize::new(320, 240).expect("synth size");
+    let config = low_delay_config(Codec::H265, 60);
+    let Some(mut encoder) = open_encoder(device, Codec::H265, size, &config) else {
+        return;
+    };
+    let mut packets = Vec::new();
+    let mut annex_b = Vec::new();
+    for index in 0..4u32 {
+        let frame = Synth::gradient(size, index);
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            annex_b.extend_from_slice(packet.data());
+            packets.push(packet);
+        }
+    }
+    encoder.request_keyframe().expect("keyframe forces");
+    for index in 4..6u32 {
+        let frame = Synth::gradient(size, index);
+        for packet in encoder.encode(&frame).expect("encode runs") {
+            annex_b.extend_from_slice(packet.data());
+            packets.push(packet);
+        }
+    }
+    for packet in encoder.flush().expect("flush runs") {
+        annex_b.extend_from_slice(packet.data());
+        packets.push(packet);
+    }
+    assert_eq!(packets.len(), 6, "one packet per frame");
+    assert_eq!(keyframes(&packets), vec![0, 4]);
+    assert_eq!(count_vcl(&annex_b, h265_kind, &[19, 1]), vec![2, 4]);
+    let mut decoder = H265Decoder::open(device);
+    let frames = decode_packets(&mut decoder, &packets);
+    assert_eq!(frames.len(), 6, "forced stream decodes clean");
+    println!("keyframe: p-flow then forced IDR at picture 5");
 }

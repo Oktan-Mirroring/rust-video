@@ -5,10 +5,10 @@
 #[cfg(target_os = "linux")]
 fn main() {
     use rust_video_caps::common::PictureSize;
-    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile};
     use rust_video_caps::traits::{Device, Encoder};
     use rust_video_harness::{FrameHash, Synth};
-    use rust_video_vaapi::{EncodeCodec, VaApiDevice, VaApiEncoder, VaApiError};
+    use rust_video_vaapi::{VaApiDevice, VaApiEncoder, VaApiError};
 
     let mut args = std::env::args().skip(1);
     let width: u32 = args
@@ -49,12 +49,11 @@ fn main() {
         std::process::exit(2);
     };
     let config = EncodeConfig {
-        rate_control: RateControl::Auto,
         profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
         level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
         ..EncodeConfig::default()
     };
-    let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H265, size, &config) {
+    let mut encoder = match VaApiEncoder::open(&device, size, config) {
         Ok(encoder) => encoder,
         Err(VaApiError::Unsupported(reason)) => {
             println!("SKIP va-api h265 encode ({reason})");

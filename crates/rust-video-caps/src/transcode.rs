@@ -4,7 +4,6 @@ use std::fmt;
 
 use crate::common::PictureSize;
 use crate::frame::PixelFormat;
-use crate::packet::Packet;
 
 /// CPU fallback cause per failed GPU hop.
 #[non_exhaustive]
@@ -179,35 +178,6 @@ impl GpuCaps {
     }
 }
 
-/// Transcode result: packets plus the executed plan.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Outcome {
-    /// Coded packets.
-    packets: Vec<Packet>,
-    /// Executed plan.
-    plan: Plan,
-}
-
-impl Outcome {
-    /// Outcome over `packets` executed under `plan`.
-    #[must_use]
-    pub fn new(packets: Vec<Packet>, plan: Plan) -> Self {
-        Self { packets, plan }
-    }
-
-    /// Coded packets.
-    #[must_use]
-    pub fn packets(&self) -> &[Packet] {
-        &self.packets
-    }
-
-    /// Executed plan.
-    #[must_use]
-    pub fn plan(&self) -> Plan {
-        self.plan
-    }
-}
-
 /// Transcode plan: route plus fallback cause on the CPU route.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Plan {
@@ -332,7 +302,7 @@ impl Scale {
 
 #[cfg(test)]
 mod tests {
-    use super::{Convert, FallbackCause, GpuCaps, Outcome, Plan, Route, Scale, ShareMechanism};
+    use super::{Convert, FallbackCause, GpuCaps, Plan, Route, Scale, ShareMechanism};
     use crate::common::PictureSize;
     use crate::frame::PixelFormat;
 
@@ -482,23 +452,6 @@ mod tests {
             to: PixelFormat::Rgba8,
         };
         assert_eq!(cause.to_string(), "gpu convert Nv12 to Rgba8 unsupported");
-    }
-
-    #[test]
-    fn outcome_reports_packets_and_plan() {
-        let outcome = Outcome::new(Vec::new(), Plan::gpu());
-        assert_eq!(outcome.packets(), []);
-        assert_eq!(outcome.plan(), Plan::gpu());
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-    }
-
-    #[test]
-    fn outcome_reports_cpu_plan() {
-        let plan = Plan::cpu(FallbackCause::DeviceMismatch);
-        let outcome = Outcome::new(Vec::new(), plan);
-        assert_eq!(outcome.packets(), []);
-        assert_eq!(outcome.plan().route(), Route::Cpu);
-        assert_eq!(outcome.plan().cause(), Some(FallbackCause::DeviceMismatch));
     }
 
     #[test]

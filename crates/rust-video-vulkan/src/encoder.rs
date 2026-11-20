@@ -12,7 +12,7 @@ use rust_video_caps::delivery::SubmitStats;
 use rust_video_caps::encode::EncodeConfig;
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{EncodeSurface, Encoder};
+use rust_video_caps::traits::{EncodeSurface, Encoder, KeyframeRequest};
 use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
 use rust_video_core::{planes, Gop};
 
@@ -35,6 +35,8 @@ struct Engine {
     index: u64,
     /// IDR cadence.
     gop: Gop,
+    /// Next stamp forced to IDR, consumed once.
+    force_idr: bool,
     /// Tight NV12 packing scratch.
     tight: Vec<u8>,
     /// Coded bytes scratch.
@@ -76,6 +78,7 @@ impl Engine {
             frame_num: 0,
             index: 0,
             gop,
+            force_idr: false,
             tight: Vec::new(),
             coded: Vec::new(),
         })
@@ -177,9 +180,15 @@ impl Engine {
         Ok(self.packet(keyframe))
     }
 
+    /// Next picture forced to IDR, consumed by the following stamp.
+    fn request_keyframe(&mut self) {
+        self.force_idr = true;
+    }
+
     /// Stamp for the next picture, advancing the counters.
     fn next_stamp(&mut self) -> PictureStamp {
-        let is_idr = self.index.is_multiple_of(u64::from(self.gop.period()));
+        let forced = std::mem::take(&mut self.force_idr);
+        let is_idr = forced || self.index.is_multiple_of(u64::from(self.gop.period()));
         if is_idr {
             self.frame_num = 0;
         } else {
@@ -372,6 +381,15 @@ impl EncodeSurface for H264Encoder {
     }
 }
 
+impl KeyframeRequest for H264Encoder {
+    type Error = VulkanError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.engine.request_keyframe();
+        Ok(())
+    }
+}
+
 /// H.265 GOP encoder over a negotiated Vulkan device.
 ///
 /// Thread-local: the session submits on its creating thread while
@@ -465,6 +483,15 @@ impl EncodeSurface for H265Encoder {
     }
 }
 
+impl KeyframeRequest for H265Encoder {
+    type Error = VulkanError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.engine.request_keyframe();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -491,6 +518,14 @@ mod tests {
         fn assert_encode_surface<T: EncodeSurface>() {}
         assert_encode_surface::<super::H264Encoder>();
         assert_encode_surface::<super::H265Encoder>();
+    }
+
+    #[test]
+    fn encoders_implement_keyframe_request() {
+        use rust_video_caps::traits::KeyframeRequest;
+        fn assert_keyframe<T: KeyframeRequest>() {}
+        assert_keyframe::<super::H264Encoder>();
+        assert_keyframe::<super::H265Encoder>();
     }
 
     #[test]

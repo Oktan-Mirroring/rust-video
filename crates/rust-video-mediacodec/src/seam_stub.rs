@@ -87,6 +87,11 @@ impl CodecSeam for StubSeam {
     fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
         Err(self.role.failure(self.mime))
     }
+
+    /// Loud missing-codec failure; nothing ever keys.
+    fn request_sync(&mut self) -> Result<(), MediaCodecError> {
+        Err(self.role.failure(self.mime))
+    }
 }
 
 impl MediaCodecDecoder {
@@ -180,6 +185,10 @@ mod tests {
             decode.reset(),
             Err(MediaCodecError::NoDecoder { mime: "video/avc" })
         );
+        assert_eq!(
+            decode.request_sync(),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        );
         let mut encode = StubSeam::encoder("video/hevc");
         assert_eq!(
             encode.submit(&[0], 0),
@@ -191,6 +200,10 @@ mod tests {
         );
         assert_eq!(
             encode.reset(),
+            Err(MediaCodecError::NoEncoder { mime: "video/hevc" })
+        );
+        assert_eq!(
+            encode.request_sync(),
             Err(MediaCodecError::NoEncoder { mime: "video/hevc" })
         );
     }

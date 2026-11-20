@@ -1,7 +1,7 @@
 //! H.264 encode on the software tier, from a synthetic frame to packets.
 
 #[cfg(feature = "h264-openh264")]
-use rust_video_caps::encode::{EncodeConfig, RateControl};
+use rust_video_caps::encode::EncodeConfig;
 #[cfg(feature = "h264-openh264")]
 use rust_video_caps::packet::Packet;
 #[cfg(feature = "h264-openh264")]
@@ -13,14 +13,7 @@ use rust_video_sw::H264Encoder;
 
 #[cfg(feature = "h264-openh264")]
 fn main() {
-    let config = EncodeConfig {
-        rate_control: RateControl::Cbr {
-            bitrate: 500_000,
-            maxrate: 500_000,
-            bufsize: 500_000,
-        },
-        ..Default::default()
-    };
+    let config = EncodeConfig::default();
     let mut encoder = H264Encoder::open(64, 64, config, 1).expect("encoder init");
     let frame = Synth::black_yuv420p(64, 64);
     let mut packets_out = 0;

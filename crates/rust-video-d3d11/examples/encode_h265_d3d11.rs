@@ -1,9 +1,11 @@
 //! H.265 encode on the D3D11 tier, from synthetic NV12 to packets.
 
 #[cfg(target_os = "windows")]
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "windows")]
-use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder};
+use rust_video_d3d11::{D3d11Device, D3d11Encoder};
 #[cfg(target_os = "windows")]
 use rust_video_harness::Synth;
 
@@ -17,7 +19,11 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let config = D3d11Encoder::auto_config(Codec::H265).expect("auto config");
+    let config = EncodeConfig {
+        profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+        level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+        ..Default::default()
+    };
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {

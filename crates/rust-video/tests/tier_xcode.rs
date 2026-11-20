@@ -103,7 +103,7 @@ fn synth_h264() -> std::path::PathBuf {
 fn resolved_tier_transcodes_vaapi_hop() {
     use bytes::Bytes;
     use rust_video::{Packet, Route};
-    use rust_video_vaapi::{EncodeCodec, Transcoder, VaApiDevice, VaApiError};
+    use rust_video_vaapi::{Codec, Transcoder, VaApiDevice, VaApiError};
 
     let caps = Capabilities::none().with_platform_hw().with_software();
     assert_eq!(
@@ -118,7 +118,7 @@ fn resolved_tier_transcodes_vaapi_hop() {
         }
         Err(error) => panic!("facade xcode: va-api device failed ({error})"),
     };
-    let mut transcoder = Transcoder::open(&device, EncodeCodec::H264);
+    let mut transcoder = Transcoder::open(&device, Codec::H264, Codec::H264).expect("facade open");
     if !transcoder.caps().ready() {
         println!("facade xcode skipped: va-api without export plus encode caps");
         return;
@@ -126,15 +126,15 @@ fn resolved_tier_transcodes_vaapi_hop() {
     let stream = Stream::demux(&synth_h264()).expect("synth h264 vector");
     let mut count = 0;
     for raw in stream.samples.iter().take(3) {
-        let outcome = transcoder
+        let packets = transcoder
             .transcode(&Packet::new(Bytes::copy_from_slice(raw)))
             .expect("facade hop");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        count += outcome.packets().len();
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        count += packets.len();
     }
     let drained = transcoder.flush().expect("facade drain");
-    assert_eq!(drained.plan().route(), Route::Gpu);
-    count += drained.packets().len();
+    assert_eq!(transcoder.plan().route(), Route::Gpu);
+    count += drained.len();
     assert!(count > 0, "no packets from the va-api hop");
     println!("facade xcode live: va-api gpu hop, {count} packets");
 }
@@ -196,12 +196,12 @@ fn vulkan_hop(platform: Platform) {
         let outcome = transcoder
             .transcode(&Packet::new(Bytes::copy_from_slice(raw)))
             .expect("facade hop");
-        assert_eq!(outcome.plan(), plan);
-        count += outcome.packets().len();
+        assert_eq!(transcoder.plan(), plan);
+        count += outcome.len();
     }
     let drained = transcoder.flush().expect("facade drain");
-    assert_eq!(drained.plan(), plan);
-    count += drained.packets().len();
+    assert_eq!(transcoder.plan(), plan);
+    count += drained.len();
     assert!(count > 0, "no packets from the vulkan hop");
     println!(
         "facade xcode live: vulkan {:?} hop, {count} packets",
@@ -264,12 +264,12 @@ fn resolved_tier_transcodes_one_hop() {
         let outcome = transcoder
             .transcode(&Packet::new(Bytes::from(raw)))
             .expect("facade hop");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        count += outcome.packets().len();
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        count += outcome.len();
     }
     let drained = transcoder.flush().expect("facade drain");
-    assert_eq!(drained.plan().route(), Route::Gpu);
-    count += drained.packets().len();
+    assert_eq!(transcoder.plan().route(), Route::Gpu);
+    count += drained.len();
     assert!(count > 0, "no packets from the d3d12 hop");
     println!("facade xcode live: d3d12 gpu hop, {count} packets");
 }
@@ -315,12 +315,12 @@ fn resolved_tier_transcodes_d3d11_hop() {
         let outcome = transcoder
             .transcode(&Packet::new(Bytes::from(raw)))
             .expect("facade hop");
-        assert_eq!(outcome.plan().route(), Route::Gpu);
-        count += outcome.packets().len();
+        assert_eq!(transcoder.plan().route(), Route::Gpu);
+        count += outcome.len();
     }
     let drained = transcoder.flush().expect("facade drain");
-    assert_eq!(drained.plan().route(), Route::Gpu);
-    count += drained.packets().len();
+    assert_eq!(transcoder.plan().route(), Route::Gpu);
+    count += drained.len();
     assert!(count > 0, "no packets from the d3d11 hop");
     println!("facade xcode live: d3d11 gpu hop, {count} packets");
 }

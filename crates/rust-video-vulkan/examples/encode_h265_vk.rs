@@ -1,13 +1,13 @@
-//! Vulkan H.265 GOP encode over a real input file.
+//! Vulkan H.265 encode over a real input file.
 //!
 //! Reads `VK_VECTOR` (raw NV12 at `VK_WIDTH`x`VK_HEIGHT`), encodes on the
-//! Vulkan tier with an IDR every `VK_GOP` frames, and writes Annex-B to
-//! `VK_OUT`. Loud skip without hardware or input.
+//! Vulkan tier under the default config, and writes Annex-B to `VK_OUT`.
+//! Loud skip without hardware or input.
 
 use bytes::Bytes;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile};
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::traits::Encoder;
 use rust_video_vulkan::{CodecOp, H265Encoder, VulkanDevice};
@@ -33,17 +33,7 @@ fn main() {
             .to_string_lossy()
             .into_owned()
     });
-    let keyint: u32 = std::env::var("VK_GOP")
-        .ok()
-        .and_then(|text| text.parse().ok())
-        .map_or(30, |keyint: u32| keyint.max(1));
     let config = EncodeConfig {
-        gop: Gop {
-            keyint,
-            min_keyint: keyint,
-            b_frames: 0,
-            refs: 1,
-        },
         profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
         level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
         ..Default::default()

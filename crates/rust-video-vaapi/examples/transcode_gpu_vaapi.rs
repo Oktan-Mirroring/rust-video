@@ -1,6 +1,7 @@
 //! VA-API GPU transcode: file in, recoded packets out.
 //!
-//! Reads MP4 (demuxed) or raw Annex B H.264:
+//! Reads MP4 (demuxed) or raw Annex B H.264, recodes under the default
+//! config with a no-op surface filter and a no-op CPU callback:
 //! `transcode_gpu_vaapi <input> [h264|h265] [width height]`.
 
 #[path = "common/input.rs"]
@@ -11,10 +12,11 @@ mod input;
 fn main() {
     use bytes::Bytes;
     use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::CpuFrame;
     use rust_video_caps::packet::Packet;
     use rust_video_caps::traits::Device;
     use rust_video_harness::FrameHash;
-    use rust_video_vaapi::{EncodeCodec, Transcoder, VaApiDevice, VaApiError};
+    use rust_video_vaapi::{Codec, Transcoder, VaApiDevice, VaApiEncoder, VaApiError, VaApiFrame};
 
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
@@ -22,12 +24,16 @@ fn main() {
         std::process::exit(2);
     };
     let codec = match args.next().as_deref() {
-        None | Some("h264") => EncodeCodec::H264,
-        Some("h265") => EncodeCodec::H265,
+        None | Some("h264") => Codec::H264,
+        Some("h265") => Codec::H265,
         Some(other) => {
             eprintln!("transcode_gpu_vaapi: unknown codec {other}");
             std::process::exit(2);
         }
+    };
+    let Some(config) = VaApiEncoder::auto_config(codec) else {
+        eprintln!("transcode_gpu_vaapi: no encoder for {codec}");
+        std::process::exit(2);
     };
     let target = match (args.next(), args.next()) {
         (None, None) => None,
@@ -61,23 +67,32 @@ fn main() {
     };
     println!("va-api transcode: device {}", device.name());
     let samples = input::samples("va-api transcode", &path);
-    let mut transcoder = Transcoder::open(&device, codec);
+    let mut transcoder = match Transcoder::open(&device, Codec::H264, codec) {
+        Ok(transcoder) => transcoder.with_config(config),
+        Err(error) => {
+            eprintln!("va-api transcode: open failed ({error})");
+            std::process::exit(1);
+        }
+    };
     if let Some(size) = target {
         transcoder = transcoder.with_target(size);
     }
     println!("va-api transcode: {} packets from {path}", samples.len());
+    let mut surface_filter = |_surface: &mut VaApiFrame| {};
+    let mut cpu_callback = |_frame: &mut CpuFrame| {};
     let mut packets_out = 0;
     for sample in samples {
         let packet = Packet::new(Bytes::from(sample));
-        match transcoder.transcode(&packet) {
-            Ok(outcome) => {
-                for packet in outcome.packets() {
+        match transcoder.transcode_surface_with(&packet, &mut surface_filter) {
+            Ok(packets) => {
+                let plan = transcoder.plan();
+                for packet in &packets {
                     println!(
                         "packet {packets_out} {} bytes key {} hash {} plan {:?}",
                         packet.data().len(),
                         packet.is_keyframe(),
                         &FrameHash::of(packet.data()).hex()[..16],
-                        outcome.plan(),
+                        plan,
                     );
                     packets_out += 1;
                 }
@@ -92,8 +107,8 @@ fn main() {
             }
         }
     }
-    match transcoder.flush() {
-        Ok(outcome) => packets_out += outcome.packets().len(),
+    match transcoder.flush_with(&mut cpu_callback) {
+        Ok(packets) => packets_out += packets.len(),
         Err(error) => {
             eprintln!("va-api transcode: flush failed ({error})");
             std::process::exit(1);

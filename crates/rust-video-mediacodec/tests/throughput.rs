@@ -236,23 +236,35 @@ fn decode_vp8_1080p_measures_realtime() {
 }
 
 /// 1080p H.264 encode measured against the realtime bar.
+///
+/// NV12 input matches the noise fixtures; no per-frame conversion.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
-    let spec = EncodeSpec::h264(1920, 1080, 8_000_000, 60, 1).expect("valid spec");
+    let spec = EncodeSpec::h264(1920, 1080, 8_000_000, 60, 1)
+        .expect("valid spec")
+        .with_color_format(FormatSpec::COLOR_SEMIPLANAR);
     run_encode("h264", &spec, &noise_frames());
 }
 
 /// 1080p H.265 encode measured against the realtime bar.
+///
+/// NV12 input matches the noise fixtures; no per-frame conversion.
 #[test]
 fn encode_h265_1080p_measures_realtime() {
-    let spec = EncodeSpec::h265(1920, 1080, 8_000_000, 60, 1).expect("valid spec");
+    let spec = EncodeSpec::h265(1920, 1080, 8_000_000, 60, 1)
+        .expect("valid spec")
+        .with_color_format(FormatSpec::COLOR_SEMIPLANAR);
     run_encode("h265", &spec, &noise_frames());
 }
 
 /// 1080p AV1 encode measured against the realtime bar.
+///
+/// NV12 input matches the noise fixtures; no per-frame conversion.
 #[test]
 fn encode_av1_1080p_measures_realtime() {
-    let spec = EncodeSpec::av1(1920, 1080, 8_000_000, 60, 1).expect("valid spec");
+    let spec = EncodeSpec::av1(1920, 1080, 8_000_000, 60, 1)
+        .expect("valid spec")
+        .with_color_format(FormatSpec::COLOR_SEMIPLANAR);
     run_encode("av1", &spec, &noise_frames());
 }
 

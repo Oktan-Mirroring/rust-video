@@ -865,7 +865,7 @@ fn transcode_case(
         else {
             return;
         };
-        let count = outcome.packets().len() + flushed.packets().len();
+        let count = outcome.len() + flushed.len();
         println!("transcode {codec:?} {}: {count} packets", path.display());
         assert!(
             count >= 2,

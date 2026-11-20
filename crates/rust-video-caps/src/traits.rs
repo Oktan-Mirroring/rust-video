@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::frame::CpuFrame;
+use crate::frame::{CpuFrame, Surface};
 use crate::packet::Packet;
 use crate::transcode::GpuCaps;
 
@@ -74,6 +74,20 @@ pub trait Encoder {
     fn flush(&mut self) -> Result<Vec<Packet>, Self::Error>;
 }
 
+/// Keyframe request forcing the next coded picture to IDR.
+pub trait KeyframeRequest {
+    /// Encode failure.
+    type Error: std::error::Error;
+
+    /// Next coded picture forced to IDR.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` wrapping a typed decline when the backend cannot force
+    /// the next picture to IDR.
+    fn request_keyframe(&mut self) -> Result<(), Self::Error>;
+}
+
 /// GPU surfaces to coded packets.
 pub trait EncodeSurface {
     /// GPU surface type.
@@ -91,6 +105,22 @@ pub trait EncodeSurface {
     ///
     /// Returns `Err` when the backend cannot encode `surface`.
     fn encode_surface(&mut self, surface: &Self::Surface) -> Result<Vec<Packet>, Self::Error>;
+}
+
+/// In-place surface filter.
+pub trait SurfaceFilter<S: Surface> {
+    /// Filtered `surface` in place.
+    ///
+    /// # Arguments
+    ///
+    /// * `surface` - surface to filter.
+    fn filter(&mut self, surface: &mut S);
+}
+
+impl<S: Surface, F: FnMut(&mut S)> SurfaceFilter<S> for F {
+    fn filter(&mut self, surface: &mut S) {
+        self(surface);
+    }
 }
 
 /// Held VRAM bytes, released on drop.
@@ -352,5 +382,56 @@ mod tests {
         }
         fn assert_encode_surface<T: EncodeSurface>() {}
         assert_encode_surface::<Dummy>();
+    }
+
+    #[test]
+    fn closure_filters_cpu_frame() {
+        use super::SurfaceFilter;
+        use crate::common::PictureSize;
+        use crate::frame::{CpuFrame, PixelFormat, Plane, Surface};
+        fn apply<S: Surface>(filter: &mut impl SurfaceFilter<S>, surface: &mut S) {
+            filter.filter(surface);
+        }
+        let size = PictureSize::new(16, 16).expect("valid size");
+        let plane = || Plane::new(Bytes::from_static(&[0; 8]), 4).expect("valid plane");
+        let mut frame =
+            CpuFrame::new(size, PixelFormat::Nv12, vec![plane(), plane()]).expect("two planes");
+        let mut observed = None;
+        let mut filter = |surface: &mut CpuFrame| {
+            observed = Some(surface.size());
+        };
+        apply(&mut filter, &mut frame);
+        assert_eq!(observed, Some(size));
+    }
+
+    #[test]
+    fn encoder_keyframe_shape_compiles() {
+        use super::{Encoder, KeyframeRequest};
+        use crate::frame::CpuFrame;
+        struct Dummy;
+        impl Encoder for Dummy {
+            type Error = std::io::Error;
+            fn caps(&self) -> GpuCaps {
+                GpuCaps::new(None, false, false)
+            }
+            fn encode(&mut self, _frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
+                Ok(Vec::new())
+            }
+            fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
+                Ok(Vec::new())
+            }
+        }
+        impl KeyframeRequest for Dummy {
+            type Error = std::io::Error;
+            fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        fn assert_encoder<T: Encoder>() {}
+        fn assert_keyframe<T: KeyframeRequest>() {}
+        assert_encoder::<Dummy>();
+        assert_keyframe::<Dummy>();
+        let mut dummy = Dummy;
+        dummy.request_keyframe().expect("keyframe");
     }
 }

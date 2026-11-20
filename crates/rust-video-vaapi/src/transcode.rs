@@ -1,24 +1,22 @@
 //! GPU transcode: decode surface to encoder input without readback.
 
 use crate::device::VaApiDevice;
-use crate::encoder::{EncodeCodec, VaApiEncoder};
+use crate::encoder::{va_profile, VaApiEncoder};
 use crate::error::VaApiError;
 use crate::ffi;
 use crate::h264::decoder::{H264Decoder, VaApiFrame};
 use crate::scale::{ScaledSurface, Scaler};
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
-use rust_video_caps::frame::PixelFormat;
+use rust_video_caps::encode::EncodeConfig;
+use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
-use rust_video_caps::traits::Encoder;
-use rust_video_caps::transcode::{
-    Convert, FallbackCause, GpuCaps, Outcome, Plan, Scale, ShareMechanism,
-};
-use rust_video_caps::{h264, h265};
+use rust_video_caps::traits::{Decoder, Encoder, SurfaceFilter};
+use rust_video_caps::transcode::{Convert, FallbackCause, GpuCaps, Plan, Scale, ShareMechanism};
+use rust_video_core::Codec;
 
-/// GPU transcode from H.264 decode to encoder input.
+/// GPU transcode from decode surface to encoder input.
 ///
 /// The encoder opens lazily on the first picture, when the decode
 /// size is known, and re-opens when a reconfig changes it; the fresh
@@ -27,8 +25,6 @@ use rust_video_caps::{h264, h265};
 pub struct Transcoder<'a> {
     /// H.264 decoder; the only wired frontend.
     decoder: H264Decoder<'a>,
-    /// Codec the transcode writes.
-    encode_codec: EncodeCodec,
     /// Encode config behind the lazy session.
     config: EncodeConfig,
     /// Encoder behind device surfaces, opened on first picture.
@@ -48,19 +44,27 @@ pub struct Transcoder<'a> {
 }
 
 impl<'a> Transcoder<'a> {
-    /// Transcoder over `device` from H.264 decode to `encode`.
-    #[must_use]
-    pub fn open(device: &'a VaApiDevice, encode: EncodeCodec) -> Self {
+    /// Transcoder over `device` from `decode` to `encode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` without a `decode` frontend, or without
+    /// an `encode` encoder on the driver.
+    pub fn open(device: &'a VaApiDevice, decode: Codec, encode: Codec) -> Result<Self, VaApiError> {
+        if decode != Codec::H264 {
+            return Err(VaApiError::DecodePending { codec: decode });
+        }
+        let config =
+            VaApiEncoder::auto_config(encode).ok_or(VaApiError::NoEncoder { codec: encode })?;
         let caps = GpuCaps::new(
             Some(ShareMechanism::DmaBuf),
             device.dmabuf_export(),
-            device.supports(encode.profile(), ffi::VA_ENTRYPOINT_ENC_SLICE),
+            device.supports(va_profile(encode)?, ffi::VA_ENTRYPOINT_ENC_SLICE),
         );
         let plan = Plan::for_caps(&caps);
-        Self {
+        Ok(Self {
             decoder: H264Decoder::open(device),
-            encode_codec: encode,
-            config: Self::default_config(encode),
+            config,
             encoder: None,
             caps,
             scale: Scale::passthrough(),
@@ -68,27 +72,7 @@ impl<'a> Transcoder<'a> {
             device,
             scaler: None,
             plan,
-        }
-    }
-
-    /// Legacy config for `encode`: tier profile under `Auto` rate control.
-    fn default_config(encode: EncodeCodec) -> EncodeConfig {
-        let (profile, level) = match encode {
-            EncodeCodec::H264 => (
-                Profile::H264(h264::EncodeProfile::High),
-                Level::H264(h264::EncodeLevel::Auto),
-            ),
-            EncodeCodec::H265 => (
-                Profile::H265(h265::EncodeProfile::Main),
-                Level::H265(h265::EncodeLevel::Auto),
-            ),
-        };
-        EncodeConfig {
-            rate_control: RateControl::Auto,
-            profile,
-            level,
-            ..EncodeConfig::default()
-        }
+        })
     }
 
     /// Transcoder retargeted to `target`.
@@ -138,7 +122,7 @@ impl<'a> Transcoder<'a> {
     ///
     /// Returns `Err` when a transcode hop missed its capability, when the
     /// scale hop misses its target, or when either backend refuses the picture.
-    pub fn transcode(&mut self, packet: &Packet) -> Result<Outcome, VaApiError> {
+    pub fn transcode(&mut self, packet: &Packet) -> Result<Vec<Packet>, VaApiError> {
         self.check_ready()?;
         self.transcode_gpu(packet)
     }
@@ -149,9 +133,85 @@ impl<'a> Transcoder<'a> {
     ///
     /// Returns `Err` when a transcode hop missed its capability, when the
     /// scale hop misses its target, or when either backend refuses the drain.
-    pub fn flush(&mut self) -> Result<Outcome, VaApiError> {
+    pub fn flush(&mut self) -> Result<Vec<Packet>, VaApiError> {
         self.check_ready()?;
         self.flush_gpu()
+    }
+
+    /// Packets transcoded from `packet` with `filter` over each CPU frame.
+    ///
+    /// Round trip: GPU decode, readback download to [`CpuFrame`],
+    /// `filter` in place, CPU upload encode. Replace the frame inside
+    /// `filter` to change pixels. The GPU plan gates this path too: a
+    /// hop miss declines before any frame moves, and a scale or convert
+    /// hop fails loud with the same typed miss as the surface path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale or convert hop misses its target, when the readback
+    /// truncates, or when either backend refuses the picture.
+    pub fn transcode_with(
+        &mut self,
+        packet: &Packet,
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VaApiError> {
+        self.check_ready()?;
+        let frames = self.decoder.decode(packet)?;
+        let mut packets = self.encode_cpu(&frames, filter)?;
+        // The upload path holds one picture back; release it per call.
+        if let Some(encoder) = self.encoder.as_mut() {
+            packets.append(&mut encoder.flush()?);
+        }
+        Ok(packets)
+    }
+
+    /// Drained packets with `filter` over each CPU frame.
+    ///
+    /// Round trip: GPU decode, readback download to [`CpuFrame`],
+    /// `filter` in place, CPU upload encode. Replace the frame inside
+    /// `filter` to change pixels. The GPU plan gates this path too: a
+    /// hop miss declines before any frame moves, and a scale or convert
+    /// hop fails loud with the same typed miss as the surface path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale or convert hop misses its target, when the readback
+    /// truncates, or when either backend refuses the drain.
+    pub fn flush_with(
+        &mut self,
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VaApiError> {
+        self.check_ready()?;
+        let frames = self.decoder.flush()?;
+        let mut packets = self.encode_cpu(&frames, filter)?;
+        if let Some(encoder) = self.encoder.as_mut() {
+            packets.append(&mut encoder.flush()?);
+        }
+        Ok(packets)
+    }
+
+    /// Packets transcoded from `packet` with `filter` over each GPU surface.
+    ///
+    /// `filter` runs between surface decode and surface encode; closures
+    /// work through the blanket [`SurfaceFilter`] impl.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the picture.
+    pub fn transcode_surface_with(
+        &mut self,
+        packet: &Packet,
+        filter: &mut impl SurfaceFilter<VaApiFrame>,
+    ) -> Result<Vec<Packet>, VaApiError> {
+        self.check_ready()?;
+        let mut surfaces = self.decoder.decode_surface(packet)?;
+        for surface in &mut surfaces {
+            filter.filter(surface);
+        }
+        self.encode_surfaces(&surfaces)
     }
 
     /// GPU route unless a hop missed, else the typed decline naming the miss.
@@ -167,20 +227,42 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Packets transcoded from `packet` through device surfaces.
-    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, VaApiError> {
+    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Vec<Packet>, VaApiError> {
         let surfaces = self.decoder.decode_surface(packet)?;
-        let packets = self.encode_surfaces(&surfaces)?;
-        Ok(Outcome::new(packets, self.plan))
+        self.encode_surfaces(&surfaces)
     }
 
     /// Drained packets through device surfaces.
-    fn flush_gpu(&mut self) -> Result<Outcome, VaApiError> {
+    fn flush_gpu(&mut self) -> Result<Vec<Packet>, VaApiError> {
         let surfaces = self.decoder.flush_surface()?;
         let mut packets = self.encode_surfaces(&surfaces)?;
         if let Some(encoder) = self.encoder.as_mut() {
             packets.append(&mut encoder.flush()?);
         }
-        Ok(Outcome::new(packets, self.plan))
+        Ok(packets)
+    }
+
+    /// Packets coded from downloaded `frames` through `filter`.
+    fn encode_cpu(
+        &mut self,
+        frames: &[VaApiFrame],
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VaApiError> {
+        let mut packets = Vec::new();
+        for frame in frames {
+            let mut cpu = frame
+                .to_cpu()
+                .ok_or(VaApiError::Unsupported(CapsUnsupported::Nv12ShortOfExtent))?;
+            if let Some(cause) = self.convert.miss(cpu.format()) {
+                return Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }));
+            }
+            if let Some(cause) = self.scale.miss(cpu.size()) {
+                return Err(VaApiError::Unsupported(CapsUnsupported::Fallback { cause }));
+            }
+            filter(&mut cpu);
+            packets.append(&mut self.encoder_for(cpu.size())?.encode(&cpu)?);
+        }
+        Ok(packets)
     }
 
     /// Packets coded from device `surfaces`.
@@ -276,7 +358,7 @@ impl<'a> Transcoder<'a> {
             .as_ref()
             .is_none_or(|encoder| encoder.size() != size)
         {
-            let encoder = VaApiEncoder::open(self.device, self.encode_codec, size, &self.config)?;
+            let encoder = VaApiEncoder::open(self.device, size, self.config)?;
             self.encoder = Some(encoder);
         }
         match self.encoder.as_mut() {
@@ -289,10 +371,55 @@ impl<'a> Transcoder<'a> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::packet::Packet;
     use rust_video_caps::transcode::{
-        Convert, FallbackCause, GpuCaps, Plan, Scale, ShareMechanism,
+        Convert, FallbackCause, GpuCaps, Plan, Route, Scale, ShareMechanism,
     };
+    use rust_video_core::Codec;
+
+    /// Live H.264 transcoder over `device`.
+    fn pair(device: &crate::device::VaApiDevice) -> super::Transcoder<'_> {
+        super::Transcoder::open(device, Codec::H264, Codec::H264).expect("open runs")
+    }
+
+    /// H.264 packets coding the synth IDR plus P picture.
+    fn input_packets() -> Vec<Packet> {
+        rust_video_harness::H264Synth::annex_b_packets()
+            .iter()
+            .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+            .collect()
+    }
+
+    /// Concatenated bytes transcoding `packets` plus the flush drain.
+    fn transcode_all(transcoder: &mut super::Transcoder<'_>, packets: &[Packet]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for packet in packets {
+            for coded in transcoder.transcode(packet).expect("transcode runs") {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in transcoder.flush().expect("flush runs") {
+            out.extend_from_slice(coded.data());
+        }
+        out
+    }
+
+    /// Solid-black NV12 frame at `size`.
+    fn black(size: PictureSize) -> CpuFrame {
+        let pixels = usize::try_from(size.width()).expect("width fits")
+            * usize::try_from(size.height()).expect("height fits");
+        CpuFrame::new(
+            size,
+            PixelFormat::Nv12,
+            vec![
+                Plane::new(Bytes::from(vec![0; pixels]), size.width()).expect("luma"),
+                Plane::new(Bytes::from(vec![128; pixels / 2]), size.width()).expect("chroma"),
+            ],
+        )
+        .expect("black frame")
+    }
 
     /// Transcoder with `caps` forced past `open`.
     fn forced(
@@ -302,8 +429,7 @@ mod tests {
     ) -> super::Transcoder<'_> {
         super::Transcoder {
             decoder: crate::h264::decoder::H264Decoder::open(device),
-            encode_codec: crate::encoder::EncodeCodec::H264,
-            config: super::Transcoder::default_config(crate::encoder::EncodeCodec::H264),
+            config: crate::encoder::VaApiEncoder::auto_config(Codec::H264).expect("tier recipe"),
             encoder: None,
             caps,
             scale: Scale::passthrough(),
@@ -334,5 +460,157 @@ mod tests {
             transcoder.flush().expect_err("drain declines").to_string(),
             "unsupported stream: encoder without gpu import"
         );
+    }
+
+    #[test]
+    fn config_changes_output_size_class() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let packets = input_packets();
+        let mut sizes = Vec::new();
+        for bitrate in [500_000u32, 8_000_000] {
+            let config = rust_video_caps::encode::EncodeConfig {
+                rate_control: rust_video_caps::encode::RateControl::Cbr {
+                    bitrate,
+                    maxrate: bitrate,
+                    bufsize: bitrate,
+                },
+                profile: rust_video_caps::encode::Profile::H264(
+                    rust_video_caps::h264::EncodeProfile::High,
+                ),
+                ..rust_video_caps::encode::EncodeConfig::default()
+            };
+            let mut transcoder = pair(&device).with_config(config);
+            if transcoder.plan().route() != Route::Gpu {
+                return;
+            }
+            let mut out = Vec::new();
+            let mut run = || -> Result<(), crate::error::VaApiError> {
+                for packet in &packets {
+                    for coded in transcoder.transcode(packet)? {
+                        out.extend_from_slice(coded.data());
+                    }
+                }
+                for coded in transcoder.flush()? {
+                    out.extend_from_slice(coded.data());
+                }
+                Ok(())
+            };
+            match run() {
+                Ok(()) => {}
+                Err(crate::error::VaApiError::Declined(decline)) => {
+                    println!("declined: cbr size class without driver mode: {decline}");
+                    return;
+                }
+                Err(error) => panic!("transcode runs: {error}"),
+            }
+            assert!(!out.is_empty(), "cbr {bitrate} emits bytes");
+            sizes.push(out.len());
+        }
+        assert!(
+            sizes[1] * 2 > sizes[0] * 3,
+            "bitrate knob moves size class past 1.5x"
+        );
+    }
+
+    #[test]
+    fn cpu_callback_alters_output_bytes() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let packets = input_packets();
+        let mut plain = pair(&device);
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        assert!(!expected.is_empty(), "plain transcode emits bytes");
+        let mut filtered = pair(&device);
+        let mut blacken = |frame: &mut CpuFrame| {
+            *frame = black(frame.size());
+        };
+        let mut out = Vec::new();
+        for packet in &packets {
+            for coded in filtered
+                .transcode_with(packet, &mut blacken)
+                .expect("filter runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in filtered.flush_with(&mut blacken).expect("drain runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert!(!out.is_empty(), "filtered transcode emits bytes");
+        assert_ne!(
+            out, expected,
+            "replaced frames re-encode to different bytes"
+        );
+    }
+
+    #[test]
+    fn noop_callback_matches_plain_transcode() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let packets = input_packets();
+        let mut plain = pair(&device);
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        let mut filtered = pair(&device);
+        let mut noop = |_frame: &mut CpuFrame| {};
+        let mut out = Vec::new();
+        for packet in &packets {
+            for coded in filtered
+                .transcode_with(packet, &mut noop)
+                .expect("pass runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in filtered.flush_with(&mut noop).expect("drain runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert_eq!(out, expected, "no-op callback preserves bytes");
+    }
+
+    #[test]
+    fn surface_filter_observes_every_picture() {
+        let Ok(device) = crate::device::VaApiDevice::open() else {
+            return;
+        };
+        let packets = input_packets();
+        let mut plain = pair(&device);
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        let mut hooked = pair(&device);
+        let mut sizes = Vec::new();
+        let mut out = Vec::new();
+        let mut observe = |surface: &mut crate::h264::decoder::VaApiFrame| {
+            sizes.push(surface.size());
+        };
+        for packet in &packets {
+            for coded in hooked
+                .transcode_surface_with(packet, &mut observe)
+                .expect("hook runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in hooked.flush().expect("flush runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert!(!sizes.is_empty(), "hook observes decoded pictures");
+        let extent = PictureSize::new(64, 64).expect("nonzero extent");
+        assert!(
+            sizes.iter().all(|size| *size == extent),
+            "hook observes decoded extents"
+        );
+        assert_eq!(out, expected, "observing filter preserves bytes");
     }
 }

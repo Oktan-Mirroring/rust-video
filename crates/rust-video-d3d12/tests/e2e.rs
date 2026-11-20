@@ -24,7 +24,7 @@ use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
 use rust_video_caps::frame::GpuExport;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::{Decoder, Device, Encoder};
-use rust_video_caps::transcode::{Outcome, Route};
+use rust_video_caps::transcode::Route;
 use rust_video_caps::{av1, vp9};
 use rust_video_harness::{decode_dir, AnnexB, H264Synth, Synth};
 
@@ -64,27 +64,27 @@ fn transcode_all(transcoder: &mut Transcoder<'_>, raws: &[Vec<u8>]) -> (usize, u
     let mut out = Vec::new();
     for (index, raw) in raws.iter().enumerate() {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let outcome = match transcoder.transcode(&packet) {
-            Ok(outcome) => outcome,
+        let coded = match transcoder.transcode(&packet) {
+            Ok(coded) => coded,
             Err(error) => panic!("transcode packet {index}: {error}"),
         };
         assert_eq!(
-            outcome.plan().route(),
+            transcoder.plan().route(),
             Route::Gpu,
             "packet {index} stays on gpu"
         );
-        coded_packets += outcome.packets().len();
-        for coded in outcome.packets() {
-            coded_bytes += coded.data().len();
-            out.extend_from_slice(coded.data());
+        coded_packets += coded.len();
+        for packet in &coded {
+            coded_bytes += packet.data().len();
+            out.extend_from_slice(packet.data());
         }
     }
-    let outcome = transcoder.flush().expect("flush drains");
-    assert_eq!(outcome.plan().route(), Route::Gpu, "flush stays on gpu");
-    coded_packets += outcome.packets().len();
-    for coded in outcome.packets() {
-        coded_bytes += coded.data().len();
-        out.extend_from_slice(coded.data());
+    let coded = transcoder.flush().expect("flush drains");
+    assert_eq!(transcoder.plan().route(), Route::Gpu, "flush stays on gpu");
+    coded_packets += coded.len();
+    for packet in &coded {
+        coded_bytes += packet.data().len();
+        out.extend_from_slice(packet.data());
     }
     assert!(coded_bytes > 0, "transcode emits a bitstream");
     (coded_packets, coded_bytes, out)
@@ -117,13 +117,9 @@ fn transcoder(device: &D3d12Device) -> Option<Transcoder<'_>> {
     Transcoder::open(device, Codec::H264, Codec::H264).ok()
 }
 
-/// Bitstream bytes behind `outcome`.
-fn bytes_of(outcome: &Outcome) -> usize {
-    outcome
-        .packets()
-        .iter()
-        .map(|packet| packet.data().len())
-        .sum()
+/// Bitstream bytes behind `packets`.
+fn bytes_of(packets: &[Packet]) -> usize {
+    packets.iter().map(|packet| packet.data().len()).sum()
 }
 
 /// Bitstream bytes through `transcoder`, every hop on the GPU route.
@@ -140,13 +136,13 @@ fn drive_raw(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> usize {
     let mut bytes = 0;
     for raw in raws {
         let packet = Packet::new(Bytes::from(raw));
-        let outcome = transcoder.transcode(&packet).expect("cropped transcode");
-        assert!(matches!(outcome.plan().route(), Route::Gpu));
-        bytes += bytes_of(&outcome);
+        let coded = transcoder.transcode(&packet).expect("cropped transcode");
+        assert!(matches!(transcoder.plan().route(), Route::Gpu));
+        bytes += bytes_of(&coded);
     }
-    let outcome = transcoder.flush().expect("cropped flush");
-    assert!(matches!(outcome.plan().route(), Route::Gpu));
-    bytes + bytes_of(&outcome)
+    let coded = transcoder.flush().expect("cropped flush");
+    assert!(matches!(transcoder.plan().route(), Route::Gpu));
+    bytes + bytes_of(&coded)
 }
 
 /// Transcoded bitstream bytes for `raws` through `transcoder`.
@@ -154,15 +150,15 @@ fn transcode_bytes(transcoder: &mut Transcoder, raws: Vec<Vec<u8>>) -> Vec<u8> {
     let mut bytes = Vec::new();
     for raw in raws {
         let packet = Packet::new(Bytes::from(raw));
-        let outcome = transcoder.transcode(&packet).expect("cropped transcode");
-        assert!(matches!(outcome.plan().route(), Route::Gpu));
-        for packet in outcome.packets() {
+        let coded = transcoder.transcode(&packet).expect("cropped transcode");
+        assert!(matches!(transcoder.plan().route(), Route::Gpu));
+        for packet in &coded {
             bytes.extend_from_slice(packet.data());
         }
     }
-    let outcome = transcoder.flush().expect("cropped flush");
-    assert!(matches!(outcome.plan().route(), Route::Gpu));
-    for packet in outcome.packets() {
+    let coded = transcoder.flush().expect("cropped flush");
+    assert!(matches!(transcoder.plan().route(), Route::Gpu));
+    for packet in &coded {
         bytes.extend_from_slice(packet.data());
     }
     bytes
@@ -582,9 +578,9 @@ fn cropped_stream_transcodes_on_gpu_scale() {
     for raw in packets {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
-            Ok(outcome) => {
-                assert!(matches!(outcome.plan().route(), Route::Gpu));
-                bytes += bytes_of(&outcome);
+            Ok(coded) => {
+                assert!(matches!(transcoder.plan().route(), Route::Gpu));
+                bytes += bytes_of(&coded);
             }
             Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
                 println!("SKIP: d3d12 scale ({error})");
@@ -593,9 +589,9 @@ fn cropped_stream_transcodes_on_gpu_scale() {
             Err(error) => panic!("cropped scale transcode: {error}"),
         }
     }
-    let outcome = transcoder.flush().expect("cropped scale flush");
-    assert!(matches!(outcome.plan().route(), Route::Gpu));
-    bytes += bytes_of(&outcome);
+    let coded = transcoder.flush().expect("cropped scale flush");
+    assert!(matches!(transcoder.plan().route(), Route::Gpu));
+    bytes += bytes_of(&coded);
     assert!(bytes > 0);
 }
 

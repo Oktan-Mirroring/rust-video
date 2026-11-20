@@ -17,7 +17,7 @@ use rust_video_caps::encode::{
 };
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 
 /// Realtime AV1 encoder over `libsvtav1` or `libaom-av1`.
@@ -447,6 +447,15 @@ impl Encoder for Av1Encoder {
     }
 }
 
+impl KeyframeRequest for Av1Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.request_keyframe();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_video_caps::av1::{EncodeLevel, EncodeProfile};
@@ -456,7 +465,7 @@ mod tests {
         Decline, EncodeConfig, FrameRate, Gop, Level, Profile, Quality, RateControl, SpeedPreset,
     };
     use rust_video_caps::frame::PixelFormat;
-    use rust_video_caps::traits::Encoder;
+    use rust_video_caps::traits::{Encoder, KeyframeRequest};
 
     use super::Av1Encoder;
     use crate::error::SwError;
@@ -593,6 +602,42 @@ mod tests {
         packets.extend(encoder.flush().expect("flush"));
         assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn pinned_svt_keyframe_request_forces_single_keyframe() {
+        let mut encoder = Av1Encoder::open_libsvt(64, 64, cbr(500_000), 1).expect("encoder");
+        let keyed = forced_keyed(&mut encoder);
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn pinned_aom_keyframe_request_forces_single_keyframe() {
+        let mut encoder = Av1Encoder::open_libaom(64, 64, cbr(500_000), 1).expect("encoder");
+        let keyed = forced_keyed(&mut encoder);
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
+    }
+
+    /// Keyframe flags over four flat frames with a request before the third.
+    fn forced_keyed(encoder: &mut Av1Encoder) -> Vec<bool> {
+        let mut packets = Vec::new();
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        encoder.request_keyframe().expect("request");
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.flush().expect("flush"));
+        packets.iter().map(|packet| packet.is_keyframe()).collect()
     }
 
     #[test]

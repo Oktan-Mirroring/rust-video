@@ -8,10 +8,10 @@ use crate::ladder::CodecOp;
 
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::encode::{EncodeConfig, RateControl};
-use rust_video_caps::frame::PixelFormat;
+use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{EncodeSurface, Encoder};
-use rust_video_caps::transcode::{Convert, GpuCaps, Outcome, Plan, Route, Scale};
+use rust_video_caps::traits::{Decoder, EncodeSurface, Encoder, SurfaceFilter};
+use rust_video_caps::transcode::{Convert, GpuCaps, Plan, Route, Scale};
 
 /// Encoder behind one transcode route.
 enum Encode {
@@ -27,6 +27,22 @@ impl Encode {
         match self {
             Self::H264(encoder) => encoder.encode_surface(frame),
             Self::H265(encoder) => encoder.encode_surface(frame),
+        }
+    }
+
+    /// Packets coded from CPU `frame`.
+    fn encode_frame(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, VulkanError> {
+        match self {
+            Self::H264(encoder) => encoder.encode(frame),
+            Self::H265(encoder) => encoder.encode(frame),
+        }
+    }
+
+    /// Packets held back for reordering or buffering.
+    fn flush(&mut self) -> Result<Vec<Packet>, VulkanError> {
+        match self {
+            Self::H264(encoder) => encoder.flush(),
+            Self::H265(encoder) => encoder.flush(),
         }
     }
 }
@@ -59,6 +75,8 @@ pub struct Transcoder<'a> {
     encode_op: CodecOp,
     /// Encode hop, opened on the first frame.
     encoder: Option<Encode>,
+    /// Encode config behind the lazy encoder.
+    config: EncodeConfig,
     /// Per-hop capabilities.
     caps: GpuCaps,
     /// Optional scale hop.
@@ -107,6 +125,15 @@ impl<'a> Transcoder<'a> {
                 });
             }
         };
+        let config = match encode_op {
+            CodecOp::H264Encode => legacy_h264(),
+            CodecOp::H265Encode => legacy_h265(),
+            CodecOp::H264Decode | CodecOp::H265Decode | CodecOp::Av1Decode => {
+                return Err(VulkanError::Unsupported {
+                    what: "transcode direction".to_owned(),
+                });
+            }
+        };
         let share = decode_device.share_mechanism();
         let decode_export = share.is_some()
             && decode_device.surface_export()
@@ -124,6 +151,7 @@ impl<'a> Transcoder<'a> {
             encode_device,
             encode_op,
             encoder: None,
+            config,
             caps,
             scale: Scale::passthrough(),
             convert: Convert::passthrough(),
@@ -151,6 +179,13 @@ impl<'a> Transcoder<'a> {
         self
     }
 
+    /// Transcoder encoding under `config` instead of the legacy recipe.
+    #[must_use]
+    pub fn with_config(mut self, config: EncodeConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Per-hop capabilities.
     #[must_use]
     pub fn caps(&self) -> GpuCaps {
@@ -169,7 +204,7 @@ impl<'a> Transcoder<'a> {
     ///
     /// Returns `Err` when the plan missed a hop or the target, or when
     /// either backend refuses the picture.
-    pub fn transcode(&mut self, packet: &Packet) -> Result<Outcome, VulkanError> {
+    pub fn transcode(&mut self, packet: &Packet) -> Result<Vec<Packet>, VulkanError> {
         self.check_ready()?;
         self.transcode_gpu(packet)
     }
@@ -180,9 +215,92 @@ impl<'a> Transcoder<'a> {
     ///
     /// Returns `Err` when the plan missed a hop or the target, or when
     /// either backend refuses the drain.
-    pub fn flush(&mut self) -> Result<Outcome, VulkanError> {
+    pub fn flush(&mut self) -> Result<Vec<Packet>, VulkanError> {
         self.check_ready()?;
         self.flush_gpu()
+    }
+
+    /// Packets transcoded from `packet` with `filter` over each CPU frame.
+    ///
+    /// Round trip: GPU decode, readback download to [`CpuFrame`],
+    /// `filter` in place, CPU upload encode. Replace the frame inside
+    /// `filter` to change pixels. The GPU plan gates this path too: a
+    /// hop miss declines before any frame moves, and a scale or convert
+    /// hop fails loud with the same typed miss as the surface path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale or convert hop misses its target, when the readback
+    /// truncates, or when either backend refuses the picture.
+    pub fn transcode_with(
+        &mut self,
+        packet: &Packet,
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VulkanError> {
+        self.check_ready()?;
+        let frames = match &mut self.decoder {
+            DecodeRouted::H264(decoder) => decoder.decode(packet)?,
+            DecodeRouted::H265(decoder) => decoder.decode(packet)?,
+            DecodeRouted::Av1(decoder) => decoder.decode(packet)?,
+        };
+        self.encode_cpu(&frames, filter)
+    }
+
+    /// Drained packets with `filter` over each CPU frame.
+    ///
+    /// Round trip: GPU decode, readback download to [`CpuFrame`],
+    /// `filter` in place, CPU upload encode. Replace the frame inside
+    /// `filter` to change pixels. The GPU plan gates this path too: a
+    /// hop miss declines before any frame moves, and a scale or convert
+    /// hop fails loud with the same typed miss as the surface path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale or convert hop misses its target, when the readback
+    /// truncates, or when either backend refuses the drain.
+    pub fn flush_with(
+        &mut self,
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VulkanError> {
+        self.check_ready()?;
+        let frames = match &mut self.decoder {
+            DecodeRouted::H264(decoder) => decoder.flush()?,
+            DecodeRouted::H265(decoder) => decoder.flush()?,
+            DecodeRouted::Av1(decoder) => decoder.flush()?,
+        };
+        let mut packets = self.encode_cpu(&frames, filter)?;
+        if let Some(encoder) = self.encoder.as_mut() {
+            packets.append(&mut encoder.flush()?);
+        }
+        Ok(packets)
+    }
+
+    /// Packets transcoded from `packet` with `filter` over each GPU surface.
+    ///
+    /// `filter` runs between surface decode and surface encode; closures
+    /// work through the blanket [`SurfaceFilter`] impl.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a transcode hop missed its capability, when the
+    /// scale hop misses its target, or when either backend refuses the picture.
+    pub fn transcode_surface_with(
+        &mut self,
+        packet: &Packet,
+        filter: &mut impl SurfaceFilter<VulkanFrame>,
+    ) -> Result<Vec<Packet>, VulkanError> {
+        self.check_ready()?;
+        let mut surfaces = match &mut self.decoder {
+            DecodeRouted::H264(decoder) => decoder.decode_surface(packet)?,
+            DecodeRouted::H265(decoder) => decoder.decode_surface(packet)?,
+            DecodeRouted::Av1(decoder) => decoder.decode_surface(packet)?,
+        };
+        for surface in &mut surfaces {
+            filter.filter(surface);
+        }
+        self.encode_surfaces(&surfaces)
     }
 
     /// GPU route unless the plan missed, else the typed decline naming the miss.
@@ -200,18 +318,17 @@ impl<'a> Transcoder<'a> {
     }
 
     /// Packets transcoded from `packet` through device exports.
-    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Outcome, VulkanError> {
+    fn transcode_gpu(&mut self, packet: &Packet) -> Result<Vec<Packet>, VulkanError> {
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.decode_surface(packet)?,
             DecodeRouted::H265(decoder) => decoder.decode_surface(packet)?,
             DecodeRouted::Av1(decoder) => decoder.decode_surface(packet)?,
         };
-        let packets = self.encode_surfaces(&frames)?;
-        Ok(Outcome::new(packets, self.plan))
+        self.encode_surfaces(&frames)
     }
 
     /// Drained packets through device exports.
-    fn flush_gpu(&mut self) -> Result<Outcome, VulkanError> {
+    fn flush_gpu(&mut self) -> Result<Vec<Packet>, VulkanError> {
         let frames = match &mut self.decoder {
             DecodeRouted::H264(decoder) => decoder.flush_surface()?,
             DecodeRouted::H265(decoder) => decoder.flush_surface()?,
@@ -219,12 +336,41 @@ impl<'a> Transcoder<'a> {
         };
         let mut packets = self.encode_surfaces(&frames)?;
         if let Some(encoder) = self.encoder.as_mut() {
-            match encoder {
-                Encode::H264(encoder) => packets.append(&mut encoder.flush()?),
-                Encode::H265(encoder) => packets.append(&mut encoder.flush()?),
-            }
+            packets.append(&mut encoder.flush()?);
         }
-        Ok(Outcome::new(packets, self.plan))
+        Ok(packets)
+    }
+
+    /// Packets coded from downloaded `frames` through `filter`.
+    fn encode_cpu(
+        &mut self,
+        frames: &[VulkanFrame],
+        filter: &mut impl FnMut(&mut CpuFrame),
+    ) -> Result<Vec<Packet>, VulkanError> {
+        let mut packets = Vec::new();
+        for frame in frames {
+            let mut cpu = frame.to_cpu().ok_or_else(|| {
+                let size = frame.identity().size();
+                let luma = u64::from(size.width()) * u64::from(size.height());
+                VulkanError::ShortReadback {
+                    expected: usize::try_from(luma + luma / 2).unwrap_or(usize::MAX),
+                    found: frame.nv12().len(),
+                }
+            })?;
+            if let Some(cause) = self.convert.miss(cpu.format()) {
+                return Err(VulkanError::Unsupported {
+                    what: cause.to_string(),
+                });
+            }
+            if let Some(cause) = self.scale.miss(cpu.size()) {
+                return Err(VulkanError::Unsupported {
+                    what: cause.to_string(),
+                });
+            }
+            filter(&mut cpu);
+            packets.append(&mut self.encoder_for(cpu.size())?.encode_frame(&cpu)?);
+        }
+        Ok(packets)
     }
 
     /// Packets coded from device `frames`.
@@ -266,13 +412,13 @@ impl<'a> Transcoder<'a> {
                     self.encode_device,
                     width,
                     height,
-                    legacy_h264(),
+                    self.config,
                 )?),
                 CodecOp::H265Encode => Encode::H265(H265Encoder::open(
                     self.encode_device,
                     width,
                     height,
-                    legacy_h265(),
+                    self.config,
                 )?),
                 CodecOp::H264Decode | CodecOp::H265Decode | CodecOp::Av1Decode => {
                     return Err(VulkanError::OverCaps { what: "codec op" });
@@ -328,6 +474,8 @@ fn decode_two_plane(device: &VulkanDevice, op: CodecOp) -> bool {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use rust_video_caps::common::PictureSize;
+    use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::packet::Packet;
     use rust_video_caps::transcode::{
         Convert, FallbackCause, GpuCaps, Plan, Route, Scale, ShareMechanism,
@@ -357,6 +505,7 @@ mod tests {
             encode_device: encode,
             encode_op: CodecOp::H264Encode,
             encoder: None,
+            config: super::legacy_h264(),
             caps,
             scale: Scale::passthrough(),
             convert: Convert::passthrough(),
@@ -409,8 +558,8 @@ mod tests {
         if transcoder.plan().route() != Route::Gpu {
             return;
         }
-        let outcome = transcoder.flush().expect("flush drains");
-        assert_eq!(outcome.packets(), []);
+        let packets = transcoder.flush().expect("flush drains");
+        assert_eq!(packets, []);
     }
 
     #[test]
@@ -424,8 +573,8 @@ mod tests {
         if transcoder.plan().route() != Route::Gpu {
             return;
         }
-        assert_eq!(transcoder.flush().expect("first flush").packets(), []);
-        assert_eq!(transcoder.flush().expect("second flush").packets(), []);
+        assert_eq!(transcoder.flush().expect("first flush"), []);
+        assert_eq!(transcoder.flush().expect("second flush"), []);
     }
 
     #[test]
@@ -440,8 +589,8 @@ mod tests {
             return;
         }
         let packet = Packet::new(Bytes::new());
-        let outcome = transcoder.transcode(&packet).expect("empty packet");
-        assert_eq!(outcome.packets(), []);
+        let packets = transcoder.transcode(&packet).expect("empty packet");
+        assert_eq!(packets, []);
     }
 
     #[test]
@@ -462,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_reports_plan() {
+    fn flush_keeps_plan() {
         let Some((decode, encode)) = devices() else {
             return;
         };
@@ -473,9 +622,9 @@ mod tests {
             return;
         }
         let plan = transcoder.plan();
-        let outcome = transcoder.flush().expect("flush drains");
-        assert_eq!(outcome.packets(), []);
-        assert_eq!(outcome.plan(), plan);
+        let packets = transcoder.flush().expect("flush drains");
+        assert_eq!(packets, []);
+        assert_eq!(transcoder.plan(), plan);
     }
 
     #[cfg(any(unix, windows))]
@@ -542,5 +691,206 @@ mod tests {
             transcoder.flush().expect_err("drain declines").to_string(),
             "unsupported decode and encode devices differ"
         );
+    }
+
+    /// H.264 packets coding the synth IDR plus P picture.
+    fn input_packets() -> Vec<Packet> {
+        rust_video_harness::H264Synth::annex_b_packets()
+            .iter()
+            .map(|raw| Packet::new(Bytes::copy_from_slice(raw)))
+            .collect()
+    }
+
+    /// Concatenated bytes transcoding `packets` plus the flush drain.
+    fn transcode_all(transcoder: &mut super::Transcoder<'_>, packets: &[Packet]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for packet in packets {
+            for coded in transcoder.transcode(packet).expect("transcode runs") {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in transcoder.flush().expect("flush runs") {
+            out.extend_from_slice(coded.data());
+        }
+        out
+    }
+
+    /// Solid-black NV12 frame at `size`.
+    fn black(size: PictureSize) -> CpuFrame {
+        let pixels = usize::try_from(size.width()).expect("width fits")
+            * usize::try_from(size.height()).expect("height fits");
+        CpuFrame::new(
+            size,
+            PixelFormat::Nv12,
+            vec![
+                Plane::new(Bytes::from(vec![0; pixels]), size.width()).expect("luma"),
+                Plane::new(Bytes::from(vec![128; pixels / 2]), size.width()).expect("chroma"),
+            ],
+        )
+        .expect("black frame")
+    }
+
+    #[test]
+    fn config_changes_output_size_class() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let packets = input_packets();
+        let mut sizes = Vec::new();
+        for bitrate in [500_000u32, 8_000_000] {
+            let config = rust_video_caps::encode::EncodeConfig {
+                rate_control: rust_video_caps::encode::RateControl::Cbr {
+                    bitrate,
+                    maxrate: bitrate,
+                    bufsize: bitrate,
+                },
+                ..rust_video_caps::encode::EncodeConfig::default()
+            };
+            let Some(unconfigured) = pair(&decode, &encode) else {
+                return;
+            };
+            let mut transcoder = unconfigured.with_config(config);
+            if transcoder.plan().route() != Route::Gpu {
+                return;
+            }
+            let mut out = Vec::new();
+            let mut run = || -> Result<(), crate::error::VulkanError> {
+                for packet in &packets {
+                    for coded in transcoder.transcode(packet)? {
+                        out.extend_from_slice(coded.data());
+                    }
+                }
+                for coded in transcoder.flush()? {
+                    out.extend_from_slice(coded.data());
+                }
+                Ok(())
+            };
+            match run() {
+                Ok(()) => {}
+                Err(crate::error::VulkanError::Declined(decline)) => {
+                    println!("declined: cbr size class without driver mode: {decline}");
+                    return;
+                }
+                Err(error) => panic!("transcode runs: {error}"),
+            }
+            assert!(!out.is_empty(), "cbr {bitrate} emits bytes");
+            sizes.push(out.len());
+        }
+        assert!(
+            sizes[1] * 2 > sizes[0] * 3,
+            "bitrate knob moves size class past 1.5x"
+        );
+    }
+
+    #[test]
+    fn cpu_callback_alters_output_bytes() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let packets = input_packets();
+        let Some(mut plain) = pair(&decode, &encode) else {
+            return;
+        };
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        assert!(!expected.is_empty(), "plain transcode emits bytes");
+        let Some(mut filtered) = pair(&decode, &encode) else {
+            return;
+        };
+        let mut blacken = |frame: &mut CpuFrame| {
+            *frame = black(frame.size());
+        };
+        let mut out = Vec::new();
+        for packet in &packets {
+            for coded in filtered
+                .transcode_with(packet, &mut blacken)
+                .expect("filter runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in filtered.flush_with(&mut blacken).expect("drain runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert!(!out.is_empty(), "filtered transcode emits bytes");
+        assert_ne!(
+            out, expected,
+            "replaced frames re-encode to different bytes"
+        );
+    }
+
+    #[test]
+    fn noop_callback_matches_plain_transcode() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let packets = input_packets();
+        let Some(mut plain) = pair(&decode, &encode) else {
+            return;
+        };
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        let Some(mut filtered) = pair(&decode, &encode) else {
+            return;
+        };
+        let mut noop = |_frame: &mut CpuFrame| {};
+        let mut out = Vec::new();
+        for packet in &packets {
+            for coded in filtered
+                .transcode_with(packet, &mut noop)
+                .expect("pass runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in filtered.flush_with(&mut noop).expect("drain runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert_eq!(out, expected, "no-op callback preserves bytes");
+    }
+
+    #[test]
+    fn surface_filter_observes_every_picture() {
+        let Some((decode, encode)) = devices() else {
+            return;
+        };
+        let packets = input_packets();
+        let Some(mut plain) = pair(&decode, &encode) else {
+            return;
+        };
+        if plain.plan().route() != Route::Gpu {
+            return;
+        }
+        let expected = transcode_all(&mut plain, &packets);
+        let Some(mut hooked) = pair(&decode, &encode) else {
+            return;
+        };
+        let mut sizes = Vec::new();
+        let mut out = Vec::new();
+        let mut observe = |surface: &mut crate::decoder::VulkanFrame| {
+            sizes.push(surface.size());
+        };
+        for packet in &packets {
+            for coded in hooked
+                .transcode_surface_with(packet, &mut observe)
+                .expect("hook runs")
+            {
+                out.extend_from_slice(coded.data());
+            }
+        }
+        for coded in hooked.flush().expect("flush runs") {
+            out.extend_from_slice(coded.data());
+        }
+        assert!(!sizes.is_empty(), "hook observes decoded pictures");
+        let extent = PictureSize::new(64, 64).expect("nonzero extent");
+        assert!(
+            sizes.iter().all(|size| *size == extent),
+            "hook observes decoded extents"
+        );
+        assert_eq!(out, expected, "observing filter preserves bytes");
     }
 }

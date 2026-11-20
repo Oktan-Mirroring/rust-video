@@ -76,6 +76,18 @@ pub enum VaApiError {
         /// Codec needing packed headers.
         codec: rust_video_core::Codec,
     },
+    /// Encode codec without a VA-API encoder.
+    #[error("{codec}: no encoder")]
+    NoEncoder {
+        /// Codec needing an encoder.
+        codec: rust_video_core::Codec,
+    },
+    /// Decode codec without a wired frontend.
+    #[error("{codec} decode pending")]
+    DecodePending {
+        /// Codec the tier cannot decode yet.
+        codec: rust_video_core::Codec,
+    },
     /// Driver returned a coded segment off the byte grid.
     #[error("unaligned coded segment")]
     UnalignedCodedSegment,
@@ -150,6 +162,20 @@ mod tests {
             }
             .to_string(),
             "h264: no packed headers"
+        );
+        assert_eq!(
+            VaApiError::NoEncoder {
+                codec: rust_video_core::Codec::Av1,
+            }
+            .to_string(),
+            "av1: no encoder"
+        );
+        assert_eq!(
+            VaApiError::DecodePending {
+                codec: rust_video_core::Codec::Vp9,
+            }
+            .to_string(),
+            "vp9 decode pending"
         );
         assert_eq!(
             VaApiError::UnalignedCodedSegment.to_string(),

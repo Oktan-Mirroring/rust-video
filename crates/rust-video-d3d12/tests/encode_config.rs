@@ -15,7 +15,7 @@ use rust_video_caps::encode::{
 };
 use rust_video_caps::frame::{CpuFrame, Surface};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Device, Encoder};
+use rust_video_caps::traits::{Decoder, Device, Encoder, KeyframeRequest};
 use rust_video_caps::{h264, h265};
 use rust_video_h264::{
     parse_sps, rbsp, split_nals, H264Error, ParseReason, StrictGate, UnsupportedReason,
@@ -382,6 +382,50 @@ fn decoder_submit_stats_start_zero() {
             (0, 0, 0)
         );
     }
+}
+
+/// Forced keyframe codes the next picture as IDR.
+#[test]
+fn keyframe_request_forces_idr() {
+    let Some(device) = device() else {
+        return;
+    };
+    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let mut encoder = match D3d12Encoder::open(&device, config) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("SKIP: no h264 encoder ({error})");
+            return;
+        }
+    };
+    let frame = Synth::grey_nv12(320, 240);
+    let before = encoder.encode(&frame).expect("encode runs");
+    encoder
+        .request_keyframe()
+        .expect("all-intra honors keyframe");
+    let after = encoder.encode(&frame).expect("encode runs");
+    // Grammar over the post-request bytes: first VCL NAL is an IDR slice.
+    let mut vcl = Vec::new();
+    for packet in &after {
+        for nal in split_nals(packet.data()) {
+            let typ = nal[0] & 0x1f;
+            if (1..=5).contains(&typ) {
+                vcl.push(typ);
+            }
+        }
+    }
+    assert!(!vcl.is_empty(), "post-request output codes a picture");
+    assert_eq!(vcl[0], 5, "first picture after request is IDR");
+    // All-intra session codes every picture IDR, pre-request included.
+    for packet in &before {
+        for nal in split_nals(packet.data()) {
+            let typ = nal[0] & 0x1f;
+            if (1..=5).contains(&typ) {
+                assert_eq!(typ, 5, "all-intra codes IDR throughout");
+            }
+        }
+    }
+    println!("keyframe: idr before and after the request");
 }
 
 /// Transcoder plan matches its caps route.

@@ -34,6 +34,12 @@ pub const NOPTS: i64 = i64::MIN;
 pub const OPT_SEARCH_CHILDREN: c_int = 1;
 /// Keyframe bit in `AVPacket::flags`.
 pub const FLAG_KEY: c_int = 1;
+/// Unset `AVFrame::pict_type` (`AV_PICTURE_TYPE_NONE`).
+pub const PICT_TYPE_NONE: c_int = 0;
+/// Intra `AVFrame::pict_type` (`AV_PICTURE_TYPE_I`); the wrappers honor it as
+/// a forced keyframe (IDR on x264/x265, `FORCE_KF` on vpx/aom, `EB_IDR_PICTURE`
+/// on svt).
+pub const PICT_TYPE_I: c_int = 1;
 
 /// Opaque codec descriptor.
 #[repr(C)]
@@ -71,7 +77,11 @@ pub struct AVPacket {
     pub flags: c_int,
 }
 
-/// Decoded frame; only geometry, format, planes, and pts are exposed.
+/// Frame; geometry, format, planes, picture type, and pts are exposed.
+///
+/// `key_frame` and `pict_type` match `libavutil/frame.h` (`AVFrame`): the
+/// encode path writes `pict_type` to force keyframes, the decode path never
+/// touches either.
 #[repr(C)]
 pub struct AVFrame {
     /// Plane base pointers.
@@ -88,8 +98,12 @@ pub struct AVFrame {
     pub nb_samples: c_int,
     /// Pixel format id.
     pub format: c_int,
-    /// Middle bytes between format and pts.
-    _mid: [u8; 16],
+    /// Keyframe flag on decoded output, unset here.
+    pub key_frame: c_int,
+    /// Forced picture type on encode input (`PICT_TYPE_*`).
+    pub pict_type: c_int,
+    /// Aspect ratio between picture type and pts.
+    _mid: [u8; 8],
     /// Presentation timestamp in time-base units.
     pub pts: i64,
 }
@@ -105,6 +119,8 @@ const _: () = {
     assert!(std::mem::offset_of!(AVFrame, width) == 104);
     assert!(std::mem::offset_of!(AVFrame, height) == 108);
     assert!(std::mem::offset_of!(AVFrame, format) == 116);
+    assert!(std::mem::offset_of!(AVFrame, key_frame) == 120);
+    assert!(std::mem::offset_of!(AVFrame, pict_type) == 124);
     assert!(std::mem::offset_of!(AVFrame, pts) == 136);
 };
 

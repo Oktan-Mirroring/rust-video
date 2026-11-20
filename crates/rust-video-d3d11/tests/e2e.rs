@@ -202,27 +202,27 @@ fn gpu_transcode_stays_ffmpeg_clean() {
     let mut out = Vec::new();
     for (index, raw) in raws.iter().enumerate() {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let outcome = match transcoder.transcode(&packet) {
-            Ok(outcome) => outcome,
+        let coded = match transcoder.transcode(&packet) {
+            Ok(coded) => coded,
             Err(error) => panic!("transcode packet {index}: {error}"),
         };
         assert_eq!(
-            outcome.plan().route(),
+            transcoder.plan().route(),
             Route::Gpu,
             "packet {index} stays on gpu"
         );
-        coded_packets += outcome.packets().len();
-        for coded in outcome.packets() {
-            coded_bytes += coded.data().len();
-            out.extend_from_slice(coded.data());
+        coded_packets += coded.len();
+        for packet in &coded {
+            coded_bytes += packet.data().len();
+            out.extend_from_slice(packet.data());
         }
     }
-    let outcome = transcoder.flush().expect("flush drains");
-    assert_eq!(outcome.plan().route(), Route::Gpu, "flush stays on gpu");
-    coded_packets += outcome.packets().len();
-    for coded in outcome.packets() {
-        coded_bytes += coded.data().len();
-        out.extend_from_slice(coded.data());
+    let coded = transcoder.flush().expect("flush drains");
+    assert_eq!(transcoder.plan().route(), Route::Gpu, "flush stays on gpu");
+    coded_packets += coded.len();
+    for packet in &coded {
+        coded_bytes += packet.data().len();
+        out.extend_from_slice(packet.data());
     }
     assert!(coded_bytes > 0, "transcode emits a bitstream");
     let path = std::env::temp_dir().join("rust-video-d3d11-e2e.h264");

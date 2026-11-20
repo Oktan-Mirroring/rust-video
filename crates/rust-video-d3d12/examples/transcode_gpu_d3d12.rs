@@ -1,8 +1,9 @@
 //! Full-GPU transcode on the D3D12 tier: decode texture to encoder texture.
 //!
 //! Pixels stay device-resident; any hop miss declines loud with the
-//! missing capability named. The committed vector transcodes without
-//! readback and the bitstream lands in the temp dir for the ffmpeg oracle.
+//! missing capability named. The committed vector transcodes under the
+//! default config with a no-op surface filter and a no-op CPU callback,
+//! and the bitstream lands in the temp dir for the ffmpeg oracle.
 
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -12,13 +13,15 @@ use bytes::Bytes;
 #[cfg(target_os = "windows")]
 use rust_video_caps::common::PictureSize;
 #[cfg(target_os = "windows")]
+use rust_video_caps::encode::EncodeConfig;
+#[cfg(target_os = "windows")]
+use rust_video_caps::frame::CpuFrame;
+#[cfg(target_os = "windows")]
 use rust_video_caps::packet::Packet;
 #[cfg(target_os = "windows")]
 use rust_video_caps::traits::Device;
 #[cfg(target_os = "windows")]
-use rust_video_caps::transcode::Outcome;
-#[cfg(target_os = "windows")]
-use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, Transcoder};
+use rust_video_d3d12::{Codec, D3d12Device, D3d12Error, GpuSurface, Transcoder};
 #[cfg(target_os = "windows")]
 use rust_video_harness::AnnexB;
 
@@ -33,7 +36,7 @@ fn main() {
     };
     println!("device: {}", device.name());
     let mut transcoder = match Transcoder::open(&device, Codec::H264, Codec::H264) {
-        Ok(transcoder) => transcoder,
+        Ok(transcoder) => transcoder.with_config(EncodeConfig::default()),
         Err(error) => {
             println!("SKIP: no h264 transcode ({error})");
             return;
@@ -50,17 +53,19 @@ fn main() {
     let mut packets = 0;
     let mut bytes = 0;
     let mut out = Vec::new();
+    let mut surface_filter = |_surface: &mut GpuSurface| {};
+    let mut cpu_callback = |_frame: &mut CpuFrame| {};
     for (index, raw) in AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl)
         .into_iter()
         .enumerate()
     {
         let packet = Packet::new(Bytes::from(raw));
-        match transcoder.transcode(&packet) {
-            Ok(outcome) => {
-                report(index, &outcome);
-                packets += outcome.packets().len();
-                bytes += bytes_of(&outcome);
-                for coded in outcome.packets() {
+        match transcoder.transcode_surface_with(&packet, &mut surface_filter) {
+            Ok(coded_packets) => {
+                report(index, &coded_packets);
+                packets += coded_packets.len();
+                bytes += bytes_of(&coded_packets);
+                for coded in &coded_packets {
                     out.extend_from_slice(coded.data());
                 }
             }
@@ -70,16 +75,16 @@ fn main() {
             }
         }
     }
-    match transcoder.flush() {
-        Ok(outcome) => {
+    match transcoder.flush_with(&mut cpu_callback) {
+        Ok(coded_packets) => {
             println!(
                 "flush: {} packet(s) route={:?}",
-                outcome.packets().len(),
-                outcome.plan().route()
+                coded_packets.len(),
+                transcoder.plan().route()
             );
-            packets += outcome.packets().len();
-            bytes += bytes_of(&outcome);
-            for coded in outcome.packets() {
+            packets += coded_packets.len();
+            bytes += bytes_of(&coded_packets);
+            for coded in &coded_packets {
                 out.extend_from_slice(coded.data());
             }
         }
@@ -107,24 +112,16 @@ fn main() {
     probe_scale(&device);
 }
 
-/// One transcode outcome on stdout.
+/// One transcode result on stdout.
 #[cfg(target_os = "windows")]
-fn report(index: usize, outcome: &Outcome) {
-    println!(
-        "packet {index}: {} packet(s) route={:?}",
-        outcome.packets().len(),
-        outcome.plan().route()
-    );
+fn report(index: usize, packets: &[Packet]) {
+    println!("packet {index}: {} packet(s)", packets.len());
 }
 
-/// Bitstream bytes behind `outcome`.
+/// Bitstream bytes behind `packets`.
 #[cfg(target_os = "windows")]
-fn bytes_of(outcome: &Outcome) -> usize {
-    outcome
-        .packets()
-        .iter()
-        .map(|packet| packet.data().len())
-        .sum()
+fn bytes_of(packets: &[Packet]) -> usize {
+    packets.iter().map(|packet| packet.data().len()).sum()
 }
 
 /// Scale request through the GPU scale hop; a box without video
@@ -147,9 +144,9 @@ fn probe_scale(device: &D3d12Device) {
     {
         let packet = Packet::new(Bytes::from(raw));
         match transcoder.transcode(&packet) {
-            Ok(outcome) => {
-                packets += outcome.packets().len();
-                bytes += bytes_of(&outcome);
+            Ok(coded) => {
+                packets += coded.len();
+                bytes += bytes_of(&coded);
             }
             Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
                 println!("MISS: {error}");
@@ -162,9 +159,9 @@ fn probe_scale(device: &D3d12Device) {
         }
     }
     match transcoder.flush() {
-        Ok(outcome) => {
-            packets += outcome.packets().len();
-            bytes += bytes_of(&outcome);
+        Ok(coded) => {
+            packets += coded.len();
+            bytes += bytes_of(&coded);
         }
         Err(D3d12Error::Unsupported(error)) if error.to_string().contains("scale") => {
             println!("MISS: {error}");

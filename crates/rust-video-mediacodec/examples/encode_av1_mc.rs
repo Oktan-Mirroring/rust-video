@@ -1,6 +1,8 @@
 //! AV1 encode probe on the `MediaCodec` tier.
 
 #[cfg(target_os = "android")]
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
+#[cfg(target_os = "android")]
 use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "android")]
 use rust_video_harness::Synth;
@@ -19,6 +21,11 @@ fn main() {
         println!("ERROR: av1 spec rejected");
         std::process::exit(1);
     };
+    let spec = spec.with_config(EncodeConfig {
+        profile: Profile::Av1(rust_video_caps::av1::EncodeProfile::Main),
+        level: Level::Av1(rust_video_caps::av1::EncodeLevel::Auto),
+        ..Default::default()
+    });
     let mut encoder = match MediaCodecEncoder::open(&spec) {
         Ok(encoder) => encoder,
         Err(error) => {

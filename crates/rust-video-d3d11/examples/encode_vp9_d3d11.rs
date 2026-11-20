@@ -1,9 +1,11 @@
 //! VP9 encode on the D3D11 tier, from synthetic NV12 to packets.
 
 #[cfg(target_os = "windows")]
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "windows")]
-use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder};
+use rust_video_d3d11::{D3d11Device, D3d11Encoder};
 #[cfg(target_os = "windows")]
 use rust_video_harness::Synth;
 
@@ -17,7 +19,11 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let config = D3d11Encoder::auto_config(Codec::Vp9).expect("auto config");
+    let config = EncodeConfig {
+        profile: Profile::Vp9(rust_video_caps::vp9::EncodeProfile::P0),
+        level: Level::Vp9(rust_video_caps::vp9::EncodeLevel::Auto),
+        ..Default::default()
+    };
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {

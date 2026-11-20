@@ -22,7 +22,7 @@ use rust_video_caps::encode::{
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::h264::{EncodeLevel, EncodeProfile as H264Profile, Level as H264Level};
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 
 /// Slice byte budget when multi-threaded; engages worker threads without tiny slice fragmentation.
@@ -397,6 +397,15 @@ impl Encoder for H264Encoder {
     }
 }
 
+impl KeyframeRequest for H264Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.force_intra_frame();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -409,7 +418,7 @@ mod tests {
     };
     use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
     use rust_video_caps::h264::{EncodeLevel, EncodeProfile};
-    use rust_video_caps::traits::Encoder as _;
+    use rust_video_caps::traits::{Encoder as _, KeyframeRequest as _};
     use rust_video_h264::{is_idr, nal_unit_type, split_nals};
 
     use super::H264Encoder;
@@ -501,6 +510,28 @@ mod tests {
         let second = encoder.encode(&frame_64()).expect("encode");
         assert_ne!(second[0].data(), []);
         assert_eq!(encoder.flush().expect("flush"), []);
+    }
+
+    #[test]
+    fn keyframe_request_forces_single_idr() {
+        let mut encoder = H264Encoder::open(64, 64, EncodeConfig::default(), 1).expect("encoder");
+        let first = encoder.encode(&frame_64()).expect("encode");
+        assert!(first[0].is_keyframe());
+        let second = encoder.encode(&frame_64()).expect("encode");
+        assert!(!second[0].is_keyframe());
+        encoder.request_keyframe().expect("request");
+        let forced = encoder.encode(&frame_64()).expect("encode");
+        assert!(forced[0].is_keyframe());
+        let types: Vec<u8> = split_nals(forced[0].data())
+            .iter()
+            .map(|nal| nal_unit_type(nal[0]))
+            .collect();
+        assert!(
+            types.iter().any(|kind| is_idr(*kind)),
+            "idr present: {types:?}"
+        );
+        let fourth = encoder.encode(&frame_64()).expect("encode");
+        assert!(!fourth[0].is_keyframe());
     }
 
     #[test]

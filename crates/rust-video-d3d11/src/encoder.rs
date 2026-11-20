@@ -11,7 +11,7 @@ use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::UnsupportedReason as StreamCore;
-use rust_video_caps::traits::{EncodeSurface, Encoder};
+use rust_video_caps::traits::{EncodeSurface, Encoder, KeyframeRequest};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 use rust_video_core::planes;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -182,6 +182,14 @@ impl Encoder for D3d11Encoder {
 
     fn flush(&mut self) -> Result<Vec<Packet>, D3d11Error> {
         self.session.flush()
+    }
+}
+
+impl KeyframeRequest for D3d11Encoder {
+    type Error = D3d11Error;
+
+    fn request_keyframe(&mut self) -> Result<(), D3d11Error> {
+        self.session.request_keyframe()
     }
 }
 

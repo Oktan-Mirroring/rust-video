@@ -143,6 +143,8 @@ pub struct MediaCodecDecoder {
     ledger: PipelineLedger,
     /// Surfaces freed by submits, awaiting the next poll.
     ready: VecDeque<MediaCodecSurface>,
+    /// True after the end marker drained; flush short-circuits until reset.
+    eos_drained: bool,
     /// OS codec session.
     backend: Box<dyn CodecSeam>,
 }
@@ -174,6 +176,7 @@ impl MediaCodecDecoder {
             slots,
             ledger: PipelineLedger::new(PipelineLedger::DEFAULT_DEPTH),
             ready: VecDeque::new(),
+            eos_drained: false,
             backend,
         }
     }
@@ -414,9 +417,12 @@ impl MediaCodecDecoder {
 
     /// Surfaces held back for reordering or buffering.
     ///
-    /// Signals end of stream first, then collects until the end marker
-    /// or quiet; both bounded. Decode after flush without reset fails
-    /// loud; `reset` re-arms the stream.
+    /// Signals end of stream first, then collects until the end marker,
+    /// while submitted inputs still owe outputs, or three quiet polls
+    /// with nothing owed; all bounded. A second flush after the end
+    /// marker returns stashed surfaces without queueing another marker:
+    /// the ended codec recycles nothing, so a second marker starves.
+    /// Decode after flush without reset fails loud; `reset` re-arms.
     ///
     /// # Errors
     ///
@@ -425,6 +431,9 @@ impl MediaCodecDecoder {
     /// every slot (`NoFreeSlot`).
     pub(crate) fn drain_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("flush")?;
+        if self.eos_drained {
+            return Ok(self.take_ready());
+        }
         let mut surfaces = self.take_ready();
         let mut items = self.backend.finish_input()?;
         let mut quiet = 0;
@@ -433,12 +442,17 @@ impl MediaCodecDecoder {
             let before = surfaces.len();
             surfaces.extend(self.surfaces(items)?);
             if eos {
+                self.eos_drained = true;
                 break;
             }
             if surfaces.len() == before {
-                quiet += 1;
-                if quiet >= DRAIN_QUIET_END {
-                    break;
+                // Cold first frames need ~80-180ms on this phone, far past
+                // three quiet polls; exit early only when nothing is owed.
+                if self.ledger.in_flight() == 0 {
+                    quiet += 1;
+                    if quiet >= DRAIN_QUIET_END {
+                        break;
+                    }
                 }
             } else {
                 quiet = 0;
@@ -474,6 +488,7 @@ impl MediaCodecDecoder {
         let items = self.backend.reset()?;
         let surfaces = self.surfaces(items)?;
         self.ledger.discard_pending();
+        self.eos_drained = false;
         Ok(surfaces)
     }
 
@@ -1134,6 +1149,8 @@ mod tests {
         latency: Duration,
         /// True after the format shipped.
         primed: bool,
+        /// Drains answered empty before held inputs release.
+        withhold: usize,
     }
 
     impl ScriptSeam {
@@ -1145,7 +1162,14 @@ mod tests {
                 capacity,
                 latency,
                 primed: false,
+                withhold: 0,
             }
+        }
+
+        /// Seam answering `polls` drains empty before releasing.
+        fn with_withhold(mut self, polls: usize) -> Self {
+            self.withhold = polls;
+            self
         }
 
         /// Call appended to the log.
@@ -1155,6 +1179,10 @@ mod tests {
 
         /// Format once, then every held input as one output.
         fn release(&mut self) -> Vec<SeamItem> {
+            if self.withhold > 0 {
+                self.withhold -= 1;
+                return Vec::new();
+            }
             let mut items = Vec::new();
             if !self.primed {
                 self.primed = true;
@@ -1212,13 +1240,19 @@ mod tests {
         fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
             self.note(Call::FinishInput);
             let mut items = self.release();
-            items.push(SeamItem::Output(SeamOutput::new(Bytes::new(), 4, 0)));
+            if self.withhold == 0 {
+                items.push(SeamItem::Output(SeamOutput::new(Bytes::new(), 4, 0)));
+            }
             Ok(items)
         }
 
         fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
             self.note(Call::Reset);
             Ok(self.release())
+        }
+
+        fn request_sync(&mut self) -> Result<(), MediaCodecError> {
+            Ok(())
         }
     }
 
@@ -1296,10 +1330,10 @@ mod tests {
     }
 
     #[test]
-    fn fifth_submit_starves_at_depth_bound() {
+    fn seventeenth_submit_starves_at_depth_bound() {
         let log = Rc::new(RefCell::new(Vec::new()));
-        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO));
-        for packet in &script_packets(4) {
+        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 32, Duration::ZERO));
+        for packet in &script_packets(16) {
             let (outcome, _) = decoder.submit_packet_nowait(packet).expect("queue");
             assert_eq!(outcome, SubmitOutcome::Queued);
         }
@@ -1309,7 +1343,7 @@ mod tests {
             .expect("bound answers");
         assert_eq!(outcome, SubmitOutcome::Starved);
         assert!(surfaces.is_empty());
-        assert_eq!(log.borrow().len(), 4);
+        assert_eq!(log.borrow().len(), 16);
         assert!(decoder.ledger().max_in_flight() <= decoder.ledger().depth());
     }
 
@@ -1341,6 +1375,68 @@ mod tests {
         assert_eq!(pipe_surfaces.len(), sync_surfaces.len());
         assert_eq!(surface_bytes(&pipe_surfaces), surface_bytes(&sync_surfaces));
         assert!(pipelined.ledger().overlap_observed());
+    }
+
+    #[test]
+    fn drain_waits_for_owed_outputs_past_quiet() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let seam = ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO).with_withhold(5);
+        let mut decoder = script_decoder(seam);
+        let packets = script_packets(1);
+        let surfaces = decoder.push_packet(&packets[0]).expect("queue");
+        assert!(surfaces.is_empty());
+        let tail = decoder.drain_surfaces().expect("drain waits");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(decoder.ledger().in_flight(), 0);
+        let reads = log
+            .borrow()
+            .iter()
+            .filter(|call| **call == Call::Read)
+            .count();
+        assert!(reads >= 5, "drain outlasts three quiet polls");
+    }
+
+    #[test]
+    fn drain_quits_quiet_with_nothing_owed() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let seam = ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO).with_withhold(60);
+        let mut decoder = script_decoder(seam);
+        let start = Instant::now();
+        let tail = decoder.drain_surfaces().expect("drain quits");
+        assert!(tail.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "unowed drain skips the cap"
+        );
+    }
+
+    #[test]
+    fn second_flush_after_eos_skips_the_marker() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut decoder = script_decoder(ScriptSeam::new(Rc::clone(&log), 8, Duration::ZERO));
+        let tail = decoder.drain_surfaces().expect("first drain");
+        assert!(tail.is_empty());
+        let start = Instant::now();
+        let again = decoder.drain_surfaces().expect("second drain");
+        assert!(again.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "latched drain skips the codec"
+        );
+        let finishes = log
+            .borrow()
+            .iter()
+            .filter(|call| **call == Call::FinishInput)
+            .count();
+        assert_eq!(finishes, 1);
+        decoder.reset_surfaces().expect("reset re-arms");
+        decoder.drain_surfaces().expect("drain after reset");
+        let finishes = log
+            .borrow()
+            .iter()
+            .filter(|call| **call == Call::FinishInput)
+            .count();
+        assert_eq!(finishes, 2);
     }
 
     #[test]
@@ -1470,17 +1566,17 @@ mod tests {
     fn split_submit_starves_past_bound() {
         let mut decoder = script_decoder(ScriptSeam::new(
             Rc::new(RefCell::new(Vec::new())),
-            8,
+            32,
             Duration::ZERO,
         ));
-        for packet in &script_packets(4) {
+        for packet in &script_packets(16) {
             assert!(decoder.try_submit(packet).expect("queue"));
         }
         assert!(!decoder
             .try_submit(&script_packets(1)[0])
             .expect("bound answers"));
-        assert_eq!(decoder.stats().submitted(), 4);
-        assert_eq!(decoder.stats().peak_inflight(), 4);
+        assert_eq!(decoder.stats().submitted(), 16);
+        assert_eq!(decoder.stats().peak_inflight(), 16);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use rust_video_d3d11::{Codec, D3d11Device, D3d11Encoder, D3d11Error, H264Decoder
 use rust_video_caps::encode::{Decline, EncodeConfig, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::traits::{Decoder, Encoder, KeyframeRequest};
 use rust_video_harness::Synth;
 
 /// Pre-change bytes: 8 grey 320x240 frames plus flush drain.
@@ -228,6 +228,51 @@ fn h264_profile_signals_into_sps() {
         );
         println!("h264 {profile:?}: sps profile {}", sps.profile_idc);
     }
+}
+
+/// Forced keyframe codes the next picture as IDR.
+#[test]
+fn keyframe_request_forces_idr() {
+    let Some(device) = device() else {
+        return;
+    };
+    let config = EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 2_000_000,
+            maxrate: 2_000_000,
+            bufsize: 2_000_000,
+        },
+        ..EncodeConfig::default()
+    };
+    let mut encoder = match D3d11Encoder::open(&device, config) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("cbr skipped: {error}");
+            return;
+        }
+    };
+    let frame = Synth::grey_nv12(320, 240);
+    let mut packets = Vec::new();
+    for _ in 0..4 {
+        packets.extend(encoder.encode(&frame).expect("encode runs"));
+    }
+    encoder.request_keyframe().expect("keyframe forces");
+    for _ in 0..2 {
+        packets.extend(encoder.encode(&frame).expect("encode runs"));
+    }
+    packets.extend(encoder.flush().expect("flush runs"));
+    let mut ingest = rust_video_h264::Ingest::<D3d11Error, rust_video_h264::PermissiveGate>::new();
+    let mut pictures = Vec::new();
+    for packet in &packets {
+        pictures.extend(ingest.ingest_packet(packet.data()).expect("grammar parses"));
+    }
+    assert_eq!(pictures.len(), 6, "six frames parse to six pictures");
+    assert!(
+        pictures[1..4].iter().any(|picture| !picture.idr),
+        "p-frames flow before the request"
+    );
+    assert!(pictures[4].idr, "first picture after the request is IDR");
+    println!("keyframe: p-flow then forced IDR at picture 5");
 }
 
 /// Grey and pattern roundtrips land within error bounds.

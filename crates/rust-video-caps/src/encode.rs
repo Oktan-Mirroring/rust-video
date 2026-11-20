@@ -472,6 +472,8 @@ pub enum Decline {
     },
     /// HDR mastering or light metadata on an SDR tier.
     HdrUnsupported,
+    /// Keyframe request the tier cannot honor.
+    KeyframeUnsupported,
 }
 
 impl fmt::Display for Decline {
@@ -535,6 +537,7 @@ impl fmt::Display for Decline {
                 write!(f, "range {range:?} unsupported")
             }
             Self::HdrUnsupported => write!(f, "HDR metadata on SDR tier unsupported"),
+            Self::KeyframeUnsupported => write!(f, "keyframe request unsupported"),
         }
     }
 }
@@ -839,6 +842,10 @@ mod tests {
         assert_eq!(
             Decline::HdrUnsupported.to_string(),
             "HDR metadata on SDR tier unsupported"
+        );
+        assert_eq!(
+            Decline::KeyframeUnsupported.to_string(),
+            "keyframe request unsupported"
         );
         assert_eq!(
             Decline::BFramesUnsupported { actual: 2, max: 0 }.to_string(),

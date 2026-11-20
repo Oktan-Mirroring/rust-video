@@ -3,7 +3,7 @@
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::av1::{EncodeLevel, EncodeProfile};
 #[cfg(feature = "ffmpeg")]
-use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
 #[cfg(feature = "ffmpeg")]
 use rust_video_caps::packet::Packet;
 #[cfg(feature = "ffmpeg")]
@@ -16,11 +16,6 @@ use rust_video_sw::Av1Encoder;
 #[cfg(feature = "ffmpeg")]
 fn main() {
     let config = EncodeConfig {
-        rate_control: RateControl::Cbr {
-            bitrate: 500_000,
-            maxrate: 500_000,
-            bufsize: 500_000,
-        },
         profile: Profile::Av1(EncodeProfile::Main),
         level: Level::Av1(EncodeLevel::Auto),
         ..Default::default()

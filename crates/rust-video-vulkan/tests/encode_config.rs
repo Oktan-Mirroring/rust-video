@@ -7,7 +7,7 @@ use rust_video_caps::common::PictureSize;
 use rust_video_caps::encode::{Decline, EncodeConfig, Gop, Level, Profile, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
+use rust_video_caps::traits::{Decoder, Encoder, KeyframeRequest};
 use rust_video_harness::{Drive, Synth};
 use rust_video_vulkan::{
     CodecOp, H264Decoder, H264Encoder, H265Decoder, H265Encoder, SkipReason, VulkanDevice,
@@ -632,4 +632,132 @@ fn open_declines_typed() {
         ),
         "foreign profile declines typed"
     );
+}
+
+/// Forced keyframe codes the next picture as IDR.
+#[test]
+fn keyframe_request_forces_idr() {
+    let _guard = Drive::serial();
+    keyframe_case_h264();
+    keyframe_case_h265();
+}
+
+/// Forced H.264 keyframe codes the next picture as IDR.
+fn keyframe_case_h264() {
+    let Some(device) = device_or_decline(CodecOp::H264Encode) else {
+        return;
+    };
+    let config = h264_config(
+        RateControl::Cbr {
+            bitrate: 2_000_000,
+            maxrate: 2_000_000,
+            bufsize: 2_000_000,
+        },
+        60,
+    );
+    let mut encoder = match H264Encoder::open(&device, WIDTH, HEIGHT, config) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("cbr skipped: {error}");
+            return;
+        }
+    };
+    if !encoder.supports_p_frames() {
+        println!("declined: h264 keyframe without P frames");
+        return;
+    }
+    let source = frames(6);
+    let mut packets = Vec::new();
+    for frame in &source[..4] {
+        let Some(coded) = unwrap_or_oom(encoder.encode(frame), "encode runs", &device) else {
+            return;
+        };
+        packets.extend(coded);
+    }
+    encoder.request_keyframe().expect("keyframe forces");
+    for frame in &source[4..] {
+        let Some(coded) = unwrap_or_oom(encoder.encode(frame), "encode runs", &device) else {
+            return;
+        };
+        packets.extend(coded);
+    }
+    packets.extend(encoder.flush().expect("flush runs"));
+    assert_eq!(packets.len(), 6, "one packet per frame");
+    assert_eq!(nal_types_h264(&packets[4]), vec![7, 8, 5]);
+    let mut ingest = rust_video_h264::Ingest::<TestError, rust_video_h264::PermissiveGate>::new();
+    let mut pictures = Vec::new();
+    for packet in &packets {
+        pictures.extend(ingest.ingest_packet(packet.data()).expect("grammar parses"));
+    }
+    if let Some(trailing) = ingest.finish().expect("grammar finishes") {
+        pictures.push(trailing);
+    }
+    assert_eq!(pictures.len(), 6, "six frames parse to six pictures");
+    assert!(
+        pictures[1..4].iter().any(|picture| !picture.idr),
+        "p-frames flow before the request"
+    );
+    assert!(pictures[4].idr, "first picture after the request is IDR");
+    println!("keyframe: p-flow then forced IDR at picture 5");
+}
+
+/// Forced H.265 keyframe codes the next picture as IDR.
+fn keyframe_case_h265() {
+    let Some(device) = device_or_decline(CodecOp::H265Encode) else {
+        return;
+    };
+    let config = h265_config(
+        RateControl::Cbr {
+            bitrate: 2_000_000,
+            maxrate: 2_000_000,
+            bufsize: 2_000_000,
+        },
+        60,
+    );
+    let mut encoder = match H265Encoder::open(&device, WIDTH, HEIGHT, config) {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            println!("cbr skipped: {error}");
+            return;
+        }
+    };
+    if !encoder.supports_p_frames() {
+        println!("declined: h265 keyframe without P frames");
+        return;
+    }
+    let source = frames(6);
+    let mut packets = Vec::new();
+    for frame in &source[..4] {
+        let Some(coded) = unwrap_or_oom(encoder.encode(frame), "encode runs", &device) else {
+            return;
+        };
+        packets.extend(coded);
+    }
+    encoder.request_keyframe().expect("keyframe forces");
+    for frame in &source[4..] {
+        let Some(coded) = unwrap_or_oom(encoder.encode(frame), "encode runs", &device) else {
+            return;
+        };
+        packets.extend(coded);
+    }
+    packets.extend(encoder.flush().expect("flush runs"));
+    assert_eq!(packets.len(), 6, "one packet per frame");
+    let types = nal_types_h265(&packets[4]);
+    assert_eq!(types[..3], [32, 33, 34]);
+    assert!(rust_video_h265::is_idr(types[3]));
+    let mut ingest = rust_video_h265::Ingest::<TestError, rust_video_h265::PermissiveGate>::new();
+    let mut pictures = Vec::new();
+    for packet in &packets {
+        pictures.extend(ingest.ingest_packet(packet.data()).expect("grammar parses"));
+    }
+    if let Some(trailing) = ingest.finish().expect("grammar finishes") {
+        pictures.push(trailing);
+    }
+    assert_eq!(pictures.len(), 6, "six frames parse to six pictures");
+    assert!(
+        pictures[1..4].iter().any(|picture| !picture.idr),
+        "p-frames flow before the request"
+    );
+    assert!(pictures[4].idr, "first picture after the request is IDR");
+    println!("keyframe: p-flow then forced IDR at picture 5");
 }

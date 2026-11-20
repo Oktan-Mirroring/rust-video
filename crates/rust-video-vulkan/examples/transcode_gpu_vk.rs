@@ -1,14 +1,17 @@
 //! Vulkan GPU transcode over a real input file.
 //!
 //! Reads `VK_VECTOR` (Annex-B of `VK_DECODE`, h264 or h265), decodes on
-//! the Vulkan tier, re-encodes to `VK_ENCODE`, and writes Annex-B to
-//! `VK_OUT` with the executed plan on stderr. Loud skip without
-//! hardware or input.
+//! the Vulkan tier, re-encodes to `VK_ENCODE` under the default config
+//! with a no-op surface filter and a no-op CPU callback, and writes
+//! Annex-B to `VK_OUT` with the executed plan on stderr. Loud skip
+//! without hardware or input.
 
 use bytes::Bytes;
 
+use rust_video_caps::encode::{EncodeConfig, Level, Profile};
+use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_vulkan::{CodecOp, Transcoder, VulkanDevice};
+use rust_video_vulkan::{CodecOp, Transcoder, VulkanDevice, VulkanFrame};
 
 fn main() {
     let decode = match std::env::var("VK_DECODE").as_deref() {
@@ -18,6 +21,14 @@ fn main() {
     let encode = match std::env::var("VK_ENCODE").as_deref() {
         Ok("h265") => CodecOp::H265Encode,
         _ => CodecOp::H264Encode,
+    };
+    let config = match encode {
+        CodecOp::H265Encode => EncodeConfig {
+            profile: Profile::H265(rust_video_caps::h265::EncodeProfile::Main),
+            level: Level::H265(rust_video_caps::h265::EncodeLevel::Auto),
+            ..Default::default()
+        },
+        _ => EncodeConfig::default(),
     };
     let vector = std::env::var("VK_VECTOR").unwrap_or_else(|_| {
         std::env::temp_dir()
@@ -42,28 +53,30 @@ fn main() {
         return;
     };
     let mut transcoder = match Transcoder::open(&decode_device, decode, &encode_device, encode) {
-        Ok(transcoder) => transcoder,
+        Ok(transcoder) => transcoder.with_config(config),
         Err(error) => {
             eprintln!("transcode_gpu_vk: open failed ({error})");
             std::process::exit(1);
         }
     };
-    let outcome = transcoder
-        .transcode(&Packet::new(Bytes::from(bytes)))
+    let mut surface_filter = |_surface: &mut VulkanFrame| {};
+    let packets = transcoder
+        .transcode_surface_with(&Packet::new(Bytes::from(bytes)), &mut surface_filter)
         .expect("transcode");
     let mut out = Vec::new();
-    for packet in outcome.packets() {
+    for packet in &packets {
         out.extend_from_slice(packet.data());
     }
-    let flushed = transcoder.flush().expect("flush");
-    for packet in flushed.packets() {
+    let mut cpu_callback = |_frame: &mut CpuFrame| {};
+    let flushed = transcoder.flush_with(&mut cpu_callback).expect("flush");
+    for packet in &flushed {
         out.extend_from_slice(packet.data());
     }
     std::fs::write(&out_path, &out).expect("write");
     eprintln!(
         "route={:?} cause={:?} bytes={}",
-        outcome.plan().route(),
-        outcome.plan().cause(),
+        transcoder.plan().route(),
+        transcoder.plan().cause(),
         out.len()
     );
 }

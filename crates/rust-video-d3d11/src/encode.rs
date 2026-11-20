@@ -55,8 +55,8 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVGOPSizeMax, CODECAPI_AVEncMPVGOPSizeMin,
-    CODECAPI_AVEncVideoMaxNumRefFrame, ICodecAPI, IMFActivate, IMFAsyncCallback,
-    IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes, IMFDXGIDeviceManager,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame, ICodecAPI, IMFActivate,
+    IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFAttributes, IMFDXGIDeviceManager,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform, METransformDrainComplete,
     METransformHaveOutput, METransformNeedInput, MFCreateAlignedMemoryBuffer,
     MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample,
@@ -630,6 +630,33 @@ impl Session {
             return Ok(Vec::new());
         }
         self.drain()
+    }
+
+    /// Next coded picture forced to IDR.
+    ///
+    /// One-shot nonzero
+    /// [AVEncVideoForceKeyFrame](https://learn.microsoft.com/en-us/windows/win32/medfound/codecapi-avencvideoforcekeyframe)
+    /// through the codec API; stream start codes IDR, so an
+    /// unconfigured session reports success without touching the
+    /// transform.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Declined(KeyframeUnsupported)` without the codec
+    /// interface or when the transform refuses the property.
+    pub(crate) fn request_keyframe(&mut self) -> Result<(), D3d11Error> {
+        if self.size.is_none() {
+            return Ok(());
+        }
+        let _com = ComGuard::enter();
+        let Ok(codec) = self.codec_api() else {
+            return Err(D3d11Error::Declined(Decline::KeyframeUnsupported));
+        };
+        if set_codec_u32(&codec, &CODECAPI_AVEncVideoForceKeyFrame, 1) {
+            Ok(())
+        } else {
+            Err(D3d11Error::Declined(Decline::KeyframeUnsupported))
+        }
     }
 
     /// Media types for `width` x `height`, falling back across MFTs.

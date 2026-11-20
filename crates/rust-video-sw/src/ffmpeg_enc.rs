@@ -40,6 +40,8 @@ pub(crate) struct FfmpegEncoder {
     allocated: bool,
     /// True after `flush` sent end-of-stream to `ctx`.
     draining: bool,
+    /// True when the next `send` forces an intra picture.
+    force_idr: bool,
 }
 
 // SAFETY: sole owner of its context, frame, and packet; every FFI call
@@ -152,7 +154,13 @@ impl FfmpegEncoder {
             next_pts: 0,
             allocated: false,
             draining: false,
+            force_idr: false,
         })
+    }
+
+    /// Next coded picture forced to intra; consumed by one `send`.
+    pub(crate) fn request_keyframe(&mut self) {
+        self.force_idr = true;
     }
 
     /// Coded packets for one validated YUV420P `frame`.
@@ -289,7 +297,15 @@ impl FfmpegEncoder {
                 copy_plane(dst, stride, plane.data(), src_stride, rows, cols);
             }
             (*self.frame).pts = self.next_pts;
+            // Reused frame: stamp the picture type every send, else one
+            // request forces every later picture.
+            (*self.frame).pict_type = if self.force_idr {
+                sys::PICT_TYPE_I
+            } else {
+                sys::PICT_TYPE_NONE
+            };
         }
+        self.force_idr = false;
         self.next_pts += 1;
         loop {
             // SAFETY: frame holds one complete picture; EAGAIN keeps it queued.

@@ -14,7 +14,7 @@ use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::UnsupportedReason as SharedUnsupported;
-use rust_video_caps::traits::{EncodeSurface, Encoder};
+use rust_video_caps::traits::{EncodeSurface, Encoder, KeyframeRequest};
 use rust_video_caps::transcode::{GpuCaps, ShareMechanism};
 use rust_video_caps::{h264, h265};
 use rust_video_core::planes;
@@ -132,6 +132,15 @@ impl<'a> D3d12Encoder<'a> {
     fn reset_session(&mut self) {
         self.session = None;
         self.active = None;
+    }
+}
+
+impl KeyframeRequest for D3d12Encoder<'_> {
+    type Error = D3d12Error;
+
+    fn request_keyframe(&mut self) -> Result<(), D3d12Error> {
+        // All-intra session: every coded picture is already an IDR.
+        Ok(())
     }
 }
 

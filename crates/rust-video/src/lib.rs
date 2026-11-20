@@ -14,4 +14,4 @@ pub use rust_video_caps::frame::{
 };
 pub use rust_video_caps::packet::Packet;
 pub use rust_video_caps::traits::{Decoder, Device, Encoder, Lease, OverBudget, SharedDevice};
-pub use rust_video_caps::transcode::{FallbackCause, Outcome, Plan, Route, Scale};
+pub use rust_video_caps::transcode::{FallbackCause, Plan, Route, Scale};

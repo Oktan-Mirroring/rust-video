@@ -25,9 +25,16 @@ use ndk::media_error::MediaError;
 /// `MediaCodec#BUFFER_FLAG_DECODE_ONLY`; `AndroidSeam` and `AsyncDrain` share it.
 const BUFFER_FLAG_DECODE_ONLY: u32 = 32;
 /// Input attempts per payload before starvation; `AndroidSeam` and `AsyncDrain` share it.
-const INPUT_ATTEMPTS: u32 = 3;
+///
+/// 200 attempts over 10ms backoffs bound one payload near 2s: dav1d
+/// holds past eight inputs of lookahead before its first recycle near
+/// 120ms, and raw sync flow proves 2s clears it. A wedged codec still
+/// fails here instead of spinning forever.
+const INPUT_ATTEMPTS: u32 = 200;
 /// Dequeue wait per attempt; `AndroidSeam` and `AsyncDrain` share it.
 const INPUT_TIMEOUT: Duration = Duration::from_millis(10);
+/// `MediaCodec#PARAMETER_KEY_REQUEST_SYNC_FRAME`.
+const REQUEST_SYNC_KEY: &str = "request-sync";
 
 /// Output arrival path.
 #[derive(Debug)]
@@ -226,14 +233,35 @@ impl AndroidSeam {
             if payload.len() > dst.len() {
                 return Err(role.overflow(payload.len(), dst.len()));
             }
-            for (slot, byte) in dst.iter_mut().zip(payload.iter()) {
-                slot.write(*byte);
-            }
+            Self::copy_payload(dst, payload);
             Ok(())
         }));
         match outcome {
             Ok(result) => result,
             Err(_) => Err(MediaCodecError::BufferLost),
+        }
+    }
+
+    /// `payload` bulk-copied into `dst`; one memcpy, no per-byte loop.
+    ///
+    /// A byte-wise loop costs ~40ms per 1080p frame in unoptimized
+    /// builds; the bulk copy keeps queueing near 1ms.
+    ///
+    /// # Arguments
+    ///
+    /// * `dst` - input buffer backing; `payload` must fit.
+    /// * `payload` - bytes to copy; disjoint from `dst`.
+    fn copy_payload(dst: &mut [std::mem::MaybeUninit<u8>], payload: &[u8]) {
+        debug_assert!(payload.len() <= dst.len());
+        // SAFETY: `payload.len() <= dst.len()` checked by both callers;
+        // source and destination ranges valid, disjoint (codec-owned
+        // mapping versus caller bytes), fully initialized after.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                dst.as_mut_ptr().cast::<u8>(),
+                payload.len(),
+            );
         }
     }
 
@@ -257,9 +285,7 @@ impl AndroidSeam {
         if payload.len() > dst.len() {
             return Err(role.overflow(payload.len(), dst.len()));
         }
-        for (slot, byte) in dst.iter_mut().zip(payload.iter()) {
-            slot.write(*byte);
-        }
+        Self::copy_payload(dst, payload);
         codec.queue_input_buffer_by_index(index, 0, payload.len(), pts_us, 0)?;
         Ok(())
     }
@@ -353,6 +379,14 @@ impl CodecSeam for AndroidSeam {
             self.codec.start()?;
         }
         Ok(items)
+    }
+
+    /// Sync frame requested through `request-sync` params.
+    fn request_sync(&mut self) -> Result<(), MediaCodecError> {
+        let mut params = MediaFormat::new();
+        params.set_i32(REQUEST_SYNC_KEY, 0);
+        self.codec.set_parameters(params)?;
+        Ok(())
     }
 }
 
@@ -743,6 +777,7 @@ mod tests {
         use crate::error::MediaCodecError;
         use crate::format::FormatSpec;
 
+        let _measure = rust_video_harness::Drive::serial();
         let packet = rust_video_harness::AnnexB::picture_packets(
             &rust_video_harness::decode_dir().join("valid_320x240.h264"),
             rust_video_harness::AnnexB::is_h264_vcl,
@@ -783,6 +818,7 @@ mod tests {
         use crate::encoder::EncodeSpec;
         use crate::error::MediaCodecError;
 
+        let _measure = rust_video_harness::Drive::serial();
         let spec = EncodeSpec::h264(320, 240, 1_000_000, 30, 1).expect("valid spec");
         let encoder = match MediaCodecEncoder::open(&spec) {
             Ok(encoder) => encoder,

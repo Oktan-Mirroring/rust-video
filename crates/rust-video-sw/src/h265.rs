@@ -17,7 +17,7 @@ use rust_video_caps::encode::{
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::h265::EncodeProfile as H265Profile;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 
 /// HEVC encoder over `libx265`; throughput unmeasured.
@@ -255,6 +255,15 @@ impl Encoder for H265Encoder {
     }
 }
 
+impl KeyframeRequest for H265Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.request_keyframe();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_video_caps::color::{ColorPrimaries, ContentLight};
@@ -264,7 +273,7 @@ mod tests {
     };
     use rust_video_caps::frame::PixelFormat;
     use rust_video_caps::h265::{EncodeLevel, EncodeProfile};
-    use rust_video_caps::traits::Encoder;
+    use rust_video_caps::traits::{Encoder, KeyframeRequest};
 
     use super::H265Encoder;
     use crate::error::SwError;
@@ -314,6 +323,25 @@ mod tests {
         packets.extend(encoder.flush().expect("flush"));
         assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn keyframe_request_forces_single_idr() {
+        let mut encoder = H265Encoder::open(64, 64, cbr(500_000), 1).expect("encoder");
+        let mut packets = Vec::new();
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        encoder.request_keyframe().expect("request");
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.flush().expect("flush"));
+        let keyed: Vec<bool> = packets.iter().map(|packet| packet.is_keyframe()).collect();
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
     }
 
     #[test]

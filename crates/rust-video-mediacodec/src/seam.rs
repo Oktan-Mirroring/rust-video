@@ -68,6 +68,13 @@ pub(crate) trait CodecSeam: std::fmt::Debug {
     ///
     /// Returns `Err` when the codec faults.
     fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError>;
+
+    /// Sync frame requested through `request-sync` params.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the codec faults.
+    fn request_sync(&mut self) -> Result<(), MediaCodecError>;
 }
 
 /// One drained codec item, in arrival order.

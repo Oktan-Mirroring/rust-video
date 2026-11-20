@@ -48,13 +48,15 @@ pub use backend::{Backend, VaPhaseStats};
 #[cfg(target_os = "linux")]
 pub use device::{DisplayHandle, VaApiDevice};
 #[cfg(target_os = "linux")]
-pub use encoder::{EncodeCodec, VaApiEncoder};
+pub use encoder::VaApiEncoder;
 #[cfg(target_os = "linux")]
 pub use error::{SkipReason, VaApiError};
 #[cfg(target_os = "linux")]
 pub use h264::decoder::{H264Decoder, VaApiFrame};
 #[cfg(target_os = "linux")]
 pub use h265::H265Decoder;
+#[cfg(target_os = "linux")]
+pub use rust_video_core::Codec;
 #[cfg(target_os = "linux")]
 pub use scale::{ScaledSurface, Scaler};
 #[cfg(target_os = "linux")]

@@ -47,18 +47,21 @@ pub struct PipelineLedger {
 }
 
 impl PipelineLedger {
-    /// In-flight ceiling: four queued inputs.
+    /// In-flight ceiling: sixteen queued inputs.
     ///
     /// The device codec pipelines internally across queue and dequeue;
-    /// four outstanding inputs keep it fed while the drain frees outputs.
-    /// Input buffer counts below four surface as `Starved`, never as waits.
-    pub const DEFAULT_DEPTH: usize = 4;
+    /// sixteen outstanding inputs keep it fed while the drain frees
+    /// outputs. The bound must clear every reorder window: dav1d holds
+    /// past eight inputs of altref lookahead before emitting, which
+    /// deadlocks any bound at or below its window. Input buffer counts
+    /// below sixteen surface as `Starved`, never as waits.
+    pub const DEFAULT_DEPTH: usize = 16;
 
     /// Smallest bound that still overlaps copy with decode.
     const MIN_DEPTH: usize = 2;
 
     /// Largest bound; deeper queues only age outputs.
-    const MAX_DEPTH: usize = 4;
+    const MAX_DEPTH: usize = 16;
 
     /// Retained timings; older completions evict first.
     const MAX_TIMINGS: usize = 1024;
@@ -148,16 +151,24 @@ impl PipelineLedger {
         self.max_in_flight = self.max_in_flight.max(self.pending.len());
     }
 
-    /// Oldest input completed, stamped `completed_pts_us`, after `copy_us`.
+    /// Input stamped `completed_pts_us` completed, after `copy_us`.
     ///
-    /// Engines execute in order, so completions match submissions FIFO.
+    /// Reordering engines emit out of order, so completions match by
+    /// echoed stamp; ties and unknown stamps fall back to FIFO.
     ///
     /// # Arguments
     ///
     /// * `completed_pts_us` - output stamp in microseconds.
     /// * `copy_us` - output-to-surface conversion in microseconds.
     pub fn note_completed(&mut self, completed_pts_us: i64, copy_us: u64) {
-        let Some(submit) = self.pending.pop_front() else {
+        let matched = self
+            .pending
+            .iter()
+            .position(|submit| {
+                i64::try_from(submit.pts_us).is_ok_and(|pts| pts == completed_pts_us)
+            })
+            .unwrap_or(0);
+        let Some(submit) = self.pending.remove(matched) else {
             debug_assert!(false, "output without submission");
             return;
         };
@@ -187,16 +198,18 @@ impl PipelineLedger {
 mod tests {
     use std::time::Duration;
 
+    use rust_video_caps::delivery::PhaseTiming;
+
     use super::PipelineLedger;
 
     #[test]
-    fn depth_clamps_to_two_through_four() {
+    fn depth_clamps_to_two_through_sixteen() {
         assert_eq!(PipelineLedger::new(0).depth(), 2);
         assert_eq!(PipelineLedger::new(1).depth(), 2);
         assert_eq!(PipelineLedger::new(3).depth(), 3);
         assert_eq!(PipelineLedger::new(4).depth(), 4);
-        assert_eq!(PipelineLedger::new(99).depth(), 4);
-        assert_eq!(PipelineLedger::DEFAULT_DEPTH, 4);
+        assert_eq!(PipelineLedger::new(99).depth(), 16);
+        assert_eq!(PipelineLedger::DEFAULT_DEPTH, 16);
     }
 
     #[test]
@@ -227,6 +240,37 @@ mod tests {
         }
         assert_eq!(ledger.in_flight(), 0);
         assert!(ledger.can_submit());
+    }
+
+    #[test]
+    fn completions_match_by_stamp_under_reorder() {
+        let mut ledger = PipelineLedger::new(4);
+        for pts in [0_u64, 40_000, 80_000] {
+            ledger.note_submitted(pts, 5);
+        }
+        for pts in [80_000_i64, 0, 40_000] {
+            ledger.note_completed(pts, 7);
+        }
+        assert_eq!(ledger.in_flight(), 0);
+        for timing in ledger.timings() {
+            assert_eq!(
+                timing.submitted_pts_us().expect("stamped"),
+                u64::try_from(timing.completed_pts_us().expect("stamped")).expect("small pts"),
+            );
+        }
+        let seqs: Vec<u64> = ledger.timings().iter().map(PhaseTiming::seq).collect();
+        assert_eq!(seqs, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn unknown_stamps_fall_back_to_fifo() {
+        let mut ledger = PipelineLedger::new(4);
+        for pts in [0_u64, 40_000] {
+            ledger.note_submitted(pts, 5);
+        }
+        ledger.note_completed(999_999, 7);
+        assert_eq!(ledger.timings()[0].seq(), 0);
+        assert_eq!(ledger.in_flight(), 1);
     }
 
     #[test]

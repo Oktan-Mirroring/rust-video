@@ -51,24 +51,23 @@ fn fps(transcoder: &mut Transcoder, warmup: &[Vec<u8>], raws: &[Vec<u8>]) -> f64
     let warmup = Packets::from_raws(warmup);
     let raws = Packets::from_raws(raws);
     for packet in &warmup {
-        let outcome = transcoder.transcode(packet).expect("warmup transcode");
-        assert!(matches!(outcome.plan().route(), Route::Gpu));
+        transcoder.transcode(packet).expect("warmup transcode");
+        assert!(matches!(transcoder.plan().route(), Route::Gpu));
     }
     let mut bytes = 0;
     let start = std::time::Instant::now();
     for _ in 0..HOPS {
         for packet in &raws {
-            let outcome = transcoder.transcode(packet).expect("timed transcode");
-            assert!(matches!(outcome.plan().route(), Route::Gpu));
-            bytes += outcome
-                .packets()
+            let coded = transcoder.transcode(packet).expect("timed transcode");
+            assert!(matches!(transcoder.plan().route(), Route::Gpu));
+            bytes += coded
                 .iter()
                 .map(|packet| packet.data().len())
                 .sum::<usize>();
         }
     }
-    let outcome = transcoder.flush().expect("timed flush");
-    assert!(matches!(outcome.plan().route(), Route::Gpu));
+    transcoder.flush().expect("timed flush");
+    assert!(matches!(transcoder.plan().route(), Route::Gpu));
     let elapsed = start.elapsed().as_secs_f64();
     assert!(bytes > 0);
     f64::from(HOPS) / elapsed

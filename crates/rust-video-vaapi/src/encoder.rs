@@ -8,7 +8,6 @@
 #![allow(unsafe_code)]
 
 use std::cell::UnsafeCell;
-use std::fmt;
 use std::marker::PhantomData;
 use std::os::raw::{c_int, c_void};
 
@@ -24,49 +23,24 @@ use crate::sys;
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
 use rust_video_caps::delivery::SubmitStats;
-use rust_video_caps::encode::EncodeConfig;
+use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
 use rust_video_caps::frame::{CpuFrame, PixelFormat};
 use rust_video_caps::packet::Packet;
 use rust_video_caps::reason::{ParseReason as CapsParse, UnsupportedReason as CapsUnsupported};
-use rust_video_caps::traits::{EncodeSurface, Encoder};
+use rust_video_caps::traits::{EncodeSurface, Encoder, KeyframeRequest};
 use rust_video_caps::transcode::{FallbackCause, GpuCaps, ShareMechanism};
 use rust_video_core::{Codec, Gop};
 
-/// Codec an encoder session writes.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum EncodeCodec {
-    /// H.264, High profile.
-    H264,
-    /// H.265, Main profile.
-    H265,
-}
-
-impl EncodeCodec {
-    /// VA-API profile for the codec.
-    #[must_use]
-    pub const fn profile(self) -> c_int {
-        match self {
-            Self::H264 => ffi::VA_PROFILE_H264_HIGH,
-            Self::H265 => ffi::VA_PROFILE_HEVC_MAIN,
-        }
-    }
-
-    /// Shared codec identity behind the session.
-    #[must_use]
-    const fn core(self) -> Codec {
-        match self {
-            Self::H264 => Codec::H264,
-            Self::H265 => Codec::H265,
-        }
-    }
-}
-
-impl fmt::Display for EncodeCodec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::H264 => write!(f, "h264"),
-            Self::H265 => write!(f, "h265"),
-        }
+/// VA-API profile for `codec`.
+///
+/// # Errors
+///
+/// Returns `Err` without an encoder for `codec`.
+pub(crate) fn va_profile(codec: Codec) -> Result<c_int, VaApiError> {
+    match codec {
+        Codec::H264 => Ok(ffi::VA_PROFILE_H264_HIGH),
+        Codec::H265 => Ok(ffi::VA_PROFILE_HEVC_MAIN),
+        _ => Err(VaApiError::NoEncoder { codec }),
     }
 }
 
@@ -76,10 +50,12 @@ impl fmt::Display for EncodeCodec {
 /// but run every call on one thread. The contract matches the display
 /// behind it; see `VaApiDevice`.
 pub struct VaApiEncoder {
-    /// Codec the session writes.
-    codec: EncodeCodec,
+    /// Codec the session writes; `open` admits H.264 and H.265 only.
+    codec: Codec,
     /// IDR cadence the session writes.
     gop: Gop,
+    /// Next picture forced to IDR, consumed once.
+    force_idr: bool,
     /// Previous picture as next P reference, if any.
     prev: Option<Reference>,
     /// Visible size in luma samples.
@@ -98,8 +74,10 @@ pub struct VaApiEncoder {
     words: Words,
     /// Level idc baked into the sequence.
     level: u8,
-    /// Pictures encoded so far.
+    /// Numbering cursor behind picture numbers.
     count: u64,
+    /// Pictures encoded so far.
+    submitted: u64,
     /// Driver buffers created by this session.
     creates: u64,
     /// Next reconstruction surface.
@@ -196,21 +174,48 @@ impl VaApiEncoder {
         | (Self::VUI_MV_LEN << Self::H264_VUI_MV_V)
         | (1 << Self::H264_VUI_MV_OVER);
 
-    /// Encoder over `device` for `codec` at `visible` size under `config`.
+    /// Legacy config for `encode`: tier profile under `Auto` rate control.
+    ///
+    /// `None` without an encoder for `encode`.
+    #[must_use]
+    pub fn auto_config(encode: Codec) -> Option<EncodeConfig> {
+        use rust_video_caps::{h264, h265};
+
+        let (profile, level) = match encode {
+            Codec::H264 => (
+                Profile::H264(h264::EncodeProfile::High),
+                Level::H264(h264::EncodeLevel::Auto),
+            ),
+            Codec::H265 => (
+                Profile::H265(h265::EncodeProfile::Main),
+                Level::H265(h265::EncodeLevel::Auto),
+            ),
+            _ => return None,
+        };
+        Some(EncodeConfig {
+            rate_control: RateControl::Auto,
+            profile,
+            level,
+            ..EncodeConfig::default()
+        })
+    }
+
+    /// Encoder over `device` at `visible` size under `config`.
     ///
     /// The device must outlive the encoder.
     ///
     /// # Errors
     ///
     /// Returns `Err` when `config` is invalid or exceeds the tier or
-    /// driver, or when the driver refuses the session.
+    /// driver, without an encoder for the `config` codec, or when the
+    /// driver refuses the session.
     pub fn open(
         device: &VaApiDevice,
-        codec: EncodeCodec,
         visible: PictureSize,
-        config: &EncodeConfig,
+        config: EncodeConfig,
     ) -> Result<Self, VaApiError> {
-        let profile = codec.profile();
+        let codec = config.codec();
+        let profile = va_profile(codec)?;
         let caps = DriverCaps {
             entrypoint: device.supports(profile, ffi::VA_ENTRYPOINT_ENC_SLICE),
             rt_format: device.config_attr(
@@ -229,7 +234,7 @@ impl VaApiEncoder {
                 ffi::VA_CONFIG_ATTRIB_ENC_PACKED_HEADERS,
             ),
         };
-        let mapped = MappedEncode::map(codec.core(), visible, config, &caps)?;
+        let mapped = MappedEncode::map(codec, visible, &config, &caps)?;
         let mut image_format = Self::nv12_format(device)?;
         let coded_size = mapped.coded;
         let session = Session::open(device, mapped.profile, coded_size, mapped.rate_control)?;
@@ -247,6 +252,7 @@ impl VaApiEncoder {
         Ok(Self {
             codec,
             gop: mapped.gop,
+            force_idr: false,
             prev: None,
             visible,
             coded: coded_size,
@@ -257,6 +263,7 @@ impl VaApiEncoder {
             words,
             level,
             count: 0,
+            submitted: 0,
             creates,
             next_recon: 0,
             next_slot: 0,
@@ -290,7 +297,7 @@ impl VaApiEncoder {
 
     /// Packed VPS (H.265) and sequence headers for the session.
     fn pack_session_headers(
-        codec: EncodeCodec,
+        codec: Codec,
         coded_size: (u32, u32),
         visible_pair: (u32, u32),
         level: u8,
@@ -300,7 +307,7 @@ impl VaApiEncoder {
         let mut writer = BitWriter::default();
         let mut creates = 0;
         let mut vps = None;
-        if codec == EncodeCodec::H265 {
+        if codec == Codec::H265 {
             Self::hevc_vps(level, &mut writer);
             let (bytes, bits) = writer.take();
             let mut pair = PackedPair::empty(display, context)?;
@@ -308,8 +315,9 @@ impl VaApiEncoder {
             vps = Some(pair);
         }
         match codec {
-            EncodeCodec::H264 => Self::h264_sps(coded_size, visible_pair, level, &mut writer),
-            EncodeCodec::H265 => Self::hevc_sps(coded_size, visible_pair, level, &mut writer),
+            Codec::H264 => Self::h264_sps(coded_size, visible_pair, level, &mut writer),
+            Codec::H265 => Self::hevc_sps(coded_size, visible_pair, level, &mut writer),
+            _ => return Err(VaApiError::NoEncoder { codec }),
         }
         let (bytes, bits) = writer.take();
         let mut sps = PackedPair::empty(display, context)?;
@@ -319,7 +327,7 @@ impl VaApiEncoder {
 
     /// Codec the session writes.
     #[must_use]
-    pub const fn codec(&self) -> EncodeCodec {
+    pub const fn codec(&self) -> Codec {
         self.codec
     }
 
@@ -339,7 +347,7 @@ impl VaApiEncoder {
     #[must_use]
     pub fn submit_stats(&self) -> SubmitStats {
         let mut stats = SubmitStats::new();
-        stats.add_submitted(self.count);
+        stats.add_submitted(self.submitted);
         stats.add_buffer_creates(self.creates);
         stats
     }
@@ -413,11 +421,19 @@ impl VaApiEncoder {
         let recon = self.session.surfaces[Self::RECON + self.next_recon];
         self.next_recon = (self.next_recon + 1) % Self::RECONS;
         let coded = self.coded_buf[slot].id();
+        if std::mem::take(&mut self.force_idr) {
+            let period = u64::from(self.gop.period());
+            let pos = self.count % period;
+            if pos != 0 {
+                self.count += period - pos;
+            }
+        }
         let numbers = Self::numbers(self.gop, self.count)?;
         let reference = self.prev;
         match self.codec {
-            EncodeCodec::H264 => self.render_h264(recon, &numbers, reference, coded)?,
-            EncodeCodec::H265 => self.render_h265(recon, &numbers, reference, coded)?,
+            Codec::H264 => self.render_h264(recon, &numbers, reference, coded)?,
+            Codec::H265 => self.render_h265(recon, &numbers, reference, coded)?,
+            _ => unreachable!("encoder codec validated at open"),
         }
         let display = self.session.display;
         let context = self.session.context;
@@ -435,6 +451,7 @@ impl VaApiEncoder {
             poc: numbers.poc,
         });
         self.count += 1;
+        self.submitted += 1;
         Ok(PendingJob {
             source,
             coded,
@@ -713,8 +730,9 @@ impl VaApiEncoder {
             return Ok(());
         }
         match self.codec {
-            EncodeCodec::H264 => Self::h264_pps(qp, &mut self.writer),
-            EncodeCodec::H265 => Self::hevc_pps(qp, &mut self.writer),
+            Codec::H264 => Self::h264_pps(qp, &mut self.writer),
+            Codec::H265 => Self::hevc_pps(qp, &mut self.writer),
+            _ => unreachable!("encoder codec validated at open"),
         }
         let bits = self.writer.bit_len();
         let recreated = self.pps.pack(
@@ -1327,6 +1345,15 @@ impl EncodeSurface for VaApiEncoder {
     }
 }
 
+impl KeyframeRequest for VaApiEncoder {
+    type Error = VaApiError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.force_idr = true;
+        Ok(())
+    }
+}
+
 /// Owned encode session: config, context, and surfaces.
 struct Session {
     /// Initialized display.
@@ -1492,9 +1519,9 @@ struct Words {
 
 impl Words {
     /// Fixed words for `codec`; per-picture values ride struct fields.
-    fn new(codec: EncodeCodec) -> Self {
+    fn new(codec: Codec) -> Self {
         match codec {
-            EncodeCodec::H264 => Self {
+            Codec::H264 => Self {
                 seq: (1u32 << VaApiEncoder::H264_SEQ_CHROMA)
                     | (1u32 << VaApiEncoder::H264_SEQ_MBS_ONLY)
                     | (1u32 << VaApiEncoder::H264_SEQ_DIRECT_8X8)
@@ -1508,7 +1535,7 @@ impl Words {
                     | (1u32 << VaApiEncoder::H264_PIC_TRANSFORM_8X8),
                 slice: 0,
             },
-            EncodeCodec::H265 => Self {
+            Codec::H265 => Self {
                 seq: (1u32 << VaApiEncoder::H265_SEQ_CHROMA)
                     | (1u32 << VaApiEncoder::H265_SEQ_STRONG_INTRA)
                     | (1u32 << VaApiEncoder::H265_SEQ_AMP),
@@ -1523,6 +1550,7 @@ impl Words {
                     | (1u32 << VaApiEncoder::H265_PIC_LOOP_TILES),
                 slice: 1 << VaApiEncoder::H265_SLICE_LAST,
             },
+            _ => unreachable!("encoder codec validated at open"),
         }
     }
 }
@@ -1728,23 +1756,32 @@ impl BitWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitWriter, EncodeCodec, VaApiEncoder, Words};
+    use super::{BitWriter, VaApiEncoder, Words};
     use crate::error::VaApiError;
     use crate::h264::Gate;
     use crate::h265::Gate as Gate265;
 
-    use rust_video_core::Gop;
+    use rust_video_core::{Codec, Gop};
 
-    /// Legacy H.264 config: High auto under `Auto` rate control.
-    fn legacy_h264() -> rust_video_caps::encode::EncodeConfig {
-        use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
-        use rust_video_caps::h264;
-
-        EncodeConfig {
-            rate_control: RateControl::Auto,
-            profile: Profile::H264(h264::EncodeProfile::High),
-            level: Level::H264(h264::EncodeLevel::Auto),
-            ..EncodeConfig::default()
+    #[test]
+    fn auto_config_covers_va_codecs() {
+        for codec in [Codec::H264, Codec::H265] {
+            let config = VaApiEncoder::auto_config(codec).expect("auto config");
+            assert_eq!(config.codec(), codec);
+            assert!(matches!(
+                config.rate_control,
+                rust_video_caps::encode::RateControl::Auto
+            ));
+        }
+        for codec in [
+            Codec::Vp9,
+            Codec::Av1,
+            Codec::Vp8,
+            Codec::Mpeg2,
+            Codec::Vc1,
+            Codec::Av2,
+        ] {
+            assert!(VaApiEncoder::auto_config(codec).is_none());
         }
     }
 
@@ -1759,8 +1796,8 @@ mod tests {
             return;
         };
         let size = PictureSize::new(320, 240).expect("synth size");
-        let config = legacy_h264();
-        let mut encoder = match VaApiEncoder::open(&device, EncodeCodec::H264, size, &config) {
+        let config = VaApiEncoder::auto_config(Codec::H264).expect("h264 auto");
+        let mut encoder = match VaApiEncoder::open(&device, size, config) {
             Ok(encoder) => encoder,
             Err(
                 VaApiError::Unsupported(_)
@@ -1828,12 +1865,12 @@ mod tests {
 
     #[test]
     fn words_pin_packed_shifts() {
-        let h264 = Words::new(EncodeCodec::H264);
+        let h264 = Words::new(Codec::H264);
         assert_eq!(h264.seq, 8229);
         assert_eq!(h264.pic_idr, 267);
         assert_eq!(h264.pic_p, 266);
         assert_eq!(h264.slice, 0);
-        let h265 = Words::new(EncodeCodec::H265);
+        let h265 = Words::new(Codec::H265);
         assert_eq!(h265.seq, 3073);
         assert_eq!(h265.pic_idr, 32_851);
         assert_eq!(h265.pic_p, 32_852);

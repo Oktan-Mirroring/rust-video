@@ -20,10 +20,21 @@ use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::h264;
 use rust_video_caps::h265;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 use rust_video_caps::vp9;
 use rust_video_core::planes;
+
+/// Drain polls in `drain_packets`; 6000 slices of 1ms bound 6s.
+const ENCODE_DRAIN_SLICES: u32 = 6000;
+/// Consecutive empty polls ending a flowing drain once packets arrived.
+const ENCODE_DRAIN_QUIET_END: u32 = 3;
+/// Wait slice between drain polls.
+///
+/// 1ms, not 10ms: the drain collects one trickling packet per poll,
+/// so a 10ms quantum adds ~5ms average latency per packet (~125ms
+/// per 30-frame flush); 1ms keeps the drain near hardware time.
+const ENCODE_DRAIN_SLICE: Duration = Duration::from_millis(1);
 
 /// Codec carried by an encode spec.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1192,6 +1203,9 @@ impl InputLayout {
         if frame.size() != self.size {
             return Err(self.mismatch(frame));
         }
+        if frame.format() == PixelFormat::Nv12 && self.layout == Layout::Nv12 {
+            return self.pack_nv12(frame);
+        }
         let width = self.size.width();
         let height = self.size.height();
         let chroma_width = width.div_ceil(2);
@@ -1235,6 +1249,39 @@ impl InputLayout {
                 Self::interleave_rows(&mut packed, u, v, chroma_width, chroma_height, self.stride)?;
             }
         }
+        Ok(Bytes::from(packed))
+    }
+
+    /// Semi-planar frame into a semi-planar buffer: row copies, no shuffling.
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - semi-planar 4:2:0 input at the configured extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the frame is not semi-planar, the extent
+    /// mismatches, or a plane is short for its rows.
+    fn pack_nv12(&self, frame: &CpuFrame) -> Result<Bytes, MediaCodecError> {
+        let [y, uv] = frame.planes() else {
+            return Err(self.mismatch(frame));
+        };
+        let mut packed = Vec::new();
+        let _reserved = packed.try_reserve_exact(self.packed_len());
+        Self::copy_rows(
+            &mut packed,
+            y,
+            self.size.width(),
+            self.size.height(),
+            self.stride,
+        )?;
+        Self::copy_rows(
+            &mut packed,
+            uv,
+            self.size.width().div_ceil(2).saturating_mul(2),
+            self.size.height().div_ceil(2),
+            self.stride,
+        )?;
         Ok(Bytes::from(packed))
     }
 
@@ -1387,6 +1434,8 @@ pub struct MediaCodecEncoder {
     input: InputLayout,
     /// Frames queued; stamps the next presentation time.
     frames: u64,
+    /// Frame packets emitted; owed inputs keep the drain waiting.
+    frames_out: u64,
     /// OS codec session.
     backend: Box<dyn CodecSeam>,
 }
@@ -1409,6 +1458,7 @@ impl MediaCodecEncoder {
             spec,
             input,
             frames: 0,
+            frames_out: 0,
             backend,
         }
     }
@@ -1493,18 +1543,42 @@ impl MediaCodecEncoder {
         let mut items = self.backend.submit(&bytes, pts)?;
         self.frames += 1;
         items.extend(self.backend.read()?);
-        Ok(Self::packets(items))
+        let packets = Self::packets(items);
+        self.frames_out += u64::try_from(packets.len()).unwrap_or(u64::MAX);
+        Ok(packets)
     }
 
     /// Packets held back for reordering or buffering.
+    ///
+    /// Mid-stream drain without an end marker: collects while queued
+    /// frames still owe packets, or three quiet polls with nothing
+    /// owed; both bounded. Software encoders need ~300-700ms for the
+    /// first packet, far past one non-blocking poll.
     ///
     /// # Errors
     ///
     /// Returns `Err` unless started, or when the codec faults.
     pub(crate) fn drain_packets(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
         self.state.ensure_started("flush")?;
-        let items = self.backend.read()?;
-        Ok(Self::packets(items))
+        let mut packets = Vec::new();
+        let mut quiet = 0;
+        for _ in 0..ENCODE_DRAIN_SLICES {
+            let batch = Self::packets(self.backend.read()?);
+            self.frames_out += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            if batch.is_empty() {
+                if self.frames_out >= self.frames {
+                    quiet += 1;
+                    if quiet >= ENCODE_DRAIN_QUIET_END {
+                        break;
+                    }
+                }
+            } else {
+                quiet = 0;
+                packets.extend(batch);
+            }
+            std::thread::sleep(ENCODE_DRAIN_SLICE);
+        }
+        Ok(packets)
     }
 
     /// Drained packets, then a codec flush; stays started.
@@ -1515,7 +1589,11 @@ impl MediaCodecEncoder {
     pub(crate) fn reset_packets(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
         self.state.ensure_started("reset")?;
         let items = self.backend.reset()?;
-        Ok(Self::packets(items))
+        let packets = Self::packets(items);
+        self.frames_out += u64::try_from(packets.len()).unwrap_or(u64::MAX);
+        // Codec flush voids queued inputs; nothing stays owed.
+        self.frames_out = self.frames_out.max(self.frames);
+        Ok(packets)
     }
 
     /// Encoder marked released.
@@ -1570,6 +1648,20 @@ impl Encoder for MediaCodecEncoder {
     }
 }
 
+impl KeyframeRequest for MediaCodecEncoder {
+    type Error = MediaCodecError;
+
+    /// Next coded picture forced to IDR.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, or when the codec faults.
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.state.ensure_started("request keyframe")?;
+        self.backend.request_sync()
+    }
+}
+
 impl Drop for MediaCodecEncoder {
     /// State marked released; the session stops with its fields.
     fn drop(&mut self) {
@@ -1579,7 +1671,8 @@ impl Drop for MediaCodecEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
 
@@ -1596,14 +1689,16 @@ mod tests {
     use rust_video_caps::h264;
     use rust_video_caps::h265;
     #[cfg(not(target_os = "android"))]
-    use rust_video_caps::traits::Encoder;
+    use rust_video_caps::traits::{Encoder, KeyframeRequest};
     use rust_video_caps::vp9;
 
     use super::{
         EncodeSpec, EncodeState, FormatEntry, InputLayout, MediaCodecEncoder, MediaCodecError,
     };
     use crate::format::FormatSpec;
+    use crate::overlap::SubmitOutcome;
     use crate::sdk::ApiLevel;
+    use crate::seam::{CodecSeam, SeamItem, SeamOutput};
 
     fn spec_16x16() -> EncodeSpec {
         EncodeSpec::h264(16, 16, 1_000_000, 30, 1).expect("valid spec")
@@ -1628,6 +1723,26 @@ mod tests {
             .apply_format(Some(19), Some(16), Some(16))
             .expect("valid format");
         layout
+    }
+
+    fn layout_16x16_nv12() -> InputLayout {
+        let mut layout = InputLayout::tentative(&spec_16x16()).expect("valid tentative");
+        layout
+            .apply_format(Some(21), Some(16), Some(16))
+            .expect("valid format");
+        layout
+    }
+
+    fn frame_16x16_nv12() -> CpuFrame {
+        CpuFrame::new(
+            PictureSize::new(16, 16).expect("valid size"),
+            PixelFormat::Nv12,
+            vec![
+                Plane::new(Bytes::from(vec![1_u8; 256]), 16).expect("valid plane"),
+                Plane::new(Bytes::from(vec![2_u8; 128]), 16).expect("valid plane"),
+            ],
+        )
+        .expect("two planes")
     }
 
     fn entries(spec: &EncodeSpec, level: u32) -> Vec<FormatEntry> {
@@ -1820,6 +1935,39 @@ mod tests {
         assert_eq!(packed.len(), 32 * 16 + 2 * 16 * 8);
         assert_eq!(&packed[16..32], &[0_u8; 16]);
         assert_eq!(&packed[32..48], &[1_u8; 16]);
+    }
+
+    #[test]
+    fn pack_nv12_copies_matching_layout() {
+        let packed = layout_16x16_nv12()
+            .pack(&frame_16x16_nv12())
+            .expect("nv12 packs");
+        assert_eq!(packed.len(), 16 * 16 * 3 / 2);
+        assert!(packed.iter().take(256).all(|byte| *byte == 1));
+        assert!(packed.iter().skip(256).all(|byte| *byte == 2));
+    }
+
+    #[test]
+    fn pack_nv12_matches_deinterleaved_planar() {
+        let planar = layout_16x16_planar()
+            .pack(&frame_16x16_nv12())
+            .expect("nv12 converts");
+        let layout = layout_16x16_nv12();
+        let frame = CpuFrame::new(
+            PictureSize::new(16, 16).expect("valid size"),
+            PixelFormat::Yuv420P,
+            vec![
+                Plane::new(Bytes::copy_from_slice(&planar[..256]), 16).expect("valid plane"),
+                Plane::new(Bytes::copy_from_slice(&planar[256..320]), 8).expect("valid plane"),
+                Plane::new(Bytes::copy_from_slice(&planar[320..]), 8).expect("valid plane"),
+            ],
+        )
+        .expect("three planes");
+        let repacked = layout.pack(&frame).expect("planar converts");
+        assert_eq!(
+            repacked,
+            layout.pack(&frame_16x16_nv12()).expect("nv12 packs")
+        );
     }
 
     #[test]
@@ -2589,6 +2737,42 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[test]
+    fn keyframe_request_reaches_stub_backend() {
+        let mut encoder = MediaCodecEncoder::open(&spec_16x16()).expect("stub opens");
+        assert_eq!(
+            encoder.request_keyframe(),
+            Err(MediaCodecError::NoEncoder { mime: "video/avc" })
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn keyframe_request_rejects_unstarted() {
+        for state in [
+            EncodeState::Unconfigured,
+            EncodeState::Configured,
+            EncodeState::Released,
+        ] {
+            let spec = spec_16x16();
+            let input = InputLayout::tentative(&spec).expect("valid tentative");
+            let mut encoder = MediaCodecEncoder::from_backend(
+                state,
+                spec,
+                input,
+                Box::new(crate::seam_stub::StubSeam::encoder("video/avc")),
+            );
+            assert_eq!(
+                encoder.request_keyframe(),
+                Err(MediaCodecError::InvalidEncodeState {
+                    op: "request keyframe",
+                    state,
+                })
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
     fn stub_open_declines_invalid_config() {
         let config = EncodeConfig {
             quality: Quality {
@@ -2605,5 +2789,97 @@ mod tests {
                 },
             })
         ));
+    }
+
+    /// Scripted codec session; reads pop scripted outputs in order.
+    #[derive(Debug)]
+    struct ScriptEncSeam {
+        /// Read scripts, oldest first.
+        reads: VecDeque<Vec<SeamItem>>,
+    }
+
+    impl ScriptEncSeam {
+        /// Seam answering reads from `reads`.
+        fn new(reads: Vec<Vec<SeamItem>>) -> Self {
+            Self {
+                reads: reads.into(),
+            }
+        }
+    }
+
+    impl CodecSeam for ScriptEncSeam {
+        fn submit(
+            &mut self,
+            _payload: &[u8],
+            _pts_us: u64,
+        ) -> Result<Vec<SeamItem>, MediaCodecError> {
+            Ok(Vec::new())
+        }
+
+        fn submit_nowait(
+            &mut self,
+            _payload: &[u8],
+            _pts_us: u64,
+        ) -> Result<(SubmitOutcome, Vec<SeamItem>), MediaCodecError> {
+            Ok((SubmitOutcome::Queued, Vec::new()))
+        }
+
+        fn read(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            Ok(self.reads.pop_front().unwrap_or_default())
+        }
+
+        fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            Ok(Vec::new())
+        }
+
+        fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            Ok(Vec::new())
+        }
+
+        fn request_sync(&mut self) -> Result<(), MediaCodecError> {
+            Ok(())
+        }
+    }
+
+    /// Encoder over scripted `reads`.
+    fn script_encoder(reads: Vec<Vec<SeamItem>>) -> MediaCodecEncoder {
+        MediaCodecEncoder::from_backend(
+            EncodeState::Started,
+            spec_16x16(),
+            layout_16x16_planar(),
+            Box::new(ScriptEncSeam::new(reads)),
+        )
+    }
+
+    /// One keyframe output carrying two bytes.
+    fn keyframe_output() -> SeamItem {
+        SeamItem::Output(SeamOutput::new(Bytes::from_static(&[0x65, 0x88]), 1, 0))
+    }
+
+    #[test]
+    fn drain_waits_for_owed_packets_past_quiet() {
+        let mut encoder = script_encoder(vec![
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![keyframe_output()],
+        ]);
+        encoder.frames = 1;
+        let packets = encoder.drain_packets().expect("drain waits");
+        assert_eq!(packets.len(), 1);
+        assert_eq!(encoder.frames_out, 1);
+    }
+
+    #[test]
+    fn drain_quits_quiet_with_nothing_owed() {
+        let mut encoder = script_encoder(Vec::new());
+        let start = Instant::now();
+        let packets = encoder.drain_packets().expect("drain quits");
+        assert_eq!(packets, Vec::new());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "unowed drain skips the cap"
+        );
     }
 }

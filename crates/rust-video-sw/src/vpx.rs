@@ -17,7 +17,7 @@ use rust_video_caps::encode::{
 };
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::Encoder;
+use rust_video_caps::traits::{Encoder, KeyframeRequest};
 use rust_video_caps::transcode::GpuCaps;
 use rust_video_caps::vp9::{EncodeLevel, Level as Vp9Level};
 
@@ -186,6 +186,15 @@ impl Encoder for Vp8Encoder {
 
     fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
         self.inner.flush()
+    }
+}
+
+impl KeyframeRequest for Vp8Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.request_keyframe();
+        Ok(())
     }
 }
 
@@ -413,6 +422,15 @@ impl Encoder for Vp9Encoder {
     }
 }
 
+impl KeyframeRequest for Vp9Encoder {
+    type Error = SwError;
+
+    fn request_keyframe(&mut self) -> Result<(), Self::Error> {
+        self.inner.request_keyframe();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_video_caps::color::{ColorPrimaries, ContentLight};
@@ -421,7 +439,7 @@ mod tests {
         Decline, EncodeConfig, FrameRate, Gop, Level, Profile, Quality, RateControl, SpeedPreset,
     };
     use rust_video_caps::frame::PixelFormat;
-    use rust_video_caps::traits::Encoder;
+    use rust_video_caps::traits::{Encoder, KeyframeRequest};
     use rust_video_caps::vp9::{EncodeLevel, EncodeProfile};
 
     use super::{Vp8Encoder, Vp9Encoder};
@@ -496,6 +514,45 @@ mod tests {
         packets.extend(encoder.flush().expect("flush"));
         assert_ne!(packets, []);
         assert!(packets[0].is_keyframe());
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn vp8_keyframe_request_forces_single_keyframe() {
+        let mut encoder = Vp8Encoder::open(64, 64, vp8_cbr(500_000), 1).expect("encoder");
+        let keyed = forced_keyed(&mut encoder);
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
+    }
+
+    // Lab-gated: needs system libavcodec.
+    #[test]
+    fn vp9_keyframe_request_forces_single_keyframe() {
+        let mut encoder = Vp9Encoder::open(64, 64, vp9_cbr(500_000), 1).expect("encoder");
+        let keyed = forced_keyed(&mut encoder);
+        assert_eq!(keyed.len(), 4, "one packet per frame: {keyed:?}");
+        assert!(keyed[0], "first packet keys: {keyed:?}");
+        assert!(!keyed[1], "second packet coasts: {keyed:?}");
+        assert!(keyed[2], "forced packet keys: {keyed:?}");
+        assert!(!keyed[3], "request is single-shot: {keyed:?}");
+    }
+
+    /// Keyframe flags over four flat frames with a request before the third.
+    fn forced_keyed<E>(encoder: &mut E) -> Vec<bool>
+    where
+        E: Encoder<Error = SwError> + KeyframeRequest<Error = SwError>,
+    {
+        let mut packets = Vec::new();
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        encoder.request_keyframe().expect("request");
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.encode(&frame_64()).expect("encode"));
+        packets.extend(encoder.flush().expect("flush"));
+        packets.iter().map(|packet| packet.is_keyframe()).collect()
     }
 
     #[test]

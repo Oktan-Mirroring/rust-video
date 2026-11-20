@@ -244,6 +244,9 @@ fn h265_shared_decode_yields_every_frame() {
 }
 
 /// Shared AV1 frames decode to every surface; lab-gated.
+///
+/// dav1d yields one frame per queued blob, so the vector feeds split
+/// into temporal units: a header unit plus one unit per frame.
 #[test]
 fn av1_shared_decode_yields_every_frame() {
     if !device_gate() {
@@ -258,7 +261,9 @@ fn av1_shared_decode_yields_every_frame() {
     let Some(mut decoder) = open_or_decline("av1", &spec) else {
         return;
     };
-    let (count, plane_bytes) = sync_run(&mut decoder, &packets(&[bytes]));
+    let raws = Obu::tu_packets(&bytes);
+    assert_eq!(raws.len(), PICTURES + 1, "vector holds header plus units");
+    let (count, plane_bytes) = sync_run(&mut decoder, &packets(&raws));
     assert_eq!(count, PICTURES, "av1 yields every frame");
     assert!(!plane_bytes.is_empty(), "av1 emits plane bytes");
 }
@@ -332,6 +337,8 @@ fn h265_shared_pipelined_matches_sync_bytes() {
 }
 
 /// Same shared AV1 bytes through sync and pipelined decode; lab-gated.
+///
+/// Temporal-unit split like the decode leg: one frame per unit.
 #[test]
 fn av1_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
@@ -343,7 +350,7 @@ fn av1_shared_pipelined_matches_sync_bytes() {
     let spec = FormatSpec::av1(320, 240)
         .expect("valid dims")
         .with_csd_0(seq);
-    parity_case("av1", &spec, &[bytes]);
+    parity_case("av1", &spec, &Obu::tu_packets(&bytes));
 }
 
 /// Same shared VP9 bytes through sync and pipelined decode; lab-gated.

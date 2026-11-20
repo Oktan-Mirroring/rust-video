@@ -4,9 +4,11 @@
 use rust_video_harness::Synth;
 
 #[cfg(target_os = "windows")]
+use rust_video_caps::encode::EncodeConfig;
+#[cfg(target_os = "windows")]
 use rust_video_caps::traits::{Device, Encoder};
 #[cfg(target_os = "windows")]
-use rust_video_d3d12::{Codec, D3d12Device, D3d12Encoder};
+use rust_video_d3d12::{D3d12Device, D3d12Encoder};
 
 #[cfg(target_os = "windows")]
 fn main() {
@@ -18,7 +20,7 @@ fn main() {
         }
     };
     println!("device: {}", device.name());
-    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let config = EncodeConfig::default();
     let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
