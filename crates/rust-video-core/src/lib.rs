@@ -10,7 +10,7 @@ pub mod time;
 
 pub use codecs::Codec;
 pub use gop::Gop;
-pub use nalu::{rbsp, rbsp_prefix, split_nals, Nalu, NaluSplitter};
+pub use nalu::{rbsp, rbsp_prefix, split_nals, Crop, Nalu, NaluSplitter};
 pub use planes::{check_plane, copy_rows, copy_rows_extend, PlaneFault};
 pub use profile::Profile;
 pub use pump::{CopyPump, InlineCopy};

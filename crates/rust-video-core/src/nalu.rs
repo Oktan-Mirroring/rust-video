@@ -248,6 +248,19 @@ fn unit_contains_payload(unit: &[u8]) -> bool {
     false
 }
 
+/// Visible rectangle in luma samples.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Crop {
+    /// Cropped luma columns on the left.
+    pub left: u32,
+    /// Cropped luma columns on the right.
+    pub right: u32,
+    /// Cropped luma rows on top.
+    pub top: u32,
+    /// Cropped luma rows at the bottom.
+    pub bottom: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{rbsp, rbsp_prefix, split_nals, NaluSplitter};
