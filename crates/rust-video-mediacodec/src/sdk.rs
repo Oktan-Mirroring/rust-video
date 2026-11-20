@@ -9,6 +9,18 @@ pub const ASYNC_NOTIFY_SDK: u32 = 28;
 /// API level carrying encoder input surfaces.
 pub const INPUT_SURFACE_SDK: u32 = 26;
 
+/// API level carrying the encoder `level` key.
+pub const LEVEL_KEY_SDK: u32 = 23;
+
+/// API level carrying the encoder color keys.
+pub const COLOR_KEYS_SDK: u32 = 24;
+
+/// API level carrying float `i-frame-interval` values.
+pub const IFRAME_FLOAT_SDK: u32 = 25;
+
+/// API level carrying the encoder `quality` key.
+pub const QUALITY_KEY_SDK: u32 = 28;
+
 /// Device API level.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ApiLevel(u32);
@@ -18,6 +30,19 @@ impl ApiLevel {
     #[must_use]
     pub fn new(level: u32) -> Self {
         Self(level)
+    }
+
+    /// Live device level, absent off-Android.
+    #[must_use]
+    pub fn current_opt() -> Option<Self> {
+        #[cfg(target_os = "android")]
+        {
+            Some(Self::current())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            None
+        }
     }
 
     /// Raw SDK integer.
@@ -58,13 +83,30 @@ impl ApiLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiLevel, ASYNC_NOTIFY_SDK, INPUT_SURFACE_SDK, MIN_SDK};
+    use super::{
+        ApiLevel, ASYNC_NOTIFY_SDK, COLOR_KEYS_SDK, IFRAME_FLOAT_SDK, INPUT_SURFACE_SDK,
+        LEVEL_KEY_SDK, MIN_SDK, QUALITY_KEY_SDK,
+    };
 
     #[test]
     fn floors_match_ndk_history() {
         assert_eq!(MIN_SDK, 21);
         assert_eq!(ASYNC_NOTIFY_SDK, 28);
         assert_eq!(INPUT_SURFACE_SDK, 26);
+    }
+
+    #[test]
+    fn key_floors_match_platform_history() {
+        assert_eq!(LEVEL_KEY_SDK, 23);
+        assert_eq!(COLOR_KEYS_SDK, 24);
+        assert_eq!(IFRAME_FLOAT_SDK, 25);
+        assert_eq!(QUALITY_KEY_SDK, 28);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn current_absent_off_android() {
+        assert_eq!(ApiLevel::current_opt(), None);
     }
 
     #[test]

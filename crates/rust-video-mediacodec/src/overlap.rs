@@ -107,6 +107,12 @@ impl PipelineLedger {
         self.max_in_flight
     }
 
+    /// Inputs queued since open, including completed ones.
+    #[must_use]
+    pub fn submitted(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Completed phase timings, oldest first, newest 1024.
     #[must_use]
     pub fn timings(&self) -> &VecDeque<PhaseTiming> {

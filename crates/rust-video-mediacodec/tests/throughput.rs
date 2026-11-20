@@ -106,7 +106,7 @@ fn check_surface(surface: &MediaCodecSurface) {
         surface.export(),
         GpuExport::Opaque { name: "mediacodec" }
     ));
-    surface.wait().expect("wait completes");
+    surface.try_wait().expect("wait completes");
 }
 
 /// Warmup plus timed decode of `raws` against the realtime bar.

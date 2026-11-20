@@ -1,17 +1,21 @@
 //! Byte-buffer decode behind the caps `Decoder` trait.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::error::MediaCodecError;
-use crate::format::{pixel_format_for, FormatSpec};
+use crate::format::FormatSpec;
 use crate::overlap::{PipelineLedger, SubmitOutcome};
 use crate::seam::{CodecSeam, SeamItem};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
+use rust_video_caps::delivery::{SplitDecode, SubmitStats};
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
+use rust_video_caps::traits::Decoder;
+use rust_video_caps::transcode::GpuCaps;
 use rust_video_core::micros;
 
 /// Decoder lifecycle state.
@@ -130,14 +134,12 @@ pub struct MediaCodecDecoder {
     slots: SurfaceSlots,
     /// In-flight bound plus phase timings.
     ledger: PipelineLedger,
+    /// Surfaces freed by submits, awaiting the next poll.
+    ready: VecDeque<MediaCodecSurface>,
     /// OS codec session.
-    // Reached only from the Android module.
-    #[allow(dead_code)]
     backend: Box<dyn CodecSeam>,
 }
 
-// Constructors and directors run only behind the Android module.
-#[allow(dead_code)]
 impl MediaCodecDecoder {
     /// Starved retries per packet before `QueueStalled`.
     ///
@@ -164,8 +166,102 @@ impl MediaCodecDecoder {
             output,
             slots,
             ledger: PipelineLedger::new(PipelineLedger::DEFAULT_DEPTH),
+            ready: VecDeque::new(),
             backend,
         }
+    }
+
+    /// Decoder for `spec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` below the device floor, without both `csd` blobs on
+    /// H.264/H.265, or when no decoder answers the mime.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - codec input format.
+    ///
+    /// # Usage Notes
+    ///
+    /// Off-Android the stub opens without a device; use fails loud.
+    pub fn open(spec: &FormatSpec) -> Result<Self, MediaCodecError> {
+        #[cfg(target_os = "android")]
+        {
+            Self::open_android(spec)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            Self::open_stub(spec)
+        }
+    }
+
+    /// Drained surfaces, then a codec flush; stays started.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    pub fn reset(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.reset_surfaces()
+    }
+
+    /// One packet queued without blocking on its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`). A full bound or a busy codec answers
+    /// `Starved`, never `Err`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// Queue outcome plus surfaces freed along the way, if any.
+    pub fn submit_nowait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<(SubmitOutcome, Vec<MediaCodecSurface>), MediaCodecError> {
+        self.submit_packet_nowait(packet)
+    }
+
+    /// One packet queued, draining between starved attempts; bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, when live surfaces hold
+    /// every slot (`NoFreeSlot`), or when `packet` still starves after
+    /// the drain budget (`QueueStalled`).
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// Surfaces freed along the way; `packet` queued on `Ok`.
+    pub fn submit_wait(
+        &mut self,
+        packet: &Packet,
+    ) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.submit_packet_wait(packet)
+    }
+
+    /// Surfaces decoded so far, draining every available output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    pub fn poll(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
+        self.poll_surfaces()
     }
 
     /// Lifecycle state.
@@ -216,7 +312,9 @@ impl MediaCodecDecoder {
         self.ledger
             .note_submitted(pts, PipelineLedger::elapsed_us(start));
         items.extend(self.backend.read()?);
-        self.surfaces(items)
+        let mut surfaces = self.take_ready();
+        surfaces.extend(self.surfaces(items)?);
+        Ok(surfaces)
     }
 
     /// Surfaces decoded from `packet`, queued without blocking on its output.
@@ -255,16 +353,16 @@ impl MediaCodecDecoder {
 
     /// Surfaces freed while queueing `packet`, draining between starved attempts.
     ///
-    /// # Arguments
-    ///
-    /// * `packet` - coded input.
-    ///
     /// # Errors
     ///
     /// Returns `Err` unless started, when the codec faults, when a format
     /// reading rejects the output layout, when live surfaces hold
     /// every slot (`NoFreeSlot`), or when `packet` still starves after
     /// the drain budget (`QueueStalled`).
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
     ///
     /// # Returns
     ///
@@ -302,7 +400,9 @@ impl MediaCodecDecoder {
     pub(crate) fn poll_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("poll")?;
         let items = self.backend.read()?;
-        self.surfaces(items)
+        let mut surfaces = self.take_ready();
+        surfaces.extend(self.surfaces(items)?);
+        Ok(surfaces)
     }
 
     /// Surfaces held back for reordering or buffering.
@@ -315,7 +415,9 @@ impl MediaCodecDecoder {
     pub(crate) fn drain_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("flush")?;
         let items = self.backend.read()?;
-        self.surfaces(items)
+        let mut surfaces = self.take_ready();
+        surfaces.extend(self.surfaces(items)?);
+        Ok(surfaces)
     }
 
     /// Drained surfaces, then a codec flush; stays started.
@@ -336,6 +438,11 @@ impl MediaCodecDecoder {
     /// Decoder marked released.
     pub(crate) fn mark_released(&mut self) {
         self.state = self.state.released().unwrap_or(DecodeState::Released);
+    }
+
+    /// Stashed surfaces freed by earlier submits, oldest first.
+    fn take_ready(&mut self) -> Vec<MediaCodecSurface> {
+        self.ready.drain(..).collect()
     }
 
     /// Surfaces over drained `items`, formats applied in order.
@@ -388,6 +495,142 @@ impl MediaCodecDecoder {
             surfaces.push(MediaCodecSurface::new(frame, coded, slot));
         }
         Ok(surfaces)
+    }
+}
+
+impl Decoder for MediaCodecDecoder {
+    type Frame = MediaCodecSurface;
+    type Error = MediaCodecError;
+
+    fn caps(&self) -> GpuCaps {
+        GpuCaps::new(None, false, false)
+    }
+
+    /// Surfaces decoded from `packet`, possibly none.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    ///
+    /// # Usage Notes
+    ///
+    /// Per-call emission: the packet queues and the drain runs in this same
+    /// call, so a stream with no reordering emits each picture on its
+    /// completing `decode` call. The client holds no decoded-picture buffer;
+    /// whatever the codec holds back for reordering stays inside the codec.
+    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.push_packet(packet)
+    }
+
+    /// Surfaces held back for reordering or buffering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` unless started, when the codec faults, when a format
+    /// reading rejects the output layout, or when live surfaces hold
+    /// every slot (`NoFreeSlot`).
+    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.drain_surfaces()
+    }
+}
+
+impl SplitDecode for MediaCodecDecoder {
+    type Frame = MediaCodecSurface;
+    type Error = MediaCodecError;
+
+    /// `packet` queued without waiting for its pictures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend rejects `packet`.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - coded input.
+    ///
+    /// # Returns
+    ///
+    /// `false` when the bound or the codec is busy; `packet` stays
+    /// unconsumed, poll then resend.
+    ///
+    /// # Usage Notes
+    ///
+    /// Surfaces freed along the way stash inside the decoder; the next
+    /// `poll` returns them ahead of newly drained outputs.
+    fn try_submit(&mut self, packet: &Packet) -> Result<bool, Self::Error> {
+        let (outcome, freed) = self.submit_packet_nowait(packet)?;
+        self.ready.extend(freed);
+        Ok(outcome == SubmitOutcome::Queued)
+    }
+
+    /// Pictures completed since the last poll, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its completed frames.
+    fn poll(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.poll_surfaces()
+    }
+
+    /// Pictures completed within `timeout`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its completed frames.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - wait budget when nothing completed.
+    ///
+    /// # Returns
+    ///
+    /// Empty when the budget lapses with nothing completed.
+    ///
+    /// # Usage Notes
+    ///
+    /// Dequeue is non-blocking, so an empty first poll sleeps in 10ms
+    /// slices until a picture completes or the budget lapses.
+    fn poll_wait(&mut self, timeout: Duration) -> Result<Vec<Self::Frame>, Self::Error> {
+        let start = Instant::now();
+        loop {
+            let batch = self.poll_surfaces()?;
+            if !batch.is_empty() {
+                return Ok(batch);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(Self::WAIT_BACKOFF.min(timeout.saturating_sub(elapsed)));
+        }
+    }
+
+    /// Trailing pictures, then end of stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the backend cannot release its trailing frames.
+    ///
+    /// # Usage Notes
+    ///
+    /// The seam carries no end-of-stream signal, so this drains trailing
+    /// outputs; streams end by dropping the decoder.
+    fn flush_split(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
+        self.drain_surfaces()
+    }
+
+    /// Submit gauges since backend open.
+    fn stats(&self) -> SubmitStats {
+        SubmitStats::snapshot(self.ledger.submitted(), self.ledger.max_in_flight(), 0, 0)
+    }
+}
+
+impl Drop for MediaCodecDecoder {
+    /// State marked released; the session stops with its fields.
+    fn drop(&mut self) {
+        self.mark_released();
     }
 }
 
@@ -456,7 +699,7 @@ impl OutputLayout {
             });
         };
         let color = color.unwrap_or(-1);
-        let format = pixel_format_for(color)
+        let format = FormatSpec::pixel_format_for(color)
             .ok_or(MediaCodecError::UnsupportedColorFormat { value: color })?;
         let layout = match format {
             PixelFormat::Nv12 => Layout::Nv12,
@@ -586,7 +829,13 @@ fn fit(value: u64, len: usize) -> usize {
 /// # Errors
 ///
 /// Returns `Err` when the range leaves the buffer.
-pub fn ranged_bytes(buffer: &[u8], offset: i32, size: i32) -> Result<Bytes, MediaCodecError> {
+// Reached only from the Android module and tests.
+#[allow(dead_code)]
+pub(crate) fn ranged_bytes(
+    buffer: &[u8],
+    offset: i32,
+    size: i32,
+) -> Result<Bytes, MediaCodecError> {
     let range = || MediaCodecError::BufferRange {
         offset,
         size,
@@ -616,8 +865,10 @@ mod tests {
 
     use bytes::Bytes;
 
+    use rust_video_caps::delivery::SplitDecode;
     use rust_video_caps::frame::PixelFormat;
     use rust_video_caps::packet::Packet;
+    use rust_video_caps::traits::Decoder;
 
     fn layout_16x16_nv12() -> OutputLayout {
         let spec = FormatSpec::h264(16, 16).expect("valid dims");
@@ -1143,5 +1394,165 @@ mod tests {
         let timings = decoder.ledger().timings();
         assert_eq!(timings.len(), 4);
         assert_eq!(timings.back().expect("fourth timing").seq(), 3);
+    }
+
+    #[test]
+    fn split_submit_poll_round_trip() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        for packet in &script_packets(4) {
+            assert!(decoder.try_submit(packet).expect("queue"));
+        }
+        let surfaces = SplitDecode::poll(&mut decoder).expect("drain");
+        assert_eq!(surfaces.len(), 4);
+        assert!(surface_bytes(&surfaces).contains(&3));
+        let stats = decoder.stats();
+        assert_eq!(stats.submitted(), 4);
+        assert_eq!(stats.peak_inflight(), 4);
+    }
+
+    #[test]
+    fn split_submit_starves_past_bound() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        for packet in &script_packets(4) {
+            assert!(decoder.try_submit(packet).expect("queue"));
+        }
+        assert!(!decoder
+            .try_submit(&script_packets(1)[0])
+            .expect("bound answers"));
+        assert_eq!(decoder.stats().submitted(), 4);
+        assert_eq!(decoder.stats().peak_inflight(), 4);
+    }
+
+    #[test]
+    fn split_submit_starves_on_busy_seam() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            0,
+            Duration::ZERO,
+        ));
+        assert!(!decoder
+            .try_submit(&script_packets(1)[0])
+            .expect("busy answers"));
+        assert_eq!(decoder.stats().submitted(), 0);
+        assert_eq!(decoder.stats().peak_inflight(), 0);
+    }
+
+    #[test]
+    fn split_poll_wait_returns_ready_without_sleep() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        for packet in &script_packets(2) {
+            assert!(decoder.try_submit(packet).expect("queue"));
+        }
+        let start = Instant::now();
+        let surfaces = decoder
+            .poll_wait(Duration::from_secs(5))
+            .expect("ready drains");
+        assert_eq!(surfaces.len(), 2);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn split_poll_wait_honors_empty_budget() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        let start = Instant::now();
+        let surfaces = decoder
+            .poll_wait(Duration::from_millis(30))
+            .expect("budget lapses");
+        assert!(surfaces.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn split_flush_drains_trailing() {
+        let mut decoder = script_decoder(ScriptSeam::new(
+            Rc::new(RefCell::new(Vec::new())),
+            8,
+            Duration::ZERO,
+        ));
+        for packet in &script_packets(3) {
+            assert!(decoder.try_submit(packet).expect("queue"));
+        }
+        let surfaces = decoder.flush_split().expect("trailing drains");
+        assert_eq!(surfaces.len(), 3);
+        assert_eq!(decoder.ledger().in_flight(), 0);
+        let stats = decoder.stats();
+        assert_eq!((stats.submitted(), stats.peak_inflight()), (3, 3));
+        assert_eq!((stats.resets(), stats.buffer_creates()), (0, 0));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn stub_open_decodes_loud() {
+        let spec = FormatSpec::h264(16, 16)
+            .expect("valid dims")
+            .with_csd_0(vec![0, 0, 1])
+            .with_csd_1(vec![0, 0, 1]);
+        let mut decoder = MediaCodecDecoder::open(&spec).expect("stub opens");
+        assert_eq!(decoder.state(), DecodeState::Started);
+        let packet = &script_packets(1)[0];
+        assert!(matches!(
+            decoder.decode(packet),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+        assert!(matches!(
+            decoder.flush(),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+        assert!(matches!(
+            decoder.reset(),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+        assert!(matches!(
+            decoder.poll(),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+        assert!(matches!(
+            decoder.poll_wait(Duration::from_millis(10)),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+        assert!(matches!(
+            decoder.flush_split(),
+            Err(MediaCodecError::NoDecoder { mime: "video/avc" })
+        ));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn stub_submit_reads_backpressure() {
+        let spec = FormatSpec::vp9(16, 16).expect("valid dims");
+        let mut decoder = MediaCodecDecoder::open(&spec).expect("stub opens");
+        assert!(!decoder
+            .try_submit(&script_packets(1)[0])
+            .expect("stub starves"));
+        assert_eq!(decoder.stats().submitted(), 0);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn stub_open_demands_csd() {
+        let spec = FormatSpec::h264(16, 16).expect("valid dims");
+        assert!(matches!(
+            MediaCodecDecoder::open(&spec),
+            Err(MediaCodecError::MissingCsd {
+                mime: "video/avc",
+                key: "csd-0",
+            })
+        ));
     }
 }

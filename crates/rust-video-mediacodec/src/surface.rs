@@ -17,17 +17,17 @@
 //! frees codec buffers; already-issued surfaces keep valid pixels.
 //!
 //! Sync story: byte-buffer dequeue completes synchronously, so pixels are
-//! complete at emission and [`MediaCodecSurface::wait`] observes completion
-//! without blocking. There is no fence to poll; the NDK `sync` module only
-//! matters to a future output-`Surface` path, which would hand out
-//! `AImage`/`HardwareBuffer` objects instead of copies.
+//! complete at emission and [`MediaCodecSurface::try_wait`] observes
+//! completion without blocking. There is no fence to poll; the NDK `sync`
+//! module only matters to a future output-`Surface` path, which would hand
+//! out `AImage`/`HardwareBuffer` objects instead of copies.
 
 use std::sync::{Arc, Mutex};
 
 use crate::error::MediaCodecError;
 
 use rust_video_caps::common::PictureSize;
-use rust_video_caps::frame::{CpuFrame, GpuExport, PixelFormat};
+use rust_video_caps::frame::{CpuFrame, GpuExport, GpuFrame, PixelFormat, Surface};
 
 /// Decoded picture pinning one decoder slot.
 ///
@@ -39,19 +39,13 @@ pub struct MediaCodecSurface {
     /// Full buffer extent from stride by slice height.
     coded: PictureSize,
     /// Slot lease; drop releases the slot.
-    _slot: SlotGuard,
+    slot: SlotGuard,
 }
 
 impl MediaCodecSurface {
     /// Surface over `frame` with `coded` extent and `slot` lease.
-    // Reached only from the Android module and tests.
-    #[allow(dead_code)]
     pub(crate) fn new(frame: CpuFrame, coded: PictureSize, slot: SlotGuard) -> Self {
-        Self {
-            frame,
-            coded,
-            _slot: slot,
-        }
+        Self { frame, coded, slot }
     }
 
     /// Visible picture extent in luma samples.
@@ -101,6 +95,22 @@ impl MediaCodecSurface {
         &self.frame
     }
 
+    /// Device frame ticket behind this picture.
+    #[must_use]
+    pub fn identity(&self) -> GpuFrame {
+        GpuFrame::new(self.size(), self.format(), self.slot.generation)
+    }
+
+    /// Packed picture bytes behind the lease.
+    #[must_use]
+    pub fn lease_bytes(&self) -> u64 {
+        self.frame
+            .planes()
+            .iter()
+            .map(|plane| plane.data().len() as u64)
+            .sum()
+    }
+
     /// Blocking completion wait for external readers.
     ///
     /// Byte-buffer pixels complete synchronously at emission, so this
@@ -112,8 +122,40 @@ impl MediaCodecSurface {
     /// Returns `Ok` always; byte-buffer pixels complete at emission.
     // Receiver is contract surface; completion needs no state read.
     #[allow(clippy::unused_self)]
-    pub fn wait(&self) -> Result<(), MediaCodecError> {
+    pub fn try_wait(&self) -> Result<(), MediaCodecError> {
         Ok(())
+    }
+}
+
+impl Surface for MediaCodecSurface {
+    /// Visible picture extent in luma samples.
+    fn size(&self) -> PictureSize {
+        self.size()
+    }
+
+    /// Pixel layout.
+    fn format(&self) -> PixelFormat {
+        self.format()
+    }
+
+    /// Array layer of this picture; byte buffers carry one layer.
+    fn slice(&self) -> u32 {
+        self.slice()
+    }
+
+    /// Full buffer extent in luma samples, stride by slice height.
+    fn coded(&self) -> PictureSize {
+        self.coded()
+    }
+
+    /// Crop left/top in luma samples; byte buffers report visible dims directly.
+    fn origin(&self) -> (u32, u32) {
+        self.origin()
+    }
+
+    /// Opaque export behind the surface.
+    fn export(&self) -> GpuExport {
+        self.export()
     }
 }
 
@@ -136,20 +178,24 @@ impl SurfaceSlots {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SlotState { capacity, live: 0 })),
+            state: Arc::new(Mutex::new(SlotState {
+                capacity,
+                live: 0,
+                next: 0,
+            })),
         }
     }
 
     /// Slot capacity.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.lock().capacity
+        SlotState::lock(&self.state).capacity
     }
 
     /// Slots currently pinned by live surfaces.
     #[must_use]
     pub fn live(&self) -> usize {
-        self.lock().live
+        SlotState::lock(&self.state).live
     }
 
     /// One slot lease for a new surface.
@@ -159,21 +205,20 @@ impl SurfaceSlots {
     /// Returns [`MediaCodecError::NoFreeSlot`] when live surfaces hold every
     /// slot.
     pub fn acquire(&self) -> Result<SlotGuard, MediaCodecError> {
-        let mut state = self.lock();
-        if state.live >= state.capacity {
-            return Err(MediaCodecError::NoFreeSlot);
-        }
-        state.live += 1;
+        let generation = {
+            let mut state = SlotState::lock(&self.state);
+            if state.live >= state.capacity {
+                return Err(MediaCodecError::NoFreeSlot);
+            }
+            state.live += 1;
+            let generation = state.next;
+            state.next += 1;
+            generation
+        };
         Ok(SlotGuard {
             state: Arc::clone(&self.state),
+            generation,
         })
-    }
-
-    /// Pool state; a poisoned mutex still yields its counts.
-    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -182,15 +227,28 @@ impl SurfaceSlots {
 pub struct SlotGuard {
     /// Shared live count plus capacity.
     state: Arc<Mutex<SlotState>>,
+    /// Pool-issued sequence number.
+    generation: u64,
+}
+
+impl SlotGuard {
+    /// Slot capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        SlotState::lock(&self.state).capacity
+    }
+
+    /// Slots currently pinned by live surfaces.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        SlotState::lock(&self.state).live
+    }
 }
 
 impl Drop for SlotGuard {
     /// Slot released back to the pool.
     fn drop(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = SlotState::lock(&self.state);
         state.live = state.live.saturating_sub(1);
     }
 }
@@ -202,6 +260,16 @@ struct SlotState {
     capacity: usize,
     /// Slots currently pinned.
     live: usize,
+    /// Next slot generation.
+    next: u64,
+}
+
+impl SlotState {
+    /// Pool state; a poisoned mutex still yields its counts.
+    fn lock(pool: &Arc<Mutex<Self>>) -> std::sync::MutexGuard<'_, Self> {
+        pool.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
@@ -209,7 +277,7 @@ mod tests {
     use bytes::Bytes;
 
     use rust_video_caps::common::PictureSize;
-    use rust_video_caps::frame::{CpuFrame, GpuExport, PixelFormat, Plane};
+    use rust_video_caps::frame::{CpuFrame, GpuExport, PixelFormat, Plane, Surface};
 
     use super::{MediaCodecSurface, SurfaceSlots};
     use crate::error::MediaCodecError;
@@ -265,9 +333,87 @@ mod tests {
     }
 
     #[test]
-    fn wait_returns_on_complete_pixels() {
+    fn try_wait_returns_on_complete_pixels() {
         let (surface, _slots) = surface();
-        surface.wait().expect("wait completes");
+        surface.try_wait().expect("wait completes");
+    }
+
+    #[test]
+    fn surface_trait_delegates_to_inherent_accessors() {
+        let (surface, _slots) = surface();
+        assert_eq!(
+            Surface::size(&surface),
+            PictureSize::new(16, 16).expect("valid")
+        );
+        assert_eq!(Surface::format(&surface), PixelFormat::Nv12);
+        assert_eq!(Surface::slice(&surface), 0);
+        assert_eq!(
+            Surface::coded(&surface),
+            PictureSize::new(32, 16).expect("valid")
+        );
+        assert_eq!(Surface::origin(&surface), (0, 0));
+        assert!(matches!(
+            Surface::export(&surface),
+            GpuExport::Opaque { name: "mediacodec" }
+        ));
+    }
+
+    #[test]
+    fn identity_carries_size_format_and_generation() {
+        let slots = SurfaceSlots::new(2);
+        let coded = PictureSize::new(16, 16).expect("valid coded");
+        let first = MediaCodecSurface::new(
+            frame_16x16_nv12(),
+            coded,
+            slots.acquire().expect("free slot"),
+        );
+        let second = MediaCodecSurface::new(
+            frame_16x16_nv12(),
+            coded,
+            slots.acquire().expect("free slot"),
+        );
+        let first_id = first.identity();
+        let second_id = second.identity();
+        assert_eq!(first_id.size(), PictureSize::new(16, 16).expect("valid"));
+        assert_eq!(first_id.format(), PixelFormat::Nv12);
+        assert_eq!(first_id.generation(), 0);
+        assert_eq!(second_id.generation(), 1);
+    }
+
+    #[test]
+    fn generations_never_reused_after_release() {
+        let slots = SurfaceSlots::new(1);
+        let coded = PictureSize::new(16, 16).expect("valid coded");
+        let first = MediaCodecSurface::new(
+            frame_16x16_nv12(),
+            coded,
+            slots.acquire().expect("free slot"),
+        );
+        assert_eq!(first.identity().generation(), 0);
+        drop(first);
+        let second = MediaCodecSurface::new(
+            frame_16x16_nv12(),
+            coded,
+            slots.acquire().expect("free slot"),
+        );
+        assert_eq!(second.identity().generation(), 1);
+    }
+
+    #[test]
+    fn lease_bytes_sums_plane_bytes() {
+        let (surface, _slots) = surface();
+        assert_eq!(surface.lease_bytes(), 256 + 128);
+    }
+
+    #[test]
+    fn guard_reports_pool_counts() {
+        let slots = SurfaceSlots::new(2);
+        let first = slots.acquire().expect("slot one");
+        assert_eq!(first.capacity(), 2);
+        assert_eq!(first.live(), 1);
+        let _second = slots.acquire().expect("slot two");
+        assert_eq!(first.live(), 2);
+        assert_eq!(slots.live(), 2);
     }
 
     #[test]

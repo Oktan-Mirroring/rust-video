@@ -49,7 +49,7 @@ fn check_surface(surface: &MediaCodecSurface) {
         surface.export(),
         GpuExport::Opaque { name: "mediacodec" }
     ));
-    surface.wait().expect("wait completes");
+    surface.try_wait().expect("wait completes");
 }
 
 #[test]

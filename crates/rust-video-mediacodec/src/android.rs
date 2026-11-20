@@ -6,14 +6,13 @@ use std::time::Duration;
 
 use crate::bridge::{CodecEvent, EventQueue, PendingInputs};
 use crate::decoder::{ranged_bytes, DecodeState, MediaCodecDecoder, OutputLayout};
-use crate::device::MediaCodecDevice;
-use crate::encoder::{EncodeSpec, EncodeState, InputLayout, MediaCodecEncoder};
+use crate::encoder::{EncodeSpec, EncodeState, FormatValue, InputLayout, MediaCodecEncoder};
 use crate::error::MediaCodecError;
 use crate::format::FormatSpec;
 use crate::overlap::SubmitOutcome;
 use crate::sdk::ApiLevel;
 use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
-use crate::surface::{MediaCodecSurface, SurfaceSlots};
+use crate::surface::SurfaceSlots;
 
 use ndk::media::media_codec::{
     AsyncNotifyCallback, DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, InputBuffer,
@@ -21,10 +20,6 @@ use ndk::media::media_codec::{
 };
 use ndk::media::media_format::MediaFormat;
 use ndk::media_error::MediaError;
-use rust_video_caps::frame::CpuFrame;
-use rust_video_caps::packet::Packet;
-use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_caps::transcode::GpuCaps;
 
 /// `MediaCodec#BUFFER_FLAG_DECODE_ONLY`; `AndroidSeam` and `AsyncDrain` share it.
 const BUFFER_FLAG_DECODE_ONLY: u32 = 32;
@@ -482,39 +477,27 @@ impl ApiLevel {
 }
 
 impl EncodeSpec {
-    /// Native format for `configure`.
+    /// Native format for `configure` on `level`.
     ///
     /// <https://docs.rs/ndk/0.9.0/ndk/media/media_format/struct.MediaFormat.html>
-    #[must_use]
-    pub fn materialize(&self) -> MediaFormat {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigDeclined` when the config exceeds the tier or `level`.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - device level gating keys by availability.
+    pub fn materialize(&self, level: ApiLevel) -> Result<MediaFormat, MediaCodecError> {
         let mut format = MediaFormat::new();
-        format.set_str(FormatSpec::KEY_MIME, self.mime());
-        format.set_i32(FormatSpec::KEY_WIDTH, self.width_as_i32());
-        format.set_i32(FormatSpec::KEY_HEIGHT, self.height_as_i32());
-        format.set_i32(
-            Self::KEY_BIT_RATE,
-            i32::try_from(self.bitrate()).unwrap_or(i32::MAX),
-        );
-        format.set_i32(
-            FormatSpec::KEY_FRAME_RATE,
-            i32::try_from(self.frame_rate()).unwrap_or(i32::MAX),
-        );
-        format.set_i32(
-            Self::KEY_I_FRAME_INTERVAL,
-            i32::try_from(self.keyframe_interval()).unwrap_or(i32::MAX),
-        );
-        format.set_i32(FormatSpec::KEY_COLOR_FORMAT, self.color_format());
-        format
-    }
-
-    /// Width as a native `i32`; construction bounds it.
-    fn width_as_i32(&self) -> i32 {
-        i32::try_from(self.width()).unwrap_or(i32::MAX)
-    }
-
-    /// Height as a native `i32`; construction bounds it.
-    fn height_as_i32(&self) -> i32 {
-        i32::try_from(self.height()).unwrap_or(i32::MAX)
+        for entry in self.format_entries(Some(level))? {
+            match entry.value() {
+                FormatValue::Int(value) => format.set_i32(entry.key(), value),
+                FormatValue::Float(value) => format.set_f32(entry.key(), value),
+                FormatValue::Str(value) => format.set_str(entry.key(), value),
+            }
+        }
+        Ok(format)
     }
 }
 
@@ -593,17 +576,17 @@ impl FormatSpec {
 }
 
 impl MediaCodecDecoder {
-    /// Decoder for `spec`.
-    ///
-    /// # Arguments
-    ///
-    /// * `spec` - codec input format.
+    /// Decoder over the device codec for `spec`.
     ///
     /// # Errors
     ///
     /// Returns `Err` below the device floor, without both `csd` blobs on
     /// H.264/H.265, or when no decoder answers the mime.
-    pub fn open(spec: &FormatSpec) -> Result<Self, MediaCodecError> {
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - codec input format.
+    pub(crate) fn open_android(spec: &FormatSpec) -> Result<Self, MediaCodecError> {
         spec.check_csd()?;
         let level = ApiLevel::current();
         if !level.meets_min() || !level.at_least(spec.min_sdk()) {
@@ -628,147 +611,30 @@ impl MediaCodecDecoder {
             backend,
         ))
     }
-
-    /// Drained surfaces, then a codec flush; stays started.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, or when live surfaces hold
-    /// every slot (`NoFreeSlot`).
-    pub fn reset(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
-        self.reset_surfaces()
-    }
-
-    /// One packet queued without blocking on its output.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, or when live surfaces hold
-    /// every slot (`NoFreeSlot`). A full bound or a busy codec answers
-    /// `Starved`, never `Err`.
-    ///
-    /// # Arguments
-    ///
-    /// * `packet` - coded input.
-    ///
-    /// # Returns
-    ///
-    /// Queue outcome plus surfaces freed along the way, if any.
-    pub fn submit_nowait(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<(SubmitOutcome, Vec<MediaCodecSurface>), MediaCodecError> {
-        self.submit_packet_nowait(packet)
-    }
-
-    /// One packet queued, draining between starved attempts; bounded.
-    ///
-    /// # Arguments
-    ///
-    /// * `packet` - coded input.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, when live surfaces hold
-    /// every slot (`NoFreeSlot`), or when `packet` still starves after
-    /// the drain budget (`QueueStalled`).
-    ///
-    /// # Returns
-    ///
-    /// Surfaces freed along the way; `packet` queued on `Ok`.
-    pub fn submit_wait(
-        &mut self,
-        packet: &Packet,
-    ) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
-        self.submit_packet_wait(packet)
-    }
-
-    /// Surfaces decoded so far, draining every available output.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, or when live surfaces hold
-    /// every slot (`NoFreeSlot`).
-    pub fn poll(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
-        self.poll_surfaces()
-    }
-}
-
-impl Decoder for MediaCodecDecoder {
-    type Frame = MediaCodecSurface;
-    type Error = MediaCodecError;
-
-    fn caps(&self) -> GpuCaps {
-        GpuCaps::new(None, false, false)
-    }
-
-    /// Surfaces decoded from `packet`, possibly none.
-    ///
-    /// Per-call emission: the packet queues and the drain runs in this same
-    /// call, so a stream with no reordering emits each picture on its
-    /// completing `decode` call. The client holds no decoded-picture buffer;
-    /// whatever the codec holds back for reordering stays inside the codec.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, or when live surfaces hold
-    /// every slot (`NoFreeSlot`).
-    fn decode(&mut self, packet: &Packet) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.push_packet(packet)
-    }
-
-    /// Surfaces held back for reordering or buffering.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the codec faults, when a format
-    /// reading rejects the output layout, or when live surfaces hold
-    /// every slot (`NoFreeSlot`).
-    fn flush(&mut self) -> Result<Vec<Self::Frame>, Self::Error> {
-        self.drain_surfaces()
-    }
-}
-
-impl Drop for MediaCodecDecoder {
-    /// State marked released; the session stops with its fields.
-    fn drop(&mut self) {
-        self.mark_released();
-    }
-}
-
-impl MediaCodecDevice {
-    /// Device probed on this machine.
-    #[must_use]
-    pub fn probe() -> Self {
-        Self::from_level(ApiLevel::current())
-    }
 }
 
 impl MediaCodecEncoder {
-    /// Encoder for `spec`.
-    ///
-    /// # Arguments
-    ///
-    /// * `spec` - codec output format.
+    /// Encoder over the device codec for `spec`.
     ///
     /// # Errors
     ///
     /// Returns `Err` below the device floor, when the input color has no
-    /// plane layout, or when no encoder answers the mime.
-    pub fn open(spec: &EncodeSpec) -> Result<Self, MediaCodecError> {
+    /// plane layout, when the config exceeds the tier, or when no encoder
+    /// answers the mime.
+    ///
+    /// # Arguments
+    ///
+    /// * `spec` - codec output format.
+    pub(crate) fn open_android(spec: &EncodeSpec) -> Result<Self, MediaCodecError> {
         let level = ApiLevel::current();
         if !level.meets_min() || !level.at_least(spec.min_sdk()) {
             return Err(MediaCodecError::BelowMinSdk { found: level.get() });
         }
+        let format = spec.materialize(level)?;
         let mut codec = MediaCodec::from_encoder_type(spec.mime())
             .ok_or(MediaCodecError::NoEncoder { mime: spec.mime() })?;
         let state = EncodeState::Unconfigured.configured()?;
-        codec.configure(&spec.materialize(), None, MediaCodecDirection::Encoder)?;
+        codec.configure(&format, None, MediaCodecDirection::Encoder)?;
         let mode = AndroidSeam::drain_mode(&mut codec, level)?;
         codec.start()?;
         let state = state.started()?;
@@ -785,53 +651,6 @@ impl MediaCodecEncoder {
         let backend = Box::new(AndroidSeam::new(codec, mode, Role::Encode));
         Ok(Self::from_backend(state, spec.clone(), input, backend))
     }
-
-    /// Drained packets, then a codec flush; stays started.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, or when the codec faults.
-    pub fn reset(&mut self) -> Result<Vec<Packet>, MediaCodecError> {
-        self.reset_packets()
-    }
-}
-
-impl Encoder for MediaCodecEncoder {
-    type Error = MediaCodecError;
-
-    fn caps(&self) -> GpuCaps {
-        GpuCaps::new(None, false, false)
-    }
-
-    /// Packets coded from `frame`, possibly none.
-    ///
-    /// # Arguments
-    ///
-    /// * `frame` - raw input frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, when the frame is not planar 4:2:0
-    /// at the configured extent, or when the codec faults.
-    fn encode(&mut self, frame: &CpuFrame) -> Result<Vec<Packet>, Self::Error> {
-        self.push_frame(frame)
-    }
-
-    /// Packets held back for reordering or buffering.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` unless started, or when the codec faults.
-    fn flush(&mut self) -> Result<Vec<Packet>, Self::Error> {
-        self.drain_packets()
-    }
-}
-
-impl Drop for MediaCodecEncoder {
-    /// State marked released; the session stops with its fields.
-    fn drop(&mut self) {
-        self.mark_released();
-    }
 }
 
 impl From<MediaError> for MediaCodecError {
@@ -847,15 +666,6 @@ impl From<MediaError> for MediaCodecError {
 
 #[cfg(test)]
 mod tests {
-    use super::MediaCodecDevice;
-
-    use rust_video_caps::traits::Device;
-
-    #[test]
-    fn probe_names_tier() {
-        assert_eq!(MediaCodecDevice::probe().name(), "mediacodec");
-    }
-
     #[test]
     fn caps_agree_with_surface_exports() {
         use bytes::Bytes;

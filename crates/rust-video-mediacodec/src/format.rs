@@ -226,21 +226,25 @@ impl FormatSpec {
     fn absent(blob: Option<&Vec<u8>>) -> bool {
         blob.is_none_or(Vec::is_empty)
     }
-}
 
-/// Pixel layout for an output `color-format`, if mappable.
-#[must_use]
-pub fn pixel_format_for(color_format: i32) -> Option<PixelFormat> {
-    match color_format {
-        FormatSpec::COLOR_PLANAR => Some(PixelFormat::Yuv420P),
-        FormatSpec::COLOR_SEMIPLANAR => Some(PixelFormat::Nv12),
-        _ => None,
+    /// Pixel layout for an output `color-format`, if mappable.
+    ///
+    /// # Arguments
+    ///
+    /// * `color_format` - raw `color-format` value.
+    #[must_use]
+    pub fn pixel_format_for(color_format: i32) -> Option<PixelFormat> {
+        match color_format {
+            Self::COLOR_PLANAR => Some(PixelFormat::Yuv420P),
+            Self::COLOR_SEMIPLANAR => Some(PixelFormat::Nv12),
+            _ => None,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{pixel_format_for, FormatSpec};
+    use super::FormatSpec;
 
     use crate::error::MediaCodecError;
     use rust_video_caps::frame::PixelFormat;
@@ -354,10 +358,10 @@ mod tests {
 
     #[test]
     fn color_map_covers_byte_buffer_layouts() {
-        assert_eq!(pixel_format_for(19), Some(PixelFormat::Yuv420P));
-        assert_eq!(pixel_format_for(21), Some(PixelFormat::Nv12));
-        assert_eq!(pixel_format_for(2_135_033_992), None);
-        assert_eq!(pixel_format_for(2_130_708_361), None);
-        assert_eq!(pixel_format_for(0), None);
+        assert_eq!(FormatSpec::pixel_format_for(19), Some(PixelFormat::Yuv420P));
+        assert_eq!(FormatSpec::pixel_format_for(21), Some(PixelFormat::Nv12));
+        assert_eq!(FormatSpec::pixel_format_for(2_135_033_992), None);
+        assert_eq!(FormatSpec::pixel_format_for(2_130_708_361), None);
+        assert_eq!(FormatSpec::pixel_format_for(0), None);
     }
 }

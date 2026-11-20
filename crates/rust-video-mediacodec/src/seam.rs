@@ -1,7 +1,4 @@
-#![allow(dead_code)]
 //! Codec session behind the portable drain discipline.
-//!
-//! Reached only from the Android module.
 
 use crate::error::MediaCodecError;
 use crate::overlap::SubmitOutcome;
@@ -10,8 +7,8 @@ use bytes::Bytes;
 
 /// Codec session behind the portable drain discipline.
 ///
-/// One queued payload in, output items out; implemented once over the
-/// NDK `MediaCodec`.
+/// One queued payload in, output items out; implemented over the NDK
+/// codec on Android and the host stub elsewhere.
 pub(crate) trait CodecSeam: std::fmt::Debug {
     /// One input payload queued; outputs freed along the way.
     ///
@@ -63,6 +60,8 @@ pub(crate) trait CodecSeam: std::fmt::Debug {
 }
 
 /// One drained codec item, in arrival order.
+// Constructed only from the Android module and tests.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SeamItem {
     /// Output payload with flags and timestamp.
@@ -84,17 +83,14 @@ pub(crate) struct SeamOutput {
 
 impl SeamOutput {
     /// Output over `bytes` with `flags` stamped `pts_us`.
+    // Reached only from the Android module and tests.
+    #[allow(dead_code)]
     pub(crate) fn new(bytes: Bytes, flags: u32, pts_us: i64) -> Self {
         Self {
             bytes,
             flags,
             pts_us,
         }
-    }
-
-    /// Raw output bytes.
-    pub(crate) fn bytes(&self) -> &Bytes {
-        &self.bytes
     }
 
     /// Raw output bytes, owned.
@@ -130,6 +126,8 @@ pub(crate) struct SeamFormat {
 
 impl SeamFormat {
     /// Format reading from raw output format values.
+    // Reached only from the Android module and tests.
+    #[allow(dead_code)]
     pub(crate) fn new(
         width: Option<i32>,
         height: Option<i32>,

@@ -3,6 +3,7 @@
 use crate::decoder::DecodeState;
 use crate::encoder::EncodeState;
 
+use rust_video_caps::encode::Decline;
 use rust_video_caps::frame::PixelFormat;
 
 /// `MediaCodec` tier failure.
@@ -136,6 +137,12 @@ pub enum MediaCodecError {
         /// State the encoder was in.
         state: EncodeState,
     },
+    /// Encode config the tier cannot express.
+    #[error("encode config declined: {decline}")]
+    ConfigDeclined {
+        /// Typed decline reason.
+        decline: Decline,
+    },
 }
 
 #[cfg(test)]
@@ -256,5 +263,20 @@ mod tests {
             state: EncodeState::Configured,
         };
         assert_eq!(error.to_string(), "cannot encode while Configured");
+    }
+
+    #[test]
+    fn decline_carries_typed_reason() {
+        use rust_video_caps::encode::{Decline, RateControl};
+
+        let error = MediaCodecError::ConfigDeclined {
+            decline: Decline::RateControlUnsupported {
+                mode: RateControl::Auto,
+            },
+        };
+        assert_eq!(
+            error.to_string(),
+            "encode config declined: rate control Auto unsupported"
+        );
     }
 }
