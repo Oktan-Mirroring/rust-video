@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{bench_dir, decode_dir, AnnexB, Drive, Ivf};
+use rust_video_harness::{bench_dir, decode_dir, AnnexB, Drive, Ivf, Obu};
 use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface};
 
 /// Pictures in each shared vector.
@@ -49,36 +49,14 @@ fn open_or_decline(name: &str, spec: &FormatSpec) -> Option<MediaCodecDecoder> {
 
 /// Spec carrying the first SPS/PPS pair in `packet`.
 fn with_h264_sets(spec: FormatSpec, packet: &[u8]) -> FormatSpec {
-    let mut sps = None;
-    let mut pps = None;
-    for nal in AnnexB::split_nals(packet) {
-        match nal.first().map(|header| header & 0x1F) {
-            Some(7) if sps.is_none() => sps = Some(nal.to_vec()),
-            Some(8) if pps.is_none() => pps = Some(nal.to_vec()),
-            _ => {}
-        }
-    }
-    spec.with_csd_0(sps.expect("sps in first packet"))
-        .with_csd_1(pps.expect("pps in first packet"))
+    let (sps, pps) = AnnexB::avc_csd(packet).expect("sps/pps in first packet");
+    spec.with_csd_0(sps).with_csd_1(pps)
 }
 
 /// Spec carrying VPS in `csd-0` and SPS/PPS in `csd-1` from `packet`.
 fn with_hevc_sets(spec: FormatSpec, packet: &[u8]) -> FormatSpec {
-    let mut vps = None;
-    let mut sps = None;
-    let mut pps = None;
-    for nal in AnnexB::split_nals(packet) {
-        match nal.first().map(|header| header >> 1) {
-            Some(32) if vps.is_none() => vps = Some(nal.to_vec()),
-            Some(33) if sps.is_none() => sps = Some(nal.to_vec()),
-            Some(34) if pps.is_none() => pps = Some(nal.to_vec()),
-            _ => {}
-        }
-    }
-    let mut sets = sps.expect("sps in first packet");
-    sets.extend_from_slice(&pps.expect("pps in first packet"));
-    spec.with_csd_0(vps.expect("vps in first packet"))
-        .with_csd_1(sets)
+    let (vps, sets) = AnnexB::hevc_csd(packet).expect("vps/sps/pps in first packet");
+    spec.with_csd_0(vps).with_csd_1(sets)
 }
 
 /// Packets over `raws`, stamped 40ms apart for completion matching.
@@ -140,7 +118,8 @@ fn check_matched(name: &str, decoder: &MediaCodecDecoder) {
 
 /// Surfaces decoded straight through sync `decode`, plus the flush drain.
 fn sync_run(decoder: &mut MediaCodecDecoder, coded: &[Packet]) -> (usize, Vec<u8>) {
-    let frames = Drive::decode_all(decoder, coded);
+    let mut frames = Drive::decode_all(decoder, coded);
+    frames.extend(decoder.flush().expect("sync drain"));
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, &frames);
     (frames.len(), bytes)
@@ -207,6 +186,7 @@ fn h264_shared_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = AnnexB::picture_packets(
         &decode_dir().join("valid_320x240.h264"),
         AnnexB::is_h264_vcl,
@@ -227,6 +207,7 @@ fn h264_bframes_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = AnnexB::picture_packets(
         &decode_dir().join("bframes_320x240.h264"),
         AnnexB::is_h264_vcl,
@@ -247,6 +228,7 @@ fn h265_shared_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = AnnexB::picture_packets(
         &decode_dir().join("inter_320x240.hevc"),
         AnnexB::is_hevc_vcl,
@@ -267,8 +249,12 @@ fn av1_shared_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let spec = FormatSpec::av1(320, 240).expect("valid dims");
+    let seq = Obu::sequence_header(&bytes).expect("sequence header in vector");
+    let spec = FormatSpec::av1(320, 240)
+        .expect("valid dims")
+        .with_csd_0(seq);
     let Some(mut decoder) = open_or_decline("av1", &spec) else {
         return;
     };
@@ -283,6 +269,7 @@ fn vp9_shared_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&decode_dir().join("valid_320x240.ivf")).frames;
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per frame");
     let spec = FormatSpec::vp9(320, 240).expect("valid dims");
@@ -300,6 +287,7 @@ fn vp8_shared_decode_yields_every_frame() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "vector holds frames");
     let spec = FormatSpec::vp8(1920, 1080).expect("valid dims");
@@ -317,6 +305,7 @@ fn h264_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = AnnexB::picture_packets(
         &decode_dir().join("valid_320x240.h264"),
         AnnexB::is_h264_vcl,
@@ -332,6 +321,7 @@ fn h265_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = AnnexB::picture_packets(
         &decode_dir().join("inter_320x240.hevc"),
         AnnexB::is_hevc_vcl,
@@ -347,8 +337,12 @@ fn av1_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let bytes = std::fs::read(decode_dir().join("valid_320x240.obu")).expect("vector readable");
-    let spec = FormatSpec::av1(320, 240).expect("valid dims");
+    let seq = Obu::sequence_header(&bytes).expect("sequence header in vector");
+    let spec = FormatSpec::av1(320, 240)
+        .expect("valid dims")
+        .with_csd_0(seq);
     parity_case("av1", &spec, &[bytes]);
 }
 
@@ -358,6 +352,7 @@ fn vp9_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&decode_dir().join("valid_320x240.ivf")).frames;
     assert_eq!(raws.len(), PICTURES, "vector holds one packet per frame");
     let spec = FormatSpec::vp9(320, 240).expect("valid dims");
@@ -370,6 +365,7 @@ fn vp8_shared_pipelined_matches_sync_bytes() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&bench_dir().join("vp8-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "vector holds frames");
     let spec = FormatSpec::vp8(1920, 1080).expect("valid dims");
@@ -382,6 +378,7 @@ fn sustained_h264_1080p_measures_realtime() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws =
         AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
@@ -395,6 +392,7 @@ fn sustained_h265_1080p_measures_realtime() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws =
         AnnexB::picture_packets(&bench_dir().join("h265-1080p_ip.h265"), AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
@@ -408,6 +406,7 @@ fn sustained_av1_1080p_measures_realtime() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&bench_dir().join("av1-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let spec = FormatSpec::av1(1920, 1080).expect("valid dims");
@@ -420,6 +419,7 @@ fn sustained_vp9_1080p_measures_realtime() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let raws = Ivf::read(&bench_dir().join("vp9-1080p_ip.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let spec = FormatSpec::vp9(1920, 1080).expect("valid dims");

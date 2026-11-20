@@ -5,6 +5,9 @@ use crate::overlap::SubmitOutcome;
 
 use bytes::Bytes;
 
+/// `MediaCodec#BUFFER_FLAG_END_OF_STREAM`.
+pub(crate) const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
+
 /// Codec session behind the portable drain discipline.
 ///
 /// One queued payload in, output items out; implemented over the NDK
@@ -50,6 +53,14 @@ pub(crate) trait CodecSeam: std::fmt::Debug {
     ///
     /// Returns `Err` when the codec faults.
     fn read(&mut self) -> Result<Vec<SeamItem>, MediaCodecError>;
+
+    /// End of stream queued; outputs freed along the way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when no input buffer frees inside the queue budget
+    /// or when the codec faults.
+    fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError>;
 
     /// Drained outputs, then a codec flush; stays started.
     ///

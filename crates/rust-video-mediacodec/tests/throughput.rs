@@ -6,7 +6,7 @@
 
 use rust_video_caps::frame::{CpuFrame, GpuExport};
 use rust_video_caps::traits::{Decoder, Encoder};
-use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets, Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, Ivf, Obu, Packets, Synth};
 use rust_video_mediacodec::{
     EncodeSpec, FormatSpec, MediaCodecDecoder, MediaCodecEncoder, MediaCodecError,
     MediaCodecSurface,
@@ -31,36 +31,14 @@ fn device_gate() -> bool {
 
 /// Spec carrying the first SPS/PPS pair in `packet`.
 fn with_h264_sets(spec: FormatSpec, packet: &[u8]) -> FormatSpec {
-    let mut sps = None;
-    let mut pps = None;
-    for nal in AnnexB::split_nals(packet) {
-        match nal.first().map(|header| header & 0x1F) {
-            Some(7) if sps.is_none() => sps = Some(nal.to_vec()),
-            Some(8) if pps.is_none() => pps = Some(nal.to_vec()),
-            _ => {}
-        }
-    }
-    spec.with_csd_0(sps.expect("sps in first packet"))
-        .with_csd_1(pps.expect("pps in first packet"))
+    let (sps, pps) = AnnexB::avc_csd(packet).expect("sps/pps in first packet");
+    spec.with_csd_0(sps).with_csd_1(pps)
 }
 
 /// Spec carrying VPS in `csd-0` and SPS/PPS in `csd-1` from `packet`.
 fn with_hevc_sets(spec: FormatSpec, packet: &[u8]) -> FormatSpec {
-    let mut vps = None;
-    let mut sps = None;
-    let mut pps = None;
-    for nal in AnnexB::split_nals(packet) {
-        match nal.first().map(|header| header >> 1) {
-            Some(32) if vps.is_none() => vps = Some(nal.to_vec()),
-            Some(33) if sps.is_none() => sps = Some(nal.to_vec()),
-            Some(34) if pps.is_none() => pps = Some(nal.to_vec()),
-            _ => {}
-        }
-    }
-    let mut sets = sps.expect("sps in first packet");
-    sets.extend_from_slice(&pps.expect("pps in first packet"));
-    spec.with_csd_0(vps.expect("vps in first packet"))
-        .with_csd_1(sets)
+    let (vps, sets) = AnnexB::hevc_csd(packet).expect("vps/sps/pps in first packet");
+    spec.with_csd_0(vps).with_csd_1(sets)
 }
 
 /// Four 1080p noise frames over seeds 1..=4.
@@ -116,7 +94,9 @@ fn run_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
         return;
     };
     let coded = Packets::from_raws(raws);
-    let warmup = Drive::decode_all(&mut decoder, &coded).len();
+    let mut warmup = Drive::decode_all(&mut decoder, &coded).len();
+    warmup += decoder.flush().expect("warmup drain").len();
+    decoder.reset().expect("warmup re-arms");
     assert!(warmup > 0, "{name}: warmup decodes");
     let start = std::time::Instant::now();
     for _ in 0..ITERS {
@@ -184,6 +164,7 @@ fn run_surface_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
         check_surface(&surface);
         warmup += 1;
     }
+    decoder.reset().expect("warmup re-arms");
     assert!(warmup > 0, "{name}: warmup decodes");
     let start = std::time::Instant::now();
     for _ in 0..ITERS {
@@ -207,8 +188,8 @@ fn run_surface_decode(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
 /// 1080p H.264 decode measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_measures_realtime() {
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    assert!(!raws.is_empty(), "synth yields a packet");
+    let raws = AnnexB::picture_packets(&bench_dir().join("h264-1080p.h264"), AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "vector groups into pictures");
     let spec = with_h264_sets(FormatSpec::h264(1920, 1080).expect("valid dims"), &raws[0]);
     run_decode("h264", &spec, &raws);
 }
@@ -229,7 +210,10 @@ fn decode_h265_1080p_measures_realtime() {
 #[test]
 fn decode_av1_1080p_measures_realtime() {
     let obu = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
-    let spec = FormatSpec::av1(1920, 1080).expect("valid dims");
+    let seq = Obu::sequence_header(&obu).expect("sequence header in vector");
+    let spec = FormatSpec::av1(1920, 1080)
+        .expect("valid dims")
+        .with_csd_0(seq);
     run_decode("av1", &spec, &[obu]);
 }
 
@@ -275,8 +259,8 @@ fn encode_av1_1080p_measures_realtime() {
 /// 1080p H.264 surface path measured against the realtime bar.
 #[test]
 fn decode_h264_1080p_surface_measures_realtime() {
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    assert!(!raws.is_empty(), "synth yields a packet");
+    let raws = AnnexB::picture_packets(&bench_dir().join("h264-1080p.h264"), AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "vector groups into pictures");
     let spec = with_h264_sets(FormatSpec::h264(1920, 1080).expect("valid dims"), &raws[0]);
     run_surface_decode("h264", &spec, &raws);
 }
@@ -297,7 +281,10 @@ fn decode_h265_1080p_surface_measures_realtime() {
 #[test]
 fn decode_av1_1080p_surface_measures_realtime() {
     let obu = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
-    let spec = FormatSpec::av1(1920, 1080).expect("valid dims");
+    let seq = Obu::sequence_header(&obu).expect("sequence header in vector");
+    let spec = FormatSpec::av1(1920, 1080)
+        .expect("valid dims")
+        .with_csd_0(seq);
     run_surface_decode("av1", &spec, &[obu]);
 }
 

@@ -78,6 +78,11 @@ impl CodecSeam for StubSeam {
         Err(self.role.failure(self.mime))
     }
 
+    /// Loud missing-codec failure; nothing ever finishes.
+    fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+        Err(self.role.failure(self.mime))
+    }
+
     /// Loud missing-codec failure; nothing ever resets.
     fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
         Err(self.role.failure(self.mime))

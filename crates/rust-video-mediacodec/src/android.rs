@@ -11,9 +11,10 @@ use crate::error::MediaCodecError;
 use crate::format::FormatSpec;
 use crate::overlap::SubmitOutcome;
 use crate::sdk::ApiLevel;
-use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput};
+use crate::seam::{CodecSeam, SeamFormat, SeamItem, SeamOutput, BUFFER_FLAG_END_OF_STREAM};
 use crate::surface::SurfaceSlots;
 
+use bytes::Bytes;
 use ndk::media::media_codec::{
     AsyncNotifyCallback, DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, InputBuffer,
     MediaCodec, MediaCodecDirection,
@@ -23,8 +24,6 @@ use ndk::media_error::MediaError;
 
 /// `MediaCodec#BUFFER_FLAG_DECODE_ONLY`; `AndroidSeam` and `AsyncDrain` share it.
 const BUFFER_FLAG_DECODE_ONLY: u32 = 32;
-/// `MediaCodec#BUFFER_FLAG_END_OF_STREAM`; `AndroidSeam` and `AsyncDrain` share it.
-const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
 /// Input attempts per payload before starvation; `AndroidSeam` and `AsyncDrain` share it.
 const INPUT_ATTEMPTS: u32 = 3;
 /// Dequeue wait per attempt; `AndroidSeam` and `AsyncDrain` share it.
@@ -179,6 +178,12 @@ impl AndroidSeam {
                 DequeuedOutputBufferInfoResult::Buffer(buffer) => {
                     let info = *buffer.info();
                     let flags = info.flags();
+                    if flags & BUFFER_FLAG_END_OF_STREAM != 0 {
+                        let pts = info.presentation_time_us();
+                        codec.release_output_buffer(buffer, false)?;
+                        items.push(SeamItem::Output(SeamOutput::new(Bytes::new(), flags, pts)));
+                        return Ok(items);
+                    }
                     if role.skips(flags) {
                         codec.release_output_buffer(buffer, false)?;
                         continue;
@@ -230,6 +235,12 @@ impl AndroidSeam {
             Ok(result) => result,
             Err(_) => Err(MediaCodecError::BufferLost),
         }
+    }
+
+    /// Empty end-of-stream marker queued into input buffer `index`.
+    fn write_eos(codec: &MediaCodec, index: usize) -> Result<(), MediaCodecError> {
+        codec.queue_input_buffer_by_index(index, 0, 0, 0, BUFFER_FLAG_END_OF_STREAM)?;
+        Ok(())
     }
 
     /// Payload bytes queued into input buffer `index`.
@@ -292,6 +303,42 @@ impl CodecSeam for AndroidSeam {
     fn read(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
         let mut items = self.primed_format();
         items.extend(self.read_inner()?);
+        Ok(items)
+    }
+
+    /// End of stream queued; outputs freed along the way.
+    fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+        let mut items = self.primed_format();
+        match &mut self.mode {
+            DrainMode::Sync => {
+                let mut queued = false;
+                for _ in 0..INPUT_ATTEMPTS {
+                    match self.codec.dequeue_input_buffer(INPUT_TIMEOUT)? {
+                        DequeuedInputBufferResult::Buffer(buffer) => {
+                            self.codec.queue_input_buffer(
+                                buffer,
+                                0,
+                                0,
+                                0,
+                                BUFFER_FLAG_END_OF_STREAM,
+                            )?;
+                            queued = true;
+                            break;
+                        }
+                        DequeuedInputBufferResult::TryAgainLater => {
+                            items.extend(Self::read_sync(&self.codec, self.role)?);
+                        }
+                    }
+                }
+                if !queued {
+                    return Err(MediaCodecError::InputStarved);
+                }
+            }
+            DrainMode::Async(drain) => {
+                let role = self.role;
+                items.extend(drain.finish(&self.codec, role)?);
+            }
+        }
         Ok(items)
     }
 
@@ -384,6 +431,20 @@ impl AsyncDrain {
         Ok((SubmitOutcome::Starved, items))
     }
 
+    /// End of stream queued; outputs freed along the way.
+    fn finish(&mut self, codec: &MediaCodec, role: Role) -> Result<Vec<SeamItem>, MediaCodecError> {
+        let mut items = Vec::new();
+        for _ in 0..INPUT_ATTEMPTS {
+            if let Some(index) = self.pending.pop() {
+                AndroidSeam::write_eos(codec, index)?;
+                return Ok(items);
+            }
+            let batch = self.queue.drain_blocking(INPUT_TIMEOUT);
+            self.absorb(codec, batch, role, &mut items)?;
+        }
+        Err(MediaCodecError::InputStarved)
+    }
+
     /// Queued `batch` absorbed: inputs stashed, outputs collected.
     ///
     /// # Errors
@@ -451,6 +512,10 @@ impl AsyncDrain {
         pts_us: i64,
         role: Role,
     ) -> Result<Option<SeamOutput>, MediaCodecError> {
+        if flags & BUFFER_FLAG_END_OF_STREAM != 0 {
+            codec.release_output_buffer_by_index(index, false)?;
+            return Ok(Some(SeamOutput::new(Bytes::new(), flags, pts_us)));
+        }
         if role.skips(flags) {
             codec.release_output_buffer_by_index(index, false)?;
             return Ok(None);

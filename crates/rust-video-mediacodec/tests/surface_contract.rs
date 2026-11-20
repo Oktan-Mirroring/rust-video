@@ -10,6 +10,7 @@ use bytes::Bytes;
 use rust_video_caps::frame::GpuExport;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
+use rust_video_harness::{decode_dir, AnnexB};
 use rust_video_mediacodec::{
     DecodeState, FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, SurfaceSlots,
 };
@@ -77,10 +78,18 @@ fn decoder_issues_contract_surfaces() {
     if !device_gate() {
         return;
     }
-    let spec = FormatSpec::h264(64, 64)
+    let packet = AnnexB::picture_packets(
+        &decode_dir().join("valid_320x240.h264"),
+        AnnexB::is_h264_vcl,
+    )
+    .into_iter()
+    .next()
+    .expect("vector groups into pictures");
+    let (sps, pps) = AnnexB::avc_csd(&packet).expect("sps/pps in vector");
+    let spec = FormatSpec::h264(320, 240)
         .expect("valid dims")
-        .with_csd_0(vec![0, 0, 1])
-        .with_csd_1(vec![0, 0, 1]);
+        .with_csd_0(sps)
+        .with_csd_1(pps);
     let Some(mut decoder) = open_or_decline("h264", &spec) else {
         return;
     };

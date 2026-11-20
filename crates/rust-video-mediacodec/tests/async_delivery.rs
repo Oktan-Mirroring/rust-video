@@ -7,7 +7,7 @@
 
 use rust_video_caps::delivery::{DecoderPump, DropPolicy, PollFrames, ReceiveFrames, SendPackets};
 use rust_video_caps::frame::GpuExport;
-use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth, Ivf, Packets};
+use rust_video_harness::{bench_dir, AnnexB, Drive, Ivf, Obu, Packets};
 use rust_video_mediacodec::{FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface};
 
 /// True when the device gate env requests on-device cases.
@@ -65,6 +65,7 @@ fn run_loopback(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let Some(decoder) = open_or_decline(name, spec) else {
         return;
     };
@@ -79,22 +80,23 @@ fn run_loopback(name: &str, spec: &FormatSpec, raws: &[Vec<u8>]) {
         check_surface(&surface);
         frames += 1;
     }
-    assert!(frames > 0, "{name}: loopback returns own frames");
     assert_eq!(pump.dropped(), 0, "{name}: roomy queue drops nothing");
     pump.finish().expect("finish drains");
     assert!(pump.is_finished(), "{name}: finished after finish");
     let mut tail = 0;
-    while pump.receive().expect("drain").is_some() {
+    while let Some(surface) = pump.receive().expect("drain") {
+        check_surface(&surface);
         tail += 1;
     }
+    assert!(frames + tail > 0, "{name}: loopback returns own frames");
     println!("mediacodec {name} delivery loopback: {frames} polled, {tail} trailing");
 }
 
-/// H.264 loopback over synth packets with real parameter sets.
+/// H.264 loopback over the shared bench vector.
 #[test]
 fn h264_loopback_returns_own_frames() {
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    assert!(!raws.is_empty(), "synth yields a packet");
+    let raws = AnnexB::picture_packets(&bench_dir().join("h264-1080p.h264"), AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "vector groups into pictures");
     let spec = with_h264_sets(FormatSpec::h264(1920, 1080).expect("valid dims"), &raws[0]);
     run_loopback("h264", &spec, &raws);
 }
@@ -115,7 +117,10 @@ fn h265_loopback_returns_own_frames() {
 #[test]
 fn av1_loopback_returns_own_frames() {
     let obu = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
-    let spec = FormatSpec::av1(1920, 1080).expect("valid dims");
+    let seq = Obu::sequence_header(&obu).expect("sequence header in vector");
+    let spec = FormatSpec::av1(1920, 1080)
+        .expect("valid dims")
+        .with_csd_0(seq);
     run_loopback("av1", &spec, &[obu]);
 }
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{AnnexB, Drive, H264Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive};
 use rust_video_mediacodec::{
     FormatSpec, MediaCodecDecoder, MediaCodecError, MediaCodecSurface, PipelineLedger,
 };
@@ -40,17 +40,8 @@ fn open_or_decline(name: &str, spec: &FormatSpec) -> Option<MediaCodecDecoder> {
 
 /// Spec carrying the first SPS/PPS pair in `packet`.
 fn with_h264_sets(spec: FormatSpec, packet: &[u8]) -> FormatSpec {
-    let mut sps = None;
-    let mut pps = None;
-    for nal in AnnexB::split_nals(packet) {
-        match nal.first().map(|header| header & 0x1F) {
-            Some(7) if sps.is_none() => sps = Some(nal.to_vec()),
-            Some(8) if pps.is_none() => pps = Some(nal.to_vec()),
-            _ => {}
-        }
-    }
-    spec.with_csd_0(sps.expect("sps in first packet"))
-        .with_csd_1(pps.expect("pps in first packet"))
+    let (sps, pps) = AnnexB::avc_csd(packet).expect("sps/pps in first packet");
+    spec.with_csd_0(sps).with_csd_1(pps)
 }
 
 /// Packets over `raws`, stamped 40ms apart for completion matching.
@@ -122,8 +113,9 @@ fn check_matched(name: &str, decoder: &MediaCodecDecoder) {
 
 /// H.264 spec plus stamped synth packets.
 fn h264_case() -> (FormatSpec, Vec<Packet>) {
-    let raws = H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40);
-    assert!(!raws.is_empty(), "synth yields a packet");
+    let raws =
+        AnnexB::picture_packets(&bench_dir().join("h264-1080p_ip.h264"), AnnexB::is_h264_vcl);
+    assert!(!raws.is_empty(), "vector groups into pictures");
     let spec = with_h264_sets(FormatSpec::h264(1920, 1080).expect("valid dims"), &raws[0]);
     (spec, packets(&raws))
 }
@@ -152,6 +144,7 @@ fn pipelined_decode_overlaps_inputs_on_device() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let (spec, coded) = h264_case();
     let Some(mut decoder) = open_or_decline("h264", &spec) else {
         return;
@@ -176,14 +169,21 @@ fn pipelined_bytes_match_sync_decode_on_device() {
     if !device_gate() {
         return;
     }
+    let _measure = Drive::serial();
     let (spec, coded) = h264_case();
     let Some(mut sync) = open_or_decline("h264", &spec) else {
         return;
     };
-    let sync_frames = Drive::decode_all(&mut sync, &coded);
-    let sync_count = sync_frames.len();
+    let mut sync_count = 0;
     let mut sync_bytes = Vec::new();
-    push_bytes(&mut sync_bytes, &sync_frames);
+    for packet in &coded {
+        let batch = sync.decode(packet).expect("sync decode");
+        sync_count += batch.len();
+        push_bytes(&mut sync_bytes, &batch);
+    }
+    let tail = sync.flush().expect("sync drain");
+    sync_count += tail.len();
+    push_bytes(&mut sync_bytes, &tail);
 
     let Some(mut pipelined) = open_or_decline("h264", &spec) else {
         return;

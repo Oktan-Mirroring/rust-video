@@ -1182,28 +1182,45 @@ impl InputLayout {
     ///
     /// # Arguments
     ///
-    /// * `frame` - planar 4:2:0 input at the configured extent.
+    /// * `frame` - planar or semi-planar 4:2:0 input at the configured extent.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when the layout is not planar 4:2:0, the extent
+    /// Returns `Err` when the layout is not 4:2:0, the extent
     /// mismatches, or a plane is short for its rows.
     pub fn pack(&self, frame: &CpuFrame) -> Result<Bytes, MediaCodecError> {
-        if frame.format() != PixelFormat::Yuv420P {
-            return Err(MediaCodecError::UnsupportedInput {
-                format: frame.format(),
-            });
-        }
         if frame.size() != self.size {
             return Err(self.mismatch(frame));
         }
-        let [y, u, v] = frame.planes() else {
-            return Err(self.mismatch(frame));
-        };
         let width = self.size.width();
         let height = self.size.height();
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
+        let owned;
+        let (y, u, v) = match frame.format() {
+            PixelFormat::Yuv420P => {
+                let [y, u, v] = frame.planes() else {
+                    return Err(self.mismatch(frame));
+                };
+                (y, u, v)
+            }
+            PixelFormat::Nv12 => {
+                let [y, uv] = frame.planes() else {
+                    return Err(self.mismatch(frame));
+                };
+                let (u, v) = Self::deinterleave(uv, chroma_width, chroma_height)?;
+                owned = (
+                    Plane::new(Bytes::from(u), chroma_width).ok_or_else(|| self.mismatch(frame))?,
+                    Plane::new(Bytes::from(v), chroma_width).ok_or_else(|| self.mismatch(frame))?,
+                );
+                (y, &owned.0, &owned.1)
+            }
+            _ => {
+                return Err(MediaCodecError::UnsupportedInput {
+                    format: frame.format(),
+                });
+            }
+        };
         let mut packed = Vec::new();
         let _reserved = packed.try_reserve_exact(self.packed_len());
         match self.layout {
@@ -1261,6 +1278,29 @@ impl InputLayout {
     }
 
     /// Plane rows copied into `dst`, padded to `pitch`.
+    /// Planar U/V from interleaved `uv` chroma rows.
+    fn deinterleave(
+        uv: &Plane,
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<u8>, Vec<u8>), MediaCodecError> {
+        let stride = Self::checked_stride(uv, width.saturating_mul(2), height)?;
+        let row = usize::try_from(width).unwrap_or(usize::MAX);
+        let rows = usize::try_from(height).unwrap_or(usize::MAX);
+        let src = uv.data();
+        let mut u = Vec::new();
+        let mut v = Vec::new();
+        for r in 0..rows {
+            let start = r.saturating_mul(stride);
+            for x in 0..row {
+                let at = start.saturating_add(x.saturating_mul(2));
+                u.push(src[at]);
+                v.push(src[at.saturating_add(1)]);
+            }
+        }
+        Ok((u, v))
+    }
+
     fn copy_rows(
         dst: &mut Vec<u8>,
         plane: &Plane,
@@ -1783,21 +1823,40 @@ mod tests {
     }
 
     #[test]
-    fn pack_declines_other_layouts() {
+    fn pack_takes_nv12() {
         let layout = layout_16x16_planar();
+        let mut uv = Vec::new();
+        for _ in 0..64 {
+            uv.extend_from_slice(&[0xAA, 0x55]);
+        }
         let frame = CpuFrame::new(
             PictureSize::new(16, 16).expect("valid size"),
             PixelFormat::Nv12,
             vec![
                 Plane::new(Bytes::from(vec![0_u8; 256]), 16).expect("valid plane"),
-                Plane::new(Bytes::from(vec![0_u8; 128]), 16).expect("valid plane"),
+                Plane::new(Bytes::from(uv), 16).expect("valid plane"),
             ],
         )
         .expect("two planes");
+        let packed = layout.pack(&frame).expect("nv12 packs");
+        assert_eq!(packed.len(), 16 * 16 + 2 * 8 * 8);
+        assert_eq!(&packed[256..320], &[0xAA_u8; 64]);
+        assert_eq!(&packed[320..384], &[0x55_u8; 64]);
+    }
+
+    #[test]
+    fn pack_declines_other_layouts() {
+        let layout = layout_16x16_planar();
+        let frame = CpuFrame::new(
+            PictureSize::new(16, 16).expect("valid size"),
+            PixelFormat::Rgba8,
+            vec![Plane::new(Bytes::from(vec![0_u8; 1024]), 64).expect("valid plane")],
+        )
+        .expect("one plane");
         assert_eq!(
             layout.pack(&frame),
             Err(MediaCodecError::UnsupportedInput {
-                format: PixelFormat::Nv12,
+                format: PixelFormat::Rgba8,
             })
         );
     }

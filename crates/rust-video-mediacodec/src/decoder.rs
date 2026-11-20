@@ -6,11 +6,18 @@ use std::time::{Duration, Instant};
 use crate::error::MediaCodecError;
 use crate::format::FormatSpec;
 use crate::overlap::{PipelineLedger, SubmitOutcome};
-use crate::seam::{CodecSeam, SeamItem};
+use crate::seam::{CodecSeam, SeamItem, BUFFER_FLAG_END_OF_STREAM};
 use crate::surface::{MediaCodecSurface, SurfaceSlots};
 
 use bytes::Bytes;
 use rust_video_caps::common::PictureSize;
+
+/// Drain polls in `drain_surfaces`.
+const DRAIN_SLICES: u32 = 60;
+/// Consecutive empty polls ending a flowing drain.
+const DRAIN_QUIET_END: u32 = 3;
+/// Wait slice between drain polls.
+const DRAIN_SLICE: Duration = Duration::from_millis(10);
 use rust_video_caps::delivery::{SplitDecode, SubmitStats};
 use rust_video_caps::frame::{CpuFrame, PixelFormat, Plane};
 use rust_video_caps::packet::Packet;
@@ -407,6 +414,10 @@ impl MediaCodecDecoder {
 
     /// Surfaces held back for reordering or buffering.
     ///
+    /// Signals end of stream first, then collects until the end marker
+    /// or quiet; both bounded. Decode after flush without reset fails
+    /// loud; `reset` re-arms the stream.
+    ///
     /// # Errors
     ///
     /// Returns `Err` unless started, when the codec faults, when a format
@@ -414,10 +425,41 @@ impl MediaCodecDecoder {
     /// every slot (`NoFreeSlot`).
     pub(crate) fn drain_surfaces(&mut self) -> Result<Vec<MediaCodecSurface>, MediaCodecError> {
         self.state.ensure_started("flush")?;
-        let items = self.backend.read()?;
         let mut surfaces = self.take_ready();
-        surfaces.extend(self.surfaces(items)?);
+        let mut items = self.backend.finish_input()?;
+        let mut quiet = 0;
+        for _ in 0..DRAIN_SLICES {
+            let eos = Self::split_eos(&mut items);
+            let before = surfaces.len();
+            surfaces.extend(self.surfaces(items)?);
+            if eos {
+                break;
+            }
+            if surfaces.len() == before {
+                quiet += 1;
+                if quiet >= DRAIN_QUIET_END {
+                    break;
+                }
+            } else {
+                quiet = 0;
+            }
+            std::thread::sleep(DRAIN_SLICE);
+            items = self.backend.read()?;
+        }
         Ok(surfaces)
+    }
+
+    /// Drops end-of-stream markers from `items`, true when one was present.
+    fn split_eos(items: &mut Vec<SeamItem>) -> bool {
+        let mut eos = false;
+        items.retain(|item| match item {
+            SeamItem::Output(output) if output.flags() & BUFFER_FLAG_END_OF_STREAM != 0 => {
+                eos = true;
+                false
+            }
+            _ => true,
+        });
+        eos
     }
 
     /// Drained surfaces, then a codec flush; stays started.
@@ -1073,6 +1115,8 @@ mod tests {
         SubmitNowait,
         /// Output drain.
         Read,
+        /// End of stream queued.
+        FinishInput,
         /// Drain plus flush.
         Reset,
     }
@@ -1163,6 +1207,13 @@ mod tests {
             self.note(Call::Read);
             std::thread::sleep(self.latency);
             Ok(self.release())
+        }
+
+        fn finish_input(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
+            self.note(Call::FinishInput);
+            let mut items = self.release();
+            items.push(SeamItem::Output(SeamOutput::new(Bytes::new(), 4, 0)));
+            Ok(items)
         }
 
         fn reset(&mut self) -> Result<Vec<SeamItem>, MediaCodecError> {
