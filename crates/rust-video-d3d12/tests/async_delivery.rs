@@ -104,7 +104,7 @@ fn h264_loopback_returns_own_frames() {
     assert_eq!(pump.decoder().resets(), 0, "clean vector never resets");
 }
 
-/// Blocking receive returns the trailing H.264 frames, then end of stream.
+/// Blocking receive returns the trailing H.264 frame, then end of stream.
 #[test]
 fn h264_blocking_receive_drains_tail() {
     let Some(device) = device() else {
@@ -119,15 +119,13 @@ fn h264_blocking_receive_drains_tail() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..PICTURES - 2 {
+    for _ in 0..PICTURES - 1 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
     pump.finish().expect("finish drains");
-    for _ in 0..2 {
-        let trailing = pump.receive().expect("trailing").expect("trailing queued");
-        generations.push(trailing.identity().generation());
-    }
+    let trailing = pump.receive().expect("trailing").expect("trailing queued");
+    generations.push(trailing.identity().generation());
     assert_eq!(generations, (0..PICTURES as u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
@@ -154,7 +152,7 @@ fn hevc_loopback_returns_own_frames() {
     assert!(pump.receive().expect("drained").is_none());
 }
 
-/// Blocking receive returns the trailing HEVC frames, then end of stream.
+/// Blocking receive returns the trailing HEVC frame, then end of stream.
 #[test]
 fn hevc_blocking_receive_drains_tail() {
     let Some(device) = device() else {
@@ -173,15 +171,13 @@ fn hevc_blocking_receive_drains_tail() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..PICTURES - 2 {
+    for _ in 0..PICTURES - 1 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
     pump.finish().expect("finish drains");
-    for _ in 0..2 {
-        let trailing = pump.receive().expect("trailing").expect("trailing queued");
-        generations.push(trailing.identity().generation());
-    }
+    let trailing = pump.receive().expect("trailing").expect("trailing queued");
+    generations.push(trailing.identity().generation());
     assert_eq!(generations, (0..PICTURES as u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }

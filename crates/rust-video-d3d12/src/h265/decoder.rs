@@ -1,6 +1,5 @@
 //! H.265 decode over a live video session.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use crate::error::{D3d12Error, ParseReason, SkipReason};
 use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::h264::frontend::Crop;
-use crate::pins::{SlotPin, SlotPins};
+use crate::pins::SlotPins;
 use crate::session::{DecodeQueues, DecodeSession};
 use crate::texture::GpuSurface;
 
@@ -59,10 +58,6 @@ pub struct HevcDecoder<'a> {
     sync_emit: Vec<Duration>,
     /// Submitted surfaces held back two packets for submit/wait overlap.
     held_surfaces: Vec<GpuSurface>,
-    /// Submitted sync outputs held back for submit/drain overlap.
-    held_sync: VecDeque<HeldSync>,
-    /// Previous call's submitted outputs, held back alongside this call's.
-    held_sync_outputs: usize,
 }
 
 impl<'a> HevcDecoder<'a> {
@@ -85,8 +80,6 @@ impl<'a> HevcDecoder<'a> {
             sync_readback: Vec::new(),
             sync_emit: Vec::new(),
             held_surfaces: Vec::new(),
-            held_sync: VecDeque::new(),
-            held_sync_outputs: 0,
         }
     }
 
@@ -155,14 +148,12 @@ impl<'a> HevcDecoder<'a> {
     fn submit_picture(
         &mut self,
         picture: &HevcPicture,
-        pending: &mut Vec<HeldSync>,
+        pending: &mut Vec<SyncPending>,
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         let submitted_at = Instant::now();
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
-            self.release_sync(frames, 0)?;
-            self.held_sync_outputs = 0;
             self.consume_pending(pending, frames)?;
             pending.clear();
             self.reconfigure(active, frames)?;
@@ -181,9 +172,8 @@ impl<'a> HevcDecoder<'a> {
         {
             let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
             // Downloads queue behind the video ticket: the copy runs at
-            // video-signal without a CPU wakeup gap. No video wait here;
-            // held pins steer the next submit past these slots and the
-            // release finishes below pace the engine.
+            // video-signal without a CPU wakeup gap, and the record hides
+            // under the engine wait. The wait still serializes submits.
             match session.submit_hevc(&decoded.submission) {
                 Ok(video) => {
                     let mut tickets = Vec::with_capacity(decoded.outputs.len());
@@ -198,19 +188,19 @@ impl<'a> HevcDecoder<'a> {
                     }
                     let recorded = Instant::now();
                     if failed.is_none() {
-                        pending.extend(tickets.into_iter().map(|(slot, ticket)| {
-                            let pin = self.pins.pin(slot);
-                            HeldSync {
-                                pending: SyncPending {
-                                    slot,
-                                    ticket,
-                                    active,
-                                    submitted_at,
-                                    submit: recorded.duration_since(submitted_at),
-                                    engine: Duration::ZERO,
-                                },
-                                pin,
-                            }
+                        if let Err(error) = session.wait_video(video) {
+                            failed = Some(error);
+                        }
+                    }
+                    if failed.is_none() {
+                        let signaled = Instant::now();
+                        pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
+                            slot,
+                            ticket,
+                            active,
+                            submitted_at,
+                            submit: recorded.duration_since(submitted_at),
+                            engine: signaled.duration_since(recorded),
                         }));
                     }
                 }
@@ -227,7 +217,7 @@ impl<'a> HevcDecoder<'a> {
     /// Readback for queued `pending` outputs into `frames`.
     fn consume_pending(
         &mut self,
-        pending: &[HeldSync],
+        pending: &[SyncPending],
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         if pending.is_empty() {
@@ -236,9 +226,7 @@ impl<'a> HevcDecoder<'a> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
-        for held in pending {
-            let output = &held.pending;
-            debug_assert_eq!(held.pin.slot(), output.slot);
+        for output in pending {
             let (waited, read, nv12) = session.finish_download_split(output.slot, output.ticket)?;
             let emit_at = Instant::now();
             let export = session.shared_handle(output.slot);
@@ -260,29 +248,12 @@ impl<'a> HevcDecoder<'a> {
         Ok(())
     }
 
-    /// Oldest held sync outputs into `frames`, keeping `keep` back.
-    fn release_sync(
-        &mut self,
-        frames: &mut Vec<D3d12Frame>,
-        keep: usize,
-    ) -> Result<(), D3d12Error> {
-        while self.held_sync.len() > keep {
-            let Some(oldest) = self.held_sync.pop_front() else {
-                break;
-            };
-            self.consume_pending(std::slice::from_ref(&oldest), frames)?;
-        }
-        Ok(())
-    }
-
     /// Drop the live session, buffer, and sequence after a mid-picture failure.
     fn reset_stream(&mut self) {
         self.dpb = None;
         self.session = None;
         self.active = None;
         self.held_surfaces.clear();
-        self.held_sync.clear();
-        self.held_sync_outputs = 0;
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -621,14 +592,7 @@ impl Decoder for HevcDecoder<'_> {
             }
         }
         self.note_inflight(pending.len());
-        // Two calls held back: older calls' downloads finish while
-        // the new submits' engine work runs. Held pins steer the
-        // next submit past their slots, so same-slot waits never fire.
-        let submitted = pending.len();
-        let hold = submitted + self.held_sync_outputs;
-        self.held_sync_outputs = submitted;
-        self.held_sync.extend(pending);
-        if let Err(error) = self.release_sync(&mut frames, hold) {
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
             self.reset_stream();
             return Err(error);
         }
@@ -645,25 +609,15 @@ impl Decoder for HevcDecoder<'_> {
             }
         }
         self.note_inflight(pending.len());
-        self.held_sync.extend(pending);
-        if let Err(error) = self.release_sync(&mut frames, 0) {
+        if let Err(error) = self.consume_pending(&pending, &mut frames) {
             self.reset_stream();
             return Err(error);
         }
-        self.held_sync_outputs = 0;
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
         Ok(frames)
     }
-}
-
-/// Queued sync output pinned past slot reuse.
-struct HeldSync {
-    /// Queued download behind the output.
-    pending: SyncPending,
-    /// Pin over the output slot, steering the next submit past it.
-    pin: SlotPin,
 }
 
 /// Session plus picture buffer for `next`, reusing submit `queues`.

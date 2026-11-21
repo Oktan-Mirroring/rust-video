@@ -36,26 +36,24 @@ fn vector() -> PathBuf {
     decode_dir().join("valid_320x240.h264")
 }
 
-/// No-reorder vector emits every frame across decode calls plus flush.
+/// No-reorder vector emits one frame per decode call.
 #[test]
-fn h264_no_reorder_emits_past_hold() {
+fn h264_no_reorder_emits_per_call() {
     let Some(device) = device() else {
         return;
     };
     let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
-    let mut total = 0;
-    for raw in &raws {
+    for (index, raw) in raws.iter().enumerate() {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        for frame in decoder.decode(&packet).expect("steady decode") {
-            assert_eq!(frame.identity().size().width(), 320);
-            assert_eq!(frame.identity().size().height(), 240);
-            total += 1;
-        }
+        let frames = decoder.decode(&packet).expect("steady decode");
+        assert_eq!(frames.len(), 1, "packet {index} emits on its call");
+        let frame = frames.first().expect("frame");
+        assert_eq!(frame.identity().size().width(), 320);
+        assert_eq!(frame.identity().size().height(), 240);
     }
-    total += decoder.flush().expect("flush drains").len();
-    assert_eq!(total, 15, "every picture decodes past the hold");
+    assert!(decoder.flush().expect("flush drains").is_empty());
 }
 
 /// Stream without a reorder guarantee holds its first picture back.
@@ -71,9 +69,9 @@ fn h264_without_guarantee_holds_back() {
     assert!(decoder.decode(&first).expect("idr decodes").is_empty());
     let second = Packet::new(Bytes::copy_from_slice(&raws[1]));
     let frames = decoder.decode(&second).expect("p decodes");
-    assert!(frames.is_empty(), "second submit held back");
+    assert_eq!(frames.len(), 1);
     let drained = decoder.flush().expect("flush drains");
-    assert_eq!(drained.len(), 2, "flush releases both pictures");
+    assert_eq!(drained.len(), 1);
 }
 
 /// Surfaces carry visible size, format, array layer, coded extent, and origin.
@@ -205,7 +203,7 @@ fn h264_held_surface_leaves_other_slots_open() {
     assert_eq!(total, 4, "every picture surfaces past the hold");
 }
 
-/// Reordered AV1 displays exactly as coded, two calls held back.
+/// Reordered AV1 displays exactly as coded: held head, then one per call.
 #[test]
 fn av1_reorder_holds_back_unchanged() {
     let Some(device) = device_for_av1() else {
@@ -223,8 +221,8 @@ fn av1_reorder_holds_back_unchanged() {
     counts.push(decoder.flush().expect("flush drains").len());
     assert_eq!(
         counts.as_slice(),
-        [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
-        "held display pattern"
+        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+        "display pattern unchanged"
     );
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }

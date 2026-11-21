@@ -295,8 +295,6 @@ fn drive_hevc_decode(device: &D3d12Device) {
             return;
         }
     };
-    assert!(frames.is_empty(), "first submit held back");
-    let frames = decoder.flush().expect("flush drains");
     assert_eq!(frames.len(), 1);
     let proven = frames.first().expect("frame");
     assert_eq!(proven.identity().size().width(), 320);
