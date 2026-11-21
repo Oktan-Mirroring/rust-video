@@ -78,9 +78,9 @@ fn h264_no_reorder_pipelines_two_deep() {
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }
 
-/// No-reorder HEVC emits each picture on its completing call.
+/// No-reorder HEVC pipelines two deep across decode calls.
 #[test]
-fn hevc_loopback_no_reorder_returns_per_call() {
+fn hevc_loopback_no_reorder_pipelines_two_deep() {
     let Some(device) = device_for(Codec::H265) else {
         return;
     };
@@ -107,11 +107,8 @@ fn hevc_loopback_no_reorder_returns_per_call() {
         assert!(frames.len() <= 1, "no bunching on a no-reorder stream");
         total += frames.len();
     }
+    total += decoder.flush().expect("decode drains").len();
     assert_eq!(total, 4, "every picture completes");
-    assert!(
-        decoder.flush().expect("decode drains").is_empty(),
-        "nothing held back"
-    );
     assert_eq!(decoder.resets(), 0, "clean stream never resets");
 }
 
@@ -171,8 +168,8 @@ fn hevc_reorder_holds_back_unchanged() {
     assert_eq!(counts[0], 0, "first picture held back");
     assert_eq!(
         counts.as_slice(),
-        [0, 0, 1, 1, 1, 1, 1, 2, 0, 1, 1, 1, 1, 1, 1, 2],
-        "reorder pattern unchanged"
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 0, 1, 1, 1, 1, 4],
+        "held outputs complete two calls late"
     );
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }

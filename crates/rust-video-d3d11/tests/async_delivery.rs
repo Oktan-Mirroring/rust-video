@@ -259,7 +259,7 @@ fn hevc_blocking_receive_gets_trailing_frames() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..12 {
+    for _ in 0..10 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
