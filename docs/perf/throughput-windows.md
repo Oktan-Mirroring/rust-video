@@ -85,7 +85,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 30 passes over the single-frame blob; downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
+| Input | 30 passes, heavy-intra single-frame blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
 | Gold | d3d11va downloaded on 120x concat; same bytes except h264 † |

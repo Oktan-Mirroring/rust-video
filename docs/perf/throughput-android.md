@@ -30,7 +30,7 @@ Sync legs, downloaded frames both sides
 
 | Field | Fact |
 |---|---|
-| Input | adjacent, not identical: rv submits single-frame vectors 30x; gold needs multi-frame (single-frame HW flush asserts) |
+| Input | adjacent, not identical: rv submits heavy-intra single-frame vectors 30x; gold needs multi-frame (single-frame HW flush asserts) |
 | Counting | fps = frames/wall; rv single run; gold median of 3, settles |
 | Build | rv debug test profile on-device; gold static aarch64; phone per Environment |
 | Gold | HW decode on 120f _ip (vp8: 30f); HW-to-null downloads, matches rv sync shape |
