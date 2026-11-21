@@ -112,9 +112,9 @@ fn hevc_loopback_no_reorder_pipelines_two_deep() {
     assert_eq!(decoder.resets(), 0, "clean stream never resets");
 }
 
-/// No-reorder AV1 emits each frame on its completing call.
+/// No-reorder AV1 pipelines two deep across decode calls.
 #[test]
-fn av1_loopback_no_reorder_returns_per_call() {
+fn av1_loopback_no_reorder_pipelines_two_deep() {
     let Some(device) = device_for(Codec::Av1) else {
         return;
     };
@@ -141,11 +141,8 @@ fn av1_loopback_no_reorder_returns_per_call() {
         assert!(frames.len() <= 1, "no bunching on a no-reorder stream");
         total += frames.len();
     }
+    total += decoder.flush().expect("decode drains").len();
     assert_eq!(total, 4, "every frame completes");
-    assert!(
-        decoder.flush().expect("decode drains").is_empty(),
-        "nothing held back"
-    );
     assert_eq!(decoder.resets(), 0, "clean stream never resets");
 }
 
@@ -192,8 +189,8 @@ fn av1_reorder_holds_back_unchanged() {
     counts.push(decoder.flush().expect("flush drains").len());
     assert_eq!(
         counts.as_slice(),
-        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-        "display pattern unchanged"
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+        "held outputs complete two calls late"
     );
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }

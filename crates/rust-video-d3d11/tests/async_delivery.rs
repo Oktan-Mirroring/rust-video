@@ -326,13 +326,14 @@ fn av1_blocking_receive_gets_trailing_frame() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..14 {
+    for _ in 0..13 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
     pump.finish().expect("finish drains");
-    let trailing = pump.receive().expect("trailing").expect("trailing queued");
-    generations.push(trailing.identity().generation());
+    while let Some(frame) = pump.receive().expect("trailing") {
+        generations.push(frame.identity().generation());
+    }
     assert_eq!(generations, (0..15u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }

@@ -53,6 +53,8 @@ pub struct Av1Decoder<'a> {
     readback: Readback,
     /// Submitted surfaces held back two packets for submit/wait overlap.
     held_surfaces: Vec<GpuSurface>,
+    /// Previous call's submitted outputs, held back alongside this call's.
+    held_outputs: usize,
 }
 
 impl Drop for Av1Decoder<'_> {
@@ -95,6 +97,7 @@ impl<'a> Av1Decoder<'a> {
             finished: false,
             readback: Readback::spawn(),
             held_surfaces: Vec::new(),
+            held_outputs: 0,
         }
     }
 
@@ -138,7 +141,9 @@ impl<'a> Av1Decoder<'a> {
     }
 
     /// Frames of `packet` submitted, without waiting on completion.
-    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `packet`.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<usize, D3d11Error> {
         let frames_in = match self.ingest.ingest_packet(packet.data()) {
             Ok(frames) => frames,
             Err(error) => {
@@ -147,14 +152,17 @@ impl<'a> Av1Decoder<'a> {
                 return Err(error);
             }
         };
+        let mut queued = 0;
         for frame in &frames_in {
-            self.submit_frame_split(frame)?;
+            queued += self.submit_frame_split(frame)?;
         }
-        Ok(())
+        Ok(queued)
     }
 
     /// Decode `frame`, queueing its outputs for completion reads.
-    fn submit_frame_split(&mut self, frame: &crate::av1::Frame) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `frame`.
+    fn submit_frame_split(&mut self, frame: &crate::av1::Frame) -> Result<usize, D3d11Error> {
         let active = self.frame_active(frame)?;
         let live = self.active;
         if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
@@ -211,7 +219,7 @@ impl<'a> Av1Decoder<'a> {
         for lane in copied {
             self.queue.push(lane, active, submit_start, submit_end);
         }
-        Ok(())
+        Ok(decoded.outputs.len())
     }
 
     /// `decoded` submitted, if it carries one.
@@ -233,6 +241,7 @@ impl<'a> Av1Decoder<'a> {
         self.active = None;
         self.ingest.reset_refs();
         self.held_surfaces.clear();
+        self.held_outputs = 0;
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -495,15 +504,25 @@ impl Decoder for Av1Decoder<'_> {
     }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        // Two packets held back: older calls drain while the new
+        // submits' engine work runs.
         let mut frames = Vec::new();
-        if let Err(error) = self.submit_packet_inner(packet) {
-            self.parts().abandon_queue();
-            return Err(error);
-        }
-        if let Err(error) = self.parts().drain_all() {
-            self.parts().abandon_queue();
-            self.reset_stream();
-            return Err(error);
+        let submitted = match self.submit_packet_inner(packet) {
+            Ok(queued) => queued,
+            Err(error) => {
+                self.parts().abandon_queue();
+                self.held_outputs = 0;
+                return Err(error);
+            }
+        };
+        let hold = submitted + self.held_outputs;
+        self.held_outputs = submitted;
+        while self.queue.pending() > hold {
+            if let Err(error) = self.parts().drain_oldest() {
+                self.parts().abandon_queue();
+                self.reset_stream();
+                return Err(error);
+            }
         }
         self.parts().take_ready(&mut frames);
         Ok(frames)
@@ -531,6 +550,7 @@ impl Decoder for Av1Decoder<'_> {
             return Err(error);
         }
         self.parts().take_ready(&mut frames);
+        self.held_outputs = 0;
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
