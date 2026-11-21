@@ -450,7 +450,7 @@ fn decode_h264_1080p_measures_realtime() {
     };
     let mut decoder = H264Decoder::open(&device);
     let raws =
-        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
+        vec![std::fs::read(bench_dir().join("h264-1080p-sync.h264")).expect("vector readable")];
     let measured = decode_fps(&mut decoder, &raws, &raws, "d3d11 h264 sync");
     println!("d3d11 h264 decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(

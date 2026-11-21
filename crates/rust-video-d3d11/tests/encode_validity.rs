@@ -290,25 +290,28 @@ fn grey_and_pattern_roundtrip_within_bounds() {
     let noise_packets = encode_eight(&mut encoder, &noise);
     // One decoder over the continuous stream: sets ride the first segment.
     let mut decoder = H264Decoder::open(&device);
-    for (tag, frame, packets, bound) in [
-        ("grey", &grey, &grey_packets, 1000u64),
-        ("noise", &noise, &noise_packets, 30_000u64),
-    ] {
-        let mut frames = Vec::new();
+    let mut frames = Vec::new();
+    for packets in [&grey_packets, &noise_packets] {
         for packet in packets {
             frames.extend(decoder.decode(packet).expect("decode runs"));
         }
-        assert_eq!(frames.len(), 8, "{tag} roundtrip yields every frame");
+    }
+    frames.extend(decoder.flush().expect("decode drains"));
+    assert_eq!(frames.len(), 16, "roundtrip yields every frame");
+    for (tag, frame, bound, slice) in [
+        ("grey", &grey, 1000u64, &frames[..8]),
+        ("noise", &noise, 30_000u64, &frames[8..]),
+    ] {
         let y = frame.planes()[0].data();
         let uv = frame.planes()[1].data();
         let mut src = Vec::with_capacity(y.len() + uv.len());
         src.extend_from_slice(y);
         src.extend_from_slice(uv);
         let mut total = 0u64;
-        for decoded in &frames {
+        for decoded in slice {
             total += mad_milli(&src, decoded.nv12());
         }
-        let count = u64::try_from(frames.len()).expect("count fits");
+        let count = u64::try_from(slice.len()).expect("count fits");
         let mean = total / count;
         println!("roundtrip {tag}: mean abs diff {mean} milli, bound {bound}");
         assert!(mean < bound, "{tag} mean {mean} within {bound}");

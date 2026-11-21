@@ -485,8 +485,7 @@ impl Decoder for Vp9Decoder<'_> {
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
         // Two packets held back: older calls drain while the new
-        // submits' engine work runs. Siblings stay per-call pinned by
-        // surface_contract; VP9 carries no such pin.
+        // submits' engine work runs.
         let mut frames = Vec::new();
         let submitted = match self.submit_packet_inner(packet) {
             Ok(queued) => queued,

@@ -310,7 +310,7 @@ fn decode_h264_1080p_measures_realtime() {
     }
     let mut decoder = H264Decoder::open(&device);
     let raws =
-        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
+        vec![std::fs::read(bench_dir().join("h264-1080p-sync.h264")).expect("vector readable")];
     let measured = match decode_fps(&mut decoder, &raws, &raws) {
         Ok(fps) => fps,
         Err(error)

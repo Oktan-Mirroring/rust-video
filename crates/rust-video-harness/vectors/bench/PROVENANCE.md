@@ -10,6 +10,7 @@ Every file below decodes to null with exit 0.
 |---|---|
 | `h264-1080p.h264` | `ffmpeg -f lavfi -i SRC -frames:v 1 -pix_fmt yuv420p -c:v libx264 -preset ultrafast -g 1 -f h264` (generated 2026-11-20; device tiers use the blob, PC bars use the synth blob below) |
 | `h264-1080p-synth.h264` | `dump_vectors` (30 bytes, sha256 `623ffdac...0fdb1`; builder bytes copied here, pin test `sized_blob_matches_builder`) |
+| `h264-1080p-sync.h264` | `ffmpeg -f lavfi -i testsrc=size=1920x1080:rate=30 -frames:v 1 -c:v libx264 -preset ultrafast -g 30 -pix_fmt yuv420p -f h264` (25346 bytes, sha256 `4F08E04C...460B`; Constrained Baseline, 1 I frame; recipe reproduces the bytes exactly; shared by the d11/d12/vk H.264 sync legs and the d3d11va downloaded gold) |
 | `h265-1080p-nvenc.h265` | `ffmpeg -f lavfi -i SRC -frames:v 1 -pix_fmt yuv420p -c:v hevc_nvenc -preset p1 -g 1 -f hevc` (RTX 5080, driver 32.0.16.2114). Main profile; carries reference sets. Shared by every HEVC bench. |
 | `av1-1080p.obu` | `ffmpeg -f lavfi -i SRC -frames:v 1 -pix_fmt yuv420p -c:v libsvtav1 -g 1 -f obu` |
 | `vp9-1080p.ivf` | `ffmpeg -f lavfi -i SRC -frames:v 1 -pix_fmt yuv420p -c:v libvpx-vp9 -b:v 0 -crf 30 -g 1 -f ivf` |
@@ -18,8 +19,10 @@ Every file below decodes to null with exit 0.
 `SRC` is the source above. The synth blob holds one
 `H264Synth::annex_b_h264_packets_cropped_sized(119, 67, 4, 40)`
 packet (SPS + PPS + header-only IDR slice, no residual); every
-PC-tier H.264 sync/surface/transcode leg reads it. ffmpeg exits 0
+PC-tier H.264 surface/transcode leg reads it. ffmpeg exits 0
 on it with concealment warnings; GPUs decode one grey 1080p frame.
+The sync legs read `h264-1080p-sync.h264` above instead (GPUs
+cannot download the synth blob, so it never had a gold pair).
 Benches resolve this directory through
 `rust_video_harness::bench_dir`.
 

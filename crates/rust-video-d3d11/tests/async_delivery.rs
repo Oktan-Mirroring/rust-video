@@ -75,6 +75,11 @@ fn send_poll_loopback_returns_own_frames() {
     while let Some(frame) = pump.try_receive().expect("poll") {
         frames.push(frame);
     }
+    pump.finish().expect("finish drains");
+    assert!(pump.is_finished());
+    while let Some(frame) = pump.receive().expect("drained") {
+        frames.push(frame);
+    }
     assert_eq!(frames.len(), 15, "every picture completes");
     for (index, frame) in frames.iter().enumerate() {
         assert_eq!(
@@ -85,9 +90,6 @@ fn send_poll_loopback_returns_own_frames() {
         assert_eq!(frame.identity().generation(), index as u64);
     }
     assert_eq!(pump.dropped(), 0, "roomy queue drops nothing");
-    pump.finish().expect("finish drains");
-    assert!(pump.is_finished());
-    assert!(pump.try_receive().expect("drained").is_none());
     assert!(pump.receive().expect("drained").is_none());
     assert_eq!(pump.decoder().resets(), 0, "clean vector never resets");
 }
@@ -108,13 +110,14 @@ fn blocking_receive_gets_trailing_frame() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..14 {
+    for _ in 0..13 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
     pump.finish().expect("finish drains");
-    let trailing = pump.receive().expect("trailing").expect("trailing queued");
-    generations.push(trailing.identity().generation());
+    while let Some(frame) = pump.receive().expect("trailing") {
+        generations.push(frame.identity().generation());
+    }
     assert_eq!(generations, (0..15u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
@@ -134,8 +137,9 @@ fn slow_consumer_drop_oldest_keeps_latest() {
     for packet in &packets {
         pump.try_send(packet.clone()).expect("policy absorbs");
     }
-    assert_eq!(pump.dropped(), 13, "slow consumer drops all but two");
+    assert_eq!(pump.dropped(), 11, "held tail not yet sent");
     pump.finish().expect("finish drains");
+    assert_eq!(pump.dropped(), 13, "slow consumer drops all but two");
     let mut generations = Vec::new();
     while let Some(frame) = pump.try_receive().expect("poll") {
         generations.push(frame.identity().generation());
@@ -159,8 +163,9 @@ fn slow_consumer_drop_incoming_keeps_first() {
     for packet in &packets {
         pump.try_send(packet.clone()).expect("policy absorbs");
     }
-    assert_eq!(pump.dropped(), 13, "slow consumer drops all but two");
+    assert_eq!(pump.dropped(), 11, "held tail not yet sent");
     pump.finish().expect("finish drains");
+    assert_eq!(pump.dropped(), 13, "slow consumer drops all but two");
     let mut generations = Vec::new();
     while let Some(frame) = pump.try_receive().expect("poll") {
         generations.push(frame.identity().generation());
@@ -188,10 +193,14 @@ fn callback_drain_collects_queued_frames() {
     let drained = pump
         .channel()
         .drain_with(|frame| generations.push(frame.identity().generation()));
-    assert_eq!(drained, 15);
-    assert_eq!(generations, (0..15u64).collect::<Vec<_>>());
+    assert_eq!(drained, 13, "held tail stays in the decoder");
+    assert_eq!(generations, (0..13u64).collect::<Vec<_>>());
     assert!(pump.is_empty());
     pump.finish().expect("finish drains");
+    while let Some(frame) = pump.receive().expect("trailing") {
+        generations.push(frame.identity().generation());
+    }
+    assert_eq!(generations, (0..15u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
 

@@ -85,22 +85,22 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 30 passes, heavy-intra single-frame 1080p blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
+| Input | 30 passes, heavy-intra single-frame 1080p blob; downloaded frames both sides<br>h264 runs the shared downloadable pair (25KB 1-frame IDR, hash in PROVENANCE); h265/av1/vp9 keep the surface blobs |
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
-| Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; same bytes except h264 † |
+| Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; identical bytes every row |
 | Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 trails gold -6% on identical bytes |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| d3d11 h264 † | 810 | 3764 | adjacent |
+| d3d11 h264 | 349.2 | 1555 | +345.3% |
 | d3d11 h265 | 873 | 1321 | +51.3% |
 | d3d11 av1 | 837 | 1038 | +24.0% |
 | d3d11 vp9 | 262.8 | 247 | -6.0% |
-| d3d12 h264 † | 810 | 2495 | adjacent |
+| d3d12 h264 | 349.2 | 1511 | +332.7% |
 | d3d12 h265 | 873 | 1407 | +61.2% |
 | d3d12 av1 | 837 | 1074 | +28.3% |
-| vulkan h264 † | 810 | 2853 | adjacent |
+| vulkan h264 | 349.2 | 1904 | +445.2% |
 | vulkan h265 | 873 | 1431 | +63.9% |
 | vulkan av1 | 837 | 1226 | +46.5% |
 

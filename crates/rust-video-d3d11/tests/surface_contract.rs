@@ -52,24 +52,29 @@ fn assert_surface_metadata(surface: &GpuSurface, width: u32, height: u32) {
     assert!(matches!(surface.export(), GpuExport::NtHandle { .. }));
 }
 
-/// No-reorder H.264 emits each picture on its completing call.
+/// No-reorder H.264 pipelines two deep across decode calls.
 #[test]
-fn h264_no_reorder_returns_per_call() {
+fn h264_no_reorder_pipelines_two_deep() {
     let Some(device) = device() else {
         return;
     };
     let raws = AnnexB::picture_packets(&h264_vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
+    let mut count = 0;
     for (index, raw) in raws.iter().enumerate() {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
         let frames = decoder.decode(&packet).expect("steady decode");
-        assert_eq!(frames.len(), 1, "picture {index} completes on its call");
+        if index < 2 {
+            assert!(frames.is_empty(), "call {index} holds its picture back");
+        } else {
+            assert_eq!(frames.len(), 1, "picture completes two calls late");
+        }
+        count += frames.len();
     }
-    assert!(
-        decoder.flush().expect("flush drains").is_empty(),
-        "nothing held back"
-    );
+    let flushed = decoder.flush().expect("flush drains");
+    assert_eq!(flushed.len(), 2, "flush releases the held tail");
+    assert_eq!(count + flushed.len(), 15, "every picture completes once");
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }
 

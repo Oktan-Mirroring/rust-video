@@ -48,6 +48,8 @@ pub struct H264Decoder<'a> {
     finished: bool,
     /// Copy worker behind launches.
     readback: Readback,
+    /// Previous call's submitted outputs, held back alongside this call's.
+    held_outputs: usize,
 }
 
 impl Drop for H264Decoder<'_> {
@@ -89,6 +91,7 @@ impl<'a> H264Decoder<'a> {
             timings: Vec::new(),
             finished: false,
             readback: Readback::spawn(),
+            held_outputs: 0,
         }
     }
 
@@ -132,16 +135,21 @@ impl<'a> H264Decoder<'a> {
     }
 
     /// Pictures of `packet` submitted, without waiting on completion.
-    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `packet`.
+    fn submit_packet_inner(&mut self, packet: &Packet) -> Result<usize, D3d11Error> {
         let pictures = self.ingest.ingest_packet(packet.data())?;
+        let mut queued = 0;
         for picture in &pictures {
-            self.submit_picture_split(picture)?;
+            queued += self.submit_picture_split(picture)?;
         }
-        Ok(())
+        Ok(queued)
     }
 
     /// Decode `picture`, queueing its outputs for completion reads.
-    fn submit_picture_split(&mut self, picture: &Picture) -> Result<(), D3d11Error> {
+    ///
+    /// Returns the outputs queued behind `picture`.
+    fn submit_picture_split(&mut self, picture: &Picture) -> Result<usize, D3d11Error> {
         let active = self.sequence(picture)?;
         if self.active != Some(active) {
             self.parts().drain_all()?;
@@ -183,7 +191,7 @@ impl<'a> H264Decoder<'a> {
         for lane in copied {
             self.queue.push(lane, active, submit_start, submit_end);
         }
-        Ok(())
+        Ok(decoded.outputs.len())
     }
 
     /// Drop the live session, buffer, and sequence after a mid-picture failure.
@@ -192,6 +200,7 @@ impl<'a> H264Decoder<'a> {
         self.session = None;
         self.shared = None;
         self.active = None;
+        self.held_outputs = 0;
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -418,15 +427,25 @@ impl Decoder for H264Decoder<'_> {
     }
 
     fn decode(&mut self, packet: &Packet) -> Result<Vec<D3d11Frame>, D3d11Error> {
+        // Two packets held back: older calls drain while the new
+        // submits' engine work runs.
         let mut frames = Vec::new();
-        if let Err(error) = self.submit_packet_inner(packet) {
-            self.parts().abandon_queue();
-            return Err(error);
-        }
-        if let Err(error) = self.parts().drain_all() {
-            self.parts().abandon_queue();
-            self.reset_stream();
-            return Err(error);
+        let submitted = match self.submit_packet_inner(packet) {
+            Ok(queued) => queued,
+            Err(error) => {
+                self.parts().abandon_queue();
+                self.held_outputs = 0;
+                return Err(error);
+            }
+        };
+        let hold = submitted + self.held_outputs;
+        self.held_outputs = submitted;
+        while self.queue.pending() > hold {
+            if let Err(error) = self.parts().drain_oldest() {
+                self.parts().abandon_queue();
+                self.reset_stream();
+                return Err(error);
+            }
         }
         self.parts().take_ready(&mut frames);
         Ok(frames)
@@ -446,6 +465,7 @@ impl Decoder for H264Decoder<'_> {
             return Err(error);
         }
         self.parts().take_ready(&mut frames);
+        self.held_outputs = 0;
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
