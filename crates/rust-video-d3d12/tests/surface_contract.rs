@@ -36,24 +36,26 @@ fn vector() -> PathBuf {
     decode_dir().join("valid_320x240.h264")
 }
 
-/// No-reorder vector emits one frame per decode call.
+/// No-reorder vector emits every frame across decode calls plus flush.
 #[test]
-fn h264_no_reorder_emits_per_call() {
+fn h264_no_reorder_emits_past_hold() {
     let Some(device) = device() else {
         return;
     };
     let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
-    for (index, raw) in raws.iter().enumerate() {
+    let mut total = 0;
+    for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let frames = decoder.decode(&packet).expect("steady decode");
-        assert_eq!(frames.len(), 1, "packet {index} emits on its call");
-        let frame = frames.first().expect("frame");
-        assert_eq!(frame.identity().size().width(), 320);
-        assert_eq!(frame.identity().size().height(), 240);
+        for frame in decoder.decode(&packet).expect("steady decode") {
+            assert_eq!(frame.identity().size().width(), 320);
+            assert_eq!(frame.identity().size().height(), 240);
+            total += 1;
+        }
     }
-    assert!(decoder.flush().expect("flush drains").is_empty());
+    total += decoder.flush().expect("flush drains").len();
+    assert_eq!(total, 15, "every picture decodes past the hold");
 }
 
 /// Stream without a reorder guarantee holds its first picture back.
@@ -69,9 +71,9 @@ fn h264_without_guarantee_holds_back() {
     assert!(decoder.decode(&first).expect("idr decodes").is_empty());
     let second = Packet::new(Bytes::copy_from_slice(&raws[1]));
     let frames = decoder.decode(&second).expect("p decodes");
-    assert_eq!(frames.len(), 1);
+    assert!(frames.is_empty(), "second submit held back");
     let drained = decoder.flush().expect("flush drains");
-    assert_eq!(drained.len(), 1);
+    assert_eq!(drained.len(), 2, "flush releases both pictures");
 }
 
 /// Surfaces carry visible size, format, array layer, coded extent, and origin.
