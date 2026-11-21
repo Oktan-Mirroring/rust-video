@@ -1,6 +1,6 @@
 # Windows throughput vs FFmpeg
 
-d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; d12 h264 sustained reads 2435 (+74%) on the primed steady method. Encode inverts 6/6 on shared noise (d11 h264 393 vs 92), pace only, settings and quality unmatched. F7 is dead: the 96 fps floor came from a C-only openh264 link, the nasm build runs 256.
+d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; d12 h264 sustained reads 2339 (+67%) on the primed steady method. Encode inverts 6/6 on shared noise (d11 h264 393 vs 92), pace only, settings and quality unmatched. F7 is dead: the 96 fps floor came from a C-only openh264 link, the nasm build runs 256.
 
 ## Environment
 
@@ -12,7 +12,7 @@ d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; 
 | rustc | 1.100.0 (0ef1bc386 2026-11-09) |
 | NVIDIA GPU | GeForce RTX 5080, driver 621.24, Vulkan 1.4.357, idle 31C unrestrained |
 | AMD GPU | Radeon integrated, Vulkan 1.3.287 (present, unselected) |
-| rv tree | 1c3a1e8 |
+| rv tree | b4c0fd9 |
 
 ## Method
 
@@ -37,19 +37,19 @@ Surface
 |---|---|
 | Input | 1 heavy intra frame x 30 sequential passes<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
 | Counting | fps = frames/wall; d11 median-of-3, d12/vk mean-of-2; quiet box |
-| Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
+| Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold cuvid on 120x same-blob concat; gpu-resident both sides |
-| Verdict basis | budget 1.5x rebaseline; bar 60; misses exempt: F20, F21, F22 |
+| Verdict basis | budget 1.5x rebaseline; bar 60; misses exempt: F21, F22 |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
 | d3d11 h264 surface | 1461 | 5421 | +271.0% |
-| d3d12 h264 surface | 1461 | 4724 | +223.3% |
+| d3d12 h264 surface | 1461 | 4855 | +232.3% |
 | vulkan h264 surface | 1461 | 3724 | +154.9% |
-| d3d11 h265 surface | 1120 | 1822 | +62.7% |
+| d3d11 h265 surface | 1120 | 2046 | +82.7% |
 | d3d12 h265 surface | 1120 | 1958 | +74.8% |
 | vulkan h265 surface | 1120 | 1479 | +32.1% |
-| d3d11 av1 surface | 819 | 1280 | +56.3% |
+| d3d11 av1 surface | 819 | 1401 | +71.1% |
 | d3d12 av1 surface | 819 | 1310 | +60.0% |
 | vulkan av1 surface | 819 | 1270 | +55.1% |
 | d3d11 vp9 surface | 250.2 | 270 | +7.9% |
@@ -62,7 +62,7 @@ Sustained overlap
 |---|---|
 | Input | 120 light inter frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
 | Counting | fps = frames/wall; exact counts, zero drops; quiet box |
-| Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
+| Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold cuvid on same _ip bytes; downloaded shape-matched pair per codec |
 | Verdict basis | budget 1.5x rebaseline; bar 60; all GREEN |
 
@@ -75,7 +75,7 @@ Sustained overlap
 | d3d11 h265 sustained | 1293 | 1719 | +32.9% |
 | d3d11 av1 sustained | 1197 | 2095 | +75.0% |
 | d3d11 vp9 sustained | 1017 | 1501 | +47.6% |
-| d3d12 h264 sustained | 1398 | 2435 | +74.2% |
+| d3d12 h264 sustained | 1398 | 2339 | +67.3% |
 | d3d12 h265 sustained | 1293 | 2064 | +59.6% |
 | d3d12 av1 sustained | 1197 | 2305 | +92.6% |
 
@@ -87,7 +87,7 @@ Sync
 |---|---|
 | Input | 30 passes, heavy-intra single-frame blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
-| Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
+| Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; same bytes except h264 † |
 | Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 trails gold -6% on identical bytes |
 
@@ -98,7 +98,7 @@ Sync
 | d3d11 av1 | 837 | 1038 | +24.0% |
 | d3d11 vp9 | 262.8 | 247 | -6.0% |
 | d3d12 h264 † | 810 | 2495 | adjacent |
-| d3d12 h265 | 873 | 1481 | +69.6% |
+| d3d12 h265 | 873 | 1407 | +61.2% |
 | d3d12 av1 | 837 | 1074 | +28.3% |
 | vulkan h264 † | 810 | 2853 | adjacent |
 | vulkan h265 | 873 | 1431 | +63.9% |
@@ -112,7 +112,7 @@ Sync
 |---|---|
 | Input | 30 timed noise frames per leg (seeds alias pairwise; both sides share dumps) |
 | Counting | fps = frames/wall; quiet box |
-| Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
+| Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVENC both sides, d11 via MFT; gold p1 intra CQP on 4x concat; settings unmatched, pace only |
 | Verdict basis | floor-bound throughout: F14 (d11), F3 (d12), F8/F4 (vk) |
 
@@ -209,7 +209,7 @@ Sync
 |---|---|
 | Input | rows as labeled; no shared input across rows |
 | Counting | fps = output frames / wall; quiet box |
-| Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
+| Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | no ffmpeg counterpart on any row |
 | Verdict basis | reference only; bar 60, all rows clear |
 
@@ -217,7 +217,7 @@ Sync
 - Transcode via rv, no ffmpeg counterpart: d3d11 454 (NVDEC+MFT), d3d12 622 (NVDEC+NVENC).
 - h264 openh264 via rv, absent from the ffmpeg build: 256.
 - d3d11 vp9 software encode via rv, no NVENC VP9: 69.
-- livepack via rv CPU, no ffmpeg counterpart (isolated singles): TsMux 502432, TsDemux 502015, FragMux 166447.
+- livepack via rv CPU, no ffmpeg counterpart (isolated singles): TsMux 553568, TsDemux 502015, FragMux 161063.
 
 ## Floors
 
@@ -242,8 +242,8 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F17 | vk h264 sustained gaps 280-286us vs 247.8 | verify §F17; verify2 spot | CONFIRMED |
 | F18 | vk h265 sustained gaps 510-517us vs 380.1 | verify §F18; verify2 spot | CONFIRMED |
 | F19 | d11 h265 decode additive floor | verify §F19; VACATED (leg GREEN full) | VACATED, leg GREEN |
-| F20 | d11 h265 surface submit+wait vs 510.2 budget | handoff direct split (1c3a1e8 print) | CONFIRMED |
-| F21 | d11 av1 surface submit+wait vs 695.4 budget | handoff direct split; tail cannot reach | CONFIRMED |
+| F20 | d11 h265 surface submit+wait vs 510.2 budget | handoff split; hold-2 vacate (db785c5) | VACATED, leg GREEN |
+| F21 | d11 av1 surface submit+wait vs 695.4 budget | handoff split; hold-2 re-derive (eac2654) | CONFIRMED |
 | F22 | d12 av1 surface engine 691-694us vs 677.1 budget | verify §F22; verify2 spot | CONFIRMED |
 
 ## Gaps
