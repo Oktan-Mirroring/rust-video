@@ -155,6 +155,28 @@ impl SyncPhases for Vp9Decoder<'_> {
     }
 }
 
+/// Median submit/wait phases behind `tag` printed as one line.
+fn print_surface_phases(tag: &str, phases: &[(u64, u64)]) {
+    let mut submit: Vec<u64> = phases.iter().map(|phase| phase.0).collect();
+    let mut wait: Vec<u64> = phases.iter().map(|phase| phase.1).collect();
+    submit.sort_unstable();
+    wait.sort_unstable();
+    let at = |sorted: &[u64]| sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+    let best = phases
+        .iter()
+        .min_by_key(|phase| phase.0.saturating_add(phase.1))
+        .copied()
+        .unwrap_or((0, 0));
+    println!(
+        "{tag} phases: submit={} wait={} min_sum={}+{} over {} calls",
+        at(&submit),
+        at(&wait),
+        best.0,
+        best.1,
+        phases.len(),
+    );
+}
+
 /// Median submit/engine/copy phases behind `tag` printed as one line.
 fn print_sync_phases(tag: &str, timings: &[rust_video_caps::delivery::PhaseTiming]) {
     let mut submit: Vec<u64> = timings
@@ -256,10 +278,12 @@ fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFram
 /// Warmup runs until steady plus a flush: short warmups leave slow
 /// ramp frames inside the timed window. The timed window covers the
 /// decode loop only; the trailing flush waits untimed for correctness.
+/// Timed calls print median submit/wait phases behind the tag.
 fn decode_surface_fps(
     decoder: &mut impl SurfaceDecode,
     warmup: &[Vec<u8>],
     raws: &[Vec<u8>],
+    tag: &str,
 ) -> f64 {
     let warmup = Packets::from_raws(warmup);
     let raws = Packets::from_raws(raws);
@@ -278,13 +302,23 @@ fn decode_surface_fps(
         surface.try_wait().expect("warmup wait");
     }
     let mut surfaces = 0;
+    let mut phases = Vec::new();
     let start = std::time::Instant::now();
     for _ in 0..HOPS {
         for packet in &raws {
-            for surface in decoder.decode_surface(packet).expect("timed decode") {
+            let submitted = std::time::Instant::now();
+            let fresh = decoder.decode_surface(packet).expect("timed decode");
+            let submit = u64::try_from(submitted.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let mut wait = 0u64;
+            for surface in fresh {
+                let waited = std::time::Instant::now();
                 surface.try_wait().expect("timed wait");
+                wait = wait.saturating_add(
+                    u64::try_from(waited.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
                 surfaces += 1;
             }
+            phases.push((submit, wait));
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -292,6 +326,7 @@ fn decode_surface_fps(
         surface.try_wait().expect("timed wait");
     }
     assert!(surfaces > 0);
+    print_surface_phases(tag, &phases);
     f64::from(surfaces) / elapsed
 }
 
@@ -635,7 +670,7 @@ fn decode_surface_h264_1080p_measures_realtime() {
     let mut decoder = H264Decoder::open(&device);
     let raws =
         vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
-    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws, "d3d11 h264 surface");
     println!(
         "d3d11 h264 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
     );
@@ -664,7 +699,7 @@ fn decode_surface_hevc_1080p_measures_realtime() {
     let raws = AnnexB::group_pictures(&data, AnnexB::is_hevc_vcl);
     assert!(!raws.is_empty(), "bench vector holds pictures");
     let mut decoder = HevcDecoder::open(&device);
-    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws, "d3d11 hevc surface");
     println!(
         "d3d11 hevc surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps"
     );
@@ -692,7 +727,7 @@ fn decode_surface_av1_1080p_measures_realtime() {
     let data = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
     let raws = vec![data];
     let mut decoder = Av1Decoder::open(&device);
-    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws, "d3d11 av1 surface");
     println!("d3d11 av1 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
@@ -718,7 +753,7 @@ fn decode_surface_vp9_1080p_measures_realtime() {
     let raws = Ivf::read(&bench_dir().join("vp9-1080p.ivf")).frames;
     assert!(!raws.is_empty(), "bench vector holds frames");
     let mut decoder = Vp9Decoder::open(&device);
-    let measured = decode_surface_fps(&mut decoder, &raws, &raws);
+    let measured = decode_surface_fps(&mut decoder, &raws, &raws, "d3d11 vp9 surface");
     println!("d3d11 vp9 surface decode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
     assert!(
         measured >= BAR,
