@@ -202,8 +202,8 @@ Proof tags: perf-final = `.tmp/perf-final.md`, verify = `.tmp/perf-verify.md`, v
 8. d11 av1 4K host cliff: 14-16x collapse at idle engine (phase re-probe on master).
 9. d11 h265 surface 4K non-monotonic: 1686 beats 1440p 1070 (NAL-structure compare).
 10. sw ffmpeg/gpl legs on Windows: need linkable libav* (`FFMPEG_LIB_DIR` per the sw build script).
-11. d12 h265 surface C-sample tiebreak: thin GREEN (+1.7%, spread 4.3% > margin); one quiet full run firms it.
-12. d12 av1 sustained third sample: 15% A/B spread (readback-noise copy 1507 vs 1148us) keeps the lull 2305; a third quiet run graduates the mean.
+11. d12 h265 surface C-sample tiebreak: CLOSED (tiebreak2: isolated quiet median-of-3 1995.1 (1986.8/2005.4/1995.1), +3.6% vs 1926, spread 0.9%, F4 >= 228.5 + dirt <= +26 on all samples; firms the thin full-mean GREEN, grade unchanged).
+12. d12 av1 sustained third sample: CLOSED (tiebreak2: isolated quiet median-of-3 2070.8 (2070.8/1974.6/2214.0), spread 11.6% readback-noise class, F4 231.8 x3, depth 4 filled; leg GREEN +92% vs 1076, grading stays full).
 
 ## Comparability notes
 
