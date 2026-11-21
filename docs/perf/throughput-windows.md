@@ -35,7 +35,7 @@ Surface
 
 | Field | Fact |
 |---|---|
-| Input | 1 heavy intra frame x 30 sequential passes (vs sustained: 120 light inter, overlapped)<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
+| Input | 1 heavy intra frame x 30 sequential passes<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
 | Counting | fps = frames/wall; d11 median-of-3, d12/vk mean-of-2; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
 | Gold | cuvid resident on 120x same-blob concat; gpu-resident both sides |
@@ -60,7 +60,7 @@ Sustained overlap
 
 | Field | Fact |
 |---|---|
-| Input | 120 light inter frames, 1 overlapped pass (vs surface: 1 heavy intra x 30 sequential)<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
+| Input | 120 light inter frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
 | Counting | fps = frames/wall; exact counts, zero drops; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
 | Gold | cuvid resident on same _ip bytes; downloaded shape-matched pair per codec |
