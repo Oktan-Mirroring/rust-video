@@ -146,15 +146,15 @@ fn hevc_held_surfaces_pin_pool_slots() {
     let second = Bytes::from(raws.next().expect("second IDR"));
     let mut decoder = HevcDecoder::open(&device);
     let mut held = decoder.decode_surface(&first).expect("first surface");
-    assert_eq!(held.len(), 1);
+    assert!(held.is_empty(), "first submit held back");
     for _ in 1..16 {
-        let surfaces = decoder
-            .decode_surface(&Packet::new(second.clone()))
-            .expect("other slots decode past held surfaces");
-        assert_eq!(surfaces.len(), 1);
-        held.extend(surfaces);
+        held.extend(
+            decoder
+                .decode_surface(&Packet::new(second.clone()))
+                .expect("other slots decode past held surfaces"),
+        );
     }
-    assert_eq!(held.len(), 16, "pool holds sixteen live surfaces");
+    assert_eq!(held.len(), 14, "fourteen surfaces past the two held back");
     let Err(error) = decoder.decode_surface(&Packet::new(second.clone())) else {
         panic!("pinned pool fails loud")
     };

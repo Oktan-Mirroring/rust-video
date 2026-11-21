@@ -23,6 +23,9 @@ use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 
+/// Submitted surfaces held back across surface calls.
+const SURFACE_HOLD: usize = 2;
+
 /// HEVC decoder over a D3D12 device.
 pub struct HevcDecoder<'a> {
     /// Device owning the decode session.
@@ -53,6 +56,8 @@ pub struct HevcDecoder<'a> {
     sync_readback: Vec<Duration>,
     /// Export plus frame wrap per sync output, oldest first.
     sync_emit: Vec<Duration>,
+    /// Submitted surfaces held back two packets for submit/wait overlap.
+    held_surfaces: Vec<GpuSurface>,
 }
 
 impl<'a> HevcDecoder<'a> {
@@ -74,6 +79,7 @@ impl<'a> HevcDecoder<'a> {
             sync_timings: Vec::new(),
             sync_readback: Vec::new(),
             sync_emit: Vec::new(),
+            held_surfaces: Vec::new(),
         }
     }
 
@@ -247,6 +253,7 @@ impl<'a> HevcDecoder<'a> {
         self.dpb = None;
         self.session = None;
         self.active = None;
+        self.held_surfaces.clear();
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -371,9 +378,14 @@ impl<'a> HevcDecoder<'a> {
         // Submit before any surface handoff: outputs may name the submission slot.
         let ticket = session.submit_hevc(&decoded.submission)?;
         let submitted = Instant::now();
-        session.wait_video(ticket)?;
-        let signaled = Instant::now();
         let submit = submitted.duration_since(submitted_at);
+        // Crop copies read decoded pixels, so cropped submits wait here;
+        // uncropped handoffs carry the fence and the release waits instead.
+        let mut signaled = submitted;
+        if session.cropped() {
+            session.wait_video(ticket)?;
+            signaled = Instant::now();
+        }
         let engine_wait = signaled.duration_since(submitted);
         if !session.cropped() {
             for output in &decoded.outputs {
@@ -517,9 +529,20 @@ impl<'a> HevcDecoder<'a> {
             return Err(SkipReason::ProfileUnsupported { codec: Codec::H265 }.into());
         }
         let pictures = self.ingest.ingest_packet(packet.data())?;
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         for picture in &pictures {
-            self.texture_picture(picture, &mut surfaces)?;
+            self.texture_picture(picture, &mut fresh)?;
+        }
+        // Two packets held back: older calls' surfaces return
+        // complete while the new submits' engine work runs. Held
+        // pins steer the next submit past their slots, so the
+        // release wait below is the only per-call engine stall.
+        self.held_surfaces.append(&mut fresh);
+        let mut surfaces = Vec::new();
+        while self.held_surfaces.len() > SURFACE_HOLD {
+            let oldest = self.held_surfaces.remove(0);
+            oldest.try_wait()?;
+            surfaces.push(oldest);
         }
         Ok(surfaces)
     }
@@ -530,14 +553,15 @@ impl<'a> HevcDecoder<'a> {
     ///
     /// Returns `Err` when the backend cannot release its held frames.
     pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d12Error> {
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         if let Some(picture) = self.ingest.finish()? {
-            self.texture_picture(&picture, &mut surfaces)?;
+            self.texture_picture(&picture, &mut fresh)?;
         }
         if let Some(active) = self.active {
-            self.drain_live_texture(&active, &mut surfaces)?;
+            self.drain_live_texture(&active, &mut fresh)?;
         }
-        Ok(surfaces)
+        self.held_surfaces.append(&mut fresh);
+        Ok(std::mem::take(&mut self.held_surfaces))
     }
 }
 
