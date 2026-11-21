@@ -35,7 +35,7 @@ Surface
 
 | Field | Fact |
 |---|---|
-| Input | 1 heavy intra frame x 30 sequential passes<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
+| Input | 1 heavy intra 1080p frame x 30 sequential passes<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
 | Counting | fps = frames/wall; d11 median-of-3, d12/vk mean-of-2; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold cuvid on 120x same-blob concat; gpu-resident both sides |
@@ -60,7 +60,7 @@ Sustained overlap
 
 | Field | Fact |
 |---|---|
-| Input | 120 light inter frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
+| Input | 120 light inter 1080p frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
 | Counting | fps = frames/wall; exact counts, zero drops; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold cuvid on same _ip bytes; downloaded shape-matched pair per codec |
@@ -85,7 +85,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 30 passes, heavy-intra single-frame blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
+| Input | 30 passes, heavy-intra single-frame 1080p blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; same bytes except h264 † |
@@ -110,7 +110,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 30 timed noise frames per leg (seeds alias pairwise; both sides share dumps) |
+| Input | 30 timed noise 1080p frames per leg (seeds alias pairwise; both sides share dumps) |
 | Counting | fps = frames/wall; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVENC both sides, d11 via MFT; gold p1 intra CQP on 4x concat; settings unmatched, pace only |
@@ -151,7 +151,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | gold 600f per codec (_ip x5; vp8 single x600); thread rows per labels |
+| Input | gold 600f 1080p per codec (_ip x5; vp8 single x600); thread rows per labels |
 | Counting | fps = frames/wall; gold median of 5 after 1 warmup |
 | Build | gold side only: ffmpeg 9.0 gyan binaries on Environment box |
 | Gold | this table is the gold reference; default SW decoders |
@@ -180,7 +180,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 300f yuv420p, 5 Mbps nominal, fastest sane settings both sides |
+| Input | 300f yuv420p 1080p, 5 Mbps nominal, fastest sane settings both sides |
 | Counting | fps = frames/wall; gold median of 5 after 1 warmup |
 | Build | gold side only: ffmpeg 9.0 gyan binaries on Environment box |
 | Gold | this table is the gold reference; settings per row labels |
@@ -207,7 +207,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | rows as labeled; no shared input across rows |
+| Input | rows as labeled, 1080p; no shared input across rows |
 | Counting | fps = output frames / wall; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | no ffmpeg counterpart on any row |

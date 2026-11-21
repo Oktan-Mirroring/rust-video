@@ -30,7 +30,7 @@ Sync legs, downloaded frames both sides
 
 | Field | Fact |
 |---|---|
-| Input | adjacent, not identical: rv submits heavy-intra bench singles 30x (h264: device blob); gold needs multi-frame (single-frame HW flush asserts)<br>sizes unrecorded except gold vp9 _ip 114KB |
+| Input | adjacent, not identical: rv submits heavy-intra bench singles 30x at 1080p (h264: device blob); gold needs multi-frame (single-frame HW flush asserts)<br>sizes unrecorded except gold vp9 _ip 114KB |
 | Counting | fps = frames/wall; rv single run; gold median of 3, settles |
 | Build | rv debug test profile on-device; gold static aarch64; phone per Environment |
 | Gold | MediaCodec HW decode on 120f _ip (vp8: 30f); HW-to-null downloads, matches rv sync shape |
@@ -50,7 +50,7 @@ Sync legs, downloaded frames both sides
 
 | Field | Fact |
 |---|---|
-| Input | not same bytes: gold runs noise-30.mkv; rv runs Synth seeds 1..=4; dump-paired re-run pending |
+| Input | not same bytes, both 1080p: gold runs noise-30.mkv; rv runs Synth seeds 1..=4; dump-paired re-run pending |
 | Counting | fps = frames/wall; rv single run; gold median of 3, settles |
 | Build | rv debug test profile on-device; gold enc-helper sibling; phone per Environment |
 | Gold | one MediaCodec encoder per codec, `-g 30`; settings differ, percents diagnose only |
@@ -68,7 +68,7 @@ Sync legs, downloaded frames both sides
 
 | Field | Fact |
 |---|---|
-| Input | rows as labeled; surface legs add `RUST_VIDEO_MEDIACODEC_DEVICE=1` |
+| Input | rows as labeled, 1080p; surface legs add `RUST_VIDEO_MEDIACODEC_DEVICE=1` |
 | Counting | fps = frames/wall; rv single run; gold median of 3, settles |
 | Build | rv debug test profile on-device; gold static/enc-helper; phone per Environment |
 | Gold | no pair per row, with reason (see rows) |

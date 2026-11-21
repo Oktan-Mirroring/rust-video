@@ -35,7 +35,7 @@ VA-API, Radeon
 
 | Field | Fact |
 |---|---|
-| Input | 600f streams per codec (bytes unrecorded); surface rows resident, readback rows via split-phase worker |
+| Input | 600f 1080p streams per codec (bytes unrecorded); surface rows resident, readback rows via split-phase worker |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; renderD128 both sides; box per Environment |
 | Gold | ffmpeg VA-API on renderD128, identical streams; shapes pair per row |
@@ -58,7 +58,7 @@ Vulkan, RTX 5080
 
 | Field | Fact |
 |---|---|
-| Input | 600f streams (bytes unrecorded); h264 ships IPB + IP, rest one stream each |
+| Input | 600f 1080p streams (bytes unrecorded); h264 ships IPB + IP, rest one stream each |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; rv RTX 5080 (RADV rejects the decode usage); box per Environment |
 | Gold | ffmpeg per GPU; percents vs RTX 5080; TIMEOUT rows stay rv-only with reason |
@@ -82,7 +82,7 @@ VA-API, Radeon
 
 | Field | Fact |
 |---|---|
-| Input | 300f yuv420p, 5 Mbps nominal, fastest sane settings both sides |
+| Input | 300f yuv420p 1080p, 5 Mbps nominal, fastest sane settings both sides |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; renderD128 both sides; box per Environment |
 | Gold | ffmpeg VA-API; settings/bitrate unmatched, pace only; transcode rows labeled per shape |
@@ -107,7 +107,7 @@ VA-API, Radeon
 
 | Field | Fact |
 |---|---|
-| Input | 600f streams per codec; thread rows per labels |
+| Input | 600f 1080p streams per codec; thread rows per labels |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; CPU legs, no device; box per Environment |
 | Gold | default SW decoders, identical streams; thread rows pair per labels |
@@ -138,7 +138,7 @@ VA-API, Radeon
 
 | Field | Fact |
 |---|---|
-| Input | 300f yuv420p, 5 Mbps nominal; SVT legs match threads both sides (rv threads map to lp) |
+| Input | 300f yuv420p 1080p, 5 Mbps nominal; SVT legs match threads both sides (rv threads map to lp) |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; CPU legs, no device; box per Environment |
 | Gold | libs per row labels, identical streams; settings differ, no quality claim |
@@ -165,7 +165,7 @@ VA-API, Radeon
 
 | Field | Fact |
 |---|---|
-| Input | rows as labeled; vk encodes 300f yuv420p; livepack synthetic units |
+| Input | rows as labeled, 1080p; vk encodes 300f yuv420p; livepack synthetic units (non-pixel) |
 | Counting | fps = frames/wall; median of 5, no warmup; quiet box |
 | Build | release; vk on RTX 5080; CPU legs need no device; box per Environment |
 | Gold | no pair per row, with reason (see rows) |
