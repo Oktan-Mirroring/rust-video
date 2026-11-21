@@ -89,14 +89,14 @@ Sync
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; identical bytes every row |
-| Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 trails gold -6% on identical bytes |
+| Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 leads gold +2% on identical bytes |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
 | d3d11 h264 | 349.2 | 1907 | +446.1% |
 | d3d11 h265 | 873 | 1696 | +94.3% |
 | d3d11 av1 | 837 | 1260 | +50.5% |
-| d3d11 vp9 | 262.8 | 247 | -6.0% |
+| d3d11 vp9 | 262.5 | 268 | +2.1% |
 | d3d12 h264 | 349.2 | 1511 | +332.7% |
 | d3d12 h265 | 873 | 1407 | +61.2% |
 | d3d12 av1 | 837 | 1074 | +28.3% |
@@ -248,6 +248,7 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F23 | d11 encode MFT roundtrip 1.02-1.13ms plus fill 0.35ms, ceilings 888/984/932 | enc1000; 4a67889 | CONFIRMED |
 | F24 | d12 h264 encode 237, bits named 5.7ms, path overhead +2.3ms | enc1000; 8d8795b | CONFIRMED |
 | F25 | sw openh264 nasm knee at 4 threads, 260 ceiling | enc1000 | CONFIRMED |
+| F26 | d11 vp9 sync net +80us/f over gold: dl 3.4x leaner covers 371us engine gap | vp9sync logs | CONFIRMED |
 
 ## Gaps
 
