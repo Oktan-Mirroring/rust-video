@@ -4,13 +4,14 @@
 //! Device-gated: each test declines when the tier skips the machine.
 //! Vector-gated: H.265 and AV1 read no-reorder vectors from the environment.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use bytes::Bytes;
 use rust_video_caps::frame::PixelFormat;
 use rust_video_caps::packet::Packet;
 use rust_video_caps::traits::Decoder;
-use rust_video_harness::{AnnexB, Drive, H264Synth};
+use rust_video_harness::{bench_dir, AnnexB, Drive, H264Synth};
 use rust_video_vulkan::{
     Av1Decoder, CodecOp, H264Decoder, H265Decoder, SkipReason, VulkanDevice, VulkanError,
     VulkanFrame,
@@ -209,19 +210,19 @@ fn av1_no_reorder_pipelines_one_deep() {
 ///
 /// Panics on other errors.
 fn decode_surfaces(
-    decoder: &mut H264Decoder<'_>,
     device: &VulkanDevice,
     raw: &[u8],
+    decode: impl FnOnce(&Packet) -> Result<Vec<VulkanFrame>, VulkanError>,
 ) -> Option<Vec<VulkanFrame>> {
-    match decoder.decode_surface(&Packet::new(Bytes::copy_from_slice(raw))) {
+    match decode(&Packet::new(Bytes::copy_from_slice(raw))) {
         Ok(frames) => Some(frames),
         Err(VulkanError::Unsupported { .. }) => {
-            println!("declined: pinning proof without exportable planes");
+            println!("declined: surface proof without exportable planes");
             None
         }
         Err(error) if error.is_out_of_device_memory() => {
             let (free_mb, total_mb) = device.memory_budget_mb();
-            println!("declined:OOM pinning proof: {error} (free {free_mb}MB of {total_mb}MB)");
+            println!("declined:OOM surface proof: {error} (free {free_mb}MB of {total_mb}MB)");
             None
         }
         Err(error) => panic!("decode runs: {error}"),
@@ -249,11 +250,15 @@ fn gpu_surfaces_pin_export_slots() {
         return;
     };
     let packets = H264Synth::annex_b_packets();
-    let Some(first) = decode_surfaces(&mut decoder, &device, &packets[0]) else {
+    let Some(first) = decode_surfaces(&device, &packets[0], |packet| {
+        decoder.decode_surface(packet)
+    }) else {
         return;
     };
     assert!(first.is_empty(), "first call holds its picture back");
-    let Some(second) = decode_surfaces(&mut decoder, &device, &packets[1]) else {
+    let Some(second) = decode_surfaces(&device, &packets[1], |packet| {
+        decoder.decode_surface(packet)
+    }) else {
         return;
     };
     assert_eq!(second.len(), 1, "first surface completes next call");
@@ -278,7 +283,9 @@ fn gpu_surfaces_pin_export_slots() {
     let freed = held_a.y_image();
     drop(second);
     drop(flushed);
-    let Some(third) = decode_surfaces(&mut decoder, &device, &packets[0]) else {
+    let Some(third) = decode_surfaces(&device, &packets[0], |packet| {
+        decoder.decode_surface(packet)
+    }) else {
         return;
     };
     assert!(third.is_empty(), "resubmitted picture stays held");
@@ -290,5 +297,56 @@ fn gpu_surfaces_pin_export_slots() {
         recycled[0].planes().expect("gpu planes").y_image(),
         freed,
         "freed slot recycles"
+    );
+}
+
+/// AV1 surface decodes recycle export slots instead of growing the pool.
+///
+/// Repeated decodes of one packet reuse a bounded set of export pairs;
+/// distinct plane handles stay flat no matter how many frames decode.
+#[test]
+fn av1_surface_recycles_export_slots() {
+    let _guard = Drive::serial();
+    if !gated() {
+        return;
+    }
+    let Some(device) = device_or_decline(CodecOp::Av1Decode) else {
+        return;
+    };
+    if device.share_mechanism().is_none() {
+        println!("declined: recycling proof needs platform export");
+        return;
+    }
+    let Some(mut decoder) = unwrap_or_oom(Av1Decoder::open(&device), "engine starts", &device)
+    else {
+        return;
+    };
+    let raw = std::fs::read(bench_dir().join("av1-1080p.obu")).expect("vector readable");
+    let mut slots = HashSet::new();
+    for _ in 0..64 {
+        let Some(frames) = decode_surfaces(&device, &raw, |packet| decoder.decode_surface(packet))
+        else {
+            return;
+        };
+        for frame in &frames {
+            check_surface(frame);
+            slots.insert(frame.planes().expect("gpu planes").y_image());
+        }
+        drop(frames);
+    }
+    let Some(flushed) = unwrap_or_oom(decoder.flush_surface(), "flush runs", &device) else {
+        return;
+    };
+    for frame in &flushed {
+        slots.insert(frame.planes().expect("gpu planes").y_image());
+    }
+    println!(
+        "av1 surface export slots: {} distinct over 64 decodes",
+        slots.len()
+    );
+    assert!(
+        slots.len() <= 8,
+        "export pool grows per frame: {} distinct slots over 64 decodes",
+        slots.len()
     );
 }

@@ -608,18 +608,23 @@ impl<'a> Av1Decoder<'a> {
         frames: Vec<VulkanFrame>,
     ) -> Vec<VulkanFrame> {
         if let Some(id) = show_id {
-            for frame in &frames {
-                let cpu = frame
-                    .device_export()
-                    .is_none()
-                    .then(|| frame.bytes().clone());
-                self.shown.insert(
-                    id,
-                    frame.identity().size(),
-                    cpu,
-                    pair.cloned(),
-                    frame.layout(),
-                );
+            // Reachable refs only: future replays name live slots, outstanding
+            // ones await; anything else orphans its export pair in the pool.
+            let live = self.context.is_live(id) || held_awaits(&self.held, id);
+            if live {
+                for frame in &frames {
+                    let cpu = frame
+                        .device_export()
+                        .is_none()
+                        .then(|| frame.bytes().clone());
+                    self.shown.insert(
+                        id,
+                        frame.identity().size(),
+                        cpu,
+                        pair.cloned(),
+                        frame.layout(),
+                    );
+                }
             }
         }
         if emit {

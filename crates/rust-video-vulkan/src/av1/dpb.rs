@@ -350,6 +350,13 @@ impl Av1Context {
         })
     }
 
+    /// True when `id` rides a live reference slot.
+    pub(crate) fn is_live(&self, id: ReferenceId) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.as_ref().is_some_and(|entry| entry.id == id))
+    }
+
     /// Stable identity per slot, if occupied.
     fn slot_ids(&self) -> [Option<ReferenceId>; av1::TOTAL_REFS] {
         let mut ids = [None; av1::TOTAL_REFS];
