@@ -217,7 +217,7 @@ where
     Ok(f64::from(total) / elapsed)
 }
 
-/// Measured fps of `HOPS` 1080p encodes through `encoder`.
+/// Measured fps of `ENCODE_ITERS` 1080p encodes through `encoder`.
 fn encode_fps(
     encoder: &mut D3d12Encoder,
     warmup: &CpuFrame,
@@ -236,7 +236,7 @@ fn encode_fps(
     }
     let elapsed = start.elapsed().as_secs_f64();
     assert!(bytes > 0);
-    Ok(f64::from(HOPS) / elapsed)
+    Ok(f64::from(ENCODE_ITERS) / elapsed)
 }
 
 /// Measured fps of `HOPS` 1080p surface decodes through `decode` plus `flush`.
@@ -430,6 +430,32 @@ fn decode_av1_1080p_measures_realtime() {
     );
 }
 
+/// Timed noise frames behind the encode benches.
+const ENCODE_ITERS: u32 = 30;
+
+/// Explicit CBR all-intra config behind the h264 encode bench.
+fn fast_config() -> rust_video_caps::encode::EncodeConfig {
+    use rust_video_caps::encode::{EncodeConfig, Gop, Level, Profile, RateControl};
+    use rust_video_caps::h264;
+
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 5_000_000,
+            maxrate: 5_000_000,
+            bufsize: 5_000_000,
+        },
+        gop: Gop {
+            keyint: 1,
+            min_keyint: 1,
+            b_frames: 0,
+            refs: 1,
+        },
+        profile: Profile::H264(h264::EncodeProfile::High),
+        level: Level::H264(h264::EncodeLevel::Auto),
+        ..EncodeConfig::default()
+    }
+}
+
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
@@ -441,7 +467,7 @@ fn encode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d12Encoder::legacy_config(Codec::H264).expect("legacy h264");
+    let config = fast_config();
     let mut encoder = match D3d12Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -449,10 +475,10 @@ fn encode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let frames: Vec<CpuFrame> = (0..HOPS)
+    let frames: Vec<CpuFrame> = (0..ENCODE_ITERS)
         .map(|seed| Synth::noise(1920, 1080, u64::from(seed)))
         .collect();
-    let warmup = Synth::noise(1920, 1080, u64::from(HOPS));
+    let warmup = Synth::noise(1920, 1080, u64::from(ENCODE_ITERS));
     let measured = match encode_fps(&mut encoder, &warmup, &frames) {
         Ok(fps) => fps,
         Err(error)
@@ -466,7 +492,9 @@ fn encode_h264_1080p_measures_realtime() {
         }
         Err(error) => panic!("warmup encode: {error}"),
     };
-    println!("d3d12 h264 encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    println!(
+        "d3d12 h264 encode 1080p: {measured:.1}fps over {ENCODE_ITERS} iters, bar {BAR:.0}fps"
+    );
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
@@ -492,10 +520,10 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let frames: Vec<CpuFrame> = (0..HOPS)
+    let frames: Vec<CpuFrame> = (0..ENCODE_ITERS)
         .map(|seed| Synth::noise(1920, 1080, u64::from(seed)))
         .collect();
-    let warmup = Synth::noise(1920, 1080, u64::from(HOPS));
+    let warmup = Synth::noise(1920, 1080, u64::from(ENCODE_ITERS));
     let measured = match encode_fps(&mut encoder, &warmup, &frames) {
         Ok(fps) => fps,
         Err(error)
@@ -509,7 +537,9 @@ fn encode_hevc_1080p_measures_realtime() {
         }
         Err(error) => panic!("warmup encode: {error}"),
     };
-    println!("d3d12 hevc encode 1080p: {measured:.1}fps over {HOPS} iters, bar {BAR:.0}fps");
+    println!(
+        "d3d12 hevc encode 1080p: {measured:.1}fps over {ENCODE_ITERS} iters, bar {BAR:.0}fps"
+    );
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
