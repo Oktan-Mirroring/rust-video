@@ -9,7 +9,7 @@ use rust_video_vulkan::{
     ParseError, VulkanDevice, VulkanError, VulkanFrame,
 };
 
-use rust_video_caps::delivery::{DropPolicy, PollFrames, ReceiveFrames, SplitDecode};
+use rust_video_caps::delivery::{DropPolicy, PhaseTiming, PollFrames, ReceiveFrames, SplitDecode};
 use rust_video_caps::encode::{EncodeConfig, RateControl};
 use rust_video_caps::frame::CpuFrame;
 use rust_video_caps::packet::Packet;
@@ -84,6 +84,9 @@ trait SurfaceDecoder {
 
     /// Surface frames held back for reordering or buffering.
     fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError>;
+
+    /// Logged phase timings, oldest first, clearing the log.
+    fn surface_timings(&mut self) -> Vec<PhaseTiming>;
 }
 
 impl SurfaceDecoder for H264Decoder<'_> {
@@ -93,6 +96,10 @@ impl SurfaceDecoder for H264Decoder<'_> {
 
     fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         H264Decoder::flush_surface(self)
+    }
+
+    fn surface_timings(&mut self) -> Vec<PhaseTiming> {
+        H264Decoder::take_timings(self)
     }
 }
 
@@ -104,6 +111,10 @@ impl SurfaceDecoder for H265Decoder<'_> {
     fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         H265Decoder::flush_surface(self)
     }
+
+    fn surface_timings(&mut self) -> Vec<PhaseTiming> {
+        H265Decoder::take_timings(self)
+    }
 }
 
 impl SurfaceDecoder for Av1Decoder<'_> {
@@ -114,6 +125,31 @@ impl SurfaceDecoder for Av1Decoder<'_> {
     fn flush_surface(&mut self) -> Result<Vec<VulkanFrame>, VulkanError> {
         Av1Decoder::flush_surface(self)
     }
+
+    fn surface_timings(&mut self) -> Vec<PhaseTiming> {
+        Av1Decoder::take_timings(self)
+    }
+}
+
+/// Median of `values`, zero when empty.
+fn median(mut values: Vec<u64>) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+/// Phase medians behind `name` over `timings`.
+fn print_phase_medians(name: &str, timings: &[PhaseTiming]) {
+    println!(
+        "{name} phases: submit {}us engine {}us copy {}us latency {}us over {} pictures",
+        median(timings.iter().map(PhaseTiming::submit_us).collect()),
+        median(timings.iter().map(PhaseTiming::engine_wait_us).collect()),
+        median(timings.iter().map(PhaseTiming::copy_us).collect()),
+        median(timings.iter().map(PhaseTiming::latency_us).collect()),
+        timings.len(),
+    );
 }
 
 /// True when `error` is the tier declining exportable planes.
@@ -189,7 +225,7 @@ fn decode_h264_1080p_measures_realtime() {
         }
     };
     let raws =
-        vec![std::fs::read(bench_dir().join("h264-1080p-synth.h264")).expect("vector readable")];
+        vec![std::fs::read(bench_dir().join("h264-1080p-sync.h264")).expect("vector readable")];
     let measured = decode_fps(&mut decoder, &raws, &raws).expect("bench runs");
     println!("vulkan h264 decode 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
     assert!(
@@ -279,6 +315,7 @@ fn surface_h264_1080p_measures_realtime() {
         Err(error) => panic!("bench runs: {error}"),
     };
     println!("vulkan h264 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    print_phase_medians("vulkan h264 surface", &decoder.surface_timings());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
@@ -316,6 +353,7 @@ fn surface_h265_1080p_measures_realtime() {
         Err(error) => panic!("bench runs: {error}"),
     };
     println!("vulkan h265 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    print_phase_medians("vulkan h265 surface", &decoder.surface_timings());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
@@ -346,6 +384,7 @@ fn surface_av1_1080p_measures_realtime() {
         Err(error) => panic!("bench runs: {error}"),
     };
     println!("vulkan av1 surface 1080p: {measured:.1}fps over {ITERS} iters, bar {BAR:.0}fps");
+    print_phase_medians("vulkan av1 surface", &decoder.surface_timings());
     assert!(
         measured >= BAR,
         "below realtime bar: {measured:.1}fps < {BAR:.0}fps"
