@@ -235,9 +235,9 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F8 | vk h264 encode ladder cap, API floor 1.22ms | perf-final §F8; verify2 spot | CONFIRMED |
 | F9-11 | d12 sync floors (poisoned inputs) | VACATED-MOOT (prime+pool legs GREEN) | VACATED, legs GREEN |
 | F12 | d12 h264 sustained engine 707us | SUPERSEDED by 5c0eaeb (2503); span-vs-service correction on record | VACATED, leg GREEN |
-| F13 | vk av1 sustained ~2100 asymptote | perf-final §F13; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
+| F13 | vk av1 sustained ~2100 asymptote | perf-final §F13; verify2 spot | CONFIRMED: av1 bytes kept, P-only, no B syntax |
 | F14 | d11 MFT Auto cap, byte-exact legacy | perf-final §F14; verify2 spot | CONFIRMED |
-| F15 | vk h264 surface 239-244us vs 217.4 budget | verify §F15; verify2 spot | CONFIRMED |
+| F15 | vk h264 surface 239-244us vs 217.4 budget | verify §F15; verify2 spot; xport-vk-gap | CONFIRMED |
 | F16 | vk h265 surface 605-614us vs 505.1 budget | verify §F16; verify2 spot | CONFIRMED |
 | F17 | vk h264 sustained gaps 280-286us vs 247.8 | verify §F17; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
 | F18 | vk h265 sustained gaps 510-517us vs 380.1 | verify §F18; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
