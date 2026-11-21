@@ -215,8 +215,9 @@ const STEADY_WARMUP: std::time::Duration = std::time::Duration::from_millis(100)
 ///
 /// Warmup runs until steady plus a flush: short warmups leave slow
 /// ramp frames inside the timed window. The timed window covers the
-/// decode loop only; the trailing flush runs untimed for correctness,
-/// since its fixed drain cost would otherwise dominate the 30-hop pace.
+/// decode loop only; the trailing flush runs untimed and its held
+/// tail counts toward the total, since its fixed drain cost would
+/// otherwise dominate the 30-hop pace.
 fn decode_fps(
     decoder: &mut (impl Decoder<Frame = D3d11Frame, Error = D3d11Error> + SyncPhases),
     warmup: &[Vec<u8>],
@@ -243,7 +244,7 @@ fn decode_fps(
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
-    decoder.flush().expect("timed drain");
+    frames += decoder.flush().expect("timed drain").len();
     assert!(frames > 0);
     print_sync_phases(tag, decoder.sync_timings());
     let total = u32::try_from(frames).expect("frame count fits");
@@ -277,8 +278,9 @@ fn encode_fps(encoder: &mut D3d11Encoder, warmup: &[CpuFrame], frames: &[CpuFram
 /// surface drops after its wait, keeping the 16 decoder slots free.
 /// Warmup runs until steady plus a flush: short warmups leave slow
 /// ramp frames inside the timed window. The timed window covers the
-/// decode loop only; the trailing flush waits untimed for correctness.
-/// Timed calls print median submit/wait phases behind the tag.
+/// decode loop only; the trailing flush waits untimed and its held
+/// tail counts toward the total. Timed calls print median
+/// submit/wait phases behind the tag.
 fn decode_surface_fps(
     decoder: &mut impl SurfaceDecode,
     warmup: &[Vec<u8>],
@@ -324,6 +326,7 @@ fn decode_surface_fps(
     let elapsed = start.elapsed().as_secs_f64();
     for surface in decoder.flush_surface().expect("timed drain") {
         surface.try_wait().expect("timed wait");
+        surfaces += 1;
     }
     assert!(surfaces > 0);
     print_surface_phases(tag, &phases);
