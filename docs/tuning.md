@@ -54,6 +54,14 @@ Notes:
   the recommended av1 value on this box.
 - sw openh264 encode, threads 1/2/4/8: 72/146/272/269fps. Scaling
   stops dead past 4 (8 matches 4). Default 4 stands.
+- sw ffmpeg decode, threads 1/4/8/16/24/32/auto: gold scales
+  1283/3399/5666/6500/6489/5982/6203fps on true-IPB 18000f; 32
+  regresses 8% vs 16 (SMT plus cross-CCD plus frame-sync
+  overhead). Sweet spot 8-16; auto lands near 16.
+- sw multi-instance: N parallel 1t decodes aggregate flat ~6k
+  from N=16 to 300 (p50 18/stream at N=300). Cap is memory
+  bandwidth (~78GB/s needed vs ~75 wall) with CPU saturated;
+  ceiling ~80-90 soft 1080p60 streams, 300 needs 3x box or HW.
 
 ## Minimum usable depth
 
