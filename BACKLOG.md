@@ -5,4 +5,5 @@
 - F3 re-proof: d12 h264 encode floor torn down by contradiction; new floor needs same-content gap-grade evidence on audited settings, else the leg stands on the audit target.
 - F17/F18 re-proof: vk h264/h265 sustained floors torn down, _ip bytes replaced with IPB; re-derive on the new bytes.
 - vk zero-copy surface: export copy costs 27us queue + 5-10us record CPU per the gap record; DPB-backed frames against the export-plane contract buy ~12% surface.
+- d11 h264 surface submit/wait split + stretch dec%: firms the 40-45us Vulkan-vs-DXVA piece in xport-vk-gap, currently resting on a sync proxy.
 - Surface floors F15/F16/F21/F22: re-adjudicate at xport landing, the ports may move the measured paths.
