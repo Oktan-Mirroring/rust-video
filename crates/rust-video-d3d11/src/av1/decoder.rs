@@ -22,6 +22,9 @@ use rust_video_caps::traits::Decoder;
 use rust_video_caps::traits::SharedDevice;
 use rust_video_caps::transcode::{FallbackCause, GpuCaps};
 
+/// Submitted surfaces held back across surface calls.
+const SURFACE_HOLD: usize = 2;
+
 /// AV1 decoder over a D3D11 device.
 pub struct Av1Decoder<'a> {
     /// Device owning the decode session.
@@ -48,6 +51,8 @@ pub struct Av1Decoder<'a> {
     finished: bool,
     /// Copy worker behind launches.
     readback: Readback,
+    /// Submitted surfaces held back two packets for submit/wait overlap.
+    held_surfaces: Vec<GpuSurface>,
 }
 
 impl Drop for Av1Decoder<'_> {
@@ -89,6 +94,7 @@ impl<'a> Av1Decoder<'a> {
             timings: Vec::new(),
             finished: false,
             readback: Readback::spawn(),
+            held_surfaces: Vec::new(),
         }
     }
 
@@ -226,6 +232,7 @@ impl<'a> Av1Decoder<'a> {
         self.shared = None;
         self.active = None;
         self.ingest.reset_refs();
+        self.held_surfaces.clear();
         self.resets = self.resets.wrapping_add(1);
     }
 
@@ -431,9 +438,20 @@ impl<'a> Av1Decoder<'a> {
                 return Err(error);
             }
         };
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         for frame in &frames_in {
-            self.surface_frame(frame, &mut surfaces)?;
+            self.surface_frame(frame, &mut fresh)?;
+        }
+        // Two packets held back: older calls' surfaces return
+        // complete while the new submits' engine work runs. Past the
+        // hold the oldest waits, retiring driver queue under the
+        // ~30-submit overrun cliff.
+        self.held_surfaces.append(&mut fresh);
+        let mut surfaces = Vec::new();
+        while self.held_surfaces.len() > SURFACE_HOLD {
+            let oldest = self.held_surfaces.remove(0);
+            oldest.try_wait()?;
+            surfaces.push(oldest);
         }
         Ok(surfaces)
     }
@@ -444,7 +462,7 @@ impl<'a> Av1Decoder<'a> {
     ///
     /// Returns [`D3d11Error`] when the trailing frame fails to convert.
     pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d11Error> {
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         let trailing = match self.ingest.finish() {
             Ok(trailing) => trailing,
             Err(error) => {
@@ -453,12 +471,13 @@ impl<'a> Av1Decoder<'a> {
             }
         };
         if let Some(frame) = trailing {
-            self.surface_frame(&frame, &mut surfaces)?;
+            self.surface_frame(&frame, &mut fresh)?;
         }
         if let Some(active) = self.active {
-            self.drain_live_surface(&active, &mut surfaces)?;
+            self.drain_live_surface(&active, &mut fresh)?;
         }
-        Ok(surfaces)
+        self.held_surfaces.append(&mut fresh);
+        Ok(std::mem::take(&mut self.held_surfaces))
     }
 }
 
