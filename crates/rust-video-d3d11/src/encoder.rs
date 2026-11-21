@@ -423,10 +423,12 @@ mod tests {
         assert_eq!(caps.share().is_some(), caps.encode_import());
         assert!(!caps.decode_export());
         let mut decoder = crate::H264Decoder::open(&device);
-        let frame = rust_video_harness::Synth::noise(320, 240, 0);
         let mut surfaces = Vec::new();
-        for packet in encoder.encode(&frame).expect("encode runs") {
-            surfaces.extend(decoder.decode_surface(&packet).expect("decode runs"));
+        for seed in 0..3u64 {
+            let frame = rust_video_harness::Synth::noise(320, 240, seed);
+            for packet in encoder.encode(&frame).expect("encode runs") {
+                surfaces.extend(decoder.decode_surface(&packet).expect("decode runs"));
+            }
         }
         let surface = surfaces.pop().expect("first picture surfaces");
         if caps.encode_import() {

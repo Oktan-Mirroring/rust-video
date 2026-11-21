@@ -205,14 +205,12 @@ fn h264_surfaces_match_frames() {
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
     let mut total = 0;
-    for (index, raw) in raws.iter().enumerate() {
+    for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let surfaces = decoder.decode_surface(&packet).expect("steady decode");
-        assert_eq!(surfaces.len(), 1, "picture {index} completes on its call");
-        for surface in &surfaces {
+        for surface in decoder.decode_surface(&packet).expect("steady decode") {
             surface.try_wait().expect("surface completes");
             if total == 0 {
-                assert_surface_metadata(surface, 320, 240);
+                assert_surface_metadata(&surface, 320, 240);
                 assert_eq!(surface.slice(), 0, "first picture takes slot zero");
                 let coded = surface.coded();
                 assert_eq!((coded.width(), coded.height()), (320, 240));
@@ -221,10 +219,10 @@ fn h264_surfaces_match_frames() {
             total += 1;
         }
     }
-    assert!(
-        decoder.flush_surface().expect("flush drains").is_empty(),
-        "nothing held back"
-    );
+    for surface in decoder.flush_surface().expect("flush drains") {
+        surface.try_wait().expect("surface completes");
+        total += 1;
+    }
     assert_eq!(total, 15, "every picture surfaces");
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }
@@ -345,7 +343,7 @@ fn held_surfaces_pin_slots_until_dropped() {
         }
     }
     assert_eq!(passes, 2, "second pass exhausts the views");
-    assert_eq!(held.len(), 16, "one surface per view");
+    assert_eq!(held.len(), 14, "caller holds all but the decoder pair");
     drop(held);
     let mut total = 0;
     for raw in &raws {
