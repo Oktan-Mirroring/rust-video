@@ -400,7 +400,17 @@ fn encode_h264_1080p_measures_realtime() {
         return;
     };
     let config = EncodeConfig {
-        rate_control: RateControl::Auto,
+        rate_control: RateControl::Cbr {
+            bitrate: 5_000_000,
+            maxrate: 5_000_000,
+            bufsize: 5_000_000,
+        },
+        gop: rust_video_caps::encode::Gop {
+            keyint: 60,
+            min_keyint: 60,
+            b_frames: 0,
+            refs: 1,
+        },
         ..Default::default()
     };
     let mut encoder = match H264Encoder::open(&device, 1920, 1080, config) {
