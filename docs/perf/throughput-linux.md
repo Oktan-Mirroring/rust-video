@@ -175,10 +175,10 @@ VA-API, Radeon
 - Vulkan h265 encode via rv, ffmpeg produced empty output: 236.8 at 83.1 Mbps actual vs 75 nominal.
 - NVENC via ffmpeg, no rv tier: h264 499.2, h265 557.3, av1 511.5.
 - h264 openh264 via rv, absent from the ffmpeg build: 857.6 at 4t, 846.7 at 8t.
-- Livepack via rv, no ffmpeg counterpart: TsMux 2039204.4, TsDemux 1552162.4, FragMux 428935.8.
+- Livepack via rv CPU, no ffmpeg counterpart: TsMux 2039204.4, TsDemux 1552162.4, FragMux 428935.8.
 - RADV transcode via ffmpeg, no rv leg: h264 226.6, h265 ERR.
 
 ## Gaps
 
-1. va batch lab proof: 5 hunks predicted-unmeasured, uncommitted in tree; legs per va-opt-report.
+1. va batch lab proof: 5 hunks predicted-unmeasured, uncommitted in tree; unblocked by lab run; legs per va-opt-report.
 2. HEAD re-grade rides the lab session (Nov-18 era numbers; method per this sheet).

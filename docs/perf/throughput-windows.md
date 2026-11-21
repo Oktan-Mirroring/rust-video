@@ -38,7 +38,7 @@ Surface
 | Input | 1 heavy intra frame x 30 sequential passes<br>h264 30B synth, h265 21KB, av1 45KB, vp9 783KB; hashes: PROVENANCE |
 | Counting | fps = frames/wall; d11 median-of-3, d12/vk mean-of-2; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
-| Gold | cuvid resident on 120x same-blob concat; gpu-resident both sides |
+| Gold | NVDEC both sides; gold cuvid on 120x same-blob concat; gpu-resident both sides |
 | Verdict basis | budget 1.5x rebaseline; bar 60; misses exempt: F20, F21, F22 |
 
 | Leg | FFmpeg | rv | Delta |
@@ -63,7 +63,7 @@ Sustained overlap
 | Input | 120 light inter frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
 | Counting | fps = frames/wall; exact counts, zero drops; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
-| Gold | cuvid resident on same _ip bytes; downloaded shape-matched pair per codec |
+| Gold | NVDEC both sides; gold cuvid on same _ip bytes; downloaded shape-matched pair per codec |
 | Verdict basis | budget 1.5x rebaseline; bar 60; all GREEN |
 
 | Leg | FFmpeg | rv | Delta |
@@ -88,8 +88,8 @@ Sync
 | Input | 30 passes, heavy-intra single-frame blob (same blobs as surface); downloaded frames both sides<br>h264 rows (†) adjacent, unpercented: gold shows _ip (synth undownloadable) |
 | Counting | fps = frames/wall; isolated grading only on full-binary collapse |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
-| Gold | d3d11va downloaded on 120x concat; same bytes except h264 † |
-| Verdict basis | budgets GREEN; vp9 trails gold -6% on identical bytes |
+| Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; same bytes except h264 † |
+| Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 trails gold -6% on identical bytes |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -113,7 +113,7 @@ Sync
 | Input | 30 timed noise frames per leg (seeds alias pairwise; both sides share dumps) |
 | Counting | fps = frames/wall; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree 1c3a1e8; box per Environment |
-| Gold | NVENC p1 intra CQP on 4x concat of each tier's frames; settings unmatched, pace only |
+| Gold | NVENC both sides, d11 via MFT; gold p1 intra CQP on 4x concat; settings unmatched, pace only |
 | Verdict basis | floor-bound throughout: F14 (d11), F3 (d12), F8/F4 (vk) |
 
 | Leg | FFmpeg | rv | Delta |
@@ -151,7 +151,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | gold 600f our bytes per codec; thread rows per labels |
+| Input | gold 600f per codec (_ip x5; vp8 single x600); thread rows per labels |
 | Counting | fps = frames/wall; gold median of 5 after 1 warmup |
 | Build | gold side only: ffmpeg 9.0 gyan binaries on Environment box |
 | Gold | this table is the gold reference; default SW decoders |
@@ -213,11 +213,11 @@ Sync
 | Gold | no ffmpeg counterpart on any row |
 | Verdict basis | reference only; bar 60, all rows clear |
 
-- d3d11 surface encode via rv, no ffmpeg counterpart: h264 653, h265 922, av1 722.
-- Transcode via rv, no ffmpeg counterpart: d3d11 454, d3d12 622.
+- d3d11 surface encode via rv MFT, no ffmpeg counterpart: h264 653, h265 922, av1 722.
+- Transcode via rv, no ffmpeg counterpart: d3d11 454 (NVDEC+MFT), d3d12 622 (NVDEC+NVENC).
 - h264 openh264 via rv, absent from the ffmpeg build: 256.
 - d3d11 vp9 software encode via rv, no NVENC VP9: 69.
-- livepack via rv, no ffmpeg counterpart (isolated singles): TsMux 502432, TsDemux 502015, FragMux 166447.
+- livepack via rv CPU, no ffmpeg counterpart (isolated singles): TsMux 502432, TsDemux 502015, FragMux 166447.
 
 ## Floors
 
@@ -248,12 +248,12 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 
 ## Gaps
 
-1. d12 h265 encode: no HW path on this adapter.
+1. d12 h265 encode: no HW path on this adapter; unblocked by driver exposing the config query.
 2. d12 VP9: no picture builder (no sync/surface/sustained legs).
 3. d11 vp9 surface-encode: no surface import.
-4. d12 h265 4K: parse fails on ffmpeg-valid stream (ladder BLOCKED).
-5. d11 av1 4K host cliff: 14-16x collapse at idle engine.
-6. d11 h265 surface 4K non-monotonic: 1686 beats 1440p 1070.
+4. d12 h265 4K: parse fails on ffmpeg-valid stream (ladder BLOCKED); unblocked by parser fix.
+5. d11 av1 4K host cliff: 14-16x collapse at idle engine; unblocked by phase-data re-probe.
+6. d11 h265 surface 4K non-monotonic: 1686 beats 1440p 1070; unblocked by NAL-structure compare.
 7. sw ffmpeg/gpl legs on Windows: need linkable libav*.
-8. va batch lab proof: 5 hunks predicted-unmeasured; legs per va-opt-report.
-9. mc phone proof: held diffs; legs per mc-opt-report; emulator-directional only so far.
+8. va batch lab proof: 5 hunks predicted-unmeasured; unblocked by lab run, legs per va-opt-report.
+9. mc phone proof: held diffs; unblocked by phone run, legs per mc-opt-report; emulator-directional only so far.

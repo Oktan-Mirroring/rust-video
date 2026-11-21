@@ -30,10 +30,10 @@ Sync legs, downloaded frames both sides
 
 | Field | Fact |
 |---|---|
-| Input | adjacent, not identical: rv submits heavy-intra single-frame vectors 30x; gold needs multi-frame (single-frame HW flush asserts) |
+| Input | adjacent, not identical: rv submits heavy-intra bench singles 30x (h264: device blob); gold needs multi-frame (single-frame HW flush asserts)<br>sizes unrecorded except gold vp9 _ip 114KB |
 | Counting | fps = frames/wall; rv single run; gold median of 3, settles |
 | Build | rv debug test profile on-device; gold static aarch64; phone per Environment |
-| Gold | HW decode on 120f _ip (vp8: 30f); HW-to-null downloads, matches rv sync shape |
+| Gold | MediaCodec HW decode on 120f _ip (vp8: 30f); HW-to-null downloads, matches rv sync shape |
 | Verdict basis | bar 60: vp9 sync 44.2 misses; rest clear; no per-leg budgets |
 
 | Leg | FFmpeg | rv | Delta |
@@ -74,16 +74,16 @@ Sync legs, downloaded frames both sides
 | Gold | no pair per row, with reason (see rows) |
 | Verdict basis | reference only; bar 60 for rv surface rows |
 
-- rv surface decode, no gold counterpart: h264 87.7, h265 103.6, vp8 78.5, vp9 44.6, av1 129.5.
-- Gold SW decode, no rv counterpart: h264 103.8, h265 159.6, vp8 94.9, vp9 11.5; gold ships no SW av1 decoder.
-- Gold vp8/vp9 encode, no rv legs: 21.2, 12.1.
+- rv surface decode, no gold counterpart, reason unrecorded: h264 87.7, h265 103.6, vp8 78.5, vp9 44.6, av1 129.5.
+- Gold SW decode, rv ran MediaCodec tier only: h264 103.8, h265 159.6, vp8 94.9, vp9 11.5; gold ships no SW av1 decoder.
+- Gold vp8/vp9 encode, rv ships neither leg: 21.2, 12.1.
 
 ## Gaps
 
-1. PENDING dump-paired encode re-run (recipe in bench PROVENANCE); supersedes encode rows.
-2. PENDING vp9-ip leg on phone (diff-5 vehicle, gold's bytes, uncommitted in tree).
+1. PENDING dump-paired encode re-run (recipe in bench PROVENANCE); unblocked by phone run; supersedes encode rows.
+2. PENDING vp9-ip leg on phone (diff-5 vehicle, gold's bytes, uncommitted); unblocked by phone run.
 3. PENDING held-diff proof (pack/reuse/pipeline/vp9-ip, uncommitted); emulator verdicts kept 7v2+8, cut 6; fps proof needs the phone. Resume block below.
-4. rv phone runs uncaptured; the re-runs supersede with captured logs.
+4. rv phone runs uncaptured; phone re-runs supersede with captured logs.
 5. SW vp8/vp9 gold used 30x loop replays vs 30f concats elsewhere; bytes identical either way.
 
 ```
