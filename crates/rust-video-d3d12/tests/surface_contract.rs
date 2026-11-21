@@ -83,27 +83,32 @@ fn surface_geometry_matches_stream() {
     let raws = AnnexB::picture_packets(&vector(), AnnexB::is_h264_vcl);
     assert_eq!(raws.len(), 15, "vector holds one packet per picture");
     let mut decoder = H264Decoder::open(&device);
-    for (index, raw) in raws.iter().enumerate() {
+    let mut total = 0;
+    for raw in &raws {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let surfaces = decoder.decode_surface(&packet).expect("steady decode");
-        assert_eq!(surfaces.len(), 1, "packet {index} emits on its call");
-        let surface = surfaces.first().expect("surface");
-        assert_eq!(surface.size().width(), 320);
-        assert_eq!(surface.size().height(), 240);
-        assert_eq!(surface.format(), PixelFormat::Nv12);
-        assert_eq!(surface.slice(), 0, "single-layer array layer");
-        assert_eq!(surface.coded().width(), 320);
-        assert_eq!(surface.coded().height(), 240);
-        assert_eq!(surface.origin(), (0, 0));
-        surface.try_wait().expect("surface complete");
-        match surface.export() {
-            GpuExport::NtHandle { handle } => assert_ne!(handle, 0),
-            GpuExport::Opaque { name } => assert_eq!(name, "d3d12"),
-            _ => panic!("unproven export shape"),
+        for surface in decoder.decode_surface(&packet).expect("steady decode") {
+            assert_eq!(surface.size().width(), 320);
+            assert_eq!(surface.size().height(), 240);
+            assert_eq!(surface.format(), PixelFormat::Nv12);
+            assert_eq!(surface.slice(), 0, "single-layer array layer");
+            assert_eq!(surface.coded().width(), 320);
+            assert_eq!(surface.coded().height(), 240);
+            assert_eq!(surface.origin(), (0, 0));
+            surface.try_wait().expect("surface complete");
+            match surface.export() {
+                GpuExport::NtHandle { handle } => assert_ne!(handle, 0),
+                GpuExport::Opaque { name } => assert_eq!(name, "d3d12"),
+                _ => panic!("unproven export shape"),
+            }
+            let _ = surface.texture();
+            total += 1;
         }
-        let _ = surface.texture();
     }
-    assert!(decoder.flush_surface().expect("flush drains").is_empty());
+    for surface in decoder.flush_surface().expect("flush drains") {
+        surface.try_wait().expect("surface complete");
+        total += 1;
+    }
+    assert_eq!(total, 15, "every picture surfaces");
 }
 
 /// Cropped surfaces separate visible size from coded extent.
@@ -182,15 +187,20 @@ fn h264_held_surface_leaves_other_slots_open() {
     assert!(decoder.copy_queue().is_none());
     let first = Packet::new(Bytes::copy_from_slice(&raws[0]));
     let held = decoder.decode_surface(&first).expect("first surface");
-    assert_eq!(held.len(), 1);
+    assert!(held.is_empty(), "first submit held back");
     assert!(decoder.video_queue().is_some());
     assert!(decoder.copy_queue().is_some());
+    drop(held);
+    let mut total = 0;
     for raw in raws.iter().skip(1).take(3) {
         let packet = Packet::new(Bytes::copy_from_slice(raw));
-        let surfaces = decoder.decode_surface(&packet).expect("other slots decode");
-        assert_eq!(surfaces.len(), 1);
+        total += decoder
+            .decode_surface(&packet)
+            .expect("other slots decode")
+            .len();
     }
-    drop(held);
+    total += decoder.flush_surface().expect("flush drains").len();
+    assert_eq!(total, 4, "every picture surfaces past the hold");
 }
 
 /// Reordered AV1 displays exactly as coded: held head, then one per call.
