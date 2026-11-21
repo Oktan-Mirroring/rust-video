@@ -31,18 +31,25 @@ Benches resolve this directory through
 120 frames of `testsrc=size=1920x1080:rate=30:duration=4`,
 generated 2026-11-18 with the same ffmpeg build for sustained
 overlap benches (IDR-only content serializes the pumps; these
-carry P-frames). Every file below decodes to null with exit 0.
+carry P-frames). The h264/h265 rows were replaced 2026-11-21
+with B-carrying encodes (`-g 60 -bf 3`); every file below
+decodes to null with exit 0.
 
 | File | Command |
 |---|---|
-| `h264-1080p_ip.h264` | `ffmpeg -f lavfi -i TS -c:v libx264 -preset ultrafast -g 30 -pix_fmt yuv420p -f h264` |
-| `h265-1080p_ip.h265` | `ffmpeg -f lavfi -i TS -c:v libx265 -preset ultrafast -g 30 -pix_fmt yuv420p -f hevc` |
-| `av1-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p -f ivf` |
-| `vp9-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libvpx-vp9 -speed 8 -g 30 -pix_fmt yuv420p -f ivf` |
+| `h264-1080p_ip.h264` | `ffmpeg -f lavfi -i TS -c:v libx264 -preset ultrafast -g 60 -bf 3 -pix_fmt yuv420p -f h264` (2 I + 30 P + 88 B, 234681 bytes, sha256 `838c85d5...9cd169`; replaces the 2026-11-18 `-g 30` encode, 4 I + 116 P, sha256 `ba8b833c...12ebf0`) |
+| `h265-1080p_ip.h265` | `ffmpeg -f lavfi -i TS -c:v libx265 -preset ultrafast -g 60 -bf 3 -pix_fmt yuv420p -f hevc` (2 I + 29 P + 89 B, 55745 bytes, sha256 `06d7b82d...1561e2`; replaces the 2026-11-18 `-g 30` encode, 4 I + 29 P + 87 B, sha256 `6b00d2e0...675538`) |
+| `av1-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p -f ivf` (unchanged: 4 I + 116 P; no B encodable, see below) |
+| `vp9-1080p_ip.ivf` | `ffmpeg -f lavfi -i TS -c:v libvpx-vp9 -speed 8 -g 30 -pix_fmt yuv420p -f ivf` (unchanged: 4 I + 116 P; no B encodable, see below) |
 
 `TS` is the testsrc above (4s, 120 frames). Throughput suites in
 every tier resolve these through `bench_dir`; no tier-local
-copies.
+copies. AV1 keeps P-only bytes: libsvtav1 (preset 8 `-g 60`,
+preset 6 `-g 60` with `hierarchical-levels=4`) and libaom-av1
+(`-cpu-used 8 -g 60 -bf 3`) all emit 2 I + 118 P with zero
+PTS/DTS inversions. VP9 keeps P-only bytes: the codec has no
+B-frame syntax (libvpx ignores `-bf 3`; alt-ref only, no
+reorder), the same reason no `vp8-1080p_ip.ivf` exists.
 
 ## Shared 320x240 decode vectors
 
@@ -117,8 +124,8 @@ IVF goes through `ffmpeg -stream_loop (N-1) -i in.ivf -c copy`
 | `h265-120x.h265` | nvenc blob x120 | 120 | `bbe541ef...e2ba6558` |
 | `av1-120x.obu` | obu blob x120 | 120 | `15c24e8d...2e7ba3f` |
 | `vp9-120x.ivf` | vp9 ivf x120 copy | 120 | `529fe913...fff0729` |
-| `sw-h264-600f.h264` | h264 _ip x5 | 600 | `d8078654...fee3fc` |
-| `sw-h265-600f.h265` | h265 _ip x5 | 600 | `5a119a10...0c3a7c` |
+| `sw-h264-600f.h264` | h264 _ip x5 | 600 | `3462a611...8636c10` |
+| `sw-h265-600f.h265` | h265 _ip x5 | 600 | `1d9d9a4b...77a808d` |
 | `sw-av1-600f.ivf` | av1 _ip x5 copy | 600 | `dde34fdd...761f859` |
 | `sw-vp9-600f.ivf` | vp9 _ip x5 copy | 600 | `a712bd2a...12fcc07` |
 | `sw-vp8-600f.ivf` | vp8 ivf x600 copy | 600 | `333aba5b...7436e2025` |
