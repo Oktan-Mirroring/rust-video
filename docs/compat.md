@@ -146,7 +146,7 @@ trade.
 C side stays untouched on purpose. `openh264-sys2 0.9.8` builds through
 `cc` defaults plus `nasm-rs` ASM with no `-march` from us or from its
 build script; upstream dispatches SIMD at runtime, and the sw H.264
-encode leg holds 260+ fps on noise 1080p, which only the ASM path
+encode leg medians ~260 fps on noise 1080p, which only the ASM path
 reaches. No `-march` appears anywhere in the repo, including near the
 NDK triples, where an x86 flag would break the ARM build.
 
