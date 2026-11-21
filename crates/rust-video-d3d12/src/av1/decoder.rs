@@ -25,6 +25,9 @@ use rust_video_caps::traits::{Decoder, SharedDevice};
 use rust_video_caps::transcode::GpuCaps;
 use windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue;
 
+/// Submitted surfaces held back across surface calls.
+const SURFACE_HOLD: usize = 2;
+
 /// AV1 decoder over a D3D12 device.
 pub struct Av1Decoder<'a> {
     /// Device owning the decode session.
@@ -55,6 +58,8 @@ pub struct Av1Decoder<'a> {
     sync_readback: Vec<Duration>,
     /// Export plus frame wrap per sync output, oldest first.
     sync_emit: Vec<Duration>,
+    /// Submitted surfaces held back two packets for submit/wait overlap.
+    held_surfaces: Vec<GpuSurface>,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -76,6 +81,7 @@ impl<'a> Av1Decoder<'a> {
             sync_timings: Vec::new(),
             sync_readback: Vec::new(),
             sync_emit: Vec::new(),
+            held_surfaces: Vec::new(),
         }
     }
 
@@ -265,6 +271,7 @@ impl<'a> Av1Decoder<'a> {
         self.dpb = None;
         self.session = None;
         self.active = None;
+        self.held_surfaces.clear();
         self.ingest.reset_refs();
         self.resets = self.resets.wrapping_add(1);
     }
@@ -397,12 +404,9 @@ impl<'a> Av1Decoder<'a> {
             None => None,
         };
         let submitted = Instant::now();
-        if let Some(ticket) = ticket {
-            session.wait_video(ticket)?;
-        }
-        let signaled = Instant::now();
         let submit = submitted.duration_since(submitted_at);
-        let engine_wait = signaled.duration_since(submitted);
+        // Handoffs carry the fence and the release waits instead.
+        let engine_wait = Duration::ZERO;
         for output in &decoded.outputs {
             let slot = output.slot();
             let resource = session.texture(slot)?;
@@ -505,9 +509,20 @@ impl<'a> Av1Decoder<'a> {
                 return Err(error);
             }
         };
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         for frame in &frames_in {
-            self.texture_frame(frame, &mut surfaces)?;
+            self.texture_frame(frame, &mut fresh)?;
+        }
+        // Two packets held back: older calls' surfaces return
+        // complete while the new submits' engine work runs. Held
+        // pins steer the next submit past their slots, so the
+        // release wait below is the only per-call engine stall.
+        self.held_surfaces.append(&mut fresh);
+        let mut surfaces = Vec::new();
+        while self.held_surfaces.len() > SURFACE_HOLD {
+            let oldest = self.held_surfaces.remove(0);
+            oldest.try_wait()?;
+            surfaces.push(oldest);
         }
         Ok(surfaces)
     }
@@ -518,7 +533,7 @@ impl<'a> Av1Decoder<'a> {
     ///
     /// Returns `Err` when the backend cannot release its held frames.
     pub fn flush_surface(&mut self) -> Result<Vec<GpuSurface>, D3d12Error> {
-        let mut surfaces = Vec::new();
+        let mut fresh = Vec::new();
         let trailing = match self.ingest.finish() {
             Ok(trailing) => trailing,
             Err(error) => {
@@ -527,12 +542,13 @@ impl<'a> Av1Decoder<'a> {
             }
         };
         if let Some(frame) = trailing {
-            self.texture_frame(&frame, &mut surfaces)?;
+            self.texture_frame(&frame, &mut fresh)?;
         }
         if let Some(active) = self.active {
-            self.drain_live_texture(&active, &mut surfaces)?;
+            self.drain_live_texture(&active, &mut fresh)?;
         }
-        Ok(surfaces)
+        self.held_surfaces.append(&mut fresh);
+        Ok(std::mem::take(&mut self.held_surfaces))
     }
 }
 
