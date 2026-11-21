@@ -1,6 +1,6 @@
 # Windows throughput vs FFmpeg
 
-d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; d12 h264 sustained reads 2339 (+67%) on the primed steady method. Encode inverts 6/6 on shared noise (d11 h264 393 vs 92), pace only, settings and quality unmatched. F7 is dead: the 96 fps floor came from a C-only openh264 link, the nasm build runs 256.
+d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; d12 h264 sustained reads 2242 (+68.7%) on the primed steady method. Encode inverts 6/6 on shared noise (d11 h264 664 vs 92), pace only, settings and quality unmatched. F7 is dead: the 96 fps floor came from a C-only openh264 link, the nasm build runs 260.
 
 ## Environment
 
@@ -110,20 +110,20 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | 30 timed noise 1080p frames per leg (seeds alias pairwise; both sides share dumps) |
+| Input | 30 timed noise 1080p frames per leg (seeds alias pairwise; both sides share dumps); legs explicit CBR 5M GOP60, d12 intra-only |
 | Counting | fps = frames/wall; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVENC both sides, d11 via MFT; gold p1 intra CQP on 4x concat; settings unmatched, pace only |
-| Verdict basis | F14 (d11), F8/F4 (vk); d12 h264 ungraded pending audit |
+| Verdict basis | F23 (d11), F24 (d12), F8/F4 (vk); all below 1000 |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| d3d11 h264 | 92.1 | 393 | +326.7% |
-| d3d11 h265 | 141.6 | 686 | +384.5% |
-| d3d11 av1 | 157.8 | 538 | +240.9% |
-| d3d12 h264 | 92.4 | 104 | +12.6% |
-| vulkan h264 | 92.4 | 498 | +439.0% |
-| vulkan h265 | 141.6 | 229 | +61.7% |
+| d3d11 h264 | 92.1 | 664 | +621.0% |
+| d3d11 h265 | 141.6 | 707 | +399.3% |
+| d3d11 av1 | 157.8 | 590 | +273.9% |
+| d3d12 h264 | 92.4 | 237 | +156.5% |
+| vulkan h264 | 92.4 | 505 | +446.5% |
+| vulkan h265 | 141.6 | 225 | +58.9% |
 
 ## Engine occupancy
 
@@ -215,7 +215,7 @@ Sync
 
 - d3d11 surface encode via rv MFT, no ffmpeg counterpart: h264 653, h265 922, av1 722.
 - Transcode via rv, no ffmpeg counterpart: d3d11 454 (NVDEC+MFT), d3d12 622 (NVDEC+NVENC).
-- h264 openh264 via rv, absent from the ffmpeg build: 256.
+- h264 openh264 via rv, absent from the ffmpeg build: 260.
 - d3d11 vp9 software encode via rv, no NVENC VP9: 69.
 - livepack via rv CPU, no ffmpeg counterpart (isolated singles): TsMux 553568, TsDemux 502015, FragMux 161063.
 
@@ -228,11 +228,11 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F1 | d11 h264 surface pace ~285us | perf-final §F1; e93b61d | VACATED, leg GREEN |
 | F2 | d12 h264 surface 2112 silicon max | perf-final §F2 (B-sample 2243 beats it) | MOOT, leg GREEN |
 | F3 | d12 h264 encode 9.65ms NVENC physics | roofline; verify2 spot | TORN DOWN: d11 393 same bytes same NVENC contradicts |
-| F4 | vk h265 encode 4.3ms driver floor | roofline; verify2 spot; ladder | CONFIRMED |
+| F4 | vk h265 encode 4.3ms driver floor | roofline; verify2 spot; ladder; enc1000 sweep flat | CONFIRMED |
 | F5 | d11 vp9 encode software MFT floor | roofline; verify2 spot | CONFIRMED |
 | F6 | d11 h264 sustained 1103 walk | roofline; VACATED (leg 1430+); ada9dea | VACATED, leg GREEN |
 | F7 | sw openh264 10.8ms parallel floor | DEAD: C-only link artifact; nasm build 256 | DEAD, leg GREEN |
-| F8 | vk h264 encode ladder cap, API floor 1.22ms | perf-final §F8; verify2 spot | CONFIRMED |
+| F8 | vk h264 encode ladder cap, API floor 1.22ms | perf-final §F8; verify2 spot; enc1000 bits 7x for +7% | CONFIRMED |
 | F9-11 | d12 sync floors (poisoned inputs) | VACATED-MOOT (prime+pool legs GREEN) | VACATED, legs GREEN |
 | F12 | d12 h264 sustained engine 707us | SUPERSEDED by 5c0eaeb (2503); span-vs-service correction on record | VACATED, leg GREEN |
 | F13 | vk av1 sustained ~2100 asymptote | perf-final §F13; verify2 spot | CONFIRMED: av1 bytes kept, P-only, no B syntax |
@@ -245,6 +245,9 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F20 | d11 h265 surface submit+wait vs 510.2 budget | handoff split; hold-2 vacate (db785c5) | VACATED, leg GREEN |
 | F21 | d11 av1 surface submit+wait vs 695.4 budget | handoff split; hold-2 re-derive (eac2654) | CONFIRMED |
 | F22 | d12 av1 surface engine 691-694us vs 677.1 budget | verify §F22; verify2 spot | CONFIRMED |
+| F23 | d11 encode MFT roundtrip 1.02-1.13ms plus fill 0.35ms, ceilings 888/984/932 | enc1000; 4a67889 | CONFIRMED |
+| F24 | d12 h264 encode 237, bits named 5.7ms, path overhead +2.3ms | enc1000; 8d8795b | CONFIRMED |
+| F25 | sw openh264 nasm knee at 4 threads, 260 ceiling | enc1000 | CONFIRMED |
 
 ## Gaps
 
