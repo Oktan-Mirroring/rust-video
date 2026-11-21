@@ -68,8 +68,8 @@ Sustained overlap
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| vulkan h264 sustained | 1329 | 1743 | +31.2% |
-| vulkan h265 sustained | 1251 | 1699 | +35.8% |
+| vulkan h264 sustained | 1329 | 1820 | +36.9% |
+| vulkan h265 sustained | 1251 | 1733 | +38.5% |
 | vulkan av1 sustained | 1197 | 2014 | +68.3% |
 | d3d11 h264 sustained | 1329 | 1831 | +37.8% |
 | d3d11 h265 sustained | 1251 | 1718 | +37.3% |
@@ -239,8 +239,8 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F14 | d11 MFT Auto cap, byte-exact legacy | perf-final §F14; verify2 spot | CONFIRMED |
 | F15 | vk h264 surface 239-244us vs 217.4 budget | verify §F15; verify2 spot; xport-vk-gap | CONFIRMED |
 | F16 | vk h265 surface 605-614us vs 505.1 budget | verify §F16; verify2 spot | CONFIRMED |
-| F17 | vk h264 sustained gaps 280-286us vs 247.8 | verify §F17; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
-| F18 | vk h265 sustained gaps 510-517us vs 380.1 | verify §F18; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
+| F17 | vk h264 sustained gaps 495-501us vs 365.2 budget | verify §F17; f17f18-reproof on IPB bytes | CONFIRMED: B-service cadence, margin 35% |
+| F18 | vk h265 sustained gaps 516-525us vs 379.2 budget | verify §F18; f17f18-reproof re-measured | CONFIRMED: content class unchanged, gaps hold |
 | F19 | d11 h265 decode additive floor | verify §F19; VACATED (leg GREEN full) | VACATED, leg GREEN |
 | F20 | d11 h265 surface submit+wait vs 510.2 budget | handoff split; hold-2 vacate (db785c5) | VACATED, leg GREEN |
 | F21 | d11 av1 surface submit+wait vs 695.4 budget | handoff split; hold-2 re-derive (eac2654) | CONFIRMED |
