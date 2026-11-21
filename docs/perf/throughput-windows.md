@@ -44,13 +44,13 @@ Surface
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
 | d3d11 h264 surface | 1461 | 5421 | +271.0% |
-| d3d12 h264 surface | 1461 | 4855 | +232.3% |
+| d3d12 h264 surface | 1461 | 5599 | +283.2% |
 | vulkan h264 surface | 1461 | 3724 | +154.9% |
 | d3d11 h265 surface | 1120 | 2046 | +82.7% |
-| d3d12 h265 surface | 1120 | 1958 | +74.8% |
+| d3d12 h265 surface | 1120 | 2169 | +93.7% |
 | vulkan h265 surface | 1120 | 1479 | +32.1% |
 | d3d11 av1 surface | 819 | 1401 | +71.1% |
-| d3d12 av1 surface | 819 | 1310 | +60.0% |
+| d3d12 av1 surface | 819 | 1423 | +73.7% |
 | vulkan av1 surface | 819 | 1270 | +55.1% |
 | d3d11 vp9 surface | 250.2 | 270 | +7.9% |
 
@@ -86,7 +86,7 @@ Sync
 | Field | Fact |
 |---|---|
 | Input | 30 passes, heavy-intra single-frame 1080p blob; downloaded frames both sides<br>h264 runs the shared downloadable pair (25KB 1-frame IDR, hash in PROVENANCE); h265/av1/vp9 keep the surface blobs |
-| Counting | fps = frames/wall; isolated grading only on full-binary collapse |
+| Counting | fps = frames/wall; isolated grading only on full-binary collapse; d11 counts held tails, d12 times flush (stricter) |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold d3d11va downloaded on 120x concat; identical bytes every row |
 | Verdict basis | budget 1.5x rebaseline, all GREEN; vp9 leads gold +2% on identical bytes |
