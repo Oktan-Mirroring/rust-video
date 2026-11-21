@@ -2,8 +2,6 @@
 
 rv-sw decode beat ffmpeg on all 16 software decode legs, +4.9% to +80.8%; sw encode took all 11 comparable legs, +2.4% to +80.4%. rv-vaapi on the Radeon took all four surfaces (+2.9% to +88.6%) plus h264 readback (+2.9%); h265 readback trails 5.2%. VA-API encode lands at h264 -4.7% to -4.3% and h265 +1.9% to +2.0%. Vulkan ran on the RTX 5080; most ffmpeg Vulkan legs timed out or produced empty output, leaving rv-only rows.
 
-Release build, 600-frame decode streams, 300-frame encode streams, median of 5, run 2026-11-18 on a 32-core LMDE 7 box. VA batch proof is PENDING (see Gaps).
-
 ## Environment
 
 | Item | Value |
@@ -19,10 +17,6 @@ Release build, 600-frame decode streams, 300-frame encode streams, median of 5, 
 
 ## Method
 
-- Decode legs run 600 frames; encode legs run 300 frames of yuv420p at 5 Mbps nominal, fastest sane settings both sides.
-- h264 ships IPB and IP streams; h265 ships IPB; every other codec runs one stream.
-- fps divides actual output frames by wall both sides: ffmpeg parses `-progress frame=` per run, rv counts decoded frames over fed frames.
-- Median of 5 runs each side, no warmup either side, livepack included.
 - VA-API: ffmpeg pins renderD128; rv opens the first render node in sorted path order that initializes with H.264 caps, renderD128 on this box.
 - Vulkan: rv negotiates one device, the first enumerated adapter that passes the op; ffmpeg runs each GPU. Every rv Vulkan leg below ran on the RTX 5080: RADV rejects the combined usage the tier decodes with and its encode session creation fails ([vulkan](../vulkan.md)), leaving NVIDIA as the only adapter that can complete a leg. Percents compare against the RTX 5080 ffmpeg column.
 - TIMEOUT marks an unfinished leg; ERR marks one that errored.
@@ -33,7 +27,17 @@ Release build, 600-frame decode streams, 300-frame encode streams, median of 5, 
 
 ### Decode, fps
 
-VA-API, Radeon:
+VA-API, Radeon
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 600f streams per codec; exact stream bytes unrecorded in pins (run predates the Nov-20 dump inventory; no vector list recorded). Surface rows gpu-resident; readback rows return CPU frames via a split-phase worker at depth 4. |
+| Counting | fps = output frames / wall both sides (ffmpeg `-progress frame=` per run, rv decoded frames over fed frames). Median of 5 runs each side, no warmup either side. Quiet box (release, quiet, median of 5 per Gap 2). |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). VA devices per Method (renderD128 both sides). Box per Environment. |
+| Gold | ffmpeg VA-API on renderD128 on identical streams per sheet (every percent compares identical streams on this table). Exact command lines unrecorded in pins. Shapes pair per row (surface/readback). |
+| Verdict basis | head-to-head delta only; no per-leg budget recorded in pins; absolute bar 60fps (all rows clear). VA batch proof PENDING (Gap 1: 5 hunks, predicted-unmeasured). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -46,9 +50,17 @@ VA-API, Radeon:
 | vp9 surface | 538.0 | 567.3 | +5.4% |
 | vp9 readback | 464.3 | 543.8 | +17.1% |
 
-Readback runs a split-phase worker at depth 4.
+Vulkan, RTX 5080
 
-Vulkan, RTX 5080:
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 600f streams per codec; exact stream bytes unrecorded in pins (same caveat as VA-API). h264 ships IPB and IP streams; h265 ships IPB; av1 runs one stream. No h264 surface leg ran on the IP stream. |
+| Counting | fps = output frames / wall both sides (ffmpeg `-progress frame=` per run, rv decoded frames over fed frames). Median of 5 runs each side, no warmup either side. Quiet box (release, quiet, median of 5 per Gap 2). TIMEOUT rows: ffmpeg leg unfinished, row stays rv-only with reason. |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). rv on the RTX 5080 (first enumerated adapter passing the op; RADV rejects the combined decode usage). Box per Environment. |
+| Gold | ffmpeg runs each GPU; percents compare against the RTX 5080 ffmpeg column. Exact command lines unrecorded in pins. FFmpeg on RADV for context, unpercented: h264 surface 579.2, readback 524.6; h265 surface TIMEOUT, readback 432.5; av1 surface 443.0, readback 373.4; both encodes ERR. RADV h264 surface varies run to run with no ffmpeg-side code change. |
+| Verdict basis | head-to-head delta only; no per-leg budget recorded in pins; absolute bar 60fps (all rv rows clear). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -60,11 +72,19 @@ Vulkan, RTX 5080:
 | av1 surface | 446.3 | 1708.3 | +282.8% |
 | av1 readback | 433.6 | 1638.1 | +277.8% |
 
-FFmpeg on RADV for context, unpercented: h264 surface 579.2, readback 524.6; h265 surface TIMEOUT, readback 432.5; av1 surface 443.0, readback 373.4; both encodes ERR. No h264 surface leg ran on the IP stream. RADV h264 surface and h265 transcode vary run to run with no ffmpeg-side code change.
-
 ### Encode, fps
 
-VA-API, Radeon:
+VA-API, Radeon
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 300f yuv420p at 5 Mbps nominal, fastest sane settings both sides; exact input bytes unrecorded in pins (run predates the Nov-20 dump inventory). h264/h265 IP g60 and all-intra rows; transcode rows pair rv all-intra against ffmpeg IP except the two labeled IP-g60-both-sides rows. |
+| Counting | fps = output frames / wall both sides (ffmpeg `-progress frame=` per run, rv counted frames). Median of 5 runs each side, no warmup either side. Quiet box (release, quiet, median of 5 per Gap 2). |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). VA devices per Method (renderD128 both sides). Box per Environment. |
+| Gold | ffmpeg VA-API on renderD128 on identical streams per sheet except the two labeled transcode rows. Exact command lines unrecorded in pins. Settings differ (bitrate and QP unmatched), no quality claim; percents diagnose pace. |
+| Verdict basis | head-to-head delta only; no per-leg budget recorded in pins; absolute bar 60fps (all rows clear). VA batch proof PENDING (Gap 1). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -77,11 +97,19 @@ VA-API, Radeon:
 | h265 transcode, rv all-intra vs ffmpeg IP | 235.0 | 224.7 | -4.4% |
 | h265 transcode, IP g60 both sides | 235.0 | 225.6 | -4.0% |
 
-Vulkan encodes ran rv-only; see One-sided reference.
-
 ## Software
 
 ### Decode, fps
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 600f streams per codec; exact stream bytes unrecorded in pins (run predates the Nov-20 dump inventory). h264 ships IPB and IP streams; h265 ships IPB; av1, vp9, and vp8 run one stream each. Thread rows per labels. |
+| Counting | fps = output frames / wall both sides (ffmpeg `-progress frame=` per run, rv decoded frames over fed frames). Median of 5 runs each side, no warmup either side. Quiet box (release, quiet, median of 5 per Gap 2). |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). CPU legs, no device. Box per Environment. |
+| Gold | default SW decoders (ffmpeg 7.1.5 GPL) on identical streams per sheet. Exact command lines unrecorded in pins. Thread rows pair per labels; rv thread plumbing unrecorded in pins. |
+| Verdict basis | head-to-head delta only; no per-leg budget recorded in pins; absolute bar 60fps (all rows clear). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -104,6 +132,16 @@ Vulkan encodes ran rv-only; see One-sided reference.
 
 ### Encode, fps
 
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 300f yuv420p at 5 Mbps nominal, fastest sane settings both sides; exact input bytes unrecorded in pins (run predates the Nov-20 dump inventory). |
+| Counting | fps = output frames / wall both sides (ffmpeg `-progress frame=` per run, rv counted frames). Median of 5 runs each side, no warmup either side. Quiet box (release, quiet, median of 5 per Gap 2). SVT legs match threads both sides: rv threads map to lp only (4t is lp4, 8t clamps to lp6), and ffmpeg `-threads` is inert for libsvtav1 (its legs set the same lp values). |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). CPU legs, no device. Box per Environment. |
+| Gold | libx264/libx265 ultrafast zerolatency, vpx cpu8, aom cpu8, svt p13 la0 lp4/lp6, per row labels; identical streams per sheet. Exact command lines unrecorded in pins. Settings differ, no quality claim. aom cpu10: ffmpeg ERR (Numerical result out of range), no rv path (crate pins cpu8); row one-sided with reason. |
+| Verdict basis | head-to-head delta only; no per-leg budget recorded in pins; absolute bar 60fps (paired rows clear). |
+
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
 | x264 ultrafast zerolat 4t | 773.0 | 926.6 | +19.9% |
@@ -119,9 +157,17 @@ Vulkan encodes ran rv-only; see One-sided reference.
 | svt p13 la0 lp4, matched | 424.8 | 572.1 | +34.7% |
 | svt p13 la0 lp6 vs rv 8t, matched | 484.0 | 873.2 | +80.4% |
 
-SVT legs match threads both sides: rv threads map to lp only (4t is lp4, 8t clamps to lp6), and ffmpeg `-threads` is inert for libsvtav1: its legs set the same lp values.
-
 ## One-sided reference, fps
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | vk encodes: 300f yuv420p (exact bytes unrecorded, same caveat); rv actual 77.6/83.1 Mbps vs 75 nominal. NVENC: ffmpeg-side only. openh264: rv at 4t/8t. livepack: synthetic units, no codec bytes. RADV transcode: ffmpeg-side (h264 226.6, h265 ERR); RADV h265 transcode varies run to run with no ffmpeg-side code change. |
+| Counting | fps = output frames / wall both sides. Median of 5 runs each side, no warmup either side, livepack included. Quiet box (release, quiet, median of 5 per Gap 2). |
+| Build | release; run tree + capture command unrecorded in pins (Gap 2). vk encodes on the RTX 5080 (RADV encode session creation fails); CPU legs need no device. Box per Environment. |
+| Gold | no pair per row, with reason: vk encodes (ffmpeg produced empty output); NVENC (no rv tier); openh264 (absent from the ffmpeg build, no libopenh264); livepack (no ffmpeg counterpart); RADV transcode (no rv leg). |
+| Verdict basis | reference only; absolute bar 60fps (all values clear; h265 transcode ERR not applicable). |
 
 - Vulkan h264 encode via rv, ffmpeg produced empty output: 543.9 at 77.6 Mbps actual vs 75 nominal.
 - Vulkan h265 encode via rv, ffmpeg produced empty output: 236.8 at 83.1 Mbps actual vs 75 nominal.
@@ -134,10 +180,3 @@ SVT legs match threads both sides: rv threads map to lp only (4t is lp4, 8t clam
 
 1. PENDING va vk-template batch lab proof: 5 hunks (surface-encode hold-back, sharded decode readback, sharded encode upload, zero-alloc stage_emit, depth ladder), all PREDICTED-UNMEASURED, uncommitted in tree. Legs per `.tmp/va-opt-report.md`: leg 0 gate (`cargo test -p rust-video-vaapi --lib` plus e2e/overlap/surface/async green; any failure kills the batch, bisect biggest-first); leg 1 transcode IP g60 (baselines h264 220.7, h265 225.6); leg 2 readback rows plus `phase_stats().copy_us`; leg 3 encode rows (h264 301.2/306.0, h265 331.7/332.8); leg 4 stage allocs (noise-band expected); leg 5 depth ladder 1-4 on one readback + one surface leg; leg 6 thread cost (+8 steady threads). In-repo legs: `cargo test -p rust-video-vaapi --test throughput` (`--release` for the headline). Kill rules per leg in the report.
 2. HEAD re-grade rides the lab session: published numbers are Nov-18 era (run tree unrecorded) on the doc's box/method (release, quiet, median of 5; decode 600 frames, encode 300).
-
-## Comparability notes
-
-- Content: every percent compares identical streams except the two transcode rows labeled all-intra, where rv encodes all-intra against ffmpeg IP.
-- Settings: encode legs carry no quality claim; bitrate and QP do not match.
-- Gaps: see Gaps (va batch proof, HEAD re-grade); otherwise aom cpu10 (ffmpeg ERR, no rv path); vulkan h264/h265 decode (ffmpeg TIMEOUT); openh264 absent from the ffmpeg build; no h264 surface leg on the IP stream.
-- Cross-OS: the Windows sheet differs in build and vectors: same counting discipline only.

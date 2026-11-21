@@ -2,8 +2,6 @@
 
 d11 h264 surface medians 5421 fps against gold 1461 (+271%) on identical bytes; d12 h264 sustained reads 2435 (+74%) on the primed steady method. Encode inverts 6/6 on shared noise (d11 h264 393 vs 92), pace only, settings and quality unmatched. F7 is dead: the 96 fps floor came from a C-only openh264 link, the nasm build runs 256.
 
-rv tree 1c3a1e8 (+ held mc/va diffs, outside the Windows binaries). The handoff-close round (2026-11-21, `.tmp/perf-handoff.md`) graduates every d11 cell to quiet median-of-3 and the d12 cells to quiet means on a zero-python box, closing the verifymax handoffs; vk cells keep verify2 (confirm-only). Gold medians one era (4e92a7c): 1 discarded warmup, 3 timed HW runs, 5 timed SW runs; `_ip` confirms within 6% of rebaseline.
-
 ## Environment
 
 | Item | Value |
@@ -18,17 +16,8 @@ rv tree 1c3a1e8 (+ held mc/va diffs, outside the Windows binaries). The handoff-
 
 ## Method
 
-- rv capture: `just benches-release` (green proof), then per tier `cargo test --release -p rust-video-<tier> --test throughput -- --nocapture` with tier `rust-video-d3d11`, `rust-video-d3d12`, `rust-video-vulkan`, and `rust-video-sw --features h264-openh264`. d11 grades median-of-3, d12/vk/sw mean-of-2. Quiet box: no builds, CPU idle, GPU near idle; discard samples taken under spikes and re-run them.
-- Verifymax era-tagging: late runs carry an F4-quietometer tag (vk h265 encode single, driver floor 229.6): lull runs (F4 228.3+) certify GPU-bound legs; host-heavy legs (sustains, MFT pumps, sw) keep a residual tax even in lull and need CPU-quiet (zero-python). Graduations use quiet pairs or era-agreeing clusters only; a mean-of-2 with a wide spread keeps the tighter pair with a note.
-- Isolated legs run the same binary filtered to the leg, 3x, median. Isolated grading applies only on full-binary collapse or a >=10% full discount with the budget at stake: d11 av1 decode qualifies (collapse 1/3, clean runs -16% quiet), d11 hevc decode does not (no collapse, -5%, clears the budget full) and grades full; livepack parallel alloc-churn costs 16-29%.
-- Sustained legs run one 120-frame IP pass per overlap pump. d11 all four and d12 all three prime untimed (steady state); vk times the cold pass. d11 counts frames then drops them (byte parity stays in the overlap tests); frame counts exact, queue drops zero.
-- Sync/surface legs: d11 warms 100ms with untimed trailing flush; d12 sync primes 4 passes; d11/d12 print submit/engine/copy phase medians, d11 surfaces print submit/wait medians plus the argmin call.
-- Gold decode: cuvid resident (`-f null`) plus d3d11va downloaded (hwdownload + rawvideo file) per codec, all on our bytes: 120x single-frame concats for sync/surface shape, `_ip` 120f for sustained. H264 synth runs cuvid resident only: d3d11va reports a corrupt frame and writes nothing, cuvid plus hwdownload is unimplemented in this build.
-- Gold encode: NVENC p1 intra CQP qp 28 (AV1 IP g4; all-intra refused) on per-tier 120f noise dumps (4x concat of each tier's timed frames; va native 120f). SW encode runs the 10x sw dump (300f yuv420p) at 5 Mbps nominal, vpx realtime.
+- rv capture: `just benches-release` (green proof), then per tier `cargo test --release -p rust-video-<tier> --test throughput -- --nocapture` with tier `rust-video-d3d11`, `rust-video-d3d12`, `rust-video-vulkan`, and `rust-video-sw --features h264-openh264`.
 - Encode dumps: `cargo run -p rust-video-harness --bin dump_vectors -- .tmp/dump-vectors` (byte-compares file against in-process build at write time); `--check` re-verifies. Recipes and hashes: bench PROVENANCE.
-- Content alias: `Synth::noise` seeds `seed | 1`, so each even/odd seed pair emits identical bytes (the sw leg cycles 4 seeds = 2 distinct frames; the 30-seed d11/d12 dumps hold 15 distinct pairs). Both sides share the dumps, so pairs stay fair; the dumps are frozen (gold-paired). Distinct-content pace reads lower (sw distinct-content probe 145 vs 256).
-- fps divides actual output frames by wall both sides; ffmpeg parses `speed=` against the 30fps input. Validity: the media clock implies 30fps output within 5% and frame counts are exact (`elapsed=` truncates to 2 decimals, unusable under ~100ms).
-- Software decode gold runs 600f our bytes: 5x `_ip` cats (vp8 600x single-frame, no `_ip` exists). The h264 IP-only legs are dropped: no our-file counterpart.
 - Devices: d3d11/d3d12 open the default hardware adapter (RTX 5080 here); rv-vulkan takes the first enumerated adapter passing the op (NVIDIA here); ffmpeg pins cuvid/nvenc/d3d11va explicitly.
 - Knobs are manual in the ffmpeg model; defaults hold landed behavior. See [tuning](../tuning.md).
 - Compare against the Linux sheet on counting discipline only: build, corpus, and vectors differ.
@@ -37,7 +26,17 @@ rv tree 1c3a1e8 (+ held mc/va diffs, outside the Windows binaries). The handoff-
 
 ### Decode, fps
 
-Surface, gpu-resident both sides:
+Surface
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | rv 30 timed passes (HOPS/ITERS=30) over the single-frame blob per codec: synth h264 30B (sha256 `623ffdac...0fdb1`), nvenc h265 21901B, svtav1 obu 45380B, vpx vp9 ivf 783128B (full hashes in PROVENANCE and the vectors inventory); noise-IDR class (synth = SPS + PPS + header-only IDR slice, one grey frame). d12 hevc times the first picture only. Gold decodes the 120x concat of the same blob (120f). |
+| Counting | fps = output frames / wall both sides; ffmpeg `speed=` x 30fps input, media clock implies 30fps output within 5%, frame counts exact (`elapsed=` truncates to 2 decimals, unusable under ~100ms). rv d11 median-of-3, d12/vk mean-of-2. Full-binary throughout (no isolated grading on this table). Quiet box (no builds, CPU idle, GPU near idle); samples under spikes discarded and re-run; F4 tags throughout (vk h265 encode single, floor 229.6): lull F4 228.3+ certifies GPU-bound legs, host-heavy legs need CPU-quiet (zero-python); wide-spread mean-of-2 keeps the tighter pair with a note. Warmup: d11 100ms + untimed trailing flush; d12 4 passes; vk single pass. Spreads: d11 h264 4960-5657, h265 1797-1915, av1 1276-1298; d12 h265 thin pair 1916/2000 (submit-luck spread; tiebreak2 isolated median 1995.1 firms GREEN, grade unchanged). |
+| Build | release test profile (x86-64-v3, thin LTO, opt 3, CGU1 per compat); tree 1c3a1e8 + held mc/va diffs (phone-gated, off on Windows); rustc 1.100.0, driver 621.24, RTX 5080. |
+| Gold | cuvid resident (`-f null`) on the 120x concat per codec (h264-synth-120x `d0aa1721...bd2afc8`, h265-120x `bbe541ef...e2ba6558`, av1-120x `15c24e8d...2e7ba3f`, vp9-120x `529fe913...fff0729`); gpu-resident both sides, same bytes. h265 gold 1120 pools two medians (1074/1167, 18% pooled spread; pooling per sheet, run log unrecorded in pins). vp9 120f file supersedes the 30f 194 (same bytes, startup amortizes). cuvid-resident and d3d11va-downloaded golds use different decoders, not comparable to each other. Medians one era (4e92a7c, 1 warmup + 3 timed); era command lines unrecorded in pins (gold-run.ps1 ran superseded bytes). d11 vp9 decode is NVDEC both sides (D3D11 VP9 profile; software MFT is the encoder only). |
+| Verdict basis | budget 1.5x rebaseline best per leg (perf-rebaseline.md); absolute bar 60fps. Floors F20 (d11 hevc -7.0%), F21 (d11 av1 -11.0%), F22 (d12 av1) exempt the misses; rest GREEN including d12 hevc thin +1.7%. vk cells keep verify2 (handoff confirm-only, floors hold). Proof: .tmp/perf-handoff.md + tiebreak2 + Floors table. |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -52,9 +51,17 @@ Surface, gpu-resident both sides:
 | vulkan av1 surface | 819 | 1270 | +55.1% |
 | d3d11 vp9 surface | 250.2 | 270 | +7.9% |
 
-Every pair shares bytes: gold decodes the 120x single-frame concat. d3d11 vp9 decode is NVDEC both sides (ours via the D3D11 VP9 decoder profile); software MFT applies to the VP9 encoder only. d11 cells are quiet median-of-3 (h264 best 5657, range 4960-5657; h265 range 1797-1915; av1 range 1276-1298); d12 cells are quiet means (h265 thin: 1916/2000, submit-luck spread, tiebreak owed). h265 gold 1120 pools two medians (1074/1167, 18% pooled spread).
+Sustained overlap
 
-Sustained overlap, 120-frame IP both sides:
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | rv one 120f IP pass per overlap pump over the committed _ip streams (h264_ip 362289B, h265_ip 79718B, av1_ip 108696B, vp9_ip 114029B; testsrc IP class, 4I+116P h264); frames counted then dropped (byte parity stays in the overlap tests), counts exact, drops zero. d11 all four + d12 all three prime 4 packets untimed (steady state); vk times the cold pass. |
+| Counting | fps = output frames / wall both sides; ffmpeg `speed=` x 30fps input, media clock implies 30fps output within 5%, frame counts exact (`elapsed=` truncates to 2 decimals, unusable under ~100ms). rv d11 median-of-3, d12/vk mean-of-2. Full-binary throughout, grading stays full. Quiet box (no builds, CPU idle, GPU near idle); samples under spikes discarded and re-run; F4 tags throughout (vk h265 encode single, floor 229.6): lull F4 228.3+ certifies GPU-bound legs, host-heavy legs need CPU-quiet (zero-python); wide-spread mean-of-2 keeps the tighter pair with a note. d12 av1 keeps the tighter lull 2305 over the 15%-spread quiet pair (copy-phase readback noise); isolated medians 2372 (handoff) and 2070.8 (tiebreak2) corroborate. |
+| Build | release test profile (x86-64-v3, thin LTO, opt 3, CGU1 per compat); tree 1c3a1e8 + held mc/va diffs (phone-gated, off on Windows); rustc 1.100.0, driver 621.24, RTX 5080. |
+| Gold | cuvid resident on the same _ip 120f bytes (gold stays resident while rv hands CPU frames back: every percent favors gold). _ip golds confirm rebaseline within 6%. Downloaded shape-matched pair per codec: gold 810/765/825/792 vs rv d3d11 sustained 1954/1719/2095/1501 (h264/h265/av1/vp9); gold includes a 373MB file write (sheet values, run log unrecorded in pins). vp9 120f file supersedes the 30f 194 (same bytes, startup amortizes). cuvid-resident and d3d11va-downloaded golds use different decoders, not comparable to each other. Medians one era (4e92a7c, 1 warmup + 3 timed); era command lines unrecorded in pins (gold-run.ps1 ran superseded bytes). |
+| Verdict basis | budget 1.5x rebaseline best per leg (perf-rebaseline.md); absolute bar 60fps. All GREEN (+33 to +116%), grading full throughout (gap 12 closed: tiebreak2 isolated 2070.8, spread 11.6% readback-noise class). vk cells keep verify2 (confirm-only; av1sust -7.4% code-side, F13 ceiling holds). Proof: .tmp/perf-handoff.md + tiebreak2. |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -69,9 +76,17 @@ Sustained overlap, 120-frame IP both sides:
 | d3d12 h265 sustained | 1293 | 2064 | +59.6% |
 | d3d12 av1 sustained | 1197 | 2305 | +92.6% |
 
-Every leg shares gold's exact bytes; gold stays resident while rv legs hand CPU frames back: each percent favors gold. d12 sustains are full-binary means, depth 4 filled (h264/hevc quiet; av1 keeps the tighter lull 2305 over the 15%-spread quiet pair, isolated median 2372, full-B 2473 confirms the 2465 endpoint). Downloaded pairs per codec are the shape-matched d3d legs: gold 810/765/825/792 against rv d3d11 sustained 1954/1719/2095/1501 (h264/h265/av1/vp9), gold with a 373 MB file write, rv with CPU frames in hand.
+Sync
 
-Sync, downloaded both sides (`†` = adjacent bytes, unpercented):
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | rv 30 timed passes (HOPS/ITERS=30) over the single-frame blob per codec (same blobs as surface; d12 hevc times the first picture only); downloaded frames both sides. h264 rows (†) are adjacent, unpercented: gold shows the _ip downloaded number while rv runs synth (gold cannot download synth bytes). |
+| Counting | fps = output frames / wall both sides; ffmpeg `speed=` x 30fps input, media clock implies 30fps output within 5%, frame counts exact (`elapsed=` truncates to 2 decimals, unusable under ~100ms). rv d11 median-of-3, d12/vk mean-of-2. Isolated grading only on full-binary collapse or >=10% full discount with the budget at stake (isolated = same binary filtered to the leg, 3x, median): d11 av1 isolated-graded (quiet median 1038; full-binary collapses 1/3, clean runs -16% quiet); hevc grades full (no collapse 3/3, -5%, clears the budget); rest full-binary. Quiet box (no builds, CPU idle, GPU near idle); samples under spikes discarded and re-run; F4 tags throughout (vk h265 encode single, floor 229.6): lull F4 228.3+ certifies GPU-bound legs, host-heavy legs need CPU-quiet (zero-python); wide-spread mean-of-2 keeps the tighter pair with a note. Warmup: d11 100ms + untimed trailing flush; d12 4 passes; vk single pass. Spreads: d11 h264 3267-3845, h265 1195-1377 (isolated 1391 headroom); d12 quiet means. |
+| Build | release test profile (x86-64-v3, thin LTO, opt 3, CGU1 per compat); tree 1c3a1e8 + held mc/va diffs (phone-gated, off on Windows); rustc 1.100.0, driver 621.24, RTX 5080. |
+| Gold | d3d11va downloaded (hwdownload + rawvideo file) on the 120x concat per codec (same 120f files as surface); h264 rows show the _ip downloaded number (_ip golds confirm rebaseline within 6%). h264-synth download impossible in this build (d3d11va reports a corrupt frame and writes nothing; cuvid plus hwdownload unimplemented). vp9 120f file supersedes the 30f 194 (same bytes, startup amortizes). cuvid-resident and d3d11va-downloaded golds use different decoders, not comparable to each other. Medians one era (4e92a7c, 1 warmup + 3 timed); era command lines unrecorded in pins (gold-run.ps1 ran superseded bytes). |
+| Verdict basis | budget 1.5x rebaseline best per leg (perf-rebaseline.md); absolute bar 60fps. All GREEN (d11 av1 isolated +10.9%, hevc full +3.1%). d12 trim (quiet): sync engines improved on all three legs; av1 wall 1073.8 lands between baseline 1031 and claim 1107 (submit 100 to 80us tracks the wall 1:1, claim retired as submit-luck). vk cells keep verify2 (confirm-only). Proof: .tmp/perf-handoff.md + Floors table. |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -86,11 +101,17 @@ Sync, downloaded both sides (`†` = adjacent bytes, unpercented):
 | vulkan h265 | 873 | 1431 | +63.9% |
 | vulkan av1 | 837 | 1226 | +46.5% |
 
-Gold downloads the 120x single-frame concat to a file; h264 rows show the `_ip` downloaded number (gold cannot download synth bytes). d11 cells are quiet median-of-3 (h264 range 3267-3845; h265 range 1195-1377, isolated median 1391 headroom); d12 syncs are quiet means. d11 av1 decode stays isolated-graded (quiet median 1038): full-binary runs collapse it to ~100fps and discount clean runs ~16% (reproduced quiet); hevc grades full (no collapse, -5%, clears the budget).
-
 ### Encode, fps
 
-Gold runs intra CQP qp 28 (AV1 IP g4) on each tier's own noise dump; rv runs MFT/Video-Encode/VkVideo defaults on the same frames. Settings differ: percents diagnose only, no quality claim.
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | rv 30 timed noise frames per leg (NV12 1080p Synth::noise; dumps frozen gold-paired: d11 seeds 4..34 `f234c8b1...36e2837`, d12 seeds 0..30 `7c21a501...49e811d3`, vk seeds 0..4 cycled x30 `9f8242ef...d02cf79`). Untimed warmups: d11 seeds 0..4, d12 seed 30, vk same seeds plus flush. Seeds alias pairwise (`seed | 1`): the 30-seed dumps hold 15 distinct pairs; both sides share the dumps. |
+| Counting | fps = output frames / wall both sides; ffmpeg `speed=` x 30fps input, media clock implies 30fps output within 5%, frame counts exact (`elapsed=` truncates to 2 decimals, unusable under ~100ms). rv d11 median-of-3, d12/vk mean-of-2. Full-binary throughout. Quiet box (no builds, CPU idle, GPU near idle); samples under spikes discarded and re-run; F4 tags throughout (vk h265 encode single, floor 229.6): lull F4 228.3+ certifies GPU-bound legs, host-heavy legs need CPU-quiet (zero-python); wide-spread mean-of-2 keeps the tighter pair with a note. MFT pump legs carry 1-python host tax even in F4-lull. |
+| Build | release test profile (x86-64-v3, thin LTO, opt 3, CGU1 per compat); tree 1c3a1e8 + held mc/va diffs (phone-gated, off on Windows); rustc 1.100.0, driver 621.24, RTX 5080. |
+| Gold | NVENC p1 intra CQP qp 28 (AV1 IP g4; all-intra refused) on the 4x concat of each tier's timed frames (120f: enc-d11 `608a5759...a25f3`, enc-d12 `996a24a0...ef1d22`, enc-vk `a143a19b...3166451`). Settings and bitrate unmatched, no quality claim; percents diagnose pace only. Noise intra is brutal for CQP: gold falls from 549/456/618 on testsrc (rebaseline) to 92/142/158 on noise. Medians one era (4e92a7c, 1 warmup + 3 timed); era command lines unrecorded in pins (gold-run.ps1 ran superseded bytes). |
+| Verdict basis | no budget verdicts: floor-bound throughout. d11 MFT Auto cap F14 (byte-exact legacy; faster settings barred by goldens); d12 h264 physics F3 (9.65ms; near the ~125 noise entropy-coding floor); vk h264 ladder cap F8 (~535 fastest rung unhit); vk h265 driver floor F4 (4.3ms, ffmpeg-confirmed). vk cells keep verify2 (confirm-only). Proof: roofline + .tmp/perf-handoff.md + Floors table. |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -101,9 +122,17 @@ Gold runs intra CQP qp 28 (AV1 IP g4) on each tier's own noise dump; rv runs MFT
 | vulkan h264 | 92.4 | 498 | +439.0% |
 | vulkan h265 | 141.6 | 229 | +61.7% |
 
-Noise intra is brutal for CQP: gold falls from 549/456/618 on testsrc to 92/142/158 on noise, and every rv leg outpaces it per frame at unknown quality. d3d12 h264 clears gold by 11.5% near the noise entropy-coding floor (~125); vulkan h265 clears it by 61.7% above the NVIDIA VkVideo submit floor (4.4 ms, ffmpeg-confirmed). Dumps alias pairwise (see Method); both sides share them.
-
 ## Engine occupancy
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | scratch res vectors (.tmp/ladder-vec, host-only, uncommitted): noise-IDR singles + 120f IP at 1440p/4K per codec (ffmpeg 9.0 gyan recipes in engine-ladder.md; h264 sync/surface and all encode legs are in-code synth with no file to swap, so the h264 ladder rides sustained). Committed 1080p refs: h264 713452B/1f (unused by PC legs), h265-nvenc 21901B, av1-obu 45380B, vp9-ivf 783128B, _ip 362289/79718/108696/114029B at 120f. Pixels 1.0x/1.78x/4.0x. |
+| Counting | release single-leg runs, 12 loops per run, 3 runs per cell (median-of-medians fps, n=36 loops), nvidia-smi dmon -s u sampled concurrently per run. Quiet gate per run (no cargo/rustc, CPU ≤15%, GPU idle sm ≤20, enc/dec ≤5; 30s wait + recheck, else SKIP + top-up). dmon columns are window means diluted by cargo gaps; peaks carry the signal. |
+| Build | base HEAD 0a19b6d (main-tree runs audited to base bytes + base profile by file mtime + commit scope; tainted cells re-ran in a pristine worktree @0a19b6d with its own target dir); rustc 1.100.0, driver 621.24, RTX 5080. |
+| Gold | no ffmpeg counterpart: rv-only occupancy probe. NVDEC duty-100% is unobserved at any tested resolution on any tier; host, parse, and cap walls arrive first. The ladder's d12 h264 session-build wall predates the 5c0eaeb prime. |
+| Verdict basis | engine-tracking vs first-wall per cell (ratios against 1.78x/4.0x pixels). Proof: .tmp/engine-ladder.md (300+ clean runs). |
 
 | Tier | Engine signal | Wall that arrives first |
 |---|---|---|
@@ -111,11 +140,19 @@ Noise intra is brutal for CQP: gold falls from 549/456/618 on testsrc to 92/142/
 | d12 | av1 decode/surface/sustained linear to 4K at low duty; av1 sustained engine share 49-90% (393us gap-implied) | h265 4K parse wall; NVENC h264 physics-saturated in-leg (F3); h265 encode no HW path |
 | vk | all legs 2.8-3.7x for 4x pixels, top duty sustained h265 ~22% mean | NVENC driver floor (F4) plus ladder cap (F8); no wall in sight at 4K |
 
-NVDEC duty-100% is unobserved at any tested resolution on any tier; host, parse, and cap walls arrive first. Method: release single-leg runs with dmon sampling against scratch res vectors; dmon columns are window means, peaks carry the signal (ladder). The ladder's d12 h264 session-build wall predates the 5c0eaeb prime.
-
 ## Software
 
 ### Decode, fps
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | gold 600f our bytes: 5x _ip cats (sw-h264-600f `d8078654...fee3fc`, sw-h265-600f `5a119a10...0c3a7c`, sw-av1-600f `dde34fdd...761f859`, sw-vp9-600f `a712bd2a...12fcc07`; vp8 600x single-frame `333aba5b...7436e2025`, no _ip exists). h264 IP-only legs dropped (no our-file counterpart). Per-frame pict counts unverified in pins (recipes carry no -bf flag); rows keep pre-convergence labels. |
+| Counting | fps = output frames / wall (ffmpeg `speed=` x 30fps input). Gold median of 5 after 1 discarded warmup (era rule); settles unrecorded for this era. rv: no legs on this table. |
+| Build | gold side only: ffmpeg 9.0 gyan binaries (libx264, libx265, libvpx, libsvtav1, libdav1d) on the Environment box; era 4e92a7c, no later re-run in pins. No rv build on this table. |
+| Gold | this table is the gold reference: default SW decoders on the 600f files, thread rows per labels (1t/4t/8t/auto). Exact command lines unrecorded for this era (rebaseline-era commands in .tmp/gold-run.ps1 ran regenerated testsrc, superseded). |
+| Verdict basis | one-sided reference, no budget: rv has no legs (ffmpeg/gpl backends need linkable libav*, absent from the binaries-only build; Windows link requires FFMPEG_LIB_DIR per the sw build script). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -134,9 +171,17 @@ NVDEC duty-100% is unobserved at any tested resolution on any tier; host, parse,
 | vp8 4t | 1107.0 | no leg | no comparison |
 | vp8 auto | 3840.0 | no leg | no comparison |
 
-rv has no legs: the ffmpeg/gpl backends need linkable libav*, absent from the binaries-only build (Windows link requires `FFMPEG_LIB_DIR` per the sw build script).
-
 ### Encode, fps
+
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | 10x sw dump enc-sw-yuv420p-300f.yuv (300f yuv420p, `ca7fa70b...cfb94727`; seeds 0..4 cycled = 2 distinct frames by `seed | 1` aliasing). 5 Mbps nominal, vpx realtime. |
+| Counting | fps = output frames / wall (ffmpeg `speed=` x 30fps input). Gold median of 5 after 1 discarded warmup (era rule); settles unrecorded for this era. rv: no legs on this table. |
+| Build | gold side only: ffmpeg 9.0 gyan binaries on the Environment box; era 4e92a7c, no later re-run in pins. No rv build on this table. |
+| Gold | this table is the gold reference: libx264/libx265 ultrafast zerolatency, vpx cpu8 realtime, aom cpu8, svt p13 la0 lp4/lp6, per row labels. aom cpu10 ERRs both sides (Result too large; cpu-used range 0-8, crate pins cpu8). Exact command lines unrecorded for this era (gold-run.ps1 ran superseded testsrc). |
+| Verdict basis | one-sided reference, no budget: same missing-libav* reason as software decode. OpenH264 runs rv-only (see One-sided reference). |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -153,13 +198,21 @@ rv has no legs: the ffmpeg/gpl backends need linkable libav*, absent from the bi
 | svt p13 la0 lp4 | 209.1 | no leg | no comparison |
 | svt p13 la0 lp6 | 267.3 | no leg | no comparison |
 
-No two-sided legs. OpenH264 runs rv-only; see One-sided reference.
-
 ## One-sided reference, fps
 
-- d3d11 surface encode via rv, no ffmpeg counterpart: h264 653, h265 922, av1 722 (new surface content).
-- Transcode via rv, no ffmpeg counterpart: d3d11 454, d3d12 622 (quiet median/mean, noisy legs).
-- h264 openh264 via rv, absent from the ffmpeg build: 256 (nasm ASM path; cycled seeds alias pairwise, distinct-content probe 145).
+**Fact sheet**
+
+| Field | Fact |
+|---|---|
+| Input | surface-encode: GPU surface decoded from synth, no YUV bytes (per-pass surface freshness unrecorded in pins). Transcode: timed synth (d11 warmup alien packets `annex_b_h264_packets` + cropped; d12 warmup clone of timed). openh264: sw 30f planar dump seeds 0..4 cycled (`4cd405cd...afd5fec`) = 2 distinct frames by `seed | 1` aliasing; distinct-content probe reads 145 vs 256. vp9enc: d11 30f dump seeds 4..34 (no NVENC VP9 path exists). livepack: synthetic units, no codec bytes. |
+| Counting | fps = output frames / wall. d11 median-of-3, d12 mean-of-2 (xcode noisy legs); livepack isolated singles (full-binary parallel alloc-churn costs 16-29%). Quiet box (no builds, CPU idle, GPU near idle); samples under spikes discarded and re-run; F4 tags throughout (vk h265 encode single, floor 229.6). |
+| Build | release test profile (x86-64-v3, thin LTO, opt 3, CGU1 per compat); tree 1c3a1e8 + held mc/va diffs (phone-gated, off on Windows); rustc 1.100.0, driver 621.24, RTX 5080. openh264 nasm ASM path (the C-only link reads ~96; F7 dead). |
+| Gold | no ffmpeg counterpart on any row: surface-encode, transcode, and livepack have no gold legs; openh264 absent from the ffmpeg build (no libopenh264); VP9 has no NVENC path. Reference only. |
+| Verdict basis | reference only, no budgets; absolute bar 60fps (all rows clear; vp9enc 69 tightest). |
+
+- d3d11 surface encode via rv, no ffmpeg counterpart: h264 653, h265 922, av1 722.
+- Transcode via rv, no ffmpeg counterpart: d3d11 454, d3d12 622.
+- h264 openh264 via rv, absent from the ffmpeg build: 256.
 - d3d11 vp9 software encode via rv, no NVENC VP9: 69.
 - livepack via rv, no ffmpeg counterpart (isolated singles): TsMux 502432, TsDemux 502015, FragMux 166447.
 
@@ -204,12 +257,3 @@ Proof tags: perf-final = `.tmp/perf-final.md`, verify = `.tmp/perf-verify.md`, v
 10. sw ffmpeg/gpl legs on Windows: need linkable libav* (`FFMPEG_LIB_DIR` per the sw build script).
 11. d12 h265 surface C-sample tiebreak: CLOSED (tiebreak2: isolated quiet median-of-3 1995.1 (1986.8/2005.4/1995.1), +3.6% vs 1926, spread 0.9%, F4 >= 228.5 + dirt <= +26 on all samples; firms the thin full-mean GREEN, grade unchanged).
 12. d12 av1 sustained third sample: CLOSED (tiebreak2: isolated quiet median-of-3 2070.8 (2070.8/1974.6/2214.0), spread 11.6% readback-noise class, F4 231.8 x3, depth 4 filled; leg GREEN +92% vs 1076, grading stays full).
-
-## Comparability notes
-
-- Content: every pair shares bytes except h264 sync/downloaded (gold `_ip` vs rv synth: adjacent) and dropped h264-IP SW legs. Encode dumps alias pairwise (`seed | 1`) and are frozen gold-paired. Resident pairs match shape (surface); downloaded pairs match shape (sync, sustained-vs-downloaded); sustained-vs-resident favors gold (rv hands CPU frames back).
-- vp9 gold: the 120f file supersedes the 30f 194 (same bytes, startup amortizes); short vp9 gold runs understate. cuvid-resident and d3d11va-downloaded golds use different decoders: not comparable to each other.
-- Settings: encode legs do not match settings or bitrate and carry no quality claim.
-- Structural: AV1 all-intra NVENC refused (IP g4 stands in); aom cpu10 errors both sides (cpu-used range 0-8, crate pins cpu8); h264-synth gold download impossible in this build (d3d11va corrupt-frame, cuvid+hwdownload unimplemented).
-- d12 trim adjudication (quiet): engines improved on all syncs (av1 649-669 vs 675-685 baseline); av1 sync wall 1073.8 lands between baseline 1031 and claim 1107 (submit 100 -> 80us tracks the wall 1:1, claim retired as submit-luck); hevc surface submit draws 29-53us (luck is the spread).
-- Cross-OS: the Linux sheet differs in build, corpus, and vectors: same counting discipline only.

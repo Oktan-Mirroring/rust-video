@@ -1,6 +1,7 @@
 # Bench vectors
 
-One all-intra 1080p frame per codec, generated 2026-11-14 with
+One all-intra 1080p frame per codec, generated 2026-11-14
+(h264 blob 2026-11-20, see row) with
 `ffmpeg version 9.0-full_build-www.gyan.dev` from
 `testsrc2=size=1920x1080:rate=30,noise=alls=8:allf=t` (one frame each).
 Every file below decodes to null with exit 0.
@@ -89,7 +90,9 @@ Encode dumps (per-tier timed frames; NV12 unless noted):
 
 Seed columns match each tier's `throughput.rs` timed encode frames
 (d11 warmup 0..4, d12 warmup 30, vk/mc/sw warmup untimed over the same
-seeds, va times 120). Full hashes in `.tmp/vectors-inventory.md`.
+seeds, va times 120). Full committed-file and encode-dump hashes in
+`.tmp/vectors-inventory.md`; timing-cat and decode-concat full hashes
+unrecorded in pins.
 
 Timing cats (byte-repeat the dump N times; raw has no headers):
 
