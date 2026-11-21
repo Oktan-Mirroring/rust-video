@@ -538,6 +538,38 @@ fn decode_vp9_1080p_measures_realtime() {
     );
 }
 
+/// Explicit realtime CBR config behind the encode benches.
+fn fast_config(codec: Codec) -> rust_video_caps::encode::EncodeConfig {
+    use rust_video_caps::encode::{EncodeConfig, Level, Profile, RateControl};
+    use rust_video_caps::{av1, h264, h265};
+
+    let (profile, level) = match codec {
+        Codec::H264 => (
+            Profile::H264(h264::EncodeProfile::Baseline),
+            Level::H264(h264::EncodeLevel::Auto),
+        ),
+        Codec::H265 => (
+            Profile::H265(h265::EncodeProfile::Main),
+            Level::H265(h265::EncodeLevel::Auto),
+        ),
+        Codec::Av1 => (
+            Profile::Av1(av1::EncodeProfile::Main),
+            Level::Av1(av1::EncodeLevel::Auto),
+        ),
+        _ => panic!("fast config covers MFT codecs only"),
+    };
+    EncodeConfig {
+        rate_control: RateControl::Cbr {
+            bitrate: 5_000_000,
+            maxrate: 5_000_000,
+            bufsize: 5_000_000,
+        },
+        profile,
+        level,
+        ..EncodeConfig::default()
+    }
+}
+
 /// 1080p H.264 encode measured against the realtime bar.
 #[test]
 fn encode_h264_1080p_measures_realtime() {
@@ -549,7 +581,7 @@ fn encode_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::H264).expect("auto config");
+    let config = fast_config(Codec::H264);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -577,7 +609,7 @@ fn encode_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::H265).expect("auto config");
+    let config = fast_config(Codec::H265);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -642,7 +674,7 @@ fn encode_av1_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::Av1).expect("auto config");
+    let config = fast_config(Codec::Av1);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -775,7 +807,7 @@ fn encode_surface_h264_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::H264).expect("auto config");
+    let config = fast_config(Codec::H264);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -809,7 +841,7 @@ fn encode_surface_hevc_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::H265).expect("auto config");
+    let config = fast_config(Codec::H265);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -875,7 +907,7 @@ fn encode_surface_av1_1080p_measures_realtime() {
             return;
         }
     };
-    let config = D3d11Encoder::auto_config(Codec::Av1).expect("auto config");
+    let config = fast_config(Codec::Av1);
     let mut encoder = match D3d11Encoder::open(&device, config) {
         Ok(encoder) => encoder,
         Err(error) => {
