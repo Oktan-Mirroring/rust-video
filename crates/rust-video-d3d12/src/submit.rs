@@ -605,12 +605,30 @@ impl DeviceResources {
         }
     }
 
-    /// `bytes` into the upload mapping.
-    pub(crate) fn write_upload(upload: &ID3D12Resource, bytes: &[u8]) -> Result<(), D3d12Error> {
-        Self::with_upload(upload, bytes.len(), |mapped| {
-            mapped.copy_from_slice(bytes);
-            Ok(())
-        })
+    /// Session-life mapping pointer behind `upload`, released separately.
+    pub(crate) fn map_upload(upload: &ID3D12Resource) -> Result<*mut u8, D3d12Error> {
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        // Sound: the caller releases the mapping at session drop.
+        unsafe { upload.Map(0, None, Some(std::ptr::addr_of_mut!(mapped))) }.map_err(|error| {
+            D3d12Error::Call {
+                call: "Map",
+                hresult: error.code().0,
+            }
+        })?;
+        if mapped.is_null() {
+            return Err(D3d12Error::Unsupported(
+                UnsupportedReason::UploadMapReturnedNull,
+            ));
+        }
+        Ok(mapped.cast::<u8>())
+    }
+
+    /// Release a mapping from [`map_upload`](Self::map_upload).
+    pub(crate) fn unmap_upload(upload: &ID3D12Resource) {
+        // Sound: the mapping is live; in-flight submits waited before the drop.
+        unsafe {
+            upload.Unmap(0, None);
+        }
     }
 
     /// `f` over the `len`-byte upload mapping.
@@ -844,6 +862,10 @@ impl Fence {
 
     /// `value` completion on `fence` through a transient event.
     pub(crate) fn wait_on(fence: &ID3D12Fence, value: u64) -> Result<(), D3d12Error> {
+        // Sound: polling a live fence for a signalled value.
+        if unsafe { fence.GetCompletedValue() } >= value {
+            return Ok(());
+        }
         // Sound: default security, auto-reset, unnamed.
         let event =
             unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(|error| {

@@ -1,5 +1,7 @@
 //! Windows OS state behind the portable d3d12 handles.
 
+use std::sync::Arc;
+
 use crate::seam::Seam;
 use crate::session::SharedExport;
 use crate::submit::DeviceResources;
@@ -67,7 +69,7 @@ impl DeviceOs {
 /// Windows export behind one decoded frame.
 pub(crate) struct FrameOs {
     /// NT handle export over the pool texture.
-    shared: SharedExport,
+    shared: Arc<SharedExport>,
 }
 
 impl FrameOs {
@@ -76,7 +78,7 @@ impl FrameOs {
     /// # Arguments
     ///
     /// * `shared` - NT handle export over the pool texture.
-    pub(crate) fn wrap(shared: Option<SharedExport>) -> Option<Box<dyn Seam>> {
+    pub(crate) fn wrap(shared: Option<Arc<SharedExport>>) -> Option<Box<dyn Seam>> {
         shared.map(|shared| Box::new(Self { shared }) as Box<dyn Seam>)
     }
 }

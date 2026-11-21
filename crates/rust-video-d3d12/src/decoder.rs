@@ -1,5 +1,6 @@
 //! Shared sequence state behind the live codec decoders.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::error::{D3d12Error, ParseReason, UnsupportedReason};
@@ -69,7 +70,10 @@ pub(crate) fn surface_layout(active: &Active, slot: u8) -> Result<SurfaceLayout,
 }
 
 /// NT-handle export for pool `slot`, honoring the session crop.
-pub(crate) fn session_surface_export(session: &DecodeSession, slot: u8) -> Option<SharedExport> {
+pub(crate) fn session_surface_export(
+    session: &DecodeSession,
+    slot: u8,
+) -> Option<Arc<SharedExport>> {
     if session.cropped() {
         session.shared_handle_crop(slot)
     } else {
@@ -116,7 +120,7 @@ pub(crate) fn visible_nv12(nv12: Bytes, active: &Active) -> Result<Bytes, D3d12E
 pub(crate) fn emit_frame(
     budget: &SharedDevice,
     bytes: Bytes,
-    export: Option<SharedExport>,
+    export: Option<Arc<SharedExport>>,
     active: &Active,
     generation: u64,
 ) -> Result<D3d12Frame, D3d12Error> {

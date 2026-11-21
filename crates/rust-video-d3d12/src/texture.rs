@@ -1,5 +1,7 @@
 //! Device-resident NV12 surface behind GPU decode and transcode.
 
+use std::sync::Arc;
+
 use crate::error::D3d12Error;
 use crate::pins::SlotPin;
 use crate::session::SharedExport;
@@ -32,7 +34,7 @@ pub struct GpuSurface {
     /// Completion fence, absent once the GPU signaled.
     wait: Option<SurfaceWait>,
     /// Shared-texture export, absent without NT-handle sharing.
-    shared: Option<SharedExport>,
+    shared: Option<Arc<SharedExport>>,
 }
 
 impl GpuSurface {
@@ -43,7 +45,7 @@ impl GpuSurface {
         generation: u64,
         pin: Option<SlotPin>,
         wait: Option<SurfaceWait>,
-        shared: Option<SharedExport>,
+        shared: Option<Arc<SharedExport>>,
     ) -> Self {
         Self {
             identity: GpuFrame::new(layout.visible, PixelFormat::Nv12, generation),

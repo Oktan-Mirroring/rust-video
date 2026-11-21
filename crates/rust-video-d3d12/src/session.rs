@@ -242,8 +242,6 @@ impl DecodeQueues {
 
 /// D3D12 video decode session over one codec geometry.
 pub(crate) struct DecodeSession {
-    /// Logical device behind shared-handle export.
-    device: ID3D12Device,
     /// Video decode queue.
     video_queue: ID3D12CommandQueue,
     /// Video decode slots, one per pool texture.
@@ -268,8 +266,14 @@ pub(crate) struct DecodeSession {
     outputs: Vec<ID3D12Resource>,
     /// Visible-size crop targets, one per pool slot, empty without an offset crop.
     crops: Vec<ID3D12Resource>,
+    /// NT-handle exports over the output pool, one per slot, absent when refused.
+    shared: [Option<Arc<SharedExport>>; POOL],
+    /// NT-handle exports over the crop targets, one per slot, empty without an offset crop.
+    shared_crop: Vec<Option<Arc<SharedExport>>>,
     /// Bitstream upload buffers, one per pipelined submit.
     bitstreams: Vec<ID3D12Resource>,
+    /// Session-life upload maps, one per pipelined submit; unmapped at drop.
+    upload_maps: [*mut u8; BITSTREAM_SLOTS],
     /// In-flight video ticket per upload buffer.
     bitstream_busy: Vec<Option<Ticket>>,
     /// Next upload buffer behind a submit.
@@ -383,6 +387,7 @@ impl DecodeSession {
                 "CreateBitstream",
             )?);
         }
+        let upload_maps = Self::upload_map_all(&bitstreams)?;
         let (layout, footprints) = resources.nv12_layout(width, height)?;
         let staging_desc = DeviceResources::buffer_desc(layout.total);
         let mut staging = Vec::with_capacity(POOL);
@@ -398,8 +403,9 @@ impl DecodeSession {
             .unwrap_or(usize::MAX)
             .min(isize::MAX as usize);
         let maps = Self::stage_maps(&staging, staged_len)?;
+        let shared = Self::share_pool(device.device(), &outputs);
+        let shared_crop = Self::share_pool_vec(device.device(), &crops);
         Ok(Self {
-            device: device.device().clone(),
             video_queue,
             video_slots,
             video_busy: vec![None; POOL],
@@ -412,7 +418,10 @@ impl DecodeSession {
             decoder,
             outputs,
             crops,
+            shared,
+            shared_crop,
             bitstreams,
+            upload_maps,
             bitstream_busy: vec![None; BITSTREAM_SLOTS],
             bitstream_next: 0,
             staging,
@@ -461,6 +470,33 @@ impl DecodeSession {
             }
         }
         Ok((outputs, crops))
+    }
+
+    /// Session-life maps over the upload buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a mapping fails, releasing earlier maps.
+    fn upload_map_all(
+        bitstreams: &[ID3D12Resource],
+    ) -> Result<[*mut u8; BITSTREAM_SLOTS], D3d12Error> {
+        let mut maps: [*mut u8; BITSTREAM_SLOTS] = [std::ptr::null_mut(); BITSTREAM_SLOTS];
+        let mut mapped = 0;
+        for (slot, buffer) in maps.iter_mut().zip(bitstreams.iter()) {
+            match DeviceResources::map_upload(buffer) {
+                Ok(ptr) => {
+                    *slot = ptr;
+                    mapped += 1;
+                }
+                Err(error) => {
+                    for buffer in bitstreams.iter().take(mapped) {
+                        DeviceResources::unmap_upload(buffer);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(maps)
     }
 
     /// Session-life maps over staging buffers.
@@ -810,18 +846,39 @@ impl DecodeSession {
     }
 
     /// NT-handle export for pool `slot`, absent when cropped or refused.
-    pub(crate) fn shared_handle(&self, slot: u8) -> Option<SharedExport> {
+    pub(crate) fn shared_handle(&self, slot: u8) -> Option<Arc<SharedExport>> {
         if crop_plan(self.width, self.height, self.crop).is_some() {
             return None;
         }
-        let resource = self.outputs.get(usize::from(slot))?;
-        Self::share_resource(&self.device, resource)
+        self.shared.get(usize::from(slot)).cloned().flatten()
     }
 
     /// NT-handle export for crop `slot`, absent without a crop target or refused.
-    pub(crate) fn shared_handle_crop(&self, slot: u8) -> Option<SharedExport> {
-        let resource = self.crops.get(usize::from(slot))?;
-        Self::share_resource(&self.device, resource)
+    pub(crate) fn shared_handle_crop(&self, slot: u8) -> Option<Arc<SharedExport>> {
+        self.shared_crop.get(usize::from(slot)).cloned().flatten()
+    }
+
+    /// NT-handle exports over the pool `textures`, one per slot.
+    fn share_pool(
+        device: &ID3D12Device,
+        textures: &[ID3D12Resource],
+    ) -> [Option<Arc<SharedExport>>; POOL] {
+        let mut shared: [Option<Arc<SharedExport>>; POOL] = core::array::from_fn(|_| None);
+        for (slot, texture) in shared.iter_mut().zip(textures.iter()) {
+            *slot = Self::share_resource(device, texture).map(Arc::new);
+        }
+        shared
+    }
+
+    /// NT-handle exports over the crop `textures`, one per slot.
+    fn share_pool_vec(
+        device: &ID3D12Device,
+        textures: &[ID3D12Resource],
+    ) -> Vec<Option<Arc<SharedExport>>> {
+        textures
+            .iter()
+            .map(|texture| Self::share_resource(device, texture).map(Arc::new))
+            .collect()
     }
 
     /// NT-handle export for `resource`, absent when the driver declines sharing.
@@ -975,7 +1032,7 @@ impl DecodeSession {
     fn submit_h264(&mut self, submission: &H264Submission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         let (upload, upload_index) = self.acquire_bitstream()?;
-        DeviceResources::write_upload(&upload, &submission.bitstream)?;
+        self.write_bitstream(upload_index, &submission.bitstream);
         let mut refs = self.ref_tables();
         let input = self.input_args(submission, Some(&mut refs), &upload)?;
         let mut read = [0u8; 16];
@@ -989,6 +1046,15 @@ impl DecodeSession {
         let ticket = self.submit_video(&input, submission.slot, &read[..count])?;
         self.bitstream_busy[upload_index] = Some(ticket);
         Ok(ticket)
+    }
+
+    /// `bytes` into the session-life map behind upload `index`.
+    fn write_bitstream(&self, index: usize, bytes: &[u8]) {
+        let mapped = self.upload_maps[index];
+        // Sound: the session-life map spans the upload capacity; the length
+        // checked against it before the buffer was acquired.
+        let dst = unsafe { std::slice::from_raw_parts_mut(mapped, bytes.len()) };
+        dst.copy_from_slice(bytes);
     }
 
     /// Upload buffer plus index behind the next submit.
@@ -1030,7 +1096,7 @@ impl DecodeSession {
     ) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         let (upload, upload_index) = self.acquire_bitstream()?;
-        DeviceResources::write_upload(&upload, &submission.bitstream)?;
+        self.write_bitstream(upload_index, &submission.bitstream);
         let mut refs = self.ref_tables();
         let input = self.input_args(submission, Some(&mut refs), &upload)?;
         let mut read = [0u8; 16];
@@ -1057,7 +1123,7 @@ impl DecodeSession {
     pub(crate) fn submit_av1(&mut self, submission: &Av1Submission) -> Result<Ticket, D3d12Error> {
         Self::check_bitstream_len(submission.bitstream.len())?;
         let (upload, upload_index) = self.acquire_bitstream()?;
-        DeviceResources::write_upload(&upload, &submission.bitstream)?;
+        self.write_bitstream(upload_index, &submission.bitstream);
         let mut refs = self.ref_tables();
         let input = self.input_args_av1(submission, &mut refs, &upload)?;
         let mut read = [0u8; 16];
@@ -1301,6 +1367,10 @@ impl Drop for DecodeSession {
         // Sound: the maps are live; the copy worker joined before the drop.
         for staging in &self.staging {
             DeviceResources::unmap_readback(staging);
+        }
+        // Sound: the maps are live; the session waits preceded the drop.
+        for upload in &self.bitstreams {
+            DeviceResources::unmap_upload(upload);
         }
     }
 }
