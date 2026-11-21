@@ -60,7 +60,7 @@ Sustained overlap
 
 | Field | Fact |
 |---|---|
-| Input | 120 light inter 1080p frames, 1 overlapped pass<br>committed _ip streams; d11/d12 prime 4 packets untimed, vk times cold |
+| Input | 120 light inter 1080p frames, 1 overlapped pass<br>committed _ip streams (h264 88B + h265 89B per 120f since 2026-11-21, full counts in PROVENANCE); d11/d12 prime 4 packets untimed, vk times cold |
 | Counting | fps = frames/wall; exact counts, zero drops; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVDEC both sides; gold cuvid on same _ip bytes; downloaded shape-matched pair per codec |
@@ -68,15 +68,15 @@ Sustained overlap
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| vulkan h264 sustained | 1398 | 3021 | +116.1% |
-| vulkan h265 sustained | 1293 | 1769 | +36.8% |
+| vulkan h264 sustained | 1329 | 1743 | +31.2% |
+| vulkan h265 sustained | 1251 | 1699 | +35.8% |
 | vulkan av1 sustained | 1197 | 2014 | +68.3% |
-| d3d11 h264 sustained | 1398 | 1954 | +39.8% |
-| d3d11 h265 sustained | 1293 | 1719 | +32.9% |
+| d3d11 h264 sustained | 1329 | 1831 | +37.8% |
+| d3d11 h265 sustained | 1251 | 1718 | +37.3% |
 | d3d11 av1 sustained | 1197 | 2095 | +75.0% |
 | d3d11 vp9 sustained | 1017 | 1501 | +47.6% |
-| d3d12 h264 sustained | 1398 | 2339 | +67.3% |
-| d3d12 h265 sustained | 1293 | 2064 | +59.6% |
+| d3d12 h264 sustained | 1329 | 2242 | +68.7% |
+| d3d12 h265 sustained | 1251 | 2106 | +68.3% |
 | d3d12 av1 sustained | 1197 | 2305 | +92.6% |
 
 Sync
@@ -114,7 +114,7 @@ Sync
 | Counting | fps = frames/wall; quiet box |
 | Build | release (x86-64-v3, thin LTO); tree b4c0fd9; box per Environment |
 | Gold | NVENC both sides, d11 via MFT; gold p1 intra CQP on 4x concat; settings unmatched, pace only |
-| Verdict basis | floor-bound throughout: F14 (d11), F3 (d12), F8/F4 (vk) |
+| Verdict basis | F14 (d11), F8/F4 (vk); d12 h264 ungraded pending audit |
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
@@ -151,7 +151,7 @@ Sync
 
 | Field | Fact |
 |---|---|
-| Input | gold 600f 1080p per codec (_ip x5; vp8 single x600); thread rows per labels |
+| Input | gold 600f 1080p per codec (_ip x5, h264/h265 B-heavy since 2026-11-21; vp8 single x600); thread rows per labels |
 | Counting | fps = frames/wall; gold median of 5 after 1 warmup |
 | Build | gold side only: ffmpeg 9.0 gyan binaries on Environment box |
 | Gold | this table is the gold reference; default SW decoders |
@@ -159,11 +159,11 @@ Sync
 
 | Leg | FFmpeg | rv | Delta |
 |---|---|---|---|
-| h264 IPB 1t | 2625.0 | no leg | no comparison |
-| h264 IPB 4t | 5760.0 | no leg | no comparison |
-| h264 IPB 8t | 7050.0 | no leg | no comparison |
-| h264 IPB auto | 6450.0 | no leg | no comparison |
-| h265 IPB 4t | 2778.0 | no leg | no comparison |
+| h264 IPB 1t | 1533.0 | no leg | no comparison |
+| h264 IPB 4t | 3720.0 | no leg | no comparison |
+| h264 IPB 8t | 5580.0 | no leg | no comparison |
+| h264 IPB auto | 5220.0 | no leg | no comparison |
+| h265 IPB 4t | 2832.0 | no leg | no comparison |
 | h265 IPB auto | 4950.0 | no leg | no comparison |
 | av1 4t | 3030.0 | no leg | no comparison |
 | av1 auto | 3360.0 | no leg | no comparison |
@@ -227,7 +227,7 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 |---|---|---|---|
 | F1 | d11 h264 surface pace ~285us | perf-final §F1; e93b61d | VACATED, leg GREEN |
 | F2 | d12 h264 surface 2112 silicon max | perf-final §F2 (B-sample 2243 beats it) | MOOT, leg GREEN |
-| F3 | d12 h264 encode 9.65ms NVENC physics | roofline; verify2 spot | CONFIRMED |
+| F3 | d12 h264 encode 9.65ms NVENC physics | roofline; verify2 spot | TORN DOWN: d11 393 same bytes same NVENC contradicts |
 | F4 | vk h265 encode 4.3ms driver floor | roofline; verify2 spot; ladder | CONFIRMED |
 | F5 | d11 vp9 encode software MFT floor | roofline; verify2 spot | CONFIRMED |
 | F6 | d11 h264 sustained 1103 walk | roofline; VACATED (leg 1430+); ada9dea | VACATED, leg GREEN |
@@ -235,12 +235,12 @@ Proof records live in `.tmp/` (perf-final, perf-verify, perf-verify2, handoff, l
 | F8 | vk h264 encode ladder cap, API floor 1.22ms | perf-final §F8; verify2 spot | CONFIRMED |
 | F9-11 | d12 sync floors (poisoned inputs) | VACATED-MOOT (prime+pool legs GREEN) | VACATED, legs GREEN |
 | F12 | d12 h264 sustained engine 707us | SUPERSEDED by 5c0eaeb (2503); span-vs-service correction on record | VACATED, leg GREEN |
-| F13 | vk av1 sustained ~2100 asymptote | perf-final §F13; verify2 spot | CONFIRMED |
+| F13 | vk av1 sustained ~2100 asymptote | perf-final §F13; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
 | F14 | d11 MFT Auto cap, byte-exact legacy | perf-final §F14; verify2 spot | CONFIRMED |
 | F15 | vk h264 surface 239-244us vs 217.4 budget | verify §F15; verify2 spot | CONFIRMED |
 | F16 | vk h265 surface 605-614us vs 505.1 budget | verify §F16; verify2 spot | CONFIRMED |
-| F17 | vk h264 sustained gaps 280-286us vs 247.8 | verify §F17; verify2 spot | CONFIRMED |
-| F18 | vk h265 sustained gaps 510-517us vs 380.1 | verify §F18; verify2 spot | CONFIRMED |
+| F17 | vk h264 sustained gaps 280-286us vs 247.8 | verify §F17; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
+| F18 | vk h265 sustained gaps 510-517us vs 380.1 | verify §F18; verify2 spot | TORN DOWN: sustained bytes under IPB replacement |
 | F19 | d11 h265 decode additive floor | verify §F19; VACATED (leg GREEN full) | VACATED, leg GREEN |
 | F20 | d11 h265 surface submit+wait vs 510.2 budget | handoff split; hold-2 vacate (db785c5) | VACATED, leg GREEN |
 | F21 | d11 av1 surface submit+wait vs 695.4 budget | handoff split; hold-2 re-derive (eac2654) | CONFIRMED |
