@@ -1,5 +1,6 @@
 //! AV1 decode over a live video session.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use crate::error::{D3d12Error, ParseReason, SkipReason, UnsupportedReason};
 use crate::frame::D3d12Frame;
 use crate::guid::Codec;
 use crate::h264::frontend::Crop;
-use crate::pins::SlotPins;
+use crate::pins::{SlotPin, SlotPins};
 use crate::session::{DecodeQueues, DecodeSession};
 use crate::texture::GpuSurface;
 
@@ -60,6 +61,10 @@ pub struct Av1Decoder<'a> {
     sync_emit: Vec<Duration>,
     /// Submitted surfaces held back two packets for submit/wait overlap.
     held_surfaces: Vec<GpuSurface>,
+    /// Submitted sync outputs held back for submit/drain overlap.
+    held_sync: VecDeque<HeldSync>,
+    /// Previous call's submitted outputs, held back alongside this call's.
+    held_sync_outputs: usize,
 }
 
 impl<'a> Av1Decoder<'a> {
@@ -82,6 +87,8 @@ impl<'a> Av1Decoder<'a> {
             sync_readback: Vec::new(),
             sync_emit: Vec::new(),
             held_surfaces: Vec::new(),
+            held_sync: VecDeque::new(),
+            held_sync_outputs: 0,
         }
     }
 
@@ -150,13 +157,15 @@ impl<'a> Av1Decoder<'a> {
     fn submit_frame(
         &mut self,
         frame: &Av1Frame,
-        pending: &mut Vec<SyncPending>,
+        pending: &mut Vec<HeldSync>,
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         let submitted_at = Instant::now();
         let active = self.sequence(frame)?;
         let live = self.active;
         if live.is_none_or(|live| (live.width, live.height) != (active.width, active.height)) {
+            self.release_sync(frames, 0)?;
+            self.held_sync_outputs = 0;
             self.consume_pending(pending, frames)?;
             pending.clear();
             self.reconfigure(active, frames)?;
@@ -186,53 +195,51 @@ impl<'a> Av1Decoder<'a> {
         decoded: &Av1Decoded,
         active: Active,
         submitted_at: Instant,
-        pending: &mut Vec<SyncPending>,
+        pending: &mut Vec<HeldSync>,
     ) -> Result<(), D3d12Error> {
         let session = self.session.as_mut().ok_or(D3d12Error::NoSession)?;
         // Downloads queue behind the video ticket: the copy runs at
-        // video-signal without a CPU wakeup gap, and the record hides
-        // under the engine wait. The wait still serializes submits.
-        if let Some(submission) = decoded.submission.as_ref() {
+        // video-signal without a CPU wakeup gap. No video wait here;
+        // held pins steer the next submit past these slots and the
+        // release finishes below pace the engine.
+        let tickets = if let Some(submission) = decoded.submission.as_ref() {
             let video = session.submit_av1(submission)?;
             let mut tickets = Vec::with_capacity(decoded.outputs.len());
             for output in &decoded.outputs {
                 let ticket = session.start_download_after(output.slot(), video)?;
                 tickets.push((output.slot(), ticket));
             }
-            let recorded = Instant::now();
-            session.wait_video(video)?;
-            let signaled = Instant::now();
-            pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
-                slot,
-                ticket,
-                active,
-                submitted_at,
-                submit: recorded.duration_since(submitted_at),
-                engine: signaled.duration_since(recorded),
-            }));
+            tickets
         } else {
             let mut tickets = Vec::with_capacity(decoded.outputs.len());
             for output in &decoded.outputs {
                 let ticket = session.start_download(output.slot())?;
                 tickets.push((output.slot(), ticket));
             }
-            let recorded = Instant::now();
-            pending.extend(tickets.into_iter().map(|(slot, ticket)| SyncPending {
-                slot,
-                ticket,
-                active,
-                submitted_at,
-                submit: recorded.duration_since(submitted_at),
-                engine: Duration::ZERO,
-            }));
-        }
+            tickets
+        };
+        let recorded = Instant::now();
+        pending.extend(tickets.into_iter().map(|(slot, ticket)| {
+            let pin = self.pins.pin(slot);
+            HeldSync {
+                pending: SyncPending {
+                    slot,
+                    ticket,
+                    active,
+                    submitted_at,
+                    submit: recorded.duration_since(submitted_at),
+                    engine: Duration::ZERO,
+                },
+                pin,
+            }
+        }));
         Ok(())
     }
 
     /// Readback for queued `pending` outputs into `frames`.
     fn consume_pending(
         &mut self,
-        pending: &[SyncPending],
+        pending: &[HeldSync],
         frames: &mut Vec<D3d12Frame>,
     ) -> Result<(), D3d12Error> {
         if pending.is_empty() {
@@ -241,7 +248,9 @@ impl<'a> Av1Decoder<'a> {
         let Some(session) = self.session.as_ref() else {
             return Err(D3d12Error::NoSession);
         };
-        for output in pending {
+        for held in pending {
+            let output = &held.pending;
+            debug_assert_eq!(held.pin.slot(), output.slot);
             let (waited, read, nv12) = session.finish_download_split(output.slot, output.ticket)?;
             let shaped_at = Instant::now();
             let nv12 = visible_nv12(nv12, &output.active)?;
@@ -266,12 +275,29 @@ impl<'a> Av1Decoder<'a> {
         Ok(())
     }
 
+    /// Oldest held sync outputs into `frames`, keeping `keep` back.
+    fn release_sync(
+        &mut self,
+        frames: &mut Vec<D3d12Frame>,
+        keep: usize,
+    ) -> Result<(), D3d12Error> {
+        while self.held_sync.len() > keep {
+            let Some(oldest) = self.held_sync.pop_front() else {
+                break;
+            };
+            self.consume_pending(std::slice::from_ref(&oldest), frames)?;
+        }
+        Ok(())
+    }
+
     /// Drop the live session, slots, and sequence after a mid-frame failure.
     fn reset_stream(&mut self) {
         self.dpb = None;
         self.session = None;
         self.active = None;
         self.held_surfaces.clear();
+        self.held_sync.clear();
+        self.held_sync_outputs = 0;
         self.ingest.reset_refs();
         self.resets = self.resets.wrapping_add(1);
     }
@@ -585,7 +611,14 @@ impl Decoder for Av1Decoder<'_> {
             }
         }
         self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        // Two calls held back: older calls' downloads finish while
+        // the new submits' engine work runs. Held pins steer the
+        // next submit past their slots, so same-slot waits never fire.
+        let submitted = pending.len();
+        let hold = submitted + self.held_sync_outputs;
+        self.held_sync_outputs = submitted;
+        self.held_sync.extend(pending);
+        if let Err(error) = self.release_sync(&mut frames, hold) {
             self.reset_stream();
             return Err(error);
         }
@@ -609,15 +642,25 @@ impl Decoder for Av1Decoder<'_> {
             }
         }
         self.note_inflight(pending.len());
-        if let Err(error) = self.consume_pending(&pending, &mut frames) {
+        self.held_sync.extend(pending);
+        if let Err(error) = self.release_sync(&mut frames, 0) {
             self.reset_stream();
             return Err(error);
         }
+        self.held_sync_outputs = 0;
         if let Some(active) = self.active {
             self.drain_live(&active, &mut frames)?;
         }
         Ok(frames)
     }
+}
+
+/// Queued sync output pinned past slot reuse.
+struct HeldSync {
+    /// Queued download behind the output.
+    pending: SyncPending,
+    /// Pin over the output slot, steering the next submit past it.
+    pin: SlotPin,
 }
 
 /// Session plus reference slots for `next`, reusing submit `queues`.

@@ -205,7 +205,7 @@ fn h264_held_surface_leaves_other_slots_open() {
     assert_eq!(total, 4, "every picture surfaces past the hold");
 }
 
-/// Reordered AV1 displays exactly as coded: held head, then one per call.
+/// Reordered AV1 displays exactly as coded, two calls held back.
 #[test]
 fn av1_reorder_holds_back_unchanged() {
     let Some(device) = device_for_av1() else {
@@ -223,8 +223,8 @@ fn av1_reorder_holds_back_unchanged() {
     counts.push(decoder.flush().expect("flush drains").len());
     assert_eq!(
         counts.as_slice(),
-        [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-        "display pattern unchanged"
+        [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+        "held display pattern"
     );
     assert_eq!(decoder.resets(), 0, "clean vector never resets");
 }
