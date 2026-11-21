@@ -154,7 +154,7 @@ fn hevc_loopback_returns_own_frames() {
     assert!(pump.receive().expect("drained").is_none());
 }
 
-/// Blocking receive returns the trailing HEVC frame, then end of stream.
+/// Blocking receive returns the trailing HEVC frames, then end of stream.
 #[test]
 fn hevc_blocking_receive_drains_tail() {
     let Some(device) = device() else {
@@ -173,13 +173,15 @@ fn hevc_blocking_receive_drains_tail() {
         pump.try_send(packet.clone()).expect("queue room");
     }
     let mut generations = Vec::new();
-    for _ in 0..PICTURES - 1 {
+    for _ in 0..PICTURES - 2 {
         let frame = pump.try_receive().expect("poll").expect("frame queued");
         generations.push(frame.identity().generation());
     }
     pump.finish().expect("finish drains");
-    let trailing = pump.receive().expect("trailing").expect("trailing queued");
-    generations.push(trailing.identity().generation());
+    for _ in 0..2 {
+        let trailing = pump.receive().expect("trailing").expect("trailing queued");
+        generations.push(trailing.identity().generation());
+    }
     assert_eq!(generations, (0..PICTURES as u64).collect::<Vec<_>>());
     assert!(pump.receive().expect("drained").is_none());
 }
